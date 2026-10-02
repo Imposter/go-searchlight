@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,6 +15,10 @@ import (
 
 // MaxIDBytes is the longest document id, in bytes.
 const MaxIDBytes = 512
+
+// MaxGramChars is the longest value, in characters, whose grams are computed. A longer
+// value has none and sets [Value.GramsTruncated].
+const MaxGramChars = 1024
 
 // Value is one field of an analyzed document: what every index structure and the
 // matcher read of it.
@@ -43,12 +45,20 @@ type Value struct {
 	// sorted ([analysis.EntryTerms]).
 	Entries []string
 	// Grams is every distinct 3-rune substring of Text ([analysis.Substrings3]), the
-	// anchors of contains and starts_with.
+	// anchors and prefilters of contains and starts_with. It is computed only for a Text
+	// of at most MaxGramChars characters, and never for the IDField.
 	Grams []string
+	// GramsTruncated is true when Text is longer than MaxGramChars and so has no Grams.
+	// Such a value can match a contains or starts_with needle that shares no gram with
+	// any index: segment term statistics, search prefilters and percolator anchors must
+	// treat it as a candidate for every needle (a residual check, or the always-verify
+	// path), never skip it for lacking a gram.
+	GramsTruncated bool
 }
 
 // Doc is an analyzed document. Fields holds every present field, by name, and the
-// pseudo-field [IDField] (the id as a keyword); Body is the document as it was given.
+// pseudo-field [IDField] (the id as a keyword); Body is the document as it was given,
+// with any invalid UTF-8 byte replaced by U+FFFD.
 type Doc struct {
 	ID     string
 	Fields map[string]Value
@@ -73,57 +83,124 @@ func ValidateID(id string) error {
 
 // Analyze turns a JSON object into an analyzed document under mapping m.
 //
-// Each top-level member is a field; null is the same as absent. A mapped field is
-// analyzed by its type. An unmapped one follows m.Dynamic: with DynamicTrue its first
-// value types it (a string is text, a number a number, a bool a bool, a non-empty array
-// a keyword_list; null, an empty array and an object add nothing and are not indexed)
-// and the returned MappingUpdate holds the fields to add with [Mapping.Merge]; with
-// DynamicFalse it is kept in Body but not indexed; with DynamicStrict the document is
-// refused. Errors are *ValidationError, naming the field.
+// Each top-level member is a field; a repeated key keeps its last value, as Python's
+// json reads it; null is the same as absent. Every member's name is read as
+// scrape-bot's index reads it, whatever the mapping: a NUL becomes U+FFFD (and of two
+// names that then coincide, the first non-null one in document order wins); a name
+// that no mapping may hold (empty, or longer than MaxFieldChars characters) is kept in
+// Body but never indexed; IDField is refused.
+//
+// A mapped field is analyzed by its type. An unmapped one follows m.Dynamic. With
+// DynamicTrue its first value types it (a string is text, a number a number, a bool a
+// bool, a non-empty array a keyword_list), and the returned MappingUpdate holds the
+// fields to add with [Mapping.Merge]; a value that types nothing (an empty array, an
+// object) is still present, with no typed part, exactly as it is once another document
+// has typed the field. With DynamicFalse it is kept in Body but not indexed. With
+// DynamicStrict the document is refused, naming the smallest unmapped field name.
+// Errors are *ValidationError, naming the field.
+//
+// Body is a copy of body (with invalid UTF-8 replaced): Analyze never keeps the caller's
+// buffer, so a caller may reuse it, and a document sliced out of a large request does
+// not pin the whole request in memory for as long as the document lives.
 func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
-	var update MappingUpdate
 	if err := ValidateID(id); err != nil {
-		return Doc{}, update, err
+		return Doc{}, MappingUpdate{}, err
 	}
-	members, err := decodeObject(body)
+	body = validUTF8Copy(body)
+	object, err := decodeObject(body)
 	if err != nil {
-		return Doc{}, update, err
+		return Doc{}, MappingUpdate{}, err
 	}
 	if m == nil {
 		m = &Mapping{}
 	}
-	doc := Doc{ID: id, Fields: make(map[string]Value, len(members)+1), Body: bytes.Clone(body)}
-	doc.Fields[IDField] = textValue(Keyword, id)
-	for _, name := range slices.Sorted(maps.Keys(members)) {
-		value := members[name]
-		if name == IDField {
-			return Doc{}, MappingUpdate{}, &ValidationError{Field: name, Message: "is reserved for the document id"}
+	a := analyzer{
+		mapping: m,
+		doc:     Doc{ID: id, Fields: make(map[string]Value, len(object)+1), Body: body},
+	}
+	a.doc.Fields[IDField] = textValue(Keyword, id, false)
+	if hasNULName(object) {
+		// Names that coincide once cleaned resolve by document order, which a map loses.
+		members, err := decodeMembers(body)
+		if err != nil {
+			return Doc{}, MappingUpdate{}, err
 		}
-		t, mapped := m.Fields[name]
-		if !mapped {
-			switch m.Dynamic {
-			case DynamicFalse:
-				continue
-			case DynamicStrict:
-				return Doc{}, MappingUpdate{}, &ValidationError{Field: name, Message: `is not in the mapping, and dynamic is "strict"`}
-			default:
-				inferred, ok := infer(value)
-				if !ok {
-					continue
-				}
-				if err := checkFieldName(name); err != nil {
-					return Doc{}, MappingUpdate{}, err
-				}
-				t = inferred
-				update.add(name, t)
+		a.claimed = map[string]bool{IDField: true}
+		for _, mem := range members {
+			if err := a.member(mem.name, mem.value); err != nil {
+				return Doc{}, MappingUpdate{}, err
 			}
 		}
-		if value == nil {
-			continue
+	} else {
+		for name, value := range object {
+			if err := a.member(name, value); err != nil {
+				return Doc{}, MappingUpdate{}, err
+			}
 		}
-		doc.Fields[name] = analyzeValue(t, value)
 	}
-	return doc, update, nil
+	if a.unmapped != "" {
+		return Doc{}, MappingUpdate{}, &ValidationError{Field: a.unmapped, Message: `is not in the mapping, and dynamic is "strict"`}
+	}
+	return a.doc, a.update, nil
+}
+
+// analyzer is one Analyze call's state.
+type analyzer struct {
+	mapping  *Mapping
+	doc      Doc
+	update   MappingUpdate
+	claimed  map[string]bool // cleaned names taken so far, when names hold NULs
+	unmapped string          // the smallest unmapped name, under DynamicStrict
+}
+
+func (a *analyzer) member(name string, value any) error {
+	if name == IDField {
+		return &ValidationError{Field: name, Message: "is reserved for the document id"}
+	}
+	name = analysis.Clean(name)
+	if name == "" || utf8.RuneCountInString(name) > MaxFieldChars {
+		return nil // as scrape-bot's index: no condition can name it
+	}
+	if value == nil {
+		return nil
+	}
+	if a.claimed != nil {
+		if a.claimed[name] {
+			return nil
+		}
+		a.claimed[name] = true
+	}
+	t, mapped := a.mapping.Fields[name]
+	if !mapped {
+		switch a.mapping.Dynamic {
+		case DynamicFalse:
+			return nil
+		case DynamicStrict:
+			if a.unmapped == "" || name < a.unmapped {
+				a.unmapped = name
+			}
+			return nil
+		default:
+			inferred, ok := infer(value)
+			if !ok {
+				a.doc.Fields[name] = Value{Present: true}
+				return nil
+			}
+			t = inferred
+			a.update.add(name, t)
+		}
+	}
+	a.doc.Fields[name] = analyzeValue(t, value)
+	return nil
+}
+
+func hasNULName(object map[string]any) bool {
+	for name := range object {
+		if strings.IndexByte(name, 0) >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // decodeObject decodes body as one JSON object, numbers kept as json.Number.
@@ -137,11 +214,109 @@ func decodeObject(body []byte) (map[string]any, error) {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, &ValidationError{Message: "the document holds more than one JSON value"}
 	}
-	members, ok := decoded.(map[string]any)
+	object, ok := decoded.(map[string]any)
 	if !ok {
 		return nil, &ValidationError{Message: "a document is a JSON object"}
 	}
-	return members, nil
+	return object, nil
+}
+
+// validUTF8Copy returns a copy of body with every byte that is not valid UTF-8 replaced
+// by U+FFFD, one per byte, as encoding/json replaces them inside strings.
+func validUTF8Copy(body []byte) []byte {
+	if utf8.Valid(body) {
+		return bytes.Clone(body)
+	}
+	out := make([]byte, 0, len(body)+len(body)/8)
+	for len(body) > 0 {
+		r, size := utf8.DecodeRune(body)
+		if r == utf8.RuneError && size == 1 {
+			out = utf8.AppendRune(out, utf8.RuneError)
+		} else {
+			out = append(out, body[:size]...)
+		}
+		body = body[size:]
+	}
+	return out
+}
+
+type member struct {
+	name  string
+	value any
+}
+
+// decodeMembers decodes body as one JSON object into its members in document order,
+// numbers kept as json.Number. A repeated key keeps its first position and last value.
+func decodeMembers(body []byte) ([]member, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	invalid := func(err error) error {
+		return &ValidationError{Message: "the document is not valid JSON: " + err.Error()}
+	}
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, invalid(err)
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, &ValidationError{Message: "a document is a JSON object"}
+	}
+	var members []member
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, invalid(err)
+		}
+		name, ok := tok.(string)
+		if !ok {
+			return nil, &ValidationError{Message: "the document is not valid JSON"}
+		}
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return nil, invalid(err)
+		}
+		members = append(members, member{name: name, value: value})
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace
+		return nil, invalid(err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, &ValidationError{Message: "the document holds more than one JSON value"}
+	}
+	return dedupe(members), nil
+}
+
+// dedupe keeps each repeated key at its first position with its last value.
+func dedupe(members []member) []member {
+	const linear = 16 // below this, a scan beats building a map
+	var index map[string]int
+	out := members[:0]
+	for _, mem := range members {
+		at := -1
+		if len(members) > linear {
+			if index == nil {
+				index = make(map[string]int, len(members))
+			}
+			if i, ok := index[mem.name]; ok {
+				at = i
+			}
+		} else {
+			for i := range out {
+				if out[i].name == mem.name {
+					at = i
+					break
+				}
+			}
+		}
+		if at >= 0 {
+			out[at].value = mem.value
+			continue
+		}
+		if index != nil {
+			index[mem.name] = len(out)
+		}
+		out = append(out, mem)
+	}
+	return out
 }
 
 // infer types an unmapped field from its first value; false: the value types nothing.
@@ -163,7 +338,7 @@ func infer(value any) (FieldType, bool) {
 func analyzeValue(t FieldType, value any) Value {
 	switch t {
 	case Keyword, Text:
-		return textValue(t, value)
+		return textValue(t, value, true)
 	case KeywordList:
 		return Value{Present: true, Entries: listEntries(value)}
 	case Number:
@@ -182,14 +357,22 @@ func analyzeValue(t FieldType, value any) Value {
 	return Value{Present: true}
 }
 
-// textValue is a keyword or text field's value: its text, grams and (text only) words.
-func textValue(t FieldType, value any) Value {
+// textValue is a keyword or text field's value: its text, (text only) words, and, when
+// grams is set, its grams up to MaxGramChars.
+func textValue(t FieldType, value any, grams bool) Value {
 	text, ok := analysis.AsText(value)
 	if !ok {
 		return Value{Present: true}
 	}
 	text = analysis.Clean(text)
-	v := Value{Present: true, Text: &text, Grams: analysis.Substrings3(text)}
+	v := Value{Present: true, Text: &text}
+	if grams {
+		if utf8.RuneCountInString(text) > MaxGramChars {
+			v.GramsTruncated = true
+		} else {
+			v.Grams = analysis.Substrings3(text)
+		}
+	}
 	if s, isString := value.(string); isString && t == Text {
 		v.Words = analysis.Words(s) // a NUL is no word character, so Words never holds one
 	}

@@ -118,9 +118,12 @@ func TestAnalyzeDynamic(t *testing.T) {
 			t.Errorf("%s typed %v, want %v", name, update.Fields[name], typ)
 		}
 	}
-	for _, name := range []string{"gone", "empty", "obj"} {
-		if _, ok := doc.Fields[name]; ok {
-			t.Errorf("%s was indexed", name)
+	if _, ok := doc.Fields["gone"]; ok {
+		t.Error("null was indexed")
+	}
+	for _, name := range []string{"empty", "obj"} {
+		if v := doc.Fields[name]; !v.Present || v.Text != nil || v.Entries != nil {
+			t.Errorf("%s: %+v, want present with no typed part", name, v)
 		}
 	}
 	if got := doc.Fields["tags"].Entries; !slices.Equal(got, []string{"a", "b"}) {
@@ -179,8 +182,6 @@ func TestAnalyzeRefuses(t *testing.T) {
 		"not an object":    {"d", `[1, 2]`, ""},
 		"two values":       {"d", `{} {}`, ""},
 		"_id in the body":  {"d", `{"_id": "x"}`, IDField},
-		"empty name":       {"d", `{"": "x"}`, ""},
-		"NUL in a name":    {"d", `{"a\u0000": "x"}`, "a\x00"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

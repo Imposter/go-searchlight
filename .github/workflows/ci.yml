@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: vet and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - name: go vet
+        run: go vet ./...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+
+  test:
+    name: test -race (SQLite, Postgres, MySQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: searchlight
+          POSTGRES_PASSWORD: searchlight
+          POSTGRES_DB: searchlight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U searchlight -d searchlight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: searchlight
+          MYSQL_USER: searchlight
+          MYSQL_PASSWORD: searchlight
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      SEARCHLIGHT_TEST_PG_URL: postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable
+      SEARCHLIGHT_TEST_MYSQL_URL: mysql://searchlight:searchlight@127.0.0.1:3306/searchlight
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: make build
+      - name: test
+        run: make test
+
+  windows:
+    name: build and test (Windows, SQLite)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build ./...
+      - name: test
+        # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
+        run: go test ./...

@@ -1,0 +1,96 @@
+version: "2"
+
+run:
+  tests: true
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - revive
+    - sloglint
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  settings:
+    errcheck:
+      check-type-assertions: true
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # layout is chosen for readability; hot structs are tuned by benchmark
+        - shadow # `err` shadowing is idiomatic
+    gosec:
+      excludes:
+        - G104 # unchecked errors are errcheck's job
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - hugeParam # values are passed by value on purpose (config.Config)
+        - unnamedResult
+        - whyNoLint # nolintlint covers it
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: package-comments
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: var-declaration
+        - name: var-naming
+    sloglint:
+      no-mixed-args: true
+      context: scope # use the *Context methods when a context is in scope
+      static-msg: true
+  exclusions:
+    presets:
+      - std-error-handling
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+          - unparam
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Imposter/go-searchlight

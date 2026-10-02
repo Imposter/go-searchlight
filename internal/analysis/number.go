@@ -69,6 +69,11 @@ func literalNumber(lit string) (float64, bool) {
 		if i, err := strconv.ParseInt(lit, 10, 64); err == nil {
 			return float64(i), true
 		}
+		// JSON forbids leading zeros, so more than 309 digits is at least 1e309, past any
+		// float64; refusing it here also keeps big.Int's superlinear parse off huge input.
+		if len(strings.TrimPrefix(lit, "-")) > maxFloatDigits {
+			return 0, false
+		}
 		n, ok := new(big.Int).SetString(lit, 10)
 		if !ok {
 			return 0, false
@@ -79,7 +84,13 @@ func literalNumber(lit string) (float64, bool) {
 	return f, isFinite(f)
 }
 
+// maxFloatDigits is the most decimal digits an integer below math.MaxFloat64 can have.
+const maxFloatDigits = 309
+
 func bigNumber(n *big.Int) (float64, bool) {
+	if n.BitLen() > 1024 { // at least 2**1024, past any float64
+		return 0, false
+	}
 	f, _ := new(big.Float).SetInt(n).Float64() // exact, then rounded half-to-even
 	return f, isFinite(f)
 }

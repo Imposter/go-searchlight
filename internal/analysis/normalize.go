@@ -14,8 +14,10 @@
 // Python's whitespace set, its \w class, str.casefold and str.lower differ from Go's
 // unicode package and golang.org/x/text/cases (Python 3.13 carries Unicode 15.1, and
 // x/text folds Cherokee capitals to lowercase where CaseFolding.txt does not), so those
-// come from tables.go, generated from the same Python as the fixtures. NFKC is
-// golang.org/x/text/unicode/norm, which the fixtures check code point by code point.
+// come from tables.go, generated from the same Python as the fixtures. [NFKC] is
+// golang.org/x/text/unicode/norm, but for its composition of supplementary-plane
+// characters, which is wrong and is redone from Python's composition pairs. The
+// fixtures check every code point alone and in ten contexts.
 //
 // Strings are UTF-8. An invalid byte reads as U+FFFD, as a Go range loop reads it; JSON
 // decoding already replaces invalid UTF-8 that way, so a document never carries one.

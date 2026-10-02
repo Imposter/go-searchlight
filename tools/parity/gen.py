@@ -2,11 +2,12 @@
 
 Run from the repository root (``make parity``)::
 
-    uv run --project E:/code/scrape_bot python tools/parity/gen.py
+    uv run --project E:/code/scrape_bot --no-sync python tools/parity/gen.py [--ref <commit>]
 
-It exports ``src/`` and ``tests/support/`` of a scrape-bot ref (``SCRAPE_BOT_REF``, default
-``origin/main``) from the scrape-bot repository (``SCRAPE_BOT``, default
-``E:/code/scrape_bot``) into a temporary directory with ``git archive``, imports
+``--no-sync`` uses scrape-bot's virtual environment as it is (no lock or sync of a checkout
+other sessions share). It exports ``src/`` and ``tests/support/`` of a scrape-bot ref
+(``--ref``, default :data:`PINNED_REF`, which the Makefile pins too) from the scrape-bot
+repository (``--repo``) into a temporary directory with ``git archive``, imports
 ``scrape_bot.conditions``, ``scrape_bot.search_index`` and ``tests.support.search_oracle``
 from there (never from the checkout, whose branch may be anything), and writes:
 
@@ -19,21 +20,27 @@ from there (never from the checkout, whose branch may be anything), and writes:
   Python values JSON cannot spell (NaN, infinities);
 * ``testdata/parity/similarity.json``: pg_trgm trigrams and ``trigram_similarity``, plus
   every code point's ``lower``;
+* ``testdata/parity/codepoints.json``: SHA-256 hashes, per block of 4096 code points, of
+  ``normalize``, ``words_of``, ``lower``, the trigrams and ``list_entries`` of every code
+  point in ten contexts (alone, between letters, beside a sigma, before a combining mark,
+  between Hangul jamo, ...), so every code point is checked in context, not only alone;
 * ``testdata/parity/match.json``: random documents and queries over every op of the
   Searchlight spec section 4, with the oracle's verdicts and scrape-bot's index documents;
 * ``internal/analysis/tables.go``: the Unicode tables the Go analysis reads (Python's
-  whitespace, ``\\w``, ``casefold``, ``lower`` and the Final_Sigma context classes), so Go
-  folds exactly as this Python does, whatever Unicode version Go's own tables carry.
+  whitespace, ``\\w``, ``casefold``, ``lower``, the Final_Sigma context classes and the
+  canonical composition pairs), so Go folds exactly as this Python does, whatever Unicode
+  version Go's own tables carry.
 
 Everything is seeded, so a run over the same scrape-bot commit writes the same bytes.
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import io
 import json
 import math
-import os
 import random
 import re
 import struct
@@ -51,8 +58,8 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "testdata" / "parity"
 TABLES = ROOT / "internal" / "analysis" / "tables.go"
-SCRAPE_BOT = Path(os.environ.get("SCRAPE_BOT", "E:/code/scrape_bot"))
-REF = os.environ.get("SCRAPE_BOT_REF", "origin/main")
+PINNED_REF = "325c3345ec8f8f892e895ea9edc0e0f81d0a7fcb"
+"""The scrape-bot commit the committed fixtures pin (the Makefile's SCRAPE_BOT_REF)."""
 SEED = 20261002
 MAX_RUNE = 0x110000
 
@@ -68,16 +75,16 @@ def _code_points() -> Iterator[int]:
 # --------------------------------------------------------------------------- import
 
 
-def _export(tree: Path) -> str:
+def _export(repo: Path, ref: str, tree: Path) -> str:
     """Export the scrape-bot ref's sources into ``tree``; returns the commit."""
     commit = subprocess.run(
-        ["git", "-C", str(SCRAPE_BOT), "rev-parse", f"{REF}^{{commit}}"],
+        ["git", "-C", str(repo), "rev-parse", f"{ref}^{{commit}}"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
     archive = subprocess.run(
-        ["git", "-C", str(SCRAPE_BOT), "archive", "--format=tar", commit, "src", "tests/support"],
+        ["git", "-C", str(repo), "archive", "--format=tar", commit, "src", "tests/support"],
         check=True,
         capture_output=True,
     ).stdout
@@ -1037,6 +1044,77 @@ def _go_map(name: str, doc: str, mapping: dict[int, str]) -> str:
     return "\n".join(lines)
 
 
+def _compositions() -> dict[tuple[int, int], int]:
+    """Canonical composition's pairs: each primary composite by its two-code-point
+    canonical decomposition. A composition exclusion (or a non-starter decomposition) is
+    one NFC does not recompose, so NFC itself says which pairs compose. Hangul syllables
+    have no table decomposition; they compose algorithmically."""
+    pairs: dict[tuple[int, int], int] = {}
+    for code in _code_points():
+        decomposition = unicodedata.decomposition(chr(code))
+        if not decomposition or decomposition.startswith("<"):
+            continue
+        parts = [int(part, 16) for part in decomposition.split()]
+        if len(parts) == 2 and unicodedata.normalize("NFC", chr(parts[0]) + chr(parts[1])) == chr(code):
+            pairs[parts[0], parts[1]] = code
+    return pairs
+
+
+def _go_pairs(name: str, doc: str, pairs: dict[tuple[int, int], int]) -> str:
+    lines = [f"// {doc}", f"var {name} = map[uint64]rune{{"]
+    lines.extend(
+        f"\t0x{first:x}<<21 | 0x{second:x}: 0x{code:x},"
+        for (first, second), code in sorted(pairs.items())
+    )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+CONTEXTS = [
+    "{}",
+    "a{}b",
+    "a\u03a3{}b",
+    " {}\u03a3",
+    "{}\u0301",
+    "e{}",
+    "{}{}",
+    "A{} \u00df",
+    "\u1100{}\u1161",
+    "x{}\u03a3 y",
+]
+"""Where every code point is tried: ``{}`` is the code point."""
+BLOCK = 4096
+
+
+def _codepoints_fixture(conditions: Any) -> dict[str, Any]:
+    """Per context and per block of :data:`BLOCK` code points, the SHA-256 of every code
+    point's line in that context: normalize, words_of, lower, sorted trigrams and
+    list_entries, joined by U+0001 (trigrams and entries by U+0003) and ended by U+0002,
+    UTF-8; surrogates skipped. ``hashes[c][b]`` is context ``c``'s, block ``b``'s."""
+    hashes: list[list[str]] = [[] for _ in CONTEXTS]
+    for start in range(0, MAX_RUNE, BLOCK):
+        digests = [hashlib.sha256() for _ in CONTEXTS]
+        for code in range(start, start + BLOCK):
+            if _is_surrogate(code):
+                continue
+            char = chr(code)
+            for context, digest in zip(CONTEXTS, digests, strict=True):
+                text = context.replace("{}", char)
+                line = "\x01".join(
+                    [
+                        conditions.normalize(text),
+                        conditions.words_of(text),
+                        text.lower(),
+                        "\x03".join(sorted(conditions._trigrams(text))),
+                        "\x03".join(conditions.list_entries(text)),
+                    ]
+                )
+                digest.update((line + "\x02").encode("utf-8"))
+        for column, digest in zip(hashes, digests, strict=True):
+            column.append(digest.hexdigest())
+    return {"contexts": CONTEXTS, "block": BLOCK, "hashes": hashes}
+
+
 def _sigma(text: str, index: int) -> str:
     return text.lower()[index]
 
@@ -1076,6 +1154,11 @@ def _tables(commit: str) -> str:
         ),
         _go_map("foldMap", "foldMap is str.casefold() of every non-ASCII code point it changes.", fold),
         _go_map("lowerMap", "lowerMap is str.lower() of every non-ASCII code point it changes (U+03A3 out of context).", lower),
+        _go_pairs(
+            "compositions",
+            "compositions is canonical composition's pairs (first<<21 | second), Hangul aside.",
+            _compositions(),
+        ),
     ]
     header = (
         "// Code generated by tools/parity/gen.py from scrape-bot "
@@ -1100,9 +1183,13 @@ def _write(name: str, meta: dict[str, Any], payload: Any) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", type=Path, default=Path("E:/code/scrape_bot"), help="the scrape-bot repository")
+    parser.add_argument("--ref", default=PINNED_REF, help="the scrape-bot commit to read (default: the pinned one)")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="searchlight-parity-") as temp:
         tree = Path(temp)
-        commit = _export(tree)
+        commit = _export(args.repo, args.ref, tree)
         sys.path[:0] = [str(tree / "src"), str(tree)]
         from scrape_bot import conditions, search_index, search_query  # noqa: PLC0415
         from tests.support import search_oracle  # noqa: PLC0415
@@ -1114,7 +1201,7 @@ def main() -> None:
 
         meta = {
             "tool": "tools/parity/gen.py",
-            "scrape_bot_ref": REF,
+            "scrape_bot_ref": args.ref,
             "scrape_bot_commit": commit,
             "python": sys.version.split()[0],
             "unicode": unicodedata.unidata_version,
@@ -1125,6 +1212,7 @@ def main() -> None:
         _write("entries.json", meta, _entries_fixture(conditions, search_index, random.Random(SEED + 2)))
         _write("numbers.json", meta, _numbers_fixture(conditions, random.Random(SEED + 3)))
         _write("similarity.json", meta, _similarity_fixture(conditions, random.Random(SEED + 4)))
+        _write("codepoints.json", meta, _codepoints_fixture(conditions))
         _write(
             "match.json",
             meta,

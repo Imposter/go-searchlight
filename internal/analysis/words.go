@@ -4,8 +4,6 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"golang.org/x/text/unicode/norm"
 )
 
 // NoWords is what [Words] returns for text that holds no word.
@@ -28,7 +26,7 @@ func IsWord(r rune) bool {
 // The padding lets a phrase match whole words only: Words(phrase) is a substring of
 // Words(text) exactly when the phrase's words appear in the text consecutively.
 func Words(s string) string {
-	folded := Normalize(norm.NFKC.String(s))
+	folded := Normalize(NFKC(s))
 	var b strings.Builder
 	b.Grow(len(folded) + 2)
 	b.WriteByte(' ')

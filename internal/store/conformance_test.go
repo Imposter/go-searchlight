@@ -762,52 +762,58 @@ func TestRegistryNodes(t *testing.T) {
 func TestRegistryLeases(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
-		reg := h.open(t).Registry()
+		st := h.open(t)
+		mustCreateIndex(t, st, "idx")
+		mustCreateIndex(t, st, "other")
+		reg := st.Registry()
 		a := ShardID{Index: "idx", Shard: 0}
 		const long = time.Minute
 
 		c, ok, err := reg.ClaimCopy(ctx, a, "n1", 1, long)
-		if err != nil || !ok || c.Slot != 0 || c.State != CopyRecovering || c.NodeID != "n1" || c.Expired() {
+		if err != nil || !ok || c.Slot != 0 || c.State != CopyRecovering || c.NodeID != "n1" || c.Expired() || c.Epoch <= 0 {
 			t.Fatalf("first claim: %+v %v %v", c, ok, err)
 		}
 		if _, ok, err := reg.ClaimCopy(ctx, a, "n2", 1, long); err != nil || ok {
 			t.Fatalf("claim over target: %v %v", ok, err)
 		}
 		c2, ok, err := reg.ClaimCopy(ctx, a, "n2", 2, long)
-		if err != nil || !ok || c2.Slot != 1 {
+		if err != nil || !ok || c2.Slot != 1 || c2.Epoch == c.Epoch {
 			t.Fatalf("claim with target 2: %+v %v %v", c2, ok, err)
 		}
-		if err := reg.SetCopyState(ctx, a, "n1", CopyServing); err != nil {
+		if err := reg.SetCopyState(ctx, c, CopyServing); err != nil {
 			t.Fatal(err)
 		}
-		if err := reg.SetCopyState(ctx, a, "n1", CopyServing); err != nil {
+		if err := reg.SetCopyState(ctx, c, CopyServing); err != nil {
 			t.Fatalf("setting the same state again: %v", err)
 		}
-		if err := reg.ReportApplied(ctx, a, "n1", 42); err != nil {
+		if err := reg.ReportApplied(ctx, c, 42); err != nil {
 			t.Fatal(err)
 		}
-		// Re-claiming keeps the slot, state and progress.
-		c, ok, err = reg.ClaimCopy(ctx, a, "n1", 3, long)
-		if err != nil || !ok || c.Slot != 0 || c.State != CopyServing || c.AppliedSeq != 42 {
-			t.Fatalf("re-claim: %+v %v %v", c, ok, err)
+		// Re-claiming keeps the slot, state, progress and epoch.
+		again, ok, err := reg.ClaimCopy(ctx, a, "n1", 3, long)
+		if err != nil || !ok || again.Slot != 0 || again.State != CopyServing || again.AppliedSeq != 42 || again.Epoch != c.Epoch {
+			t.Fatalf("re-claim: %+v %v %v", again, ok, err)
 		}
-		if err := reg.SetCopyState(ctx, a, "n1", "bogus"); !errors.Is(err, ErrInvalid) {
+		if err := reg.SetCopyState(ctx, c, "bogus"); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("bad state: %v", err)
 		}
-		if err := reg.SetCopyState(ctx, a, "n3", CopyServing); !errors.Is(err, ErrLeaseLost) {
+		other := c
+		other.NodeID = "n3"
+		if err := reg.SetCopyState(ctx, other, CopyServing); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("state for a node without a copy: %v", err)
 		}
 
 		// Expiry and steal.
 		b := ShardID{Index: "idx", Shard: 1}
 		const short = 300 * time.Millisecond
-		if _, ok, err := reg.ClaimCopy(ctx, b, "n1", 1, short); err != nil || !ok {
+		old, ok, err := reg.ClaimCopy(ctx, b, "n1", 1, short)
+		if err != nil || !ok {
 			t.Fatalf("short claim: %v %v", ok, err)
 		}
-		if err := reg.SetCopyState(ctx, b, "n1", CopyServing); err != nil {
+		if err := reg.SetCopyState(ctx, old, CopyServing); err != nil {
 			t.Fatal(err)
 		}
-		if err := reg.ReportApplied(ctx, b, "n1", 7); err != nil {
+		if err := reg.ReportApplied(ctx, old, 7); err != nil {
 			t.Fatal(err)
 		}
 		if _, ok, _ := reg.ClaimCopy(ctx, b, "n2", 1, long); ok {
@@ -827,14 +833,15 @@ func TestRegistryLeases(t *testing.T) {
 		if expired == nil || !expired.Expired() || expired.NodeID != "n1" {
 			t.Fatalf("expired copy %+v", expired)
 		}
-		if err := reg.SetCopyState(ctx, b, "n1", CopyRetiring); !errors.Is(err, ErrLeaseLost) {
+		if err := reg.SetCopyState(ctx, old, CopyRetiring); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("state on an expired lease: %v", err)
 		}
 		stolen, ok, err := reg.ClaimCopy(ctx, b, "n2", 1, long)
-		if err != nil || !ok || stolen.Slot != 0 || stolen.NodeID != "n2" || stolen.State != CopyRecovering || stolen.AppliedSeq != 0 {
+		if err != nil || !ok || stolen.Slot != 0 || stolen.NodeID != "n2" || stolen.State != CopyRecovering || stolen.AppliedSeq != 0 ||
+			stolen.Epoch <= old.Epoch {
 			t.Fatalf("steal: %+v %v %v", stolen, ok, err)
 		}
-		if err := reg.ReportApplied(ctx, b, "n1", 8); !errors.Is(err, ErrLeaseLost) {
+		if err := reg.ReportApplied(ctx, old, 8); !errors.Is(err, ErrLeaseLost) {
 			t.Fatalf("progress from the old owner: %v", err)
 		}
 
@@ -852,9 +859,11 @@ func TestRegistryLeases(t *testing.T) {
 		if len(copies) != 1 || copies[0].Expired() || copies[0].LeaseLeft < long/2 {
 			t.Fatalf("renewed lease %+v", copies)
 		}
-		// An expired, unstolen lease is not renewed but can be re-claimed.
+		// An expired, unstolen lease is not renewed but can be re-claimed,
+		// keeping its epoch: it is the same incarnation.
 		d := ShardID{Index: "other", Shard: 1}
-		if _, ok, _ := reg.ClaimCopy(ctx, d, "n1", 1, short); !ok {
+		dc, ok, _ := reg.ClaimCopy(ctx, d, "n1", 1, short)
+		if !ok {
 			t.Fatal("claim d")
 		}
 		time.Sleep(short + 200*time.Millisecond)
@@ -864,13 +873,16 @@ func TestRegistryLeases(t *testing.T) {
 				t.Fatal("renewed an expired lease")
 			}
 		}
-		if c, ok, err := reg.ClaimCopy(ctx, d, "n1", 1, long); err != nil || !ok || c.Expired() {
+		if c, ok, err := reg.ClaimCopy(ctx, d, "n1", 1, long); err != nil || !ok || c.Expired() || c.Epoch != dc.Epoch {
 			t.Fatalf("re-claim an expired lease: %+v %v %v", c, ok, err)
 		}
 
 		// Release frees the slot.
-		if err := reg.ReleaseCopy(ctx, a, "n1"); err != nil {
+		if err := reg.ReleaseCopy(ctx, c); err != nil {
 			t.Fatal(err)
+		}
+		if err := reg.ReleaseCopy(ctx, c); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("releasing twice: %v", err)
 		}
 		if _, ok, err := reg.ClaimCopy(ctx, a, "n3", 2, long); err != nil || !ok {
 			t.Fatalf("claim a released slot: %v %v", ok, err)
@@ -882,11 +894,68 @@ func TestRegistryLeases(t *testing.T) {
 	})
 }
 
+// TestRegistryFencing has a node lose its slot and then reclaim the same
+// slot: the old incarnation, still holding its Copy, must not touch the new
+// row even though node and slot match.
+func TestRegistryFencing(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "fence")
+		reg := st.Registry()
+		shard := ShardID{Index: "fence"}
+		const short = 200 * time.Millisecond
+
+		first, ok, err := reg.ClaimCopy(ctx, shard, "n1", 1, short)
+		if err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		time.Sleep(short + 150*time.Millisecond)
+		// n2 steals the slot, then gives it up; n1 claims it afresh.
+		thief, ok, err := reg.ClaimCopy(ctx, shard, "n2", 1, time.Minute)
+		if err != nil || !ok || thief.Slot != first.Slot {
+			t.Fatal(thief, ok, err)
+		}
+		if err := reg.ReleaseCopy(ctx, thief); err != nil {
+			t.Fatal(err)
+		}
+		second, ok, err := reg.ClaimCopy(ctx, shard, "n1", 1, time.Minute)
+		if err != nil || !ok || second.Slot != first.Slot || second.NodeID != first.NodeID {
+			t.Fatal(second, ok, err)
+		}
+		if second.Epoch == first.Epoch || second.Epoch == thief.Epoch {
+			t.Fatalf("epochs: first %d, thief %d, second %d", first.Epoch, thief.Epoch, second.Epoch)
+		}
+		if err := reg.ReportApplied(ctx, second, 10); err != nil {
+			t.Fatal(err)
+		}
+		// The stale incarnation is fenced off from every update.
+		if err := reg.SetCopyState(ctx, first, CopyServing); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("stale SetCopyState: %v", err)
+		}
+		if err := reg.ReportApplied(ctx, first, 99); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("stale ReportApplied: %v", err)
+		}
+		if err := reg.ReleaseCopy(ctx, first); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("stale ReleaseCopy: %v", err)
+		}
+		copies, err := reg.Copies(ctx, "fence")
+		if err != nil || len(copies) != 1 || copies[0].Epoch != second.Epoch || copies[0].AppliedSeq != 10 || copies[0].State != CopyRecovering {
+			t.Fatalf("the new incarnation was touched: %+v %v", copies, err)
+		}
+		// Epochs never consume changelog sequence numbers.
+		if got := counterValue(t, st); got != 0 {
+			t.Fatalf("claims moved the seq counter to %d", got)
+		}
+	})
+}
+
 // TestRegistryConcurrentClaims has eight nodes race for three copies.
 func TestRegistryConcurrentClaims(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		shard := ShardID{Index: "race", Shard: 0}
+		mustCreateIndex(t, h.open(t), "race")
 		var wins atomic.Int32
 		var wg sync.WaitGroup
 		for n := range 8 {

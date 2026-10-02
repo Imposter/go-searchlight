@@ -77,13 +77,13 @@ func (g *registry) Nodes(ctx context.Context) (out []Node, err error) {
 	return out, rows.Err()
 }
 
-const copyCols = "index_name, shard, slot, node_id, state, applied_seq, lease_until"
+const copyCols = "index_name, shard, slot, node_id, state, applied_seq, epoch, lease_until"
 
 func (g *registry) scanCopy(row interface{ Scan(...any) error }) (Copy, error) {
 	var c Copy
 	var state string
 	var until, now int64
-	err := row.Scan(&c.Shard.Index, &c.Shard.Shard, &c.Slot, &c.NodeID, &state, &c.AppliedSeq, &until, &now)
+	err := row.Scan(&c.Shard.Index, &c.Shard.Shard, &c.Slot, &c.NodeID, &state, &c.AppliedSeq, &c.Epoch, &until, &now)
 	c.State = CopyState(state)
 	c.LeaseUntil = millis(until)
 	c.LeaseLeft = time.Duration(until-now) * time.Millisecond
@@ -169,9 +169,15 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		}
 	}
 
+	// A fresh fencing token for a new owner; a node renewing its own slot
+	// keeps the epoch it has.
+	epoch, err := g.nextEpoch(ctx, tx)
+	if err != nil {
+		return Copy{}, false, err
+	}
 	ownQ := s.bind("SELECT " + copyCols + ", " + s.d.Now + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? AND slot = ?")
 	for _, slot := range candidates {
-		q, args := s.d.Claim(dialect.ClaimArgs{Index: shard.Index, Shard: shard.Shard, Slot: slot, Node: nodeID, TTLms: ttlMs})
+		q, args := s.d.Claim(dialect.ClaimArgs{Index: shard.Index, Shard: shard.Shard, Slot: slot, Node: nodeID, TTLms: ttlMs, Epoch: epoch})
 		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return Copy{}, false, fmt.Errorf("claim slot %d: %w", slot, err)
 		}
@@ -185,6 +191,21 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		}
 	}
 	return Copy{}, false, tx.Commit()
+}
+
+// nextEpoch takes the next value of the epoch counter (sl_counter row 2),
+// which is separate from the changelog sequence so claims never leave gaps
+// in it.
+func (g *registry) nextEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
+	s := g.s
+	if _, err := tx.ExecContext(ctx, "UPDATE sl_counter SET value = value + 1 WHERE id = 2"); err != nil {
+		return 0, fmt.Errorf("next epoch: %w", err)
+	}
+	var epoch int64
+	if err := tx.QueryRowContext(ctx, s.q.readEpoch).Scan(&epoch); err != nil {
+		return 0, fmt.Errorf("next epoch: %w", err)
+	}
+	return epoch, nil
 }
 
 func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) (out []ShardID, err error) {
@@ -227,17 +248,24 @@ func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Dura
 	return out, tx.Commit()
 }
 
-func (g *registry) ReleaseCopy(ctx context.Context, shard ShardID, nodeID string) (err error) {
-	s := g.s
-	ctx, end := s.start(ctx, "release_copy", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard),
-		attribute.String("node_id", nodeID))
-	defer end(&err)
-	if err := validShard(shard); err != nil {
-		return err
+// fence is the WHERE clause that names one incarnation of a copy.
+const fence = " WHERE index_name = ? AND shard = ? AND slot = ? AND node_id = ? AND epoch = ?"
+
+func fenceArgs(c *Copy) []any { return []any{c.Shard.Index, c.Shard.Shard, c.Slot, c.NodeID, c.Epoch} }
+
+func copyAttrs(c *Copy) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("index", c.Shard.Index), attribute.Int("shard", c.Shard.Shard),
+		attribute.String("node_id", c.NodeID), attribute.Int64("epoch", c.Epoch),
 	}
-	_, err = s.w.ExecContext(ctx, s.bind("DELETE FROM sl_shard_copies WHERE index_name = ? AND shard = ? AND node_id = ?"),
-		shard.Index, shard.Shard, nodeID)
-	return err
+}
+
+func (g *registry) ReleaseCopy(ctx context.Context, c Copy) (err error) {
+	s := g.s
+	ctx, end := s.start(ctx, "release_copy", copyAttrs(&c)...)
+	defer end(&err)
+	res, err := s.w.ExecContext(ctx, s.bind("DELETE FROM sl_shard_copies"+fence), fenceArgs(&c)...)
+	return leaseResult(res, err, &c)
 }
 
 func (g *registry) Copies(ctx context.Context, index string) (out []Copy, err error) {
@@ -265,32 +293,30 @@ func (g *registry) Copies(ctx context.Context, index string) (out []Copy, err er
 	return out, rows.Err()
 }
 
-func (g *registry) SetCopyState(ctx context.Context, shard ShardID, nodeID string, state CopyState) (err error) {
+func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (err error) {
 	s := g.s
-	ctx, end := s.start(ctx, "set_copy_state", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard),
-		attribute.String("node_id", nodeID), attribute.String("state", string(state)))
+	ctx, end := s.start(ctx, "set_copy_state", append(copyAttrs(&c), attribute.String("state", string(state)))...)
 	defer end(&err)
 	if !state.valid() {
 		return invalidf("copy state %q", state)
 	}
-	q := s.bind("UPDATE sl_shard_copies SET state = ? WHERE index_name = ? AND shard = ? AND node_id = ? AND lease_until >= " + s.d.Now)
-	res, err := s.w.ExecContext(ctx, q, string(state), shard.Index, shard.Shard, nodeID)
-	return leaseResult(res, err, shard, nodeID)
+	q := s.bind("UPDATE sl_shard_copies SET state = ?" + fence + " AND lease_until >= " + s.d.Now)
+	res, err := s.w.ExecContext(ctx, q, append([]any{string(state)}, fenceArgs(&c)...)...)
+	return leaseResult(res, err, &c)
 }
 
-func (g *registry) ReportApplied(ctx context.Context, shard ShardID, nodeID string, seq int64) (err error) {
+func (g *registry) ReportApplied(ctx context.Context, c Copy, seq int64) (err error) {
 	s := g.s
-	ctx, end := s.start(ctx, "report_applied", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard),
-		attribute.String("node_id", nodeID))
+	ctx, end := s.start(ctx, "report_applied", copyAttrs(&c)...)
 	defer end(&err)
-	q := s.bind("UPDATE sl_shard_copies SET applied_seq = ? WHERE index_name = ? AND shard = ? AND node_id = ?")
-	res, err := s.w.ExecContext(ctx, q, seq, shard.Index, shard.Shard, nodeID)
-	return leaseResult(res, err, shard, nodeID)
+	q := s.bind("UPDATE sl_shard_copies SET applied_seq = ?" + fence)
+	res, err := s.w.ExecContext(ctx, q, append([]any{seq}, fenceArgs(&c)...)...)
+	return leaseResult(res, err, &c)
 }
 
 // leaseResult turns an update that matched no row into ErrLeaseLost. Every
 // dialect reports matched rows (MySQL through CLIENT_FOUND_ROWS).
-func leaseResult(res sql.Result, err error, shard ShardID, nodeID string) error {
+func leaseResult(res sql.Result, err error, c *Copy) error {
 	if err != nil {
 		return err
 	}
@@ -299,7 +325,7 @@ func leaseResult(res sql.Result, err error, shard ShardID, nodeID string) error 
 		return err
 	}
 	if n == 0 {
-		return fmt.Errorf("%s on node %q: %w", shard, nodeID, ErrLeaseLost)
+		return fmt.Errorf("%s slot %d on node %q at epoch %d: %w", c.Shard, c.Slot, c.NodeID, c.Epoch, ErrLeaseLost)
 	}
 	return nil
 }

@@ -43,6 +43,9 @@ type ClaimArgs struct {
 	Slot  int
 	Node  string
 	TTLms int64
+	// Epoch is the fencing token a new owner gets; a node renewing its own
+	// copy keeps the epoch it has.
+	Epoch int64
 }
 
 // Dialect is one SQL engine.
@@ -93,7 +96,7 @@ type Dialect struct {
 	// Claim returns the conditional insert-or-steal of one shard-copy slot:
 	// insert the slot for Node, or take it over when its lease has expired, or
 	// renew it when Node already holds it; otherwise leave it unchanged. A new
-	// owner starts in state "recovering" with applied_seq 0.
+	// owner starts in state "recovering" with applied_seq 0 and Epoch.
 	Claim func(a ClaimArgs) (query string, args []any)
 
 	// ApplyTx and SnapshotTx are the transaction options for Apply (the

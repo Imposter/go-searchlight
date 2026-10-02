@@ -108,17 +108,18 @@ func onConflict(keys, update []string) string {
 	return b.String()
 }
 
-var claimQuery = strings.ReplaceAll(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until)
-VALUES ($1, $2, $3, $4, 'recovering', 0, NOW + $5)
+var claimQuery = strings.ReplaceAll(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
+VALUES ($1, $2, $3, $4, 'recovering', 0, NOW + $5, $6)
 ON CONFLICT (index_name, shard, slot) DO UPDATE SET
 	state = CASE WHEN sl_shard_copies.node_id = EXCLUDED.node_id THEN sl_shard_copies.state ELSE EXCLUDED.state END,
 	applied_seq = CASE WHEN sl_shard_copies.node_id = EXCLUDED.node_id THEN sl_shard_copies.applied_seq ELSE 0 END,
+	epoch = CASE WHEN sl_shard_copies.node_id = EXCLUDED.node_id THEN sl_shard_copies.epoch ELSE EXCLUDED.epoch END,
 	node_id = EXCLUDED.node_id,
 	lease_until = EXCLUDED.lease_until
 WHERE sl_shard_copies.node_id = EXCLUDED.node_id OR sl_shard_copies.lease_until < NOW`, "NOW", now)
 
 func claim(a dialect.ClaimArgs) (string, []any) {
-	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms}
+	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }
 
 // listen runs LISTEN on conn and calls fn for each notification until ctx

@@ -56,6 +56,7 @@ type sqlStore struct {
 // queries are the fixed statements, bound to the dialect's placeholders.
 type queries struct {
 	lockCounter, updateCounter, readCounter string
+	readEpoch                               string
 	changesAfter, horizon                   string
 	docSeq, querySeq                        string
 	scanDocs, scanQueries                   string
@@ -80,6 +81,7 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		lockCounter:   s.bind("SELECT value, " + d.Now + " FROM sl_counter WHERE id = 1" + d.ForUpdate),
 		updateCounter: s.bind("UPDATE sl_counter SET value = ? WHERE id = 1"),
 		readCounter:   s.bind("SELECT value FROM sl_counter WHERE id = 1"),
+		readEpoch:     "SELECT value FROM sl_counter WHERE id = 2",
 		changesAfter: s.bind(`SELECT seq, kind, id, payload, at FROM sl_changes
 WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?`),
 		horizon:     s.bind("SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?"),

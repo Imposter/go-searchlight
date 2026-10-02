@@ -105,17 +105,19 @@ type RegistryStore interface {
 	// renewed; the node must claim it again, which succeeds unless the slot
 	// was taken meanwhile.
 	RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) ([]ShardID, error)
-	// ReleaseCopy gives up nodeID's copy of shard.
-	ReleaseCopy(ctx context.Context, shard ShardID, nodeID string) error
+	// ReleaseCopy gives up a copy. It returns ErrLeaseLost if the slot no
+	// longer holds this incarnation (same node and epoch).
+	ReleaseCopy(ctx context.Context, c Copy) error
 	// Copies lists the copies of index's shards, or of every index when
 	// index is "", expired leases included.
 	Copies(ctx context.Context, index string) ([]Copy, error)
-	// SetCopyState changes the state of nodeID's copy. It returns
-	// ErrLeaseLost unless nodeID holds an unexpired lease on it.
-	SetCopyState(ctx context.Context, shard ShardID, nodeID string, state CopyState) error
-	// ReportApplied records the seq nodeID's copy has applied. It returns
-	// ErrLeaseLost unless nodeID still holds the copy.
-	ReportApplied(ctx context.Context, shard ShardID, nodeID string, seq int64) error
+	// SetCopyState changes a copy's state. It returns ErrLeaseLost unless
+	// the slot still holds this incarnation (same node and epoch) under an
+	// unexpired lease.
+	SetCopyState(ctx context.Context, c Copy, state CopyState) error
+	// ReportApplied records the seq a copy has applied. It returns
+	// ErrLeaseLost unless the slot still holds this incarnation.
+	ReportApplied(ctx context.Context, c Copy, seq int64) error
 }
 
 // BlobStore keeps named blobs (segment bundles) in sl_blobs, split into

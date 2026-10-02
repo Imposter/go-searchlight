@@ -138,16 +138,17 @@ func onDuplicateKey(_, update []string) string {
 }
 
 // MySQL evaluates ON DUPLICATE KEY UPDATE assignments left to right, each
-// seeing the ones before, so node_id changes after state and applied_seq
-// have read the old owner, and lease_until last.
-var claimQuery = strings.ReplaceAll(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until)
-VALUES (?, ?, ?, ?, 'recovering', 0, NOW + ?)
+// seeing the ones before, so node_id changes after state, applied_seq and
+// epoch have read the old owner, and lease_until last.
+var claimQuery = strings.ReplaceAll(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
+VALUES (?, ?, ?, ?, 'recovering', 0, NOW + ?, ?)
 ON DUPLICATE KEY UPDATE
 	state = IF(node_id = VALUES(node_id), state, IF(lease_until < NOW, VALUES(state), state)),
 	applied_seq = IF(node_id = VALUES(node_id), applied_seq, IF(lease_until < NOW, 0, applied_seq)),
+	epoch = IF(node_id = VALUES(node_id), epoch, IF(lease_until < NOW, VALUES(epoch), epoch)),
 	node_id = IF(lease_until < NOW, VALUES(node_id), node_id),
 	lease_until = IF(node_id = VALUES(node_id), VALUES(lease_until), lease_until)`, "NOW", now)
 
 func claim(a dialect.ClaimArgs) (string, []any) {
-	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms}
+	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }

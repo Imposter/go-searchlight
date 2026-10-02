@@ -180,6 +180,10 @@ type Copy struct {
 	NodeID     string
 	State      CopyState
 	AppliedSeq int64
+	// Epoch is the copy's fencing token: it changes whenever the slot gets a
+	// new owner and stays while the owner renews. Updates by the copy name
+	// it, so a stale incarnation can never touch its successor's row.
+	Epoch      int64
 	LeaseUntil time.Time
 	// LeaseLeft is the lease's remaining time by the database clock;
 	// zero or negative means it has expired and the slot may be taken.

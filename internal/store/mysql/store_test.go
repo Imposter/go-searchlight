@@ -81,8 +81,9 @@ func TestClaimAssignmentOrder(t *testing.T) {
 	// node_id must be assigned after state and applied_seq, and lease_until
 	// last, because MySQL evaluates the assignments in order.
 	iState, iApplied := strings.Index(q, "state = IF"), strings.Index(q, "applied_seq = IF")
+	iEpoch := strings.Index(q, "epoch = IF")
 	iNode, iLease := strings.Index(q, "node_id = IF"), strings.Index(q, "lease_until = IF")
-	if iState < 0 || iState > iApplied || iApplied > iNode || iNode > iLease {
+	if iState < 0 || iState > iApplied || iApplied > iEpoch || iEpoch > iNode || iNode > iLease {
 		t.Fatalf("assignment order wrong:\n%s", q)
 	}
 	if strings.Count(q, "?") != len(args) {

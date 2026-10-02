@@ -153,11 +153,12 @@ func onConflict(keys, update []string) string {
 	return b.String()
 }
 
-const claimSQL = `INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until)
-VALUES (?1, ?2, ?3, ?4, 'recovering', 0, (NOW) + ?5)
+const claimSQL = `INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
+VALUES (?1, ?2, ?3, ?4, 'recovering', 0, (NOW) + ?5, ?6)
 ON CONFLICT (index_name, shard, slot) DO UPDATE SET
 	state = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.state ELSE excluded.state END,
 	applied_seq = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.applied_seq ELSE 0 END,
+	epoch = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.epoch ELSE excluded.epoch END,
 	node_id = excluded.node_id,
 	lease_until = excluded.lease_until
 WHERE sl_shard_copies.node_id = excluded.node_id OR sl_shard_copies.lease_until < (NOW)`
@@ -165,5 +166,5 @@ WHERE sl_shard_copies.node_id = excluded.node_id OR sl_shard_copies.lease_until 
 var claimQuery = strings.ReplaceAll(claimSQL, "NOW", "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)")
 
 func claim(a dialect.ClaimArgs) (string, []any) {
-	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms}
+	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }

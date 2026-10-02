@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS sl_counter (
 	value BIGINT NOT NULL
 );
 
+-- Row 1 is the changelog sequence; row 2 issues shard-copy epochs (fencing
+-- tokens), so claims never consume sequence numbers.
 INSERT INTO sl_counter (id, value) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO sl_counter (id, value) VALUES (2, 0) ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS sl_pruned (
 	index_name TEXT NOT NULL,
@@ -71,6 +75,7 @@ CREATE TABLE IF NOT EXISTS sl_shard_copies (
 	state TEXT NOT NULL,
 	applied_seq BIGINT NOT NULL,
 	lease_until BIGINT NOT NULL,
+	epoch BIGINT NOT NULL,
 	PRIMARY KEY (index_name, shard, slot)
 );
 

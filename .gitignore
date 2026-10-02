@@ -8,3 +8,4 @@ coverage.*
 /data/
 go.work
 go.work.sum
+.pgtmp/

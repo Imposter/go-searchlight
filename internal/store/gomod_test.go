@@ -14,7 +14,7 @@ func TestGoDirective(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := regexp.MustCompile(`(?m)^go (\S+)$`).FindSubmatch(b)
-	if m == nil || string(m[1]) != "1.25.0" {
+	if len(m) < 2 || string(m[1]) != "1.25.0" {
 		t.Fatalf("go.mod go directive is %q, want 1.25.0", m)
 	}
 	if regexp.MustCompile(`(?m)^toolchain `).Match(b) {

@@ -296,7 +296,7 @@ func gather(t *testing.T, g *GroupCommitter, collected <-chan struct{}, ctxs []c
 	var wg sync.WaitGroup
 	for i, b := range batches {
 		ctx := context.Background()
-		if ctxs != nil && ctxs[i] != nil {
+		if i < len(ctxs) && ctxs[i] != nil {
 			ctx = ctxs[i]
 		}
 		wg.Go(func() {

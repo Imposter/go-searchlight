@@ -87,48 +87,60 @@ func isTrigramWord(r rune) bool {
 	return r != '_' && IsWord(r)
 }
 
-// trigramSet returns s's pg_trgm trigrams: s lowercased, split into runs of letters and
-// digits, each run padded with two spaces before and one after, and every 3-rune window.
-func trigramSet(s string) map[string]struct{} {
-	grams := make(map[string]struct{})
-	lowered := Lower(s)
-	var word []rune
-	flush := func() {
-		if len(word) == 0 {
-			return
-		}
-		padded := make([]rune, 0, len(word)+3)
-		padded = append(padded, ' ', ' ')
-		padded = append(padded, word...)
-		padded = append(padded, ' ')
-		for k := 0; k+3 <= len(padded); k++ {
-			grams[string(padded[k:k+3])] = struct{}{}
-		}
-		word = word[:0]
-	}
-	for _, r := range lowered {
-		if isTrigramWord(r) {
-			word = append(word, r)
-		} else {
-			flush()
-		}
-	}
-	flush()
-	return grams
+// runeBits is how many bits a code point takes in a packed trigram key.
+const runeBits = 21
+
+// packTrigram packs three code points into one key, 21 bits each. Keys order as the
+// trigrams' code points do, so sorted keys are sorted trigrams.
+func packTrigram(a, b, c rune) uint64 {
+	return uint64(a)<<(2*runeBits) | uint64(b)<<runeBits | uint64(c) //nolint:gosec // code points are 0..0x10FFFF
 }
 
-// Trigrams returns s's pg_trgm trigrams (see [Similarity]), distinct and sorted by code
-// point.
-func Trigrams(s string) []string {
-	set := trigramSet(s)
-	if len(set) == 0 {
+// TrigramKeys returns s's pg_trgm trigrams as packed keys (three 21-bit code points),
+// sorted and distinct: s lowercased ([Lower]), split into runs of letters and digits,
+// each run padded with two spaces before and one after, and every 3-rune window. These
+// are what [SimilarityKeys] compares; compute a text's keys once and reuse them.
+func TrigramKeys(s string) []uint64 {
+	lowered := Lower(s)
+	keys := make([]uint64, 0, len(lowered)+1)
+	before2, before1 := rune(' '), rune(' ')
+	inWord := false
+	for _, r := range lowered {
+		if isTrigramWord(r) {
+			if !inWord {
+				before2, before1, inWord = ' ', ' ', true
+			}
+			keys = append(keys, packTrigram(before2, before1, r))
+			before2, before1 = before1, r
+			continue
+		}
+		if inWord {
+			keys = append(keys, packTrigram(before2, before1, ' '))
+			inWord = false
+		}
+	}
+	if inWord {
+		keys = append(keys, packTrigram(before2, before1, ' '))
+	}
+	if len(keys) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(set))
-	for gram := range set {
-		out = append(out, gram)
+	slices.Sort(keys)
+	return slices.Compact(keys)
+}
+
+// Trigrams returns s's pg_trgm trigrams (see [TrigramKeys]) as strings, distinct and
+// sorted by code point.
+func Trigrams(s string) []string {
+	keys := TrigramKeys(s)
+	if keys == nil {
+		return nil
 	}
-	slices.Sort(out)
+	const mask = 1<<runeBits - 1
+	out := make([]string, len(keys))
+	for i, key := range keys {
+		out[i] = string([]rune{rune(key >> (2 * runeBits)), rune(key >> runeBits & mask), rune(key & mask)})
+	}
 	return out
 }
 

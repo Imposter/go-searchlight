@@ -1,0 +1,7 @@
+.superpowers/
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+/snapshots/

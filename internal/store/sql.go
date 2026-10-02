@@ -176,75 +176,92 @@ func rollback(tx *sql.Tx) { _ = tx.Rollback() }
 
 // --- Apply ---------------------------------------------------------------
 
-// prepared is a validated batch with its stored payload text.
+// prepared is a validated batch with its stored payload text. The prepared
+// forms of several requests concatenate (GroupCommitter).
 type prepared struct {
 	payload     []string
 	query       []QueryPayload // KindQueryUpsert only
-	indexes     []string       // distinct, in first-use order
 	conditional bool
 }
 
+func (p *prepared) append(q *prepared) {
+	p.payload = append(p.payload, q.payload...)
+	p.query = append(p.query, q.query...)
+	p.conditional = p.conditional || q.conditional
+}
+
+// prepare validates a batch and reports the first bad change as a
+// *ChangeError with its position in batch.
 func prepare(batch []Change) (*prepared, error) {
 	p := &prepared{payload: make([]string, len(batch)), query: make([]QueryPayload, len(batch))}
-	seen := make(map[string]struct{}, 1)
 	for i := range batch {
-		c := &batch[i]
-		if err := validShard(c.ShardID()); err != nil {
-			return nil, fmt.Errorf("change %d: %w", i, err)
-		}
-		if err := validKey("id", c.ID, MaxID); err != nil {
-			return nil, fmt.Errorf("change %d: %w", i, err)
-		}
-		if !c.Kind.valid() {
-			return nil, fmt.Errorf("change %d: %w", i, invalidf("kind %q", c.Kind))
-		}
-		if c.IfSeq < IfAbsent {
-			return nil, fmt.Errorf("change %d: %w", i, invalidf("if_seq %d", c.IfSeq))
-		}
-		if c.IfSeq != 0 {
-			p.conditional = true
-		}
-		switch c.Kind {
-		case KindUpsert:
-			if err := validJSON("payload", c.Payload); err != nil {
-				return nil, fmt.Errorf("change %d: %w", i, err)
-			}
-			p.payload[i] = string(c.Payload)
-		case KindQueryUpsert:
-			q, err := DecodeQueryPayload(c.Payload)
-			if err != nil {
-				return nil, fmt.Errorf("change %d: %w", i, fmt.Errorf("%w: %w", ErrInvalid, err))
-			}
-			if len(q.Meta) == 0 || string(q.Meta) == "null" {
-				q.Meta = json.RawMessage("{}")
-			}
-			p.query[i] = q
-			p.payload[i] = string(c.Payload)
-		case KindDelete, KindQueryDelete:
-			if len(c.Payload) != 0 {
-				return nil, fmt.Errorf("change %d: %w", i, invalidf("%s carries a payload", c.Kind))
-			}
-		}
-		if _, ok := seen[c.Index]; !ok {
-			seen[c.Index] = struct{}{}
-			p.indexes = append(p.indexes, c.Index)
+		if err := p.prepareOne(i, &batch[i]); err != nil {
+			return nil, &ChangeError{Position: i, Err: err}
 		}
 	}
 	return p, nil
+}
+
+func (p *prepared) prepareOne(i int, c *Change) error {
+	if err := validShard(c.ShardID()); err != nil {
+		return err
+	}
+	if err := validKey("id", c.ID, MaxID); err != nil {
+		return err
+	}
+	if !c.Kind.valid() {
+		return invalidf("kind %q", c.Kind)
+	}
+	if c.IfSeq < IfAbsent {
+		return invalidf("if_seq %d", c.IfSeq)
+	}
+	if c.IfSeq != 0 {
+		p.conditional = true
+	}
+	switch c.Kind {
+	case KindUpsert:
+		if err := validJSON("payload", c.Payload); err != nil {
+			return err
+		}
+		p.payload[i] = string(c.Payload)
+	case KindQueryUpsert:
+		if err := validJSON("payload", c.Payload); err != nil {
+			return err
+		}
+		q, err := DecodeQueryPayload(c.Payload)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalid, err)
+		}
+		if len(q.Meta) == 0 || string(q.Meta) == "null" {
+			q.Meta = json.RawMessage("{}")
+		}
+		p.query[i] = q
+		p.payload[i] = string(c.Payload)
+	case KindDelete, KindQueryDelete:
+		if len(c.Payload) != 0 {
+			return invalidf("%s carries a payload", c.Kind)
+		}
+	}
+	return nil
 }
 
 func (s *sqlStore) Apply(ctx context.Context, batch []Change) (first, last int64, err error) {
 	if len(batch) == 0 {
 		return 0, 0, nil
 	}
+	p, err := prepare(batch)
+	if err != nil {
+		return 0, 0, err
+	}
+	return s.applyPrepared(ctx, batch, p)
+}
+
+// applyPrepared commits a batch prepare has accepted.
+func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepared) (first, last int64, err error) {
 	ctx, end := s.start(ctx, "apply", attribute.Int("changes", len(batch)))
 	defer end(&err)
 	if s.closed.Load() {
 		return 0, 0, ErrClosed
-	}
-	p, err := prepare(batch)
-	if err != nil {
-		return 0, 0, err
 	}
 	for attempt := 1; ; attempt++ {
 		first, last, err = s.applyOnce(ctx, batch, p)
@@ -286,14 +303,8 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	}
 	first, last = counter+1, counter+int64(len(batch))
 
-	for _, name := range p.indexes {
-		var n int
-		if err := tx.QueryRowContext(ctx, s.q.indexExists, name).Scan(&n); err != nil {
-			return 0, 0, err
-		}
-		if n == 0 {
-			return 0, 0, fmt.Errorf("index %q: %w", name, ErrNotFound)
-		}
+	if err := s.checkIndexes(ctx, tx, batch); err != nil {
+		return 0, 0, err
 	}
 	if p.conditional {
 		if err := s.checkConditions(ctx, tx, batch, first); err != nil {
@@ -333,9 +344,41 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	return first, last, nil
 }
 
+// checkIndexes fails with an *IndexNotFoundError naming every change whose
+// index does not exist.
+func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) error {
+	exists := make(map[string]bool, 1)
+	var missing *IndexNotFoundError
+	for i := range batch {
+		name := batch[i].Index
+		ok, seen := exists[name]
+		if !seen {
+			var n int
+			if err := tx.QueryRowContext(ctx, s.q.indexExists, name).Scan(&n); err != nil {
+				return err
+			}
+			ok = n > 0
+			exists[name] = ok
+			if !ok {
+				if missing == nil {
+					missing = &IndexNotFoundError{}
+				}
+				missing.Indexes = append(missing.Indexes, name)
+			}
+		}
+		if !ok {
+			missing.Positions = append(missing.Positions, i)
+		}
+	}
+	if missing != nil {
+		return missing
+	}
+	return nil
+}
+
 // checkConditions evaluates IfSeq conditions in batch order, as if each
-// change before applied, and fails with a *ConflictError listing every
-// failure.
+// change before that passed its condition applied, and fails with a
+// *ConflictError listing every failure.
 func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) error {
 	cur := make(map[recKey]int64)
 	var conflict *ConflictError
@@ -363,6 +406,7 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 				}
 				conflict.Positions = append(conflict.Positions, i)
 				conflict.Current = append(conflict.Current, seq)
+				continue // a failed change does not apply
 			}
 		}
 		if c.Kind.isUpsert() {

@@ -160,13 +160,21 @@ func TestApplyAndRead(t *testing.T) {
 			"kind":         {Index: "products", Kind: "nope", ID: "z"},
 			"delete body":  {Index: "products", Kind: KindDelete, ID: "z", Payload: []byte(`{}`)},
 			"query no dsl": {Index: "products", Kind: KindQueryUpsert, ID: "z", Payload: []byte(`{"meta":{}}`)},
+			"bad utf8":     upsert("products", 0, "z", "{\"x\":\"\xff\"}"),
 		} {
 			if _, _, err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrInvalid) {
 				t.Errorf("%s: %v, want ErrInvalid", name, err)
 			}
 		}
-		if _, _, err := st.Apply(ctx, []Change{upsert("missing", 0, "z", `{}`)}); !errors.Is(err, ErrNotFound) {
-			t.Errorf("missing index: %v, want ErrNotFound", err)
+		var nf *IndexNotFoundError
+		_, _, err = st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("missing", 0, "z", `{}`), upsert("missing", 1, "y", `{}`)})
+		if !errors.As(err, &nf) || fmt.Sprint(nf.Positions) != "[1 2]" || nf.Indexes[0] != "missing" || !errors.Is(err, ErrNotFound) {
+			t.Errorf("missing index: %v, want an IndexNotFoundError at [1 2]", err)
+		}
+		// An invalid change is reported by position.
+		var che *ChangeError
+		if _, _, err := st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("products", 0, "", `{}`)}); !errors.As(err, &che) || che.Position != 1 {
+			t.Errorf("invalid change: %v, want a ChangeError at 1", err)
 		}
 		if got := counterValue(t, st); got != 10 {
 			t.Fatalf("counter = %d after refused batches, want 10", got)
@@ -569,6 +577,15 @@ func TestConditionalWrites(t *testing.T) {
 		c.IfSeq = s1 + 100
 		if _, _, err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrConflict) {
 			t.Fatalf("stale if_seq: %v", err)
+		}
+		// A failed condition does not count as applied for later changes:
+		// a stale update of a new key leaves it absent for the next change.
+		stale := upsert("cond", 0, "new", `{}`)
+		stale.IfSeq = 12345
+		create := upsert("cond", 0, "new", `{}`)
+		create.IfSeq = IfAbsent
+		if _, _, err := st.Apply(ctx, []Change{stale, create}); !errors.As(err, &ce) || fmt.Sprint(ce.Positions) != "[0]" {
+			t.Fatalf("stale then create: %v, want a conflict at [0] only", err)
 		}
 		c.IfSeq = s1
 		c.Payload = []byte(`{"v":2}`)
@@ -1121,6 +1138,62 @@ func TestWatch(t *testing.T) {
 			case <-deadline:
 				t.Fatal("no notification")
 			}
+		}
+	})
+}
+
+// TestGroupCommitIsolation is the reviewer's probe on every dialect: in one
+// group-commit batch, a stale IfSeq must not make a later IfAbsent on the
+// same new key fail, a genuine conflict still fails, and a missing index or
+// invalid change fails only its own request.
+func TestGroupCommitIsolation(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "gc")
+		collected := make(chan struct{}, 8)
+		g := NewGroupCommitter(st, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 5, received: func() { collected <- struct{}{} }})
+		defer g.Close()
+
+		bad := upsert("gc", 0, "zz", "{")
+		if _, _, err := g.Apply(ctx, []Change{upsert("gc", 0, "ok", `{}`), bad}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid request: %v", err)
+		}
+
+		a := upsert("gc", 0, "k", `{"by":"a"}`)
+		a.IfSeq = 99 // stale: k does not exist
+		b := upsert("gc", 0, "k", `{"by":"b"}`)
+		b.IfSeq = IfAbsent
+		c := upsert("gc", 0, "m", `{"by":"c"}`)
+		c.IfSeq = IfAbsent
+		d := upsert("gc", 0, "m", `{"by":"d"}`)
+		d.IfSeq = IfAbsent // genuinely conflicts: c creates m first
+		missing := upsert("nope", 0, "x", `{}`)
+		res := gather(t, g, collected, nil, [][]Change{{a}, {b}, {c}, {d}, {missing}})
+
+		var ce *ConflictError
+		if !errors.As(res[0].err, &ce) || ce.Current[0] != 0 {
+			t.Fatalf("A (stale if_seq) got %v", res[0].err)
+		}
+		if res[1].err != nil {
+			t.Fatalf("B (if_absent on the same new key) got %v", res[1].err)
+		}
+		if res[2].err != nil {
+			t.Fatalf("C got %v", res[2].err)
+		}
+		if !errors.As(res[3].err, &ce) || ce.Current[0] != res[2].first {
+			t.Fatalf("D got %v, want a conflict with C's seq %d", res[3].err, res[2].first)
+		}
+		var nf *IndexNotFoundError
+		if !errors.As(res[4].err, &nf) || fmt.Sprint(nf.Positions) != "[0]" {
+			t.Fatalf("missing index got %v", res[4].err)
+		}
+		if res[2].first != res[1].first+1 {
+			t.Fatalf("B and C got seqs %d and %d", res[1].first, res[2].first)
+		}
+		recs, _ := scanAll(t, st, ShardID{Index: "gc"})
+		if string(recs["d:k"].Body) != `{"by":"b"}` || string(recs["d:m"].Body) != `{"by":"c"}` || len(recs) != 2 {
+			t.Fatalf("records %v", recs)
 		}
 	})
 }

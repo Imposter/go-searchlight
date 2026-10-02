@@ -249,6 +249,33 @@ func (e *ConflictError) Error() string {
 // Is makes a ConflictError match ErrConflict.
 func (e *ConflictError) Is(target error) bool { return target == ErrConflict }
 
+// ChangeError reports an invalid change by its position in the caller's
+// batch. It wraps ErrInvalid.
+type ChangeError struct {
+	Position int
+	Err      error
+}
+
+func (e *ChangeError) Error() string { return fmt.Sprintf("change %d: %v", e.Position, e.Err) }
+
+// Unwrap returns the reason.
+func (e *ChangeError) Unwrap() error { return e.Err }
+
+// IndexNotFoundError is returned by Apply when changes name indexes that do
+// not exist. Nothing in the batch was applied.
+type IndexNotFoundError struct {
+	Indexes []string // the missing indexes, in first-use order
+	// Positions are the changes naming them, ascending.
+	Positions []int
+}
+
+func (e *IndexNotFoundError) Error() string {
+	return fmt.Sprintf("store: index %q not found (%d change(s), first at position %d)", e.Indexes[0], len(e.Positions), e.Positions[0])
+}
+
+// Is makes an IndexNotFoundError match ErrNotFound.
+func (e *IndexNotFoundError) Is(target error) bool { return target == ErrNotFound }
+
 func invalidf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
 }
@@ -283,6 +310,9 @@ func validShard(s ShardID) error {
 }
 
 func validJSON(what string, b []byte) error {
+	if !utf8.Valid(b) {
+		return invalidf("%s is not valid UTF-8", what)
+	}
 	if !json.Valid(b) {
 		return invalidf("%s is not valid JSON", what)
 	}

@@ -214,9 +214,9 @@ func TestGroupCommitConflictIsPerRequest(t *testing.T) {
 	}
 }
 
-func TestSplitConflict(t *testing.T) {
+func TestSplitPositions(t *testing.T) {
 	reqs := []*gcRequest{{changes: make([]Change, 2)}, {changes: make([]Change, 3)}, {changes: make([]Change, 1)}}
-	got := splitConflict(reqs, &ConflictError{Positions: []int{1, 2, 4, 5}, Current: []int64{10, 20, 40, 50}})
+	got := splitPositions(reqs, []int{1, 2, 4, 5}, []int64{10, 20, 40, 50})
 	if len(got) != 3 || fmt.Sprint(got[0].Positions, got[1].Positions, got[2].Positions) != "[1] [0 2] [0]" ||
 		fmt.Sprint(got[1].Current) != "[20 40]" {
 		t.Fatalf("split %v %v %v", got[0], got[1], got[2])
@@ -264,7 +264,8 @@ func TestGroupCommitCancellation(t *testing.T) {
 
 func TestGroupCommitClose(t *testing.T) {
 	f := &fakeApplier{}
-	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour})
+	collected := make(chan struct{}, 1)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, received: func() { collected <- struct{}{} }})
 	res := make(chan error, 1)
 	go func() {
 		_, _, err := g.Apply(context.Background(), changes("pending", 2))
@@ -272,7 +273,7 @@ func TestGroupCommitClose(t *testing.T) {
 	}()
 	// The request is collected but would wait an hour for company; Close
 	// flushes it.
-	time.Sleep(50 * time.Millisecond)
+	<-collected
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -284,5 +285,112 @@ func TestGroupCommitClose(t *testing.T) {
 	}
 	if err := g.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// gather starts the requests in order, each only after the committer has
+// taken the one before into its batch, and returns their results.
+func gather(t *testing.T, g *GroupCommitter, collected <-chan struct{}, ctxs []context.Context, batches [][]Change) []gcResult {
+	t.Helper()
+	out := make([]gcResult, len(batches))
+	var wg sync.WaitGroup
+	for i, b := range batches {
+		ctx := context.Background()
+		if ctxs != nil && ctxs[i] != nil {
+			ctx = ctxs[i]
+		}
+		wg.Go(func() {
+			first, last, err := g.Apply(ctx, b)
+			out[i] = gcResult{first, last, err}
+		})
+		<-collected
+	}
+	wg.Wait()
+	return out
+}
+
+func TestGroupCommitInvalidRequestFailsAlone(t *testing.T) {
+	f := &fakeApplier{}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 4, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	bad := changes("bad", 3)
+	bad[2].Payload = []byte("{\"x\":\"\xff\"}") // invalid UTF-8
+	if _, _, err := g.Apply(context.Background(), bad); err == nil {
+		t.Fatal("invalid request accepted")
+	} else {
+		var ce *ChangeError
+		if !errors.As(err, &ce) || ce.Position != 2 || !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid request got %v", err)
+		}
+	}
+	res := gather(t, g, collected, nil, [][]Change{changes("a", 2), changes("b", 2)})
+	for i, r := range res {
+		if r.err != nil {
+			t.Fatalf("request %d: %v", i, r.err)
+		}
+	}
+	if f.txCount() != 1 {
+		t.Fatalf("%d transactions", f.txCount())
+	}
+}
+
+func TestGroupCommitMissingIndexFailsAlone(t *testing.T) {
+	// Any batch naming index "gone" fails like the store does.
+	f := &fakeApplier{fail: func(batch []Change) error {
+		var e *IndexNotFoundError
+		for i, c := range batch {
+			if c.Index == "gone" {
+				if e == nil {
+					e = &IndexNotFoundError{Indexes: []string{"gone"}}
+				}
+				e.Positions = append(e.Positions, i)
+			}
+		}
+		if e != nil {
+			return e
+		}
+		return nil
+	}}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 7, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	gone := changes("g", 3)
+	gone[1].Index = "gone"
+	res := gather(t, g, collected, nil, [][]Change{changes("a", 2), gone, changes("b", 2)})
+	var nf *IndexNotFoundError
+	if !errors.As(res[1].err, &nf) || fmt.Sprint(nf.Positions) != "[1]" || !errors.Is(res[1].err, ErrNotFound) {
+		t.Fatalf("request naming a missing index got %v", res[1].err)
+	}
+	if res[0].err != nil || res[2].err != nil || res[0].first != 1 || res[2].first != 3 {
+		t.Fatalf("other requests: %+v %+v", res[0], res[2])
+	}
+}
+
+// A request held for a conflict caused by an earlier request is
+// re-evaluated when that earlier request's caller gives up.
+func TestGroupCommitHeldConflictReopens(t *testing.T) {
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	f := &fakeApplier{}
+	f.fail = func(batch []Change) error {
+		// B conflicts only when A is in the batch before it.
+		for i, c := range batch {
+			if c.ID == "B-0" && i > 0 && batch[0].ID == "A-0" {
+				cancelA() // A's caller leaves while the transaction runs
+				return &ConflictError{Positions: []int{i}, Current: []int64{1}}
+			}
+		}
+		return nil
+	}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 2, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	res := gather(t, g, collected, []context.Context{ctxA, nil}, [][]Change{changes("A", 1), changes("B", 1)})
+	if !errors.Is(res[0].err, context.Canceled) {
+		t.Fatalf("A got %v", res[0].err)
+	}
+	if res[1].err != nil || res[1].first != 1 {
+		t.Fatalf("B got %+v; its conflict depended on A, which never committed", res[1])
 	}
 }

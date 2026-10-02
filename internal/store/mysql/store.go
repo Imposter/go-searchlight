@@ -66,9 +66,11 @@ func retryable(err error) bool {
 
 // Config converts a store URL of the form
 // mysql://user:pass@host[:port]/db[?param=value...] into a driver config. The
-// query parameters are go-sql-driver DSN parameters (tls, timeout, ...). The
-// store always interpolates parameters client-side (one round trip per
-// statement), reports matched rather than changed rows, and talks UTC.
+// query parameters are go-sql-driver DSN parameters (tls, timeout, ...) or
+// session variables. The store always interpolates parameters client-side
+// (one round trip per statement), reports matched rather than changed rows,
+// and talks UTC: the session time_zone is +00:00, so the database clock
+// (UNIX_TIMESTAMP(NOW(3))) is never ambiguous across a DST change.
 func Config(u *url.URL) (*mysql.Config, error) {
 	host := u.Host
 	if host == "" {
@@ -97,6 +99,10 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	cfg.ClientFoundRows = true
 	cfg.MultiStatements = false
 	cfg.Loc = time.UTC
+	if cfg.Params == nil {
+		cfg.Params = make(map[string]string, 1)
+	}
+	cfg.Params["time_zone"] = "'+00:00'"
 	return cfg, nil
 }
 

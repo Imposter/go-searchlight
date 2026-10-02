@@ -32,6 +32,25 @@ func TestConfigFromCIURL(t *testing.T) {
 	if !cfg.InterpolateParams || !cfg.ClientFoundRows || cfg.MultiStatements || cfg.Loc != time.UTC {
 		t.Fatalf("store settings not forced: %+v", cfg)
 	}
+	if cfg.Params["time_zone"] != "'+00:00'" {
+		t.Fatalf("session time zone not UTC: %v", cfg.Params)
+	}
+}
+
+// The UTC session time zone is merged with session variables the URL sets,
+// and wins over a time_zone the URL sets.
+func TestConfigTimeZoneMerged(t *testing.T) {
+	cfg, err := Config(mustParse(t, "mysql://u@db/x?sql_mode=%27ANSI_QUOTES%27&time_zone=%27Europe%2FParis%27"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Params["time_zone"] != "'+00:00'" || cfg.Params["sql_mode"] != "'ANSI_QUOTES'" {
+		t.Fatalf("params %v", cfg.Params)
+	}
+	dsn, err := DSN(mustParse(t, "mysql://u@db/x"))
+	if err != nil || !strings.Contains(dsn, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("dsn %q %v", dsn, err)
+	}
 }
 
 func TestDSNRoundTrip(t *testing.T) {

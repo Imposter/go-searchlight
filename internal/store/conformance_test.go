@@ -1266,3 +1266,26 @@ func TestGroupCommitIsolation(t *testing.T) {
 		}
 	})
 }
+
+// TestDatabaseClock checks the database clock the registry judges leases by
+// is Unix milliseconds in UTC, and that MySQL sessions run in UTC so it is
+// never ambiguous across a DST change.
+func TestDatabaseClock(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		s := engine(h.open(t))
+		var dbNow int64
+		if err := s.r.QueryRowContext(ctx, "SELECT "+s.d.Now).Scan(&dbNow); err != nil {
+			t.Fatal(err)
+		}
+		if skew := time.Since(time.UnixMilli(dbNow)); skew.Abs() > 5*time.Second {
+			t.Fatalf("database clock is %s off the local clock", skew)
+		}
+		if h.dialect == "mysql" {
+			var tz string
+			if err := s.r.QueryRowContext(ctx, "SELECT @@session.time_zone").Scan(&tz); err != nil || tz != "+00:00" {
+				t.Fatalf("session time zone %q %v", tz, err)
+			}
+		}
+	})
+}

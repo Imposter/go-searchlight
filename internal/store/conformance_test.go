@@ -993,6 +993,141 @@ func TestRegistryConcurrentClaims(t *testing.T) {
 	})
 }
 
+// TestClaimCopyMissingIndex checks ClaimCopy refuses a shard of an index
+// that was never created, or has been dropped, instead of happily leasing a
+// slot nothing will ever tail.
+func TestClaimCopyMissingIndex(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		reg := st.Registry()
+		if _, ok, err := reg.ClaimCopy(ctx, ShardID{Index: "ghost"}, "n1", 1, time.Minute); !errors.Is(err, ErrNotFound) || ok {
+			t.Fatalf("claim on a never-created index: ok=%v err=%v", ok, err)
+		}
+		mustCreateIndex(t, st, "gone")
+		if _, ok, err := reg.ClaimCopy(ctx, ShardID{Index: "gone"}, "n1", 1, time.Minute); err != nil || !ok {
+			t.Fatalf("claim before drop: ok=%v err=%v", ok, err)
+		}
+		if err := st.Indexes().Drop(ctx, "gone"); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := reg.ClaimCopy(ctx, ShardID{Index: "gone"}, "n2", 1, time.Minute); !errors.Is(err, ErrNotFound) || ok {
+			t.Fatalf("claim on a dropped index: ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestReportAppliedMonotonic checks a late, stale ReportApplied never moves
+// applied_seq backwards, and that it and SetCopyState validate their shard
+// and node like every other entry point.
+func TestReportAppliedMonotonic(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "mono")
+		reg := st.Registry()
+		shard := ShardID{Index: "mono"}
+		c, ok, err := reg.ClaimCopy(ctx, shard, "n1", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		if err := reg.ReportApplied(ctx, c, 10); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.ReportApplied(ctx, c, 3); err != nil { // stale, arrives late
+			t.Fatal(err)
+		}
+		copies, err := reg.Copies(ctx, "mono")
+		if err != nil || len(copies) != 1 || copies[0].AppliedSeq != 10 {
+			t.Fatalf("a stale report moved applied_seq: %+v %v", copies, err)
+		}
+		if err := reg.ReportApplied(ctx, c, 20); err != nil {
+			t.Fatal(err)
+		}
+		if copies, err = reg.Copies(ctx, "mono"); err != nil || copies[0].AppliedSeq != 20 {
+			t.Fatalf("a newer report did not advance applied_seq: %+v %v", copies, err)
+		}
+
+		bad := c
+		bad.Shard.Index = ""
+		if err := reg.ReportApplied(ctx, bad, 1); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("report applied with an invalid shard: %v", err)
+		}
+		if err := reg.SetCopyState(ctx, bad, CopyServing); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("set copy state with an invalid shard: %v", err)
+		}
+		bad = c
+		bad.NodeID = ""
+		if err := reg.ReportApplied(ctx, bad, 1); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("report applied with an invalid node: %v", err)
+		}
+		if err := reg.SetCopyState(ctx, bad, CopyServing); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("set copy state with an invalid node: %v", err)
+		}
+	})
+}
+
+// TestCopyExpired checks Expired() agrees with every dialect's SQL steal
+// boundary (lease_until < now): a lease with no time left at all is not yet
+// stealable, only one that has gone negative.
+func TestCopyExpired(t *testing.T) {
+	for leaseLeft, want := range map[time.Duration]bool{
+		time.Second:  false,
+		0:            false,
+		-1:           true,
+		-time.Second: true,
+	} {
+		c := Copy{LeaseLeft: leaseLeft}
+		if got := c.Expired(); got != want {
+			t.Fatalf("LeaseLeft %s: Expired() = %v, want %v", leaseLeft, got, want)
+		}
+	}
+}
+
+// TestRegistryConcurrentSameNodeClaim has one node claim the same shard
+// copy from many goroutines at once. Exactly one slot must result, and every
+// caller that wins must agree on its final epoch, on every dialect: a race
+// between two self-claims must never mint two different fencing tokens for
+// what is really one incarnation.
+func TestRegistryConcurrentSameNodeClaim(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "same")
+		shard := ShardID{Index: "same", Shard: 0}
+		const n = 8
+		results := make([]Copy, n)
+		oks := make([]bool, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			reg := h.open(t).Registry()
+			wg.Go(func() {
+				results[i], oks[i], errs[i] = reg.ClaimCopy(ctx, shard, "solo", 1, time.Minute)
+			})
+		}
+		wg.Wait()
+		for i := range n {
+			if errs[i] != nil || !oks[i] {
+				t.Fatalf("claim %d: ok=%v err=%v", i, oks[i], errs[i])
+			}
+			if results[i].Slot != 0 || results[i].NodeID != "solo" {
+				t.Fatalf("claim %d: %+v", i, results[i])
+			}
+		}
+		epoch := results[0].Epoch
+		for i := 1; i < n; i++ {
+			if results[i].Epoch != epoch {
+				t.Fatalf("claim %d got epoch %d, claim 0 got %d: one incarnation must agree", i, results[i].Epoch, epoch)
+			}
+		}
+		copies, err := h.open(t).Registry().Copies(ctx, "same")
+		if err != nil || len(copies) != 1 || copies[0].Epoch != epoch {
+			t.Fatalf("final state %+v %v", copies, err)
+		}
+	})
+}
+
 // TestIndexIncarnation checks a dropped-and-recreated index gets a fresh
 // UID, and that Apply and ScanShard stamp every Change and Record with the
 // incarnation they belong to, so a tailer can tell the two apart without an

@@ -202,8 +202,10 @@ type Copy struct {
 	LeaseLeft time.Duration
 }
 
-// Expired reports whether the copy's lease has run out.
-func (c *Copy) Expired() bool { return c.LeaseLeft <= 0 }
+// Expired reports whether the copy's lease has run out, agreeing with the
+// SQL steal boundary (lease_until < now): a lease with no time left at all
+// (LeaseLeft == 0) is not yet stealable, only one that has gone negative.
+func (c *Copy) Expired() bool { return c.LeaseLeft < 0 }
 
 // Notification announces that a shard's changelog advanced to Seq.
 type Notification struct {

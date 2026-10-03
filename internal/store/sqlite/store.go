@@ -49,6 +49,7 @@ func Dialect() *dialect.Dialect {
 		Now:         "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)",
 		Upsert:      onConflict,
 		Claim:       claim,
+		Greatest:    greatest,
 		MaxParams:   32766,
 	}
 }
@@ -168,3 +169,7 @@ var claimQuery = strings.ReplaceAll(claimSQL, "NOW", "CAST((julianday('now') - 2
 func claim(a dialect.ClaimArgs) (string, []any) {
 	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }
+
+// greatest uses SQLite's multi-argument MAX, which (unlike single-argument
+// MAX) is the scalar function, not the aggregate.
+func greatest(a, b string) string { return "MAX(" + a + ", " + b + ")" }

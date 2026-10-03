@@ -4,8 +4,10 @@
 // Apply locks the counter row with SELECT ... FOR UPDATE under READ
 // COMMITTED, so sequence numbers are assigned and committed in order. MySQL
 // DDL is not transactional, so migrations run on one connection holding a
-// GET_LOCK named after the database, and each file is recorded as it
-// completes. Identifiers and names are VARBINARY: ids compare byte for byte,
+// GET_LOCK named after an MD5 hash of the database (a name can run to 64
+// bytes, which a long database name alone could exceed), and each file is
+// recorded as it completes. Identifiers and names are VARBINARY: ids compare
+// byte for byte,
 // as on the other dialects, instead of under a case-insensitive collation.
 package mysql
 
@@ -45,12 +47,13 @@ func Dialect() *dialect.Dialect {
 	applied_at BIGINT NOT NULL
 ) ENGINE=InnoDB`,
 		MigrateInTx:   false,
-		SessionLock:   "SELECT GET_LOCK(CONCAT('searchlight.migrate.', DATABASE()), 120)",
-		SessionUnlock: "SELECT RELEASE_LOCK(CONCAT('searchlight.migrate.', DATABASE()))",
+		SessionLock:   "SELECT GET_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())), 120)",
+		SessionUnlock: "SELECT RELEASE_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())))",
 		ForUpdate:     " FOR UPDATE",
 		Now:           now,
 		Upsert:        onDuplicateKey,
 		Claim:         claim,
+		Greatest:      greatest,
 		ApplyTx:       &sql.TxOptions{Isolation: sql.LevelReadCommitted},
 		SnapshotTx:    &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
 		MaxParams:     65535,
@@ -158,3 +161,5 @@ ON DUPLICATE KEY UPDATE
 func claim(a dialect.ClaimArgs) (string, []any) {
 	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }
+
+func greatest(a, b string) string { return "GREATEST(" + a + ", " + b + ")" }

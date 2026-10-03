@@ -54,6 +54,7 @@ func Dialect() *dialect.Dialect {
 		Now:         now,
 		Upsert:      onConflict,
 		Claim:       claim,
+		Greatest:    greatest,
 		ApplyTx:     &sql.TxOptions{Isolation: sql.LevelReadCommitted},
 		SnapshotTx:  &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
 		MaxParams:   65535,
@@ -121,6 +122,8 @@ WHERE sl_shard_copies.node_id = EXCLUDED.node_id OR sl_shard_copies.lease_until 
 func claim(a dialect.ClaimArgs) (string, []any) {
 	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
 }
+
+func greatest(a, b string) string { return "GREATEST(" + a + ", " + b + ")" }
 
 // listen runs LISTEN on conn and calls fn for each notification until ctx
 // ends. The connection is discarded afterwards rather than returned to the

@@ -124,6 +124,14 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 	}
 	defer rollback(tx)
 
+	var indexed int
+	if err := tx.QueryRowContext(ctx, s.bind("SELECT COUNT(*) FROM sl_indexes WHERE name = ?"), shard.Index).Scan(&indexed); err != nil {
+		return Copy{}, false, err
+	}
+	if indexed == 0 {
+		return Copy{}, false, fmt.Errorf("index %q: %w", shard.Index, ErrNotFound)
+	}
+
 	slotQ := s.bind("SELECT " + copyCols + ", " + s.d.Now + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot")
 	rows, err := tx.QueryContext(ctx, slotQ, shard.Index, shard.Shard)
 	if err != nil {
@@ -297,6 +305,12 @@ func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (e
 	s := g.s
 	ctx, end := s.start(ctx, "set_copy_state", append(copyAttrs(&c), attribute.String("state", string(state)))...)
 	defer end(&err)
+	if err := validShard(c.Shard); err != nil {
+		return err
+	}
+	if err := validNode(c.NodeID); err != nil {
+		return err
+	}
 	if !state.valid() {
 		return invalidf("copy state %q", state)
 	}
@@ -305,11 +319,19 @@ func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (e
 	return leaseResult(res, err, &c)
 }
 
+// ReportApplied is monotonic: a late report naming an older seq than one
+// already recorded never moves applied_seq backwards.
 func (g *registry) ReportApplied(ctx context.Context, c Copy, seq int64) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "report_applied", copyAttrs(&c)...)
 	defer end(&err)
-	q := s.bind("UPDATE sl_shard_copies SET applied_seq = ?" + fence)
+	if err := validShard(c.Shard); err != nil {
+		return err
+	}
+	if err := validNode(c.NodeID); err != nil {
+		return err
+	}
+	q := s.bind("UPDATE sl_shard_copies SET applied_seq = " + s.d.Greatest("applied_seq", "?") + fence)
 	res, err := s.w.ExecContext(ctx, q, append([]any{seq}, fenceArgs(&c)...)...)
 	return leaseResult(res, err, &c)
 }

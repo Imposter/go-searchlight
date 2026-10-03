@@ -99,6 +99,12 @@ type Dialect struct {
 	// owner starts in state "recovering" with applied_seq 0 and Epoch.
 	Claim func(a ClaimArgs) (query string, args []any)
 
+	// Greatest returns the SQL expression for the larger of the two
+	// expressions a and b (GREATEST on Postgres and MySQL; SQLite's
+	// multi-argument MAX is the scalar equivalent). ReportApplied uses it so a
+	// late, stale report never moves applied_seq backwards.
+	Greatest func(a, b string) string
+
 	// ApplyTx and SnapshotTx are the transaction options for Apply (the
 	// counter-locking write) and for consistent multi-statement reads.
 	ApplyTx    *sql.TxOptions

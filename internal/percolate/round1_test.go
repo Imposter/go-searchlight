@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
@@ -128,5 +129,32 @@ func TestCraftedFieldCountRefusedCheaply(t *testing.T) {
 	}
 	if grew := after.TotalAlloc - before.TotalAlloc; grew > 16<<20 {
 		t.Fatalf("refusing the file allocated %d bytes", grew)
+	}
+}
+
+// Anchors come from the stored JSON parsed back: a leaf built by hand with only a
+// Value is anchored exactly as the parsed tree verification compiles.
+func TestAnchorsFromStoredTree(t *testing.T) {
+	byHand := &query.All{Children: []query.Node{
+		&query.Leaf{Field: "brand", Op: query.OpEq, Value: []byte(`"ACME"`)},
+		&query.Leaf{Field: "price", Op: query.OpLt, Value: []byte(`10`)},
+	}}
+	data, err := encodeSegment(context.Background(), []shard.StoredQuery{{ID: "q", Query: byHand}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg, err := openData("h", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seg.NumAlways() != 0 {
+		t.Fatal("a hand-built query went to always-check")
+	}
+	sc := new(scratch)
+	sc.fit(seg.NumQueries(), seg.NumEntries())
+	d, _, _ := schema.Analyze(testMapping(), "d", []byte(`{"brand":"acme","price":3}`))
+	seg.collect(&d, sc)
+	if len(sc.cands) != 1 {
+		t.Fatalf("candidates %v", sc.cands)
 	}
 }

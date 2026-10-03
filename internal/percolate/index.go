@@ -255,13 +255,19 @@ func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
 	if err != nil {
 		return err
 	}
+	// Anchors and the class come from the stored JSON parsed back, the very tree
+	// verification compiles, so the two can never disagree.
+	stored, problems := query.Parse(src)
+	if len(problems) > 0 {
+		return fmt.Errorf("query does not round-trip: %s: %s", problems[0].Loc, problems[0].Message)
+	}
 	b.offsets = append(b.offsets, uint64(len(b.records)))
 	b.records = appendBytes(b.records, []byte(q.ID))
 	b.records = binary.AppendVarint(b.records, q.Seq)
 	b.records = appendBytes(b.records, src)
 	b.records = appendBytes(b.records, q.Meta)
 
-	key := classKey(q.Query, src)
+	key := classKey(stored, src)
 	if rep, ok := b.classOf[key]; ok {
 		b.classes[ord] = rep
 	} else {
@@ -269,7 +275,7 @@ func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
 		b.classes[ord] = ord
 	}
 
-	set := b.ex.node(q.Query)
+	set := b.ex.node(stored)
 	if !set.ok {
 		b.always = append(b.always, ord)
 		return nil

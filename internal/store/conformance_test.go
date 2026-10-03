@@ -808,12 +808,17 @@ func TestRegistryLeases(t *testing.T) {
 			t.Fatalf("state for a node without a copy: %v", err)
 		}
 
-		// Expiry and steal.
+		// Expiry and steal. The initial claim uses a long lease so the
+		// "still alive" checks below (blocking a steal) can never race the
+		// clock on a loaded machine; the lease is shortened only right
+		// before the wait for it to expire, and that wait polls the
+		// database clock (waitFor) instead of guessing a sleep long enough
+		// to outrun it.
 		b := ShardID{Index: "idx", Shard: 1}
 		const short = 300 * time.Millisecond
-		old, ok, err := reg.ClaimCopy(ctx, b, "n1", 1, short)
+		old, ok, err := reg.ClaimCopy(ctx, b, "n1", 1, long)
 		if err != nil || !ok {
-			t.Fatalf("short claim: %v %v", ok, err)
+			t.Fatalf("claim: %v %v", ok, err)
 		}
 		if err := reg.SetCopyState(ctx, old, CopyServing); err != nil {
 			t.Fatal(err)
@@ -824,7 +829,25 @@ func TestRegistryLeases(t *testing.T) {
 		if _, ok, _ := reg.ClaimCopy(ctx, b, "n2", 1, long); ok {
 			t.Fatal("stole a live lease")
 		}
-		time.Sleep(short + 200*time.Millisecond)
+		// Shrink only this one slot's lease: re-claiming by its own owner
+		// renews just that row (unlike RenewLeases, which would also touch
+		// a's still-live lease on the same node).
+		old, ok, err = reg.ClaimCopy(ctx, b, "n1", 1, short)
+		if err != nil || !ok {
+			t.Fatalf("shorten the lease: %v %v", ok, err)
+		}
+		waitFor(t, func() bool {
+			copies, err := reg.Copies(ctx, "idx")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cp := range copies {
+				if cp.Shard == b {
+					return cp.Expired()
+				}
+			}
+			return false
+		})
 		copies, err := reg.Copies(ctx, "idx")
 		if err != nil {
 			t.Fatal(err)
@@ -850,28 +873,45 @@ func TestRegistryLeases(t *testing.T) {
 			t.Fatalf("progress from the old owner: %v", err)
 		}
 
-		// Renewal covers live leases only.
+		// Renewal covers live leases only. c3's claim uses a long lease too:
+		// what is tested here is that renewal reaches every live lease of
+		// the node (a and c3), not just one, which does not need c3 to be
+		// anywhere near expiring, and claiming it short only reintroduced
+		// the same race as b's above (RenewLeases must run before a 300 ms
+		// deadline, on a loaded machine, with no margin at all).
 		c3 := ShardID{Index: "other", Shard: 0}
-		if _, ok, err := reg.ClaimCopy(ctx, c3, "n1", 1, short); err != nil || !ok {
+		if _, ok, err := reg.ClaimCopy(ctx, c3, "n1", 1, long); err != nil || !ok {
 			t.Fatal(ok, err)
 		}
 		renewed, err := reg.RenewLeases(ctx, "n1", long)
 		if err != nil || fmt.Sprint(renewed) != fmt.Sprint([]ShardID{a, c3}) {
 			t.Fatalf("renewed %v %v", renewed, err)
 		}
-		time.Sleep(short + 200*time.Millisecond)
 		copies, _ = reg.Copies(ctx, "other")
 		if len(copies) != 1 || copies[0].Expired() || copies[0].LeaseLeft < long/2 {
 			t.Fatalf("renewed lease %+v", copies)
 		}
 		// An expired, unstolen lease is not renewed but can be re-claimed,
-		// keeping its epoch: it is the same incarnation.
+		// keeping its epoch: it is the same incarnation. Here the lease
+		// must actually expire, so wait for the database clock to agree
+		// instead of guessing a sleep long enough to outrun it.
 		d := ShardID{Index: "other", Shard: 1}
 		dc, ok, _ := reg.ClaimCopy(ctx, d, "n1", 1, short)
 		if !ok {
 			t.Fatal("claim d")
 		}
-		time.Sleep(short + 200*time.Millisecond)
+		waitFor(t, func() bool {
+			copies, err := reg.Copies(ctx, "other")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, cp := range copies {
+				if cp.Shard == d {
+					return cp.Expired()
+				}
+			}
+			return false
+		})
 		renewed, _ = reg.RenewLeases(ctx, "n1", long)
 		for _, s := range renewed {
 			if s == d {

@@ -264,3 +264,22 @@ func TestParseKeyGivenTwiceKeepsLast(t *testing.T) {
 		t.Fatalf("Parse kept %#v, want value 2", n)
 	}
 }
+
+// Decoded reads a parsed leaf's value, and decodes a hand-built leaf's raw value the
+// same way.
+func TestLeafDecoded(t *testing.T) {
+	parsed, ok := mustParse(t, `{"field":"a","op":"in","value":[" X ",1,true]}`).(*Leaf)
+	if !ok {
+		t.Fatal("not a leaf")
+	}
+	byHand := &Leaf{Field: "a", Op: OpIn, Value: []byte(`[" X ",1,true]`)}
+	for _, l := range []*Leaf{parsed, byHand} {
+		a := l.Decoded()
+		if a.Kind != ArgList || len(a.List) != 3 || a.List[0].Norm != "x" || a.List[1].Number != 1 || !a.List[2].Bool {
+			t.Fatalf("Decoded() = %+v", a)
+		}
+	}
+	if a := (&Leaf{Field: "a", Op: OpExists}).Decoded(); a.Kind != ArgNone {
+		t.Fatalf("no value decoded as %+v", a)
+	}
+}

@@ -211,15 +211,17 @@ The percolator reverse-indexes the saved queries.
   - **`eq` / `in`:** value keys.
   - **`has*`:** entry keys.
   - **`words_*`:** word keys.
-  - **`contains*` / `starts_with`:** the needle's rarest trigram.
+  - **`contains*` / `starts_with`:** the needle's rarest 3-character window. A needle shorter than three characters anchors on "the field has a text".
+  - **`similar`** (min > 0): the union of the text's pg_trgm trigram keys. This is sound because a document sharing no trigram has similarity exactly 0 (`SimilarityKeys`), and 0 is below any minimum the matcher accepts (0 < min ≤ 1).
   - **Ranges:** interval anchors.
   - **`exists:true` / `nonempty`:** `present` keys.
   - **`all`:** the lowest-frequency child set. Frequencies come from the shard's document statistics.
+  - **`all`, pairs:** when cheaper, a pair of two children whose sets are made only of value, bool, entry or word keys, anchored on every pair of one key from each, at most 16 pairs per group. This is sound because both children hold whenever the group does, so a matching document holds a key of each. A document finds its pairs by walking the partner lists of the pair halves it holds, in time linear in those lists rather than quadratic in its keys. Past a budget, it adds every query any held half belongs to, which is also sound.
   - **`any`:** the union of the children's sets. One unanchorable child makes the whole group unanchorable.
-  - **Unanchorable:** `not`, `ne`, `exists:false`, `empty`, `similar` (v1), and the root `{"all": []}`. These go on the always-check list.
-- **Query index.** Anchors are stored per shard in percolator segments: a term dictionary → postings of query ordinals, an interval tree per field, the compiled query ASTs, and the always-check list. It is refreshed and merged exactly like document segments.
+  - **Unanchorable:** `not`, `ne`, `exists:false`, `empty`, and the root `{"all": []}`. These go on the always-check list.
+- **Query index.** Anchors are stored per shard in percolator segments: a term dictionary → postings of query ordinals, pair partner lists, an interval tree per field, the stored queries (compiled on open by a background warm-up), and the always-check list. It is refreshed and merged exactly like document segments.
 - **Per document:**
-  1. Analyze it into atoms: values, entries, words, every trigram, `present` keys and numbers. Atoms are never truncated or sampled.
+  1. Analyze it into atoms: values, entries, words, every 3-character window of the whole text, trigram keys, `present` keys and numbers. Atoms are never truncated or sampled.
   2. Probe the query index to get candidates.
   3. Add the always-check list.
   4. Verify each candidate with the exact matcher.
@@ -407,7 +409,8 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | Durability of acknowledgement | committed to SQL |
 | Coordination | database leases only |
 | Default copies | every node holds every shard |
-| `similar` anchoring | always-check in v1 |
+| `similar` anchoring | trigram keys (union) when min > 0 |
+| Conjunctive anchors | pairs of two `all` children, at most 16 per group, probed in linear time |
 | History ops | stay in scrape-bot |
 | BM25 / nested documents | v2 |
 | Go | 1.25 |

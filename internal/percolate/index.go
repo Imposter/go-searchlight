@@ -12,8 +12,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Imposter/go-searchlight/internal/query"
@@ -169,7 +171,14 @@ func (Index) Open(dir, name string) (shard.QuerySegment, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openData(path, data)
+	seg, err := openData(path, data)
+	if err != nil {
+		return nil, err
+	}
+	if warmOnOpen {
+		seg.warm()
+	}
+	return seg, nil
 }
 
 // ---- building ----
@@ -643,6 +652,11 @@ type Segment struct {
 	// compiled caches each verification class's compiled query, compiled on first use
 	// (by its representative's ordinal).
 	compiled []atomic.Pointer[query.Compiled]
+
+	// stop ends the warm-up (see warm) at Close; warmed is closed once it has ended.
+	stop     chan struct{}
+	warmed   chan struct{}
+	stopOnce sync.Once
 }
 
 var _ shard.QuerySegment = (*Segment)(nil)
@@ -991,8 +1005,15 @@ func (s *Segment) Query(ord uint32) (shard.StoredQuery, error) {
 	return shard.StoredQuery{ID: string(id), Seq: seq, Query: n, Meta: m}, nil
 }
 
-// Close implements [shard.QuerySegment]. The segment's memory is the collector's.
-func (s *Segment) Close() error { return nil }
+// Close implements [shard.QuerySegment]: it stops the warm-up (see warm) and waits
+// for it. The segment's memory is the collector's.
+func (s *Segment) Close() error {
+	if s.stop != nil {
+		s.stopOnce.Do(func() { close(s.stop) })
+		<-s.warmed
+	}
+	return nil
+}
 
 // id returns query ord's id (a view into the segment).
 func (s *Segment) id(ord uint32) []byte {
@@ -1393,3 +1414,62 @@ func (s *Segment) pairAt(r int) (partner uint32, posts []byte) {
 
 // NumEntries is how many terms the segment's dictionary holds.
 func (s *Segment) NumEntries() uint32 { return uint32(len(s.entries) / entrySize) } //nolint:gosec // validated against a u32 count
+
+// warmSlots bounds the goroutines warming segments across the process, so a merge or a
+// reopen never takes every core from percolation.
+var warmSlots = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/4))
+
+// warmOnOpen turns the warm-up on (benchmarks turn it off to measure a cold segment).
+var warmOnOpen = true
+
+// warmBatch is how many queries a warm-up compiles per slot it takes.
+const warmBatch = 256
+
+// warm compiles every verification class in the background, so the first documents
+// after a refresh, a merge or a reopen do not pay for compiling their candidates (a
+// cold 100k-query segment costs about 10 µs per class). Up to cap(warmSlots) workers
+// per segment claim batches in turn, each holding one of the process-wide warmSlots
+// per batch, until done or Close; a class a percolation compiles first is found
+// compiled.
+func (s *Segment) warm() {
+	s.stop, s.warmed = make(chan struct{}), make(chan struct{})
+	batches := int((s.n + warmBatch - 1) / warmBatch)
+	workers := min(cap(warmSlots), batches)
+	if workers == 0 {
+		close(s.warmed)
+		return
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for {
+				b := next.Add(1) - 1
+				if b >= int64(batches) {
+					return
+				}
+				select {
+				case warmSlots <- struct{}{}:
+				case <-s.stop:
+					return
+				}
+				start := uint32(b) * warmBatch //nolint:gosec // b < batches, which fit a u32
+				for ord := start; ord < min(start+warmBatch, s.n); ord++ {
+					if s.class(ord) == ord && s.compiled[ord].Load() == nil {
+						_, _ = s.compiledQuery(ord) // a parse error surfaces at verification
+					}
+				}
+				<-warmSlots
+				select {
+				case <-s.stop:
+					return
+				default:
+				}
+			}
+		})
+	}
+	go func() {
+		wg.Wait()
+		close(s.warmed)
+	}()
+}

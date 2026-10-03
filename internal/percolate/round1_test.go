@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -168,6 +169,56 @@ func TestVerificationsCountMatchCalls(t *testing.T) {
 	}
 	if st.verifiedMatch != 2 || st.verifiedMiss != 1 || st.matched != 3 {
 		t.Fatalf("Match calls %d match, %d miss; %d matched; want 2, 1, 3", st.verifiedMatch, st.verifiedMiss, st.matched)
+	}
+}
+
+// Opening a segment compiles every class in the background; Close stops the warm-up
+// and waits for it.
+func TestWarmUpCompilesEveryClass(t *testing.T) {
+	dir := t.TempDir()
+	qs := make([]shard.StoredQuery, 3000)
+	for i := range qs {
+		qs[i] = shard.StoredQuery{ID: fmt.Sprintf("q%05d", i), Query: parseQuery(t, fmt.Sprintf(`{"field":"brand","op":"eq","value":"b%d"}`, i))}
+	}
+	if _, err := (Index{}).Build(context.Background(), dir, "w", qs, nil); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Index{}.Open(dir, "w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg, ok := opened.(*Segment)
+	if !ok {
+		t.Fatalf("Open returned %T", opened)
+	}
+	select {
+	case <-seg.warmed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the warm-up did not finish")
+	}
+	for ord := range seg.NumQueries() {
+		if seg.compiled[seg.class(ord)].Load() == nil {
+			t.Fatalf("class of query %d not compiled", ord)
+		}
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Close on a segment still warming returns once the warm-up has stopped.
+	opened, err = Index{}.Open(dir, "w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil { // idempotent
+		t.Fatal(err)
+	}
+	if seg, ok := opened.(*Segment); !ok {
+		t.Fatalf("Open returned %T", opened)
+	} else if _, running := <-seg.warmed; running {
+		t.Fatal("warm-up still running after Close")
 	}
 }
 

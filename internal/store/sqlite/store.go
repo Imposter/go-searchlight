@@ -13,7 +13,7 @@
 // retried like a Postgres serialization failure or a MySQL deadlock: the
 // whole transaction was never committed, so running it again is safe.
 //
-// A batch is written as multi-row INSERTs sized to SQLite's variable limit,
+// A batch is written one row a statement, each prepared once per batch,
 // and writes that are read back use RETURNING (SQLite 3.35 and later).
 package sqlite
 

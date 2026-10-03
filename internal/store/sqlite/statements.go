@@ -12,10 +12,6 @@ const now = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)"
 // withNow spells the clock: the statements below write NOW for it.
 func withNow(q string) string { return strings.ReplaceAll(q, "NOW", "("+now+")") }
 
-// maxParams is SQLite's bind-variable limit (SQLITE_MAX_VARIABLE_NUMBER,
-// 32766 since SQLite 3.32); a multi-row INSERT takes as many rows as fit.
-const maxParams = 32766
-
 // copyColumns is dialect.Registry's CopyColumns.
 const copyColumns = "index_name, shard, slot, node_id, state, applied_seq, epoch, lease_until, NOW"
 
@@ -42,27 +38,48 @@ var changelog = dialect.Changelog{
 	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
-// write spells w as multi-row INSERTs as large as the variable limit allows,
-// upserts with ON CONFLICT, and IN-list deletes.
+// write spells w one row a statement: the store prepares a statement that
+// repeats once and runs it for each row. SQLite has no round trips to save,
+// and compiling a multi-row VALUES list costs more than stepping a prepared
+// statement per row (Apply of 1000 rows: about 1.9x the throughput of
+// 500-row statements, see the store benchmarks).
 func write(w *dialect.Write) []dialect.Stmt {
-	out := dialect.Values("insert changes", "INSERT INTO sl_changes ("+dialect.ChangeColumns+") VALUES ", "",
-		9, maxParams, 0, dialect.ChangeArgs(w.Changes))
-	out = append(out, dialect.Values("upsert documents", "INSERT INTO sl_documents ("+dialect.DocumentColumns+") VALUES ",
-		" ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, seq = excluded.seq",
-		5, maxParams, 0, dialect.DocumentArgs(w.Documents))...)
-	out = append(out, dialect.Values("upsert queries", "INSERT INTO sl_queries ("+dialect.QueryColumns+") VALUES ",
-		" ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq",
-		6, maxParams, 0, dialect.QueryArgs(w.Queries))...)
+	out := make([]dialect.Stmt, 0, len(w.Changes)+len(w.Documents)+len(w.Queries)+len(w.DocumentDeletes)+len(w.QueryDeletes)+1)
+	for i := range w.Changes {
+		r := &w.Changes[i]
+		out = append(out, dialect.Stmt{
+			What: "insert changes", SQL: insertChange,
+			Args: []any{r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, r.At, r.IndexUID, r.MappingVersion},
+		})
+	}
+	for i := range w.Documents {
+		r := &w.Documents[i]
+		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, r.Seq}})
+	}
+	for i := range w.Queries {
+		r := &w.Queries[i]
+		out = append(out, dialect.Stmt{What: "upsert queries", SQL: upsertQuery, Args: []any{r.Index, r.Shard, r.ID, r.Query, r.Meta, r.Seq}})
+	}
 	for _, g := range w.DocumentDeletes {
-		out = append(out, dialect.In("delete documents", "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id IN (", ")",
-			[]any{g.Index, g.Shard}, g.IDs, maxParams)...)
+		for _, id := range g.IDs {
+			out = append(out, dialect.Stmt{What: "delete documents", SQL: deleteDocument, Args: []any{g.Index, g.Shard, id}})
+		}
 	}
 	for _, g := range w.QueryDeletes {
-		out = append(out, dialect.In("delete queries", "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id IN (", ")",
-			[]any{g.Index, g.Shard}, g.IDs, maxParams)...)
+		for _, id := range g.IDs {
+			out = append(out, dialect.Stmt{What: "delete queries", SQL: deleteQuery, Args: []any{g.Index, g.Shard, id}})
+		}
 	}
 	return append(out, dialect.Stmt{What: "advance counter", SQL: "UPDATE sl_counter SET value = ? WHERE id = 1", Args: []any{w.Counter}})
 }
+
+const (
+	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	upsertDocument = "INSERT INTO sl_documents (index_name, shard, id, body, seq) VALUES (?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, seq = excluded.seq"
+	upsertQuery    = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq"
+	deleteDocument = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
+	deleteQuery    = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
+)
 
 var records = dialect.Records{
 	GetDocument: "SELECT body, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",

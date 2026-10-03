@@ -99,7 +99,9 @@ type Changelog struct {
 	DocumentSeq string
 	QuerySeq    string
 	// Write returns the statements that store w, in order, inside the
-	// transaction holding the counter lock.
+	// transaction holding the counter lock. The store prepares a statement
+	// text that runs several times in a row once for the run, so one row a
+	// statement costs no parse per row.
 	Write func(w *Write) []Stmt
 	// ChangesAfter: (index, shard, seq, limit) -> seq, kind, id, payload, at,
 	// index_uid, mapping_version of the shard's changes after seq, by seq.

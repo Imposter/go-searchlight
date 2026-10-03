@@ -360,11 +360,37 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 
 // write runs the dialect's statements for w inside tx, which holds the
 // counter lock: the changelog rows, the net state, the counter's new value
-// and the notifications.
+// and the notifications. A statement text that runs several times in a row
+// is prepared once for the run.
 func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) error {
-	for _, st := range s.d.Changelog.Write(w) {
-		if _, err := tx.ExecContext(ctx, st.SQL, st.Args...); err != nil {
+	stmts := s.d.Changelog.Write(w)
+	var run *sql.Stmt // prepared for stmts[i].SQL while it repeats
+	defer func() {
+		if run != nil {
+			run.Close()
+		}
+	}()
+	for i, st := range stmts {
+		repeats := i+1 < len(stmts) && stmts[i+1].SQL == st.SQL
+		var err error
+		switch {
+		case run != nil:
+			_, err = run.ExecContext(ctx, st.Args...)
+		case repeats:
+			if run, err = tx.PrepareContext(ctx, st.SQL); err == nil {
+				_, err = run.ExecContext(ctx, st.Args...)
+			}
+		default:
+			_, err = tx.ExecContext(ctx, st.SQL, st.Args...)
+		}
+		if err != nil {
 			return fmt.Errorf("%s: %w", st.What, err)
+		}
+		if run != nil && !repeats {
+			if err := run.Close(); err != nil {
+				return fmt.Errorf("%s: %w", st.What, err)
+			}
+			run = nil
 		}
 	}
 	return nil

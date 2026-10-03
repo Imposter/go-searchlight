@@ -15,15 +15,18 @@ import (
 // instruments are a shard's metrics (spec section 11), labelled with its index and
 // shard.
 type instruments struct {
-	refresh    metric.Float64Histogram
-	merge      metric.Float64Histogram
-	mergeBytes metric.Int64Counter
-	backlog    metric.Float64Gauge
-	segments   metric.Float64Gauge
-	bufferDocs metric.Float64Gauge
-	documents  metric.Float64Gauge
-	diskBytes  metric.Float64Gauge
-	changes    metric.Int64Counter
+	refresh metric.Float64Histogram
+	merge   metric.Float64Histogram
+
+	refreshFailures metric.Int64Counter
+	mergeFailures   metric.Int64Counter
+	mergeBytes      metric.Int64Counter
+	backlog         metric.Float64Gauge
+	segments        metric.Float64Gauge
+	bufferDocs      metric.Float64Gauge
+	documents       metric.Float64Gauge
+	diskBytes       metric.Float64Gauge
+	changes         metric.Int64Counter
 
 	attrs     metric.MeasurementOption
 	kindAttrs [QueryDelete + 1]metric.AddOption
@@ -36,16 +39,19 @@ func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logge
 	in := telemetry.NewInstruments(meter)
 	base := []attribute.KeyValue{attribute.String(telemetry.KeyIndex, index), attribute.Int(telemetry.KeyShard, shard)}
 	i := &instruments{
-		refresh:    in.Histogram(telemetry.MetricRefreshDuration),
-		merge:      in.Histogram(telemetry.MetricMergeDuration),
-		mergeBytes: in.Counter(telemetry.MetricMergeBytes),
-		backlog:    in.Gauge(telemetry.MetricMergeBacklog),
-		segments:   in.Gauge(telemetry.MetricShardSegments),
-		bufferDocs: in.Gauge(telemetry.MetricShardBufferDocs),
-		documents:  in.Gauge(telemetry.MetricShardDocuments),
-		diskBytes:  in.Gauge(telemetry.MetricShardDiskSize),
-		changes:    in.Counter(telemetry.MetricIndexChanges),
-		attrs:      metric.WithAttributeSet(attribute.NewSet(base...)),
+		refresh: in.Histogram(telemetry.MetricRefreshDuration),
+		merge:   in.Histogram(telemetry.MetricMergeDuration),
+
+		refreshFailures: in.Counter(telemetry.MetricRefreshFailures),
+		mergeFailures:   in.Counter(telemetry.MetricMergeFailures),
+		mergeBytes:      in.Counter(telemetry.MetricMergeBytes),
+		backlog:         in.Gauge(telemetry.MetricMergeBacklog),
+		segments:        in.Gauge(telemetry.MetricShardSegments),
+		bufferDocs:      in.Gauge(telemetry.MetricShardBufferDocs),
+		documents:       in.Gauge(telemetry.MetricShardDocuments),
+		diskBytes:       in.Gauge(telemetry.MetricShardDiskSize),
+		changes:         in.Counter(telemetry.MetricIndexChanges),
+		attrs:           metric.WithAttributeSet(attribute.NewSet(base...)),
 	}
 	for k := Upsert; k <= QueryDelete; k++ {
 		i.kindAttrs[k] = metric.WithAttributeSet(attribute.NewSet(append(base[:2:2], attribute.String("kind", k.String()))...))

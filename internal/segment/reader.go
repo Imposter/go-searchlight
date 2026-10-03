@@ -2,6 +2,7 @@ package segment
 
 import (
 	"bytes"
+	"errors"
 	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -46,6 +47,7 @@ type Reader struct {
 	fields    map[string]*fieldInfo
 	stored    storedIndex
 	ids       *termDict // the IDS section; nil for a segment with no documents
+	numTerms  uint64    // every field's terms, all kinds, added up
 	cache     *storedCache
 	ownsCache bool
 	closed    atomic.Bool
@@ -168,6 +170,7 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 				return &CorruptError{Path: r.path, Section: "terms", Reason: err.Error()}
 			}
 			fi.dicts[k] = dict
+			r.numTerms += uint64(dict.numTerms)
 		}
 		if keywordColOff != 0 {
 			kc, err := openKeywordColumn(r.data, keywordColOff, r.numDocs, fi.dicts[KindValue])
@@ -228,6 +231,21 @@ func (r *Reader) validBitmap(rg region) bool {
 
 // NumDocs returns how many document ordinals the segment holds, live and deleted.
 func (r *Reader) NumDocs() uint32 { return r.numDocs }
+
+// NumTerms returns how many terms the segment's dictionaries hold: every field and
+// kind, added up (a term in two fields counts twice).
+func (r *Reader) NumTerms() uint64 { return r.numTerms }
+
+// ResidentBytes returns how many bytes of the segment's mapping are resident in memory
+// now (mincore on Linux, the working set on Windows), or errors.ErrUnsupported where
+// the platform has no way to ask, or for a Reader with no mapping of its own. It walks
+// the mapping's pages, so it is for metrics, not for a hot path.
+func (r *Reader) ResidentBytes() (int64, error) {
+	if r.m == nil || r.closed.Load() {
+		return 0, errors.ErrUnsupported
+	}
+	return residentBytes(r.data)
+}
 
 // Postings returns term's documents, or an empty bitmap when field has no such
 // dictionary or term is not in it.
@@ -410,6 +428,8 @@ func (r *Reader) Retain() *Reader {
 		fields:  r.fields,
 		stored:  r.stored,
 		ids:     r.ids,
+
+		numTerms: r.numTerms,
 	}
 	if cache, err := newStoredCache(); err == nil {
 		nr.cache = cache

@@ -1209,3 +1209,38 @@ func TestNoDirSync(t *testing.T) {
 		t.Fatalf("WriteDeletes with NoDirSync: %+v syncs", got)
 	}
 }
+
+func TestNumTermsAndResidentBytes(t *testing.T) {
+	r := mustBuild(t, testDocs(t))
+	var want uint64
+	for name, fi := range r.fields {
+		for k := range TermKind(numKinds) {
+			if fi.dicts[k] == nil {
+				continue
+			}
+			r.Terms(name, k, "", func(string, uint32) bool { want++; return true })
+		}
+	}
+	if got := r.NumTerms(); got != want || want == 0 {
+		t.Fatalf("NumTerms = %d, want %d", got, want)
+	}
+	for ord := range r.NumDocs() {
+		if _, err := r.Stored(ord); err != nil { // touch the stored blocks
+			t.Fatal(err)
+		}
+	}
+	got, err := r.ResidentBytes()
+	if errors.Is(err, errors.ErrUnsupported) {
+		t.Skipf("no residency on %s", runtime.GOOS)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got <= 0 || got > int64(len(r.data)) {
+		t.Fatalf("ResidentBytes = %d of a %d-byte mapping", got, len(r.data))
+	}
+	_ = r.Close()
+	if _, err := r.ResidentBytes(); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("ResidentBytes after Close = %v", err)
+	}
+}

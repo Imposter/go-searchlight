@@ -34,9 +34,10 @@ func analyze(t testing.TB, id, body string) *schema.Doc {
 	return &d
 }
 
-// testOptions are quiet, manual options: no background refresh or merges.
+// testOptions are quiet, manual options: no background refresh or merges, and a
+// filter cache of the test's own (so its Stats are the test's alone).
 func testOptions() Options {
-	return Options{RefreshInterval: -1, DisableMerges: true, Logger: quietLogger}
+	return Options{RefreshInterval: -1, DisableMerges: true, Logger: quietLogger, FilterCache: NewFilterCache(1<<20, nil)}
 }
 
 // harness drives one shard against a model: every applied change is mirrored in

@@ -398,3 +398,22 @@ func TestForceMergeEndsUnderSteadyDeletes(t *testing.T) {
 	}
 	h.check()
 }
+
+// M6: shards opened without a merge budget or filter cache share the process-wide
+// ones, never a private one each.
+func TestDefaultBudgetAndCacheAreShared(t *testing.T) {
+	opts := testOptions()
+	opts.FilterCache = nil
+	a, b := newHarness(t, opts), newHarness(t, opts)
+	if a.s.opts.MergeBudget != b.s.opts.MergeBudget || a.s.opts.MergeBudget != DefaultMergeBudget() {
+		t.Fatal("two shards with no MergeBudget do not share the default one")
+	}
+	if a.s.opts.FilterCache != b.s.opts.FilterCache || a.s.opts.FilterCache != DefaultFilterCache() {
+		t.Fatal("two shards with no FilterCache do not share the default one")
+	}
+	own := NewMergeBudget(1, 0)
+	opts.MergeBudget = own
+	if c := newHarness(t, opts); c.s.opts.MergeBudget != own {
+		t.Fatal("an explicit MergeBudget was replaced")
+	}
+}

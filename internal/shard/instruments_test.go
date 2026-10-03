@@ -23,6 +23,7 @@ func TestShardMetrics(t *testing.T) {
 	meter := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 	opts := testOptions()
 	opts.Meter = meter
+	opts.FilterCache = NewFilterCache(1<<20, meter)
 	opts.Index, opts.Shard = "products", 3
 	h := newHarness(t, opts)
 	h.upsert("a", "b")

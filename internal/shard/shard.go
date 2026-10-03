@@ -182,11 +182,12 @@ type Options struct {
 	// DisableMerges turns background merges off; ForceMerge still merges.
 	DisableMerges bool
 	// MergeBudget bounds merge CPU and I/O. Share one across every shard on a node
-	// (NewMergeBudget(cfg.MergeThreads, cfg.MergeBudget)). Nil gives this shard a
-	// private one with GOMAXPROCS/4 threads and no I/O limit.
+	// (NewMergeBudget(cfg.MergeThreads, cfg.MergeBudget)). Nil means the process-wide
+	// [DefaultMergeBudget], so shards opened without one still share a budget.
 	MergeBudget *MergeBudget
 	// FilterCache caches leaf bitmaps per segment. Share one across every shard on a
-	// node. Nil gives this shard a private one of DefaultFilterCacheBytes.
+	// node, made with the node's meter so its hits and misses are counted. Nil means
+	// the process-wide [DefaultFilterCache], which counts them only in Stats.
 	FilterCache *FilterCache
 	// QueryIndex builds and opens the percolator's query segments. Nil means the
 	// built-in [DefaultQueryIndex], which stores queries without anchors.
@@ -213,6 +214,25 @@ const (
 	DefaultFilterCacheBytes = 64 << 20
 )
 
+// The process-wide defaults: every shard opened without its own shares them, so a
+// node's shards never each get a private budget or cache by accident.
+var (
+	defaultMergeBudget = sync.OnceValue(func() *MergeBudget {
+		return NewMergeBudget(max(1, runtime.GOMAXPROCS(0)/4), 0)
+	})
+	defaultFilterCache = sync.OnceValue(func() *FilterCache {
+		return NewFilterCache(DefaultFilterCacheBytes, nil)
+	})
+)
+
+// DefaultMergeBudget returns the process-wide merge budget shards use when Options
+// has none: GOMAXPROCS/4 threads (at least one) and no I/O limit.
+func DefaultMergeBudget() *MergeBudget { return defaultMergeBudget() }
+
+// DefaultFilterCache returns the process-wide filter cache shards use when Options has
+// none: DefaultFilterCacheBytes, with no metrics.
+func DefaultFilterCache() *FilterCache { return defaultFilterCache() }
+
 func (o *Options) resolve() {
 	if o.RefreshInterval == 0 {
 		o.RefreshInterval = DefaultRefreshInterval
@@ -231,7 +251,7 @@ func (o *Options) resolve() {
 		o.MergePolicy = &p
 	}
 	if o.MergeBudget == nil {
-		o.MergeBudget = NewMergeBudget(max(1, runtime.GOMAXPROCS(0)/4), 0)
+		o.MergeBudget = DefaultMergeBudget()
 	}
 	if o.QueryIndex == nil {
 		o.QueryIndex = DefaultQueryIndex{}
@@ -246,7 +266,7 @@ func (o *Options) resolve() {
 		o.Tracer = tracenoop.NewTracerProvider().Tracer(telemetry.ScopeName)
 	}
 	if o.FilterCache == nil {
-		o.FilterCache = NewFilterCache(DefaultFilterCacheBytes, o.Meter)
+		o.FilterCache = DefaultFilterCache()
 	}
 }
 

@@ -60,7 +60,7 @@ type queries struct {
 	changesAfter, horizon                   string
 	docSeq, querySeq                        string
 	scanDocs, scanQueries                   string
-	indexExists                             string
+	indexUID                                string
 }
 
 func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore, error) {
@@ -82,14 +82,14 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		updateCounter: s.bind("UPDATE sl_counter SET value = ? WHERE id = 1"),
 		readCounter:   s.bind("SELECT value FROM sl_counter WHERE id = 1"),
 		readEpoch:     "SELECT value FROM sl_counter WHERE id = 2",
-		changesAfter: s.bind(`SELECT seq, kind, id, payload, at FROM sl_changes
+		changesAfter: s.bind(`SELECT seq, kind, id, payload, at, index_uid FROM sl_changes
 WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?`),
 		horizon:     s.bind("SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?"),
 		docSeq:      s.bind("SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"),
 		querySeq:    s.bind("SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"),
 		scanDocs:    s.bind("SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id"),
 		scanQueries: s.bind("SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id"),
-		indexExists: s.bind("SELECT COUNT(*) FROM sl_indexes WHERE name = ?"),
+		indexUID:    s.bind("SELECT uid FROM sl_indexes WHERE name = ?"),
 	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
@@ -305,7 +305,8 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	}
 	first, last = counter+1, counter+int64(len(batch))
 
-	if err := s.checkIndexes(ctx, tx, batch); err != nil {
+	uids, err := s.checkIndexes(ctx, tx, batch)
+	if err != nil {
 		return 0, 0, err
 	}
 	if p.conditional {
@@ -314,13 +315,15 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		}
 	}
 
-	// The changelog.
-	args := make([]any, 0, len(batch)*7)
+	// The changelog. Each row carries the uid of the incarnation of its
+	// index as of this Apply, so a tailer can tell a drop-and-recreate apart
+	// from a continuing index without an extra query per batch.
+	args := make([]any, 0, len(batch)*8)
 	for i := range batch {
 		c := &batch[i]
-		args = append(args, first+int64(i), c.Index, c.Shard, string(c.Kind), c.ID, p.payload[i], nowMs)
+		args = append(args, first+int64(i), c.Index, c.Shard, string(c.Kind), c.ID, p.payload[i], nowMs, uids[c.Index])
 	}
-	if err := s.insertRows(ctx, tx, "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at) VALUES ", 7, args, ""); err != nil {
+	if err := s.insertRows(ctx, tx, "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid) VALUES ", 8, args, ""); err != nil {
 		return 0, 0, fmt.Errorf("insert changes: %w", err)
 	}
 
@@ -347,35 +350,38 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 }
 
 // checkIndexes fails with an *IndexNotFoundError naming every change whose
-// index does not exist.
-func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) error {
-	exists := make(map[string]bool, 1)
+// index does not exist, and otherwise returns each named index's current
+// incarnation (sl_indexes.uid), so the changelog row can carry it.
+func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) (map[string]string, error) {
+	uids := make(map[string]string, 1)
 	var missing *IndexNotFoundError
 	for i := range batch {
 		name := batch[i].Index
-		ok, seen := exists[name]
+		uid, seen := uids[name]
 		if !seen {
-			var n int
-			if err := tx.QueryRowContext(ctx, s.q.indexExists, name).Scan(&n); err != nil {
-				return err
+			err := tx.QueryRowContext(ctx, s.q.indexUID, name).Scan(&uid)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				uid = ""
+			case err != nil:
+				return nil, err
 			}
-			ok = n > 0
-			exists[name] = ok
-			if !ok {
+			uids[name] = uid
+			if uid == "" {
 				if missing == nil {
 					missing = &IndexNotFoundError{}
 				}
 				missing.Indexes = append(missing.Indexes, name)
 			}
 		}
-		if !ok {
+		if uid == "" {
 			missing.Positions = append(missing.Positions, i)
 		}
 	}
 	if missing != nil {
-		return missing
+		return nil, missing
 	}
-	return nil
+	return uids, nil
 }
 
 // checkConditions evaluates IfSeq conditions in batch order, as if each
@@ -572,7 +578,7 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		var kind string
 		var payload []byte
 		var at int64
-		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &at); err != nil {
+		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &at, &c.IndexUID); err != nil {
 			return nil, err
 		}
 		c.Kind = Kind(kind)
@@ -618,14 +624,20 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	if err := tx.QueryRowContext(ctx, s.q.readCounter).Scan(&asOf); err != nil {
 		return 0, err
 	}
+	// The index's current incarnation, read once in this scan's snapshot and
+	// stamped on every record, instead of a query per row.
+	var uid string
+	if err := tx.QueryRowContext(ctx, s.q.indexUID, shard.Index).Scan(&uid); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
 	if err := scanRows(ctx, tx, s.q.scanDocs, shard, func(rows *sql.Rows) (Record, error) {
-		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard}
+		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Seq)
 	}, fn); err != nil {
 		return 0, err
 	}
 	if err := scanRows(ctx, tx, s.q.scanQueries, shard, func(rows *sql.Rows) (Record, error) {
-		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard}
+		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
 	}, fn); err != nil {
 		return 0, err

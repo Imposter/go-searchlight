@@ -149,8 +149,10 @@ type BlobStore interface {
 
 // IndexStore is the index catalogue in sl_indexes.
 type IndexStore interface {
-	// Create adds an index, or returns ErrExists. It returns the stored entry
-	// (version 1).
+	// Create adds an index, or returns ErrExists. It returns the stored
+	// entry (version 1), with a fresh IndexMeta.UID: creating an index under
+	// a name a prior index once held, after it was Dropped, is a new
+	// incarnation, distinct from the old one even though the name repeats.
 	Create(ctx context.Context, m IndexMeta) (IndexMeta, error)
 	// Get returns an index or ErrNotFound.
 	Get(ctx context.Context, name string) (IndexMeta, error)

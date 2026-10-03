@@ -8,7 +8,10 @@ CREATE TABLE IF NOT EXISTS sl_indexes (
 	mapping LONGTEXT CHARACTER SET utf8mb4 NOT NULL,
 	settings LONGTEXT CHARACTER SET utf8mb4 NOT NULL,
 	version BIGINT NOT NULL,
-	created_at BIGINT NOT NULL
+	created_at BIGINT NOT NULL,
+	-- uid identifies this incarnation of the index: fresh on every create, so
+	-- a drop followed by a recreate under the same name gets a new one.
+	uid VARBINARY(32) NOT NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS sl_documents (
@@ -38,6 +41,10 @@ CREATE TABLE IF NOT EXISTS sl_changes (
 	id VARBINARY(512) NOT NULL,
 	payload LONGTEXT CHARACTER SET utf8mb4 NOT NULL,
 	at BIGINT NOT NULL,
+	-- index_uid is the index's incarnation (sl_indexes.uid) as of this
+	-- change, so a tailer can tell a drop-and-recreate apart from a
+	-- continuing index without an extra query per batch.
+	index_uid VARBINARY(32) NOT NULL,
 	KEY sl_changes_shard_seq (index_name, shard, seq)
 ) ENGINE=InnoDB;
 

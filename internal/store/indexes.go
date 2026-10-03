@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -11,6 +13,15 @@ import (
 
 // indexStore implements IndexStore over sl_indexes.
 type indexStore struct{ s *sqlStore }
+
+// newIndexUID mints a fresh incarnation id for a created or recreated index.
+func newIndexUID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
 
 func validMeta(m *IndexMeta) error {
 	if err := validKey("index name", m.Name, MaxIndexName); err != nil {
@@ -35,8 +46,12 @@ func (x *indexStore) Create(ctx context.Context, m IndexMeta) (out IndexMeta, er
 	if err := validMeta(&m); err != nil {
 		return out, err
 	}
-	q := s.bind("INSERT INTO sl_indexes (name, mapping, settings, version, created_at) VALUES (?, ?, ?, 1, " + s.d.Now + ")")
-	if _, err := s.w.ExecContext(ctx, q, m.Name, string(m.Mapping), string(m.Settings)); err != nil {
+	uid, err := newIndexUID()
+	if err != nil {
+		return out, err
+	}
+	q := s.bind("INSERT INTO sl_indexes (name, mapping, settings, version, created_at, uid) VALUES (?, ?, ?, 1, " + s.d.Now + ", ?)")
+	if _, err := s.w.ExecContext(ctx, q, m.Name, string(m.Mapping), string(m.Settings), uid); err != nil {
 		// A key violation looks different on every dialect; look instead.
 		if _, gerr := x.get(ctx, m.Name); gerr == nil {
 			return out, fmt.Errorf("index %q: %w", m.Name, ErrExists)
@@ -50,8 +65,8 @@ func (x *indexStore) get(ctx context.Context, name string) (IndexMeta, error) {
 	s := x.s
 	m := IndexMeta{Name: name}
 	var created int64
-	err := s.r.QueryRowContext(ctx, s.bind("SELECT mapping, settings, version, created_at FROM sl_indexes WHERE name = ?"), name).
-		Scan(&m.Mapping, &m.Settings, &m.Version, &created)
+	err := s.r.QueryRowContext(ctx, s.bind("SELECT mapping, settings, version, created_at, uid FROM sl_indexes WHERE name = ?"), name).
+		Scan(&m.Mapping, &m.Settings, &m.Version, &created, &m.UID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, fmt.Errorf("index %q: %w", name, ErrNotFound)
 	}
@@ -69,7 +84,7 @@ func (x *indexStore) List(ctx context.Context) (out []IndexMeta, err error) {
 	s := x.s
 	ctx, end := s.start(ctx, "index_list")
 	defer end(&err)
-	rows, err := s.r.QueryContext(ctx, "SELECT name, mapping, settings, version, created_at FROM sl_indexes ORDER BY name")
+	rows, err := s.r.QueryContext(ctx, "SELECT name, mapping, settings, version, created_at, uid FROM sl_indexes ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +92,7 @@ func (x *indexStore) List(ctx context.Context) (out []IndexMeta, err error) {
 	for rows.Next() {
 		var m IndexMeta
 		var created int64
-		if err := rows.Scan(&m.Name, &m.Mapping, &m.Settings, &m.Version, &created); err != nil {
+		if err := rows.Scan(&m.Name, &m.Mapping, &m.Settings, &m.Version, &created, &m.UID); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = millis(created)

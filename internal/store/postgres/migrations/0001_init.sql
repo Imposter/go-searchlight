@@ -6,7 +6,10 @@ CREATE TABLE IF NOT EXISTS sl_indexes (
 	mapping TEXT NOT NULL,
 	settings TEXT NOT NULL,
 	version BIGINT NOT NULL,
-	created_at BIGINT NOT NULL
+	created_at BIGINT NOT NULL,
+	-- uid identifies this incarnation of the index: fresh on every create, so
+	-- a drop followed by a recreate under the same name gets a new one.
+	uid TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sl_documents (
@@ -35,7 +38,11 @@ CREATE TABLE IF NOT EXISTS sl_changes (
 	kind TEXT NOT NULL,
 	id TEXT NOT NULL,
 	payload TEXT NOT NULL,
-	at BIGINT NOT NULL
+	at BIGINT NOT NULL,
+	-- index_uid is the index's incarnation (sl_indexes.uid) as of this
+	-- change, so a tailer can tell a drop-and-recreate apart from a
+	-- continuing index without an extra query per batch.
+	index_uid TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS sl_changes_shard_seq ON sl_changes (index_name, shard, seq);

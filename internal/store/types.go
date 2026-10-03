@@ -81,6 +81,12 @@ type Change struct {
 	// it; IfAbsent requires the target not to exist. Zero applies
 	// unconditionally. It is not stored.
 	IfSeq int64
+	// IndexUID is the incarnation of Index this change was applied against,
+	// set by the store and returned by ChangesAfter. A tailer that sees a UID
+	// different from the one it last applied knows Index was dropped and
+	// recreated under the same name, and must recover from scratch rather
+	// than resume. Callers leave it zero.
+	IndexUID string
 }
 
 // ShardID returns the shard the change belongs to.
@@ -132,6 +138,8 @@ type Record struct {
 	Meta []byte
 	// Seq is the seq of the change that last wrote the record.
 	Seq int64
+	// IndexUID is Index's incarnation as of this scan (see Change.IndexUID).
+	IndexUID string
 }
 
 // IndexMeta is an index's catalogue entry in sl_indexes.
@@ -142,6 +150,10 @@ type IndexMeta struct {
 	// Version counts updates; Update succeeds only against the current one.
 	Version   int64
 	CreatedAt time.Time
+	// UID identifies this incarnation of the index: a fresh random id minted
+	// by Create, so a drop followed by a recreate under the same Name gets a
+	// different UID. It is set by the store, ignored on input.
+	UID string
 }
 
 // CopyState is a shard copy's lifecycle state.

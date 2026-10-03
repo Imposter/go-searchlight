@@ -274,15 +274,17 @@ func checkLoad(t *testing.T, st Store, got []applied) {
 		if a.first != next || a.last != a.first+int64(len(a.batch))-1 {
 			t.Fatalf("range %d..%d for %d changes, expected to start at %d", a.first, a.last, len(a.batch), next)
 		}
-		for i, c := range a.batch {
-			bySeq[a.first+int64(i)] = c
+		for i := range a.batch {
+			bySeq[a.first+int64(i)] = a.batch[i]
 		}
 		next = a.last + 1
 	}
 	total := 0
 	for shard := range 3 {
 		var prev int64
-		for _, c := range allChanges(t, st, ShardID{Index: "load", Shard: shard}) {
+		changes := allChanges(t, st, ShardID{Index: "load", Shard: shard})
+		for i := range changes {
+			c := &changes[i]
 			if c.Seq <= prev {
 				t.Fatalf("shard %d: seq %d after %d", shard, c.Seq, prev)
 			}
@@ -987,6 +989,49 @@ func TestRegistryConcurrentClaims(t *testing.T) {
 		}
 		if len(owners) != 3 {
 			t.Fatalf("copies %v", copies)
+		}
+	})
+}
+
+// TestIndexIncarnation checks a dropped-and-recreated index gets a fresh
+// UID, and that Apply and ScanShard stamp every Change and Record with the
+// incarnation they belong to, so a tailer can tell the two apart without an
+// extra query per batch.
+func TestIndexIncarnation(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		ix := st.Indexes()
+		m1, err := ix.Create(ctx, IndexMeta{Name: "inc"})
+		if err != nil || m1.UID == "" {
+			t.Fatalf("create: %+v %v", m1, err)
+		}
+		shard := ShardID{Index: "inc"}
+		mustApply(t, st, upsert("inc", 0, "a", `{}`))
+		changes := allChanges(t, st, shard)
+		if len(changes) != 1 || changes[0].IndexUID != m1.UID {
+			t.Fatalf("changes before recreate: %+v", changes)
+		}
+		recs, _ := scanAll(t, st, shard)
+		if r := recs["d:a"]; r.IndexUID != m1.UID {
+			t.Fatalf("scan before recreate: %+v", r)
+		}
+
+		if err := ix.Drop(ctx, "inc"); err != nil {
+			t.Fatal(err)
+		}
+		m2, err := ix.Create(ctx, IndexMeta{Name: "inc"})
+		if err != nil || m2.UID == "" || m2.UID == m1.UID {
+			t.Fatalf("recreate: %+v %v (first uid %q)", m2, err, m1.UID)
+		}
+		mustApply(t, st, upsert("inc", 0, "b", `{}`))
+		changes = allChanges(t, st, shard)
+		if len(changes) != 1 || changes[0].ID != "b" || changes[0].IndexUID != m2.UID {
+			t.Fatalf("changes after recreate: %+v", changes)
+		}
+		recs, _ = scanAll(t, st, shard)
+		if r := recs["d:b"]; len(recs) != 1 || r.IndexUID != m2.UID {
+			t.Fatalf("scan after recreate: %+v", recs)
 		}
 	})
 }

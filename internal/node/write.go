@@ -300,8 +300,8 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 		if sh == nil {
 			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", s)
 		}
-		if h := c.halted.Load(); h != nil {
-			return api.Unavailable(*h, "shard %d of index %q has halted", s, idx.name)
+		if err := c.notServing(); err != nil {
+			return err
 		}
 		if err := sh.Admit(); err != nil {
 			if errors.Is(err, shard.ErrBackpressure) {
@@ -460,8 +460,8 @@ func waitApplied(ctx context.Context, c *copyState, seq int64) error {
 		if sh.AppliedSeq() >= seq {
 			return nil
 		}
-		if h := c.halted.Load(); h != nil {
-			return *h
+		if err := c.notServing(); err != nil {
+			return err
 		}
 		if err := sh.Err(); err != nil {
 			return err

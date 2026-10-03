@@ -42,6 +42,11 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 	} else {
 		info.State = api.ShardRecovering
 	}
+	if hr, ok := c.tailer.(HaltReporter); ok {
+		if err := hr.HaltErr(); err != nil {
+			info.State, info.Error = api.ShardHalted, err.Error()
+		}
+	}
 	if sr, ok := c.tailer.(StateReporter); ok && info.State == api.ShardServing {
 		switch sr.StateName() {
 		case StateRecovering, StateIdle:
@@ -95,9 +100,11 @@ func (n *Single) Nodes(context.Context) ([]api.NodeInfo, error) {
 }
 
 // Ready implements [api.Coordinator] (spec section 10): the node is ready while it is
-// open, every copy has finished its startup recovery, and the database answered
-// within max_lag. A copy that halts or re-recovers later shows in health (red), not
-// here: the node still serves every other shard.
+// open, every copy has finished its startup recovery, the database answered within
+// max_lag, and no copy that is not halted trails the changelog by more than max_lag
+// (by its tailer's Lag, which keeps rising while its polls fail). A copy that halts
+// or re-recovers later shows in health (red), not here: the node still serves every
+// other shard.
 func (n *Single) Ready(context.Context) error {
 	n.mu.RLock()
 	closed := n.closed
@@ -111,13 +118,24 @@ func (n *Single) Ready(context.Context) error {
 	var waiting []error
 	for _, idx := range n.sortedIndexes() {
 		for _, c := range idx.copies {
-			if !c.startedUp() {
+			switch {
+			case !c.startedUp():
 				waiting = append(waiting, fmt.Errorf("%s is still recovering", c.id))
+			case c.halted.Load() == nil && haltErr(c) == nil && c.trailing(n.cfg.MaxLag):
+				waiting = append(waiting, fmt.Errorf("%s trails the changelog by more than max_lag (%s)", c.id, n.cfg.MaxLag))
 			}
 		}
 	}
 	if len(waiting) > 0 {
-		return api.Unavailable(errors.Join(waiting...), "%d shard copies have not finished their startup recovery", len(waiting))
+		return api.Unavailable(errors.Join(waiting...), "%d shard copies are recovering or behind", len(waiting))
+	}
+	return nil
+}
+
+// haltErr is why the copy's tailer has halted it, nil when it has not.
+func haltErr(c *copyState) error {
+	if hr, ok := c.tailer.(HaltReporter); ok {
+		return hr.HaltErr()
 	}
 	return nil
 }

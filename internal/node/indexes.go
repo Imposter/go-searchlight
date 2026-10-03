@@ -28,6 +28,9 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	if err := m.Validate(); err != nil {
 		return nil, err
 	}
+	if limit := n.maxIndexFields(); len(m.Fields) > limit {
+		return nil, api.InvalidAt("mapping.fields", "the mapping holds %d fields, over max_index_fields (%d)", len(m.Fields), limit)
+	}
 	if err := spec.Settings.Validate(); err != nil {
 		return nil, err
 	}
@@ -83,8 +86,45 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	}
 	n.indexes[name] = idx
 	n.mu.Unlock()
+	// A new copy recovers (from an empty snapshot) before it serves: answer once
+	// it does, so the client's next request finds it serving.
+	if err := n.waitServing(ctx, idx); err != nil {
+		n.log.WarnContext(ctx, "a new index's copies are not serving yet", slog.String("index", name), slog.Any("error", err))
+	}
 	n.log.InfoContext(ctx, "index created", slog.String("index", name), slog.Int("shards", spec.Settings.Shards), slog.String("uid", meta.UID))
 	return n.describe(idx), nil
+}
+
+// waitServing waits, under ctx and at most max_lag, until every copy of idx serves;
+// a halted copy ends the wait at once.
+func (n *Single) waitServing(ctx context.Context, idx *index) error {
+	ctx, cancel := context.WithTimeout(ctx, max(n.cfg.MaxLag, time.Second))
+	defer cancel()
+	delay := time.Millisecond
+	for {
+		var err error
+		for _, c := range idx.copies {
+			if err = c.notServing(); err != nil {
+				break
+			}
+		}
+		if err == nil {
+			return nil
+		}
+		for _, c := range idx.copies {
+			if c.halted.Load() != nil || haltErr(c) != nil {
+				return err
+			}
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+		delay = min(2*delay, 20*time.Millisecond)
+	}
 }
 
 // dropTimeout bounds dropping an index from the store.
@@ -239,9 +279,14 @@ func (n *Single) updateCatalog(ctx context.Context, idx *index, change func(st *
 // it is (store.ErrConflict), for the caller to re-read and retry. The catalogue lock
 // is held.
 func (n *Single) storeCatalogLocked(ctx context.Context, idx *index, cur *indexState, m *schema.Mapping, settings api.IndexSettings) (*indexState, error) {
-	mapping, err := json.Marshal(m)
-	if err != nil {
-		return nil, err
+	// An unchanged mapping keeps its stored bytes exactly: the store logs a
+	// mapping change (and copies may rebuild) whenever the bytes differ.
+	mapping := cur.meta.Mapping
+	if m != cur.mapping {
+		var err error
+		if mapping, err = json.Marshal(m); err != nil {
+			return nil, err
+		}
 	}
 	raw, err := json.Marshal(settings)
 	if err != nil {
@@ -253,9 +298,14 @@ func (n *Single) storeCatalogLocked(ctx context.Context, idx *index, cur *indexS
 	if errors.Is(err, store.ErrConflict) {
 		return nil, err
 	}
+	if errors.Is(err, store.ErrInvalid) {
+		// The only settings the store refuses to change: the shard count.
+		return nil, api.InvalidAt("settings.shards", "%v", err)
+	}
 	if err != nil {
 		return nil, storeError(err, idx.name)
 	}
+	// The entry as stored, with its new version and mapping version.
 	next := &indexState{meta: updated, mapping: m, settings: settings}
 	idx.meta.Store(next)
 	return next, nil
@@ -279,25 +329,17 @@ func (n *Single) reloadCatalog(ctx context.Context, idx *index) error {
 }
 
 // PatchMapping implements [api.Coordinator]: fields are added; a field that exists
-// with another type is a 400.
-//
-// An index with dynamic false is refused (409). Its documents keep unmapped fields in
-// their bodies unindexed, and mapping changes are not in the changelog: a copy that
-// applied a document before the field was added leaves it unindexed, while a copy
-// rebuilt afterwards (from the store's snapshot) indexes it, so the copies would
-// answer the same query differently. A strict index holds no unmapped field and a
-// dynamic one maps every field before its document commits, so adding fields to
-// either indexes no stored document differently on any copy.
+// with another type is a 400. The change goes through the store's Update, which logs
+// it to every shard's changelog; a copy holding a live document with a field the
+// change maps (a dynamic false index keeps such fields unindexed) is rebuilt at that
+// seq, so tailed and rebuilt copies agree, and the document becomes searchable on
+// the field.
 func (n *Single) PatchMapping(ctx context.Context, name string, fields map[string]schema.FieldType) (*api.IndexInfo, error) {
 	idx, err := n.lookup(name)
 	if err != nil {
 		return nil, err
 	}
 	_, err = n.updateCatalog(ctx, idx, func(st *indexState) (*schema.Mapping, api.IndexSettings, error) {
-		if st.mapping.Dynamic == schema.DynamicFalse {
-			return nil, st.settings, api.Conflict(api.CodeConflict,
-				"index %q has dynamic false: its documents may hold these fields unindexed, and adding them now would index them on rebuilt copies only; create a new index with the fields and reindex", name)
-		}
 		merged, err := st.mapping.Merge(schema.MappingUpdate{Fields: fields})
 		if err == nil {
 			if field := overFieldLimit(st.mapping, merged, n.maxIndexFields()); field != "" {

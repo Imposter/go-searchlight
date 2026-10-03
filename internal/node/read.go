@@ -39,6 +39,9 @@ func (n *Single) waitSeq(ctx context.Context, idx *index, seq int64) error {
 		c.tailer.Wake()
 	}
 	for _, c := range idx.copies {
+		if err := c.notServing(); err != nil {
+			return err
+		}
 		sh := c.shard()
 		if sh == nil {
 			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", c.id.Shard)
@@ -59,31 +62,14 @@ func (n *Single) waitSeq(ctx context.Context, idx *index, seq int64) error {
 	return nil
 }
 
-// headSeqer is a store that reads its newest committed seq (store.HeadSeq, from Task
-// 9).
-type headSeqer interface {
-	HeadSeq(ctx context.Context) (int64, error)
-}
-
 // checkHead refuses (400) a wait_for_seq past the newest committed seq, which no
-// copy would ever reach: the node's head is raised from the store's when it can read
-// it, else from what its copies have applied.
+// copy would ever reach: the node's head is raised from the store's first.
 func (n *Single) checkHead(ctx context.Context, seq int64) error {
 	if seq <= n.head.Load() {
 		return nil
 	}
-	if hs, ok := n.st.(headSeqer); ok {
-		if h, err := hs.HeadSeq(ctx); err == nil {
-			n.noteHead(h)
-		}
-	} else {
-		for _, idx := range n.sortedIndexes() {
-			for _, c := range idx.copies {
-				if sh := c.shard(); sh != nil {
-					n.noteHead(sh.AppliedSeq())
-				}
-			}
-		}
+	if h, _, err := n.st.HeadSeq(ctx); err == nil {
+		n.noteHead(h)
 	}
 	if head := n.head.Load(); seq > head {
 		return api.InvalidAt("params.wait_for_seq", "wait_for_seq %d is past the newest committed seq, %d", seq, head)
@@ -125,6 +111,13 @@ func (n *Single) acquire(idx *index) ([]*shard.Generation, func(), error) {
 		}
 	}
 	for _, c := range idx.copies {
+		if err := c.notServing(); err != nil {
+			release()
+			if idx.dropped.Load() {
+				return nil, nil, indexNotFound(idx.name)
+			}
+			return nil, nil, err
+		}
 		var g *shard.Generation
 		if sh := c.shard(); sh != nil {
 			g = sh.Acquire()
@@ -175,7 +168,7 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 	}
 	defer release()
 	r.Index = name
-	stale := n.stale()
+	stale := n.indexStale(idx)
 	resp, err := searchGenerations(ctx, gens, r)
 	if err != nil {
 		return nil, err
@@ -290,7 +283,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 	if err := n.waitQueries(ctx, idx); err != nil {
 		return nil, err
 	}
-	stale := n.stale()
+	stale := n.indexStale(idx)
 	// Stored documents are read from this node's copies (as searches are), not
 	// realtime from the database as GET is: pass wait_for_seq to see a write.
 	gens, release, err := n.acquire(idx)

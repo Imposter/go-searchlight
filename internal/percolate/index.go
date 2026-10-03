@@ -2,6 +2,7 @@ package percolate
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -29,7 +30,7 @@ import (
 // opened segment is safe. Its parts, each a length-prefixed section after the header
 // (magic, version, section count):
 //
-//	meta       queries, fields, dictionary entries, hash slots, always-check, tree nodes, tree records (u32 each)
+//	meta       queries, fields, dictionary entries, hash slots, always-check, tree nodes, tree records, pairs (u32 each)
 //	fields     per field: name, the atom kinds it has terms of (a bit mask), its interval tree's root, node and record ranges
 //	offsets    u64 per query + 1: each query's record in records
 //	records    per query: id, seq (varint), query JSON, meta (id, JSON and meta uvarint-length-prefixed)
@@ -39,7 +40,9 @@ import (
 //	slots      u32 per hash slot (a power of two): 0 empty, else a dictionary entry + 1
 //	entries    24 bytes per dictionary entry: hash, field<<8|kind, term offset and length, postings offset and count
 //	terms      the dictionary terms
-//	postings   u32 query ordinals, ascending per entry
+//	postings   u32 query ordinals, ascending per entry and per pair
+//	partners   8 bytes per dictionary entry: the first pair record it owns and how many (a member's only)
+//	pairs      12 bytes per pair: its partner (a member entry), postings offset and count
 //	always     u32 ordinals of the always-check list, ascending
 //	nodes      24 bytes per interval tree node: center, left, right, record start and count
 //	bylo       20 bytes per tree record (lo, hi, ordinal), each node's sorted by lo ascending
@@ -51,6 +54,13 @@ import (
 // numeric field, its center the median of the field's endpoints, so a value finds the
 // ranges holding it in O(log n + k).
 //
+// Pair anchors (two atoms a query needs together) are stored once each, under one of
+// their halves, both of which are AtomMember entries (whose postings are every query
+// either is half of). The owner is the half with fewer pairs, so a frequent atom
+// paired with many rare ones keeps a short list. A document collects the members it
+// holds, then walks their partner lists, keeping the pairs whose partner it holds
+// too: work linear in those lists, never quadratic in the members (see probePairs).
+//
 // Verification classes: queries whose canonical form ([query.Canonical]) is the same
 // match the same documents, so they share one compiled query and, per document, one
 // verification. A query with a words_* condition is its own class (keyed by its exact
@@ -59,16 +69,17 @@ import (
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.
-	FormatName = "percolate/1"
+	FormatName = "percolate/2"
 	// FileExt is a query segment file's extension.
 	FileExt = ".perc"
 
-	formatVersion = 1
-	numSections   = 15
+	formatVersion = 2
+	numSections   = 17
 	entrySize     = 24
 	nodeSize      = 24
 	recordSize    = 20
-	metaSize      = 7 * 4
+	metaSize      = 8 * 4
+	pairSize      = 12
 )
 
 var fileMagic = [8]byte{'S', 'L', 'P', 'E', 'R', 'C', '\r', '\n'}
@@ -88,6 +99,8 @@ const (
 	secEntries
 	secTerms
 	secPostings
+	secPartners
+	secPairs
 	secAlways
 	secNodes
 	secByLo
@@ -96,7 +109,7 @@ const (
 
 var sectionNames = [numSections]string{
 	"meta", "fields", "offsets", "records", "classes", "ids", "ranks", "slots", "entries",
-	"terms", "postings", "always", "nodes", "bylo", "byhi",
+	"terms", "postings", "partners", "pairs", "always", "nodes", "bylo", "byhi",
 }
 
 // CorruptError is a query segment file that fails its checksum or does not parse.
@@ -191,6 +204,16 @@ type segmentBuilder struct {
 	classOf map[string]uint32
 	offsets []uint64
 	records []byte
+
+	// pairs are the pair anchors, keyed by their members' dictionary keys in order;
+	// degree counts each member's pairs and memberCost its estimated frequency.
+	pairs      map[[2]string]*pairBuild
+	degree     map[string]int
+	memberCost map[string]float64
+}
+
+type pairBuild struct {
+	posts []uint32
 }
 
 func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard.TermStats) ([]byte, error) {
@@ -203,7 +226,11 @@ func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard
 		dict:    map[string]*dictEntry{},
 		classes: make([]uint32, len(queries)),
 		classOf: map[string]uint32{},
-		offsets: make([]uint64, 0, len(queries)+1),
+		pairs:   map[[2]string]*pairBuild{},
+		degree:  map[string]int{},
+
+		memberCost: map[string]float64{},
+		offsets:    make([]uint64, 0, len(queries)+1),
 	}
 	ids := make(map[string]struct{}, len(queries))
 	for i := range queries {
@@ -250,18 +277,27 @@ func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
 		b.post(t.Kind, b.field(t.Field), t.Term, ord)
 	}
 	for _, p := range set.pairs {
-		// A pair is keyed by its two atoms' encodings in byte order, as a document
-		// enumerates its member atoms; each atom is also a member of its field.
-		var enc [2]string
-		for k, t := range p {
+		// Each half is a member of its field (postings: every query it is half of);
+		// the pair itself is stored once, under one of its halves (see encode).
+		var k [2]string
+		for i, t := range p {
 			fi := b.field(t.Field)
-			b.post(AtomMember, fi, memberTerm(t.Kind, t.Term), ord)
-			enc[k] = string(appendAtom(nil, t.Kind, fi, t.Term))
+			k[i] = b.post(AtomMember, fi, memberTerm(t.Kind, t.Term), ord)
+			b.memberCost[k[i]] = b.ex.termCost(t.Kind, t.Field, t.Term)
 		}
-		if enc[0] > enc[1] {
-			enc[0], enc[1] = enc[1], enc[0]
+		if k[0] > k[1] {
+			k[0], k[1] = k[1], k[0]
 		}
-		b.post(AtomPair, 0, enc[0]+enc[1], ord)
+		pb := b.pairs[k]
+		if pb == nil {
+			pb = &pairBuild{}
+			b.pairs[k] = pb
+			b.degree[k[0]]++
+			b.degree[k[1]]++
+		}
+		if n := len(pb.posts); n == 0 || pb.posts[n-1] != ord {
+			pb.posts = append(pb.posts, ord)
+		}
 	}
 	for _, r := range set.ranges {
 		fi := b.field(r.Field)
@@ -351,6 +387,42 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 		}
 	}
 
+	// Pairs, each stored once under its owner, with its partner and postings. The
+	// owner is the half with fewer pairs (then the rarer, then the smaller key), so a
+	// frequent atom paired with many rare ones (a store with every model) keeps a short
+	// partner list, and a document walks about one record per member it holds.
+	entryOf := make(map[string]uint32, len(keys))
+	for i, k := range keys {
+		entryOf[k] = count32(i)
+	}
+	owned := make([][]pairRecord, len(keys))
+	for k, pb := range b.pairs {
+		owner, partner := k[0], k[1]
+		if b.ownsAfter(owner, partner) {
+			owner, partner = partner, owner
+		}
+		owned[entryOf[owner]] = append(owned[entryOf[owner]], pairRecord{partner: entryOf[partner], posts: pb.posts})
+	}
+	var partners, pairs []byte
+	numPairs := 0
+	for _, list := range owned {
+		slices.SortFunc(list, func(a, b pairRecord) int { return cmp.Compare(a.partner, b.partner) })
+		partners = binary.LittleEndian.AppendUint32(partners, count32(numPairs))
+		partners = binary.LittleEndian.AppendUint32(partners, count32(len(list)))
+		for _, r := range list {
+			if len(postings)/4 > math.MaxUint32-len(r.posts) {
+				return nil, errors.New("percolate: query segment postings over 4 GiB")
+			}
+			pairs = binary.LittleEndian.AppendUint32(pairs, r.partner)
+			pairs = binary.LittleEndian.AppendUint32(pairs, count32(len(postings)/4))
+			pairs = binary.LittleEndian.AppendUint32(pairs, count32(len(r.posts)))
+			for _, p := range r.posts {
+				postings = binary.LittleEndian.AppendUint32(postings, p)
+			}
+		}
+		numPairs += len(list)
+	}
+
 	// Fields and their interval trees.
 	var fields []byte
 	var nodes []treeNode
@@ -370,7 +442,7 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 
 	var sec [numSections][]byte
 	meta := make([]byte, 0, metaSize)
-	for _, v := range []int{n, len(b.fields), len(keys), int(tableSize), len(b.always), len(nodes), len(byLo)} {
+	for _, v := range []int{n, len(b.fields), len(keys), int(tableSize), len(b.always), len(nodes), len(byLo), numPairs} {
 		meta = binary.LittleEndian.AppendUint32(meta, count32(v))
 	}
 	sec[secMeta] = meta
@@ -390,6 +462,8 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 	sec[secEntries] = entries
 	sec[secTerms] = terms
 	sec[secPostings] = postings
+	sec[secPartners] = partners
+	sec[secPairs] = pairs
 	sec[secAlways] = appendU32s(b.always)
 	for _, nd := range nodes {
 		sec[secNodes] = binary.LittleEndian.AppendUint64(sec[secNodes], math.Float64bits(nd.center))
@@ -548,6 +622,8 @@ type Segment struct {
 	entries   []byte
 	terms     []byte
 	postings  []byte
+	partners  []byte
+	pairs     []byte
 	always    []byte
 	nodes     []byte
 	byLo      []byte
@@ -615,15 +691,16 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if len(sec[secMeta]) != metaSize {
 		return nil, corrupt("meta: %d bytes", len(sec[secMeta]))
 	}
-	var meta [7]uint32
+	var meta [8]uint32
 	for i := range meta {
 		meta[i] = u32(sec[secMeta], 4*i)
 	}
-	n, numFields, numEntries, tableSize, numAlways, numNodes, numRecs := meta[0], meta[1], meta[2], meta[3], meta[4], meta[5], meta[6]
+	n, numFields, numEntries, tableSize, numAlways, numNodes, numRecs, numPairs := meta[0], meta[1], meta[2], meta[3], meta[4], meta[5], meta[6], meta[7]
 	s := &Segment{
 		path: path, n: n,
 		offsets: sec[secOffsets], records: sec[secRecords], classes: sec[secClasses], ids: sec[secIDs], ranks: sec[secRanks],
 		slots: sec[secSlots], entries: sec[secEntries], terms: sec[secTerms], postings: sec[secPostings],
+		partners: sec[secPartners], pairs: sec[secPairs],
 		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi],
 	}
 	sizes := []struct {
@@ -640,6 +717,8 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		{secNodes, nodeSize * uint64(numNodes)},
 		{secByLo, recordSize * uint64(numRecs)},
 		{secByHi, recordSize * uint64(numRecs)},
+		{secPartners, 8 * uint64(numEntries)},
+		{secPairs, pairSize * uint64(numPairs)},
 	}
 	for _, sz := range sizes {
 		if uint64(len(sec[sz.sec])) != sz.want {
@@ -736,7 +815,6 @@ func (s *Segment) checkOrdinals() error {
 
 // checkDictionary checks every entry's term and postings, and every slot.
 func (s *Segment) checkDictionary(numEntries uint32) error {
-	numPosts := uint64(len(s.postings) / 4)
 	for i := range numEntries {
 		e := int(i) * entrySize
 		fk := u32(s.entries, e+4)
@@ -745,18 +823,27 @@ func (s *Segment) checkDictionary(numEntries uint32) error {
 			return fmt.Errorf("entry %d: atom kind %d", i, kind)
 		}
 		termOff, termLen := uint64(u32(s.entries, e+8)), uint64(u32(s.entries, e+12))
-		postOff, postN := uint64(u32(s.entries, e+16)), uint64(u32(s.entries, e+20))
-		if termOff+termLen > uint64(len(s.terms)) || postOff+postN > numPosts || postN == 0 {
-			return fmt.Errorf("entry %d: term or postings out of range", i)
+		if termOff+termLen > uint64(len(s.terms)) {
+			return fmt.Errorf("entry %d: term out of range", i)
 		}
 		if kind == AtomSimKey && termLen != 8 {
 			return fmt.Errorf("entry %d: a trigram key of %d bytes", i, termLen)
 		}
-		for p := postOff; p < postOff+postN; p++ {
-			ord := u32(s.postings, int(p)*4)                                     //nolint:gosec // p < numPosts, a count of the section's u32s
-			if ord >= s.n || p > postOff && ord <= u32(s.postings, int(p-1)*4) { //nolint:gosec // as above
-				return fmt.Errorf("entry %d: postings out of range or order", i)
-			}
+		if !s.validPostings(uint64(u32(s.entries, e+16)), uint64(u32(s.entries, e+20))) {
+			return fmt.Errorf("entry %d: postings out of range or order", i)
+		}
+		// Partners: only a member lists any.
+		pOff, pN := uint64(u32(s.partners, int(i)*8)), uint64(u32(s.partners, int(i)*8+4))
+		if pOff+pN > uint64(len(s.pairs)/pairSize) || pN > 0 && kind != AtomMember {
+			return fmt.Errorf("entry %d: partners out of range", i)
+		}
+	}
+	// Each pair names a member entry as its partner, with valid postings.
+	for r := 0; r < len(s.pairs); r += pairSize {
+		partner := u32(s.pairs, r)
+		if partner >= numEntries || AtomKind(u32(s.entries, int(partner)*entrySize+4)&0xff) != AtomMember ||
+			!s.validPostings(uint64(u32(s.pairs, r+4)), uint64(u32(s.pairs, r+8))) {
+			return fmt.Errorf("pair %d: bad partner or postings", r/pairSize)
 		}
 	}
 	for i := 0; i < len(s.slots); i += 4 {
@@ -1142,11 +1229,9 @@ func writeFileSync(path string, data []byte) error {
 }
 
 // post adds ord to the postings of (kind, field fi, term), marking the field as having
-// terms of the kind (AtomPair is keyed under field 0 and marks none).
-func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, ord uint32) {
-	if kind != AtomPair {
-		b.fields[fi].kinds |= 1 << kind
-	}
+// terms of the kind, and returns the entry's dictionary key.
+func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, ord uint32) string {
+	b.fields[fi].kinds |= 1 << kind
 	b.key = append(b.key[:0], byte(kind))
 	b.key = binary.LittleEndian.AppendUint32(b.key, fi)
 	b.key = append(b.key, term...)
@@ -1158,6 +1243,7 @@ func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, ord uint32)
 	if n := len(e.posts); n == 0 || e.posts[n-1] != ord {
 		e.posts = append(e.posts, ord)
 	}
+	return string(b.key)
 }
 
 // memberTerm is an AtomMember term: the atom's kind, then its term.
@@ -1165,17 +1251,9 @@ func memberTerm(kind AtomKind, term string) string {
 	return string(rune(kind)) + term
 }
 
-// appendAtom appends an atom's encoding in an AtomPair term: its kind, its field's
-// index (little-endian u32), its term's length (uvarint) and its term.
-func appendAtom(dst []byte, kind AtomKind, fi uint32, term string) []byte {
-	dst = append(dst, byte(kind))
-	dst = binary.LittleEndian.AppendUint32(dst, fi)
-	dst = binary.AppendUvarint(dst, uint64(len(term)))
-	return append(dst, term...)
-}
-
-// lookupBytes is lookup of a term held in bytes.
-func (s *Segment) lookupBytes(kind AtomKind, field uint32, term []byte) []byte {
+// findEntry returns the index of the dictionary entry (kind, field, term), -1 when
+// there is none.
+func (s *Segment) findEntry(kind AtomKind, field uint32, term []byte) int {
 	h := hashPrefix(kind, field)
 	for _, c := range term {
 		h ^= uint64(c)
@@ -1185,7 +1263,7 @@ func (s *Segment) lookupBytes(kind AtomKind, field uint32, term []byte) []byte {
 	for slot, probes := lo32(h)&s.tableMask, uint32(0); probes <= s.tableMask; slot, probes = (slot+1)&s.tableMask, probes+1 {
 		e := u32(s.slots, 4*int(slot))
 		if e == 0 {
-			return nil
+			return -1
 		}
 		o := int(e-1) * entrySize
 		if u32(s.entries, o) != hi32(h) || u32(s.entries, o+4) != fk {
@@ -1193,10 +1271,10 @@ func (s *Segment) lookupBytes(kind AtomKind, field uint32, term []byte) []byte {
 		}
 		off, n := u32(s.entries, o+8), u32(s.entries, o+12)
 		if bytes.Equal(s.terms[off:off+n], term) {
-			return s.posts(o)
+			return int(e - 1)
 		}
 	}
-	return nil
+	return -1
 }
 
 // lo32 and hi32 are a 64-bit hash's halves: the slot and the stored check.
@@ -1214,3 +1292,57 @@ func unsigned(v int32) uint32 { return uint32(v) } //nolint:gosec // two's compl
 // query count (checked below 2^32 at the start of a build) or by the dictionary's size
 // (checked below 4 GiB as it is written).
 func count32(n int) uint32 { return uint32(n) } //nolint:gosec // see above
+
+// pairRecord is one pair as its owner lists it.
+type pairRecord struct {
+	partner uint32
+	posts   []uint32
+}
+
+// ownsAfter reports whether member a should leave the pair to b: a has more pairs, or
+// as many and is more frequent, or ties on both and has the larger key.
+func (b *segmentBuilder) ownsAfter(a, other string) bool {
+	if da, db := b.degree[a], b.degree[other]; da != db {
+		return da > db
+	}
+	if ca, cb := b.memberCost[a], b.memberCost[other]; ca != cb {
+		return ca > cb
+	}
+	return a > other
+}
+
+// validPostings reports whether postings [off, off+n) lie in the section, are not
+// empty, and hold ascending ordinals below the query count.
+func (s *Segment) validPostings(off, n uint64) bool {
+	if n == 0 || off+n > uint64(len(s.postings)/4) {
+		return false
+	}
+	list := s.postings[4*off : 4*(off+n)]
+	prev := uint32(0)
+	for i := 0; i < len(list); i += 4 {
+		ord := binary.LittleEndian.Uint32(list[i:])
+		if ord >= s.n || i > 0 && ord <= prev {
+			return false
+		}
+		prev = ord
+	}
+	return true
+}
+
+// entryPosts returns entry i's postings.
+func (s *Segment) entryPosts(i int) []byte { return s.posts(i * entrySize) }
+
+// partnersOf returns the first pair record entry i owns and how many.
+func (s *Segment) partnersOf(i int) (first, n int) {
+	return int(u32(s.partners, 8*i)), int(u32(s.partners, 8*i+4))
+}
+
+// pairAt returns pair record r: its partner entry and its postings.
+func (s *Segment) pairAt(r int) (partner uint32, posts []byte) {
+	o := r * pairSize
+	off, n := u32(s.pairs, o+4), u32(s.pairs, o+8)
+	return u32(s.pairs, o), s.postings[4*int(off) : 4*int(off+n)]
+}
+
+// NumEntries is how many terms the segment's dictionary holds.
+func (s *Segment) NumEntries() uint32 { return uint32(len(s.entries) / entrySize) } //nolint:gosec // validated against a u32 count

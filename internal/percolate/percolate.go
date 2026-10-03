@@ -139,13 +139,14 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	start := time.Now()
 
 	views := make([]view, len(g.QuerySegments))
-	var maxN uint32
+	var maxN, maxEntries uint32
 	always := 0
 	for i := range g.QuerySegments {
 		qs := &g.QuerySegments[i]
 		v := view{n: qs.NumQueries}
 		if seg, ok := qs.Segment.(*Segment); ok {
 			v.seg = seg
+			maxEntries = max(maxEntries, seg.NumEntries())
 			always += seg.NumAlways()
 		} else {
 			v.other = qs.Segment
@@ -168,7 +169,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		if sc == nil {
 			sc = new(scratch)
 		}
-		sc.fit(maxN)
+		sc.fit(maxN, maxEntries)
 		var local docStats
 		for {
 			i := int(next.Add(1) - 1)

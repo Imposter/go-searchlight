@@ -1,7 +1,6 @@
 package percolate
 
 import (
-	"bytes"
 	"encoding/binary"
 	"slices"
 
@@ -28,11 +27,13 @@ type scratch struct {
 	matched []uint64
 	hits    [][]byte
 	buf     []byte
-	// members are the document's atoms that are pair members, encoded in memberBuf;
-	// key is a buffer for probe keys.
-	members   []member
-	memberBuf []byte
-	key       []byte
+	// held are the dictionary entries of the pair members the document holds, also
+	// set in heldBits; pairOps counts pair-probing work (for tests); key is a buffer
+	// for probe keys.
+	held     []uint32
+	heldBits []uint64
+	pairOps  int
+	key      []byte
 }
 
 const (
@@ -40,8 +41,11 @@ const (
 	memoMiss  = 2
 )
 
-// fit sizes s for a segment of n queries.
-func (s *scratch) fit(n uint32) {
+// fit sizes s for a segment of n queries and entries dictionary terms.
+func (s *scratch) fit(n, entries uint32) {
+	if words := int(entries+63) / 64; len(s.heldBits) < words {
+		s.heldBits = make([]uint64, words)
+	}
 	if words := int(n+63) / 64; len(s.bits) < words {
 		s.bits = make([]uint64, words)
 	}
@@ -244,39 +248,68 @@ func (s *scratch) clearHits() {
 	s.hits = s.hits[:0]
 }
 
-// member is a document atom that is a member of some pair: its encoding in
-// scratch.memberBuf.
-type member struct{ off, n int }
+// Pair probing limits (variables so tests can force each path). A document walks the
+// partner lists of the member atoms it holds when that is cheap: within pairWalkBudget
+// records, or within candidateWeight records per candidate the fallback would add.
+// Otherwise it adds every query any member it holds is half of (the members'
+// postings), which is linear in those postings and sound with no threshold at all: a
+// query anchored on a pair the document holds has the pair's halves among its
+// members.
+var (
+	pairWalkBudget  = 4096
+	candidateWeight = 32
+)
 
-// addMember records atom (kind, field, term) of the document when the segment has it
-// as a member of some pair.
+// addMember records the document's atom (kind, field, term) when the segment has it
+// as half of some pair.
 func (s *Segment) addMember(sc *scratch, kind AtomKind, field uint32, term string) {
 	sc.key = append(sc.key[:0], byte(kind))
 	sc.key = append(sc.key, term...)
-	if s.lookupBytes(AtomMember, field, sc.key) == nil {
+	e := s.findEntry(AtomMember, field, sc.key)
+	if e < 0 {
 		return
 	}
-	off := len(sc.memberBuf)
-	sc.memberBuf = appendAtom(sc.memberBuf, kind, field, term)
-	sc.members = append(sc.members, member{off: off, n: len(sc.memberBuf) - off})
+	w, bit := e>>6, uint64(1)<<(e&63)
+	if sc.heldBits[w]&bit == 0 {
+		sc.heldBits[w] |= bit
+		sc.held = append(sc.held, count32(e))
+	}
 }
 
-// probePairs adds the queries anchored on a pair of the document's member atoms: every
-// unordered pair of distinct members, each keyed in byte order as the builder keys it.
+// probePairs adds the queries anchored on a pair both of whose halves the document
+// holds. Each pair is stored once, under one half (its owner), with the other as its
+// partner: walking the partner lists of the held members, and keeping the partners
+// held, finds every such pair in time linear in those lists, never quadratic in the
+// members. When the lists are long (see pairWalkBudget) it adds the held members'
+// postings instead. pairOps counts the records walked or postings added.
 func (s *Segment) probePairs(sc *scratch) {
-	if len(sc.members) < 2 {
-		sc.members, sc.memberBuf = sc.members[:0], sc.memberBuf[:0]
-		return
-	}
-	buf := sc.memberBuf
-	enc := func(m member) []byte { return buf[m.off : m.off+m.n] }
-	slices.SortFunc(sc.members, func(a, b member) int { return bytes.Compare(enc(a), enc(b)) })
-	sc.members = slices.CompactFunc(sc.members, func(a, b member) bool { return bytes.Equal(enc(a), enc(b)) })
-	for i, a := range sc.members {
-		for _, b := range sc.members[i+1:] {
-			sc.key = append(append(sc.key[:0], enc(a)...), enc(b)...)
-			sc.addPosts(s.lookupBytes(AtomPair, 0, sc.key))
+	if len(sc.held) >= 2 {
+		walk, fallback := 0, 0
+		for _, e := range sc.held {
+			_, n := s.partnersOf(int(e))
+			walk += n
+			fallback += len(s.entryPosts(int(e))) / 4
+		}
+		if walk <= pairWalkBudget || walk <= candidateWeight*fallback {
+			for _, e := range sc.held {
+				first, n := s.partnersOf(int(e))
+				for r := first; r < first+n; r++ {
+					partner, posts := s.pairAt(r)
+					if sc.heldBits[partner>>6]&(1<<(partner&63)) != 0 {
+						sc.addPosts(posts)
+					}
+				}
+			}
+			sc.pairOps += walk
+		} else {
+			for _, e := range sc.held {
+				sc.addPosts(s.entryPosts(int(e)))
+			}
+			sc.pairOps += fallback
 		}
 	}
-	sc.members, sc.memberBuf = sc.members[:0], sc.memberBuf[:0]
+	for _, e := range sc.held {
+		sc.heldBits[e>>6] = 0
+	}
+	sc.held = sc.held[:0]
 }

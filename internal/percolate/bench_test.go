@@ -227,7 +227,7 @@ func BenchmarkPercolate(b *testing.B) {
 				b.ReportMetric(float64(matches)/float64(len(lat)), "matches/doc")
 				for qi := range env.g.QuerySegments {
 					if seg, ok := env.g.QuerySegments[qi].Segment.(*Segment); ok {
-						sc.fit(seg.NumQueries())
+						sc.fit(seg.NumQueries(), seg.NumEntries())
 						for _, d := range env.docs[:500] {
 							seg.collect(&d, sc)
 							cands += len(sc.cands)

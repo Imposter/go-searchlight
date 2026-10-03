@@ -56,11 +56,9 @@ const (
 	AtomText
 	// AtomNonempty is a keyword_list field with an entry, the term "": nonempty.
 	AtomNonempty
-	// AtomPair is two atoms a query needs together (see [Anchors].Pairs): the query
-	// index keys conjunctive anchors by it.
-	AtomPair
-	// AtomMember is an atom that is one half of some AtomPair, so a document probes pairs
-	// only among the atoms it holds that are members.
+	// AtomMember is an atom that is one half of a pair anchor (see [Anchors].Pairs), its
+	// term the atom's kind byte then its term. Its postings are every query with a pair
+	// it is half of, and it lists its partners (see the format notes in index.go).
 	AtomMember
 
 	numAtomKinds
@@ -69,7 +67,7 @@ const (
 var atomNames = [numAtomKinds]string{
 	AtomValue: "value", AtomBool: "bool", AtomEntry: "entry", AtomWord: "word", AtomGram: "gram",
 	AtomSimKey: "simkey", AtomPresent: "present", AtomText: "text", AtomNonempty: "nonempty",
-	AtomPair: "pair", AtomMember: "member",
+	AtomMember: "member",
 }
 
 func (k AtomKind) String() string {

@@ -103,7 +103,7 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	}
 	v := &view{seg: seg, n: seg.NumQueries(), deletes: deletes}
 	sc := new(scratch)
-	sc.fit(seg.NumQueries())
+	sc.fit(seg.NumQueries(), seg.NumEntries())
 	m := testMapping()
 	isAlways := make(map[uint32]bool)
 	for i := 0; i < len(seg.always); i += 4 {

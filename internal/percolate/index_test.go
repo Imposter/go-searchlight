@@ -163,7 +163,7 @@ func TestEmptySegment(t *testing.T) {
 		t.Fatal("not empty")
 	}
 	sc := new(scratch)
-	sc.fit(0)
+	sc.fit(0, 0)
 	d, _, _ := schema.Analyze(testMapping(), "a", []byte(`{"brand":"x","price":1}`))
 	seg.collect(&d, sc)
 	if len(sc.cands) != 0 {
@@ -280,7 +280,7 @@ func exercise(seg *Segment) {
 	}
 	seg.Ord("q1")
 	sc := new(scratch)
-	sc.fit(seg.NumQueries())
+	sc.fit(seg.NumQueries(), seg.NumEntries())
 	for _, body := range []string{
 		`{"brand":"acme","title":"RTX 4090 café founders","tags":["a","ß"],"price":3,"stock":true}`,
 		`{"brand":1,"title":["x"],"price":"x","tags":"a, b"}`,
@@ -332,7 +332,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			seg.nodes = binary.LittleEndian.AppendUint32(seg.nodes, nd.count)
 		}
 		sc := new(scratch)
-		sc.fit(uint32(n))
+		sc.fit(uint32(n), 0)
 		for x := -2.0; x <= 102; x += 0.5 {
 			if root >= 0 {
 				seg.stab(root, x, sc)

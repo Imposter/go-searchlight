@@ -745,3 +745,87 @@ func runUseAfterCloseChild() {
 	// got's containers still point into it, so this read must fault.
 	_ = got.ToArray()
 }
+
+// emptyTermDocs is the N1 repro: a part whose only term for a (field, kind) is "" must
+// still sort "" first. Before the fix, an empty-but-nil arena made "" look like "no
+// minimum yet" to writeMergedDict, so the next part's "b" won and "" was written after
+// it - out of order, so Postings("") missed and the keyword ordinals were reversed.
+func emptyTermDocs(t *testing.T) []schema.Doc {
+	t.Helper()
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword}}
+	return []schema.Doc{
+		mustAnalyze(t, m, "d0", `{"brand": ""}`),
+		mustAnalyze(t, m, "d1", `{"brand": "b"}`),
+	}
+}
+
+// checkEmptyTermSegment asserts r holds emptyTermDocs exactly: "" sorts first with
+// ordinal 0 and doc 0, "b" second with ordinal 1 and doc 1.
+func checkEmptyTermSegment(t *testing.T, r *Reader) {
+	t.Helper()
+	var terms []string
+	r.Terms("brand", KindValue, "", func(term string, _ uint32) bool {
+		terms = append(terms, term)
+		return true
+	})
+	if !slices.Equal(terms, []string{"", "b"}) {
+		t.Fatalf("Terms(brand) = %q, want [\"\" \"b\"]", terms)
+	}
+	if got := r.Postings("brand", KindValue, ""); !got.Equals(roaring.BitmapOf(0)) {
+		t.Fatalf(`Postings(brand, "") = %v, want [0]`, got.ToArray())
+	}
+	if got := r.Postings("brand", KindValue, "b"); !got.Equals(roaring.BitmapOf(1)) {
+		t.Fatalf(`Postings(brand, "b") = %v, want [1]`, got.ToArray())
+	}
+	kw := r.Keywords("brand")
+	for doc, want := range []string{"", "b"} {
+		ord, ok := kw.Ord(uint32(doc))
+		if !ok || ord != uint32(doc) || kw.Term(ord) != want {
+			t.Fatalf("Keywords(brand).Ord(%d) = %d, %v (term %q), want %d (term %q)", doc, ord, ok, kw.Term(ord), doc, want)
+		}
+	}
+}
+
+func TestEmptyTermSortsFirstAcrossParts(t *testing.T) {
+	docs := emptyTermDocs(t)
+	for _, threads := range []int{1, 2} {
+		t.Run(fmt.Sprintf("Build/Threads%d", threads), func(t *testing.T) {
+			meta, err := Build(t.TempDir(), docs, BuildOptions{Threads: threads})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := Open(meta.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			checkEmptyTermSegment(t, r)
+		})
+	}
+	t.Run("Merge", func(t *testing.T) {
+		dir := t.TempDir()
+		var readers []*Reader
+		for _, d := range docs {
+			meta, err := Build(dir, []schema.Doc{d}, BuildOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r, err := Open(meta.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			readers = append(readers, r)
+		}
+		meta, err := Merge(dir, readers, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := Open(meta.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		checkEmptyTermSegment(t, r)
+	})
+}

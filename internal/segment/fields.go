@@ -347,14 +347,19 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, 
 	var ord uint32
 	docBuf := make([]uint32, 0, 64)
 	for anyLeft() {
+		// The smallest current term is tracked by which part holds it (minPart), never
+		// by whether minTerm is nil: "" is a real term, and a part whose arena holds
+		// nothing but "" hands it back as a nil slice, which a nil-means-unset check
+		// would mistake for "no minimum yet" and let a later part's term beat it.
 		var minTerm []byte
+		minPart := -1
 		for p := range parts {
 			if cursor[p] >= len(parts[p].groups) {
 				continue
 			}
 			term := parts[p].termBytes(&parts[p].groups[cursor[p]])
-			if minTerm == nil || bytes.Compare(term, minTerm) < 0 {
-				minTerm = term
+			if minPart < 0 || bytes.Compare(term, minTerm) < 0 {
+				minTerm, minPart = term, p
 			}
 		}
 		docBuf = docBuf[:0]

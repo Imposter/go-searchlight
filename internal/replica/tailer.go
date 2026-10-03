@@ -152,6 +152,11 @@ type Options struct {
 type testHooks struct {
 	// afterDiscard runs in a wipe once the manifest is gone, before the files are.
 	afterDiscard func(ctx context.Context, dir string)
+	// beforeSwap runs in an aside rebuild once the new copy in dir has caught up,
+	// before it is made current; an error abandons the rebuild there (a crash).
+	beforeSwap func(ctx context.Context, dir string) error
+	// inPlace rebuilds every copy in place, as one that cannot be built aside is.
+	inPlace bool
 }
 
 func (o *Options) resolve() {
@@ -215,6 +220,10 @@ const (
 	StateTailing
 	// StateHalted: a change could not be applied; Run backs off and retries.
 	StateHalted
+	// StateRebuilding: the copy is being rebuilt aside (a mapping change, a pruned
+	// changelog, a halt): the old copy keeps serving, stale, until the new one has
+	// caught up and replaces it.
+	StateRebuilding
 )
 
 func (s State) String() string {
@@ -227,6 +236,8 @@ func (s State) String() string {
 		return "tailing"
 	case StateHalted:
 		return "halted"
+	case StateRebuilding:
+		return "rebuilding"
 	}
 	return fmt.Sprintf("State(%d)", int32(s))
 }

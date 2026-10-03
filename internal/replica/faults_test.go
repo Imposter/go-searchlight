@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,13 +229,55 @@ func TestCrashPoints(t *testing.T) {
 			}
 			reached := make(chan struct{})
 			var once sync.Once
-			c.opts.hooks = &testHooks{afterDiscard: func(ctx context.Context, _ string) {
+			c.opts.hooks = &testHooks{inPlace: true, afterDiscard: func(ctx context.Context, _ string) {
 				once.Do(func() { close(reached) })
 				<-ctx.Done()
 			}}
 			crashAt(c, reached)
 			c.opts.hooks = nil
 			c.start()
+			check(c)
+		})
+
+		t.Run("mid-aside", func(t *testing.T) {
+			// A copy pruned past is rebuilt aside: a crash just before the swap
+			// leaves the old copy current; the next open removes the half-built
+			// one, and the copy rebuilds again and converges.
+			c := newCopy(t, d.open(t), id, testOptions())
+			c.start()
+			c.waitApplied(mustApply(t, st, upsert("cp", 0, "a", `{}`)))
+			if err := c.stop(); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.shard().Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			head, _, err := st.HeadSeq(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustApply(t, st, upsert("cp", 0, "a2", `{}`))
+			if err := st.Prune(context.Background(), id, head+2); err != nil {
+				t.Fatal(err)
+			}
+			reached := make(chan struct{})
+			var once sync.Once
+			var built string
+			c.opts.hooks = &testHooks{beforeSwap: func(ctx context.Context, dir string) error {
+				built = dir
+				once.Do(func() { close(reached) })
+				<-ctx.Done()
+				return ctx.Err()
+			}}
+			crashAt(c, reached)
+			if cur, err := CopyDir(c.dir); err != nil || cur != c.dir {
+				t.Fatalf("after a crash mid-build the current copy is %q (%v), want the old one", cur, err)
+			}
+			c.opts.hooks = nil
+			c.start()
+			if _, err := os.Stat(built); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the half-built copy %s survived the reopen: %v", built, err)
+			}
 			check(c)
 		})
 

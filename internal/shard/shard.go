@@ -315,12 +315,16 @@ type Shard struct {
 	refreshMu sync.Mutex
 	// commitMu serializes refresh and merge commits: the generation counter, the
 	// segment set, the manifest and the merging set.
-	commitMu  sync.Mutex
-	gen       uint64
-	merging   map[*segRef]bool
-	inflight  int
-	mergeDone chan struct{} // closed and replaced when a merge finishes
-	committed atomic.Int64
+	commitMu sync.Mutex
+	gen      uint64
+	merging  map[*segRef]bool
+	inflight int
+	// forceEligible is the running ForceMerge's segments (nil when none runs);
+	// forceMu runs ForceMerges one at a time.
+	forceEligible map[*segRef]bool
+	forceMu       sync.Mutex
+	mergeDone     chan struct{} // closed and replaced when a merge finishes
+	committed     atomic.Int64
 	// manifestBytes is the manifest's size, for the disk-size metric.
 	manifestBytes atomic.Int64
 	// committedUID is the manifest's index uid.

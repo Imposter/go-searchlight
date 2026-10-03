@@ -88,6 +88,13 @@ func TestConcurrentReadersDuringRefreshAndMerge(t *testing.T) {
 	}
 	h.refresh()
 	h.forceMerge(1)
+	if g := h.s.Acquire(); len(g.Segments) != 1 {
+		n := len(g.Segments)
+		g.Release()
+		t.Fatalf("ForceMerge(1) under background merges left %d segments", n)
+	} else {
+		g.Release()
+	}
 	close(stop)
 	wg.Wait()
 	close(errs)

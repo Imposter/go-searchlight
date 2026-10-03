@@ -327,16 +327,30 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 	if p.kind == kindQueries {
 		docs, queries = slices.Clone(cur.docs), next
 	}
-	return s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid)
+	published, err := s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid)
+	if published && out != nil && s.forceEligible != nil {
+		// A merge of segments a ForceMerge is responsible for (a background merge in
+		// flight when it started, or its own) makes a segment it is responsible for.
+		for _, ref := range p.inputs {
+			if s.forceEligible[ref] {
+				s.forceEligible[out] = true
+				break
+			}
+		}
+	}
+	return published, err
 }
 
 // ForceMerge merges the segments the shard holds when it is called down to at most
 // maxSegments document segments (and as many query segments), and rewrites each of them
 // that has deletes without them, like Lucene's forceMerge: the smallest are merged into
-// one. Segments refreshes add meanwhile are left to the merge policy, and each segment
-// is rewritten for its deletes at most once, so a steady stream of deletes cannot keep
-// it going. It waits for background merges in flight first, and ignores DisableMerges.
-// Close cancels it and waits for it to return; after Close it returns ErrClosed.
+// one. The segments it is responsible for are those present when it starts and every
+// segment a merge of them makes, its own or a background merge's (one in flight when
+// it starts included); segments refreshes add meanwhile are left to the merge policy.
+// Each segment is rewritten for its deletes at most once, so a steady stream of
+// deletes cannot keep it going. It waits for background merges in flight, ignores
+// DisableMerges, and runs one at a time. Close cancels it and waits for it to return;
+// after Close it returns ErrClosed.
 func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	s.mu.Lock()
 	if s.closing {
@@ -353,17 +367,28 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	ctx, span := s.startSpan(ctx, "shard.force_merge", attribute.Int("max_segments", maxSegments))
 	defer span.End()
 	maxSegments = max(1, maxSegments)
-	// eligible: the segments present at entry, and what ForceMerge makes of them.
+	s.forceMu.Lock()
+	defer s.forceMu.Unlock()
+	// s.forceEligible: the segments ForceMerge is responsible for (see above), kept
+	// under commitMu so commitMerge adds every merge's output of them.
 	// rewritten: segments already rewritten for their deletes, never again.
-	eligible, rewritten := map[*segRef]bool{}, map[*segRef]bool{}
-	if g := s.Acquire(); g != nil {
-		for _, list := range [][]segState{g.docs, g.queries} {
+	rewritten := map[*segRef]bool{}
+	s.commitMu.Lock()
+	eligible := map[*segRef]bool{}
+	if cur := s.cur.Load(); cur != nil {
+		for _, list := range [][]segState{cur.docs, cur.queries} {
 			for _, st := range list {
 				eligible[st.ref] = true
 			}
 		}
-		g.Release()
 	}
+	s.forceEligible = eligible
+	s.commitMu.Unlock()
+	defer func() {
+		s.commitMu.Lock()
+		s.forceEligible = nil
+		s.commitMu.Unlock()
+	}()
 	for {
 		if err := s.usable(); err != nil {
 			return err
@@ -403,11 +428,8 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 				span.SetStatus(codes.Error, "force merge failed")
 				return err
 			}
-			if out != nil {
-				eligible[out] = true
-				if len(p.inputs) == 1 {
-					rewritten[out] = true
-				}
+			if out != nil && len(p.inputs) == 1 {
+				rewritten[out] = true
 			}
 		}
 	}

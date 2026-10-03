@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -416,4 +417,38 @@ func TestDefaultBudgetAndCacheAreShared(t *testing.T) {
 	if c := newHarness(t, opts); c.s.opts.MergeBudget != own {
 		t.Fatal("an explicit MergeBudget was replaced")
 	}
+}
+
+// M7: a writer faster than refreshes is refused with ErrBackpressure once the buffer
+// passes MaxBufferFactor times FlushBytes; after a retry everything is applied.
+func TestApplyBackpressure(t *testing.T) {
+	opts := testOptions()
+	opts.FlushBytes = 4 << 10
+	opts.MaxBufferFactor = 2
+	h := newHarness(t, opts)
+	refused := 0
+	for i := range 200 {
+		h.seq++
+		id := fmt.Sprintf("d%03d", i%150)
+		b := body(id, h.seq)
+		c := []Change{{Seq: h.seq, Kind: Upsert, Doc: analyze(t, id, b)}}
+		for {
+			err := h.s.Apply(context.Background(), c)
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrBackpressure) {
+				t.Fatal(err)
+			}
+			refused++
+			time.Sleep(time.Millisecond)
+		}
+		h.model[id] = b
+		h.snapshots[h.seq] = maps.Clone(h.model)
+	}
+	if refused == 0 {
+		t.Fatal("a writer far ahead of refreshes was never refused")
+	}
+	h.refresh()
+	h.check()
 }

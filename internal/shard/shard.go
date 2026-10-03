@@ -134,6 +134,10 @@ var (
 	ErrSeqOrder = errors.New("shard: change seq does not increase")
 	// ErrIndexUID is a change for another incarnation of the index than the shard's.
 	ErrIndexUID = errors.New("shard: change belongs to another incarnation of the index")
+	// ErrBackpressure is an Apply refused because the write buffer is over its limit
+	// (Options.MaxBufferFactor times FlushBytes) while refreshes catch up. Nothing of
+	// the batch was applied; retry it after a short wait (an HTTP API answers 429).
+	ErrBackpressure = errors.New("shard: the write buffer is full; retry")
 	// ErrInvalidChange is a change that is malformed: an unknown kind, a missing
 	// document or query, an id no document may have, an id that disagrees with its
 	// document's, or a meta object over MaxMetaBytes.
@@ -177,6 +181,11 @@ type Options struct {
 	// FlushBytes triggers an early background refresh when the buffer's estimated
 	// size passes it, bounding buffer memory. 0 means 64 MiB; negative disables it.
 	FlushBytes int64
+	// MaxBufferFactor bounds the write buffer at this many times FlushBytes: past it
+	// Apply refuses with [ErrBackpressure] until a refresh drains the buffer. 0 means
+	// 4; it is off when FlushBytes is negative. A refresh in progress holds one more
+	// buffer, frozen, so memory is bounded at about MaxBufferFactor+1 times FlushBytes.
+	MaxBufferFactor int
 	// MergePolicy chooses background merges. Nil means DefaultTieredPolicy().
 	MergePolicy *TieredPolicy
 	// DisableMerges turns background merges off; ForceMerge still merges.
@@ -210,6 +219,7 @@ const (
 	DefaultRefreshInterval  = time.Second
 	DefaultSeqPersist       = 30 * time.Second
 	DefaultFlushBytes       = 64 << 20
+	DefaultMaxBufferFactor  = 4
 	DefaultDeleteRetry      = 5 * time.Second
 	DefaultFilterCacheBytes = 64 << 20
 )
@@ -245,6 +255,9 @@ func (o *Options) resolve() {
 	}
 	if o.FlushBytes == 0 {
 		o.FlushBytes = DefaultFlushBytes
+	}
+	if o.MaxBufferFactor <= 0 {
+		o.MaxBufferFactor = DefaultMaxBufferFactor
 	}
 	if o.MergePolicy == nil {
 		p := DefaultTieredPolicy()
@@ -499,7 +512,8 @@ func (s *Shard) usable() error {
 // Every change is checked first, and if any is refused none is applied: the error is a
 // *[ChangeError] naming the first refused change's position, wrapping [ErrDocTooLarge]
 // (a document over segment.MaxStoredBytes, refused here so it can never fail a
-// refresh), [ErrSeqOrder], [ErrIndexUID] or [ErrInvalidChange].
+// refresh), [ErrSeqOrder], [ErrIndexUID] or [ErrInvalidChange]. A buffer over its
+// limit refuses the whole batch with [ErrBackpressure] (retryable).
 func (s *Shard) Apply(ctx context.Context, changes []Change) error {
 	ctx, span := s.startSpan(ctx, "shard.apply", attribute.Int("changes", len(changes)))
 	defer span.End()
@@ -529,6 +543,10 @@ func (s *Shard) apply(changes []Change) (int, error) {
 	}
 	if err := s.usable(); err != nil {
 		return 0, err
+	}
+	if limit := s.opts.FlushBytes * int64(s.opts.MaxBufferFactor); s.opts.FlushBytes > 0 && s.buf.bytes >= limit {
+		wake(s.refreshWake)
+		return 0, fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, s.buf.bytes, limit)
 	}
 	last, uid := s.applied, s.indexUID
 	for i := range changes {

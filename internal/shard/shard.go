@@ -522,7 +522,7 @@ func (s *Shard) usable() error {
 func (s *Shard) Apply(ctx context.Context, changes []Change) error {
 	ctx, span := s.startSpan(ctx, "shard.apply", attribute.Int("changes", len(changes)))
 	defer span.End()
-	buffered, err := s.apply(changes)
+	buffered, err := s.apply(changes, false)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "apply refused")
@@ -533,8 +533,34 @@ func (s *Shard) Apply(ctx context.Context, changes []Change) error {
 	return nil
 }
 
-// apply checks and buffers changes, returning the buffer's size after.
-func (s *Shard) apply(changes []Change) (int, error) {
+// Load adds a snapshot's records (the store's ScanShard) to a shard being rebuilt from
+// it. It is Apply but for two things: the seqs need not increase, since a snapshot
+// lists records by id, each with the seq of the change that last wrote it; and
+// AppliedSeq does not move. Once every record is loaded, the caller Advances to the
+// snapshot's seq, and tails the changelog from there.
+//
+// Load is only for a shard that has applied nothing (AppliedSeq is 0): it refuses any
+// other with [ErrSeqOrder]. Each id must appear once across the load. Until the
+// Advance, a refresh commits the loaded records under seq 0, so a copy whose
+// CommittedSeq is 0 but which holds segments was interrupted mid-load: wipe it.
+func (s *Shard) Load(ctx context.Context, changes []Change) error {
+	ctx, span := s.startSpan(ctx, "shard.load", attribute.Int("changes", len(changes)))
+	defer span.End()
+	buffered, err := s.apply(changes, true)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "load refused")
+		return err
+	}
+	s.inst.countChanges(ctx, changes)
+	s.inst.recordBuffer(ctx, buffered)
+	return nil
+}
+
+// apply checks and buffers changes, returning the buffer's size after. load is Load's
+// variant: seqs in any order, into a shard that has applied nothing, and AppliedSeq
+// left as it is.
+func (s *Shard) apply(changes []Change, load bool) (int, error) {
 	for i := range changes {
 		if err := s.check(&changes[i]); err != nil {
 			c := &changes[i]
@@ -553,13 +579,22 @@ func (s *Shard) apply(changes []Change) (int, error) {
 		wake(s.refreshWake)
 		return 0, fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, s.buf.bytes, limit)
 	}
-	last, uid := s.applied, s.indexUID
+	last, top, uid := s.applied, s.maxChange, s.indexUID
+	if load && last != 0 {
+		return 0, fmt.Errorf("%w: a load into a shard that has applied seq %d", ErrSeqOrder, last)
+	}
 	for i := range changes {
 		c := &changes[i]
-		if c.Seq <= last {
+		switch {
+		case load && c.Seq <= 0:
+			return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: seq %d", ErrSeqOrder, c.Seq)}
+		case load:
+			top = max(top, c.Seq)
+		case c.Seq <= last:
 			return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: seq %d after %d", ErrSeqOrder, c.Seq, last)}
+		default:
+			last, top = c.Seq, c.Seq
 		}
-		last = c.Seq
 		if c.IndexUID != "" {
 			if uid == "" {
 				uid = c.IndexUID
@@ -584,7 +619,7 @@ func (s *Shard) apply(changes []Change) (int, error) {
 			s.buf.putQuery(c.QueryID, c.Seq, nil)
 		}
 	}
-	s.applied, s.maxChange, s.indexUID = last, last, uid
+	s.applied, s.maxChange, s.indexUID = last, top, uid
 	if s.opts.FlushBytes > 0 && s.buf.bytes >= s.opts.FlushBytes {
 		wake(s.refreshWake)
 	}
@@ -747,6 +782,18 @@ func (s *Shard) Close(ctx context.Context) error {
 	s.log.InfoContext(ctx, "shard closed", slog.Int64("seq", s.CommittedSeq()))
 	return nil
 }
+
+// Abandon stops the shard at once, as if its process had died: there is no final
+// refresh, so whatever was applied since the last commit is lost and the directory
+// keeps exactly what CommittedSeq covers. Generations readers hold stay valid until
+// released. It is for a copy about to be wiped or reopened (a failed one, or one whose
+// index was recreated), where a final commit is wasted work or impossible. A Close
+// after it returns at once.
+func (s *Shard) Abandon() { s.shutdown() }
+
+// Options returns the options the shard was opened with, defaults filled in: open the
+// directory again with them to get the same shard.
+func (s *Shard) Options() Options { return s.opts }
 
 // shutdown stops the background goroutines and drops the shard's generation, without
 // any further commit.

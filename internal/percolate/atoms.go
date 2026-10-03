@@ -115,12 +115,12 @@ func (s *Segment) collect(d *schema.Doc, sc *scratch) {
 				a, b, c := -1, -1, -1
 				for i := range text {
 					if a >= 0 {
-						sc.addPosts(s.lookup(AtomGram, field, text[a:i]))
+						sc.addPosts(s.lookupGram(f, field, text[a:i]))
 					}
 					a, b, c = b, c, i
 				}
 				if a >= 0 {
-					sc.addPosts(s.lookup(AtomGram, field, text[a:]))
+					sc.addPosts(s.lookupGram(f, field, text[a:]))
 				}
 			}
 			if k&(1<<AtomSimKey) != 0 {

@@ -611,6 +611,10 @@ type fieldInfo struct {
 	root               int32
 	nodeStart, nodeEnd uint32
 	recStart, recEnd   uint32
+	// grams is a 64K-bit prefilter of the field's AtomGram terms (bit: the entry's
+	// stored hash half, masked), built at Open: a document's window whose bit is clear
+	// has no entry, so it skips the table. Nil when the field has no gram terms.
+	grams []uint64
 }
 
 // Segment is an open query segment: a [shard.QuerySegment] that also answers the
@@ -752,6 +756,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if err := s.parseFields(sec[secFields], numFields, numNodes, numRecs); err != nil {
 		return nil, corrupt("%v", err)
 	}
+	s.buildGramFilters()
 	s.compiled = make([]atomic.Pointer[query.Compiled], n)
 	return s, nil
 }
@@ -1021,7 +1026,40 @@ func (s *Segment) compiledQuery(rep uint32) (*query.Compiled, error) {
 
 // lookup returns the postings of (kind, field, term), nil when the dictionary has none.
 func (s *Segment) lookup(kind AtomKind, field uint32, term string) []byte {
-	h := hashTerm(kind, field, term)
+	return s.lookupHashed(kind, field, term, hashTerm(kind, field, term))
+}
+
+// gramFilterBits is a gram prefilter's size: 65,536 bits, 8 KiB per field.
+const gramFilterBits = 1 << 16
+
+// buildGramFilters sets each gram entry's bit in its field's prefilter. It runs after
+// the entries and fields are validated.
+func (s *Segment) buildGramFilters() {
+	for o := 0; o < len(s.entries); o += entrySize {
+		fk := u32(s.entries, o+4)
+		if AtomKind(fk&0xff) != AtomGram || int(fk>>8) >= len(s.fields) {
+			continue
+		}
+		f := &s.fields[fk>>8]
+		if f.grams == nil {
+			f.grams = make([]uint64, gramFilterBits/64)
+		}
+		bit := u32(s.entries, o) & (gramFilterBits - 1)
+		f.grams[bit>>6] |= 1 << (bit & 63)
+	}
+}
+
+// lookupGram is lookup of an AtomGram term of field f, through its prefilter.
+func (s *Segment) lookupGram(f *fieldInfo, field uint32, gram string) []byte {
+	h := hashTerm(AtomGram, field, gram)
+	if bit := hi32(h) & (gramFilterBits - 1); f.grams == nil || f.grams[bit>>6]&(1<<(bit&63)) == 0 {
+		return nil
+	}
+	return s.lookupHashed(AtomGram, field, gram, h)
+}
+
+// lookupHashed is lookup with the term's hash computed.
+func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint64) []byte {
 	fk := field<<8 | uint32(kind)
 	for slot, probes := lo32(h)&s.tableMask, uint32(0); probes <= s.tableMask; slot, probes = (slot+1)&s.tableMask, probes+1 {
 		e := u32(s.slots, 4*int(slot))

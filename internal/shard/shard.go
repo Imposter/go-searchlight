@@ -618,6 +618,13 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 	}
 	for i := range changes {
 		c := &changes[i]
+		if c.IndexUID != "" {
+			if uid == "" {
+				uid = c.IndexUID
+			} else if c.IndexUID != uid {
+				return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: %q, shard holds %q", ErrIndexUID, c.IndexUID, uid)}
+			}
+		}
 		if c.Kind == Remap {
 			if !load && c.MappingVersion <= mp.version {
 				return 0, &ChangeError{Pos: i, Seq: c.Seq, Err: fmt.Errorf("%w: mapping version %d after %d", ErrInvalidChange, c.MappingVersion, mp.version)}
@@ -636,13 +643,6 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 			return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: seq %d after %d", ErrSeqOrder, c.Seq, last)}
 		default:
 			last, top = c.Seq, c.Seq
-		}
-		if c.IndexUID != "" {
-			if uid == "" {
-				uid = c.IndexUID
-			} else if c.IndexUID != uid {
-				return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: %q, shard holds %q", ErrIndexUID, c.IndexUID, uid)}
-			}
 		}
 	}
 	if len(changes) == 0 {

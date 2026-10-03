@@ -50,6 +50,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -69,7 +70,9 @@ type Options struct {
 	// seq_persist_interval, merge_threads, merge_budget, search_threads, max_doc_bytes,
 	// node_id, advertise_address and max_lag are used.
 	Config config.Config
-	// NewTailer makes each shard copy's tailer. Required.
+	// NewTailer makes each shard copy's tailer. Nil means the replica tailer
+	// (ReplicaTailers), sharing one replica Hub the node runs when the store
+	// pushes notifications (Postgres).
 	NewTailer NewTailerFunc
 	// Background are node-wide loops the tailers share (the replica Hub's Run, which
 	// delivers Postgres notifications), run from NewSingle until Close. An error one
@@ -201,9 +204,9 @@ func (n *Single) pingLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		// Half the interval: a slow but live database answers in time, and a
-		// hung one is caught before the next ping.
-		pctx, cancel := context.WithTimeout(ctx, n.pingInterval()/2)
+		// A database slower than max_lag/2 to answer a ping is as good as gone
+		// for reads that must not trail by more than max_lag.
+		pctx, cancel := context.WithTimeout(ctx, n.pingTimeout())
 		err := n.st.Ping(pctx)
 		cancel()
 		if ctx.Err() != nil {
@@ -211,6 +214,14 @@ func (n *Single) pingLoop(ctx context.Context) {
 		}
 		n.noteDB(err)
 	}
+}
+
+// pingTimeout bounds one ping: max_lag/2.
+func (n *Single) pingTimeout() time.Duration {
+	if n.cfg.MaxLag > 0 {
+		return n.cfg.MaxLag / 2
+	}
+	return time.Second
 }
 
 // noteDB records whether the database just answered.
@@ -226,9 +237,60 @@ func (n *Single) noteDB(err error) {
 }
 
 // stale reports whether reads should be marked stale: the database cannot be
-// reached, so the copies may trail writes made through other nodes. The replica
-// tailer's Lag will refine this per copy once it is wired in.
+// reached, so the copies may trail writes made through other nodes.
 func (n *Single) stale() bool { return n.dbDown.Load() }
+
+// indexStale reports whether a read of idx should be marked stale: the database is
+// unreachable, or a copy trails the changelog by more than max_lag or cannot poll it.
+func (n *Single) indexStale(idx *index) bool {
+	if n.stale() {
+		return true
+	}
+	for _, c := range idx.copies {
+		if c.trailing(n.cfg.MaxLag) {
+			return true
+		}
+	}
+	return false
+}
+
+// trailing reports whether the copy trails the changelog by more than maxLag (by
+// its tailer's measure), or cannot poll it now.
+func (c *copyState) trailing(maxLag time.Duration) bool {
+	if pr, ok := c.tailer.(PollReporter); ok && pr.PollFailing() {
+		return true
+	}
+	if lr, ok := c.tailer.(LagReporter); ok && maxLag > 0 {
+		if _, age := lr.Lag(); age > maxLag {
+			return true
+		}
+	}
+	return false
+}
+
+// notServing is why the copy cannot serve a read or take a write now (a 503), or nil:
+// it has halted, or it is recovering (being opened, reopened or rebuilt: the shard a
+// tailer exposes then may be empty or partly loaded, so it is never read).
+func (c *copyState) notServing() error {
+	if h := c.halted.Load(); h != nil {
+		return api.Unavailable(*h, "shard %d of index %q has halted", c.id.Shard, c.id.Index)
+	}
+	if hr, ok := c.tailer.(HaltReporter); ok {
+		if err := hr.HaltErr(); err != nil {
+			return api.Unavailable(err, "shard %d of index %q has halted", c.id.Shard, c.id.Index)
+		}
+	}
+	if sr, ok := c.tailer.(StateReporter); ok {
+		switch sr.StateName() {
+		case StateTailing:
+		case StateHalted:
+			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q has halted", c.id.Shard, c.id.Index)
+		default:
+			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q is recovering", c.id.Shard, c.id.Index)
+		}
+	}
+	return nil
+}
 
 // LagReporter is implemented by a tailer that measures how far its copy trails the
 // changelog (replica.Tailer.Lag): in changes of its own shard, and in time.
@@ -257,8 +319,8 @@ func (c *copyState) shard() *shard.Shard { return c.tailer.Shard() }
 // and starts them. Copies of indexes no longer in the catalogue are removed from
 // data_dir.
 func NewSingle(ctx context.Context, o Options) (*Single, error) {
-	if o.Store == nil || o.NewTailer == nil {
-		return nil, errors.New("node: Options.Store and Options.NewTailer are required")
+	if o.Store == nil {
+		return nil, errors.New("node: Options.Store is required")
 	}
 	rr, ok := o.Store.(store.RecordReader)
 	if !ok {
@@ -281,6 +343,15 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	}
 	if o.GroupCommit.Meter == nil {
 		o.GroupCommit.Meter = o.Meter
+	}
+	if o.NewTailer == nil {
+		// One Hub per node, shared by every tailer; nil (no notifications, as on
+		// SQLite and MySQL) means the tailers poll and are woken by writes.
+		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter})
+		if hub != nil {
+			o.Background = append(o.Background, hub.Run)
+		}
+		o.NewTailer = ReplicaTailers(o.Config, hub, o.Logger, o.Tracer, o.Meter)
 	}
 	n := &Single{
 		st:       o.Store,
@@ -315,6 +386,14 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		return nil, fmt.Errorf("node: list indexes: %w", err)
 	}
 	n.noteDB(nil)
+	// The wait_for_seq bound and every copy's saved-query wait start at the
+	// store's head, so nothing committed before a restart is missed.
+	if head, _, err := o.Store.HeadSeq(ctx); err == nil {
+		n.noteHead(head)
+	} else {
+		_ = n.Close(ctx)
+		return nil, fmt.Errorf("node: read the head seq: %w", err)
+	}
 	n.bg.Go(func() { n.pingLoop(bgCtx) })
 	keep := map[string]bool{}
 	for _, m := range metas {
@@ -422,6 +501,10 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 				Logger: n.log, Tracer: n.tr, Meter: n.meter,
 			}),
 		}
+		// A percolation waits until the copy has every change up to the head as
+		// of its opening (its saved queries among them), then only for queries
+		// saved since.
+		c.querySeq.Store(n.head.Load())
 		idx.copies = append(idx.copies, c)
 		idx.wg.Add(1)
 		go n.runTailer(runCtx, idx, c)

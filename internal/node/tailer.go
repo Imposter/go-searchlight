@@ -12,12 +12,12 @@ import (
 // writer. The node commits writes to the store, then wakes the tailers of the shards
 // it wrote; reads wait on the shard for the seq they need.
 //
-// It is the part of the replica tailer (Task 9, replica.Tailer) the node uses:
-// replica.NewTailer's result satisfies it as it is, so wiring the real tailer in is
-// one [NewTailerFunc].
+// It is the part of the replica tailer (replica.Tailer) the node uses; ReplicaTailers
+// is the production [NewTailerFunc], and nodetest has one tests can pause.
 type Tailer interface {
-	// Run applies the changelog until ctx ends (it then returns nil) or the copy
-	// halts on a change it cannot apply (it returns why).
+	// Run applies the changelog until ctx ends (it then returns nil) or it must
+	// stop (it returns why). A copy the replica tailer halts does not stop Run
+	// (HaltReporter says so); a simpler tailer's Run may return on a halt.
 	Run(ctx context.Context) error
 	// Applied is the newest seq the copy has applied.
 	Applied() int64
@@ -54,7 +54,7 @@ type TailerEnv struct {
 }
 
 // NewTailerFunc makes the tailer of one shard copy: the node's one seam for its
-// tailer. Wire replica.NewTailer through it; tests use nodetest.NewTailer.
+// tailer: ReplicaTailers in production, nodetest.NewTailer in tests that pause a copy.
 type NewTailerFunc func(st store.Store, sh *shard.Shard, id store.ShardID, env TailerEnv) Tailer
 
 // ShardFor is the shard of an index with n shards that a document or saved query id

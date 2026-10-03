@@ -1,5 +1,5 @@
-// Package nodetest holds test doubles for package node: a changelog tailer that
-// stands in for the replica tailer (Task 9) until it is wired in.
+// Package nodetest holds test doubles for package node: a minimal changelog tailer
+// that tests can pause, where the replica tailer cannot be.
 package nodetest
 
 import (
@@ -120,6 +120,10 @@ func (t *Tailer) CatchUp(ctx context.Context) error {
 			if err := t.apply(ctx, changes); err != nil {
 				return err
 			}
+			// Past the page, mapping changes (applied as nothing) included.
+			if err := t.sh.Advance(changes[len(changes)-1].Seq); err != nil {
+				return err
+			}
 		}
 		if len(changes) < pageSize {
 			break
@@ -146,11 +150,16 @@ func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 		return fmt.Errorf("%w: mapping: %w", ErrHalted, err)
 	}
 	t.sh.SetMapping(m)
-	out := make([]shard.Change, len(changes))
+	out := make([]shard.Change, 0, len(changes))
 	for i := range changes {
 		c := &changes[i]
 		sc := shard.Change{Seq: c.Seq, IndexUID: c.IndexUID}
 		switch c.Kind {
+		case store.KindMapping:
+			// The catalogue's mapping, read above, already holds it: documents are
+			// analyzed under the newest mapping, which this stand-in allows itself
+			// (the replica tailer adopts each mapping at its seq).
+			continue
 		case store.KindUpsert:
 			doc, _, err := schema.Analyze(m, c.ID, c.Payload)
 			if err != nil {
@@ -178,7 +187,10 @@ func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 		default:
 			return fmt.Errorf("%w: seq %d: kind %q", ErrHalted, c.Seq, c.Kind)
 		}
-		out[i] = sc
+		out = append(out, sc)
+	}
+	if len(out) == 0 {
+		return nil // only mapping changes: CatchUp advances past them
 	}
 	for {
 		err := t.sh.Apply(ctx, out)

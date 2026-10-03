@@ -92,3 +92,72 @@ func TestGCRetryNeverRemovesTheManifestBeingWritten(t *testing.T) {
 	h.reopen()
 	h.check()
 }
+
+// I2: when the directory fsync after the manifest rename fails, the swap may not be
+// durable: the new generation is published, but nothing the old manifest needs is
+// removed and CommittedSeq stays what is known to be durable. The next Open settles it.
+func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
+	dirSyncFailed := errors.New("fsync directory: input/output error")
+	var armed atomic.Bool
+	opts := testOptions()
+	opts.hooks = &testHooks{at: func(point string) error {
+		if point == pointManifestRenamed && armed.CompareAndSwap(true, false) {
+			return dirSyncFailed
+		}
+		return nil
+	}}
+	h := newHarness(t, opts)
+	h.upsert("a", "b")
+	h.refresh()
+	h.del("a")
+	h.refresh() // a sidecar of the first commit's segment
+	h.upsert("c")
+	h.refresh()
+	before := dirFiles(t, h.dir)
+	committed := h.s.CommittedSeq()
+
+	// A merge whose swap is uncertain.
+	armed.Store(true)
+	if err := h.s.ForceMerge(context.Background(), 1); !errors.Is(err, dirSyncFailed) {
+		t.Fatalf("ForceMerge = %v, want the directory fsync failure", err)
+	}
+	if !errors.Is(h.s.Err(), ErrFailed) {
+		t.Fatalf("Err() = %v, want the shard failed", h.s.Err())
+	}
+	g := h.s.Acquire()
+	if len(g.Segments) != 1 {
+		t.Fatalf("%d segments: the merged generation was not published", len(g.Segments))
+	}
+	if err := checkGeneration(g, h.model); err != nil {
+		t.Fatal(err)
+	}
+	g.Release()
+	h.s.jan.drain()
+	for _, name := range before {
+		if _, err := os.Stat(filepath.Join(h.dir, name)); err != nil {
+			t.Fatalf("%s, which the old manifest needs, was removed after an uncertain swap", name)
+		}
+	}
+	if h.s.CommittedSeq() != committed {
+		t.Fatalf("CommittedSeq %d, want %d", h.s.CommittedSeq(), committed)
+	}
+
+	// A refresh's uncertain swap leaves CommittedSeq where it was.
+	h.abandon()
+	armed.Store(true)
+	h.open()
+	h.upsert("d")
+	committed = h.s.CommittedSeq()
+	if err := h.s.Refresh(context.Background()); !errors.Is(err, dirSyncFailed) {
+		t.Fatalf("Refresh = %v", err)
+	}
+	if h.s.RefreshedSeq() != h.seq || h.s.CommittedSeq() != committed {
+		t.Fatalf("RefreshedSeq %d CommittedSeq %d, want %d and %d", h.s.RefreshedSeq(), h.s.CommittedSeq(), h.seq, committed)
+	}
+	h.check()
+	h.abandon()
+	h.opts.hooks = nil
+	h.open() // whichever manifest survived: here the new one
+	h.check()
+	h.waitNoOrphans()
+}

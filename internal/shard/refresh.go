@@ -314,17 +314,28 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		err = fmt.Errorf("shard: the manifest swap may not be durable: %w", err)
 		s.fail(err)
 	}
+	// uncertain: the new manifest is in place but may not survive a crash, so the old
+	// one may come back: its files (merged-away segments, superseded sidecars) stay,
+	// and CommittedSeq stays what is known to be durable. The next Open collects
+	// whatever the surviving manifest does not reference.
+	uncertain := err != nil
 
 	g := newGeneration(s, gen, seq, maxSeq, uid, docs, queries)
-	for _, ref := range removed {
-		ref.obsolete.Store(true)
+	if !uncertain {
+		for _, ref := range removed {
+			ref.obsolete.Store(true)
+		}
 	}
 	old := s.cur.Swap(g)
-	s.committed.Store(seq)
+	if !uncertain {
+		s.committed.Store(seq)
+	}
 	if old != nil {
 		old.Release()
 	}
-	s.jan.removeLater(obsolete...)
+	if !uncertain {
+		s.jan.removeLater(obsolete...)
+	}
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
 	return true, err

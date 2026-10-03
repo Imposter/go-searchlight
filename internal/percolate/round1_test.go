@@ -2,8 +2,11 @@ package percolate
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -86,5 +89,44 @@ func TestPairFallbackIsSound(t *testing.T) {
 	seg.collect(&d, sc)
 	if want := 2000 + 1000; sc.pairOps > want {
 		t.Fatalf("fallback: %d operations, want at most %d", sc.pairOps, want)
+	}
+}
+
+// A crafted, checksummed file claiming one field per byte of a 4 MB fields section is
+// refused before anything is allocated for them (each field takes at least 25 bytes;
+// without that bound, 4M fieldInfos are 160 MiB).
+func TestCraftedFieldCountRefusedCheaply(t *testing.T) {
+	data, err := encodeSegment(context.Background(), sampleStored(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := data[:len(data)-4]
+	head := len(fileMagic) + 8
+	var sections [][]byte
+	for rest := body[head:]; len(rest) > 0; {
+		n := binary.LittleEndian.Uint64(rest)
+		sections = append(sections, rest[8:8+n])
+		rest = rest[8+n:]
+	}
+	const fieldBytes = 4 << 20
+	sections[secFields] = make([]byte, fieldBytes)
+	meta := slices.Clone(sections[secMeta])
+	binary.LittleEndian.PutUint32(meta[4:], fieldBytes) // the field count
+	sections[secMeta] = meta
+	crafted := slices.Clone(body[:head])
+	for _, s := range sections {
+		crafted = binary.LittleEndian.AppendUint64(crafted, uint64(len(s)))
+		crafted = append(crafted, s...)
+	}
+	crafted = restamp(crafted)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err = openData("crafted", crafted)
+	runtime.ReadMemStats(&after)
+	if !isCorrupt(err) {
+		t.Fatalf("got %v", err)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 16<<20 {
+		t.Fatalf("refusing the file allocated %d bytes", grew)
 	}
 }

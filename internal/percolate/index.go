@@ -80,6 +80,7 @@ const (
 	recordSize    = 20
 	metaSize      = 8 * 4
 	pairSize      = 12
+	minFieldSize  = 1 + 6*4
 )
 
 var fileMagic = [8]byte{'S', 'L', 'P', 'E', 'R', 'C', '\r', '\n'}
@@ -859,7 +860,9 @@ func (s *Segment) checkDictionary(numEntries uint32) error {
 // records lie in the field's record range.
 func (s *Segment) parseFields(b []byte, numFields, numNodes, numRecs uint32) error {
 	r := byteReader{b: b}
-	if uint64(numFields) > uint64(len(b)) {
+	// Each field takes at least 25 bytes (a length byte and six u32s): bound the count
+	// by the section before allocating for it.
+	if uint64(numFields)*minFieldSize > uint64(len(b)) {
 		return errors.New("fields: count out of range")
 	}
 	s.fields = make([]fieldInfo, 0, numFields)

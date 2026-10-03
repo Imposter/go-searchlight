@@ -67,6 +67,7 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `refresh_interval` | `1s` | how often writes become searchable |
 | `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
 | `max_lag` | `2s` | how far a copy may trail the changelog and still serve |
+| `changelog_poll_interval` | `500ms` | how often a shard copy polls the changelog when no notification or local write wakes it |
 | `merge_budget` | `64MiB` | bytes per second merges may write (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent background merges |
 | `search_threads` | GOMAXPROCS | search worker pool size |

@@ -20,6 +20,10 @@ import (
 // transaction that changes data; Read runs plain reads and snapshot scans.
 // They are the same pool except on SQLite, whose writer pool begins every
 // transaction with BEGIN IMMEDIATE.
+//
+// Read must reach the same database as Write (the primary), never a replica
+// that lags it: a tailer reads HeadSeq and then ChangesAfter and trusts that
+// every seq at or below the head is visible to the second read.
 type Pools struct {
 	Write *sql.DB
 	Read  *sql.DB

@@ -244,7 +244,16 @@ func allChanges(t *testing.T, st Store, shard ShardID) []Change {
 func scanAll(t *testing.T, st Store, shard ShardID) (map[string]Record, int64) {
 	t.Helper()
 	out := make(map[string]Record)
+	first := true
 	asOf, err := st.ScanShard(context.Background(), shard, func(r Record) error {
+		isFirst := first
+		first = false
+		if r.Kind == RecordMapping {
+			if !isFirst {
+				t.Errorf("the mapping record is not the first")
+			}
+			return nil // scanMapping reads it
+		}
 		k := "d:" + r.ID
 		if r.Kind == RecordQuery {
 			k = "q:" + r.ID

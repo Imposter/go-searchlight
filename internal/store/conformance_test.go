@@ -527,6 +527,9 @@ func TestScanShardSnapshot(t *testing.T) {
 		var lateSeq int64
 		var ids []string
 		asOf, err := st.ScanShard(ctx, shard, func(r Record) error {
+			if r.Kind == RecordMapping {
+				return nil
+			}
 			if lateSeq == 0 {
 				// Commit more changes mid-scan; the scan must not see them.
 				f, _, err := writer.Apply(ctx, []Change{upsert("snap", 0, "d9", `{}`), upsert("snap", 0, "d0", `{"v":2}`)})
@@ -1448,13 +1451,13 @@ func TestHeadSeq(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		if head, err := st.HeadSeq(ctx); err != nil || head != 0 {
-			t.Fatalf("empty store head = %d, %v", head, err)
+		if head, now, err := st.HeadSeq(ctx); err != nil || head != 0 || time.Since(now).Abs() > time.Minute {
+			t.Fatalf("empty store head = %d at %s, %v", head, now, err)
 		}
 		mustCreateIndex(t, st, "h")
 		mustApply(t, st, upsert("h", 0, "a", `{}`), upsert("h", 1, "b", `{}`))
 		_, last := mustApply(t, st, upsert("h", 1, "c", `{}`))
-		head, err := st.HeadSeq(ctx)
+		head, _, err := st.HeadSeq(ctx)
 		if err != nil || head != last {
 			t.Fatalf("head = %d, %v; want %d", head, err, last)
 		}
@@ -1463,7 +1466,7 @@ func TestHeadSeq(t *testing.T) {
 			t.Fatalf("shard 0 after 1: %v, %v", page, err)
 		}
 		_ = st.Close()
-		if _, err := st.HeadSeq(ctx); !errors.Is(err, ErrClosed) {
+		if _, _, err := st.HeadSeq(ctx); !errors.Is(err, ErrClosed) {
 			t.Fatalf("head after close: %v", err)
 		}
 	})
@@ -1869,4 +1872,130 @@ func TestBlobGetSpan(t *testing.T) {
 	if !ended() {
 		t.Fatal("blob_get span still open after Close")
 	}
+}
+
+// TestMappingChanges: an Update that changes the mapping moves the mapping version
+// and logs a mapping change to every shard, in its transaction and with contiguous
+// seqs; every later change carries the new version; ScanShard yields the mapping as
+// of its snapshot first; and only Update writes mapping changes.
+func TestMappingChanges(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		ix := st.Indexes()
+		m, err := ix.Create(ctx, IndexMeta{Name: "mc", Mapping: []byte(`{"fields":{}}`), Settings: []byte(`{"shards":3}`)})
+		if err != nil || m.MappingVersion != 1 {
+			t.Fatalf("create: %+v %v", m, err)
+		}
+		mustApply(t, st, upsert("mc", 1, "a", `{}`))
+		// A settings-only update logs nothing.
+		m.Settings = []byte(`{"shards":3,"refresh_interval":"2s"}`)
+		if m, err = ix.Update(ctx, m); err != nil || m.MappingVersion != 1 || counterValue(t, st) != 1 {
+			t.Fatalf("settings update: %+v %v (counter %d)", m, err, counterValue(t, st))
+		}
+		m.Mapping = []byte(`{"fields":{"brand":"keyword"}}`)
+		if m, err = ix.Update(ctx, m); err != nil || m.MappingVersion != 2 {
+			t.Fatalf("mapping update: %+v %v", m, err)
+		}
+		if counterValue(t, st) != 4 {
+			t.Fatalf("counter %d after a mapping change to 3 shards", counterValue(t, st))
+		}
+		for sh := range 3 {
+			changes := allChanges(t, st, ShardID{Index: "mc", Shard: sh})
+			last := changes[len(changes)-1]
+			if last.Kind != KindMapping || last.ID != MappingChangeID || last.Seq != int64(2+sh) ||
+				last.MappingVersion != 2 || !bytes.Equal(last.Payload, m.Mapping) || last.IndexUID != m.UID {
+				t.Fatalf("shard %d: %+v", sh, last)
+			}
+		}
+		_, after := mustApply(t, st, upsert("mc", 1, "b", `{"brand":"x"}`))
+		changes := allChanges(t, st, ShardID{Index: "mc", Shard: 1})
+		if c := changes[len(changes)-1]; c.Seq != after || c.MappingVersion != 2 || changes[0].MappingVersion != 1 {
+			t.Fatalf("changes %+v", changes)
+		}
+		var mapping []Record
+		_, err = st.ScanShard(ctx, ShardID{Index: "mc", Shard: 1}, func(r Record) error {
+			if r.Kind == RecordMapping {
+				mapping = append(mapping, r)
+			} else if r.MappingVersion != 2 {
+				t.Errorf("record %+v", r)
+			}
+			return nil
+		})
+		if err != nil || len(mapping) != 1 || !bytes.Equal(mapping[0].Body, m.Mapping) || mapping[0].MappingVersion != 2 {
+			t.Fatalf("scan mapping %+v %v", mapping, err)
+		}
+		if _, _, err := st.Apply(ctx, []Change{{Index: "mc", Kind: KindMapping, ID: MappingChangeID, Payload: []byte(`{}`)}}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("Apply of a mapping change: %v", err)
+		}
+		m.Settings = []byte(`{"shards":0}`)
+		if _, err := ix.Update(ctx, m); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("shards 0: %v", err)
+		}
+		if _, err := ix.Create(ctx, IndexMeta{Name: "bad", Settings: []byte(`{"shards":"x"}`)}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("shards x: %v", err)
+		}
+	})
+}
+
+// TestMappingChangesOrderWithApply: under concurrent writers and mapping updates,
+// every change of a shard follows the mapping change of the version it carries.
+func TestMappingChangesOrderWithApply(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "mo", Mapping: []byte(`{"fields":{}}`)}); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for w := range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range 25 {
+					if _, _, err := st.Apply(ctx, []Change{upsert("mo", 0, fmt.Sprintf("w%d-%d", w, i), `{}`)}); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 10 {
+				for {
+					m, err := st.Indexes().Get(ctx, "mo")
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					m.Mapping = []byte(fmt.Sprintf(`{"fields":{"f%d":"keyword"}}`, i))
+					if _, err = st.Indexes().Update(ctx, m); err == nil {
+						break
+					} else if !errors.Is(err, ErrConflict) {
+						t.Error(err)
+						return
+					}
+				}
+			}
+		}()
+		wg.Wait()
+		version := int64(1)
+		for _, c := range allChanges(t, st, ShardID{Index: "mo"}) {
+			if c.Kind == KindMapping {
+				if c.MappingVersion != version+1 {
+					t.Fatalf("mapping change %d after version %d", c.MappingVersion, version)
+				}
+				version = c.MappingVersion
+				continue
+			}
+			if c.MappingVersion != version {
+				t.Fatalf("seq %d carries mapping version %d, the log is at %d", c.Seq, c.MappingVersion, version)
+			}
+		}
+		if version != 11 {
+			t.Fatalf("ended at mapping version %d", version)
+		}
+	})
 }

@@ -56,11 +56,13 @@ type sqlStore struct {
 // queries are the fixed statements, bound to the dialect's placeholders.
 type queries struct {
 	lockCounter, updateCounter, readCounter string
+	readHead                                string
 	readEpoch                               string
 	changesAfter, horizon                   string
 	docSeq, querySeq                        string
 	scanDocs, scanQueries                   string
 	indexUID                                string
+	indexState                              string
 }
 
 func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore, error) {
@@ -81,8 +83,9 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		lockCounter:   s.bind("SELECT value, " + d.Now + " FROM sl_counter WHERE id = 1" + d.ForUpdate),
 		updateCounter: s.bind("UPDATE sl_counter SET value = ? WHERE id = 1"),
 		readCounter:   s.bind("SELECT value FROM sl_counter WHERE id = 1"),
+		readHead:      s.bind("SELECT value, " + d.Now + " FROM sl_counter WHERE id = 1"),
 		readEpoch:     "SELECT value FROM sl_counter WHERE id = 2",
-		changesAfter: s.bind(`SELECT seq, kind, id, payload, at, index_uid FROM sl_changes
+		changesAfter: s.bind(`SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes
 WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?`),
 		horizon:     s.bind("SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?"),
 		docSeq:      s.bind("SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"),
@@ -90,6 +93,7 @@ WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?`),
 		scanDocs:    s.bind("SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id"),
 		scanQueries: s.bind("SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id"),
 		indexUID:    s.bind("SELECT uid FROM sl_indexes WHERE name = ?"),
+		indexState:  s.bind("SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?"),
 	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
@@ -305,7 +309,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	}
 	first, last = counter+1, counter+int64(len(batch))
 
-	uids, err := s.checkIndexes(ctx, tx, batch)
+	idx, err := s.checkIndexes(ctx, tx, batch)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -318,12 +322,13 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	// The changelog. Each row carries the uid of the incarnation of its
 	// index as of this Apply, so a tailer can tell a drop-and-recreate apart
 	// from a continuing index without an extra query per batch.
-	args := make([]any, 0, len(batch)*8)
+	args := make([]any, 0, len(batch)*9)
 	for i := range batch {
 		c := &batch[i]
-		args = append(args, first+int64(i), c.Index, c.Shard, string(c.Kind), c.ID, p.payload[i], nowMs, uids[c.Index])
+		st := idx[c.Index]
+		args = append(args, first+int64(i), c.Index, c.Shard, string(c.Kind), c.ID, p.payload[i], nowMs, st.uid, st.mappingVersion)
 	}
-	if err := s.insertRows(ctx, tx, "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid) VALUES ", 8, args, ""); err != nil {
+	if err := s.insertRows(ctx, tx, insertChanges, 9, args, ""); err != nil {
 		return 0, 0, fmt.Errorf("insert changes: %w", err)
 	}
 
@@ -349,24 +354,37 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	return first, last, nil
 }
 
+// insertChanges is the changelog insert; rows have 9 columns.
+const insertChanges = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version) VALUES "
+
+// indexState is an index's incarnation and mapping version as of a
+// transaction, which every changelog row carries.
+type indexState struct {
+	uid            string
+	mappingVersion int64
+}
+
 // checkIndexes fails with an *IndexNotFoundError naming every change whose
 // index does not exist, and otherwise returns each named index's current
-// incarnation (sl_indexes.uid), so the changelog row can carry it.
-func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) (map[string]string, error) {
-	uids := make(map[string]string, 1)
+// incarnation and mapping version, so the changelog row can carry them.
+func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) (map[string]indexState, error) {
+	states := make(map[string]indexState, 1)
 	var missing *IndexNotFoundError
 	for i := range batch {
 		name := batch[i].Index
-		uid, seen := uids[name]
+		st, seen := states[name]
+		uid := st.uid
 		if !seen {
-			err := tx.QueryRowContext(ctx, s.q.indexUID, name).Scan(&uid)
+			var mapping string
+			err := tx.QueryRowContext(ctx, s.q.indexState, name).Scan(&st.uid, &st.mappingVersion, &mapping)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
-				uid = ""
+				st = indexState{}
 			case err != nil:
 				return nil, err
 			}
-			uids[name] = uid
+			states[name] = st
+			uid = st.uid
 			if uid == "" {
 				if missing == nil {
 					missing = &IndexNotFoundError{}
@@ -381,7 +399,7 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 	if missing != nil {
 		return nil, missing
 	}
-	return uids, nil
+	return states, nil
 }
 
 // checkConditions evaluates IfSeq conditions in batch order, as if each
@@ -578,7 +596,7 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		var kind string
 		var payload []byte
 		var at int64
-		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &at, &c.IndexUID); err != nil {
+		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &at, &c.IndexUID, &c.MappingVersion); err != nil {
 			return nil, err
 		}
 		c.Kind = Kind(kind)
@@ -624,20 +642,30 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	if err := tx.QueryRowContext(ctx, s.q.readCounter).Scan(&asOf); err != nil {
 		return 0, err
 	}
-	// The index's current incarnation, read once in this scan's snapshot and
-	// stamped on every record, instead of a query per row.
+	// The index's current incarnation and mapping, read once in this scan's
+	// snapshot: the mapping is the first record, and the incarnation and
+	// mapping version are stamped on every record.
 	var uid string
-	if err := tx.QueryRowContext(ctx, s.q.indexUID, shard.Index).Scan(&uid); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var mv int64
+	var mapping []byte
+	switch err := tx.QueryRowContext(ctx, s.q.indexState, shard.Index).Scan(&uid, &mv, &mapping); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
 		return 0, err
+	default:
+		r := Record{Kind: RecordMapping, Index: shard.Index, Shard: shard.Shard, Body: mapping, IndexUID: uid, MappingVersion: mv}
+		if err := fn(r); err != nil {
+			return 0, err
+		}
 	}
 	if err := scanRows(ctx, tx, s.q.scanDocs, shard, func(rows *sql.Rows) (Record, error) {
-		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid}
+		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Seq)
 	}, fn); err != nil {
 		return 0, err
 	}
 	if err := scanRows(ctx, tx, s.q.scanQueries, shard, func(rows *sql.Rows) (Record, error) {
-		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid}
+		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
 	}, fn); err != nil {
 		return 0, err
@@ -663,14 +691,15 @@ func scanRows(ctx context.Context, tx *sql.Tx, q string, shard ShardID, scan fun
 	return rows.Err()
 }
 
-func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, err error) {
+func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, now time.Time, err error) {
 	ctx, end := s.start(ctx, "head_seq")
 	defer end(&err)
 	if s.closed.Load() {
-		return 0, ErrClosed
+		return 0, time.Time{}, ErrClosed
 	}
-	err = s.r.QueryRowContext(ctx, s.q.readCounter).Scan(&seq)
-	return seq, err
+	var nowMs int64
+	err = s.r.QueryRowContext(ctx, s.q.readHead).Scan(&seq, &nowMs)
+	return seq, millis(nowMs), err
 }
 
 // --- Pruning ---------------------------------------------------------------

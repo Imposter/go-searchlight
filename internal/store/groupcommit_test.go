@@ -412,6 +412,22 @@ func TestGroupCommitMissingIndexNamesOwnIndex(t *testing.T) {
 	}
 }
 
+// TestOwnIndexesDedups checks that when one request names the same missing
+// index at more than one position, ownIndexes reports that index once, not
+// once per position.
+func TestOwnIndexesDedups(t *testing.T) {
+	r := &gcRequest{changes: []Change{
+		{Index: "a"},
+		{Index: "gone"},
+		{Index: "b"},
+		{Index: "gone"},
+	}}
+	got := ownIndexes(r, []int{1, 3})
+	if want := "[gone]"; fmt.Sprint(got) != want {
+		t.Fatalf("ownIndexes = %v, want %s", got, want)
+	}
+}
+
 // A request held for a conflict caused by an earlier request is
 // re-evaluated when that earlier request's caller gives up.
 func TestGroupCommitHeldConflictReopens(t *testing.T) {

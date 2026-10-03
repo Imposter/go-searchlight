@@ -124,8 +124,10 @@ const (
 	// Refresh and merge.
 	MetricRefreshDuration = "searchlight.shard.refresh.duration"
 	MetricMergeDuration   = "searchlight.shard.merge.duration"
+	MetricMergeBytes      = "searchlight.shard.merge.bytes"
 	MetricMergeBacklog    = "searchlight.shard.merge.backlog"
 	MetricShardSegments   = "searchlight.shard.segments"
+	MetricShardBufferDocs = "searchlight.shard.buffer.documents"
 
 	// Size.
 	MetricShardDocuments    = "searchlight.shard.documents"
@@ -176,8 +178,10 @@ var Catalog = []MetricSpec{
 
 	{MetricRefreshDuration, KindHistogram, "s", "Shard refresh time, by index and shard.", SlowBuckets},
 	{MetricMergeDuration, KindHistogram, "s", "Segment merge time, by index and shard.", SlowBuckets},
+	{MetricMergeBytes, KindCounter, "By", "Bytes written by segment merges, by index and shard.", nil},
 	{MetricMergeBacklog, KindGauge, "{segment}", "Segments waiting to be merged, by index and shard.", nil},
 	{MetricShardSegments, KindGauge, "{segment}", "Segments in the current generation, by index and shard.", nil},
+	{MetricShardBufferDocs, KindGauge, "{change}", "Documents and saved queries in the write buffer, not yet refreshed, by index and shard.", nil},
 
 	{MetricShardDocuments, KindGauge, "{document}", "Live documents, by index and shard.", nil},
 	{MetricShardTerms, KindGauge, "{term}", "Distinct terms across a shard's segments, by index and shard.", nil},

@@ -101,32 +101,69 @@ func packTrigram(a, b, c rune) uint64 {
 // each run padded with two spaces before and one after, and every 3-rune window. These
 // are what [SimilarityKeys] compares; compute a text's keys once and reuse them.
 func TrigramKeys(s string) []uint64 {
-	lowered := Lower(s)
-	keys := make([]uint64, 0, len(lowered)+1)
-	before2, before1 := rune(' '), rune(' ')
-	inWord := false
-	for _, r := range lowered {
-		if isTrigramWord(r) {
-			if !inWord {
-				before2, before1, inWord = ' ', ' ', true
-			}
-			keys = append(keys, packTrigram(before2, before1, r))
-			before2, before1 = before1, r
-			continue
-		}
-		if inWord {
-			keys = append(keys, packTrigram(before2, before1, ' '))
-			inWord = false
-		}
-	}
-	if inWord {
-		keys = append(keys, packTrigram(before2, before1, ' '))
-	}
+	keys := AppendTrigramKeys(make([]uint64, 0, len(s)+1), s)
 	if len(keys) == 0 {
 		return nil
 	}
-	slices.Sort(keys)
-	return slices.Compact(keys)
+	return keys
+}
+
+// AppendTrigramKeys appends s's [TrigramKeys] to dst, sorted and distinct among
+// themselves, and returns the extended slice. It lowercases as it goes rather than
+// building the lowered text, so with room in dst it allocates nothing (unless s holds a
+// capital sigma, whose lowercase depends on its context): the matcher computes a
+// document's keys into a reused buffer this way.
+func AppendTrigramKeys(dst []uint64, s string) []uint64 {
+	base := len(dst)
+	t := trigrammer{keys: dst, before2: ' ', before1: ' '}
+	if strings.ContainsRune(s, capitalSigma) {
+		for _, r := range Lower(s) {
+			t.feed(r)
+		}
+	} else {
+		for _, r := range s {
+			if r < utf8.RuneSelf {
+				if r >= 'A' && r <= 'Z' {
+					r += 'a' - 'A'
+				}
+				t.feed(r)
+			} else if lowered, ok := lowerMap[r]; ok {
+				for _, l := range lowered {
+					t.feed(l)
+				}
+			} else {
+				t.feed(r)
+			}
+		}
+	}
+	if t.inWord {
+		t.keys = append(t.keys, packTrigram(t.before2, t.before1, ' '))
+	}
+	added := t.keys[base:]
+	slices.Sort(added)
+	return t.keys[:base+len(slices.Compact(added))]
+}
+
+// trigrammer collects a lowered text's trigram keys, one code point at a time.
+type trigrammer struct {
+	keys             []uint64
+	before2, before1 rune
+	inWord           bool
+}
+
+func (t *trigrammer) feed(r rune) {
+	if isTrigramWord(r) {
+		if !t.inWord {
+			t.before2, t.before1, t.inWord = ' ', ' ', true
+		}
+		t.keys = append(t.keys, packTrigram(t.before2, t.before1, r))
+		t.before2, t.before1 = t.before1, r
+		return
+	}
+	if t.inWord {
+		t.keys = append(t.keys, packTrigram(t.before2, t.before1, ' '))
+		t.inWord = false
+	}
 }
 
 // Trigrams returns s's pg_trgm trigrams (see [TrigramKeys]) as strings, distinct and

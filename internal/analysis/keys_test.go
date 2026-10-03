@@ -39,3 +39,24 @@ func BenchmarkTrigramKeys(b *testing.B) {
 		_ = TrigramKeys("Nike Air Max 90 Running Shoe")
 	}
 }
+
+func TestAppendTrigramKeys(t *testing.T) {
+	texts := []string{
+		"", "!! __", "Cat cat CAT!", "nike air max 90", "İstanbul STRASSE straße",
+		"ΟΔΟΣ οδος Σ", "ﬁsh ＦＵＬＬ 日本", "a\x00b", "bad \xff utf8", "Ꭰ Ꮳ",
+	}
+	for _, text := range texts {
+		want := TrigramKeys(text)
+		prefix := []uint64{7, 3}
+		got := AppendTrigramKeys(prefix, text)
+		if !slices.Equal(got[:2], []uint64{7, 3}) || !slices.Equal(got[2:], want) {
+			t.Errorf("AppendTrigramKeys(%q) = %x, want %x after the prefix", text, got, want)
+		}
+	}
+	buf := make([]uint64, 0, 64)
+	if allocs := testing.AllocsPerRun(100, func() {
+		buf = AppendTrigramKeys(buf[:0], "İstanbul straße 日本 nike air")
+	}); allocs != 0 {
+		t.Fatalf("AppendTrigramKeys allocates %v times with room in dst", allocs)
+	}
+}

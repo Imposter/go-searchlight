@@ -323,7 +323,8 @@ func lazyTotals(t *testing.T, tag uint64) {
 		{0, 20, RelationEq},
 	} {
 		// A condition of its own each time, so the filter cache never serves it and
-		// every request verifies lazily.
+		// every request verifies lazily (even when the test runs again in one process).
+		leafUsage.reset()
 		q := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","unique-%d-%d"]}`, tc.track, tag))
 		resp, err := c.search(&Request{Query: q, Size: 3, Sort: []SortField{{Field: "price"}}, TrackTotal: tc.track})
 		if err != nil {
@@ -340,6 +341,7 @@ func lazyTotals(t *testing.T, tag uint64) {
 	g := c.shards[0].Acquire()
 	defer g.Release()
 	// A condition no earlier request used, so the filter cache stays out of it.
+	leafUsage.reset()
 	fresh := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","lazy-test-unique-%d"]}`, tag))
 	res, err := ExecuteShard(context.Background(), g, &Request{Query: fresh, Size: 1, Sort: []SortField{{Field: "price", Desc: true}}, TrackTotal: TrackTotalNone})
 	if err != nil {

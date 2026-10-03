@@ -17,6 +17,11 @@ import (
 //	blocks  per block: packed keys (count, keyWidth), packed docs (count, docWidth)
 const pointsBlockSize = 128
 
+const (
+	pointsHeaderLen = 4 + 4 + 1 + 1
+	pointsEntryLen  = 8 + 8 + 4 + 8
+)
+
 type pointPair struct {
 	key uint64
 	doc uint32
@@ -37,9 +42,11 @@ func writeSortedPoints(w *fileWriter, numDocs uint32, pairs []pointPair) uint64 
 	docWidth := packedWidth(bitsFor(uint64(numDocs)))
 
 	off := w.off
-	const headerLen = 4 + 4 + 1 + 1
-	const tableEntryLen = 8 + 8 + 4 + 8
-	blocksStart := off + headerLen + uint64(numBlocks)*tableEntryLen
+	// blocksStart, and so every blockOffset written below, is relative to this index's
+	// own start (off), never to w's: w.off happens to be 0 when the index is first in
+	// a private per-field buffer, but a field's point index is not guaranteed to be
+	// first in its buffer, and openPoints adds the index's absolute start back.
+	blocksStart := uint64(pointsHeaderLen) + uint64(numBlocks)*pointsEntryLen
 
 	var h encoder
 	h.u32(uint32(n))         //nolint:gosec // n fits uint32 ordinal space
@@ -104,7 +111,7 @@ func openPoints(data []byte, off uint64, enc numEncoding) (*points, error) {
 	p.numBlocks = d.u32()
 	p.keyWidth = d.u8()
 	p.docWidth = d.u8()
-	p.table = d.bytes(uint64(p.numBlocks) * 28)
+	p.table = d.bytes(uint64(p.numBlocks) * pointsEntryLen)
 	if d.err != nil {
 		return nil, d.err
 	}
@@ -119,7 +126,7 @@ func openPoints(data []byte, off uint64, enc numEncoding) (*points, error) {
 }
 
 func (p *points) blockRange(i uint32) (minKey, maxKey uint64, count uint32, off uint64) {
-	e := p.table[i*28:]
+	e := p.table[i*pointsEntryLen:]
 	return binary.LittleEndian.Uint64(e), binary.LittleEndian.Uint64(e[8:]), binary.LittleEndian.Uint32(e[16:]), p.base + binary.LittleEndian.Uint64(e[20:])
 }
 

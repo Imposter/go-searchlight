@@ -507,12 +507,7 @@ func writeFieldPoints(w *fileWriter, numDocs uint32, s *fieldScratch) {
 	for i, dv := range s.combinedNumDocs {
 		pairs[i] = pointPair{key: s.numEnc.key(dv.v), doc: dv.doc}
 	}
-	slices.SortFunc(pairs, func(a, c pointPair) int {
-		if d := cmp.Compare(a.key, c.key); d != 0 {
-			return d
-		}
-		return cmp.Compare(a.doc, c.doc)
-	})
+	sortPointPairs(pairs)
 	off := writeSortedPoints(w, numDocs, pairs)
 	s.out.pointsOff = off + 1
 }
@@ -572,4 +567,15 @@ func serializeBitmap(rb *roaring.Bitmap) []byte {
 		panic(err) // MarshalBinary over an in-memory bitmap cannot fail
 	}
 	return data
+}
+
+// sortPointPairs sorts a number column's (key, doc) pairs by key, then doc: the order
+// [writeSortedPoints] requires.
+func sortPointPairs(pairs []pointPair) {
+	slices.SortFunc(pairs, func(a, c pointPair) int {
+		if d := cmp.Compare(a.key, c.key); d != 0 {
+			return d
+		}
+		return cmp.Compare(a.doc, c.doc)
+	})
 }

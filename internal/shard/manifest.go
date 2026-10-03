@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -43,12 +44,15 @@ const (
 )
 
 type manifest struct {
-	Gen           uint64            `json:"gen"`
-	Seq           int64             `json:"seq"`
-	MaxSeq        int64             `json:"max_seq"`
-	IndexUID      string            `json:"index_uid,omitempty"`
-	Segments      []manifestSegment `json:"segments"`
-	QuerySegments []manifestSegment `json:"query_segments"`
+	Gen      uint64 `json:"gen"`
+	Seq      int64  `json:"seq"`
+	MaxSeq   int64  `json:"max_seq"`
+	IndexUID string `json:"index_uid,omitempty"`
+	// Mapping is the index mapping as of Seq, MappingVersion its version.
+	Mapping        json.RawMessage   `json:"mapping,omitempty"`
+	MappingVersion int64             `json:"mapping_version,omitempty"`
+	Segments       []manifestSegment `json:"segments"`
+	QuerySegments  []manifestSegment `json:"query_segments"`
 }
 
 type manifestSegment struct {
@@ -192,6 +196,26 @@ func Discard(dir string) error {
 		return fmt.Errorf("shard: discarding %s: %w", dir, err)
 	}
 	return nil
+}
+
+// mappingState is a mapping and its version, as of some seq. It is never changed: a
+// new mapping is a new mappingState, so comparing pointers tells whether it moved.
+type mappingState struct {
+	m       *schema.Mapping
+	version int64
+}
+
+// mappingState returns the manifest's mapping, or, when it records none, fallback at
+// version 0.
+func (m *manifest) mappingState(dir string, fallback *schema.Mapping) (*mappingState, error) {
+	if len(m.Mapping) == 0 {
+		return &mappingState{m: fallback}, nil
+	}
+	var mapping schema.Mapping
+	if err := json.Unmarshal(m.Mapping, &mapping); err != nil {
+		return nil, &ManifestError{Path: filepath.Join(dir, manifestName), Reason: "bad mapping: " + err.Error()}
+	}
+	return &mappingState{m: &mapping, version: m.MappingVersion}, nil
 }
 
 // encodeManifest returns m as the manifest file's bytes.

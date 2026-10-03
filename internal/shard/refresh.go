@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -47,15 +48,15 @@ func (s *Shard) Refresh(ctx context.Context) error {
 
 	s.mu.Lock()
 	fb := s.buf
-	seq, maxSeq, uid := s.applied, s.maxChange, s.indexUID
+	seq, maxSeq, uid, mp := s.applied, s.maxChange, s.indexUID, s.mapState
 	if fb.empty() {
 		s.mu.Unlock()
-		if seq == cur.seq && uid == cur.uid {
+		if seq == cur.seq && uid == cur.uid && mp == cur.mp {
 			return nil
 		}
 		ctx, span := s.startSpan(ctx, "shard.refresh", attribute.Int64("seq", seq), attribute.Bool("seq_only", true))
 		defer span.End()
-		s.publishSeq(ctx, seq, maxSeq, uid)
+		s.publishSeq(ctx, seq, maxSeq, uid, mp)
 		return nil
 	}
 	s.buf = newBuffer()
@@ -65,7 +66,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	defer span.End()
 	start := time.Now()
-	published, err := s.refresh(ctx, fb, seq, maxSeq, uid)
+	published, err := s.refresh(ctx, fb, seq, maxSeq, uid, mp)
 	if err != nil {
 		if !published && !isCrash(err) {
 			s.mu.Lock()
@@ -95,7 +96,7 @@ const telemetryDuration = "duration_ms"
 
 // refresh writes and commits a frozen buffer. published reports whether a generation
 // was published (even if the shard then failed): if not, nothing of fb is visible.
-func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string) (published bool, err error) {
+func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState) (published bool, err error) {
 	var built []*segRef
 	discard := func(err error) (bool, error) {
 		for _, ref := range built {
@@ -146,7 +147,7 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 			queries = append(queries, st)
 		}
 	}
-	published, err = s.commit(ctx, docs, queries, nil, seq, maxSeq, uid)
+	published, err = s.commit(ctx, docs, queries, nil, seq, maxSeq, uid, mp)
 	if !published {
 		return discard(err)
 	}
@@ -279,7 +280,7 @@ func (s *Shard) mask(states []segState, ids []string) []segState {
 // survives a crash comes with the renames before it. On one that does not, the worst
 // a crash at that moment leaves is a manifest naming a missing file, which Open
 // refuses (the copy recovers from a peer or the changelog), never a silent misread.
-func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []*segRef, seq, maxSeq int64, uid string) (published bool, err error) {
+func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []*segRef, seq, maxSeq int64, uid string, mp *mappingState) (published bool, err error) {
 	s.gen++
 	gen := s.gen // never reused, even if this commit fails
 	var written, obsolete []string
@@ -325,7 +326,10 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	if err := s.hook(pointCommitSidecars); err != nil {
 		return fail(err)
 	}
-	man := buildManifest(gen, seq, maxSeq, uid, docs, queries)
+	man, err := buildManifest(gen, seq, maxSeq, uid, mp, docs, queries)
+	if err != nil {
+		return fail(err)
+	}
 	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	if err != nil {
 		if !renamed {
@@ -345,7 +349,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	// whatever the surviving manifest does not reference.
 	uncertain := err != nil
 
-	g := newGeneration(s, gen, seq, maxSeq, uid, docs, queries)
+	g := newGeneration(s, gen, seq, maxSeq, uid, mp, docs, queries)
 	if !uncertain {
 		for _, ref := range removed {
 			ref.obsolete.Store(true)
@@ -356,6 +360,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	if !uncertain {
 		s.committed.Store(seq)
 		s.committedUID = uid
+		s.committedMap = mp
 	}
 	if old != nil {
 		old.Release()
@@ -370,14 +375,14 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 
 // publishSeq publishes the current segments as covering seq: a refresh with nothing
 // to write. Nothing is written, so CommittedSeq stays where it was ([persistSeq]).
-func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string) {
+func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	cur := s.cur.Load()
 	if cur == nil {
 		return
 	}
-	g := newGeneration(s, cur.gen, seq, maxSeq, uid, slices.Clone(cur.docs), slices.Clone(cur.queries))
+	g := newGeneration(s, cur.gen, seq, maxSeq, uid, mp, slices.Clone(cur.docs), slices.Clone(cur.queries))
 	s.cur.Store(g)
 	cur.Release()
 	s.notifyPublished()
@@ -396,17 +401,24 @@ func (s *Shard) persistSeq(ctx context.Context) error {
 	if err := s.Err(); err != nil {
 		return err
 	}
-	if cur.seq == s.committed.Load() && cur.uid == s.committedUID {
+	if cur.seq == s.committed.Load() && cur.uid == s.committedUID && cur.mp == s.committedMap {
 		return nil
 	}
-	_, err := s.commit(ctx, slices.Clone(cur.docs), slices.Clone(cur.queries), nil, cur.seq, cur.maxSeq, cur.uid)
+	_, err := s.commit(ctx, slices.Clone(cur.docs), slices.Clone(cur.queries), nil, cur.seq, cur.maxSeq, cur.uid, cur.mp)
 	return err
 }
 
-func buildManifest(gen uint64, seq, maxSeq int64, uid string, docs, queries []segState) *manifest {
+func buildManifest(gen uint64, seq, maxSeq int64, uid string, mp *mappingState, docs, queries []segState) (*manifest, error) {
 	m := &manifest{
 		Gen: gen, Seq: seq, MaxSeq: maxSeq, IndexUID: uid,
 		Segments: make([]manifestSegment, len(docs)), QuerySegments: make([]manifestSegment, len(queries)),
+	}
+	if mp.m != nil {
+		raw, err := json.Marshal(mp.m)
+		if err != nil {
+			return nil, fmt.Errorf("shard: encoding the mapping: %w", err)
+		}
+		m.Mapping, m.MappingVersion = raw, mp.version
 	}
 	for i := range docs {
 		m.Segments[i] = manifestEntry(&docs[i])
@@ -414,7 +426,7 @@ func buildManifest(gen uint64, seq, maxSeq int64, uid string, docs, queries []se
 	for i := range queries {
 		m.QuerySegments[i] = manifestEntry(&queries[i])
 	}
-	return m
+	return m, nil
 }
 
 func manifestEntry(st *segState) manifestSegment {

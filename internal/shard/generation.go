@@ -140,6 +140,7 @@ type Generation struct {
 	maxSeq  int64
 	uid     string
 	mapping *schema.Mapping
+	mp      *mappingState // mapping, with its version
 
 	// Segments are the document segments, in base-ordinal order.
 	Segments []SegmentView
@@ -152,14 +153,15 @@ type Generation struct {
 
 // newGeneration builds a generation over docs and queries, taking a reference on each
 // segment; the generation starts with one reference, the caller's.
-func newGeneration(s *Shard, gen uint64, seq, maxSeq int64, uid string, docs, queries []segState) *Generation {
+func newGeneration(s *Shard, gen uint64, seq, maxSeq int64, uid string, mp *mappingState, docs, queries []segState) *Generation {
 	g := &Generation{
 		shard:   s,
 		gen:     gen,
 		seq:     seq,
 		maxSeq:  maxSeq,
 		uid:     uid,
-		mapping: s.mapping.Load(),
+		mapping: mp.m,
+		mp:      mp,
 		docs:    docs,
 		queries: queries,
 	}
@@ -251,7 +253,10 @@ func (g *Generation) MaxSeq() int64 { return g.maxSeq }
 // seen).
 func (g *Generation) IndexUID() string { return g.uid }
 
-// Mapping is the index mapping the shard had when the generation was published.
+// MappingVersion is the version of Mapping (0 when it came from Open or SetMapping).
+func (g *Generation) MappingVersion() int64 { return g.mp.version }
+
+// Mapping is the index mapping as of the generation's seq.
 func (g *Generation) Mapping() *schema.Mapping { return g.mapping }
 
 // NumDocs is how many live documents the generation holds.
@@ -310,7 +315,7 @@ func (g *Generation) LookupQuery(id string) (seg int, ord uint32, ok bool) {
 }
 
 // openGeneration opens every segment the manifest lists, checking each against it.
-func (s *Shard) openGeneration(man *manifest) (*Generation, error) {
+func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, error) {
 	var docs, queries []segState
 	fail := func(err error) (*Generation, error) {
 		for _, list := range [][]segState{docs, queries} {
@@ -351,7 +356,7 @@ func (s *Shard) openGeneration(man *manifest) (*Generation, error) {
 			return fail(err)
 		}
 	}
-	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, docs, queries)
+	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, mp, docs, queries)
 	// newGeneration took the generation's references; the opener's are not needed.
 	return g, nil
 }

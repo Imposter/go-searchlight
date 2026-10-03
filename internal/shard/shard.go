@@ -67,12 +67,16 @@ const (
 	QueryUpsert
 	// QueryDelete removes the saved query QueryID.
 	QueryDelete
+	// Remap makes Mapping, at MappingVersion, the index mapping from this change on:
+	// the changes after it were analyzed under it. The shard records it with the seq,
+	// so a generation, and the manifest, carry the mapping as of the seq they cover.
+	Remap
 )
 
-var kindNames = [...]string{Upsert: "upsert", Delete: "delete", QueryUpsert: "query_upsert", QueryDelete: "query_delete"}
+var kindNames = [...]string{Upsert: "upsert", Delete: "delete", QueryUpsert: "query_upsert", QueryDelete: "query_delete", Remap: "remap"}
 
 func (k ChangeKind) String() string {
-	if k >= Upsert && k <= QueryDelete {
+	if k >= Upsert && k <= Remap {
 		return kindNames[k]
 	}
 	return fmt.Sprintf("ChangeKind(%d)", uint8(k))
@@ -96,6 +100,10 @@ type Change struct {
 	Query query.Node
 	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes].
 	Meta []byte
+	// Mapping and MappingVersion are a Remap's mapping and its version (the store's
+	// mapping version, increasing with every mapping change of the index).
+	Mapping        *schema.Mapping
+	MappingVersion int64
 	// IndexUID is the incarnation of the index the change belongs to (store.Change's
 	// IndexUID), or "" when unknown. The shard adopts the first one it sees, records
 	// it in its manifest, and refuses a change for any other with [ErrIndexUID]:
@@ -295,6 +303,7 @@ type Shard struct {
 	// spanAttrs label every span: the index and shard.
 	spanAttrs []attribute.KeyValue
 
+	// mapping is mapState's mapping, for lock-free reads.
 	mapping atomic.Pointer[schema.Mapping]
 
 	// cur is the published generation; the shard holds one reference on it.
@@ -306,6 +315,7 @@ type Shard struct {
 	applied   int64 // every change with seq <= applied is in a segment or buf
 	maxChange int64 // the newest change applied
 	indexUID  string
+	mapState  *mappingState // the mapping as of applied
 	closing   bool
 
 	// failed is set once the shard cannot vouch for its durable state.
@@ -327,8 +337,9 @@ type Shard struct {
 	committed     atomic.Int64
 	// manifestBytes is the manifest's size, for the disk-size metric.
 	manifestBytes atomic.Int64
-	// committedUID is the manifest's index uid.
+	// committedUID and committedMap are the manifest's index uid and mapping.
 	committedUID string
+	committedMap *mappingState
 
 	waitMu sync.Mutex
 	waitCh chan struct{} // closed and replaced at every publish
@@ -393,11 +404,16 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s.inst.observeResident(opts.Meter, s)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
-	if m != nil {
-		s.mapping.Store(m)
+	mp, err := man.mappingState(dir, m)
+	if err != nil {
+		return nil, err
+	}
+	s.mapState, s.committedMap = mp, mp
+	if mp.m != nil {
+		s.mapping.Store(mp.m)
 	}
 
-	g, err := s.openGeneration(man)
+	g, err := s.openGeneration(man, mp)
 	if err != nil {
 		return nil, err
 	}
@@ -456,12 +472,27 @@ func (s *Shard) IndexUID() string {
 	return s.indexUID
 }
 
-// Mapping returns the index mapping the shard was last given.
+// Mapping returns the index mapping as of the applied seq: the last Remap applied,
+// the manifest's at Open, or the one Open or SetMapping was given.
 func (s *Shard) Mapping() *schema.Mapping { return s.mapping.Load() }
 
-// SetMapping replaces the index mapping (mappings only grow); generations published
-// from now on carry it.
-func (s *Shard) SetMapping(m *schema.Mapping) { s.mapping.Store(m) }
+// MappingVersion returns the version of Mapping: the last Remap's, the manifest's at
+// Open, and 0 for a mapping only Open or SetMapping gave.
+func (s *Shard) MappingVersion() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mapState.version
+}
+
+// SetMapping replaces the index mapping, keeping its version; the next refresh
+// publishes (and commits) it. A copy that tails the changelog takes its mappings from
+// Remap changes instead, so the mapping is recorded with the seq it holds from.
+func (s *Shard) SetMapping(m *schema.Mapping) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.mapState = &mappingState{m: m, version: s.mapState.version}
+	s.mapping.Store(m)
+}
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change
 // with a seq at or below it is in the committed segments. After a crash, replay the
@@ -539,6 +570,8 @@ func (s *Shard) Apply(ctx context.Context, changes []Change) error {
 // AppliedSeq does not move. Once every record is loaded, the caller Advances to the
 // snapshot's seq, and tails the changelog from there.
 //
+// A Remap in a load is the snapshot's mapping: its seq is not checked (0 will do).
+//
 // Load is only for a shard that has applied nothing (AppliedSeq is 0): it refuses any
 // other with [ErrSeqOrder]. Each id must appear once across the load. Until the
 // Advance, a refresh commits the loaded records under seq 0, so a copy whose
@@ -579,12 +612,21 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		wake(s.refreshWake)
 		return 0, fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, s.buf.bytes, limit)
 	}
-	last, top, uid := s.applied, s.maxChange, s.indexUID
+	last, top, uid, mp := s.applied, s.maxChange, s.indexUID, s.mapState
 	if load && last != 0 {
 		return 0, fmt.Errorf("%w: a load into a shard that has applied seq %d", ErrSeqOrder, last)
 	}
 	for i := range changes {
 		c := &changes[i]
+		if c.Kind == Remap {
+			if !load && c.MappingVersion <= mp.version {
+				return 0, &ChangeError{Pos: i, Seq: c.Seq, Err: fmt.Errorf("%w: mapping version %d after %d", ErrInvalidChange, c.MappingVersion, mp.version)}
+			}
+			mp = &mappingState{m: c.Mapping, version: c.MappingVersion}
+			if load {
+				continue // a snapshot's mapping is not a changelog entry
+			}
+		}
 		switch {
 		case load && c.Seq <= 0:
 			return 0, &ChangeError{Pos: i, Seq: c.Seq, ID: c.id(), Err: fmt.Errorf("%w: seq %d", ErrSeqOrder, c.Seq)}
@@ -620,6 +662,10 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		}
 	}
 	s.applied, s.maxChange, s.indexUID = last, top, uid
+	if mp != s.mapState {
+		s.mapState = mp
+		s.mapping.Store(mp.m)
+	}
 	if s.opts.FlushBytes > 0 && s.buf.bytes >= s.opts.FlushBytes {
 		wake(s.refreshWake)
 	}
@@ -662,6 +708,10 @@ func (s *Shard) check(c *Change) error {
 	case QueryDelete:
 		if err := schema.ValidateID(c.QueryID); err != nil {
 			return fmt.Errorf("%w: %w", ErrInvalidChange, err)
+		}
+	case Remap:
+		if c.Mapping == nil || c.MappingVersion <= 0 {
+			return fmt.Errorf("%w: a remap without a mapping or a version", ErrInvalidChange)
 		}
 	default:
 		return fmt.Errorf("%w: kind %v", ErrInvalidChange, c.Kind)

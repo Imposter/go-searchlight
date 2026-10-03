@@ -327,7 +327,7 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 	if p.kind == kindQueries {
 		docs, queries = slices.Clone(cur.docs), next
 	}
-	published, err := s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid)
+	published, err := s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid, cur.mp)
 	if published && out != nil && s.forceEligible != nil {
 		// A merge of only segments a ForceMerge is responsible for (a background merge
 		// in flight when it started, whose inputs all existed then, or its own) makes a

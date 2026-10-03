@@ -320,10 +320,16 @@ func isShardFile(name string) bool {
 	if name == manifestName+".tmp" {
 		return true
 	}
-	if len(name) <= segmentNameLen || name[segmentNameLen] != '.' {
+	return len(name) > segmentNameLen && name[segmentNameLen] == '.' && isSegmentName(name[:segmentNameLen])
+}
+
+// isSegmentName reports whether name is one newSegmentName makes: 32 lowercase hex
+// digits.
+func isSegmentName(name string) bool {
+	if len(name) != segmentNameLen {
 		return false
 	}
-	for _, c := range name[:segmentNameLen] {
+	for _, c := range name {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}

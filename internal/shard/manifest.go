@@ -117,6 +117,20 @@ func readManifest(dir string) (*manifest, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, bad(err.Error())
 	}
+	// Ids become file names: only the names the shard itself gives are accepted, so a
+	// damaged or crafted manifest can never point outside the directory.
+	seen := map[string]bool{}
+	for _, list := range [][]manifestSegment{m.Segments, m.QuerySegments} {
+		for _, ms := range list {
+			if !isSegmentName(ms.ID) {
+				return nil, bad(fmt.Sprintf("segment id %q is not a segment name", ms.ID))
+			}
+			if seen[ms.ID] {
+				return nil, bad(fmt.Sprintf("segment %s is listed twice", ms.ID))
+			}
+			seen[ms.ID] = true
+		}
+	}
 	return &m, nil
 }
 

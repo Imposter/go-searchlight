@@ -452,3 +452,35 @@ func TestApplyBackpressure(t *testing.T) {
 	h.refresh()
 	h.check()
 }
+
+// M8: a manifest naming a segment id the shard never makes (a path, upper case, a
+// duplicate) is refused, checksum or not, before any id reaches a file name.
+func TestManifestSegmentIDsValidated(t *testing.T) {
+	good := "0123456789abcdef0123456789abcdef"
+	for name, ids := range map[string][]string{
+		"path":      {"../../outside"},
+		"upper":     {"0123456789ABCDEF0123456789ABCDEF"},
+		"short":     {"0123"},
+		"duplicate": {good, good},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			m := &manifest{Gen: 1}
+			for _, id := range ids {
+				m.Segments = append(m.Segments, manifestSegment{ID: id, Docs: 1})
+			}
+			data, err := encodeManifest(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, manifestName), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err = Open(context.Background(), dir, testMapping, testOptions())
+			var me *ManifestError
+			if !errors.As(err, &me) {
+				t.Fatalf("Open = %v, want a ManifestError", err)
+			}
+		})
+	}
+}

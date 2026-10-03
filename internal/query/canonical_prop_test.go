@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
@@ -215,7 +216,7 @@ func TestEqualCanonicalMatchesAlike(t *testing.T) {
 					} {
 						la := &Leaf{Field: field, Op: op, Value: mustMarshal(t, shape(a))}
 						lb := &Leaf{Field: field, Op: op, Value: mustMarshal(t, shape(b))}
-						if string(Canonical(la)) != string(Canonical(lb)) {
+						if !bytes.Equal(Canonical(la), Canonical(lb)) {
 							continue
 						}
 						collisions++
@@ -239,15 +240,15 @@ func TestEqualCanonicalMatchesAlike(t *testing.T) {
 func TestCanonicalWordsKeepsPhraseWords(t *testing.T) {
 	a := &Leaf{Field: "t", Op: OpWordsAll, Value: json.RawMessage(`"ß́ x"`)}
 	b := &Leaf{Field: "t", Op: OpWordsAll, Value: json.RawMessage(`"sś x"`)}
-	if string(Canonical(a)) == string(Canonical(b)) {
+	if bytes.Equal(Canonical(a), Canonical(b)) {
 		t.Fatal("different phrases share a Canonical")
 	}
 	never := &Leaf{Field: "t", Op: OpWordsAll, Value: json.RawMessage(`["x", "!!"]`)}
 	anyOne := &Leaf{Field: "t", Op: OpWordsAny, Value: json.RawMessage(`["x", "!!"]`)}
-	if string(Canonical(never)) == string(Canonical(&Leaf{Field: "t", Op: OpWordsAll, Value: json.RawMessage(`"x"`)})) {
+	if bytes.Equal(Canonical(never), Canonical(&Leaf{Field: "t", Op: OpWordsAll, Value: json.RawMessage(`"x"`)})) {
 		t.Fatal("a words_all with a wordless phrase canonicalizes like one without")
 	}
-	if string(Canonical(anyOne)) != string(Canonical(&Leaf{Field: "t", Op: OpWordsAny, Value: json.RawMessage(`"x"`)})) {
+	if !bytes.Equal(Canonical(anyOne), Canonical(&Leaf{Field: "t", Op: OpWordsAny, Value: json.RawMessage(`"x"`)})) {
 		t.Fatal("words_any drops a wordless phrase, so it should canonicalize alike")
 	}
 }

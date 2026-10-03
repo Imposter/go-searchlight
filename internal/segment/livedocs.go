@@ -85,7 +85,13 @@ func LoadDeletes(segmentDir, segmentID string, gen uint64) (*roaring.Bitmap, err
 	sec := footer.sections[sectionPresence]
 	rb := roaring.New()
 	if sec.n > 0 {
-		if err := rb.UnmarshalBinary(data[sec.off : sec.off+sec.n]); err != nil {
+		// The same check segment bitmaps get (checkBitmap): UnmarshalBinary accepts
+		// container shapes that later operations on rb would panic over.
+		raw := data[sec.off : sec.off+sec.n]
+		if _, ok := checkBitmap(raw, 1<<32); !ok {
+			return nil, &CorruptError{Path: path, Section: "presence", Reason: "malformed bitmap"}
+		}
+		if err := rb.UnmarshalBinary(raw); err != nil {
 			return nil, &CorruptError{Path: path, Section: "presence", Reason: err.Error()}
 		}
 	}

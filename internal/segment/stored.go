@@ -241,7 +241,7 @@ func openStoredIndex(data []byte, off, base, sectionLen uint64, numDocs uint32) 
 	}
 	d := decoder{b: data, pos: int(off)} //nolint:gosec // bounded by len(data)
 	n := uint64(d.u32())
-	if d.err != nil || n > uint64(len(data)-d.pos)/storedEntryLen {
+	if d.err != nil || n > uint64(len(data)-d.pos)/storedEntryLen { //nolint:gosec // d.pos <= len(data): the u32 just read fit
 		return storedIndex{}, errShort
 	}
 	blocks := make([]storedBlockInfo, n)
@@ -355,6 +355,13 @@ func (c *storedCache) record(data []byte, b storedBlockInfo, ord uint32) (string
 		region := region{off: b.off, n: uint64(b.clen)}
 		compressed, ok := region.slice(data)
 		if !ok {
+			return "", nil, errShort
+		}
+		// A frame whose header declares a content size other than the table's rawLen
+		// is refused before any buffer is allocated. (EncodeAll omits the size for
+		// small blocks; those still decode into exactly rawLen's capacity, below.)
+		var h zstd.Header
+		if h.Decode(compressed) != nil || (h.HasFCS && h.FrameContentSize != uint64(b.rawLen)) {
 			return "", nil, errShort
 		}
 		payload, err := c.dec.DecodeAll(compressed, make([]byte, 0, b.rawLen))

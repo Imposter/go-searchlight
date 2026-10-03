@@ -20,7 +20,7 @@ func TestCompressBlocksParallelEncoderFailureNoLeak(t *testing.T) {
 
 	payloads := make([]storedPayload, 64)
 	for i := range payloads {
-		payloads[i] = storedPayload{firstOrd: uint32(i), count: 1, data: []byte("x")} //nolint:gosec // small test index
+		payloads[i] = storedPayload{firstOrd: uint32(i), count: 1, data: []byte("x")}
 	}
 	before := runtime.NumGoroutine()
 	for range 5 {

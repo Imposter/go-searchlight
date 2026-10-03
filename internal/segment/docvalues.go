@@ -237,13 +237,14 @@ func writeNumberColumn(w *fileWriter, numDocs uint32, enc numEncoding, st Stats,
 
 // numberColumn reads a number column in place.
 type numberColumn struct {
-	enc     numEncoding
-	width   uint8
-	stats   Stats
-	present []byte // has-value bitset words, nil when every document has a value
-	packed  []byte
-	numDocs uint32
-	points  *points
+	enc        numEncoding
+	width      uint8
+	stats      Stats
+	present    []byte // has-value bitset words, unused when allPresent
+	allPresent bool
+	packed     []byte
+	numDocs    uint32
+	points     *points
 }
 
 func openNumberColumn(data []byte, off uint64, numDocs uint32) (*numberColumn, error) {
@@ -255,14 +256,14 @@ func openNumberColumn(data []byte, off uint64, numDocs uint32) (*numberColumn, e
 	c.enc.mode = d.u8()
 	c.enc.scale = d.u8()
 	c.width = d.u8()
-	allPresent := d.u8() == 1
+	c.allPresent = d.u8() == 1
 	c.stats.Count = d.u32()
 	c.stats.Min = math.Float64frombits(d.u64())
 	c.stats.Max = math.Float64frombits(d.u64())
 	c.stats.Sum = math.Float64frombits(d.u64())
 	c.enc.base = d.u64()
 	c.enc.gcd = d.u64()
-	if !allPresent {
+	if !c.allPresent {
 		c.present = d.bytes((uint64(numDocs) + 63) / 64 * 8)
 	}
 	c.packed = d.bytes(packedSize(uint64(numDocs), c.width))
@@ -279,7 +280,7 @@ func (c *numberColumn) has(ord uint32) bool {
 	if ord >= c.numDocs {
 		return false
 	}
-	if c.present == nil {
+	if c.allPresent {
 		return true
 	}
 	return c.present[ord/8]>>(ord%8)&1 != 0
@@ -311,22 +312,13 @@ func (n NumericColumn) Stats() Stats {
 }
 
 // Range returns the documents whose value is within [lo, hi], each bound inclusive per
-// incLo/incHi, served by the column's point index when it has one, or a full scan
-// otherwise.
+// incLo/incHi, served by the column's point index (which Open requires every number
+// column to have).
 func (n NumericColumn) Range(lo, hi float64, incLo, incHi bool) *roaring.Bitmap {
 	if n.c == nil {
 		return roaring.New()
 	}
-	if n.c.points != nil {
-		return n.c.points.rangeDocs(lo, hi, incLo, incHi)
-	}
-	result := roaring.New()
-	for ord := range n.c.numDocs {
-		if v, ok := n.Value(ord); ok && inRange(v, lo, hi, incLo, incHi) {
-			result.Add(ord)
-		}
-	}
-	return result
+	return n.c.points.rangeDocs(lo, hi, incLo, incHi)
 }
 
 // keywordSource yields each document's ordinal in ascending document order.
@@ -465,6 +457,7 @@ func writeMultiColumn(w *fileWriter, numDocs, numTerms uint32, src multiSource) 
 type multiColumn struct {
 	offWidth, ordWidth uint8
 	offs, ords         []byte
+	total              uint64 // how many ordinals ords holds
 	numDocs            uint32
 	dict               *termDict
 }
@@ -477,10 +470,13 @@ func openMultiColumn(data []byte, off uint64, numDocs uint32, dict *termDict) (*
 	c := &multiColumn{numDocs: numDocs, dict: dict}
 	c.offWidth = d.u8()
 	c.ordWidth = d.u8()
-	total := d.u64()
+	c.total = d.u64()
 	c.offs = d.bytes(packedSize(uint64(numDocs)+1, c.offWidth))
-	c.ords = d.bytes(packedSize(total, c.ordWidth))
-	if d.err != nil || (c.offWidth > 56 && c.offWidth != 64) || (c.ordWidth > 56 && c.ordWidth != 64) {
+	// ordWidth is at least 1 in any real column (it holds bitsFor(numTerms), and a
+	// column only exists with at least one term). Width 0 would let total claim any
+	// count in a fixed 8 bytes, and Ords then loop that many times.
+	c.ords = d.bytes(packedSize(c.total, c.ordWidth))
+	if d.err != nil || c.ordWidth == 0 || (c.offWidth > 56 && c.offWidth != 64) || (c.ordWidth > 56 && c.ordWidth != 64) {
 		return nil, errShort
 	}
 	return c, nil
@@ -495,12 +491,11 @@ func (m MultiColumn) Exists() bool { return m.c != nil }
 
 // Ords appends document doc's entry ordinals, ascending, to dst.
 func (m MultiColumn) Ords(doc uint32, dst []uint32) []uint32 {
-	c := m.c
-	if c == nil || doc >= c.numDocs {
+	from, to, ok := m.c.span(doc)
+	if !ok {
 		return dst
 	}
-	from := unpack(c.offs, uint64(doc), c.offWidth)
-	to := unpack(c.offs, uint64(doc)+1, c.offWidth)
+	c := m.c
 	for i := from; i < to; i++ {
 		dst = append(dst, uint32(unpack(c.ords, i, c.ordWidth))) //nolint:gosec // written from a uint32
 	}
@@ -509,11 +504,28 @@ func (m MultiColumn) Ords(doc uint32, dst []uint32) []uint32 {
 
 // Count returns how many entries document doc has.
 func (m MultiColumn) Count(doc uint32) int {
-	c := m.c
-	if c == nil || doc >= c.numDocs {
+	from, to, ok := m.c.span(doc)
+	if !ok {
 		return 0
 	}
-	return int(unpack(c.offs, uint64(doc)+1, c.offWidth) - unpack(c.offs, uint64(doc), c.offWidth)) //nolint:gosec // bounded by the entry count
+	return int(to - from) //nolint:gosec // at most the dictionary's term count, see span
+}
+
+// span returns where document doc's ordinals sit in c.ords, or false for no document,
+// no column, or a span a real column cannot have: running backward, past the ordinals
+// the column holds, or longer than the dictionary has terms (a document's entries are
+// distinct). Treating such a span as empty is what keeps a damaged file from reading
+// past c.ords or appending an unbounded number of ordinals.
+func (c *multiColumn) span(doc uint32) (from, to uint64, ok bool) {
+	if c == nil || doc >= c.numDocs {
+		return 0, 0, false
+	}
+	from = unpack(c.offs, uint64(doc), c.offWidth)
+	to = unpack(c.offs, uint64(doc)+1, c.offWidth)
+	if from > to || to > c.total || to-from > uint64(c.dict.numTerms) {
+		return 0, 0, false
+	}
+	return from, to, true
 }
 
 // NumTerms returns how many distinct entries the column's dictionary holds.

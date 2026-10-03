@@ -45,13 +45,27 @@ func (e *postingsEncoder) encode(docs []uint32) []byte {
 }
 
 // bitmapAt returns a term's postings: a fresh bitmap for an inline document, or a view
-// over the mapping for a serialized one. See [viewBitmap] for the view's lifetime.
-func bitmapAt(data []byte, info termInfo) *roaring.Bitmap {
-	if info.docFreq == 0 {
+// over the mapping for a serialized one (see [viewBitmap] for the view's lifetime).
+// Either way it holds only documents below numDocs, and a serialized one only if it is
+// well formed and holds exactly docFreq of them ([checkBitmap]); anything else - which
+// only a damaged or crafted file can hold - reads as empty, never as a bitmap whose
+// later use could panic or claim documents the segment does not have.
+func bitmapAt(data []byte, info termInfo, numDocs uint32) *roaring.Bitmap {
+	switch info.docFreq {
+	case 0:
+		return roaring.New()
+	case 1:
+		if info.single >= numDocs {
+			return roaring.New()
+		}
+		return roaring.BitmapOf(info.single)
+	}
+	b, ok := info.post.slice(data)
+	if !ok {
 		return roaring.New()
 	}
-	if info.docFreq == 1 {
-		return roaring.BitmapOf(info.single)
+	if card, ok := checkBitmap(b, uint64(numDocs)); !ok || card != uint64(info.docFreq) {
+		return roaring.New()
 	}
 	return viewBitmap(data, info.post)
 }
@@ -60,8 +74,12 @@ func bitmapAt(data []byte, info termInfo) *roaring.Bitmap {
 // hold slices of data itself. The result is only valid for as long as data's backing
 // mapping stays mapped - callers that return it to package callers (Postings, Present,
 // Truncated) document that lifetime there; a caller that needs it to outlive the
-// mapping must Clone() it. A region that does not hold one (which a checksummed file
-// cannot have) reads as empty.
+// mapping must Clone() it.
+//
+// viewBitmap trusts r to hold a well-formed bitmap: every caller has checked it with
+// [checkBitmap] first - bitmapAt on each call, Reader.parseMeta once at Open for the
+// presence and truncated bitmaps. A region outside data, or one FromBuffer refuses,
+// still reads as empty.
 func viewBitmap(data []byte, r region) *roaring.Bitmap {
 	rb := roaring.New()
 	b, ok := r.slice(data)
@@ -74,22 +92,25 @@ func viewBitmap(data []byte, r region) *roaring.Bitmap {
 	return rb
 }
 
-// appendDocs appends a term's documents to dst, in order.
-func appendDocs(dst []uint32, data []byte, info termInfo) []uint32 {
-	switch info.docFreq {
-	case 0:
-		return dst
-	case 1:
-		return append(dst, info.single)
+// forEachDoc calls fn with each of a term's documents, ascending, a chunk at a time
+// without listing them all first. numDocs bounds them as it does for [bitmapAt]: a
+// damaged file's postings read as empty rather than reaching fn.
+func forEachDoc(data []byte, info termInfo, numDocs uint32, fn func(doc uint32)) {
+	if info.docFreq == 1 {
+		if info.single < numDocs {
+			fn(info.single)
+		}
+		return
 	}
-	rb := viewBitmap(data, info.post)
-	it := rb.ManyIterator()
+	it := bitmapAt(data, info, numDocs).ManyIterator()
 	var buf [256]uint32
 	for {
 		n := it.NextMany(buf[:])
 		if n == 0 {
-			return dst
+			return
 		}
-		dst = append(dst, buf[:n]...)
+		for _, doc := range buf[:n] {
+			fn(doc)
+		}
 	}
 }

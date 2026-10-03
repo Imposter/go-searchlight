@@ -250,10 +250,10 @@ func fieldViewsFor(r *Reader, names []string) map[string]*fieldViews {
 		}
 		if fi.keywordCol == nil && fi.dicts[KindValue] != nil {
 			if info, ok := fi.dicts[KindValue].lookup(stringBytes(TermTrue)); ok {
-				fv.trueBM = bitmapAt(r.data, info)
+				fv.trueBM = bitmapAt(r.data, info, r.numDocs)
 			}
 			if info, ok := fi.dicts[KindValue].lookup(stringBytes(TermFalse)); ok {
-				fv.falseBM = bitmapAt(r.data, info)
+				fv.falseBM = bitmapAt(r.data, info, r.numDocs)
 			}
 		}
 		out[name] = fv
@@ -302,28 +302,30 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32, ordsScratc
 }
 
 // mergeTermsOnly merges one kind that has no doc-values column (word, gram): term by
-// term, remapping and filtering its postings.
+// term, remapping and filtering its postings. Each term's new ordinals are added only
+// while they keep ascending, which [termPairs.add] requires: always so for a file this
+// package wrote (its bitmaps ascend, and remap preserves order), and enforced here so a
+// damaged one cannot break that invariant, only lose documents. Documents at or past
+// the input's own count are never visited (see [forEachDoc]).
 func mergeTermsOnly(b *fieldBuilder, fi *fieldInfo, data []byte, remap []int32, kind TermKind) {
 	dict := fi.dicts[kind]
 	if dict == nil {
 		return
 	}
+	pairs := &b.gramPairs
+	if kind == KindWord {
+		pairs = &b.wordPairs
+	}
+	limit := uint32(len(remap)) //nolint:gosec // remap has one entry per document ordinal, a uint32
 	it := dict.iter(0)
 	for it.next() {
-		term := string(it.term)
-		for _, old := range appendDocs(nil, data, it.info) {
-			if int(old) >= len(remap) {
-				continue
+		last := int32(-1)
+		forEachDoc(data, it.info, limit, func(old uint32) {
+			if newOrd := remap[old]; newOrd > last {
+				// add copies the term into its arena, so it.term's reused buffer is safe.
+				pairs.add(it.term, uint32(newOrd)) //nolint:gosec // newOrd > last >= -1
+				last = newOrd
 			}
-			newOrd := remap[old]
-			if newOrd < 0 {
-				continue
-			}
-			if kind == KindWord {
-				b.addWordTerm(uint32(newOrd), term)
-			} else {
-				b.addGramTerm(uint32(newOrd), term)
-			}
-		}
+		})
 	}
 }

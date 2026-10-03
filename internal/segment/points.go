@@ -118,16 +118,39 @@ func openPoints(data []byte, off uint64, enc numEncoding) (*points, error) {
 	if (p.keyWidth > 56 && p.keyWidth != 64) || (p.docWidth > 56 && p.docWidth != 64) {
 		return nil, errShort
 	}
-	wantBlocks := (p.numEntries + pointsBlockSize - 1) / pointsBlockSize
-	if p.numEntries > 0 && p.numBlocks != wantBlocks {
+	// In uint64, so numEntries near 2^32 cannot wrap into a small block count.
+	if uint64(p.numBlocks) != (uint64(p.numEntries)+pointsBlockSize-1)/pointsBlockSize {
+		return nil, errShort
+	}
+	// Every block must hold 1 to pointsBlockSize entries, together exactly numEntries,
+	// with its packed keys and docs inside data: rangeDocs slices them unchecked.
+	var total uint64
+	room := uint64(len(data)) - off
+	for i := range p.numBlocks {
+		_, _, count, rel := p.blockEntry(i)
+		size := packedSize(uint64(count), p.keyWidth) + packedSize(uint64(count), p.docWidth)
+		if count == 0 || count > pointsBlockSize || rel > room || size > room-rel {
+			return nil, errShort
+		}
+		total += uint64(count)
+	}
+	if total != uint64(p.numEntries) {
 		return nil, errShort
 	}
 	return p, nil
 }
 
-func (p *points) blockRange(i uint32) (minKey, maxKey uint64, count uint32, off uint64) {
+// blockEntry returns block i's table entry as written: its offset relative to base.
+func (p *points) blockEntry(i uint32) (minKey, maxKey uint64, count uint32, rel uint64) {
 	e := p.table[i*pointsEntryLen:]
-	return binary.LittleEndian.Uint64(e), binary.LittleEndian.Uint64(e[8:]), binary.LittleEndian.Uint32(e[16:]), p.base + binary.LittleEndian.Uint64(e[20:])
+	return binary.LittleEndian.Uint64(e), binary.LittleEndian.Uint64(e[8:]), binary.LittleEndian.Uint32(e[16:]), binary.LittleEndian.Uint64(e[20:])
+}
+
+// blockRange returns block i's key range, entry count and absolute data offset, all of
+// which openPoints has already checked lie inside the mapping.
+func (p *points) blockRange(i uint32) (minKey, maxKey uint64, count uint32, off uint64) {
+	minKey, maxKey, count, rel := p.blockEntry(i)
+	return minKey, maxKey, count, p.base + rel
 }
 
 // inRange reports whether v is within [lo, hi], each bound inclusive per incLo/incHi.

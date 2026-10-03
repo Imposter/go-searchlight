@@ -58,19 +58,27 @@ func Open(path string) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	ok := false
-	defer func() {
-		if !ok {
-			_ = m.release()
-		}
-	}()
-	footer, err := verifyFile(path, m.data)
+	r, err := openData(path, m.data)
+	if err != nil {
+		_ = m.release()
+		return nil, err
+	}
+	r.m = m
+	return r, nil
+}
+
+// openData is [Open] over bytes already in hand: it verifies and parses data, which
+// must stay valid and unchanged for the Reader's life. The Reader it returns has no
+// mapping of its own (Open attaches one); FuzzOpen uses it directly, to skip a file
+// and an mmap per input.
+func openData(path string, data []byte) (*Reader, error) {
+	footer, err := verifyFile(path, data)
 	if err != nil {
 		return nil, err
 	}
-	r := &Reader{path: path, m: m, data: m.data, fields: map[string]*fieldInfo{}}
+	r := &Reader{path: path, data: data, fields: map[string]*fieldInfo{}}
 	metaSec := footer.sections[sectionMeta]
-	metaBytes, sliceOK := region{off: metaSec.off, n: metaSec.n}.slice(m.data)
+	metaBytes, sliceOK := region{off: metaSec.off, n: metaSec.n}.slice(data)
 	if !sliceOK {
 		return nil, &CorruptError{Path: path, Section: "meta", Reason: "section runs outside the file"}
 	}
@@ -83,7 +91,6 @@ func Open(path string) (*Reader, error) {
 	}
 	r.cache = cache
 	r.ownsCache = true
-	ok = true
 	return r, nil
 }
 
@@ -141,6 +148,13 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 		if d.err != nil {
 			return corrupt()
 		}
+		// Present and Truncated hand these out as unchecked zero-copy views on every
+		// call, so they are checked once, here, instead ([checkBitmap]).
+		// The presence bitmap is always written; the truncated one only when a document
+		// was truncated (truncLen 0: none).
+		if !r.validBitmap(fi.presRegion) || (truncLen > 0 && !r.validBitmap(fi.truncRegion)) {
+			return &CorruptError{Path: r.path, Section: "presence", Reason: "malformed bitmap"}
+		}
 		for k := range numKinds {
 			if dictOffs[k] == 0 {
 				continue
@@ -170,13 +184,18 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "docvalues", Reason: err.Error()}
 			}
-			if pointsOff != 0 {
-				p, err := openPoints(r.data, pointsOff, nc.enc)
-				if err != nil {
-					return &CorruptError{Path: r.path, Section: "points", Reason: err.Error()}
-				}
-				nc.points = p
+			// Every number column is written with a point index (writeFieldPoints), so a
+			// column without one is damage - and refusing it here means Range always
+			// works from the index, whose size the file bounds, never from a scan of
+			// however many documents a damaged META claims.
+			if pointsOff == 0 {
+				return &CorruptError{Path: r.path, Section: "points", Reason: "number column without a point index"}
 			}
+			p, err := openPoints(r.data, pointsOff, nc.enc)
+			if err != nil {
+				return &CorruptError{Path: r.path, Section: "points", Reason: err.Error()}
+			}
+			nc.points = p
 			fi.numberCol = nc
 		}
 		r.fields[name] = fi
@@ -190,6 +209,17 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	}
 	r.stored = stored
 	return nil
+}
+
+// validBitmap reports whether rg lies inside the mapping and holds one well-formed
+// bitmap of documents below NumDocs ([checkBitmap]).
+func (r *Reader) validBitmap(rg region) bool {
+	b, ok := rg.slice(r.data)
+	if !ok {
+		return false
+	}
+	_, ok = checkBitmap(b, uint64(r.numDocs))
+	return ok
 }
 
 // NumDocs returns how many document ordinals the segment holds, live and deleted.
@@ -206,7 +236,7 @@ func (r *Reader) Postings(field string, kind TermKind, term string) *roaring.Bit
 	if !ok {
 		return roaring.New()
 	}
-	return bitmapAt(r.data, info)
+	return bitmapAt(r.data, info, r.numDocs)
 }
 
 // TermFreq returns how many documents hold term, 0 when there are none.
@@ -362,12 +392,13 @@ func (r *Reader) Ord(id string) (uint32, bool) {
 	if info.docFreq == 1 {
 		return info.single, true
 	}
-	// Duplicate ids should never reach a segment; fall back to the first document.
-	docs := appendDocs(nil, r.data, info)
-	if len(docs) == 0 {
+	// Duplicate ids should never reach a segment; fall back to the first document,
+	// read as the bitmap's minimum rather than by listing every document it holds.
+	rb := bitmapAt(r.data, info, r.numDocs)
+	if rb.IsEmpty() {
 		return 0, false
 	}
-	return docs[0], true
+	return rb.Minimum(), true
 }
 
 // idFieldName is the pseudo-field [schema.IDField] holds a document's id under. segment
@@ -387,7 +418,9 @@ const idFieldName = "_id"
 // something Retain can rescue: incrementing a reference count after the mapping was
 // already unmapped does not re-map it.
 func (r *Reader) Retain() *Reader {
-	r.m.retain()
+	if r.m != nil {
+		r.m.retain()
+	}
 	nr := &Reader{
 		path:    r.path,
 		m:       r.m,
@@ -417,6 +450,9 @@ func (r *Reader) Close() error {
 	}
 	if r.ownsCache {
 		r.cache.close()
+	}
+	if r.m == nil {
+		return nil // openData's Reader: the caller owns data
 	}
 	return r.m.release()
 }

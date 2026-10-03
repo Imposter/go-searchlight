@@ -42,7 +42,7 @@ type segmentLayout struct {
 	storedIndexAbs uint64 // the stored block table's absolute position
 }
 
-func layoutOf(t *testing.T, data []byte) segmentLayout {
+func layoutOf(t testing.TB, data []byte) segmentLayout {
 	t.Helper()
 	footer, err := verifyFile("layout", data)
 	if err != nil {
@@ -54,7 +54,7 @@ func layoutOf(t *testing.T, data []byte) segmentLayout {
 }
 
 // buildFile builds docs and returns the segment's bytes.
-func buildFile(t *testing.T, docs []schema.Doc) []byte {
+func buildFile(t testing.TB, docs []schema.Doc) []byte {
 	t.Helper()
 	meta, err := Build(t.TempDir(), docs, BuildOptions{})
 	if err != nil {
@@ -96,7 +96,7 @@ func wantCorrupt(t *testing.T, err error, section string) {
 // craftStoredBlockCount is N4's stored.go case: a block count of 2^32-1 in a table with
 // a few bytes after it. Open used to make([]storedBlockInfo, n) first - about 100 GiB -
 // and only then find the bytes missing.
-func craftStoredBlockCount(t *testing.T, data []byte) []byte {
+func craftStoredBlockCount(t testing.TB, data []byte) []byte {
 	t.Helper()
 	binary.LittleEndian.PutUint32(data[layoutOf(t, data).storedIndexAbs:], 0xFFFFFFFF)
 	return data
@@ -139,7 +139,7 @@ func TestStoredRawLenMismatchIsAnError(t *testing.T) {
 		data := buildFile(t, testDocs(t))
 		e := data[layoutOf(t, data).storedIndexAbs+4:]
 		raw := binary.LittleEndian.Uint32(e[12:])
-		binary.LittleEndian.PutUint32(e[12:], uint32(int(raw)+delta)) //nolint:gosec // raw is a small block size
+		binary.LittleEndian.PutUint32(e[12:], uint32(int(raw)+delta))
 		r, err := openCrafted(t, data)
 		if err != nil {
 			t.Fatalf("delta %d: Open: %v", delta, err)

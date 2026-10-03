@@ -197,7 +197,9 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
-	if t.numBlocks != (t.numTerms+blockTerms-1)/blockTerms {
+	// In uint64: numTerms+blockTerms-1 wraps in uint32 for numTerms near 2^32, which
+	// would let a huge numTerms pass with no blocks and send termAt past blockOffs.
+	if uint64(t.numBlocks) != (uint64(t.numTerms)+blockTerms-1)/blockTerms {
 		return nil, errShort
 	}
 	for i := range t.numBlocks {
@@ -241,11 +243,12 @@ func (t *termDict) blockFor(term []byte) (uint32, bool) {
 
 // blockCursor decodes one block's entries in order.
 type blockCursor struct {
-	d     decoder
-	post  uint64 // the next serialized postings' offset
-	ord   uint32
-	left  uint32
-	entry termInfo
+	d       decoder
+	post    uint64 // the next serialized postings' offset
+	ord     uint32
+	left    uint32
+	prevLen int // the previous entry's term length (0 before the first entry)
+	entry   termInfo
 }
 
 func (t *termDict) cursor(block uint32) blockCursor {
@@ -265,13 +268,21 @@ func (t *termDict) cursor(block uint32) blockCursor {
 }
 
 // next decodes the next entry: its shared prefix length and suffix. False at the end
-// of the block, or on a malformed block.
+// of the block, or on a malformed block - including an entry claiming to share more
+// bytes with the previous term than that term has (the first entry of a block shares
+// none), which every caller would otherwise slice its term buffer past the end for.
 func (c *blockCursor) next() (shared int, suffix []byte, ok bool) {
 	if c.left == 0 {
 		return 0, nil, false
 	}
-	shared = int(c.d.uvarint()) //nolint:gosec // bounded by term length
+	sharedLen := c.d.uvarint()
 	suffix = c.d.bytes(c.d.uvarint())
+	if sharedLen > uint64(c.prevLen) { //nolint:gosec // prevLen is a length, non-negative
+		c.left = 0
+		return 0, nil, false
+	}
+	shared = int(sharedLen) //nolint:gosec // at most prevLen, checked above
+	c.prevLen = shared + len(suffix)
 	c.entry = termInfo{ord: c.ord, docFreq: uint32(c.d.uvarint())} //nolint:gosec // written from a uint32
 	if c.entry.docFreq == 1 {
 		c.entry.single = uint32(c.d.uvarint()) //nolint:gosec // written from a uint32

@@ -15,7 +15,7 @@ func TestPointsRelocatableWithinBuffer(t *testing.T) {
 	const numDocs = 1000
 	values := make([]docFloat, numDocs)
 	for i := range values {
-		values[i] = docFloat{doc: uint32(i), v: float64(i % 300)} //nolint:gosec // small test values
+		values[i] = docFloat{doc: uint32(i), v: float64(i % 300)}
 	}
 	enc, _, _ := chooseEncoding(numDocs, values)
 	pairs := make([]pointPair, len(values))

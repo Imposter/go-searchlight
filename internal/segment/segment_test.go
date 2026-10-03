@@ -31,7 +31,7 @@ func testMapping() *schema.Mapping {
 	}}
 }
 
-func mustAnalyze(t *testing.T, m *schema.Mapping, id, body string) schema.Doc {
+func mustAnalyze(t testing.TB, m *schema.Mapping, id, body string) schema.Doc {
 	t.Helper()
 	doc, _, err := schema.Analyze(m, id, []byte(body))
 	if err != nil {
@@ -55,7 +55,7 @@ func mustBuild(t *testing.T, docs []schema.Doc) *Reader {
 	return r
 }
 
-func testDocs(t *testing.T) []schema.Doc {
+func testDocs(t testing.TB) []schema.Doc {
 	m := testMapping()
 	long := strings.Repeat("abcdefghij", 200) // 2000 chars, over MaxGramChars (1024)
 	bodies := []struct {
@@ -690,7 +690,7 @@ func TestDebugGuardFaultsOnUseAfterClose(t *testing.T) {
 		t.Skip("only meaningful with -tags searchlight_debug")
 	}
 	if dir := os.Getenv("SEARCHLIGHT_DEBUG_GUARD_CHILD"); dir != "" {
-		runUseAfterCloseChild(dir)
+		runUseAfterCloseChild(filepath.Clean(dir))
 		return // unreachable if the guard works: the access above should fault first
 	}
 
@@ -767,7 +767,7 @@ func runUseAfterCloseChild(dir string) {
 // still sort "" first. Before the fix, an empty-but-nil arena made "" look like "no
 // minimum yet" to writeMergedDict, so the next part's "b" won and "" was written after
 // it - out of order, so Postings("") missed and the keyword ordinals were reversed.
-func emptyTermDocs(t *testing.T) []schema.Doc {
+func emptyTermDocs(t testing.TB) []schema.Doc {
 	t.Helper()
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword}}
 	return []schema.Doc{
@@ -831,7 +831,7 @@ func TestEmptyTermSortsFirstAcrossParts(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer r.Close()
+			t.Cleanup(func() { _ = r.Close() })
 			readers = append(readers, r)
 		}
 		meta, err := Merge(dir, readers, nil)
@@ -851,7 +851,7 @@ func TestEmptyTermSortsFirstAcrossParts(t *testing.T) {
 // values deliberately include the edge cases a dense corpus never hits: "" keywords and
 // text, empty and blank-only lists, a field only one document has, and a field nothing
 // but deleted documents might have. Deterministic for a given n.
-func sparseDocs(t *testing.T, n int) []schema.Doc {
+func sparseDocs(t testing.TB, n int) []schema.Doc {
 	t.Helper()
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{
 		"title":   schema.Text,
@@ -867,7 +867,7 @@ func sparseDocs(t *testing.T, n int) []schema.Doc {
 	state := uint64(12345)
 	next := func(k int) int {
 		state = state*6364136223846793005 + 1442695040888963407
-		return int((state >> 33) % uint64(k)) //nolint:gosec // k is a small positive pool size
+		return int((state >> 33) % uint64(k))
 	}
 	docs := make([]schema.Doc, 0, n)
 	for i := range n {
@@ -967,7 +967,7 @@ func TestMergeByteIdenticalToRebuild(t *testing.T) {
 func checkMergeEqualsRebuild(t *testing.T, docs []schema.Doc, segs int, withDeletes bool) {
 	t.Helper()
 	dir := t.TempDir()
-	ranges := splitRanges(uint32(len(docs)), segs) //nolint:gosec // test corpora are small
+	ranges := splitRanges(uint32(len(docs)), segs)
 	readers := make([]*Reader, 0, len(ranges))
 	deletes := make([]*roaring.Bitmap, 0, len(ranges))
 	var live []schema.Doc
@@ -986,7 +986,7 @@ func checkMergeEqualsRebuild(t *testing.T, docs []schema.Doc, segs int, withDele
 		del := roaring.New()
 		for j := range part {
 			if withDeletes && (j+i)%3 == 0 {
-				del.Add(uint32(j)) //nolint:gosec // test corpora are small
+				del.Add(uint32(j))
 				continue
 			}
 			live = append(live, part[j])

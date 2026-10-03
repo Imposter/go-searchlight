@@ -57,7 +57,7 @@ func (e *env) with(t *testing.T) *env {
 	return &env{t: t, url: e.url, srv: e.srv, node: e.node, st: e.st, cfg: e.cfg, token: e.token, client: e.client, validate: e.validate, tailers: e.tailers}
 }
 
-// tailer returns a shard copy's tailer.
+// tailer returns a shard copy's tailer (with fakeTailers).
 func (e *env) tailer(index string, s int) *nodetest.Tailer {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -66,9 +66,11 @@ func (e *env) tailer(index string, s int) *nodetest.Tailer {
 
 // envOpts adjust newEnv.
 type envOpts struct {
-	cfg       func(*config.Config)
-	node      func(*node.Options)
-	newTailer node.NewTailerFunc
+	cfg  func(*config.Config)
+	node func(*node.Options)
+	// fakeTailers uses nodetest.Tailer, which tests can pause, instead of the
+	// replica tailer.
+	fakeTailers bool
 }
 
 // testConfig is a node's configuration for tests: SQLite in a temp dir, auth off,
@@ -81,6 +83,8 @@ func testConfig(t testing.TB) config.Config {
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.InsecureNoAuth = true
 	cfg.RefreshInterval = 20 * time.Millisecond
+	cfg.ChangelogPollInterval = 20 * time.Millisecond
+	cfg.RemapDebounce = 0
 	cfg.RequestTimeout = 10 * time.Second
 	cfg.ShutdownTimeout = 10 * time.Second
 	cfg.NodeID = "test-node"
@@ -111,8 +115,8 @@ func newEnv(t testing.TB, o envOpts) *env {
 	}
 	st := openStore(t, cfg)
 	e := &env{t: t, st: st, cfg: cfg, tailers: map[store.ShardID]*nodetest.Tailer{}}
-	newTailer := o.newTailer
-	if newTailer == nil {
+	var newTailer node.NewTailerFunc // nil: the replica tailer
+	if o.fakeTailers {
 		newTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
 			tl := nodetest.NewTailer(st, sh, id, env)
 			e.mu.Lock()

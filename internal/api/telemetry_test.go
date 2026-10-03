@@ -13,7 +13,6 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
-	"github.com/Imposter/go-searchlight/internal/node/nodetest"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -48,7 +47,7 @@ func TestRequestTelemetry(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tel.Shutdown(context.Background()) })
 	st := openStore(t, cfg)
-	n, err := node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, NewTailer: nodetest.NewTailer, Logger: slog.New(slog.DiscardHandler)})
+	n, err := node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, Logger: slog.New(slog.DiscardHandler)})
 	if err != nil {
 		t.Fatal(err)
 	}

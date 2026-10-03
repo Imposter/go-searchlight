@@ -36,6 +36,8 @@ func testConfig(t *testing.T) config.Config {
 	cfg.StoreURL = "sqlite:///" + filepath.ToSlash(filepath.Join(dir, "sl.db"))
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.RefreshInterval = 20 * time.Millisecond
+	cfg.ChangelogPollInterval = 20 * time.Millisecond
+	cfg.RemapDebounce = 0
 	cfg.NodeID = "n1"
 	cfg.MergeThreads = 1
 	return cfg
@@ -56,7 +58,7 @@ func openStore(t *testing.T, cfg config.Config) store.Store {
 
 func open(t *testing.T, cfg config.Config, st store.Store, mod func(*node.Options)) *node.Single {
 	t.Helper()
-	o := node.Options{Store: st, Config: cfg, NewTailer: nodetest.NewTailer, Logger: quiet}
+	o := node.Options{Store: st, Config: cfg, Logger: quiet} // the replica tailer
 	if mod != nil {
 		mod(&o)
 	}
@@ -305,7 +307,7 @@ func TestDynamicMappingUnderConcurrentWriters(t *testing.T) {
 	}
 }
 
-func TestPatchMappingRefusesDynamicFalse(t *testing.T) {
+func TestPatchMappingOnEveryDynamicMode(t *testing.T) {
 	cfg := testConfig(t)
 	n := open(t, cfg, openStore(t, cfg), nil)
 	for name, mode := range map[string]schema.DynamicMode{"loose": schema.DynamicFalse, "strict": schema.DynamicStrict, "dyn": schema.DynamicTrue} {
@@ -313,25 +315,19 @@ func TestPatchMappingRefusesDynamicFalse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	add := map[string]schema.FieldType{"price": schema.Number}
-	_, err := n.PatchMapping(ctx(t), "loose", add)
-	var ae *api.Error
-	if !errors.As(err, &ae) || ae.Status != 409 {
-		t.Errorf("dynamic false: err = %v, want a 409", err)
+	// A document under dynamic false keeps its unmapped field unindexed.
+	mustWrite(t, n, "loose", upsert("1", `{"colour": "red"}`))
+	if info, _ := n.GetIndex(ctx(t), "loose"); len(info.Mapping.Fields) != 0 {
+		t.Errorf("dynamic false grew the mapping: %v", info.Mapping.Fields)
 	}
-	for _, name := range []string{"strict", "dyn"} {
+	// Adding fields works on every mode (the replica rebuilds a copy whose
+	// documents hold a field a mapping change maps).
+	add := map[string]schema.FieldType{"price": schema.Number}
+	for _, name := range []string{"loose", "strict", "dyn"} {
 		info, err := n.PatchMapping(ctx(t), name, add)
 		if err != nil || info.Mapping.Fields["price"] != schema.Number {
 			t.Errorf("%s: %+v %v", name, info, err)
 		}
-	}
-	// A document under dynamic false keeps its unmapped field unindexed.
-	res := mustWrite(t, n, "loose", upsert("1", `{"colour": "red"}`))
-	if info, _ := n.GetIndex(ctx(t), "loose"); len(info.Mapping.Fields) != 0 {
-		t.Errorf("dynamic false grew the mapping: %v", info.Mapping.Fields)
-	}
-	if got := count(t, n, "loose", &query.All{}, res.Seq); got != 1 {
-		t.Errorf("count = %d", got)
 	}
 }
 
@@ -422,6 +418,19 @@ func TestCopyStatesInHealth(t *testing.T) {
 	}
 	if err := n.Ready(ctx(t)); err == nil {
 		t.Error("ready with a recovering copy")
+	}
+	// A recovering copy is neither read nor written, at once (a 503), not after a
+	// deadline: the shard it exposes may be empty or half loaded.
+	var rae *api.Error
+	start := time.Now()
+	if _, err := n.Search(ctx(t), "rec", &search.Request{Query: &query.All{}}, api.ReadOptions{}); !errors.As(err, &rae) || rae.Status != 503 {
+		t.Errorf("a search of a recovering copy: %v", err)
+	}
+	if _, err := n.Write(ctx(t), "rec", []api.WriteOp{upsert("1", `{}`)}, api.WriteOptions{}); !errors.As(err, &rae) || rae.Status != 503 {
+		t.Errorf("a write to a recovering copy: %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("failing fast took %v", time.Since(start))
 	}
 	wrap.Store("halt")
 	if _, err := n.CreateIndex(ctx(t), "bad", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
@@ -789,5 +798,78 @@ func TestDatabaseHangs(t *testing.T) {
 	}
 	if doc, err := n.GetDocument(ctx(t), "h", "a"); err != nil || doc.Stale || doc.Seq == 0 {
 		t.Errorf("GET after recovery: %+v %v", doc, err)
+	}
+}
+
+// A settings-only patch reuses the mapping's stored bytes, so the store logs no
+// mapping change (which would cost every copy a remap); a mapping patch logs one per
+// shard and the node adopts the new mapping version.
+func TestSettingsPatchLogsNoMappingChange(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	n := open(t, cfg, st, nil)
+	if _, err := n.CreateIndex(ctx(t), "s", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	head := func() int64 {
+		h, _, err := st.HeadSeq(ctx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	before := head()
+	d := 250 * time.Millisecond
+	if _, err := n.PatchSettings(ctx(t), "s", api.SettingsPatch{RefreshInterval: &d}); err != nil {
+		t.Fatal(err)
+	}
+	if after := head(); after != before {
+		t.Errorf("a settings patch logged %d changes", after-before)
+	}
+	meta, _ := st.Indexes().Get(ctx(t), "s")
+	if _, err := n.PatchMapping(ctx(t), "s", map[string]schema.FieldType{"x": schema.Number}); err != nil {
+		t.Fatal(err)
+	}
+	if after := head(); after != before+2 {
+		t.Errorf("a mapping patch on 2 shards logged %d changes", after-before)
+	}
+	meta2, _ := st.Indexes().Get(ctx(t), "s")
+	if meta2.MappingVersion != meta.MappingVersion+1 {
+		t.Errorf("mapping version %d -> %d", meta.MappingVersion, meta2.MappingVersion)
+	}
+}
+
+// A saved query committed before a restart but not yet applied by the copy is seen by
+// the first percolation after it: the copies' saved-query wait starts at the head.
+func TestPercolateAfterRestartSeesQueries(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	var fake *nodetest.Tailer
+	n := open(t, cfg, st, func(o *node.Options) {
+		o.NewTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
+			tl := nodetest.NewTailer(st, sh, id, env)
+			fake = tl.(*nodetest.Tailer) //nolint:forcetypeassert,errcheck // NewTailer returns a *Tailer
+			return tl
+		}
+	})
+	if _, err := n.CreateIndex(ctx(t), "p", api.IndexSpec{Mapping: &schema.Mapping{Fields: map[string]schema.FieldType{"x": schema.Number}}, Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.Pause() // the query commits but the copy never applies it before the restart
+	mustWrite(t, n, "p", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "x", "op": "eq", "value": 1}`)})
+	if err := n.Close(ctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	n2 := open(t, cfg, st, nil)
+	deadline := time.Now().Add(20 * time.Second)
+	for n2.Ready(ctx(t)) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("never ready")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	res, err := n2.Percolate(ctx(t), "p", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"x": 1}`)}}, api.ReadOptions{})
+	if err != nil || fmt.Sprint(res.Results[0].Queries) != "[q]" {
+		t.Errorf("percolation after a restart: %+v %v", res, err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIndexLifecycle(t *testing.T) {
@@ -190,5 +191,37 @@ func TestReadYourWrites(t *testing.T) {
 	e.must(http.StatusOK, "DELETE", "/indexes/ryw/docs/a?refresh=wait_for", "")
 	if r := search(""); slices.Contains(ids(r), "a") {
 		t.Errorf("refresh=wait_for on a delete: search still sees a")
+	}
+}
+
+// The 409 on PATCH mapping for a dynamic false index is lifted: the store logs the
+// mapping change, the copy holding a document with the newly mapped field is rebuilt
+// under it, and a search on the field finds the document.
+func TestPatchMappingIndexesKeptFields(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.must(http.StatusCreated, "PUT", "/indexes/loose", `{"mapping": {"dynamic": false, "fields": {"title": "text"}}, "settings": {"shards": 2}}`)
+	w := e.must(http.StatusOK, "PUT", "/indexes/loose/docs/1", `{"title": "red chair", "colour": "Red"}`)
+	e.must(http.StatusOK, "PUT", "/indexes/loose/docs/2", `{"title": "blue chair", "colour": "Blue"}`)
+	// Unmapped, the field is kept in the body but cannot be queried.
+	e.problem(e.do("POST", fmt.Sprintf("/indexes/loose/_search?wait_for_seq=%d", seqOf(t, w)), `{"query": {"field": "colour", "op": "eq", "value": "red"}}`), http.StatusBadRequest, "invalid_request")
+	p := e.must(http.StatusOK, "PATCH", "/indexes/loose/mapping", `{"fields": {"colour": "keyword"}}`)
+	if p["mapping"].(map[string]any)["fields"].(map[string]any)["colour"] != "keyword" { //nolint:forcetypeassert,errcheck // the shape
+		t.Fatalf("patched = %v", p)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		r := e.do("POST", "/indexes/loose/_search", `{"query": {"field": "colour", "op": "eq", "value": "red"}}`)
+		if r.status == http.StatusOK && fmt.Sprint(ids(r.json(t))) == "[1]" {
+			break
+		}
+		// 503 while the copy is rebuilt under the new mapping; an empty result
+		// until then.
+		if r.status != http.StatusOK && r.status != http.StatusServiceUnavailable {
+			t.Fatalf("search: %d %s", r.status, r.body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the document never became searchable on the newly mapped field: %d %s", r.status, r.body)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

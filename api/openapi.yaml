@@ -237,7 +237,7 @@ paths:
       tags: [indexes]
       operationId: patchMapping
       summary: Add fields to the mapping (additive only).
-      description: A field that exists with another type is a 400. An index with `dynamic` false refuses new fields (409), since its documents may already hold them unindexed.
+      description: A field that exists with another type is a 400, as is passing max_index_fields. The change is logged to every shard; on an index with `dynamic` false, documents that already hold a newly mapped field become searchable on it once their copy is rebuilt under the new mapping (reads of that copy answer 503 meanwhile).
       requestBody:
         required: true
         content:

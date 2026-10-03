@@ -69,6 +69,9 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
 | `max_lag` | `2s` | how far a copy may trail the changelog and still serve |
 | `changelog_poll_interval` | `500ms` | how often a shard copy polls the changelog when no notification or local write wakes it |
+| `remap_debounce` | `2s` | how long a copy that a mapping change must rebuild waits for more mapping changes (`0s` = rebuild at once) |
+| `halt_retry_base`, `halt_retry_cap` | `30s`, `10m` | backoff between retries of a halted shard copy |
+| `rebuild_retry_cap` | `2m` | longest backoff between retries of a copy rebuild that keeps failing |
 | `merge_budget` | `64MiB` | bytes per second merges may write (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent background merges |
 | `search_threads` | GOMAXPROCS | search worker pool size |
@@ -83,7 +86,7 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `search_queue` | `1000` | reads in progress at once before more get a 429 |
 | `max_inflight_write_bytes` | `512MiB` | heap the writes in progress may take (body bytes times `inflight_amplification`) before more get a 429 |
 | `max_inflight_read_bytes` | `256MiB` | the same for reads |
-| `inflight_amplification` | `8` | heap a request takes per byte of body at its peak: measured about 4.5 for a bulk, 8 for a bulk with `percolate=true` or a percolation (`BenchmarkBulkPeakHeap`) |
+| `inflight_amplification` | `10` | heap a request takes per byte of body at its peak: measured about 4.5 for a bulk, 8 for a bulk with `percolate=true` or a percolation (`BenchmarkBulkPeakHeap`); a node's heap is about 1.5 times the two budgets, plus each shard copy's write buffers (64 MiB times 4 by default) |
 | `max_index_fields` | `1000` | most fields one index's mapping holds (Elasticsearch's `index.mapping.total_fields.limit`) |
 | `drop_timeout` | `10m` | how long dropping an index from the store may take |
 | `shutdown_grace` | `2s` | how long the API keeps serving after readiness turns false at shutdown |

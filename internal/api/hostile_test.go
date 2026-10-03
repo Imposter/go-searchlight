@@ -275,7 +275,7 @@ func TestAuthConfiguration(t *testing.T) {
 }
 
 func TestBackpressure(t *testing.T) {
-	e := newEnv(t, envOpts{node: func(o *node.Options) { o.MaxApplyLag = 2 }})
+	e := newEnv(t, envOpts{fakeTailers: true, node: func(o *node.Options) { o.MaxApplyLag = 2 }})
 	e.must(http.StatusCreated, "PUT", "/indexes/bp", "")
 	tl := e.tailer("bp", 0)
 	tl.Pause()
@@ -393,7 +393,7 @@ func TestRequestDeadline(t *testing.T) {
 }
 
 func TestWaitForSeqTimesOut(t *testing.T) {
-	e := newEnv(t, envOpts{cfg: func(c *config.Config) { c.RequestTimeout = 2 * time.Second }})
+	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 2 * time.Second }})
 	e.must(http.StatusCreated, "PUT", "/indexes/w", "")
 	// A seq past the newest committed one is refused at once, before a bulk writes.
 	e.problem(e.do("POST", "/indexes/w/_search?wait_for_seq=999999", `{}`), http.StatusBadRequest, "invalid_request")

@@ -17,7 +17,6 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
-	"github.com/Imposter/go-searchlight/internal/node/nodetest"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -30,7 +29,7 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 	cfg := testConfig(t)
 	st := openStore(t, cfg)
 	n, err := node.NewSingle(context.Background(), node.Options{
-		Store: st, Config: cfg, NewTailer: nodetest.NewTailer, Logger: slog.New(slog.DiscardHandler),
+		Store: st, Config: cfg, Logger: slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +167,7 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 
 	// A restarted node serves every acknowledged write.
 	n2, err := node.NewSingle(context.Background(), node.Options{
-		Store: st, Config: cfg, NewTailer: nodetest.NewTailer, Logger: slog.New(slog.DiscardHandler),
+		Store: st, Config: cfg, Logger: slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -180,6 +179,14 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 	}
 	wctx, wcancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer wcancel()
+	// The copies recover before they serve; readiness says when, as a load
+	// balancer would ask.
+	for n2.Ready(wctx) != nil {
+		if wctx.Err() != nil {
+			t.Fatal("the restarted node never became ready")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	resp, err := n2.Search(wctx, "load", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: maxSeq})
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("the restarted node did not catch up")

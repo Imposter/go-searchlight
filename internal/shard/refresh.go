@@ -177,7 +177,7 @@ func (s *Shard) openDocSegment(meta segment.Meta) (*segRef, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shard: opening segment %s: %w", meta.ID, err)
 	}
-	return &segRef{id: meta.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: info.Size(), reader: r, ids: newDocIDs(r)}, nil
+	return &segRef{id: meta.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: info.Size(), reader: r}, nil
 }
 
 // buildQuerySegment writes queries as a new query segment and opens it.

@@ -86,13 +86,13 @@ func (b *buffer) absorb(newer *buffer) {
 	}
 }
 
-// liveDocs returns the buffer's documents (no tombstones) ready for segment.Build, in
-// buffer order, each with the id fields lookups need ([prepareDoc]).
+// liveDocs returns the buffer's documents (no tombstones) for segment.Build, in buffer
+// order.
 func (b *buffer) liveDocs() []schema.Doc {
 	out := make([]schema.Doc, 0, len(b.docs))
 	for i := range b.docs {
 		if d := b.docs[i].doc; d != nil {
-			out = append(out, prepareDoc(d))
+			out = append(out, *d)
 		}
 	}
 	return out

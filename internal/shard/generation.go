@@ -52,7 +52,6 @@ type segRef struct {
 	format  string // a query segment's builder format
 
 	reader *segment.Reader // kindDocs
-	ids    docIDs          // kindDocs
 	qs     QuerySegment    // kindQueries
 
 	// refs counts the live generations that list the segment (plus one while a
@@ -63,10 +62,13 @@ type segRef struct {
 	obsolete atomic.Bool
 }
 
-// lookup returns id's ordinal in the segment, deleted or not.
+// lookup returns the ordinal of the document or query whose id is exactly id, deleted
+// or not: within one segment an id has at most one copy (a refresh writes each id
+// once, a merge keeps only live copies, of which there is at most one per id, and
+// segment.Build refuses duplicates).
 func (r *segRef) lookup(id string) (uint32, bool) {
 	if r.kind == kindDocs {
-		return r.ids.lookup(id)
+		return r.reader.Ord(id)
 	}
 	return r.qs.Ord(id)
 }
@@ -315,7 +317,7 @@ func (s *Shard) openGeneration(man *manifest) (*Generation, error) {
 		if err != nil {
 			return fail(fmt.Errorf("shard: segment %s: %w", ms.ID, err))
 		}
-		ref := &segRef{id: ms.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: ms.Bytes, reader: r, ids: newDocIDs(r)}
+		ref := &segRef{id: ms.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: ms.Bytes, reader: r}
 		docs = append(docs, segState{ref: ref, deletes: emptyDeletes})
 		if r.NumDocs() != ms.Docs {
 			return fail(fmt.Errorf("shard: segment %s holds %d documents, the manifest says %d", ms.ID, r.NumDocs(), ms.Docs))

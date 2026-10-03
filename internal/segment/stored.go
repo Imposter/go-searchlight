@@ -132,12 +132,39 @@ func (si storedIndex) blockFor(ord uint32) (storedBlockInfo, bool) {
 	return b, true
 }
 
-// storedCache decompresses one block at a time, reused across calls on the assumption
-// that nearby ordinals are fetched together (as hits usually are).
+// storedCacheShards is how many independent cache slots [storedCache] keeps. Task 6's
+// concurrent hit fetches will hit many different blocks at once; a single shared slot
+// (and the one mutex guarding it) meant every one of those serialized on the same
+// lock and then, as likely as not, evicted the block the next concurrent call wanted,
+// decompressing it all over again. Picking a slot by block offset modulo this spreads
+// unrelated blocks across independent locks, so only two fetches that land on the
+// very same slot (whether or not they're the very same block) ever wait on each
+// other.
+const storedCacheShards = 8
+
+// storedCache decompresses blocks, keeping the last few decompressed ones (one per
+// shard) around on the assumption that nearby ordinals are fetched together, as hits
+// usually are - within one shard; across shards, unrelated blocks simply don't
+// contend.
+//
+// Its one *zstd.Decoder is shared by every shard with no lock of its own:
+// Decoder.DecodeAll is documented safe for concurrent use (it hands out one of the
+// decoder's own pooled block decoders per call, up to its configured concurrency,
+// instead of mutating shared state), so decompressing two different blocks for two
+// different shards already proceeds in parallel without a sync.Pool of decoders on
+// top - which would only add redundant block-decoder pools fighting over the same
+// cores.
 type storedCache struct {
-	dec   *zstd.Decoder
+	dec    *zstd.Decoder
+	shards [storedCacheShards]storedShard
+}
+
+// storedShard is one cache slot: the one block it currently holds decompressed (or 0,
+// i.e. never, since block offset 0 is inside the header and never a real block), and
+// its own lock, independent of every other shard's.
+type storedShard struct {
 	mu    sync.Mutex
-	block uint64 // the cached block's offset, or 0 for none
+	block uint64
 	data  []byte
 }
 
@@ -151,13 +178,14 @@ func newStoredCache() (*storedCache, error) {
 
 func (c *storedCache) close() { c.dec.Close() }
 
-// record decompresses b (reusing the cache when b is already cached) and returns
-// document ord's id and body. The returned slices are views of the cache and are only
-// valid until the next call.
+// record decompresses b (reusing its shard's cache when b is already cached) and
+// returns document ord's id and body. The returned slices are views of the cache and
+// are only valid until the next call that lands on the same shard.
 func (c *storedCache) record(data []byte, b storedBlockInfo, ord uint32) (string, []byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.block != b.off {
+	shard := &c.shards[b.off%storedCacheShards]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if shard.block != b.off {
 		region := region{off: b.off, n: uint64(b.clen)}
 		compressed, ok := region.slice(data)
 		if !ok {
@@ -167,10 +195,10 @@ func (c *storedCache) record(data []byte, b storedBlockInfo, ord uint32) (string
 		if err != nil {
 			return "", nil, err
 		}
-		c.data = payload
-		c.block = b.off
+		shard.data = payload
+		shard.block = b.off
 	}
-	d := decoder{b: c.data}
+	d := decoder{b: shard.data}
 	var id string
 	var body []byte
 	for i := uint32(0); i <= ord-b.firstOrd; i++ {

@@ -60,6 +60,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		return nil
 	}
 	s.buf = newBuffer()
+	s.bufBytes.Store(0)
 	s.mu.Unlock()
 
 	ctx, span := s.startSpan(ctx, "shard.refresh",
@@ -72,6 +73,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 			s.mu.Lock()
 			fb.absorb(s.buf)
 			s.buf = fb
+			s.bufBytes.Store(fb.bytes)
 			s.mu.Unlock()
 		}
 		span.RecordError(err)
@@ -327,6 +329,9 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		return fail(err)
 	}
 	man, err := buildManifest(gen, seq, maxSeq, uid, mp, docs, queries)
+	if err == nil && s.marksUntyped {
+		man.UntypedMarks = untypedMarksFormat
+	}
 	if err != nil {
 		return fail(err)
 	}

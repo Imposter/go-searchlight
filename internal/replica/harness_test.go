@@ -250,7 +250,7 @@ func testShardOptions(id ShardID) shard.Options {
 
 func openShard(t testing.TB, dir string, opts shard.Options) *shard.Shard {
 	t.Helper()
-	sh, err := shard.Open(context.Background(), dir, nil, opts)
+	sh, err := OpenCopy(context.Background(), dir, nil, opts) // dir is the copy's root
 	if err != nil {
 		t.Fatalf("open shard %s: %v", dir, err)
 	}

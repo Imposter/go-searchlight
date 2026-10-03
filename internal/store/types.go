@@ -66,7 +66,16 @@ const (
 	// IfAbsent makes a change apply only when the document or query does not
 	// exist.
 	IfAbsent int64 = -1
+	// IfExists makes a change apply only when the document or query exists: a
+	// delete of nothing is skipped inside the transaction (it writes no change
+	// and takes no seq; its Seq stays 0) while the rest of the batch applies.
+	IfExists int64 = -2
 )
+
+// MaxPayloadBytes bounds an upsert's id and payload together: the largest document a
+// segment stores (segment.MaxStoredBytes). A larger one could commit but never be
+// applied, halting every copy of its shard, so Apply refuses it.
+const MaxPayloadBytes = 32 << 20
 
 // Change is one entry of the changelog: a document or saved-query upsert or
 // delete on one shard. Apply assigns Seq and At; callers leave them zero.
@@ -86,14 +95,16 @@ type Change struct {
 	At time.Time
 	// IfSeq makes the change conditional, checked atomically inside Apply in
 	// batch order: a positive IfSeq requires the target's current seq to equal
-	// it; IfAbsent requires the target not to exist. Zero applies
-	// unconditionally. It is not stored.
+	// it; IfAbsent requires the target not to exist, IfExists requires it to
+	// exist. Zero applies unconditionally. It is not stored.
 	IfSeq int64
 	// IndexUID is the incarnation of Index this change was applied against,
 	// set by the store and returned by ChangesAfter. A tailer that sees a UID
 	// different from the one it last applied knows Index was dropped and
 	// recreated under the same name, and must recover from scratch rather
-	// than resume. Callers leave it zero.
+	// than resume. A caller may set it to the incarnation it means to write:
+	// Apply then refuses the change, as for a missing index
+	// (*IndexNotFoundError), when the index is another incarnation now.
 	IndexUID string
 	// MappingVersion is the index's mapping version when the change committed,
 	// set by the store. The KindMapping change of that version precedes it in

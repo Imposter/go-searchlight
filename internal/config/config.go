@@ -53,8 +53,13 @@ type Config struct {
 	NodeID string
 	// DataDir holds the local segments.
 	DataDir string
-	// TokensFile lists the API bearer tokens. Empty disables API auth.
+	// TokensFile lists the API bearer tokens. Empty disables API auth, which
+	// Load refuses unless InsecureNoAuth is set.
 	TokensFile string
+	// InsecureNoAuth allows an empty TokensFile: the public API then serves
+	// every request unauthenticated. Meant for a laptop or a test, never for a
+	// reachable node; the API logs a warning at start when it is on.
+	InsecureNoAuth bool
 	// ClusterToken authenticates the internal peer API.
 	ClusterToken string
 	// RefreshInterval is how often each shard's write buffer becomes a
@@ -76,6 +81,14 @@ type Config struct {
 	// brings other nodes' writes to a copy on MySQL and SQLite, and the
 	// safety net everywhere.
 	ChangelogPollInterval time.Duration
+	// RemapDebounce is how long a copy a mapping change must rebuild waits for
+	// more mapping changes, so a burst costs one rebuild; 0 rebuilds at once.
+	RemapDebounce time.Duration
+	// HaltRetryBase and HaltRetryCap bound the backoff of a halted copy's retries;
+	// RebuildRetryCap bounds it for a rebuild that keeps failing.
+	HaltRetryBase   time.Duration
+	HaltRetryCap    time.Duration
+	RebuildRetryCap time.Duration
 	// MergeBudget caps the bytes per second background merges write on this
 	// node; 0 means unlimited. It is the I/O half of the merge budget.
 	MergeBudget int64
@@ -90,7 +103,61 @@ type Config struct {
 	Pprof bool
 	// ShutdownTimeout bounds the graceful shutdown.
 	ShutdownTimeout time.Duration
+
+	// MaxBodyBytes caps a public API request body. It stays below MaxBodyLimit,
+	// the largest document a segment stores, so a body never holds a document
+	// no refresh could write.
+	MaxBodyBytes int64
+	// MaxDocBytes caps one document's JSON (a PUT body, a bulk line). It is at
+	// most MaxBodyBytes.
+	MaxDocBytes int64
+	// MaxBulkOps caps the operations of one _bulk request.
+	MaxBulkOps int
+	// RequestTimeout is every public API request's deadline: a search past it
+	// answers with what it has (timed_out), a wait past it gives up.
+	RequestTimeout time.Duration
+	// ReadTimeout bounds reading a whole request, headers and body, so a slow
+	// client cannot hold a connection open (slowloris).
+	ReadTimeout time.Duration
+	// SearchQueue caps the reads (searches, counts, percolations, field
+	// catalogues) in progress at once; past it a read is refused with 429.
+	SearchQueue int
+	// MaxInflightWriteBytes and MaxInflightReadBytes cap the heap the writes, and
+	// the reads, in progress may take at once (Elasticsearch's indexing pressure):
+	// each request is charged its body bytes times InflightAmplification, and past
+	// either budget a request is refused with 429. Each is at least
+	// MaxBodyBytes times InflightAmplification, so any single request fits.
+	MaxInflightWriteBytes int64
+	MaxInflightReadBytes  int64
+	// InflightAmplification is the heap a request takes per byte of its body, at
+	// its peak: measured at about 4.5 for a bulk and 8 for a bulk with percolate
+	// or a percolation (BenchmarkBulkPeakHeap); the default, 10, leaves headroom.
+	// A node's heap is then about 1.5 times the two budgets, plus each shard
+	// copy's write buffers (flush_bytes times max_buffer_factor: 64 MiB times 4 by
+	// default).
+	InflightAmplification int
+	// DropTimeout bounds dropping an index from the store, which deletes its
+	// documents, queries and changes, apart from the request's own deadline.
+	DropTimeout time.Duration
+	// ShutdownGrace is how long the API keeps serving after readiness turns
+	// false at shutdown, before it closes its listener, so a load balancer stops
+	// sending it traffic first.
+	ShutdownGrace time.Duration
+	// MaxIndexFields caps the fields of one index's mapping (Elasticsearch's
+	// index.mapping.total_fields.limit): a document or mapping change that would
+	// pass it is refused.
+	MaxIndexFields int
+	// TLSCert and TLSKey, both set, serve the public API over TLS. Unset, serve
+	// it behind a TLS-terminating proxy.
+	TLSCert string
+	TLSKey  string
 }
+
+// MaxBodyLimit is the largest max_body_bytes: 32 MiB less 1 KiB, so a body
+// and the longest document id (512 bytes) stay below the largest document a
+// segment stores (segment.MaxStoredBytes, 32 MiB with its id), and no accepted
+// body can carry a document a refresh would refuse.
+const MaxBodyLimit = 32<<20 - 1<<10
 
 // Default returns the production defaults. StoreURL is empty because it has
 // no default.
@@ -104,11 +171,28 @@ func Default() Config {
 		SeqPersistInterval:    30 * time.Second,
 		MaxLag:                2 * time.Second,
 		ChangelogPollInterval: 500 * time.Millisecond,
+		RemapDebounce:         2 * time.Second,
+		HaltRetryBase:         30 * time.Second,
+		HaltRetryCap:          10 * time.Minute,
+		RebuildRetryCap:       2 * time.Minute,
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       30 * time.Second,
+		MaxBodyBytes:          16 << 20,
+		MaxDocBytes:           4 << 20,
+		MaxBulkOps:            10_000,
+		RequestTimeout:        30 * time.Second,
+		ReadTimeout:           time.Minute,
+		SearchQueue:           1000,
+
+		MaxInflightWriteBytes: 512 << 20,
+		MaxInflightReadBytes:  256 << 20,
+		InflightAmplification: 10,
+		DropTimeout:           10 * time.Minute,
+		ShutdownGrace:         2 * time.Second,
+		MaxIndexFields:        1000,
 	}
 }
 
@@ -170,6 +254,18 @@ var settings = []setting{
 		format: func(c *Config) string { return c.TokensFile },
 	},
 	{
+		name: "insecure_no_auth", isBool: true, usage: "serve the API without auth when tokens_file is empty (never on a reachable node)",
+		parse: func(c *Config, v string) error {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return fmt.Errorf("want true or false, got %q", v)
+			}
+			c.InsecureNoAuth = b
+			return nil
+		},
+		format: func(c *Config) string { return strconv.FormatBool(c.InsecureNoAuth) },
+	},
+	{
 		name: "cluster_token", secret: true, usage: "token for the internal peer API",
 		parse:   func(c *Config, v string) error { c.ClusterToken = v; return nil },
 		format:  func(c *Config) string { return c.ClusterToken },
@@ -194,6 +290,33 @@ var settings = []setting{
 		name: "changelog_poll_interval", usage: "how often a shard copy polls the changelog when nothing wakes it sooner",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.ChangelogPollInterval, v) },
 		format: func(c *Config) string { return c.ChangelogPollInterval.String() },
+	},
+	{
+		name: "remap_debounce", usage: "how long a copy a mapping change must rebuild waits for more mapping changes (0 = none)",
+		parse: func(c *Config, v string) error {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 {
+				return fmt.Errorf("want a duration such as 2s or 0s, got %q", v)
+			}
+			c.RemapDebounce = d
+			return nil
+		},
+		format: func(c *Config) string { return c.RemapDebounce.String() },
+	},
+	{
+		name: "halt_retry_base", usage: "first backoff before a halted shard copy is retried",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.HaltRetryBase, v) },
+		format: func(c *Config) string { return c.HaltRetryBase.String() },
+	},
+	{
+		name: "halt_retry_cap", usage: "longest backoff between a halted shard copy's retries",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.HaltRetryCap, v) },
+		format: func(c *Config) string { return c.HaltRetryCap.String() },
+	},
+	{
+		name: "rebuild_retry_cap", usage: "longest backoff between retries of a shard copy rebuild that keeps failing",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RebuildRetryCap, v) },
+		format: func(c *Config) string { return c.RebuildRetryCap.String() },
 	},
 	{
 		name: "merge_budget", usage: "bytes per second merges may write, e.g. 64MiB (0 = unlimited)",
@@ -240,6 +363,99 @@ var settings = []setting{
 		name: "shutdown_timeout", usage: "how long a graceful shutdown may take",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.ShutdownTimeout, v) },
 		format: func(c *Config) string { return c.ShutdownTimeout.String() },
+	},
+	{
+		name: "max_body_bytes", usage: "largest API request body, e.g. 16MiB (at most 32MiB less 1KiB)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.MaxBodyBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.MaxBodyBytes) },
+	},
+	{
+		name: "max_doc_bytes", usage: "largest document JSON, e.g. 4MiB (at most max_body_bytes)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.MaxDocBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.MaxDocBytes) },
+	},
+	{
+		name: "max_bulk_ops", usage: "most operations in one _bulk request",
+		parse:  func(c *Config, v string) error { return positiveInt(&c.MaxBulkOps, v) },
+		format: func(c *Config) string { return strconv.Itoa(c.MaxBulkOps) },
+	},
+	{
+		name: "request_timeout", usage: "deadline of every API request",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestTimeout, v) },
+		format: func(c *Config) string { return c.RequestTimeout.String() },
+	},
+	{
+		name: "read_timeout", usage: "how long reading a request's headers and body may take",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.ReadTimeout, v) },
+		format: func(c *Config) string { return c.ReadTimeout.String() },
+	},
+	{
+		name: "search_queue", usage: "reads in progress at once before more are refused with 429",
+		parse:  func(c *Config, v string) error { return positiveInt(&c.SearchQueue, v) },
+		format: func(c *Config) string { return strconv.Itoa(c.SearchQueue) },
+	},
+	{
+		name: "max_inflight_write_bytes", usage: "heap the writes in progress may take before more get 429 (at least max_body_bytes times inflight_amplification)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.MaxInflightWriteBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.MaxInflightWriteBytes) },
+	},
+	{
+		name: "max_inflight_read_bytes", usage: "heap the reads in progress may take before more get 429 (at least max_body_bytes times inflight_amplification)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.MaxInflightReadBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.MaxInflightReadBytes) },
+	},
+	{
+		name: "inflight_amplification", usage: "heap a request takes per byte of its body, charged to the in-flight budgets",
+		parse:  func(c *Config, v string) error { return positiveInt(&c.InflightAmplification, v) },
+		format: func(c *Config) string { return strconv.Itoa(c.InflightAmplification) },
+	},
+	{
+		name: "drop_timeout", usage: "how long dropping an index from the store may take",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.DropTimeout, v) },
+		format: func(c *Config) string { return c.DropTimeout.String() },
+	},
+	{
+		name: "shutdown_grace", usage: "how long the API serves after readiness turns false at shutdown (0 = none)",
+		parse: func(c *Config, v string) error {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 {
+				return fmt.Errorf("want a duration such as 2s or 0s, got %q", v)
+			}
+			c.ShutdownGrace = d
+			return nil
+		},
+		format: func(c *Config) string { return c.ShutdownGrace.String() },
+	},
+	{
+		name: "max_index_fields", usage: "most fields one index's mapping holds",
+		parse:  func(c *Config, v string) error { return positiveInt(&c.MaxIndexFields, v) },
+		format: func(c *Config) string { return strconv.Itoa(c.MaxIndexFields) },
+	},
+	{
+		name: "tls_cert", usage: "PEM certificate file to serve the API over TLS (with tls_key; else use a TLS proxy)",
+		parse:  func(c *Config, v string) error { c.TLSCert = v; return nil },
+		format: func(c *Config) string { return c.TLSCert },
+	},
+	{
+		name: "tls_key", usage: "PEM private key file for tls_cert",
+		parse:  func(c *Config, v string) error { c.TLSKey = v; return nil },
+		format: func(c *Config) string { return c.TLSKey },
 	},
 }
 
@@ -353,9 +569,36 @@ func (c *Config) validate() []error {
 	if c.NodeID == "" {
 		errs = append(errs, errors.New("node_id: must not be empty"))
 	}
-	if c.TokensFile != "" {
+	switch {
+	case c.TokensFile != "":
 		if _, err := os.Stat(c.TokensFile); err != nil {
 			errs = append(errs, fmt.Errorf("tokens_file: %w", err))
+		}
+	case !c.InsecureNoAuth:
+		errs = append(errs, errors.New("tokens_file: is required; set insecure_no_auth=true to serve the API without auth"))
+	}
+	if c.MaxBodyBytes < 1<<10 || c.MaxBodyBytes > MaxBodyLimit {
+		errs = append(errs, fmt.Errorf("max_body_bytes: want 1KiB to %d bytes, got %d", MaxBodyLimit, c.MaxBodyBytes))
+	}
+	if c.MaxDocBytes < 1 || c.MaxDocBytes > c.MaxBodyBytes {
+		errs = append(errs, fmt.Errorf("max_doc_bytes: want 1 byte to max_body_bytes (%d), got %d", c.MaxBodyBytes, c.MaxDocBytes))
+	}
+	for _, b := range []struct {
+		name string
+		n    int64
+	}{{"max_inflight_write_bytes", c.MaxInflightWriteBytes}, {"max_inflight_read_bytes", c.MaxInflightReadBytes}} {
+		if floor := c.MaxBodyBytes * int64(max(1, c.InflightAmplification)); b.n < floor {
+			errs = append(errs, fmt.Errorf("%s: want at least max_body_bytes times inflight_amplification (%d), got %d", b.name, floor, b.n))
+		}
+	}
+	if (c.TLSCert == "") != (c.TLSKey == "") {
+		errs = append(errs, errors.New("tls_cert: tls_cert and tls_key are set together"))
+	}
+	for _, f := range []struct{ name, path string }{{"tls_cert", c.TLSCert}, {"tls_key", c.TLSKey}} {
+		if f.path != "" {
+			if _, err := os.Stat(f.path); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", f.name, err))
+			}
 		}
 	}
 	return errs

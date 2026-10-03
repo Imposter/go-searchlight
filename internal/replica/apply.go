@@ -253,7 +253,13 @@ func analyzeDoc(view *schema.Mapping, dynamic schema.DynamicMode, id string, bod
 		return doc, false, err
 	}
 	for f := range upd.Fields {
-		doc.Fields[f] = schema.Value{Present: true}
+		// Typeable content: dynamic inference types this value, so mapping the
+		// field would analyze it differently. A value inference does not type
+		// (an empty list, an object) analyzes as presence alone whatever the
+		// field's type, and is not marked. The mark rides on the field's
+		// Truncated bitmap, which an untyped field has no other use for
+		// (shard.MarksUntyped).
+		doc.Fields[f] = schema.Value{Present: true, GramsTruncated: true}
 	}
 	return doc, !upd.Empty() && dynamic != schema.DynamicFalse, nil
 }
@@ -489,7 +495,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 					if err := flush(i); err != nil {
 						return err
 					}
-					rebuild, err := t.remapReanalyzes(ctx, sh, fields)
+					rebuild, err := t.remapReanalyzes(ctx, sh, m, fields)
 					if err != nil {
 						return err
 					}
@@ -516,11 +522,16 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 	return flush(len(items))
 }
 
-// remapReanalyzes reports whether a live document of the copy holds one of fields,
-// which a mapping change maps, re-types or unmaps: the copy must then be rebuilt to be
-// analyzed as a copy rebuilt after the change would be. Unmapped fields are indexed for
-// presence, so this is a bitmap check, after a refresh puts the buffer in segments.
-func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, fields []string) (bool, error) {
+// remapReanalyzes reports whether a live document of the copy would analyze
+// differently under a mapping change that maps, re-types or unmaps fields: the copy
+// must then be rebuilt to be analyzed as a copy rebuilt after the change would be.
+// For a field old maps, any live holder counts. For a field it does not, only a holder
+// whose value dynamic inference types (marked at analysis; see analyzeDoc): a value
+// it does not type ([] or {}) analyzes as presence alone, typed or not, so mapping the
+// field changes nothing for it, and the copy adopts the mapping in place. A shard
+// whose segments are not all marked falls back to any holder. It is a bitmap check,
+// after a refresh puts the buffer in segments.
+func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old *schema.Mapping, fields []string) (bool, error) {
 	if err := sh.Refresh(ctx); err != nil {
 		return false, err
 	}
@@ -529,9 +540,13 @@ func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, fields []
 		return false, shard.ErrClosed
 	}
 	defer g.Release()
+	marked := sh.MarksUntyped()
 	for _, sv := range g.Segments {
 		for _, f := range fields {
 			p := sv.Reader.Present(f)
+			if _, mapped := old.Type(f); !mapped && marked && f != schema.IDField {
+				p = sv.Reader.Truncated(f)
+			}
 			if p == nil || p.IsEmpty() {
 				continue
 			}

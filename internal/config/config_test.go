@@ -20,8 +20,12 @@ func envOf(m map[string]string) func(string) string {
 
 const sqliteURL = "sqlite:///tmp/searchlight.db"
 
+// insecure is the environment of a node with no tokens file, which Load refuses
+// unless auth is explicitly off.
+const insecure = "SEARCHLIGHT_INSECURE_NO_AUTH"
+
 func TestLoadDefaults(t *testing.T) {
-	c, err := Load(nil, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}))
+	c, err := Load(nil, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -40,11 +44,29 @@ func TestLoadDefaults(t *testing.T) {
 		SeqPersistInterval:    30 * time.Second,
 		MaxLag:                2 * time.Second,
 		ChangelogPollInterval: 500 * time.Millisecond,
+		RemapDebounce:         2 * time.Second,
+		HaltRetryBase:         30 * time.Second,
+		HaltRetryCap:          10 * time.Minute,
+		RebuildRetryCap:       2 * time.Minute,
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       30 * time.Second,
+		InsecureNoAuth:        true,
+		MaxBodyBytes:          16 << 20,
+		MaxDocBytes:           4 << 20,
+		MaxBulkOps:            10_000,
+		RequestTimeout:        30 * time.Second,
+		ReadTimeout:           time.Minute,
+		SearchQueue:           1000,
+
+		MaxInflightWriteBytes: 512 << 20,
+		MaxInflightReadBytes:  256 << 20,
+		InflightAmplification: 10,
+		DropTimeout:           10 * time.Minute,
+		ShutdownGrace:         2 * time.Second,
+		MaxIndexFields:        1000,
 	}
 	if c != want {
 		t.Errorf("defaults:\n got %+v\nwant %+v", c, want)
@@ -57,24 +79,35 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := map[string]string{
-		"SEARCHLIGHT_STORE_URL":               "postgres://sl:pw@db:5432/sl?sslmode=disable",
-		"SEARCHLIGHT_LISTEN":                  "0.0.0.0:9000",
-		"SEARCHLIGHT_ADMIN_LISTEN":            "127.0.0.1:9001",
-		"SEARCHLIGHT_ADVERTISE_ADDRESS":       "node-a.internal:9000",
-		"SEARCHLIGHT_NODE_ID":                 "node-a",
-		"SEARCHLIGHT_DATA_DIR":                "/var/lib/searchlight",
-		"SEARCHLIGHT_TOKENS_FILE":             tokens,
-		"SEARCHLIGHT_CLUSTER_TOKEN":           "s3cret",
-		"SEARCHLIGHT_REFRESH_INTERVAL":        "250ms",
-		"SEARCHLIGHT_SEQ_PERSIST_INTERVAL":    "10s",
-		"SEARCHLIGHT_MAX_LAG":                 "5s",
-		"SEARCHLIGHT_CHANGELOG_POLL_INTERVAL": "2s",
-		"SEARCHLIGHT_MERGE_BUDGET":            "128MB",
-		"SEARCHLIGHT_MERGE_THREADS":           "3",
-		"SEARCHLIGHT_SEARCH_THREADS":          "7",
-		"SEARCHLIGHT_LOG_LEVEL":               "DEBUG",
-		"SEARCHLIGHT_PPROF":                   "true",
-		"SEARCHLIGHT_SHUTDOWN_TIMEOUT":        "1m",
+		"SEARCHLIGHT_STORE_URL":                "postgres://sl:pw@db:5432/sl?sslmode=disable",
+		"SEARCHLIGHT_LISTEN":                   "0.0.0.0:9000",
+		"SEARCHLIGHT_ADMIN_LISTEN":             "127.0.0.1:9001",
+		"SEARCHLIGHT_ADVERTISE_ADDRESS":        "node-a.internal:9000",
+		"SEARCHLIGHT_NODE_ID":                  "node-a",
+		"SEARCHLIGHT_DATA_DIR":                 "/var/lib/searchlight",
+		"SEARCHLIGHT_TOKENS_FILE":              tokens,
+		"SEARCHLIGHT_CLUSTER_TOKEN":            "s3cret",
+		"SEARCHLIGHT_REFRESH_INTERVAL":         "250ms",
+		"SEARCHLIGHT_SEQ_PERSIST_INTERVAL":     "10s",
+		"SEARCHLIGHT_MAX_LAG":                  "5s",
+		"SEARCHLIGHT_CHANGELOG_POLL_INTERVAL":  "2s",
+		"SEARCHLIGHT_MERGE_BUDGET":             "128MB",
+		"SEARCHLIGHT_MERGE_THREADS":            "3",
+		"SEARCHLIGHT_SEARCH_THREADS":           "7",
+		"SEARCHLIGHT_LOG_LEVEL":                "DEBUG",
+		"SEARCHLIGHT_PPROF":                    "true",
+		"SEARCHLIGHT_SHUTDOWN_TIMEOUT":         "1m",
+		"SEARCHLIGHT_MAX_BODY_BYTES":           "8MiB",
+		"SEARCHLIGHT_MAX_DOC_BYTES":            "1MiB",
+		"SEARCHLIGHT_MAX_BULK_OPS":             "500",
+		"SEARCHLIGHT_REQUEST_TIMEOUT":          "5s",
+		"SEARCHLIGHT_READ_TIMEOUT":             "20s",
+		"SEARCHLIGHT_SEARCH_QUEUE":             "64",
+		"SEARCHLIGHT_MAX_INFLIGHT_WRITE_BYTES": "64MiB",
+		"SEARCHLIGHT_MAX_INFLIGHT_READ_BYTES":  "32MiB",
+		"SEARCHLIGHT_INFLIGHT_AMPLIFICATION":   "4",
+		"SEARCHLIGHT_DROP_TIMEOUT":             "1m",
+		"SEARCHLIGHT_SHUTDOWN_GRACE":           "0s",
 	}
 	c, err := Load(nil, envOf(env))
 	if err != nil {
@@ -93,12 +126,28 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		SeqPersistInterval:    10 * time.Second,
 		MaxLag:                5 * time.Second,
 		ChangelogPollInterval: 2 * time.Second,
+		RemapDebounce:         2 * time.Second,
+		HaltRetryBase:         30 * time.Second,
+		HaltRetryCap:          10 * time.Minute,
+		RebuildRetryCap:       2 * time.Minute,
 		MergeBudget:           128e6,
 		MergeThreads:          3,
 		SearchThreads:         7,
 		LogLevel:              slog.LevelDebug,
 		Pprof:                 true,
 		ShutdownTimeout:       time.Minute,
+		MaxBodyBytes:          8 << 20,
+		MaxDocBytes:           1 << 20,
+		MaxBulkOps:            500,
+		RequestTimeout:        5 * time.Second,
+		ReadTimeout:           20 * time.Second,
+		SearchQueue:           64,
+
+		MaxInflightWriteBytes: 64 << 20,
+		MaxInflightReadBytes:  32 << 20,
+		InflightAmplification: 4,
+		DropTimeout:           time.Minute,
+		MaxIndexFields:        1000,
 	}
 	if c != want {
 		t.Errorf("env overrides:\n got %+v\nwant %+v", c, want)
@@ -108,6 +157,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 func TestLoadFlagsWinOverEnvironment(t *testing.T) {
 	env := envOf(map[string]string{
 		"SEARCHLIGHT_STORE_URL":        sqliteURL,
+		insecure:                       "true",
 		"SEARCHLIGHT_REFRESH_INTERVAL": "5s",
 		"SEARCHLIGHT_PPROF":            "false",
 	})
@@ -131,6 +181,7 @@ func TestLoadSecretFromFile(t *testing.T) {
 	c, err := Load(nil, envOf(map[string]string{
 		"SEARCHLIGHT_STORE_URL":          sqliteURL,
 		"SEARCHLIGHT_CLUSTER_TOKEN_FILE": path,
+		insecure:                         "true",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -150,7 +201,7 @@ func TestLoadSecretFromFile(t *testing.T) {
 }
 
 func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
-	base := map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}
+	base := map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}
 	cases := []struct {
 		setting string
 		env     map[string]string
@@ -176,6 +227,25 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"log_level", map[string]string{"SEARCHLIGHT_LOG_LEVEL": "loud"}, nil},
 		{"pprof", map[string]string{"SEARCHLIGHT_PPROF": "maybe"}, nil},
 		{"shutdown_timeout", map[string]string{"SEARCHLIGHT_SHUTDOWN_TIMEOUT": "0"}, nil},
+		{"tokens_file", map[string]string{insecure: "false"}, nil},
+		{"insecure_no_auth", map[string]string{insecure: "perhaps"}, nil},
+		{"max_body_bytes", map[string]string{"SEARCHLIGHT_MAX_BODY_BYTES": "32MiB"}, nil},
+		{"max_body_bytes", map[string]string{"SEARCHLIGHT_MAX_BODY_BYTES": "100"}, nil},
+		{"max_doc_bytes", map[string]string{"SEARCHLIGHT_MAX_DOC_BYTES": "17MiB"}, nil},
+		{"max_doc_bytes", map[string]string{"SEARCHLIGHT_MAX_DOC_BYTES": "0"}, nil},
+		{"max_bulk_ops", map[string]string{"SEARCHLIGHT_MAX_BULK_OPS": "0"}, nil},
+		{"request_timeout", map[string]string{"SEARCHLIGHT_REQUEST_TIMEOUT": "0s"}, nil},
+		{"read_timeout", map[string]string{"SEARCHLIGHT_READ_TIMEOUT": "never"}, nil},
+		{"search_queue", map[string]string{"SEARCHLIGHT_SEARCH_QUEUE": "-1"}, nil},
+		{"max_inflight_write_bytes", map[string]string{"SEARCHLIGHT_MAX_INFLIGHT_WRITE_BYTES": "1MiB"}, nil},
+		{"max_inflight_read_bytes", map[string]string{"SEARCHLIGHT_MAX_INFLIGHT_READ_BYTES": "lots"}, nil},
+		{"max_inflight_write_bytes", map[string]string{"SEARCHLIGHT_INFLIGHT_AMPLIFICATION": "64"}, nil},
+		{"inflight_amplification", map[string]string{"SEARCHLIGHT_INFLIGHT_AMPLIFICATION": "0"}, nil},
+		{"drop_timeout", map[string]string{"SEARCHLIGHT_DROP_TIMEOUT": "0s"}, nil},
+		{"max_index_fields", map[string]string{"SEARCHLIGHT_MAX_INDEX_FIELDS": "0"}, nil},
+		{"shutdown_grace", map[string]string{"SEARCHLIGHT_SHUTDOWN_GRACE": "-1s"}, nil},
+		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_KEY": "key.pem"}, nil},
+		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_CERT": filepath.Join(t.TempDir(), "nope.pem"), "SEARCHLIGHT_TLS_KEY": filepath.Join(t.TempDir(), "nope.key")}, nil},
 		{"search_threads", nil, []string{"--search_threads=-2"}},
 		{"data_dir", nil, []string{"--data_dir="}},
 		{"bogus", nil, []string{"--bogus=1"}},
@@ -196,6 +266,17 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.setting) {
 			t.Errorf("%s: error %q does not name the setting", tc.setting, err)
 		}
+	}
+}
+
+func TestLoadRefusesNoAuthUnlessInsecure(t *testing.T) {
+	_, err := Load(nil, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}))
+	if err == nil || !strings.Contains(err.Error(), "insecure_no_auth") {
+		t.Errorf("no tokens_file: err = %v, want one naming insecure_no_auth", err)
+	}
+	c, err := Load([]string{"--insecure_no_auth"}, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}))
+	if err != nil || !c.InsecureNoAuth {
+		t.Errorf("--insecure_no_auth: %+v, %v", c, err)
 	}
 }
 
@@ -225,7 +306,7 @@ func TestLoadHelpAndPositionalArgs(t *testing.T) {
 	if _, err := Load([]string{"-h"}, envOf(nil)); !errors.Is(err, flag.ErrHelp) {
 		t.Errorf("-h: err = %v, want flag.ErrHelp", err)
 	}
-	if _, err := Load([]string{"serve"}, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL})); err == nil {
+	if _, err := Load([]string{"serve"}, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"})); err == nil {
 		t.Error("positional argument: want an error")
 	}
 }
@@ -234,6 +315,7 @@ func TestLogValueRedactsSecrets(t *testing.T) {
 	c, err := Load(nil, envOf(map[string]string{
 		"SEARCHLIGHT_STORE_URL":     "postgres://sl:hunter2@db/sl",
 		"SEARCHLIGHT_CLUSTER_TOKEN": "tops3cret",
+		insecure:                    "true",
 	}))
 	if err != nil {
 		t.Fatal(err)

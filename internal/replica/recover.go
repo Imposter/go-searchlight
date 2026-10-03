@@ -127,15 +127,26 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 				return g
 			}
 		}
+		// A copy that is valid but outdated keeps serving (stale) while its
+		// replacement is built aside; any other is rebuilt in place, unserved.
+		aside := t.canBuildAside(t.needRebuild)
+		if !t.halted() {
+			if aside {
+				t.setState(StateRebuilding)
+			} else {
+				t.setState(StateRecovering)
+			}
+		}
 		if t.needRebuild == reasonRemap {
 			if err := t.debounceRemap(ctx); err != nil {
 				return err
 			}
 		}
-		if !t.halted() {
-			t.setState(StateRecovering)
+		rebuild := t.rebuild
+		if aside {
+			rebuild = t.rebuildAside
 		}
-		if err := t.rebuild(ctx, t.needRebuild); err != nil {
+		if err := rebuild(ctx, t.needRebuild); err != nil {
 			var rb *rebuildError
 			var halt *HaltError
 			switch {
@@ -144,14 +155,117 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			case errors.As(err, &halt):
 				t.gate = halt
 			}
-			// Whatever the rebuild left behind is wiped by the next attempt.
-			t.needRebuild = reasonInterrupted
+			if !aside {
+				// Whatever the rebuild left behind is wiped by the next attempt.
+				t.needRebuild = reasonInterrupted
+			}
 			return err
 		}
 		t.needRebuild, t.gate, t.remapSince = "", nil, time.Time{}
 		t.rebuildWait = 0
 		t.clearHalt()
 	}
+	return nil
+}
+
+// asideReasons are the rebuilds of a copy that is valid, only outdated: it can keep
+// serving while its replacement is built.
+var asideReasons = map[string]bool{
+	reasonRemap: true, reasonMappingOrder: true, reasonMappingBehind: true, reasonPruned: true, reasonHalted: true,
+}
+
+// canBuildAside reports whether the rebuild for reason can be built aside: the copy
+// is outdated rather than invalid, its shard works and holds data, and no Fetcher
+// fetches the replacement into the copy's own directory.
+func (t *Tailer) canBuildAside(reason string) bool {
+	sh := t.Shard()
+	if t.opts.hooks != nil && t.opts.hooks.inPlace {
+		return false
+	}
+	return asideReasons[reason] && t.opts.Fetcher == nil && sh.Err() == nil && sh.AppliedSeq() > 0
+}
+
+// rebuildAside rebuilds the copy in a new directory under its root while the current
+// copy keeps serving: it loads the store's snapshot there, applies the changelog
+// after it until caught up, refreshes, then makes it current (CURRENT, atomically)
+// and swaps it in. Readers holding a generation of the old copy keep it until they
+// release it; the old copy's files are removed once they have (or by the next
+// OpenCopy). A failure, or a crash, leaves the old copy current and serving, and the
+// half-built directory is removed (now, or by the next OpenCopy).
+func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
+	if err := t.cat.load(ctx, t.id.Shard); err != nil {
+		return err
+	}
+	t.lastCatalog = time.Now()
+	old := t.Shard()
+	root := copyRoot(old.Dir())
+	dir := newCopyDir(root)
+	ctx, span := t.startRecoverySpan(ctx, sourceSQL, reason)
+	start := time.Now()
+	defer func() { t.endRecovery(ctx, span, sourceSQL, reason, start, err) }()
+	sh, err := t.openShard(ctx, dir)
+	if err != nil {
+		return err
+	}
+	swapped := false
+	defer func() {
+		if !swapped {
+			sh.Abandon()
+			t.applied.Store(old.AppliedSeq())
+			if ctx.Err() == nil {
+				_ = os.RemoveAll(dir)
+			} // stopping: left, like a crash's, for the next OpenCopy to remove
+		}
+	}()
+	t.log.InfoContext(ctx, "rebuilding the shard copy aside; the current copy serves meanwhile", slog.String("reason", reason), slog.String("dir", dir))
+	asOf, err := t.loadSnapshot(ctx, sh)
+	if err != nil {
+		return err
+	}
+	for {
+		head, _, err := t.st.HeadSeq(ctx)
+		if err != nil {
+			return err
+		}
+		changes, err := t.st.ChangesAfter(ctx, t.id, sh.AppliedSeq(), t.opts.BatchSize)
+		if errors.Is(err, store.ErrPruned) {
+			return &rebuildError{reason: reasonPruned, err: err}
+		}
+		if err != nil {
+			return err
+		}
+		if len(changes) > 0 {
+			if err := t.applyChanges(ctx, sh, changes); err != nil {
+				return err
+			}
+		}
+		if len(changes) < t.opts.BatchSize {
+			if head > sh.AppliedSeq() {
+				if err := sh.Advance(head); err != nil {
+					return err
+				}
+			}
+			break
+		}
+	}
+	if err := sh.Refresh(ctx); err != nil {
+		return err
+	}
+	if t.opts.hooks != nil && t.opts.hooks.beforeSwap != nil {
+		if err := t.opts.hooks.beforeSwap(ctx, dir); err != nil {
+			return err
+		}
+	}
+	if err := makeCurrent(root, dir); err != nil {
+		return fmt.Errorf("replica: making %s current: %w", dir, err)
+	}
+	swapped = true
+	t.swap(sh)
+	old.Abandon()
+	removeCopy(root, old.Dir())
+	t.lastSource, t.recoveredAt, t.minMappingVersion = sourceSQL, asOf, 0
+	t.log.InfoContext(ctx, "shard copy rebuilt aside and swapped in", slog.String("reason", reason), slog.Int64("seq", sh.AppliedSeq()),
+		slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000))
 	return nil
 }
 
@@ -292,7 +406,7 @@ func (t *Tailer) fetch(ctx context.Context, reason, dir string) (ok bool, err er
 	start := time.Now()
 	var used error
 	defer func() { t.endRecovery(ctx, span, sourcePeer, reason, start, used) }()
-	if used = os.MkdirAll(dir, 0o750); used == nil { //nolint:gosec // dir is the copy's own directory, the node's choice
+	if used = os.MkdirAll(dir, 0o750); used == nil {
 		used = t.opts.Fetcher.Fetch(ctx, t.id, dir)
 	}
 	if used == nil {
@@ -433,7 +547,7 @@ func (t *Tailer) wipe(ctx context.Context, dir string) error {
 			err = ctx.Err()
 		}
 		if err == nil {
-			err = os.RemoveAll(dir) //nolint:gosec // dir is the copy's own directory, the node's choice
+			err = os.RemoveAll(dir)
 		}
 		if err == nil {
 			return nil

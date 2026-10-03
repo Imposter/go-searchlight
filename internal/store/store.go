@@ -39,9 +39,11 @@ type Store interface {
 	Migrate(ctx context.Context) error
 
 	// Apply commits batch as one transaction and returns its sequence
-	// numbers, firstSeq..lastSeq in batch order. Every change's index must
-	// exist. When an IfSeq condition fails it returns a *ConflictError and
-	// applies nothing.
+	// numbers, firstSeq..lastSeq in batch order, and sets each applied
+	// change's Seq in batch. Every change's index must exist. When an IfSeq
+	// condition fails it returns a *ConflictError and applies nothing. A
+	// change whose IfExists target does not exist is skipped instead: it
+	// writes nothing, takes no seq (its Seq stays 0) and fails nothing else.
 	Apply(ctx context.Context, batch []Change) (firstSeq, lastSeq int64, err error)
 
 	// ChangesAfter returns up to limit changes of shard with seq > seq, in

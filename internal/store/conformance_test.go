@@ -1516,6 +1516,58 @@ func TestBlobPutSurvivesPostCommitFailure(t *testing.T) {
 	})
 }
 
+// TestBlobPutAmbiguousCommit checks that when switchTo's pointer-switch
+// transaction genuinely commits but Put never learns that (a cancelled
+// context or a network blip racing the server's own decision), Put reports
+// ErrAmbiguousCommit without touching the now-live upload, the blob stays
+// intact, and a later Sweep leaves it alone too.
+func TestBlobPutAmbiguousCommit(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		bs := st.Blobs()
+		hooks := engine(st).blobs
+		data := []byte("hello, this blob's commit outcome goes missing")
+
+		hooks.crash = func(point string) bool { return point == "commit" }
+		_, err := bs.Put(ctx, "amb", bytes.NewReader(data))
+		if !errors.Is(err, ErrAmbiguousCommit) {
+			t.Fatalf("put: %v", err)
+		}
+		hooks.crash = nil
+
+		// The commit landed: the blob is there, intact.
+		if got := blobChunkCount(t, st); got == 0 {
+			t.Fatal("the live upload's chunks are gone after an ambiguous commit")
+		}
+		rc, info, err := bs.Get(ctx, "amb")
+		if err != nil {
+			t.Fatalf("get after an ambiguous commit: %v", err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("blob content after an ambiguous commit: %q %v, want %q", got, err, data)
+		}
+		if info.Size != int64(len(data)) {
+			t.Fatalf("blob info after an ambiguous commit: %+v", info)
+		}
+
+		// A later Sweep leaves the live upload alone.
+		if removed, err := bs.Sweep(ctx, 0); err != nil || removed != 0 {
+			t.Fatalf("sweep after an ambiguous commit: %d %v", removed, err)
+		}
+		if got := blobChunkCount(t, st); got == 0 {
+			t.Fatal("sweep removed the live upload's chunks")
+		}
+		rc2, _, err := bs.Get(ctx, "amb")
+		if err != nil {
+			t.Fatalf("get after sweep: %v", err)
+		}
+		_ = rc2.Close()
+	})
+}
+
 // TestBlobSweep covers what crashes leave behind: a Put that dies mid-write,
 // one that dies after switching the pointer but before removing the old
 // upload, and the interplay of Sweep with Puts still writing.

@@ -247,6 +247,11 @@ var (
 	// ErrNewerSchema is returned by Migrate when the database has migrations
 	// this binary does not know.
 	ErrNewerSchema = errors.New("store: database schema is newer than this binary")
+	// ErrAmbiguousCommit is returned by BlobStore.Put when a commit's
+	// outcome could not be learned (a cancelled context or a network blip
+	// racing the server's own decision): the blob may or may not have been
+	// replaced. The caller should Stat or Get to find out.
+	ErrAmbiguousCommit = errors.New("store: blob commit outcome is unknown")
 )
 
 // ConflictError is returned by Apply when changes' IfSeq conditions fail.

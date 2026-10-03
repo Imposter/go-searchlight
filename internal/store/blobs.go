@@ -37,8 +37,10 @@ type blobStore struct {
 	s *sqlStore
 
 	// crash, when set (tests only), makes Put stop dead, with no cleanup, at
-	// the named point: "chunk" after each chunk, or "cleanup" after the
-	// pointer switch commits.
+	// the named point: "chunk" after each chunk, "commit" after switchTo's
+	// transaction genuinely commits (simulating the race where the caller
+	// never learns the commit landed), or "cleanup" after the pointer
+	// switch commits and Put has acted on that.
 	crash func(point string) bool
 
 	// failAfterCommit, when set (tests only), is called right after Put's
@@ -137,6 +139,16 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 	sum := hex.EncodeToString(h.Sum(nil))
 
 	old, createdAt, err := b.switchTo(ctx, name, upload, size, chunks, sum)
+	if errors.Is(err, ErrAmbiguousCommit) {
+		// upload may now be live (the commit may have landed): never sweep
+		// it. old may or may not actually be garbage (the commit may have
+		// rolled back, in which case old is still sl_blobs' current
+		// upload): leave it alone and let a later Sweep, or this same
+		// upload's own eventual removal, sort it out. The caller cannot be
+		// told what happened; it must Stat or Get to find out.
+		committed = true
+		return info, err
+	}
 	if err != nil {
 		return info, err
 	}
@@ -213,7 +225,18 @@ func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int6
 			return "", 0, err
 		}
 	}
-	return old, createdAt, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		// Whether this landed server-side is unknown: ctx may have been
+		// cancelled, or the connection dropped, right as the server decided.
+		// The caller must not act as if it knows the outcome either way.
+		return "", 0, fmt.Errorf("switch blob %q to upload %s: %w: %w", name, upload, ErrAmbiguousCommit, err)
+	}
+	if b.crashAt("commit") {
+		// The commit above genuinely landed; simulate the same race by
+		// reporting it as unknown anyway.
+		return "", 0, fmt.Errorf("switch blob %q to upload %s: %w: simulated", name, upload, ErrAmbiguousCommit)
+	}
+	return old, createdAt, nil
 }
 
 // registerGarbage records an upload that is no longer referenced with

@@ -126,6 +126,10 @@ type RegistryStore interface {
 type BlobStore interface {
 	// Put stores r under name, replacing any blob of that name once the new
 	// one is complete. Readers see the old blob or the new one, never a mix.
+	// Put can fail with ErrAmbiguousCommit when the commit's own outcome
+	// could not be learned (a cancelled context or a network blip racing
+	// the server's decision): name may or may not have been replaced, and
+	// the caller must Stat or Get to find out rather than assume either way.
 	Put(ctx context.Context, name string, r io.Reader) (BlobInfo, error)
 	// Get streams a blob. The reader fetches one chunk at a time and fails
 	// with ErrChecksum if the content does not match; it fails with

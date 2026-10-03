@@ -247,11 +247,17 @@ func (n *Single) indexStale(idx *index) bool {
 		return true
 	}
 	for _, c := range idx.copies {
-		if c.trailing(n.cfg.MaxLag) {
+		if c.trailing(n.cfg.MaxLag) || c.rebuilding() {
 			return true
 		}
 	}
 	return false
+}
+
+// rebuilding reports whether the copy is being rebuilt aside: it serves, stale.
+func (c *copyState) rebuilding() bool {
+	sr, ok := c.tailer.(StateReporter)
+	return ok && sr.StateName() == StateRebuilding
 }
 
 // trailing reports whether the copy trails the changelog by more than maxLag (by
@@ -282,7 +288,9 @@ func (c *copyState) notServing() error {
 	}
 	if sr, ok := c.tailer.(StateReporter); ok {
 		switch sr.StateName() {
-		case StateTailing:
+		case StateTailing, StateRebuilding:
+			// Rebuilding aside: the current copy serves (stale) until its
+			// replacement is swapped in.
 		case StateHalted:
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q has halted", c.id.Shard, c.id.Index)
 		default:
@@ -487,7 +495,9 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 		if n.opts.ShardOptions != nil {
 			n.opts.ShardOptions(&opts)
 		}
-		sh, err := shard.Open(ctx, filepath.Join(idx.dir, strconv.Itoa(s)), state.mapping, opts)
+		// A copy rebuilt aside lives in a subdirectory its root names: open the
+		// current one (and collect what a crash or a swap left behind).
+		sh, err := replica.OpenCopy(ctx, filepath.Join(idx.dir, strconv.Itoa(s)), state.mapping, opts)
 		if err != nil {
 			_ = n.stopIndex(ctx, idx)
 			return nil, fmt.Errorf("node: open %s: %w", id, err)

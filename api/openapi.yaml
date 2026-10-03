@@ -1081,3 +1081,5 @@ components:
         lag: { type: integer }
         docs: { type: integer }
         error: { type: string }
+        stale: { type: boolean, description: "A serving copy whose reads are stale: it trails by more than max_lag, or is being rebuilt aside." }
+        rebuilding: { type: boolean, description: "A serving copy being rebuilt aside; its replacement is swapped in once it catches up." }

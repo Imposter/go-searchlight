@@ -387,8 +387,9 @@ const (
 
 // ClusterHealth is the operator's view of the cluster.
 type ClusterHealth struct {
-	// Status is green (every shard copy serving), yellow (a shard below its copy
-	// target) or red (a shard with no serving copy).
+	// Status is green (every shard copy serving current data), yellow (a shard
+	// below its copy target, or a copy serving stale data) or red (a shard with no
+	// serving copy).
 	Status        string `json:"status"`
 	Nodes         int    `json:"nodes"`
 	Indexes       int    `json:"indexes"`
@@ -430,6 +431,11 @@ type ShardInfo struct {
 	Docs uint64 `json:"docs"`
 	// Error is why a halted copy stopped.
 	Error string `json:"error,omitempty"`
+	// Stale marks a serving copy whose reads are stale: it trails the changelog by
+	// more than max_lag, or is being rebuilt aside (Rebuilding), serving its old
+	// data until its replacement is swapped in.
+	Stale      bool `json:"stale,omitempty"`
+	Rebuilding bool `json:"rebuilding,omitempty"`
 }
 
 // strictDecode decodes one JSON value into v, refusing unknown keys and trailing data.

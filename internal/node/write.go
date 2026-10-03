@@ -438,11 +438,7 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 				}
 			}
 		}
-		sh := c.shard()
-		if sh == nil {
-			return shard.ErrClosed
-		}
-		if err := sh.WaitRefreshed(ctx, seq); err != nil {
+		if err := c.waitRefreshed(ctx, seq); err != nil {
 			return err
 		}
 	}

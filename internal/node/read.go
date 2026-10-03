@@ -42,15 +42,15 @@ func (n *Single) waitSeq(ctx context.Context, idx *index, seq int64) error {
 		if err := c.notServing(); err != nil {
 			return err
 		}
-		sh := c.shard()
-		if sh == nil {
-			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", c.id.Shard)
-		}
-		if err := sh.WaitRefreshed(ctx, seq); err != nil {
+		if err := c.waitRefreshed(ctx, seq); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
+				var at int64
+				if sh := c.shard(); sh != nil {
+					at = sh.RefreshedSeq()
+				}
 				return &api.Error{
 					Status: http.StatusGatewayTimeout, Code: api.CodeTimeout, Err: err,
-					Detail: fmt.Sprintf("seq %d was not searchable on shard %d before the deadline (it is at %d)", seq, c.id.Shard, sh.RefreshedSeq()),
+					Detail: fmt.Sprintf("seq %d was not searchable on shard %d before the deadline (it is at %d)", seq, c.id.Shard, at),
 				}
 			}
 			if h := c.halted.Load(); h != nil {
@@ -95,7 +95,7 @@ func (n *Single) waitQueries(ctx context.Context, idx *index) error {
 			continue
 		}
 		c.tailer.Wake()
-		if err := sh.WaitRefreshed(ctx, q); err != nil {
+		if err := c.waitRefreshed(ctx, q); err != nil {
 			return err
 		}
 	}
@@ -111,27 +111,70 @@ func (n *Single) acquire(idx *index) ([]*shard.Generation, func(), error) {
 		}
 	}
 	for _, c := range idx.copies {
-		if err := c.notServing(); err != nil {
+		g, err := c.acquire()
+		if err != nil {
 			release()
 			if idx.dropped.Load() {
 				return nil, nil, indexNotFound(idx.name)
 			}
 			return nil, nil, err
 		}
-		var g *shard.Generation
-		if sh := c.shard(); sh != nil {
-			g = sh.Acquire()
-		}
-		if g == nil {
-			release()
-			if idx.dropped.Load() {
-				return nil, nil, indexNotFound(idx.name)
-			}
-			return nil, nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is closed", c.id.Shard, idx.name)
-		}
 		gens = append(gens, g)
 	}
 	return gens, release, nil
+}
+
+// acquireTries bounds acquire's retries when the copy's shard is swapped under it.
+const acquireTries = 4
+
+// acquire holds the copy's current generation, checking that the copy serves both
+// before and after: a tailer marks a copy recovering and then swaps in the shard it
+// rebuilds, so a reader that read the state before the mark and the shard after the
+// swap would hold an empty shard. After the Acquire the copy must still serve, from
+// the very shard acquired; otherwise the generation is released and it tries again.
+func (c *copyState) acquire() (*shard.Generation, error) {
+	for range acquireTries {
+		if err := c.notServing(); err != nil {
+			return nil, err
+		}
+		sh := c.shard()
+		if sh == nil {
+			return nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is closed", c.id.Shard, c.id.Index)
+		}
+		g := sh.Acquire()
+		if g == nil {
+			if c.shard() != sh {
+				continue // swapped: the old shard closed under the reader
+			}
+			return nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is closed", c.id.Shard, c.id.Index)
+		}
+		if c.notServing() == nil && c.shard() == sh {
+			return g, nil
+		}
+		g.Release()
+	}
+	if err := c.notServing(); err != nil {
+		return nil, err
+	}
+	return nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is being swapped; retry", c.id.Shard, c.id.Index)
+}
+
+// waitRefreshed waits until the copy has seq searchable, following a swap: the shard
+// a rebuild replaces closes, and the wait goes on on its replacement.
+func (c *copyState) waitRefreshed(ctx context.Context, seq int64) error {
+	for {
+		sh := c.shard()
+		if sh == nil {
+			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", c.id.Shard)
+		}
+		err := sh.WaitRefreshed(ctx, seq)
+		if errors.Is(err, shard.ErrClosed) {
+			if next := c.shard(); next != nil && next != sh {
+				continue
+			}
+		}
+		return err
+	}
 }
 
 // readSpan starts a read's span.

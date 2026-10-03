@@ -881,3 +881,78 @@ func TestPercolateAfterRestartSeesQueries(t *testing.T) {
 		t.Errorf("percolation after a restart: %+v %v", res, err)
 	}
 }
+
+// laggingTailer reports a copy an hour behind.
+type laggingTailer struct {
+	node.Tailer
+}
+
+func (laggingTailer) Lag() (int64, time.Duration) { return 10, time.Hour }
+
+// A copy that trails the changelog by more than max_lag marks reads stale and health
+// yellow, but leaves the node ready: one busy copy must not take it out of rotation.
+func TestLaggingCopyIsStaleNotUnready(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	n := open(t, cfg, st, func(o *node.Options) {
+		o.NewTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
+			return laggingTailer{nodetest.NewTailer(st, sh, id, env)}
+		}
+	})
+	if _, err := n.CreateIndex(ctx(t), "lag", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Ready(ctx(t)); err != nil {
+		t.Errorf("a lagging copy made the node unready: %v", err)
+	}
+	res, err := n.Search(ctx(t), "lag", &search.Request{Query: &query.All{}}, api.ReadOptions{})
+	if err != nil || !res.Stale {
+		t.Errorf("a read of a lagging copy: %+v %v", res, err)
+	}
+	h, _ := n.Health(ctx(t))
+	shards, _ := n.Shards(ctx(t))
+	if h.Status != api.StatusYellow || len(shards) != 1 || !shards[0].Stale || shards[0].State != api.ShardServing {
+		t.Errorf("health %+v, shards %+v", h, shards)
+	}
+}
+
+// flippingTailer reports tailing for the next ok calls of StateName, then recovering:
+// a copy the tailer marks recovering between a reader's check and its Acquire.
+type flippingTailer struct {
+	node.Tailer
+	ok *atomic.Int32
+}
+
+func (f flippingTailer) StateName() string {
+	if f.ok.Add(-1) >= 0 {
+		return node.StateTailing
+	}
+	return node.StateRecovering
+}
+
+// A reader that checked the copy serves, then acquired its shard, checks again after:
+// a copy marked recovering in between (its tailer about to swap in an empty shard) is
+// not read.
+func TestAcquireRechecksTheCopy(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	ok := &atomic.Int32{}
+	ok.Store(1 << 20)
+	n := open(t, cfg, st, func(o *node.Options) {
+		o.NewTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
+			return flippingTailer{Tailer: nodetest.NewTailer(st, sh, id, env), ok: ok}
+		}
+	})
+	if _, err := n.CreateIndex(ctx(t), "fl", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Search(ctx(t), "fl", &search.Request{Query: &query.All{}}, api.ReadOptions{}); err != nil {
+		t.Fatalf("a read of a serving copy: %v", err)
+	}
+	ok.Store(1) // serving at the check, recovering by the recheck
+	_, err := n.Search(ctx(t), "fl", &search.Request{Query: &query.All{}}, api.ReadOptions{})
+	var ae *api.Error
+	if !errors.As(err, &ae) || ae.Status != 503 {
+		t.Errorf("a read racing the copy going recovering: %v", err)
+	}
+}

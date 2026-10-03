@@ -58,6 +58,10 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 	if h := c.halted.Load(); h != nil {
 		info.State, info.Error = api.ShardHalted, (*h).Error()
 	}
+	if info.State == api.ShardServing {
+		info.Rebuilding = c.rebuilding()
+		info.Stale = info.Rebuilding || c.trailing(n.cfg.MaxLag)
+	}
 	return info
 }
 
@@ -73,9 +77,9 @@ func (n *Single) Shards(context.Context) ([]api.ShardInfo, error) {
 }
 
 // Health implements [api.Coordinator]: on one node every shard has its one copy, so
-// the cluster is green while every copy serves and red when one is recovering or
-// halted (that shard has no serving copy). Yellow (a shard below its copy target with
-// a serving copy) needs more nodes.
+// the cluster is green while every copy serves current data, yellow while a copy
+// serves stale data (it trails the changelog by more than max_lag, or is being rebuilt
+// aside), and red when one is recovering or halted (that shard has no serving copy).
 func (n *Single) Health(ctx context.Context) (*api.ClusterHealth, error) {
 	shards, err := n.Shards(ctx)
 	if err != nil {
@@ -86,6 +90,9 @@ func (n *Single) Health(ctx context.Context) (*api.ClusterHealth, error) {
 		switch shards[i].State {
 		case api.ShardServing:
 			h.ServingShards++
+			if shards[i].Stale && h.Status == api.StatusGreen {
+				h.Status = api.StatusYellow // serving, but behind or being rebuilt
+			}
 		default:
 			h.Unassigned++
 			h.Status = api.StatusRed
@@ -100,11 +107,11 @@ func (n *Single) Nodes(context.Context) ([]api.NodeInfo, error) {
 }
 
 // Ready implements [api.Coordinator] (spec section 10): the node is ready while it is
-// open, every copy has finished its startup recovery, the database answered within
-// max_lag, and no copy that is not halted trails the changelog by more than max_lag
-// (by its tailer's Lag, which keeps rising while its polls fail). A copy that halts
-// or re-recovers later shows in health (red), not here: the node still serves every
-// other shard.
+// open, every copy has finished its startup recovery, and the database answered
+// within max_lag. A copy that trails the changelog by more than max_lag, or is being
+// rebuilt aside, marks reads stale and health yellow, but leaves the node ready (a
+// node under a heavy bulk must not flap); one that halts or re-recovers later shows
+// in health (red): the node still serves every other shard.
 func (n *Single) Ready(context.Context) error {
 	n.mu.RLock()
 	closed := n.closed
@@ -118,16 +125,13 @@ func (n *Single) Ready(context.Context) error {
 	var waiting []error
 	for _, idx := range n.sortedIndexes() {
 		for _, c := range idx.copies {
-			switch {
-			case !c.startedUp():
+			if !c.startedUp() {
 				waiting = append(waiting, fmt.Errorf("%s is still recovering", c.id))
-			case c.halted.Load() == nil && haltErr(c) == nil && c.trailing(n.cfg.MaxLag):
-				waiting = append(waiting, fmt.Errorf("%s trails the changelog by more than max_lag (%s)", c.id, n.cfg.MaxLag))
 			}
 		}
 	}
 	if len(waiting) > 0 {
-		return api.Unavailable(errors.Join(waiting...), "%d shard copies are recovering or behind", len(waiting))
+		return api.Unavailable(errors.Join(waiting...), "%d shard copies have not finished their startup recovery", len(waiting))
 	}
 	return nil
 }

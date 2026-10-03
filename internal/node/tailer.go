@@ -34,6 +34,7 @@ const (
 	StateRecovering = "recovering"
 	StateTailing    = "tailing"
 	StateHalted     = "halted"
+	StateRebuilding = "rebuilding"
 )
 
 // StateReporter is implemented by a tailer that can say where its copy is: one of

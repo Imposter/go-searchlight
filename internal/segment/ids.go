@@ -124,3 +124,13 @@ func (r *Reader) IDsFrom(from string, fn func(id []byte, ord uint32) bool) {
 		}
 	}
 }
+
+// IDAt returns the i-th smallest document id (exact, byte order; deleted documents
+// included), false past the last: with a rank from an [Reader.IDsFrom] walk, an id
+// without reading the stored record.
+func (r *Reader) IDAt(i uint32) (string, bool) {
+	if r.ids == nil || i >= r.ids.numTerms {
+		return "", false
+	}
+	return string(r.ids.termAt(nil, i)), true
+}

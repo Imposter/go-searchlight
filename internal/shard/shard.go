@@ -369,7 +369,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("shard: %w", err)
 	}
-	man, err := readManifest(dir)
+	man, err := readManifest(dir, opts.Logger)
 	if err != nil {
 		return nil, err
 	}

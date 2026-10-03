@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -61,6 +64,28 @@ type manifestSegment struct {
 	Format string `json:"format,omitempty"`
 }
 
+// retryDelays are the waits between retryIO's attempts: ten attempts over about
+// half a second.
+var retryDelays = [...]time.Duration{
+	5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond,
+	100 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond,
+}
+
+// retryIO runs fn, again after each of retryDelays while it fails with an error
+// retryableIO accepts (on Windows, another handle in the way: a scanner, an indexer, a
+// reader that did not share delete), and returns its last error.
+func retryIO(log *slog.Logger, op, path string, fn func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := fn()
+		if err == nil || attempt == len(retryDelays) || !retryableIO(err) {
+			return err
+		}
+		log.Debug("manifest file busy; retrying", slog.String("op", op), slog.String("file", path),
+			slog.Int("attempt", attempt+1), slog.Any("error", err))
+		time.Sleep(retryDelays[attempt])
+	}
+}
+
 // ManifestError is a manifest that cannot be read: damaged, or of an unknown format.
 // The copy must be recovered.
 type ManifestError struct {
@@ -72,10 +97,22 @@ func (e *ManifestError) Error() string {
 	return fmt.Sprintf("shard manifest %s: %s", e.Path, e.Reason)
 }
 
-// readManifest reads dir's manifest; an empty manifest when there is none.
-func readManifest(dir string) (*manifest, error) {
+// readManifest reads dir's manifest; an empty manifest when there is none. It opens
+// the file sharing it fully (openShared), so the read never stops a commit renaming a
+// new manifest over it, and retries briefly while another handle is in the way
+// (retryIO); log takes the retries, at debug.
+func readManifest(dir string, log *slog.Logger) (*manifest, error) {
 	path := filepath.Join(dir, manifestName)
-	data, err := os.ReadFile(path)
+	var data []byte
+	err := retryIO(log, "open", path, func() error {
+		f, err := openShared(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		data, err = io.ReadAll(f)
+		return err
+	})
 	if errors.Is(err, os.ErrNotExist) {
 		return &manifest{}, nil
 	}
@@ -150,7 +187,10 @@ func encodeManifest(m *manifest) ([]byte, error) {
 //
 // forget is called with manifest.tmp's path before it is written: garbage collection
 // may have left it pending removal.
-func writeManifest(dir string, m *manifest, hook func(point string) error, forget func(paths ...string)) (size int64, renamed bool, err error) {
+//
+// The rename replaces the manifest even while readers hold it (replaceFile), and is
+// retried briefly while another handle is in the way (retryIO, logging to log).
+func writeManifest(dir string, m *manifest, hook func(point string) error, forget func(paths ...string), log *slog.Logger) (size int64, renamed bool, err error) {
 	data, err := encodeManifest(m)
 	if err != nil {
 		return 0, false, err
@@ -177,7 +217,7 @@ func writeManifest(dir string, m *manifest, hook func(point string) error, forge
 	if err := hook(pointManifestWritten); err != nil {
 		return size, false, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := retryIO(log, "rename", path, func() error { return replaceFile(tmp, path) }); err != nil {
 		return size, false, err
 	}
 	if err := hook(pointManifestRenamed); err != nil {

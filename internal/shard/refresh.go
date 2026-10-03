@@ -326,7 +326,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		return fail(err)
 	}
 	man := buildManifest(gen, seq, maxSeq, uid, docs, queries)
-	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget)
+	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	if err != nil {
 		if !renamed {
 			return fail(fmt.Errorf("shard: writing the manifest: %w", err))

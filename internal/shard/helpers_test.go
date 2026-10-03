@@ -229,7 +229,7 @@ func dirFiles(t testing.TB, dir string) []string {
 // referencedFiles lists every file dir's manifest references, sorted.
 func referencedFiles(t testing.TB, dir string) []string {
 	t.Helper()
-	man, err := readManifest(dir)
+	man, err := readManifest(dir, quietLogger)
 	if err != nil {
 		t.Fatal(err)
 	}

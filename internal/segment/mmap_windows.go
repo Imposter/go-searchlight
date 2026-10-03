@@ -3,6 +3,7 @@
 package segment
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"unsafe"
@@ -54,15 +55,37 @@ func (m *windowsMapping) Close() error {
 	return err
 }
 
-// Poison switches the view to PAGE_NOACCESS in place, rather than unmapping it: the
-// address range stays reserved (so nothing else can be mapped there) and any further
-// read raises an access violation. See [mmapHandle.Poison].
+// Poison releases the view and the file mapping, then reserves the view's exact
+// address range again as PAGE_NOACCESS: any further read raises an access violation,
+// and nothing else can be mapped there while the reservation stands (for the rest of
+// the process). Unlike leaving the view mapped and VirtualProtect-ing it, this lets
+// go of the file itself, so it can be deleted (t.TempDir's cleanup) or renamed over.
+//
+// Windows has no atomic "replace this view with a reservation", so there is a window
+// between UnmapViewOfFile and VirtualAlloc in which another allocation could land in
+// the range; VirtualAlloc then fails and Poison reports it, rather than claiming a
+// guard it could not place. See [mmapHandle.Poison].
 func (m *windowsMapping) Poison() error {
 	if m.addr == 0 {
 		return nil
 	}
-	var old uint32
-	return windows.VirtualProtect(m.addr, uintptr(len(m.data)), windows.PAGE_NOACCESS, &old)
+	addr := m.addr
+	m.addr = 0
+	err := windows.UnmapViewOfFile(addr)
+	if cerr := windows.CloseHandle(m.h); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	got, err := windows.VirtualAlloc(addr, uintptr(len(m.data)), windows.MEM_RESERVE, windows.PAGE_NOACCESS)
+	if err != nil {
+		return fmt.Errorf("segment: poisoning %#x: reserving the unmapped range: %w", addr, err)
+	}
+	if got != addr {
+		return fmt.Errorf("segment: poisoning %#x: reservation landed at %#x", addr, got)
+	}
+	return nil
 }
 
 // fsyncDir is a documented no-op on Windows: NTFS does not expose a way to fsync a

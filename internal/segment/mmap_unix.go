@@ -4,6 +4,7 @@ package segment
 
 import (
 	"os"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,14 +34,20 @@ func (m *unixMapping) Close() error {
 	return unix.Munmap(data)
 }
 
-// Poison switches the mapping to PROT_NONE in place, rather than unmapping it: the
-// address range stays reserved (so nothing else can be mapped there) and any further
-// read faults with SIGSEGV. See [mmapHandle.Poison].
+// Poison replaces the mapping, in place and atomically, with an anonymous PROT_NONE
+// mapping of the same range (mmap with MAP_FIXED): any further read faults with
+// SIGSEGV, nothing else can be mapped there (the range stays reserved for the rest of
+// the process), and the file's own pages are released, so the file can be removed
+// (t.TempDir's cleanup) like any other. See [mmapHandle.Poison].
 func (m *unixMapping) Poison() error {
 	if m.data == nil {
 		return nil
 	}
-	return unix.Mprotect(m.data, unix.PROT_NONE)
+	data := m.data
+	m.data = nil
+	_, err := unix.MmapPtr(-1, 0, unsafe.Pointer(unsafe.SliceData(data)), uintptr(len(data)),
+		unix.PROT_NONE, unix.MAP_FIXED|unix.MAP_PRIVATE|unix.MAP_ANON)
+	return err
 }
 
 // fsyncDir fsyncs dir itself, making a prior rename (or create, or unlink) of an entry

@@ -681,15 +681,16 @@ func TestBitmapValidAcrossRetainClose(t *testing.T) {
 // TestDebugGuardFaultsOnUseAfterClose only runs when built with -tags
 // searchlight_debug (see debug_on.go): it re-execs itself as a subprocess that keeps a
 // zero-copy Postings bitmap past the segment's last Close and then reads it, and
-// checks the subprocess crashed rather than returning wrong data. Plain `go test`
-// (without the tag) skips it, since debugGuard is false and there is nothing to
-// demonstrate.
+// checks the subprocess died of a memory access fault at exactly that read - not any
+// non-zero exit, which a panic, a failed Build or a test failure would also produce.
+// Plain `go test` (without the tag) skips it, since debugGuard is false and there is
+// nothing to demonstrate.
 func TestDebugGuardFaultsOnUseAfterClose(t *testing.T) {
 	if !debugGuard {
 		t.Skip("only meaningful with -tags searchlight_debug")
 	}
-	if os.Getenv("SEARCHLIGHT_DEBUG_GUARD_CHILD") == "1" {
-		runUseAfterCloseChild()
+	if dir := os.Getenv("SEARCHLIGHT_DEBUG_GUARD_CHILD"); dir != "" {
+		runUseAfterCloseChild(dir)
 		return // unreachable if the guard works: the access above should fault first
 	}
 
@@ -697,8 +698,8 @@ func TestDebugGuardFaultsOnUseAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-test.run", "TestDebugGuardFaultsOnUseAfterClose", "-test.v")
-	cmd.Env = append(os.Environ(), "SEARCHLIGHT_DEBUG_GUARD_CHILD=1")
+	cmd := exec.Command(exe, "-test.run", "^TestDebugGuardFaultsOnUseAfterClose$", "-test.v")
+	cmd.Env = append(os.Environ(), "SEARCHLIGHT_DEBUG_GUARD_CHILD="+t.TempDir())
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("child process exited cleanly instead of faulting on the poisoned mapping; output:\n%s", out)
@@ -707,16 +708,30 @@ func TestDebugGuardFaultsOnUseAfterClose(t *testing.T) {
 	if !errors.As(err, &exitErr) {
 		t.Fatalf("child process failed to even start: %v", err)
 	}
-	t.Logf("child faulted as expected (%v); output:\n%s", exitErr, out)
+	text := string(out)
+	_, after, found := strings.Cut(text, debugGuardMarker)
+	if !found {
+		t.Fatalf("child died before reaching the poisoned read (%v); output:\n%s", exitErr, text)
+	}
+	// The Go runtime reports a fault in Go code as "unexpected fault address" and
+	// "fatal error: fault", then the signal: SIGSEGV on unix, the access violation
+	// exception code 0xc0000005 on Windows.
+	accessFault := strings.Contains(after, "SIGSEGV") || strings.Contains(after, "0xc0000005")
+	if !strings.Contains(after, "fatal error: fault") || !accessFault {
+		t.Fatalf("child died after the poisoned read, but not of a memory access fault (%v); output:\n%s", exitErr, text)
+	}
+	t.Logf("child faulted on the poisoned read as expected (%v)", exitErr)
 }
 
+// debugGuardMarker is what the child prints just before its use-after-close read, so
+// the parent can tell a fault at that read from a failure anywhere earlier.
+const debugGuardMarker = "searchlight-debug-guard: reading a bitmap after Close"
+
 // runUseAfterCloseChild is the body of the subprocess TestDebugGuardFaultsOnUseAfterClose
-// launches: it must crash, not return, so the parent never gets to assert on got.
-func runUseAfterCloseChild() {
-	dir, err := os.MkdirTemp("", "searchlight-debug-guard")
-	if err != nil {
-		panic(err)
-	}
+// launches, building its segment in dir (the parent's t.TempDir, which the parent's
+// cleanup can remove only because poisoning releases the file): it must crash, not
+// return, so the parent never gets to assert on got.
+func runUseAfterCloseChild(dir string) {
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword}}
 	// Two documents sharing the term forces the roaring-serialized (docFreq > 1) path,
 	// a real zero-copy view over the mapping - a single document would hit the inline
@@ -742,8 +757,9 @@ func runUseAfterCloseChild() {
 	if err := r.Close(); err != nil {
 		panic(err)
 	}
-	// The mapping is now poisoned (PROT_NONE / PAGE_NOACCESS), not merely unmapped.
+	// The mapping is now poisoned (an inaccessible reservation), not merely unmapped.
 	// got's containers still point into it, so this read must fault.
+	fmt.Fprintln(os.Stderr, debugGuardMarker)
 	_ = got.ToArray()
 }
 

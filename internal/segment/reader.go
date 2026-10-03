@@ -36,8 +36,8 @@ type fieldInfo struct {
 // Built with the searchlight_debug tag, a Reader poisons its mapping instead of
 // unmapping it when the last handle closes, so a bitmap kept past that point faults
 // immediately on access instead of silently returning stale or reused memory - see
-// debug_on.go. That tag trades a process-lifetime address and file descriptor leak for
-// a deterministic crash, which is only ever a good trade in a test binary.
+// debug_on.go. That tag trades a process-lifetime address-range leak (the file itself
+// is released) for a deterministic crash, which is only ever a good trade in a test binary.
 type Reader struct {
 	path      string
 	m         *mapping

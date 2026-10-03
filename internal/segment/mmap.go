@@ -13,14 +13,16 @@ type mmapHandle interface {
 	Data() []byte
 	// Close unmaps. Idempotent.
 	Close() error
-	// Poison makes the mapping's address range inaccessible without releasing it
-	// (mprotect/VirtualProtect to no-access, never munmap/UnmapViewOfFile), so a stale
-	// reference to Data (for example a zero-copy roaring.Bitmap returned by
-	// [Reader.Postings], kept past [Reader.Close]) faults immediately and
-	// deterministically instead of silently reading whatever the OS later maps at the
-	// same address. Used only when built with the searchlight_debug tag; it leaks the
-	// address range (and, on close, the file descriptor stays open too) for the rest
-	// of the process, which is fine for tests and never used in a release build.
+	// Poison releases the file and its mapping but keeps the mapping's address range
+	// reserved as no-access (unix: an anonymous PROT_NONE mmap with MAP_FIXED over
+	// it; Windows: UnmapViewOfFile, then a PAGE_NOACCESS VirtualAlloc reservation of
+	// the same range), so a stale reference to Data (for example a zero-copy
+	// roaring.Bitmap returned by [Reader.Postings], kept past [Reader.Close]) faults
+	// immediately and deterministically instead of silently reading whatever the OS
+	// later maps at the same address. The file itself is let go, so it can be removed
+	// or renamed over as after a real Close. Used only when built with the
+	// searchlight_debug tag; it leaks the address range for the rest of the process,
+	// which is fine for tests and never used in a release build.
 	Poison() error
 }
 

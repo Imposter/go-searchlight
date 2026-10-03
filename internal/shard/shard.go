@@ -312,8 +312,9 @@ type Shard struct {
 	// mu guards the write buffer and what has been applied to it.
 	mu        sync.Mutex
 	buf       *buffer
-	applied   int64 // every change with seq <= applied is in a segment or buf
-	maxChange int64 // the newest change applied
+	bufBytes  atomic.Int64 // buf.bytes, for Admit without the lock
+	applied   int64        // every change with seq <= applied is in a segment or buf
+	maxChange int64        // the newest change applied
 	indexUID  string
 	mapState  *mappingState // the mapping as of applied
 	closing   bool
@@ -666,10 +667,44 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		s.mapState = mp
 		s.mapping.Store(mp.m)
 	}
+	s.bufBytes.Store(s.buf.bytes)
 	if s.opts.FlushBytes > 0 && s.buf.bytes >= s.opts.FlushBytes {
 		wake(s.refreshWake)
 	}
 	return s.buf.size(), nil
+}
+
+// CheckDocSize refuses a document a segment cannot store: its id and body together
+// over segment.MaxStoredBytes, as [ErrDocTooLarge]. Apply checks every upsert with it;
+// a writer checks with it before committing, so the two never disagree.
+func CheckDocSize(id string, body []byte) error {
+	if size := len(id) + len(body); size > segment.MaxStoredBytes {
+		return fmt.Errorf("%w: %d bytes of id and body, over %d", ErrDocTooLarge, size, segment.MaxStoredBytes)
+	}
+	return nil
+}
+
+// Admit reports, without taking a lock, whether Apply would take more changes now:
+// [ErrBackpressure] (and a refresh is woken) while the write buffer is over its
+// limit, the failure or [ErrClosed] when the shard cannot take writes, else nil. A
+// writer calls it before committing changes for this copy, so clients back off before
+// the changelog outruns the copy.
+func (s *Shard) Admit() error {
+	if err := s.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-s.closed:
+		return ErrClosed
+	default:
+	}
+	if limit := s.opts.FlushBytes * int64(s.opts.MaxBufferFactor); s.opts.FlushBytes > 0 {
+		if n := s.bufBytes.Load(); n >= limit {
+			wake(s.refreshWake)
+			return fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, n, limit)
+		}
+	}
+	return nil
 }
 
 // check refuses a change no refresh could store, before it is buffered.
@@ -685,8 +720,8 @@ func (s *Shard) check(c *Change) error {
 		if err := schema.ValidateID(c.Doc.ID); err != nil {
 			return fmt.Errorf("%w: %w", ErrInvalidChange, err)
 		}
-		if size := len(c.Doc.ID) + len(c.Doc.Body); size > segment.MaxStoredBytes {
-			return fmt.Errorf("%w: %d bytes of id and body, over %d", ErrDocTooLarge, size, segment.MaxStoredBytes)
+		if err := CheckDocSize(c.Doc.ID, c.Doc.Body); err != nil {
+			return err
 		}
 	case Delete:
 		if err := schema.ValidateID(c.DocID); err != nil {

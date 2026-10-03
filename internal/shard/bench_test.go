@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 var (
@@ -183,4 +184,66 @@ func BenchmarkLookup(b *testing.B) {
 			b.Fatal("not found")
 		}
 	}
+}
+
+// BenchmarkRefreshKinds is refresh latency, and fsyncs per refresh, for three shapes
+// of buffer over a shard holding one 10k-document segment: 1,000 new documents, one
+// delete of an existing document, and nothing but an Advance (a seq that belongs to
+// other shards). Run it with -benchtime of at most 80x (it uses fresh ids each time).
+func BenchmarkRefreshKinds(b *testing.B) {
+	docs := corpus(b, 100_000)
+	setup := func(b *testing.B) (*Shard, int64) {
+		s := benchOpen(b, b.TempDir())
+		b.Cleanup(s.shutdown)
+		if err := s.Apply(context.Background(), changesFor(docs[:10_000], 1)); err != nil {
+			b.Fatal(err)
+		}
+		if err := s.Refresh(context.Background()); err != nil {
+			b.Fatal(err)
+		}
+		return s, 10_001
+	}
+	run := func(b *testing.B, prepare func(s *Shard, i int, seq int64) int64) {
+		s, seq := setup(b)
+		ctx := context.Background()
+		before := segment.SyncCounts()
+		b.ResetTimer()
+		for i := range b.N {
+			b.StopTimer()
+			seq = prepare(s, i, seq)
+			b.StartTimer()
+			if err := s.Refresh(ctx); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StopTimer()
+		after := segment.SyncCounts()
+		b.ReportMetric(float64(after.Files-before.Files)/float64(b.N), "filesyncs/op")
+		b.ReportMetric(float64(after.Dirs-before.Dirs)/float64(b.N), "dirsyncs/op")
+	}
+	b.Run("new-1k", func(b *testing.B) {
+		run(b, func(s *Shard, i int, seq int64) int64 {
+			part := docs[10_000+i*1000 : 10_000+(i+1)*1000]
+			if err := s.Apply(context.Background(), changesFor(part, seq)); err != nil {
+				b.Fatal(err)
+			}
+			return seq + int64(len(part))
+		})
+	})
+	b.Run("delete-1", func(b *testing.B) {
+		run(b, func(s *Shard, i int, seq int64) int64 {
+			if err := s.Apply(context.Background(), []Change{{Seq: seq, Kind: Delete, DocID: docs[i].ID}}); err != nil {
+				b.Fatal(err)
+			}
+			return seq + 1
+		})
+	})
+	b.Run("advance-only", func(b *testing.B) {
+		run(b, func(s *Shard, _ int, seq int64) int64 {
+			if err := s.Advance(seq); err != nil {
+				b.Fatal(err)
+			}
+			return seq + 1
+		})
+	})
 }

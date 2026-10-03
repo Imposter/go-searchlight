@@ -328,11 +328,21 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 		p.confirmed.Add(card(a.sure))
 		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size)
 		rest := roaring.AndNot(a.maybe, s.lazy.checked)
-		buf := make([]uint32, countChunk)
+		// Count in batches sized from the match rate so far to what is still needed
+		// (twice over), at least countChunk: few round trips, little overshoot.
+		var tried, matched int64
 		for !rest.IsEmpty() && p.confirmed.Load() < p.need && !s.checkCtx() {
+			size := int64(countChunk)
+			if tried > 0 {
+				missing := p.need - p.confirmed.Load()
+				size = max(size, 2*missing*tried/max(matched, 1))
+			}
+			buf := make([]uint32, min(size, card(rest)))
 			n := rest.ManyIterator().NextMany(buf)
 			chunk := roaring.BitmapOf(buf[:n]...)
 			got := card(s.resolve(p.root, chunk))
+			tried += int64(n)
+			matched += got
 			s.lazy.found += got
 			p.confirmed.Add(got)
 			rest.AndNot(chunk)

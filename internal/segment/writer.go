@@ -427,7 +427,7 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	if w.err != nil {
 		return Meta{}, w.err
 	}
-	if err := f.Sync(); err != nil {
+	if err := SyncFile(f); err != nil {
 		return Meta{}, err
 	}
 	if err := f.Close(); err != nil {
@@ -440,7 +440,7 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	// The rename is only durable once the directory entry itself is fsynced: without
 	// this, a crash can leave the directory pointing at the old file (or nothing),
 	// even though the new file's own bytes were already fsynced above.
-	if err := fsyncDir(filepath.Dir(path)); err != nil {
+	if err := SyncDir(filepath.Dir(path)); err != nil {
 		return Meta{}, err
 	}
 	return Meta{Path: path, NumDocs: numDocs}, nil

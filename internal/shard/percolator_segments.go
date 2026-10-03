@@ -340,7 +340,7 @@ func writeFileSync(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := f.Sync(); err != nil {
+	if err := segment.SyncFile(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

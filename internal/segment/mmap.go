@@ -98,4 +98,27 @@ func (m *mapping) release() error {
 // SyncDir fsyncs dir itself, making a prior rename, create or unlink of an entry inside
 // it durable (a documented no-op on Windows, where the volume's journal does this; see
 // mmap_windows.go). Shards use it after swapping their manifest.
-func SyncDir(dir string) error { return fsyncDir(dir) }
+func SyncDir(dir string) error {
+	dirSyncs.Add(1)
+	return fsyncDir(dir)
+}
+
+// SyncFile fsyncs f's contents, counting it in [SyncCounts].
+func SyncFile(f *os.File) error {
+	fileSyncs.Add(1)
+	return f.Sync()
+}
+
+// fileSyncs and dirSyncs count every fsync this package (or a caller through SyncFile
+// and SyncDir) asked for, for measuring what a refresh or merge costs in syncs.
+var fileSyncs, dirSyncs atomic.Int64
+
+// SyncStats are the fsyncs asked for so far in this process.
+type SyncStats struct {
+	// Files are file fsyncs; Dirs are directory fsyncs (requested: on Windows they are
+	// no-ops, see SyncDir).
+	Files, Dirs int64
+}
+
+// SyncCounts returns the fsyncs asked for so far, through this package.
+func SyncCounts() SyncStats { return SyncStats{Files: fileSyncs.Load(), Dirs: dirSyncs.Load()} }

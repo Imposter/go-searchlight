@@ -148,7 +148,7 @@ func writeManifest(dir string, m *manifest, hook func(point string) error) (rena
 		_ = f.Close()
 		return false, err
 	}
-	if err := f.Sync(); err != nil {
+	if err := segment.SyncFile(f); err != nil {
 		_ = f.Close()
 		return false, err
 	}

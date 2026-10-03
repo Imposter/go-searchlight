@@ -81,6 +81,14 @@ type Config struct {
 	// brings other nodes' writes to a copy on MySQL and SQLite, and the
 	// safety net everywhere.
 	ChangelogPollInterval time.Duration
+	// RemapDebounce is how long a copy a mapping change must rebuild waits for
+	// more mapping changes, so a burst costs one rebuild; 0 rebuilds at once.
+	RemapDebounce time.Duration
+	// HaltRetryBase and HaltRetryCap bound the backoff of a halted copy's retries;
+	// RebuildRetryCap bounds it for a rebuild that keeps failing.
+	HaltRetryBase   time.Duration
+	HaltRetryCap    time.Duration
+	RebuildRetryCap time.Duration
 	// MergeBudget caps the bytes per second background merges write on this
 	// node; 0 means unlimited. It is the I/O half of the merge budget.
 	MergeBudget int64
@@ -123,7 +131,10 @@ type Config struct {
 	MaxInflightReadBytes  int64
 	// InflightAmplification is the heap a request takes per byte of its body, at
 	// its peak: measured at about 4.5 for a bulk and 8 for a bulk with percolate
-	// or a percolation (BenchmarkBulkPeakHeap), so the default is 8.
+	// or a percolation (BenchmarkBulkPeakHeap); the default, 10, leaves headroom.
+	// A node's heap is then about 1.5 times the two budgets, plus each shard
+	// copy's write buffers (flush_bytes times max_buffer_factor: 64 MiB times 4 by
+	// default).
 	InflightAmplification int
 	// DropTimeout bounds dropping an index from the store, which deletes its
 	// documents, queries and changes, apart from the request's own deadline.
@@ -160,6 +171,10 @@ func Default() Config {
 		SeqPersistInterval:    30 * time.Second,
 		MaxLag:                2 * time.Second,
 		ChangelogPollInterval: 500 * time.Millisecond,
+		RemapDebounce:         2 * time.Second,
+		HaltRetryBase:         30 * time.Second,
+		HaltRetryCap:          10 * time.Minute,
+		RebuildRetryCap:       2 * time.Minute,
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
@@ -275,6 +290,33 @@ var settings = []setting{
 		name: "changelog_poll_interval", usage: "how often a shard copy polls the changelog when nothing wakes it sooner",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.ChangelogPollInterval, v) },
 		format: func(c *Config) string { return c.ChangelogPollInterval.String() },
+	},
+	{
+		name: "remap_debounce", usage: "how long a copy a mapping change must rebuild waits for more mapping changes (0 = none)",
+		parse: func(c *Config, v string) error {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 {
+				return fmt.Errorf("want a duration such as 2s or 0s, got %q", v)
+			}
+			c.RemapDebounce = d
+			return nil
+		},
+		format: func(c *Config) string { return c.RemapDebounce.String() },
+	},
+	{
+		name: "halt_retry_base", usage: "first backoff before a halted shard copy is retried",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.HaltRetryBase, v) },
+		format: func(c *Config) string { return c.HaltRetryBase.String() },
+	},
+	{
+		name: "halt_retry_cap", usage: "longest backoff between a halted shard copy's retries",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.HaltRetryCap, v) },
+		format: func(c *Config) string { return c.HaltRetryCap.String() },
+	},
+	{
+		name: "rebuild_retry_cap", usage: "longest backoff between retries of a shard copy rebuild that keeps failing",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RebuildRetryCap, v) },
+		format: func(c *Config) string { return c.RebuildRetryCap.String() },
 	},
 	{
 		name: "merge_budget", usage: "bytes per second merges may write, e.g. 64MiB (0 = unlimited)",

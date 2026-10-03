@@ -116,23 +116,76 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 		}
 	}
 	if t.needRebuild != "" {
+		if g := t.gate; g != nil {
+			// A load stopped at a row the copy cannot apply: a rebuild would stop
+			// there again until the row is superseded.
+			superseded, err := t.superseded(ctx, g)
+			if err != nil {
+				return err
+			}
+			if !superseded {
+				return g
+			}
+		}
+		if t.needRebuild == reasonRemap {
+			if err := t.debounceRemap(ctx); err != nil {
+				return err
+			}
+		}
 		if !t.halted() {
 			t.setState(StateRecovering)
 		}
 		if err := t.rebuild(ctx, t.needRebuild); err != nil {
 			var rb *rebuildError
-			if errors.As(err, &rb) {
+			var halt *HaltError
+			switch {
+			case errors.As(err, &rb):
 				return err // handle records the new reason
+			case errors.As(err, &halt):
+				t.gate = halt
 			}
 			// Whatever the rebuild left behind is wiped by the next attempt.
 			t.needRebuild = reasonInterrupted
 			return err
 		}
-		t.needRebuild = ""
+		t.needRebuild, t.gate, t.remapSince = "", nil, time.Time{}
 		t.rebuildWait = 0
 		t.clearHalt()
 	}
 	return nil
+}
+
+// debounceRemap holds a rebuild a mapping change asked for until mapping changes stop
+// arriving for RemapDebounce (at most five such windows), so that a burst of them
+// costs one rebuild, at the latest seq. Nothing is applied meanwhile: the copy never
+// analyzes a document under a mapping it knows to be stale.
+func (t *Tailer) debounceRemap(ctx context.Context) error {
+	if t.opts.RemapDebounce < 0 {
+		return nil
+	}
+	if t.remapSince.IsZero() {
+		if err := t.cat.load(ctx, t.id.Shard); err != nil {
+			return err
+		}
+		t.remapSince, t.remapVersion = time.Now(), t.cat.meta.MappingVersion
+		t.log.InfoContext(ctx, "a mapping change re-analyzes the copy; waiting for more before rebuilding it",
+			slog.Duration("debounce", t.opts.RemapDebounce))
+	}
+	limit := t.remapSince.Add(5 * t.opts.RemapDebounce)
+	for {
+		sleepCtx(ctx, min(t.opts.RemapDebounce, max(0, time.Until(limit))))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := t.cat.load(ctx, t.id.Shard); err != nil {
+			return err
+		}
+		v := t.cat.meta.MappingVersion
+		if v <= t.remapVersion || !time.Now().Before(limit) {
+			return nil
+		}
+		t.remapVersion = v // another mapping change: wait for the burst to end
+	}
 }
 
 // refreshCatalog re-reads the catalogue entry: a dropped index (or shard) stops the

@@ -262,7 +262,7 @@ func testOptions() Options {
 	return Options{
 		PollInterval: 10 * time.Millisecond, WatchedPollInterval: 200 * time.Millisecond,
 		ReportInterval: 20 * time.Millisecond, CatalogInterval: time.Second,
-		RetryBase: 5 * time.Millisecond, RetryCap: 50 * time.Millisecond, RebuildRetryCap: 100 * time.Millisecond,
+		RetryBase: 5 * time.Millisecond, RetryCap: 50 * time.Millisecond, RebuildRetryCap: 100 * time.Millisecond, RemapDebounce: 20 * time.Millisecond,
 		HaltRetryBase: 20 * time.Millisecond, HaltRetryCap: 100 * time.Millisecond,
 		Logger: quietLogger,
 	}

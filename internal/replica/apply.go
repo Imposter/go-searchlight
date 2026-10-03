@@ -41,6 +41,42 @@ type HaltError struct {
 	ID     string // the document or saved query id
 	Reason string // one of the Reason constants
 	Err    error
+
+	// class is what ID names (a document, a saved query or the mapping), so that
+	// only a later change of the same thing counts as superseding it; "" matches
+	// any.
+	class string
+}
+
+// Classes of the things a change targets.
+const (
+	classDocument = "document"
+	classQuery    = "query"
+	classMapping  = "mapping"
+)
+
+func classOfShardKind(k shard.ChangeKind) string {
+	switch k {
+	case shard.Upsert, shard.Delete:
+		return classDocument
+	case shard.QueryUpsert, shard.QueryDelete:
+		return classQuery
+	case shard.Remap:
+		return classMapping
+	}
+	return ""
+}
+
+func classOfStoreKind(k store.Kind) string {
+	switch k {
+	case store.KindUpsert, store.KindDelete:
+		return classDocument
+	case store.KindQueryUpsert, store.KindQueryDelete:
+		return classQuery
+	case store.KindMapping:
+		return classMapping
+	}
+	return ""
 }
 
 func (e *HaltError) Error() string {
@@ -369,7 +405,7 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 }
 
 func (t *Tailer) haltAt(it *item, reason string, err error) *HaltError {
-	return &HaltError{Shard: t.id, Seq: it.seq, ID: it.id, Reason: reason, Err: err}
+	return &HaltError{Shard: t.id, Seq: it.seq, ID: it.id, Reason: reason, Err: err, class: classOfShardKind(it.kind)}
 }
 
 // applyChanges applies one page of the changelog and moves the applied seq past what
@@ -584,7 +620,7 @@ func (t *Tailer) applyBatch(ctx context.Context, sh *shard.Shard, changes []shar
 			reason = ReasonOrder
 		}
 		bad := &changes[ce.Pos]
-		return n, &HaltError{Shard: t.id, Seq: bad.Seq, ID: ce.ID, Reason: reason, Err: err}
+		return n, &HaltError{Shard: t.id, Seq: bad.Seq, ID: ce.ID, Reason: reason, Err: err, class: classOfShardKind(bad.Kind)}
 	}
 }
 
@@ -610,13 +646,17 @@ func (t *Tailer) drain(ctx context.Context, sh *shard.Shard, wait *time.Duration
 
 // onHalt records a halt: counted, logged loudly, the copy marked recovering in the
 // registry. Run then backs off (HaltRetryBase, doubling to HaltRetryCap) and tails
-// again; a halt at the same change as the last one asks for a rebuild instead. It
-// returns an error only when Run must stop (the lease is lost).
+// again. Halted at the same change again, the copy is rebuilt (a snapshot holds only
+// current rows) once the changelog shows a later change of the same document or
+// query, superseding the bad one; until then it keeps what it has and only tails
+// again, rather than wiping and rescanning a copy that would stop at the same row.
+// It returns an error only when Run must stop (the lease is lost).
 func (t *Tailer) onHalt(ctx context.Context, h *HaltError) error {
 	if h.Shard == (ShardID{}) {
 		h.Shard = t.id
 	}
 	prev := t.halt.Swap(h)
+	repeat := prev != nil && prev.Seq == h.Seq && prev.ID == h.ID
 	t.setState(StateHalted)
 	t.inst.halts.Add(ctx, 1, t.inst.with(attribute.String("reason", h.Reason)))
 	_, span := t.tr.Start(ctx, "replica.halt", trace.WithAttributes(
@@ -625,17 +665,28 @@ func (t *Tailer) onHalt(ctx context.Context, h *HaltError) error {
 	span.RecordError(h)
 	span.SetStatus(codes.Error, "shard copy halted")
 	span.End()
-	t.log.ErrorContext(ctx, "shard copy halted: the store accepted a change this copy cannot apply",
-		slog.Int64("seq", h.Seq), slog.String("id", h.ID), slog.String("reason", h.Reason),
-		slog.Int64("applied", t.Applied()), slog.Any("error", h.Err))
+	if repeat {
+		t.log.WarnContext(ctx, "shard copy still halted", slog.Int64("seq", h.Seq), slog.String("id", h.ID),
+			slog.String("reason", h.Reason))
+	} else {
+		t.log.ErrorContext(ctx, "shard copy halted: the store accepted a change this copy cannot apply",
+			slog.Int64("seq", h.Seq), slog.String("id", h.ID), slog.String("reason", h.Reason),
+			slog.Int64("applied", t.Applied()), slog.Any("error", h.Err))
+	}
 	if err := t.setCopyState(ctx, store.CopyRecovering); err != nil {
 		if errors.Is(err, store.ErrLeaseLost) {
 			return err
 		}
 		t.log.WarnContext(ctx, "could not mark the halted copy recovering; retrying with the halt", slog.Any("error", err))
 	}
-	if prev != nil && prev.Seq == h.Seq && t.needRebuild == "" {
-		t.needRebuild = reasonHalted
+	if repeat && t.gate == nil && t.needRebuild == "" {
+		superseded, err := t.superseded(ctx, h)
+		switch {
+		case err != nil:
+			t.log.DebugContext(ctx, "could not look for a change superseding the halted one", slog.Any("error", err))
+		case superseded:
+			t.needRebuild = reasonHalted
+		}
 	}
 	t.haltWait = nextBackoff(t.haltWait, t.opts.HaltRetryBase, t.opts.HaltRetryCap)
 	t.log.InfoContext(ctx, "halted copy retries after a backoff", slog.Duration("backoff", t.haltWait),
@@ -649,5 +700,37 @@ func (t *Tailer) clearHalt() {
 	if h := t.halt.Swap(nil); h != nil {
 		t.haltWait = 0
 		t.log.Info("halted copy moves again", slog.Int64("halted_at", h.Seq), slog.Int64("seq", t.Applied()))
+	}
+}
+
+// superseded reports whether the changelog holds a change of h's document or query
+// (or mapping) after h's seq: the bad row is then no longer current, and a rebuild
+// from a snapshot gets past it. The search resumes where the last one for h stopped.
+// A changelog pruned past h needs a rebuild anyway: that counts as superseded.
+func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
+	if t.scanFor == nil || t.scanFor.Seq != h.Seq || t.scanFor.ID != h.ID {
+		t.scanFor, t.scanFrom = h, h.Seq
+	}
+	for {
+		page, err := t.st.ChangesAfter(ctx, t.id, t.scanFrom, t.opts.BatchSize)
+		if errors.Is(err, store.ErrPruned) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		for i := range page {
+			c := &page[i]
+			if c.ID == h.ID && (h.class == "" || classOfStoreKind(c.Kind) == h.class) {
+				return true, nil
+			}
+		}
+		if len(page) == 0 {
+			return false, nil
+		}
+		t.scanFrom = page[len(page)-1].Seq
+		if len(page) < t.opts.BatchSize {
+			return false, nil
+		}
 	}
 }

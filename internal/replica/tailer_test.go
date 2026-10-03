@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,10 +475,10 @@ func TestIndexDroppedStopsTheTailer(t *testing.T) {
 
 // TestApplyErrorHalts: a change the store accepted but the copy cannot apply halts it
 // exactly before that change, marks it recovering in the registry, and is counted;
-// Run keeps going, retrying with backoff and, halted again at the same change,
-// rebuilding: while the bad change is current the copy stays halted before it (never
-// skipping it), and once it is superseded the rebuild gets past it and the copy
-// serves again.
+// Run keeps going, retrying with backoff. While the bad change is current the copy
+// stays halted before it (never skipping it) and is never wiped, and a new copy
+// whose snapshot holds the bad row halts in its load and is not reloaded; once the
+// change is superseded, both rebuild past it and serve again.
 func TestApplyErrorHalts(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -512,6 +513,8 @@ func TestApplyErrorHalts(t *testing.T) {
 				opts.Copy = &cp
 				opts.HaltRetryBase, opts.HaltRetryCap = time.Second, time.Second // room to inspect the halted copy
 				opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+				var swaps atomic.Int32
+				opts.OnShard = func(*shard.Shard) { swaps.Add(1) }
 				c := newCopy(t, d.open(t), id, opts)
 				c.start()
 				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
@@ -539,33 +542,58 @@ func TestApplyErrorHalts(t *testing.T) {
 					t.Fatalf("halted copy holds %v %v: want ok1 and ok2 only", v.docs, v.queries)
 				}
 
-				// While the bad change is current, retries (tailing, then a rebuild
-				// from the snapshot that still holds it) stop before it every time.
+				// While the bad change is current, the copy tails again and again
+				// but is never wiped: a rebuild would stop at the same row.
 				deadline := time.Now().Add(30 * time.Second)
-				for counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonHalted) == 0 ||
-					counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) < 3 {
+				for counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) < 3 {
 					if time.Now().After(deadline) {
-						t.Fatalf("no rebuild after repeated halts: %d halts", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""))
+						t.Fatalf("%d halts", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""))
 					}
 					time.Sleep(20 * time.Millisecond)
 				}
-				if h := c.tailer.Halt(); h == nil || h.ID != "bad" {
-					t.Fatalf("halt after the rebuild %+v", h)
+				if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "", ""); n != 1 || swaps.Load() != 0 {
+					t.Fatalf("%d recoveries (want the first one only) and %d swaps while the bad row is current", n, swaps.Load())
 				}
-				if sh := c.shard(); !sh.Mapping().Fields["title"].Valid() {
-					t.Fatal("the rebuilt copy has no mapping")
+				if h := c.tailer.Halt(); h == nil || h.Seq != badSeq || c.tailer.Applied() != badSeq-1 {
+					t.Fatalf("halt %+v, applied %d", h, c.tailer.Applied())
 				}
 				waitCopyState(t, st, id, store.CopyRecovering)
+
+				// A new copy meets the bad row in its snapshot load: it halts there,
+				// half-loaded, and is not reloaded while the row is current.
+				optsB, readerB := meteredOptions()
+				optsB.HaltRetryBase, optsB.HaltRetryCap = 20*time.Millisecond, 50*time.Millisecond
+				b := newCopy(t, d.open(t), id, optsB)
+				b.start()
+				hb := waitHalt(t, b.tailer)
+				if hb.ID != "bad" || hb.Reason != tc.reason {
+					t.Fatalf("load halt %+v", hb)
+				}
+				deadline = time.Now().Add(30 * time.Second)
+				for counterSum(t, readerB, telemetry.MetricReplicaHalts, "", "") < 4 {
+					if time.Now().After(deadline) {
+						t.Fatal("the halted load was not retried")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if n := counterSum(t, readerB, telemetry.MetricReplicaRecoveries, "", ""); n != 1 {
+					t.Fatalf("%d snapshot loads while the bad row is current; want 1", n)
+				}
 
 				// Superseded, the bad change is not in the snapshot: the copy gets
 				// past it and serves again.
 				head := mustApply(t, st, tc.fix)
-				sh := c.waitApplied(head)
-				if c.tailer.Halt() != nil {
-					t.Fatalf("still halted: %+v", c.tailer.Halt())
+				for _, cr := range []*copyRunner{c, b} {
+					sh := cr.waitApplied(head)
+					if cr.tailer.Halt() != nil {
+						t.Fatalf("still halted: %+v", cr.tailer.Halt())
+					}
+					if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+						t.Fatalf("recovered copy differs:\n%s", dd)
+					}
 				}
-				if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
-					t.Fatalf("recovered copy differs:\n%s", dd)
+				if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonHalted); n != 1 {
+					t.Fatalf("%d rebuilds once the bad row was superseded; want 1", n)
 				}
 				waitCopyState(t, st, id, store.CopyServing)
 				if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaHalted); v != 0 {

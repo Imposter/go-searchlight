@@ -113,14 +113,35 @@ func (s *segExec) verifyDoc(lp *leafPlan, d uint32) bool {
 		}
 		return ok
 	}
-	one := roaring.BitmapOf(d)
-	out := roaring.New()
-	if s.r.Keywords(lp.field).Exists() {
-		s.verifyTexts(lp, one, out)
-	} else {
-		s.verifyValues(lp, one, out)
+	kc := s.r.Keywords(lp.field)
+	if !kc.Exists() {
+		out := roaring.New()
+		s.verifyValues(lp, roaring.BitmapOf(d), out)
+		return out.Contains(d)
 	}
-	return out.Contains(d)
+	o, ok := kc.Ord(d)
+	if !ok {
+		doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: s.r.Present(lp.field).Contains(d)}}}
+		return lp.match.Match(&doc)
+	}
+	key := ordKey{lp, o}
+	if m, ok := s.ordMatches[key]; ok {
+		return m
+	}
+	m := false
+	kc.EachTerm(o, func(_ uint32, term []byte) bool {
+		text := string(term)
+		m = lp.match.Match(&schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: true, Text: &text}}})
+		return false
+	})
+	s.ordMatches[key] = m
+	return m
+}
+
+// ordKey memoizes a text leaf's one-at-a-time checks by value ordinal.
+type ordKey struct {
+	lp  *leafPlan
+	ord uint32
 }
 
 // verifyChunk is how many candidates one parallel task checks.

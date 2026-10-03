@@ -289,6 +289,16 @@ func ptr[T any](v T) *T { return &v }
 // Lazy verification: candidates are verified only as the top hits and the total
 // need them, and the total stays exact up to TrackTotal, a lower bound past it.
 func TestLazyVerificationTotals(t *testing.T) {
+	for _, batchAfter := range []uint64{2048, 2} {
+		t.Run(fmt.Sprintf("batch after %d", batchAfter), func(t *testing.T) {
+			lazyBatchAfter = batchAfter
+			defer func() { lazyBatchAfter = 2048 }()
+			lazyTotals(t, batchAfter)
+		})
+	}
+}
+
+func lazyTotals(t *testing.T, tag uint64) {
 	c := newCluster(t, 1)
 	for i := range 60 {
 		title := "abc bcd filler" // every gram of "abcd", never "abcd": a candidate only
@@ -314,7 +324,7 @@ func TestLazyVerificationTotals(t *testing.T) {
 	} {
 		// A condition of its own each time, so the filter cache never serves it and
 		// every request verifies lazily.
-		q := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","unique-%d"]}`, tc.track))
+		q := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","unique-%d-%d"]}`, tc.track, tag))
 		resp, err := c.search(&Request{Query: q, Size: 3, Sort: []SortField{{Field: "price"}}, TrackTotal: tc.track})
 		if err != nil {
 			t.Fatal(err)
@@ -330,12 +340,12 @@ func TestLazyVerificationTotals(t *testing.T) {
 	g := c.shards[0].Acquire()
 	defer g.Release()
 	// A condition no earlier request used, so the filter cache stays out of it.
-	fresh := mustParse(t, `{"field":"title","op":"contains_any","value":["abcd","lazy-test-unique"]}`)
+	fresh := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","lazy-test-unique-%d"]}`, tag))
 	res, err := ExecuteShard(context.Background(), g, &Request{Query: fresh, Size: 1, Sort: []SortField{{Field: "price", Desc: true}}, TrackTotal: TrackTotalNone})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Scanned >= 60 || res.TotalRelation != RelationGte || len(res.Hits) != 1 || res.Hits[0].ID != "d19" {
+	if tag > 2 && (res.Scanned >= 60 || res.TotalRelation != RelationGte) || len(res.Hits) != 1 || res.Hits[0].ID != "d19" || res.Total > 20 {
 		t.Errorf("track none: scanned %d, %d %s, hits %v", res.Scanned, res.Total, res.TotalRelation, hitIDs(res.Hits))
 	}
 	if r, ps := ParseRequest([]byte(`{"track_total": false}`)); len(ps) > 0 || r.TrackTotal != TrackTotalNone {

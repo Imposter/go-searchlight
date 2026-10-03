@@ -161,8 +161,9 @@ type segExec struct {
 	estimates map[*leafPlan]estimate
 	sources   map[string]*fieldSrc
 
-	approxes map[*pnode]approx
-	orders   map[*pnode][]*pnode
+	approxes   map[*pnode]approx
+	orders     map[*pnode][]*pnode
+	ordMatches map[ordKey]bool
 	// lazy is set when the segment verifies candidates only as needed.
 	lazy *lazyState
 
@@ -176,7 +177,17 @@ type lazyState struct {
 	maybe   *roaring.Bitmap
 	checked *roaring.Bitmap
 	found   int64
+	// batched holds the matches among every maybe document once one-at-a-time checks
+	// stopped paying (see lazyBatchAfter): from then on accept is a lookup.
+	batched *roaring.Bitmap
 }
+
+// lazyBatchAfter is how many one-at-a-time checks a segment makes before it verifies
+// all its remaining candidates in one batch: when most candidates fail (a needle
+// whose grams are common but which is itself rare) the top-k would otherwise check
+// nearly all of them singly, which batching does several times faster. A variable so
+// tests can make it small.
+var lazyBatchAfter uint64 = 2048
 
 // accept reports whether document d, a candidate about to enter the top-k, matches:
 // at once for a sure document, by a check of the query for a maybe one.
@@ -184,6 +195,17 @@ func (s *segExec) accept(d uint32) bool {
 	l := s.lazy
 	if l == nil || !l.maybe.Contains(d) {
 		return true
+	}
+	if l.batched == nil && l.checked.GetCardinality() >= lazyBatchAfter {
+		rest := roaring.AndNot(l.maybe, l.checked)
+		l.batched = s.resolve(s.p.root, rest)
+		l.checked.Or(rest)
+		got := card(l.batched)
+		l.found += got
+		s.p.confirmed.Add(got)
+	}
+	if l.batched != nil {
+		return l.batched.Contains(d)
 	}
 	l.checked.Add(d)
 	if !s.check(s.p.root, d) {
@@ -200,12 +222,13 @@ func newSegExec(ctx context.Context, p *prepared, g *shard.Generation, i int) *s
 	all.AddRange(0, uint64(sv.NumDocs))
 	return &segExec{
 		ctx: ctx, p: p, sv: sv, seg: i, r: sv.Reader, n: sv.NumDocs, allDocs: all,
-		cache:     g.FilterCache(),
-		cacheMemo: map[*leafPlan]*roaring.Bitmap{},
-		approxes:  map[*pnode]approx{},
-		orders:    map[*pnode][]*pnode{},
-		estimates: map[*leafPlan]estimate{},
-		sources:   map[string]*fieldSrc{},
+		cache:      g.FilterCache(),
+		cacheMemo:  map[*leafPlan]*roaring.Bitmap{},
+		approxes:   map[*pnode]approx{},
+		ordMatches: map[ordKey]bool{},
+		orders:     map[*pnode][]*pnode{},
+		estimates:  map[*leafPlan]estimate{},
+		sources:    map[string]*fieldSrc{},
 	}
 }
 

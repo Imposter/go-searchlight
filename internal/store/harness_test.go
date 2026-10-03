@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -273,7 +274,7 @@ func counterValue(t *testing.T, st Store) int64 {
 	t.Helper()
 	var v int64
 	s := engine(st)
-	if err := s.r.QueryRowContext(context.Background(), s.q.readCounter).Scan(&v); err != nil {
+	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounter).Scan(&v); err != nil {
 		t.Fatal(err)
 	}
 	return v
@@ -283,8 +284,28 @@ func countRows(t *testing.T, st Store, query string, args ...any) int {
 	t.Helper()
 	s := engine(st)
 	var n int
-	if err := s.r.QueryRowContext(context.Background(), s.bind(query), args...).Scan(&n); err != nil {
+	if err := s.r.QueryRowContext(context.Background(), rebind(s, query), args...).Scan(&n); err != nil {
 		t.Fatalf("%s: %v", query, err)
 	}
 	return n
+}
+
+// rebind numbers the ? placeholders of a test's statement for Postgres, so a
+// test can write one statement for every dialect. The statements never
+// contain a literal question mark.
+func rebind(s *sqlStore, q string) string {
+	if s.d.Name != "postgres" {
+		return q
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range q {
+		if r == '?' {
+			n++
+			b.WriteString("$" + strconv.Itoa(n))
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

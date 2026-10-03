@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-
-	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
 func mustParse(t *testing.T, raw string) *url.URL {
@@ -96,7 +94,7 @@ func TestConfigErrors(t *testing.T) {
 }
 
 func TestClaimAssignmentOrder(t *testing.T) {
-	q, args := Dialect().Claim(dialect.ClaimArgs{Index: "i", Shard: 1, Node: "n", TTLms: 1000})
+	q := Dialect().Registry.Claim.Write
 	// node_id must be assigned after state and applied_seq, and lease_until
 	// last, because MySQL evaluates the assignments in order.
 	iState, iApplied := strings.Index(q, "state = IF"), strings.Index(q, "applied_seq = IF")
@@ -105,7 +103,8 @@ func TestClaimAssignmentOrder(t *testing.T) {
 	if iState < 0 || iState > iApplied || iApplied > iEpoch || iEpoch > iNode || iNode > iLease {
 		t.Fatalf("assignment order wrong:\n%s", q)
 	}
-	if strings.Count(q, "?") != len(args) {
-		t.Fatalf("%d placeholders for %d args", strings.Count(q, "?"), len(args))
+	// The claim takes (index, shard, slot, node_id, ttl_ms, epoch).
+	if n := strings.Count(q, "?"); n != 6 {
+		t.Fatalf("%d placeholders for 6 arguments", n)
 	}
 }

@@ -3,12 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
-
-	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
 // registry implements RegistryStore. A shard copy is a slot row of
@@ -36,10 +37,7 @@ func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 	if n.Capacity < 0 {
 		return invalidf("capacity %d", n.Capacity)
 	}
-	q := "INSERT INTO sl_nodes (node_id, address, version, capacity, heartbeat_at, started_at) VALUES (?, ?, ?, ?, " +
-		s.d.Now + ", " + s.d.Now + ")" +
-		s.d.Upsert([]string{"node_id"}, []string{"address", "version", "capacity", "heartbeat_at"})
-	_, err = s.w.ExecContext(ctx, s.bind(q), n.ID, n.Address, n.Version, n.Capacity)
+	_, err = s.w.ExecContext(ctx, s.d.Registry.Heartbeat, n.ID, n.Address, n.Version, n.Capacity)
 	return err
 }
 
@@ -50,7 +48,7 @@ func (g *registry) RemoveNode(ctx context.Context, nodeID string) (err error) {
 	if err := validNode(nodeID); err != nil {
 		return err
 	}
-	_, err = s.w.ExecContext(ctx, s.bind("DELETE FROM sl_nodes WHERE node_id = ?"), nodeID)
+	_, err = s.w.ExecContext(ctx, s.d.Registry.RemoveNode, nodeID)
 	return err
 }
 
@@ -58,8 +56,7 @@ func (g *registry) Nodes(ctx context.Context) (out []Node, err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "nodes")
 	defer end(&err)
-	q := s.bind("SELECT node_id, address, version, capacity, heartbeat_at, started_at, " + s.d.Now + " FROM sl_nodes ORDER BY node_id")
-	rows, err := s.r.QueryContext(ctx, q)
+	rows, err := s.r.QueryContext(ctx, s.d.Registry.Nodes)
 	if err != nil {
 		return nil, err
 	}
@@ -77,8 +74,7 @@ func (g *registry) Nodes(ctx context.Context) (out []Node, err error) {
 	return out, rows.Err()
 }
 
-const copyCols = "index_name, shard, slot, node_id, state, applied_seq, epoch, lease_until"
-
+// scanCopy reads the dialect's CopyColumns.
 func (g *registry) scanCopy(row interface{ Scan(...any) error }) (Copy, error) {
 	var c Copy
 	var state string
@@ -125,15 +121,14 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 	defer rollback(tx)
 
 	var indexed int
-	if err := tx.QueryRowContext(ctx, s.bind("SELECT COUNT(*) FROM sl_indexes WHERE name = ?"), shard.Index).Scan(&indexed); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Registry.IndexExists, shard.Index).Scan(&indexed); err != nil {
 		return Copy{}, false, err
 	}
 	if indexed == 0 {
 		return Copy{}, false, fmt.Errorf("index %q: %w", shard.Index, ErrNotFound)
 	}
 
-	slotQ := s.bind("SELECT " + copyCols + ", " + s.d.Now + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot")
-	rows, err := tx.QueryContext(ctx, slotQ, shard.Index, shard.Shard)
+	rows, err := tx.QueryContext(ctx, s.d.Registry.Slots, shard.Index, shard.Shard)
 	if err != nil {
 		return Copy{}, false, err
 	}
@@ -183,18 +178,21 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 	if err != nil {
 		return Copy{}, false, err
 	}
-	ownQ := s.bind("SELECT " + copyCols + ", " + s.d.Now + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? AND slot = ?")
 	for _, slot := range candidates {
-		q, args := s.d.Claim(dialect.ClaimArgs{Index: shard.Index, Shard: shard.Shard, Slot: slot, Node: nodeID, TTLms: ttlMs, Epoch: epoch})
-		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		// The claim locks the slot row; what it reads back is who holds the
+		// slot now (no row: the slot was left to its live owner).
+		row, err := returningRow(ctx, tx, s.d.Registry.Claim,
+			[]any{shard.Index, shard.Shard, slot, nodeID, ttlMs, epoch}, []any{shard.Index, shard.Shard, slot})
+		if err != nil {
 			return Copy{}, false, fmt.Errorf("claim slot %d: %w", slot, err)
 		}
-		// The claim statement locked the slot row; read who holds it now.
-		c, err := g.scanCopy(tx.QueryRowContext(ctx, ownQ, shard.Index, shard.Shard, slot))
-		if err != nil {
-			return Copy{}, false, err
-		}
-		if c.NodeID == nodeID {
+		c, err := g.scanCopy(row)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return Copy{}, false, fmt.Errorf("claim slot %d: %w", slot, err)
+		case c.NodeID == nodeID:
 			return c, true, tx.Commit()
 		}
 	}
@@ -205,12 +203,12 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 // which is separate from the changelog sequence so claims never leave gaps
 // in it.
 func (g *registry) nextEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
-	s := g.s
-	if _, err := tx.ExecContext(ctx, "UPDATE sl_counter SET value = value + 1 WHERE id = 2"); err != nil {
+	row, err := returningRow(ctx, tx, g.s.d.Registry.NextEpoch, nil, nil)
+	if err != nil {
 		return 0, fmt.Errorf("next epoch: %w", err)
 	}
 	var epoch int64
-	if err := tx.QueryRowContext(ctx, s.q.readEpoch).Scan(&epoch); err != nil {
+	if err := row.Scan(&epoch); err != nil {
 		return 0, fmt.Errorf("next epoch: %w", err)
 	}
 	return epoch, nil
@@ -227,18 +225,18 @@ func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Dura
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
-	if err != nil {
-		return nil, err
+	// A renewal that reads back in its own statement is atomic as it is;
+	// a write and a separate read take a transaction.
+	var q queryer = s.w
+	var tx *sql.Tx
+	if s.d.Registry.Renew.Write != "" {
+		if tx, err = s.w.BeginTx(ctx, s.d.ApplyTx); err != nil {
+			return nil, err
+		}
+		defer rollback(tx)
+		q = tx
 	}
-	defer rollback(tx)
-	upd := s.bind("UPDATE sl_shard_copies SET lease_until = " + s.d.Now + " + ? WHERE node_id = ? AND lease_until >= " + s.d.Now)
-	if _, err := tx.ExecContext(ctx, upd, ms, nodeID); err != nil {
-		return nil, err
-	}
-	sel := s.bind("SELECT index_name, shard FROM sl_shard_copies WHERE node_id = ? AND lease_until >= " + s.d.Now +
-		" ORDER BY index_name, shard")
-	rows, err := tx.QueryContext(ctx, sel, nodeID)
+	rows, err := returning(ctx, q, s.d.Registry.Renew, []any{ms, nodeID}, []any{nodeID})
 	if err != nil {
 		return nil, err
 	}
@@ -253,11 +251,17 @@ func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Dura
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return out, tx.Commit()
+	slices.SortFunc(out, func(a, b ShardID) int {
+		if c := strings.Compare(a.Index, b.Index); c != 0 {
+			return c
+		}
+		return a.Shard - b.Shard
+	})
+	if tx != nil {
+		return out, tx.Commit()
+	}
+	return out, nil
 }
-
-// fence is the WHERE clause that names one incarnation of a copy.
-const fence = " WHERE index_name = ? AND shard = ? AND slot = ? AND node_id = ? AND epoch = ?"
 
 func fenceArgs(c *Copy) []any { return []any{c.Shard.Index, c.Shard.Shard, c.Slot, c.NodeID, c.Epoch} }
 
@@ -272,7 +276,7 @@ func (g *registry) ReleaseCopy(ctx context.Context, c Copy) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "release_copy", copyAttrs(&c)...)
 	defer end(&err)
-	res, err := s.w.ExecContext(ctx, s.bind("DELETE FROM sl_shard_copies"+fence), fenceArgs(&c)...)
+	res, err := s.w.ExecContext(ctx, s.d.Registry.Release, fenceArgs(&c)...)
 	return leaseResult(res, err, &c)
 }
 
@@ -280,13 +284,11 @@ func (g *registry) Copies(ctx context.Context, index string) (out []Copy, err er
 	s := g.s
 	ctx, end := s.start(ctx, "copies", attribute.String("index", index))
 	defer end(&err)
-	q := "SELECT " + copyCols + ", " + s.d.Now + " FROM sl_shard_copies"
-	var args []any
+	q, args := s.d.Registry.Copies, []any(nil)
 	if index != "" {
-		q += " WHERE index_name = ?"
-		args = append(args, index)
+		q, args = s.d.Registry.IndexCopies, []any{index}
 	}
-	rows, err := s.r.QueryContext(ctx, s.bind(q+" ORDER BY index_name, shard, slot"), args...)
+	rows, err := s.r.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -314,8 +316,7 @@ func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (e
 	if !state.valid() {
 		return invalidf("copy state %q", state)
 	}
-	q := s.bind("UPDATE sl_shard_copies SET state = ?" + fence + " AND lease_until >= " + s.d.Now)
-	res, err := s.w.ExecContext(ctx, q, append([]any{string(state)}, fenceArgs(&c)...)...)
+	res, err := s.w.ExecContext(ctx, s.d.Registry.SetState, append([]any{string(state)}, fenceArgs(&c)...)...)
 	return leaseResult(res, err, &c)
 }
 
@@ -331,8 +332,7 @@ func (g *registry) ReportApplied(ctx context.Context, c Copy, seq int64) (err er
 	if err := validNode(c.NodeID); err != nil {
 		return err
 	}
-	q := s.bind("UPDATE sl_shard_copies SET applied_seq = " + s.d.Greatest("applied_seq", "?") + fence)
-	res, err := s.w.ExecContext(ctx, q, append([]any{seq}, fenceArgs(&c)...)...)
+	res, err := s.w.ExecContext(ctx, s.d.Registry.ReportApplied, append([]any{seq}, fenceArgs(&c)...)...)
 	return leaseResult(res, err, &c)
 }
 

@@ -43,12 +43,10 @@ func (s *sqlStore) GetRecord(ctx context.Context, kind RecordKind, shard ShardID
 	var row *sql.Row
 	switch kind {
 	case RecordDocument:
-		row = s.r.QueryRowContext(ctx, s.bind("SELECT body, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"),
-			shard.Index, shard.Shard, id)
+		row = s.r.QueryRowContext(ctx, s.d.Records.GetDocument, shard.Index, shard.Shard, id)
 		err = row.Scan(&r.Body, &r.Seq)
 	case RecordQuery:
-		row = s.r.QueryRowContext(ctx, s.bind("SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"),
-			shard.Index, shard.Shard, id)
+		row = s.r.QueryRowContext(ctx, s.d.Records.GetQuery, shard.Index, shard.Shard, id)
 		err = row.Scan(&r.Body, &r.Meta, &r.Seq)
 	default:
 		return r, invalidf("record kind %d", kind)
@@ -71,8 +69,7 @@ func (s *sqlStore) ListQueries(ctx context.Context, index, after string, limit i
 	if limit <= 0 || limit > MaxListLimit {
 		return nil, invalidf("limit %d is not 1 to %d", limit, MaxListLimit)
 	}
-	rows, err := s.r.QueryContext(ctx, s.bind("SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?"),
-		index, after, limit)
+	rows, err := s.r.QueryContext(ctx, s.d.Records.ListQueries, index, after, limit)
 	if err != nil {
 		return nil, err
 	}

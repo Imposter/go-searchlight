@@ -1,0 +1,176 @@
+package mysql
+
+import (
+	"strings"
+
+	"github.com/Imposter/go-searchlight/internal/store/dialect"
+)
+
+// now is the database clock in Unix milliseconds. Sessions run in UTC (see
+// Config), so it is never ambiguous across a DST change.
+const now = "CAST(UNIX_TIMESTAMP(NOW(3)) * 1000 AS SIGNED)"
+
+// withNow spells the clock: the statements below write NOW for it.
+func withNow(q string) string { return strings.ReplaceAll(q, "NOW", now) }
+
+// Batch limits: MySQL takes up to 65,535 placeholders in a statement, and
+// the client interpolates them into one packet, which must stay well below
+// max_allowed_packet (64 MB by default).
+const (
+	maxParams     = 65535
+	maxWriteBytes = 16 << 20
+)
+
+// copyColumns is dialect.Registry's CopyColumns.
+const copyColumns = "index_name, shard, slot, node_id, state, applied_seq, epoch, lease_until, NOW"
+
+// fence names one incarnation of a copy, after the statement's own argument.
+const fence = " WHERE index_name = ? AND shard = ? AND slot = ? AND node_id = ? AND epoch = ?"
+
+// indexColumns is dialect.Indexes' IndexColumns.
+const indexColumns = "mapping, settings, version, created_at, uid, mapping_version"
+
+var changelog = dialect.Changelog{
+	LockCounter:   withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
+	ReadCounter:   "SELECT value FROM sl_counter WHERE id = 1",
+	ReadHead:      withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
+	IndexState:    "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
+	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	Write:         write,
+	ChangesAfter:  "SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
+	ScanDocuments: "SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
+}
+
+// write spells w as multi-row INSERTs as large as the limits allow, upserts
+// with ON DUPLICATE KEY UPDATE, and IN-list deletes.
+func write(w *dialect.Write) []dialect.Stmt {
+	out := dialect.Values("insert changes", "INSERT INTO sl_changes ("+dialect.ChangeColumns+") VALUES ", "",
+		9, maxParams, maxWriteBytes, dialect.ChangeArgs(w.Changes))
+	out = append(out, dialect.Values("upsert documents", "INSERT INTO sl_documents ("+dialect.DocumentColumns+") VALUES ",
+		" ON DUPLICATE KEY UPDATE body = VALUES(body), seq = VALUES(seq)",
+		5, maxParams, maxWriteBytes, dialect.DocumentArgs(w.Documents))...)
+	out = append(out, dialect.Values("upsert queries", "INSERT INTO sl_queries ("+dialect.QueryColumns+") VALUES ",
+		" ON DUPLICATE KEY UPDATE query = VALUES(query), meta = VALUES(meta), seq = VALUES(seq)",
+		6, maxParams, maxWriteBytes, dialect.QueryArgs(w.Queries))...)
+	for _, g := range w.DocumentDeletes {
+		out = append(out, dialect.In("delete documents", "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id IN (", ")",
+			[]any{g.Index, g.Shard}, g.IDs, maxParams)...)
+	}
+	for _, g := range w.QueryDeletes {
+		out = append(out, dialect.In("delete queries", "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id IN (", ")",
+			[]any{g.Index, g.Shard}, g.IDs, maxParams)...)
+	}
+	return append(out, dialect.Stmt{What: "advance counter", SQL: "UPDATE sl_counter SET value = ? WHERE id = 1", Args: []any{w.Counter}})
+}
+
+var records = dialect.Records{
+	GetDocument: "SELECT body, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?",
+}
+
+var registry = dialect.Registry{
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, heartbeat_at, started_at) VALUES (?, ?, ?, ?, NOW, NOW)
+ON DUPLICATE KEY UPDATE address = VALUES(address), version = VALUES(version), capacity = VALUES(capacity), heartbeat_at = VALUES(heartbeat_at)`),
+	RemoveNode:  "DELETE FROM sl_nodes WHERE node_id = ?",
+	Nodes:       withNow("SELECT node_id, address, version, capacity, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	IndexExists: "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",
+	Slots:       withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot"),
+	NextEpoch: dialect.Returning{
+		Write: "UPDATE sl_counter SET value = value + 1 WHERE id = 2",
+		Read:  "SELECT value FROM sl_counter WHERE id = 2",
+	},
+	// MySQL evaluates ON DUPLICATE KEY UPDATE assignments left to right, each
+	// seeing the ones before, so node_id changes after state, applied_seq and
+	// epoch have read the old owner, and lease_until last.
+	Claim: dialect.Returning{
+		Write: withNow(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
+VALUES (?, ?, ?, ?, 'recovering', 0, NOW + ?, ?)
+ON DUPLICATE KEY UPDATE
+	state = IF(node_id = VALUES(node_id), state, IF(lease_until < NOW, VALUES(state), state)),
+	applied_seq = IF(node_id = VALUES(node_id), applied_seq, IF(lease_until < NOW, 0, applied_seq)),
+	epoch = IF(node_id = VALUES(node_id), epoch, IF(lease_until < NOW, VALUES(epoch), epoch)),
+	node_id = IF(lease_until < NOW, VALUES(node_id), node_id),
+	lease_until = IF(node_id = VALUES(node_id), VALUES(lease_until), lease_until)`),
+		// The claim locked the slot row; this reads who holds it now.
+		Read: withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? AND slot = ?"),
+	},
+	Renew: dialect.Returning{
+		Write: withNow("UPDATE sl_shard_copies SET lease_until = NOW + ? WHERE node_id = ? AND lease_until >= NOW"),
+		Read:  withNow("SELECT index_name, shard FROM sl_shard_copies WHERE node_id = ? AND lease_until >= NOW"),
+	},
+	Release:       "DELETE FROM sl_shard_copies WHERE index_name = ? AND shard = ? AND slot = ? AND node_id = ? AND epoch = ?",
+	Copies:        withNow("SELECT " + copyColumns + " FROM sl_shard_copies ORDER BY index_name, shard, slot"),
+	IndexCopies:   withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? ORDER BY index_name, shard, slot"),
+	SetState:      withNow("UPDATE sl_shard_copies SET state = ?" + fence + " AND lease_until >= NOW"),
+	ReportApplied: "UPDATE sl_shard_copies SET applied_seq = GREATEST(applied_seq, ?)" + fence,
+}
+
+var blobs = dialect.Blobs{
+	Clock:           withNow("SELECT NOW"),
+	Register:        withNow("INSERT INTO sl_blob_uploads (upload_id, name, touched_at) VALUES (?, ?, NOW)"),
+	Touch:           withNow("UPDATE sl_blob_uploads SET touched_at = NOW WHERE upload_id = ?"),
+	Unregister:      "DELETE FROM sl_blob_uploads WHERE upload_id = ?",
+	RegisterGarbage: "INSERT INTO sl_blob_uploads (upload_id, name, touched_at) VALUES (?, ?, 0)",
+	WriteChunk:      "INSERT INTO sl_blob_chunks (upload_id, chunk, data) VALUES (?, ?, ?)",
+	ReadChunk:       "SELECT data FROM sl_blob_chunks WHERE upload_id = ? AND chunk = ?",
+	MaxChunk:        "SELECT MAX(chunk) FROM sl_blob_chunks WHERE upload_id = ?",
+	DeleteChunks:    "DELETE FROM sl_blob_chunks WHERE upload_id = ? AND chunk >= ? AND chunk < ?",
+	Take: dialect.Returning{
+		Write: "INSERT INTO sl_blobs (name, upload_id, size, chunks, sha256, created_at) VALUES (?, '', 0, 0, '', 0) ON DUPLICATE KEY UPDATE name = VALUES(name)",
+		Read:  "SELECT upload_id FROM sl_blobs WHERE name = ? FOR UPDATE",
+	},
+	Point:         "UPDATE sl_blobs SET upload_id = ?, size = ?, chunks = ?, sha256 = ?, created_at = ? WHERE name = ?",
+	LockForDelete: "SELECT upload_id FROM sl_blobs WHERE name = ? FOR UPDATE",
+	Delete:        "DELETE FROM sl_blobs WHERE name = ?",
+	Stat:          "SELECT upload_id, size, chunks, sha256, created_at FROM sl_blobs WHERE name = ?",
+	ListFrom:      "SELECT name, size, chunks, sha256, created_at FROM sl_blobs WHERE name >= ? ORDER BY name",
+	ListRange:     "SELECT name, size, chunks, sha256, created_at FROM sl_blobs WHERE name >= ? AND name < ? ORDER BY name",
+	Stale: withNow(`SELECT upload_id FROM sl_blob_uploads u WHERE touched_at < NOW - ?
+	AND NOT EXISTS (SELECT 1 FROM sl_blobs b WHERE b.upload_id = u.upload_id)`),
+	ClaimStale: withNow("DELETE FROM sl_blob_uploads WHERE upload_id = ? AND touched_at < NOW - ?"),
+	Orphans: `SELECT DISTINCT upload_id FROM sl_blob_chunks c
+	WHERE NOT EXISTS (SELECT 1 FROM sl_blobs b WHERE b.upload_id = c.upload_id)
+	AND NOT EXISTS (SELECT 1 FROM sl_blob_uploads u WHERE u.upload_id = c.upload_id)`,
+}
+
+var indexes = dialect.Indexes{
+	Create: dialect.Returning{
+		Write: withNow("INSERT INTO sl_indexes (name, mapping, settings, version, created_at, mapping_version, uid) VALUES (?, ?, ?, 1, NOW, 1, ?)"),
+		Read:  "SELECT " + indexColumns + " FROM sl_indexes WHERE name = ?",
+	},
+	Get:     "SELECT " + indexColumns + " FROM sl_indexes WHERE name = ?",
+	List:    "SELECT name, " + indexColumns + " FROM sl_indexes ORDER BY name",
+	Current: "SELECT mapping, settings, version, mapping_version, uid FROM sl_indexes WHERE name = ?",
+	Update:  "UPDATE sl_indexes SET mapping = ?, settings = ?, version = version + 1, mapping_version = ? WHERE name = ? AND version = ?",
+	Drop:    "DELETE FROM sl_indexes WHERE name = ?",
+	DropData: []string{
+		"DELETE FROM sl_documents WHERE index_name = ?",
+		"DELETE FROM sl_queries WHERE index_name = ?",
+		"DELETE FROM sl_changes WHERE index_name = ?",
+		"DELETE FROM sl_pruned WHERE index_name = ?",
+		"DELETE FROM sl_shard_copies WHERE index_name = ?",
+	},
+}
+
+var maintenance = dialect.Maintenance{
+	MinSeq:        "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
+	DeleteChanges: "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",
+	RaiseHorizon: dialect.Returning{
+		Write: "INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE below_seq = GREATEST(below_seq, VALUES(below_seq))",
+		Read:  "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
+	},
+	VersionTable: `CREATE TABLE IF NOT EXISTS sl_schema_migrations (
+	version INT NOT NULL PRIMARY KEY,
+	name VARCHAR(255) NOT NULL,
+	applied_at BIGINT NOT NULL
+) ENGINE=InnoDB`,
+	AppliedMigrations: "SELECT version FROM sl_schema_migrations",
+	RecordMigration:   withNow("INSERT INTO sl_schema_migrations (version, name, applied_at) VALUES (?, ?, NOW)"),
+	MigrateInTx:       false,
+	SessionLock:       "SELECT GET_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())), 120)",
+	SessionUnlock:     "SELECT RELEASE_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())))",
+}

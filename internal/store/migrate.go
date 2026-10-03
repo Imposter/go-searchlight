@@ -92,14 +92,15 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if s.d.MigrateInTx {
+	m := &s.d.Maintenance
+	if m.MigrateInTx {
 		tx, err := s.w.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		defer rollback(tx)
-		if s.d.MigrateLock != "" {
-			if _, err := tx.ExecContext(ctx, s.d.MigrateLock); err != nil {
+		if m.MigrateLock != "" {
+			if _, err := tx.ExecContext(ctx, m.MigrateLock); err != nil {
 				return fmt.Errorf("migration lock: %w", err)
 			}
 		}
@@ -115,7 +116,7 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	}
 	defer conn.Close()
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, s.d.SessionLock).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, m.SessionLock).Scan(&got); err != nil {
 		return fmt.Errorf("migration lock: %w", err)
 	}
 	if !got.Valid || got.Int64 != 1 {
@@ -123,7 +124,7 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	}
 	defer func() {
 		var released sql.NullInt64
-		_ = conn.QueryRowContext(context.WithoutCancel(ctx), s.d.SessionUnlock).Scan(&released)
+		_ = conn.QueryRowContext(context.WithoutCancel(ctx), m.SessionUnlock).Scan(&released)
 	}()
 	return s.migrateOn(ctx, conn, ms)
 }
@@ -131,10 +132,10 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 // migrateOn applies the pending migrations, recording each version as it
 // completes.
 func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration) error {
-	if _, err := ex.ExecContext(ctx, s.d.VersionTable); err != nil {
+	if _, err := ex.ExecContext(ctx, s.d.Maintenance.VersionTable); err != nil {
 		return fmt.Errorf("create version table: %w", err)
 	}
-	rows, err := ex.QueryContext(ctx, "SELECT version FROM sl_schema_migrations")
+	rows, err := ex.QueryContext(ctx, s.d.Maintenance.AppliedMigrations)
 	if err != nil {
 		return err
 	}
@@ -160,7 +161,7 @@ func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration) err
 			return fmt.Errorf("%w: it has migration %d, this binary knows up to %d", ErrNewerSchema, v, known)
 		}
 	}
-	record := s.bind("INSERT INTO sl_schema_migrations (version, name, applied_at) VALUES (?, ?, " + s.d.Now + ")")
+	record := s.d.Maintenance.RecordMigration
 	for _, m := range ms {
 		if applied[m.version] {
 			continue

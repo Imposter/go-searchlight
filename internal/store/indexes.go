@@ -10,6 +10,8 @@ import (
 	"fmt"
 
 	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
 // indexStore implements IndexStore over sl_indexes.
@@ -55,28 +57,36 @@ func (x *indexStore) Create(ctx context.Context, m IndexMeta) (out IndexMeta, er
 	if err != nil {
 		return out, err
 	}
-	q := s.bind("INSERT INTO sl_indexes (name, mapping, settings, version, created_at, mapping_version, uid) VALUES (?, ?, ?, 1, " + s.d.Now + ", 1, ?)")
-	if _, err := s.w.ExecContext(ctx, q, m.Name, string(m.Mapping), string(m.Settings), uid); err != nil {
-		// A key violation looks different on every dialect; look instead.
-		if _, gerr := x.get(ctx, m.Name); gerr == nil {
-			return out, fmt.Errorf("index %q: %w", m.Name, ErrExists)
+	create := s.d.Indexes.Create
+	row, err := returningRow(ctx, s.w, create, []any{m.Name, string(m.Mapping), string(m.Settings), uid}, []any{m.Name})
+	if err == nil {
+		out, err = scanIndex(row, m.Name)
+		if err == nil || create.Write != "" {
+			return out, err // the insert is done; this is the read's outcome
 		}
-		return out, err
 	}
-	return x.get(ctx, m.Name)
+	// The insert failed. A key violation looks different on every dialect;
+	// look instead.
+	if _, gerr := x.get(ctx, m.Name); gerr == nil {
+		return IndexMeta{}, fmt.Errorf("index %q: %w", m.Name, ErrExists)
+	}
+	return IndexMeta{}, err
 }
 
-func (x *indexStore) get(ctx context.Context, name string) (IndexMeta, error) {
-	s := x.s
+// scanIndex reads the dialect's IndexColumns.
+func scanIndex(row interface{ Scan(...any) error }, name string) (IndexMeta, error) {
 	m := IndexMeta{Name: name}
 	var created int64
-	err := s.r.QueryRowContext(ctx, s.bind("SELECT mapping, settings, version, created_at, uid, mapping_version FROM sl_indexes WHERE name = ?"), name).
-		Scan(&m.Mapping, &m.Settings, &m.Version, &created, &m.UID, &m.MappingVersion)
+	err := row.Scan(&m.Mapping, &m.Settings, &m.Version, &created, &m.UID, &m.MappingVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return m, fmt.Errorf("index %q: %w", name, ErrNotFound)
 	}
 	m.CreatedAt = millis(created)
 	return m, err
+}
+
+func (x *indexStore) get(ctx context.Context, name string) (IndexMeta, error) {
+	return scanIndex(x.s.r.QueryRowContext(ctx, x.s.d.Indexes.Get, name), name)
 }
 
 func (x *indexStore) Get(ctx context.Context, name string) (m IndexMeta, err error) {
@@ -89,7 +99,7 @@ func (x *indexStore) List(ctx context.Context) (out []IndexMeta, err error) {
 	s := x.s
 	ctx, end := s.start(ctx, "index_list")
 	defer end(&err)
-	rows, err := s.r.QueryContext(ctx, "SELECT name, mapping, settings, version, created_at, uid, mapping_version FROM sl_indexes ORDER BY name")
+	rows, err := s.r.QueryContext(ctx, s.d.Indexes.List)
 	if err != nil {
 		return nil, err
 	}
@@ -139,13 +149,13 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	}
 	defer rollback(tx)
 	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return fmt.Errorf("lock counter: %w", err)
 	}
 	var oldMapping, oldSettings []byte
 	var version, mappingVersion int64
 	var uid string
-	err = tx.QueryRowContext(ctx, s.bind("SELECT mapping, settings, version, mapping_version, uid FROM sl_indexes WHERE name = ?"), m.Name).
+	err = tx.QueryRowContext(ctx, s.d.Indexes.Current, m.Name).
 		Scan(&oldMapping, &oldSettings, &version, &mappingVersion, &uid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("index %q: %w", m.Name, ErrNotFound)
@@ -171,8 +181,7 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	if remap {
 		mappingVersion++
 	}
-	q := s.bind("UPDATE sl_indexes SET mapping = ?, settings = ?, version = version + 1, mapping_version = ? WHERE name = ? AND version = ?")
-	if _, err := tx.ExecContext(ctx, q, string(m.Mapping), string(m.Settings), mappingVersion, m.Name, m.Version); err != nil {
+	if _, err := tx.ExecContext(ctx, s.d.Indexes.Update, string(m.Mapping), string(m.Settings), mappingVersion, m.Name, m.Version); err != nil {
 		return err
 	}
 	if remap {
@@ -181,21 +190,19 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 			return err
 		}
 		batch := make([]Change, shards)
-		args := make([]any, 0, shards*9)
+		w := &dialect.Write{Changes: make([]dialect.ChangeRow, shards), Counter: counter + int64(shards)}
 		for sh := range shards {
 			batch[sh] = Change{Index: m.Name, Shard: sh, Kind: KindMapping, ID: MappingChangeID}
-			args = append(args, counter+1+int64(sh), m.Name, sh, string(KindMapping), MappingChangeID, string(m.Mapping), nowMs, uid, mappingVersion)
-		}
-		if err := s.insertRows(ctx, tx, insertChanges, 9, args, ""); err != nil {
-			return fmt.Errorf("log mapping changes: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, s.q.updateCounter, counter+int64(shards)); err != nil {
-			return fmt.Errorf("advance counter: %w", err)
-		}
-		if s.d.Notify != "" {
-			if err := s.notify(ctx, tx, batch, counter+1); err != nil {
-				return err
+			w.Changes[sh] = dialect.ChangeRow{
+				Seq: counter + 1 + int64(sh), Index: m.Name, Shard: sh, Kind: string(KindMapping), ID: MappingChangeID,
+				Payload: string(m.Mapping), At: nowMs, IndexUID: uid, MappingVersion: mappingVersion,
 			}
+		}
+		if w.Notify, err = s.notifications(batch, counter+1); err != nil {
+			return err
+		}
+		if err := s.write(ctx, tx, w); err != nil {
+			return fmt.Errorf("log mapping changes: %w", err)
 		}
 	}
 	return tx.Commit()
@@ -216,10 +223,10 @@ func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	// Taking the counter lock orders the drop with Apply: no change for the
 	// index commits after it.
 	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, s.bind("DELETE FROM sl_indexes WHERE name = ?"), name)
+	res, err := tx.ExecContext(ctx, s.d.Indexes.Drop, name)
 	if err != nil {
 		return err
 	}
@@ -228,9 +235,9 @@ func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	} else if n == 0 {
 		return fmt.Errorf("index %q: %w", name, ErrNotFound)
 	}
-	for _, table := range []string{"sl_documents", "sl_queries", "sl_changes", "sl_pruned", "sl_shard_copies"} {
-		if _, err := tx.ExecContext(ctx, s.bind("DELETE FROM "+table+" WHERE index_name = ?"), name); err != nil {
-			return fmt.Errorf("drop index %q from %s: %w", name, table, err)
+	for _, q := range s.d.Indexes.DropData {
+		if _, err := tx.ExecContext(ctx, q, name); err != nil {
+			return fmt.Errorf("drop index %q: %w", name, err)
 		}
 	}
 	return tx.Commit()

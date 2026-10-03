@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,21 +20,15 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// notifyChannel is the Postgres NOTIFY channel Apply announces commits on.
-const notifyChannel = "searchlight_changes"
-
-// maxRowsPerInsert caps the rows of one multi-row INSERT.
-const maxRowsPerInsert = 500
-
 // applyAttempts bounds Apply's retries of transient failures.
 const applyAttempts = 3
 
-// sqlStore is the dialect-independent store engine.
+// sqlStore is the dialect-independent store engine: the transaction shapes
+// and protocols, over the statements of its dialect.
 type sqlStore struct {
 	d      *dialect.Dialect
 	pools  dialect.Pools
 	w, r   *sql.DB
-	q      queries
 	log    *slog.Logger
 	tracer trace.Tracer
 	dur    metric.Float64Histogram
@@ -54,18 +46,6 @@ type sqlStore struct {
 	idx   *indexStore
 }
 
-// queries are the fixed statements, bound to the dialect's placeholders.
-type queries struct {
-	lockCounter, updateCounter, readCounter string
-	readHead                                string
-	readEpoch                               string
-	changesAfter, horizon                   string
-	docSeq, querySeq                        string
-	scanDocs, scanQueries                   string
-	indexUID                                string
-	indexState                              string
-}
-
 func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore, error) {
 	in := telemetry.NewInstruments(o.meter)
 	s := &sqlStore{
@@ -80,47 +60,41 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 	if err := in.Err(); err != nil {
 		return nil, fmt.Errorf("store instruments: %w", err)
 	}
-	s.q = queries{
-		lockCounter:   s.bind("SELECT value, " + d.Now + " FROM sl_counter WHERE id = 1" + d.ForUpdate),
-		updateCounter: s.bind("UPDATE sl_counter SET value = ? WHERE id = 1"),
-		readCounter:   s.bind("SELECT value FROM sl_counter WHERE id = 1"),
-		readHead:      s.bind("SELECT value, " + d.Now + " FROM sl_counter WHERE id = 1"),
-		readEpoch:     "SELECT value FROM sl_counter WHERE id = 2",
-		changesAfter: s.bind(`SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes
-WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?`),
-		horizon:     s.bind("SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?"),
-		docSeq:      s.bind("SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"),
-		querySeq:    s.bind("SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"),
-		scanDocs:    s.bind("SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id"),
-		scanQueries: s.bind("SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id"),
-		indexUID:    s.bind("SELECT uid FROM sl_indexes WHERE name = ?"),
-		indexState:  s.bind("SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?"),
-	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
 	s.idx = &indexStore{s: s}
 	return s, nil
 }
 
-// bind rewrites ? placeholders for dialects that number them. Statements
-// never contain a literal question mark.
-func (s *sqlStore) bind(q string) string {
-	if !s.d.Dollar || !strings.Contains(q, "?") {
-		return q
+// queryer is what statements run on: a pool, a transaction or a connection.
+type queryer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// returning runs a write the store reads back: one statement taking
+// writeArgs where the dialect returns rows from the write, and otherwise the
+// write with writeArgs and then the read with readArgs.
+func returning(ctx context.Context, q queryer, r dialect.Returning, writeArgs, readArgs []any) (*sql.Rows, error) {
+	if r.Write == "" {
+		return q.QueryContext(ctx, r.Read, writeArgs...)
 	}
-	var b strings.Builder
-	b.Grow(len(q) + 16)
-	n := 0
-	for i := 0; i < len(q); i++ {
-		if q[i] == '?' {
-			n++
-			b.WriteByte('$')
-			b.WriteString(strconv.Itoa(n))
-			continue
-		}
-		b.WriteByte(q[i])
+	if _, err := q.ExecContext(ctx, r.Write, writeArgs...); err != nil {
+		return nil, err
 	}
-	return b.String()
+	return q.QueryContext(ctx, r.Read, readArgs...)
+}
+
+// returningRow is returning for a write that reads back at most one row.
+func returningRow(ctx context.Context, q queryer, r dialect.Returning, writeArgs, readArgs []any) (*sql.Row, error) {
+	if r.Write == "" {
+		return q.QueryRowContext(ctx, r.Read, writeArgs...), nil
+	}
+	if _, err := q.ExecContext(ctx, r.Write, writeArgs...); err != nil {
+		return nil, err
+	}
+	return q.QueryRowContext(ctx, r.Read, readArgs...), nil
 }
 
 // start opens a span for one public operation and returns a function that
@@ -308,7 +282,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 
 	// The counter row lock serializes every Apply, so seqs commit in order.
 	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return 0, 0, fmt.Errorf("lock counter: %w", err)
 	}
 	for i := range batch {
@@ -351,27 +325,21 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	// The changelog. Each row carries the uid of the incarnation of its
 	// index as of this Apply, so a tailer can tell a drop-and-recreate apart
 	// from a continuing index without an extra query per batch.
-	args := make([]any, 0, len(batch)*9)
+	w := &dialect.Write{Changes: make([]dialect.ChangeRow, len(batch)), Counter: last}
 	for i := range batch {
 		c := &batch[i]
 		st := idx[c.Index]
-		args = append(args, first+int64(i), c.Index, c.Shard, string(c.Kind), c.ID, p.payload[i], nowMs, st.uid, st.mappingVersion)
+		w.Changes[i] = dialect.ChangeRow{
+			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID, Payload: p.payload[i],
+			At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion,
+		}
 	}
-	if err := s.insertRows(ctx, tx, insertChanges, 9, args, ""); err != nil {
-		return 0, 0, fmt.Errorf("insert changes: %w", err)
-	}
-
-	if err := s.applyState(ctx, tx, batch, p, first); err != nil {
+	netState(w, batch, p, first)
+	if w.Notify, err = s.notifications(batch, first); err != nil {
 		return 0, 0, err
 	}
-
-	if _, err := tx.ExecContext(ctx, s.q.updateCounter, last); err != nil {
-		return 0, 0, fmt.Errorf("advance counter: %w", err)
-	}
-	if s.d.Notify != "" {
-		if err := s.notify(ctx, tx, batch, first); err != nil {
-			return 0, 0, err
-		}
+	if err := s.write(ctx, tx, w); err != nil {
+		return 0, 0, err
 	}
 	if s.beforeCommit != nil {
 		s.beforeCommit(ctx, first, last)
@@ -390,8 +358,17 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	return first, last, nil
 }
 
-// insertChanges is the changelog insert; rows have 9 columns.
-const insertChanges = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version) VALUES "
+// write runs the dialect's statements for w inside tx, which holds the
+// counter lock: the changelog rows, the net state, the counter's new value
+// and the notifications.
+func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) error {
+	for _, st := range s.d.Changelog.Write(w) {
+		if _, err := tx.ExecContext(ctx, st.SQL, st.Args...); err != nil {
+			return fmt.Errorf("%s: %w", st.What, err)
+		}
+	}
+	return nil
+}
 
 // indexState is an index's incarnation and mapping version as of a
 // transaction, which every changelog row carries.
@@ -412,7 +389,7 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 		uid := st.uid
 		if !seen {
 			var mapping string
-			err := tx.QueryRowContext(ctx, s.q.indexState, name).Scan(&st.uid, &st.mappingVersion, &mapping)
+			err := tx.QueryRowContext(ctx, s.d.Changelog.IndexState, name).Scan(&st.uid, &st.mappingVersion, &mapping)
 			switch {
 			case errors.Is(err, sql.ErrNoRows):
 				st = indexState{}
@@ -464,9 +441,9 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 		if c.IfSeq != 0 {
 			seq, ok := cur[k]
 			if !ok {
-				q := s.q.docSeq
+				q := s.d.Changelog.DocumentSeq
 				if k.query {
-					q = s.q.querySeq
+					q = s.d.Changelog.QuerySeq
 				}
 				err := tx.QueryRowContext(ctx, q, c.Index, c.Shard, c.ID).Scan(&seq)
 				switch {
@@ -504,21 +481,19 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 	return skip, nil
 }
 
-// applyState writes the batch's net effect on sl_documents and sl_queries:
-// the last change to each key wins.
-func (s *sqlStore) applyState(ctx context.Context, tx *sql.Tx, batch []Change, p *prepared, first int64) error {
+// netState adds the batch's net effect on sl_documents and sl_queries to w:
+// the last change to each key wins, so each key appears once.
+func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 	lastPos := make(map[recKey]int, len(batch))
 	for i := range batch {
 		lastPos[keyOf(&batch[i])] = i
 	}
-	var docArgs, queryArgs []any
 	type group struct {
 		query bool
 		index string
 		shard int
 	}
-	deletes := make(map[group][]any)
-	var order []group
+	deletes := make(map[group]int) // the group's position in its delete list
 	for i := range batch {
 		c := &batch[i]
 		k := keyOf(c)
@@ -528,79 +503,35 @@ func (s *sqlStore) applyState(ctx context.Context, tx *sql.Tx, batch []Change, p
 		seq := first + int64(i)
 		switch c.Kind {
 		case KindUpsert:
-			docArgs = append(docArgs, c.Index, c.Shard, c.ID, p.payload[i], seq)
+			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i], Seq: seq})
 		case KindQueryUpsert:
-			queryArgs = append(queryArgs, c.Index, c.Shard, c.ID, string(p.query[i].Query), string(p.query[i].Meta), seq)
+			w.Queries = append(w.Queries, dialect.QueryRow{
+				Index: c.Index, Shard: c.Shard, ID: c.ID, Query: string(p.query[i].Query), Meta: string(p.query[i].Meta), Seq: seq,
+			})
 		case KindDelete, KindQueryDelete:
+			groups := &w.DocumentDeletes
+			if k.query {
+				groups = &w.QueryDeletes
+			}
 			g := group{query: k.query, index: c.Index, shard: c.Shard}
-			if _, ok := deletes[g]; !ok {
-				order = append(order, g)
+			at, ok := deletes[g]
+			if !ok {
+				at = len(*groups)
+				deletes[g] = at
+				*groups = append(*groups, dialect.DeleteGroup{Index: c.Index, Shard: c.Shard})
 			}
-			deletes[g] = append(deletes[g], c.ID)
+			(*groups)[at].IDs = append((*groups)[at].IDs, c.ID)
 		}
 	}
-	if len(docArgs) > 0 {
-		err := s.insertRows(ctx, tx, "INSERT INTO sl_documents (index_name, shard, id, body, seq) VALUES ", 5, docArgs,
-			s.d.Upsert([]string{"index_name", "shard", "id"}, []string{"body", "seq"}))
-		if err != nil {
-			return fmt.Errorf("upsert documents: %w", err)
-		}
-	}
-	if len(queryArgs) > 0 {
-		err := s.insertRows(ctx, tx, "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq) VALUES ", 6, queryArgs,
-			s.d.Upsert([]string{"index_name", "shard", "id"}, []string{"query", "meta", "seq"}))
-		if err != nil {
-			return fmt.Errorf("upsert queries: %w", err)
-		}
-	}
-	for _, g := range order {
-		table := "sl_documents"
-		if g.query {
-			table = "sl_queries"
-		}
-		ids := deletes[g]
-		per := min(maxRowsPerInsert, s.d.MaxParams-2)
-		for start := 0; start < len(ids); start += per {
-			part := ids[start:min(start+per, len(ids))]
-			q := "DELETE FROM " + table + " WHERE index_name = ? AND shard = ? AND id IN (" +
-				strings.TrimSuffix(strings.Repeat("?, ", len(part)), ", ") + ")"
-			args := append([]any{g.index, g.shard}, part...)
-			if _, err := tx.ExecContext(ctx, s.bind(q), args...); err != nil {
-				return fmt.Errorf("delete from %s: %w", table, err)
-			}
-		}
-	}
-	return nil
 }
 
-// insertRows runs prefix + (?, ...), (?, ...) ... + suffix in chunks of at
-// most maxRowsPerInsert rows; args holds ncols values per row.
-func (s *sqlStore) insertRows(ctx context.Context, tx *sql.Tx, prefix string, ncols int, args []any, suffix string) error {
-	rows := len(args) / ncols
-	per := min(maxRowsPerInsert, s.d.MaxParams/ncols)
-	row := "(" + strings.TrimSuffix(strings.Repeat("?, ", ncols), ", ") + ")"
-	for start := 0; start < rows; start += per {
-		end := min(start+per, rows)
-		var b strings.Builder
-		b.Grow(len(prefix) + (end-start)*(len(row)+2) + len(suffix))
-		b.WriteString(prefix)
-		for i := start; i < end; i++ {
-			if i > start {
-				b.WriteString(", ")
-			}
-			b.WriteString(row)
-		}
-		b.WriteString(suffix)
-		if _, err := tx.ExecContext(ctx, s.bind(b.String()), args[start*ncols:end*ncols]...); err != nil {
-			return err
-		}
+// notifications are the payloads announcing each shard's highest new seq.
+// They are sent inside the transaction, so they are delivered exactly when
+// it commits. There are none where the dialect cannot listen.
+func (s *sqlStore) notifications(batch []Change, first int64) ([]string, error) {
+	if s.d.Listen == nil {
+		return nil, nil
 	}
-	return nil
-}
-
-// notify announces each shard's highest new seq inside the transaction, so
-// the notifications are delivered exactly when it commits.
-func (s *sqlStore) notify(ctx context.Context, tx *sql.Tx, batch []Change, first int64) error {
 	top := make(map[ShardID]int64)
 	var order []ShardID
 	for i := range batch {
@@ -610,17 +541,15 @@ func (s *sqlStore) notify(ctx context.Context, tx *sql.Tx, batch []Change, first
 		}
 		top[id] = first + int64(i)
 	}
-	q := s.bind(s.d.Notify)
+	out := make([]string, 0, len(order))
 	for _, id := range order {
 		payload, err := json.Marshal(notification{Index: id.Index, Shard: id.Shard, Seq: top[id]})
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if _, err := tx.ExecContext(ctx, q, notifyChannel, string(payload)); err != nil {
-			return fmt.Errorf("notify: %w", err)
-		}
+		out = append(out, string(payload))
 	}
-	return nil
+	return out, nil
 }
 
 type notification struct {
@@ -643,7 +572,7 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	if limit <= 0 {
 		limit = DefaultChangesLimit
 	}
-	rows, err := s.r.QueryContext(ctx, s.q.changesAfter, shard.Index, shard.Shard, seq, limit)
+	rows, err := s.r.QueryContext(ctx, s.d.Changelog.ChangesAfter, shard.Index, shard.Shard, seq, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -670,7 +599,7 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	// before the read above is visible here, and one that commits later did
 	// not remove anything that read returned.
 	var below int64
-	err = s.r.QueryRowContext(ctx, s.q.horizon, shard.Index, shard.Shard).Scan(&below)
+	err = s.r.QueryRowContext(ctx, s.d.Changelog.Horizon, shard.Index, shard.Shard).Scan(&below)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
@@ -696,7 +625,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	}
 	defer rollback(tx)
 	// The counter is read first, in the same snapshot as the rows.
-	if err := tx.QueryRowContext(ctx, s.q.readCounter).Scan(&asOf); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounter).Scan(&asOf); err != nil {
 		return 0, err
 	}
 	// The index's current incarnation and mapping, read once in this scan's
@@ -705,7 +634,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	var uid string
 	var mv int64
 	var mapping []byte
-	switch err := tx.QueryRowContext(ctx, s.q.indexState, shard.Index).Scan(&uid, &mv, &mapping); {
+	switch err := tx.QueryRowContext(ctx, s.d.Changelog.IndexState, shard.Index).Scan(&uid, &mv, &mapping); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
 		return 0, err
@@ -715,13 +644,13 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 			return 0, err
 		}
 	}
-	if err := scanRows(ctx, tx, s.q.scanDocs, shard, func(rows *sql.Rows) (Record, error) {
+	if err := scanRows(ctx, tx, s.d.Changelog.ScanDocuments, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Seq)
 	}, fn); err != nil {
 		return 0, err
 	}
-	if err := scanRows(ctx, tx, s.q.scanQueries, shard, func(rows *sql.Rows) (Record, error) {
+	if err := scanRows(ctx, tx, s.d.Changelog.ScanQueries, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
 	}, fn); err != nil {
@@ -755,7 +684,7 @@ func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, now time.Time, err e
 		return 0, time.Time{}, ErrClosed
 	}
 	var nowMs int64
-	err = s.r.QueryRowContext(ctx, s.q.readHead).Scan(&seq, &nowMs)
+	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadHead).Scan(&seq, &nowMs)
 	return seq, millis(nowMs), err
 }
 
@@ -783,18 +712,17 @@ func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (er
 	}
 	// The horizon is published, so ChangesAfter already refuses the range;
 	// delete it in short statements.
-	minQ := s.bind("SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?")
-	delQ := s.bind("DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?")
+	m := &s.d.Maintenance
 	for {
 		var lo sql.NullInt64
-		if err := s.r.QueryRowContext(ctx, minQ, shard.Index, shard.Shard, below).Scan(&lo); err != nil {
+		if err := s.r.QueryRowContext(ctx, m.MinSeq, shard.Index, shard.Shard, below).Scan(&lo); err != nil {
 			return err
 		}
 		if !lo.Valid {
 			return nil
 		}
 		hi := min(lo.Int64+pruneStep, below)
-		if _, err := s.w.ExecContext(ctx, delQ, shard.Index, shard.Shard, lo.Int64, hi); err != nil {
+		if _, err := s.w.ExecContext(ctx, m.DeleteChanges, shard.Index, shard.Shard, lo.Int64, hi); err != nil {
 			return err
 		}
 	}
@@ -810,30 +738,22 @@ func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int
 	}
 	defer rollback(tx)
 	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return 0, err
 	}
 	belowSeq = min(belowSeq, counter+1)
-	var cur int64
-	err = tx.QueryRowContext(ctx, s.q.horizon, shard.Index, shard.Shard).Scan(&cur)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		_, err = tx.ExecContext(ctx, s.bind("INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES (?, ?, ?)"),
-			shard.Index, shard.Shard, belowSeq)
-	case err != nil:
-	case cur >= belowSeq:
-		belowSeq = cur
-	default:
-		_, err = tx.ExecContext(ctx, s.bind("UPDATE sl_pruned SET below_seq = ? WHERE index_name = ? AND shard = ?"),
-			belowSeq, shard.Index, shard.Shard)
-	}
+	row, err := returningRow(ctx, tx, s.d.Maintenance.RaiseHorizon,
+		[]any{shard.Index, shard.Shard, belowSeq}, []any{shard.Index, shard.Shard})
 	if err != nil {
+		return 0, err
+	}
+	if err := row.Scan(&belowSeq); err != nil {
 		return 0, err
 	}
 	return belowSeq, tx.Commit()
 }
 
-// --- Postgres notifications --------------------------------------------------
+// --- Notifications -----------------------------------------------------------
 
 // watchingStore adds Watch on dialects with notifications.
 type watchingStore struct{ *sqlStore }
@@ -847,7 +767,7 @@ func (s *watchingStore) Watch(ctx context.Context, ready func(), fn func(Notific
 		return err
 	}
 	defer conn.Close()
-	return s.d.Listen(ctx, conn, notifyChannel, ready, func(payload string) {
+	return s.d.Listen(ctx, conn, ready, func(payload string) {
 		var n notification
 		if err := json.Unmarshal([]byte(payload), &n); err != nil {
 			s.log.WarnContext(ctx, "ignoring a malformed change notification", slog.String("payload", payload))

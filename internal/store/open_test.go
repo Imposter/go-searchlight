@@ -51,17 +51,6 @@ func TestOpenSelectsDialect(t *testing.T) {
 	}
 }
 
-func TestBind(t *testing.T) {
-	pg := &sqlStore{d: dialectMust("postgres")}
-	if got := pg.bind("SELECT a FROM t WHERE x = ? AND y IN (?, ?)"); got != "SELECT a FROM t WHERE x = $1 AND y IN ($2, $3)" {
-		t.Fatalf("bind: %s", got)
-	}
-	lite := &sqlStore{d: dialectMust("sqlite")}
-	if got := lite.bind("x = ?"); got != "x = ?" {
-		t.Fatalf("sqlite bind: %s", got)
-	}
-}
-
 func dialectMust(scheme string) *dialect.Dialect {
 	d, err := dialectFor(scheme)
 	if err != nil {

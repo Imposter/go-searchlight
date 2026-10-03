@@ -484,3 +484,105 @@ func TestManifestSegmentIDsValidated(t *testing.T) {
 		})
 	}
 }
+
+// M9: one Apply batch that upserts, deletes and re-adds the same id leaves its last
+// version, once, whether the earlier versions are in segments or not.
+func TestOneBatchUpsertDeleteUpsert(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.upsert("x", "y")
+	h.refresh()
+	batch := func(id string) {
+		var changes []Change
+		for i, kind := range []ChangeKind{Upsert, Delete, Upsert} {
+			h.seq++
+			c := Change{Seq: h.seq, Kind: kind, DocID: id}
+			if kind == Upsert {
+				b := body(id, h.seq)
+				c.Doc = analyze(t, id, b)
+				if i == 2 {
+					h.model[id] = b
+				}
+			}
+			changes = append(changes, c)
+		}
+		h.apply(changes)
+	}
+	batch("x") // over a copy in a segment
+	batch("z") // new
+	h.refresh()
+	h.check()
+	h.forceMerge(1)
+	h.check()
+}
+
+// M9: a saved query deleted and re-added across a merge appears once, with its new
+// version.
+func TestQueryDeleteReaddAcrossMerge(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.putQuery("q1", "q2")
+	h.refresh()
+	h.putQuery("q3")
+	h.refresh()
+	h.delQuery("q1")
+	h.refresh()
+	h.forceMerge(1)
+	h.checkQueries()
+	h.putQuery("q1")
+	h.refresh()
+	h.checkQueries()
+	h.forceMerge(1)
+	h.checkQueries()
+	h.reopen()
+	h.checkQueries()
+}
+
+// M9: deletes and updates of saved queries refreshed while their query segments merge
+// land on the merged query segment.
+func TestQueryMergeCarriesDeletesMadeDuringIt(t *testing.T) {
+	built := make(chan struct{})
+	proceed := make(chan struct{})
+	opts := testOptions()
+	opts.hooks = &testHooks{at: func(point string) error {
+		if point == pointMergeBuilt {
+			close(built)
+			<-proceed
+		}
+		return nil
+	}}
+	h := newHarness(t, opts)
+	for i := range 12 {
+		h.putQuery(fmt.Sprintf("q%02d", i))
+		if i%4 == 3 {
+			h.refresh()
+		}
+	}
+	errc := make(chan error, 1)
+	p := h.planAll(kindQueries)
+	go func() {
+		_, err := h.s.runMerge(context.Background(), p)
+		errc <- err
+	}()
+	<-built
+	h.delQuery("q01", "q05")
+	h.putQuery("q09")
+	h.delQuery("q10")
+	h.putQuery("q10")
+	h.refresh()
+	h.checkQueries()
+	close(proceed)
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	h.checkQueries()
+	g := h.s.Acquire()
+	merged := g.QuerySegments[0]
+	for _, id := range []string{"q01", "q05", "q09", "q10"} {
+		ord, ok := merged.Segment.Ord(id)
+		if !ok || !merged.Deletes.Contains(ord) {
+			t.Errorf("%s: the merged query segment's copy (ord %d, %v) is not deleted", id, ord, ok)
+		}
+	}
+	g.Release()
+	h.reopen()
+	h.checkQueries()
+}

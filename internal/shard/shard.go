@@ -346,7 +346,15 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		s.jan.drain()
 		return nil, err
 	}
-	s.gen = man.Gen
+	// Never reuse a generation a crash left a sidecar of (I1): its file may still be
+	// pending removal, or be removed later by a janitor that could not remove it now.
+	topGen, err := maxSidecarGen(dir)
+	if err != nil {
+		g.retireAll()
+		s.jan.drain()
+		return nil, err
+	}
+	s.gen = max(man.Gen, topGen)
 	s.applied = man.Seq
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID

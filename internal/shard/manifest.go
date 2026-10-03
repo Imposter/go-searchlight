@@ -133,13 +133,17 @@ func encodeManifest(m *manifest) ([]byte, error) {
 // writeManifest replaces dir's manifest with m atomically. renamed reports whether the
 // new manifest was renamed into place (a failure after that, the directory fsync,
 // leaves the swap's durability unknown); hook is the shard's kill-point hook.
-func writeManifest(dir string, m *manifest, hook func(point string) error) (renamed bool, err error) {
+//
+// forget is called with manifest.tmp's path before it is written: garbage collection
+// may have left it pending removal.
+func writeManifest(dir string, m *manifest, hook func(point string) error, forget func(paths ...string)) (renamed bool, err error) {
 	data, err := encodeManifest(m)
 	if err != nil {
 		return false, err
 	}
 	path := filepath.Join(dir, manifestName)
 	tmp := path + ".tmp"
+	forget(tmp)
 	f, err := os.Create(tmp)
 	if err != nil {
 		return false, err

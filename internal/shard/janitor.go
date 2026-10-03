@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,15 +23,27 @@ import (
 // a removal that fails anyway (Windows refuses to delete a file another process, an
 // antivirus scanner say, has open) stays pending and is retried every
 // Options.DeleteRetry, then once more at Close. What is still left then is collected at
-// the next Open, which removes every file the manifest does not reference.
+// the next Open, which removes every shard file the manifest does not reference.
+//
+// A pending name may be written again: a deletes sidecar is named by its segment and
+// commit generation, and manifest.tmp by nothing at all. So a commit forgets a name
+// before writing it ([janitor.forget]), and forget waits out a removal of that name in
+// progress (removeMu), so a retry can never remove the new file. Once the shard is
+// closed the janitor forgets every pending name: another Shard may reopen the
+// directory, and that Shard's garbage collection owns whatever is left.
 type janitor struct {
 	s      *Shard
 	remove func(path string) error
+
+	// removeMu is held across each removal and by forget, so forget returns only
+	// once no removal of the forgotten names is running or can start.
+	removeMu sync.Mutex
 
 	mu      sync.Mutex
 	retired []*segRef
 	pending map[string]bool // files to remove
 	running bool
+	stopped bool
 	wake    chan struct{}
 	stopCh  chan struct{}
 	done    chan struct{}
@@ -53,7 +66,9 @@ func (j *janitor) start() {
 	go j.loop()
 }
 
-// stop ends the loop and does its work one last time.
+// stop ends the loop, does its work one last time, and forgets what is still pending.
+// Segments retired after it are still closed, and an obsolete one's files removed if
+// they can be, once.
 func (j *janitor) stop() {
 	j.mu.Lock()
 	running := j.running
@@ -64,6 +79,12 @@ func (j *janitor) stop() {
 		<-j.done
 	}
 	j.drain()
+	j.removeMu.Lock()
+	j.mu.Lock()
+	j.stopped = true
+	clear(j.pending)
+	j.mu.Unlock()
+	j.removeMu.Unlock()
 }
 
 // retire hands over a segment no generation lists any more.
@@ -97,6 +118,18 @@ func (j *janitor) removeLater(paths ...string) {
 	}
 }
 
+// forget drops paths from the pending removals, waiting for a removal of any of them
+// already under way: call it before writing a file whose name may be pending.
+func (j *janitor) forget(paths ...string) {
+	j.removeMu.Lock()
+	defer j.removeMu.Unlock()
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, p := range paths {
+		delete(j.pending, p)
+	}
+}
+
 func (j *janitor) loop() {
 	defer close(j.done)
 	t := time.NewTicker(j.s.opts.DeleteRetry)
@@ -113,7 +146,7 @@ func (j *janitor) loop() {
 }
 
 // drain closes every retired segment, queues the files of obsolete ones, and tries
-// every pending removal once.
+// every pending removal once. After stop nothing stays pending.
 func (j *janitor) drain() {
 	j.mu.Lock()
 	retired := j.retired
@@ -125,6 +158,9 @@ func (j *janitor) drain() {
 		}
 		j.s.opts.FilterCache.DropSegment(ref.id)
 		if ref.obsolete.Load() {
+			// A segment's own name is unique for the directory's life (and no
+			// manifest lists an obsolete one again), so its files are safe to remove
+			// whenever this runs.
 			files := segmentFiles(j.s.dir, ref.id)
 			j.mu.Lock()
 			for _, p := range files {
@@ -139,17 +175,32 @@ func (j *janitor) drain() {
 	for p := range j.pending {
 		paths = append(paths, p)
 	}
+	stopped := j.stopped
 	j.mu.Unlock()
 	for _, p := range paths {
-		err := j.remove(p)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			j.s.log.Debug("file removal deferred", slog.String("file", p), slog.Any("error", err))
-			continue
-		}
-		j.mu.Lock()
-		delete(j.pending, p)
-		j.mu.Unlock()
+		j.removeOne(p, stopped)
 	}
+}
+
+// removeOne removes p if it is still pending; on failure it stays pending, unless the
+// janitor has stopped.
+func (j *janitor) removeOne(p string, stopped bool) {
+	j.removeMu.Lock()
+	defer j.removeMu.Unlock()
+	j.mu.Lock()
+	still := j.pending[p]
+	j.mu.Unlock()
+	if !still {
+		return // forgotten (about to be written again), or removed by another drain
+	}
+	err := j.remove(p)
+	if err != nil && !errors.Is(err, os.ErrNotExist) && !stopped {
+		j.s.log.Debug("file removal deferred", slog.String("file", p), slog.Any("error", err))
+		return
+	}
+	j.mu.Lock()
+	delete(j.pending, p)
+	j.mu.Unlock()
 }
 
 // pendingFiles returns the files still waiting to be removed (for tests).
@@ -177,6 +228,33 @@ func segmentFiles(dir, id string) []string {
 		}
 	}
 	return out
+}
+
+// maxSidecarGen returns the highest commit generation any deletes sidecar (or its temp
+// file) in dir is named for, 0 when there is none. A crash can leave a sidecar of a
+// generation the manifest never reached; the next commit must not reuse its name.
+func maxSidecarGen(dir string) (uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, fmt.Errorf("shard: %w", err)
+	}
+	var top uint64
+	for _, e := range entries {
+		if gen, ok := sidecarGen(e.Name()); ok {
+			top = max(top, gen)
+		}
+	}
+	return top, nil
+}
+
+// sidecarGen parses <segment>.<gen>.del or <segment>.<gen>.del.tmp.
+func sidecarGen(name string) (uint64, bool) {
+	name = strings.TrimSuffix(name, ".tmp")
+	if !isShardFile(name) || !strings.HasSuffix(name, deletesExt) {
+		return 0, false
+	}
+	gen, err := strconv.ParseUint(name[segmentNameLen+1:len(name)-len(deletesExt)], 10, 64)
+	return gen, err == nil
 }
 
 // collectGarbage removes every shard file in the directory that man does not

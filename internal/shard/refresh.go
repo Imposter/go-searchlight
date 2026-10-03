@@ -278,6 +278,9 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 			}
 		}
 	}
+	for _, st := range dirty {
+		s.jan.forget(filepath.Join(s.dir, deletesName(st.ref.id, gen)))
+	}
 	// Each sidecar is fsynced on its own; writing them in parallel overlaps the syncs.
 	sidecarErrs := make([]error, len(dirty))
 	parallel(len(dirty), sidecarWriters, func(i int) {
@@ -298,7 +301,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		return fail(err)
 	}
 	man := buildManifest(gen, seq, maxSeq, uid, docs, queries)
-	renamed, err := writeManifest(s.dir, man, s.hook)
+	renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget)
 	if err != nil {
 		if !renamed {
 			return fail(fmt.Errorf("shard: writing the manifest: %w", err))

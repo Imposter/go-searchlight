@@ -1477,6 +1477,45 @@ func blobChunkCount(t *testing.T, st Store) int {
 	return countRows(t, st, "SELECT COUNT(*) FROM sl_blob_chunks")
 }
 
+// TestBlobPutSurvivesPostCommitFailure checks that when something goes
+// wrong after Put's pointer-switch transaction has committed — a cancelled
+// context racing the end of Put, a transient error — Put reports that
+// failure but leaves the blob it just committed alone: its chunks must not
+// be swept out from under it by Put's own cleanup, which only ever owned
+// its failed, pre-commit attempt.
+func TestBlobPutSurvivesPostCommitFailure(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		bs := st.Blobs()
+		hooks := engine(st).blobs
+		data := []byte("hello, world, this is a committed blob")
+
+		injected := errors.New("injected post-commit failure")
+		hooks.failAfterCommit = func() error { return injected }
+		if _, err := bs.Put(ctx, "p", bytes.NewReader(data)); !errors.Is(err, injected) {
+			t.Fatalf("put: %v", err)
+		}
+		hooks.failAfterCommit = nil
+
+		if got := blobChunkCount(t, st); got == 0 {
+			t.Fatal("the committed upload's chunks were swept after a post-commit failure")
+		}
+		rc, info, err := bs.Get(ctx, "p")
+		if err != nil {
+			t.Fatalf("get after a post-commit failure: %v", err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("blob content after a post-commit failure: %q %v, want %q", got, err, data)
+		}
+		if info.Size != int64(len(data)) || info.Chunks == 0 {
+			t.Fatalf("blob info after a post-commit failure: %+v", info)
+		}
+	})
+}
+
 // TestBlobSweep covers what crashes leave behind: a Put that dies mid-write,
 // one that dies after switching the pointer but before removing the old
 // upload, and the interplay of Sweep with Puts still writing.

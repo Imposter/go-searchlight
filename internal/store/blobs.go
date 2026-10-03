@@ -40,6 +40,13 @@ type blobStore struct {
 	// the named point: "chunk" after each chunk, or "cleanup" after the
 	// pointer switch commits.
 	crash func(point string) bool
+
+	// failAfterCommit, when set (tests only), is called right after Put's
+	// pointer-switch transaction commits; a non-nil result is returned from
+	// Put instead of nil, exercising the case where something goes wrong
+	// between commit and return (a cancelled context, a transient error)
+	// without touching the chunks that are now live.
+	failAfterCommit func() error
 }
 
 // Blob store tuning.
@@ -83,8 +90,14 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 	if _, err := s.w.ExecContext(ctx, reg, upload, name); err != nil {
 		return info, fmt.Errorf("register blob upload: %w", err)
 	}
+	// committed becomes true once switchTo's transaction makes upload the
+	// live one; after that, upload's chunks must never be swept by this
+	// defer, however Put goes on to fail (a cancelled context, a transient
+	// error, a test's injected failure) — only a failure before the switch
+	// means upload is still this call's own, abandoned attempt.
+	committed := false
 	defer func() {
-		if err != nil && !errors.Is(err, errSimulatedCrash) {
+		if err != nil && !committed && !errors.Is(err, errSimulatedCrash) {
 			b.removeUpload(context.WithoutCancel(ctx), upload)
 		}
 	}()
@@ -123,17 +136,26 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
 
-	old, err := b.switchTo(ctx, name, upload, size, chunks, sum)
+	old, createdAt, err := b.switchTo(ctx, name, upload, size, chunks, sum)
 	if err != nil {
 		return info, err
 	}
+	// The blob is now committed: upload is live, and its chunks must stay
+	// put no matter what happens from here on.
+	committed = true
+	info = BlobInfo{Name: name, Size: size, Chunks: chunks, SHA256: sum, CreatedAt: millis(createdAt)}
 	if b.crashAt("cleanup") {
 		return info, errSimulatedCrash
 	}
 	if old != "" {
 		b.removeUpload(context.WithoutCancel(ctx), old)
 	}
-	return b.Stat(ctx, name)
+	if b.failAfterCommit != nil {
+		if ferr := b.failAfterCommit(); ferr != nil {
+			return info, ferr
+		}
+	}
+	return info, nil
 }
 
 // sweptCheck turns an update of an upload's registration that matched no
@@ -152,41 +174,46 @@ func sweptCheck(res sql.Result, err error, name string) error {
 	return nil
 }
 
-// switchTo points name at upload and returns the upload it replaced, now
-// registered for removal.
-func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int64, chunks int, sum string) (string, error) {
+// switchTo points name at upload and returns the upload it replaced (now
+// registered for removal) and the commit timestamp it stamped on the row,
+// so the caller can report the result without a second read.
+func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int64, chunks int, sum string) (old string, createdAt int64, err error) {
 	s := b.s
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer rollback(tx)
+	// One read of the database clock serves both the row and the return
+	// value, so they can never disagree.
+	if err := tx.QueryRowContext(ctx, "SELECT "+s.d.Now).Scan(&createdAt); err != nil {
+		return "", 0, err
+	}
 	// The upload must still be registered, or Sweep has started removing it.
 	res, err := tx.ExecContext(ctx, s.bind("DELETE FROM sl_blob_uploads WHERE upload_id = ?"), upload)
 	if err := sweptCheck(res, err, name); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	// Make sure the row exists and lock it, so that of two concurrent Puts
 	// the second sees the first's upload as the one it replaces.
 	ensure := "INSERT INTO sl_blobs (name, upload_id, size, chunks, sha256, created_at) VALUES (?, '', 0, 0, '', 0)" +
 		s.d.Upsert([]string{"name"}, []string{"name"})
 	if _, err := tx.ExecContext(ctx, s.bind(ensure), name); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	var old string
 	if err := tx.QueryRowContext(ctx, s.bind("SELECT upload_id FROM sl_blobs WHERE name = ?"+s.d.ForUpdate), name).Scan(&old); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	set := "UPDATE sl_blobs SET upload_id = ?, size = ?, chunks = ?, sha256 = ?, created_at = " + s.d.Now + " WHERE name = ?"
-	if _, err := tx.ExecContext(ctx, s.bind(set), upload, size, chunks, sum, name); err != nil {
-		return "", err
+	set := s.bind("UPDATE sl_blobs SET upload_id = ?, size = ?, chunks = ?, sha256 = ?, created_at = ? WHERE name = ?")
+	if _, err := tx.ExecContext(ctx, set, upload, size, chunks, sum, createdAt, name); err != nil {
+		return "", 0, err
 	}
 	if old != "" {
 		if err := b.registerGarbage(ctx, tx, old, name); err != nil {
-			return "", err
+			return "", 0, err
 		}
 	}
-	return old, tx.Commit()
+	return old, createdAt, tx.Commit()
 }
 
 // registerGarbage records an upload that is no longer referenced with

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,13 +53,28 @@ func checkMerges(t *testing.T, p TieredPolicy, cands []MergeCandidate, merges []
 
 func TestTieredPolicy(t *testing.T) {
 	p := DefaultTieredPolicy()
+	if p.MaxMergedBytes != 1<<30 {
+		t.Fatalf("default MaxMergedBytes %d, want 1 GiB (merges are in memory)", p.MaxMergedBytes)
+	}
+	// Segments over half the cap (600 MiB) are left alone, however many there are.
+	cands := segs(12, 1<<10)
+	for i := range 12 {
+		cands = append(cands, MergeCandidate{ID: fmt.Sprintf("big%d", i), Bytes: 600 << 20, Docs: 1000})
+	}
+	for _, mm := range p.FindMerges(cands) {
+		for _, id := range mm {
+			if strings.HasPrefix(id, "big") {
+				t.Fatalf("merge %v takes a segment past half the 1 GiB cap", mm)
+			}
+		}
+	}
 
 	// Up to SegmentsPerTier small segments: nothing to do.
 	if m := p.FindMerges(segs(10, 1<<10)); len(m) != 0 {
 		t.Fatalf("10 small segments: merges %v", m)
 	}
 	// More: merge MaxMergeAtOnce of them at a time, down to the allowed count.
-	cands := segs(25, 1<<10)
+	cands = segs(25, 1<<10)
 	m := p.FindMerges(cands)
 	if n := checkMerges(t, p, cands, m); len(m) == 0 || n < 15 {
 		t.Fatalf("25 small segments: merges %v", m)

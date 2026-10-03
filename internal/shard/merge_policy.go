@@ -23,7 +23,10 @@ type TieredPolicy struct {
 	SegmentsPerTier int
 	// MaxMergeAtOnce is the most segments one merge takes. Default 10.
 	MaxMergeAtOnce int
-	// MaxMergedBytes caps a merge's result. Default 5 GiB.
+	// MaxMergedBytes caps a merge's result. Default 1 GiB, not Lucene's 5 GiB:
+	// segment.Merge holds every live document's stored body in memory while it
+	// writes (a streaming merge is parked to Task 14), so this also bounds a merge's
+	// memory, once per concurrent merge.
 	MaxMergedBytes int64
 	// FloorSegmentBytes is the size a smaller segment counts as. Default 2 MiB.
 	FloorSegmentBytes int64
@@ -32,12 +35,13 @@ type TieredPolicy struct {
 	DeletesPctAllowed float64
 }
 
-// DefaultTieredPolicy returns Lucene's defaults (Elasticsearch's too).
+// DefaultTieredPolicy returns Lucene's defaults (Elasticsearch's too), except a 1 GiB
+// MaxMergedBytes (see its comment).
 func DefaultTieredPolicy() TieredPolicy {
 	return TieredPolicy{
 		SegmentsPerTier:   10,
 		MaxMergeAtOnce:    10,
-		MaxMergedBytes:    5 << 30,
+		MaxMergedBytes:    1 << 30,
 		FloorSegmentBytes: 2 << 20,
 		DeletesPctAllowed: 20,
 	}

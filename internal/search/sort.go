@@ -334,7 +334,7 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 	}
 	ss := newSegSorter(s)
 	first := ss.cols[0].spec
-	if first.kind == sortID && !first.desc && rankCache.get(s.sv.ID) == nil &&
+	if first.kind == sortID && !first.desc &&
 		hits.GetCardinality()*16 >= uint64(s.n) {
 		return s.topByIDWalk(hits, k)
 	}
@@ -388,7 +388,8 @@ func (s *segExec) collectNumberWindows(ss *segSorter, h *topHeap, hits *roaring.
 		span = edge - st.Min
 	}
 	density := float64(hits.GetCardinality()) / float64(max(s.n, 1))
-	frac := 2 * float64(k) / (density * float64(st.Count))
+	// Start narrow (a skewed column holds many values near its edge) and widen fast.
+	frac := float64(k) / (8 * density * float64(st.Count))
 	if density == 0 || frac >= 1 || span <= 0 || math.IsInf(span, 0) {
 		ss.collect(h, hits, k)
 		return
@@ -486,6 +487,11 @@ func (s *segExec) toSegHits(ss *segSorter, es []entry) []segHit {
 			}
 		}
 		out[i] = segHit{seg: s.seg, ord: e.ord, vals: vals}
+		if ss.rank != nil {
+			// The rank array was built: the id is one dictionary lookup away, no
+			// stored record to decompress.
+			out[i].id, out[i].hasID = s.r.IDAt(ss.rank[e.ord])
+		}
 	}
 	return out
 }

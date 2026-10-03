@@ -172,6 +172,7 @@ func TestEveryLeafEqualsBruteForce(t *testing.T) {
 		values = 60
 	}
 	docs := c.docs()
+	defer func() { docValuesFactor = 16 }()
 	for _, f := range queryFields {
 		for _, op := range query.Ops {
 			for range values {
@@ -184,7 +185,9 @@ func TestEveryLeafEqualsBruteForce(t *testing.T) {
 					continue
 				}
 				want := docIDs(brute(docs, q, nil))
-				for pass := range 2 {
+				for pass := range 3 {
+					// Pass 2 collects ranges from the point index, never doc values.
+					docValuesFactor = map[int]uint64{0: 16, 1: 16, 2: 0}[pass]
 					got, err := c.search(&Request{Query: q, Size: MaxSize, TrackTotal: TrackTotalAll})
 					if err != nil {
 						t.Fatalf("%s: %v", raw, err)

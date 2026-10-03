@@ -492,6 +492,12 @@ func (s *segExec) evalLeaf(lp *leafPlan, scope *roaring.Bitmap) *roaring.Bitmap 
 			return roaring.And(bm, scope)
 		}
 	}
+	if pred, ok := numericPredicate(lp); ok && scope.GetCardinality() <= docValuesFactor*s.estimateLeaf(lp).card {
+		// Unless the range is far narrower than what is left in question, reading the
+		// documents' values (a few nanoseconds each) beats collecting the range's
+		// documents from the point index (Lucene's IndexOrDocValuesQuery).
+		return s.numericScan(lp.field, pred, scope)
+	}
 	c := s.candidates(lp)
 	if c.maybe == nil || c.maybe.IsEmpty() {
 		if lp.useCache {
@@ -539,4 +545,80 @@ func boolTerm(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// docValuesFactor is how much larger than a range's estimated matches the scope may
+// be for the range to be checked on doc values rather than collected from the point
+// index. A variable so tests can force either path.
+var docValuesFactor uint64 = 16
+
+// numericPredicate returns a range condition's test on a number, as candidates
+// computes its range: false when the leaf is not a range or holds nothing.
+func numericPredicate(lp *leafPlan) (func(float64) bool, bool) {
+	a := &lp.arg
+	switch lp.op {
+	case query.OpLt, query.OpLte, query.OpGt, query.OpGte:
+		if a.Kind != query.ArgNumber || !a.Scalar.Finite {
+			return nil, false
+		}
+		x := a.Scalar.Number
+		switch lp.op {
+		case query.OpLt:
+			return func(v float64) bool { return v < x }, true
+		case query.OpLte:
+			return func(v float64) bool { return v <= x }, true
+		case query.OpGt:
+			return func(v float64) bool { return v > x }, true
+		default:
+			return func(v float64) bool { return v >= x }, true
+		}
+	case query.OpBetween:
+		if a.Kind != query.ArgList || len(a.List) != 2 {
+			return nil, false
+		}
+		lo, hi := a.List[0], a.List[1]
+		if lo.Kind != query.ArgNumber || !lo.Finite || hi.Kind != query.ArgNumber || !hi.Finite || lo.Number > hi.Number {
+			return nil, false
+		}
+		return func(v float64) bool { return lo.Number <= v && v <= hi.Number }, true
+	}
+	return nil, false
+}
+
+// numericScanChunk is how many ordinals one parallel task of numericScan covers.
+const numericScanChunk = 1 << 16
+
+// numericScan returns the documents of scope whose number holds pred, scanning
+// stretches of 65536 ordinals in parallel on the search pool.
+func (s *segExec) numericScan(field string, pred func(float64) bool, scope *roaring.Bitmap) *roaring.Bitmap {
+	nc := s.r.Numbers(field)
+	if !nc.Exists() || scope.IsEmpty() {
+		return roaring.New()
+	}
+	first, last := scope.Minimum(), scope.Maximum()
+	chunks := int(last/numericScanChunk-first/numericScanChunk) + 1
+	parts := make([]*roaring.Bitmap, chunks)
+	runParallel(chunks, func(c int) {
+		lo := (first/numericScanChunk + uint32(c)) * numericScanChunk //nolint:gosec // c < chunks
+		out := roaring.New()
+		keep := make([]uint32, 0, 256)
+		it := scope.Iterator()
+		it.AdvanceIfNeeded(lo)
+		for it.HasNext() {
+			d := it.Next()
+			if d-lo >= numericScanChunk {
+				break
+			}
+			if v, ok := nc.Value(d); ok && pred(v) {
+				keep = append(keep, d)
+				if len(keep) == cap(keep) {
+					out.AddMany(keep)
+					keep = keep[:0]
+				}
+			}
+		}
+		out.AddMany(keep)
+		parts[c] = out
+	})
+	return roaring.FastOr(parts...)
 }

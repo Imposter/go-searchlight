@@ -136,7 +136,7 @@ type segExec struct {
 
 	scanned int64
 	err     error
-	warned  bool
+	warned  atomic.Bool // residual checks run in parallel
 }
 
 func newSegExec(ctx context.Context, p *prepared, g *shard.Generation, i int) *segExec {
@@ -171,10 +171,9 @@ func (s *segExec) fail(err error) {
 }
 
 func (s *segExec) warnResidual(id string, err error) {
-	if s.warned {
+	if !s.warned.CompareAndSwap(false, true) {
 		return
 	}
-	s.warned = true
 	telemetry.WithRequest(s.ctx).WarnContext(s.ctx, "search: a stored document does not analyze; it matches no residual check",
 		slog.String("segment", s.sv.ID), slog.String("id", id), slog.Any("error", err))
 }
@@ -427,28 +426,12 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 		m.order = append(m.order, i)
 	}
 	heap.Init(m)
-	var out []Hit
-	for len(out) < p.size && m.Len() > 0 && m.err == nil {
+	// Choose first, reading ids only where they break a tie; then fetch the chosen
+	// records in parallel: a stored block's decompression is most of a small search.
+	var chosen []*segHit
+	for len(chosen) < p.size && m.Len() > 0 && m.err == nil {
 		i := m.order[0]
-		h := m.head(i)
-		id := m.id(h)
-		body, err := g.Segments[h.seg].Reader.Stored(h.ord)
-		if err != nil {
-			return nil, fmt.Errorf("search: segment %s: %w", g.Segments[h.seg].ID, err)
-		}
-		if len(p.fields) > 0 {
-			if body, err = filterBody(body, p.fields); err != nil {
-				return nil, fmt.Errorf("search: document %q: %w", id, err)
-			}
-		}
-		sortVals := make([]any, len(p.sorts))
-		copy(sortVals, h.vals)
-		for j, spec := range p.sorts {
-			if spec.kind == sortID {
-				sortVals[j] = id
-			}
-		}
-		out = append(out, Hit{ID: id, Sort: sortVals, Body: body})
+		chosen = append(chosen, m.head(i))
 		m.pos[i]++
 		if m.pos[i] == len(m.lists[i]) {
 			heap.Pop(m)
@@ -459,7 +442,49 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 	if m.err != nil {
 		return nil, m.err
 	}
+	out := make([]Hit, len(chosen))
+	errs := make([]error, len(chosen))
+	const perTask = 2
+	runParallel((len(chosen)+perTask-1)/perTask, func(task int) {
+		for k := task * perTask; k < min(len(chosen), (task+1)*perTask); k++ {
+			out[k], errs[k] = fetchHit(g, p, chosen[k])
+		}
+	})
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
+}
+
+// fetchHit reads one chosen hit's id and body.
+func fetchHit(g *shard.Generation, p *prepared, h *segHit) (Hit, error) {
+	sv := &g.Segments[h.seg]
+	if !h.hasID {
+		id, err := sv.Reader.ID(h.ord)
+		if err != nil {
+			return Hit{}, fmt.Errorf("search: segment %s: %w", sv.ID, err)
+		}
+		h.id, h.hasID = id, true
+	}
+	body, err := sv.Reader.Stored(h.ord)
+	if err != nil {
+		return Hit{}, fmt.Errorf("search: segment %s: %w", sv.ID, err)
+	}
+	if len(p.fields) > 0 {
+		if body, err = filterBody(body, p.fields); err != nil {
+			return Hit{}, fmt.Errorf("search: document %q: %w", h.id, err)
+		}
+	}
+	sortVals := make([]any, len(p.sorts))
+	copy(sortVals, h.vals)
+	for j, spec := range p.sorts {
+		if spec.kind == sortID {
+			sortVals[j] = h.id
+		}
+	}
+	return Hit{ID: h.id, Sort: sortVals, Body: body}, nil
 }
 
 // filterBody keeps the members of a stored JSON object named in fields, in fields'

@@ -4,6 +4,7 @@ import (
 	"math"
 	"sync"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -48,60 +49,76 @@ func (s *segExec) verify(lp *leafPlan, cand, out *roaring.Bitmap) {
 	}
 }
 
-// verifyBodies re-analyzes each candidate's stored body.
+// verifyBodies re-analyzes each candidate's stored body, in parallel chunks.
 func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
-	it := cand.Iterator()
-	for i := 0; it.HasNext(); i++ {
-		if i%checkEvery == 0 && s.checkCtx() {
-			return
+	ords := cand.ToArray()
+	keep := make([]bool, len(ords))
+	errs := s.parallelChunks(len(ords), func(lo, hi int) error {
+		for k := lo; k < hi; k++ {
+			ord := ords[k]
+			id, err := s.r.ID(ord)
+			if err != nil {
+				return err
+			}
+			body, err := s.r.Stored(ord)
+			if err != nil {
+				return err
+			}
+			doc, _, err := schema.Analyze(s.mapping, id, body)
+			if err != nil {
+				// A body the mapping now refuses (it only ever grows, so this is
+				// damage): it matches nothing it cannot be read for.
+				s.warnResidual(id, err)
+				continue
+			}
+			keep[k] = lp.match.Match(&doc)
 		}
-		ord := it.Next()
-		id, err := s.r.ID(ord)
-		if err != nil {
-			s.fail(err)
-			return
-		}
-		body, err := s.r.Stored(ord)
-		if err != nil {
-			s.fail(err)
-			return
-		}
-		doc, _, err := schema.Analyze(s.mapping, id, body)
-		if err != nil {
-			// A body the mapping now refuses (it only ever grows, so this is damage):
-			// it matches nothing it cannot be read for.
-			s.warnResidual(id, err)
-			continue
-		}
-		if lp.match.Match(&doc) {
+		return nil
+	})
+	if errs != nil {
+		s.fail(errs)
+		return
+	}
+	if s.checkCtx() {
+		return
+	}
+	for k, ord := range ords {
+		if keep[k] {
 			out.Add(ord)
 		}
 	}
 }
 
-// verifyTexts checks candidates by their keyword column value, once per value.
+// verifyChunk is how many candidates one parallel task checks.
+const verifyChunk = 512
+
+// parallelChunks runs fn over [0, n) in chunks on the search pool, stopping early
+// when the context ends (the caller then sees it through checkCtx). It returns the
+// first error fn returned.
+func (s *segExec) parallelChunks(n int, fn func(lo, hi int) error) error {
+	chunks := (n + verifyChunk - 1) / verifyChunk
+	errs := make([]error, chunks)
+	runParallel(chunks, func(c int) {
+		if s.ctx.Err() != nil {
+			return
+		}
+		errs[c] = fn(c*verifyChunk, min(n, (c+1)*verifyChunk))
+	})
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyTexts checks candidates by their keyword column value, once per distinct
+// value, in parallel chunks of the candidates' sorted ordinals: a dense chunk walks its
+// stretch of the dictionary once, a sparse one looks each ordinal up; neither
+// allocates per value.
 func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 	kc := s.r.Keywords(lp.field)
 	present := s.r.Present(lp.field)
-	text := ""
-	v := schema.Value{Present: true, Text: &text}
-	doc := schema.Doc{Fields: map[string]schema.Value{lp.field: v}}
-	// Documents with no text: the field missing, or present with another type.
-	var noText [2]int8 // by presence: 0 unknown, 1 no match, 2 match
-	matchNoText := func(p bool) bool {
-		i := 0
-		if p {
-			i = 1
-		}
-		if noText[i] == 0 {
-			doc.Fields[lp.field] = schema.Value{Present: p}
-			noText[i] = 1
-			if lp.match.Match(&doc) {
-				noText[i] = 2
-			}
-		}
-		return noText[i] == 2
-	}
 	docs := cand.ToArray()
 	ords := make([]uint32, len(docs))
 	const none = math.MaxUint32
@@ -114,41 +131,59 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 			ords[i] = none
 		}
 	}
+	list := wanted.ToArray()
+	hit := make([]bool, len(list))
+	_ = s.parallelChunks(len(list), func(lo, hi int) error {
+		var text string
+		doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: true, Text: &text}}}
+		check := func(k int, term []byte) {
+			// The matcher only reads the text during the call.
+			text = unsafe.String(unsafe.SliceData(term), len(term))
+			hit[k] = lp.match.Match(&doc)
+		}
+		if span := int(list[hi-1] - list[lo]); span <= 8*(hi-lo) {
+			k := lo
+			kc.EachTerm(list[lo], func(o uint32, term []byte) bool {
+				if o == list[k] {
+					check(k, term)
+					k++
+				}
+				return k < hi
+			})
+			return nil
+		}
+		for k := lo; k < hi; k++ {
+			kc.EachTerm(list[k], func(_ uint32, term []byte) bool {
+				check(k, term)
+				return false
+			})
+		}
+		return nil
+	})
+	if s.checkCtx() {
+		return
+	}
 	matched := roaring.New()
-	check := func(o uint32, term string) {
-		text = term
-		doc.Fields[lp.field] = v
-		if lp.match.Match(&doc) {
+	for k, o := range list {
+		if hit[k] {
 			matched.Add(o)
 		}
 	}
-	nTerms := kc.NumTerms()
-	if card := wanted.GetCardinality(); card*8 >= uint64(nTerms) {
-		// Many values: one ordered walk of the dictionary decodes each block once.
-		last := wanted.Maximum()
-		var o uint32
-		s.r.Terms(lp.field, kindValue, "", func(term string, _ uint32) bool {
-			if o%checkEvery == 0 && s.checkCtx() {
-				return false
-			}
-			if wanted.Contains(o) {
-				check(o, term)
-			}
-			o++
-			return o <= last
-		})
-	} else {
-		it := wanted.Iterator()
-		for i := 0; it.HasNext(); i++ {
-			if i%checkEvery == 0 && s.checkCtx() {
-				return
-			}
-			o := it.Next()
-			check(o, kc.Term(o))
+	// Documents with no text: the field missing, or present with another type.
+	var noText [2]int8 // by presence: 0 unknown, 1 no match, 2 match
+	matchNoText := func(p bool) bool {
+		i := 0
+		if p {
+			i = 1
 		}
-	}
-	if s.err != nil {
-		return
+		if noText[i] == 0 {
+			doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: p}}}
+			noText[i] = 1
+			if lp.match.Match(&doc) {
+				noText[i] = 2
+			}
+		}
+		return noText[i] == 2
 	}
 	keep := make([]uint32, 0, len(docs))
 	for i, d := range docs {

@@ -2,7 +2,9 @@ package search
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"testing"
 
@@ -102,4 +104,55 @@ func cmpSorts(a, b []any, sorts []SortField) int {
 		}
 	}
 	return 0
+}
+
+// TestNumberSortWindows: number sorts over enough documents that the point-index
+// windows (not a full scan) find the top hits, with ties, missing values, deletes,
+// filters and cursors, equal brute force.
+func TestNumberSortWindows(t *testing.T) {
+	seed := testSeed(t)
+	rng := rand.New(rand.NewPCG(seed, seed^0x50e7))
+	c := newCluster(t, 2)
+	for round := range 2 {
+		for i := range 2500 {
+			body := `{"brand":"x"}`
+			switch rng.IntN(10) {
+			case 0: // missing
+			case 1:
+				body = fmt.Sprintf(`{"price":%d,"brand":"y"}`, rng.IntN(5)) // ties
+			default:
+				body = fmt.Sprintf(`{"price":%v,"brand":%q}`, math.Round(math.Exp(rng.Float64()*8)*100)/100, pick(rng, []string{"x", "y", "z"}))
+			}
+			c.upsert(fmt.Sprintf("d%05d", rng.IntN(2500)+round*1000+i%3), body)
+		}
+		c.refreshAll()
+	}
+	docs := c.docs()
+	for range 150 {
+		sorts := []SortField{{Field: "price", Desc: rng.IntN(2) == 0}}
+		if rng.IntN(3) == 0 {
+			sorts = append(sorts, SortField{Field: "brand", Desc: rng.IntN(2) == 0})
+		}
+		var q query.Node = &query.All{}
+		if rng.IntN(2) == 0 {
+			q = mustParse(t, fmt.Sprintf(`{"field":"brand","op":"eq","value":%q}`, pick(rng, []string{"x", "y", "z"})))
+		}
+		want := brute(docs, q, sorts)
+		size := 1 + rng.IntN(25)
+		var after []any
+		start := 0
+		if rng.IntN(2) == 0 && len(want) > 0 {
+			start = 1 + rng.IntN(len(want)-1+1) - 1
+			after = expectedSort(want[start], sorts)
+			start++
+		}
+		got, err := c.search(&Request{Query: q, Sort: sorts, Size: size, SearchAfter: after})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantIDs := docIDs(want[min(start, len(want)):min(start+size, len(want))])
+		if ids := hitIDs(got.Hits); !slices.Equal(ids, wantIDs) {
+			t.Fatalf("sort %+v after %v size %d:\n got %q\nwant %q", sorts, after, size, ids, wantIDs)
+		}
+	}
 }

@@ -1,0 +1,1083 @@
+openapi: 3.1.0
+info:
+  title: Searchlight API
+  version: "1"
+  summary: Search and percolation over SQL-backed, memory-mapped segments.
+  description: |
+    Searchlight's public HTTP/JSON API (spec section 5). Requests and responses are
+    JSON, except `_bulk`, which is NDJSON. Every error is problem JSON (RFC 9457) with
+    a machine-readable `code` and, for a refused request, `problems` whose `loc` is a
+    dotted path into the request (`query.all.2.any.0.value`, `params.wait_for_seq`,
+    `line.3.upsert.id`).
+
+    **Consistency.** Every write answers with the `seq` it committed (acknowledged =
+    committed to SQL). Writes become searchable within the index's refresh interval;
+    `refresh=wait_for` returns once the write is searchable on this node, and
+    `refresh=true` refreshes the written shards at once. Any read takes
+    `wait_for_seq=N` and waits, under the request deadline, until every change up to N
+    is searchable (read-your-writes). GET of one document or saved query is realtime.
+
+    **Limits.** Bodies over `max_body_bytes` and documents over `max_doc_bytes` are
+    413, as is a `_bulk` of more than `max_bulk_ops` operations. A copy whose write
+    buffer is full, or that trails its writes, answers writes with 429 and
+    `Retry-After`; so does a node with `search_queue` reads in progress. Every request
+    has a deadline (`request_timeout`): a search past it answers what it found with
+    `timed_out`, a wait past it is 504.
+
+    **Auth.** Bearer tokens from `tokens_file`, read-only or read-write. `/healthz` and
+    `/readyz` need none.
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8780
+security:
+  - bearer: []
+tags:
+  - name: indexes
+  - name: documents
+  - name: search
+  - name: queries
+  - name: percolate
+  - name: cluster
+  - name: probes
+
+paths:
+  /healthz:
+    get:
+      tags: [probes]
+      operationId: healthz
+      summary: Liveness.
+      security: []
+      responses:
+        "200":
+          description: The process serves.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        default: { $ref: "#/components/responses/Error" }
+  /readyz:
+    get:
+      tags: [probes]
+      operationId: readyz
+      summary: Readiness.
+      description: 503 while the node drains for shutdown, the database does not answer, or a shard copy is recovering or halted.
+      security: []
+      responses:
+        "200":
+          description: The node takes traffic.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        default: { $ref: "#/components/responses/Error" }
+  /metrics:
+    get:
+      tags: [probes]
+      operationId: metrics
+      summary: Prometheus metrics (also on the admin listener, unauthenticated).
+      responses:
+        "200":
+          description: The Prometheus text exposition.
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /_cluster/health:
+    get:
+      tags: [cluster]
+      operationId: clusterHealth
+      summary: The cluster's health, green, yellow or red.
+      responses:
+        "200":
+          description: The health.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClusterHealth" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /_cluster/nodes:
+    get:
+      tags: [cluster]
+      operationId: clusterNodes
+      summary: The cluster's nodes.
+      responses:
+        "200":
+          description: The nodes.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [nodes]
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /_cluster/shards:
+    get:
+      tags: [cluster]
+      operationId: clusterShards
+      summary: Every shard copy with its applied, refreshed and committed seq and lag.
+      responses:
+        "200":
+          description: The shard copies.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [shards]
+                properties:
+                  shards:
+                    type: array
+                    items: { $ref: "#/components/schemas/ShardInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /indexes:
+    get:
+      tags: [indexes]
+      operationId: listIndexes
+      summary: Every index, by name.
+      responses:
+        "200":
+          description: The indexes.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [indexes]
+                properties:
+                  indexes:
+                    type: array
+                    items: { $ref: "#/components/schemas/IndexInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    put:
+      tags: [indexes]
+      operationId: createIndex
+      summary: Create an index with a mapping and settings.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                mapping: { $ref: "#/components/schemas/Mapping" }
+                settings: { $ref: "#/components/schemas/IndexSettings" }
+      responses:
+        "201":
+          description: The index.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IndexInfo" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [indexes]
+      operationId: getIndex
+      summary: Describe an index.
+      responses:
+        "200":
+          description: The index.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IndexInfo" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [indexes]
+      operationId: deleteIndex
+      summary: Drop an index with its documents and saved queries.
+      responses:
+        "200":
+          description: Dropped.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Acknowledged" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/mapping:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    patch:
+      tags: [indexes]
+      operationId: patchMapping
+      summary: Add fields to the mapping (additive only).
+      description: A field that exists with another type is a 400. An index with `dynamic` false refuses new fields (409), since its documents may already hold them unindexed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fields]
+              properties:
+                fields:
+                  type: object
+                  additionalProperties: { $ref: "#/components/schemas/FieldType" }
+      responses:
+        "200":
+          description: The index.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IndexInfo" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/settings:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    patch:
+      tags: [indexes]
+      operationId: patchSettings
+      summary: Change the refresh interval or the replica target.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
+                replicas_per_shard: { type: integer, minimum: 0, maximum: 1024 }
+      responses:
+        "200":
+          description: The index.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IndexInfo" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /indexes/{index}/docs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+      - $ref: "#/components/parameters/ID"
+    put:
+      tags: [documents]
+      operationId: putDocument
+      summary: Create or replace a document.
+      parameters:
+        - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/OpType"
+        - $ref: "#/components/parameters/Refresh"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DocumentBody" }
+      responses:
+        "200": { $ref: "#/components/responses/Written" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [documents]
+      operationId: getDocument
+      summary: Read a document (realtime).
+      parameters:
+        - $ref: "#/components/parameters/WaitForSeq"
+      responses:
+        "200":
+          description: The document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Document" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [documents]
+      operationId: deleteDocument
+      summary: Delete a document.
+      parameters:
+        - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/OpType"
+        - $ref: "#/components/parameters/Refresh"
+      responses:
+        "200": { $ref: "#/components/responses/Written" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/_bulk:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    post:
+      tags: [documents]
+      operationId: bulk
+      summary: NDJSON upserts and deletes, in one transaction.
+      description: |
+        An action line per operation, then the document for an upsert:
+
+            {"upsert": {"id": "a"}}
+            {"title": "Red chair", "price": 30}
+            {"create": {"id": "b"}}
+            {"title": "Blue chair"}
+            {"delete": {"id": "c", "if_seq": 12}}
+
+        `index` is an alias of `upsert` and `_id` of `id`; `create` requires the
+        document to be new. An operation refused on its own (an invalid document, a
+        failed `if_seq`) is reported in its item, with `errors` set, and the rest
+        commit. A malformed action line, a line over `max_doc_bytes` or more than
+        `max_bulk_ops` operations refuse the whole request before anything is
+        written. A delete of a document that does not exist is a 404 item (result
+        not_found) and writes nothing. With `percolate=true` each upserted
+        document's item lists the saved queries it matches, as written: against
+        every saved query committed through this node before the percolation, and
+        every change up to `wait_for_seq` when it is given (a seq past the newest
+        committed one is a 400, before anything is written).
+      parameters:
+        - $ref: "#/components/parameters/Refresh"
+        - name: percolate
+          in: query
+          schema: { type: boolean }
+          description: Return each upserted document's matching saved queries.
+        - $ref: "#/components/parameters/WaitForSeq"
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema: { type: string }
+      responses:
+        "200":
+          description: Each operation's outcome.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BulkResponse" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /indexes/{index}/_search:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    post:
+      tags: [search]
+      operationId: search
+      summary: Search an index.
+      parameters:
+        - $ref: "#/components/parameters/WaitForSeq"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: The hits, total and aggregations.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/_count:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    post:
+      tags: [search]
+      operationId: count
+      summary: Count the matching documents exactly.
+      parameters:
+        - $ref: "#/components/parameters/WaitForSeq"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                query: { $ref: "#/components/schemas/Query" }
+      responses:
+        "200":
+          description: The count.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [count, relation, timed_out]
+                properties:
+                  count: { type: integer }
+                  relation: { type: string, enum: [eq, gte] }
+                  timed_out: { type: boolean }
+                  stale: { type: boolean }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /indexes/{index}/queries:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    get:
+      tags: [queries]
+      operationId: listQueries
+      summary: Page through the saved queries by id (realtime).
+      parameters:
+        - name: after
+          in: query
+          schema: { type: string }
+          description: The previous page's `next`.
+        - name: size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - $ref: "#/components/parameters/WaitForSeq"
+      responses:
+        "200":
+          description: A page of saved queries.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [queries, next]
+                properties:
+                  queries:
+                    type: array
+                    items: { $ref: "#/components/schemas/SavedQuery" }
+                  next:
+                    type: [string, "null"]
+                    description: Pass as `after` for the next page; null on the last.
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/queries/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+      - $ref: "#/components/parameters/ID"
+    put:
+      tags: [queries]
+      operationId: putQuery
+      summary: Create or replace a saved query.
+      parameters:
+        - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/OpType"
+        - $ref: "#/components/parameters/Refresh"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [query]
+              properties:
+                query: { $ref: "#/components/schemas/Query" }
+                meta:
+                  type: object
+                  description: An opaque object of at most 16 KiB, returned as given.
+      responses:
+        "200": { $ref: "#/components/responses/Written" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [queries]
+      operationId: getQuery
+      summary: Read a saved query (realtime).
+      parameters:
+        - $ref: "#/components/parameters/WaitForSeq"
+      responses:
+        "200":
+          description: The saved query.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SavedQuery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [queries]
+      operationId: deleteQuery
+      summary: Delete a saved query.
+      parameters:
+        - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/OpType"
+        - $ref: "#/components/parameters/Refresh"
+      responses:
+        "200": { $ref: "#/components/responses/Written" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /indexes/{index}/_percolate:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    post:
+      tags: [percolate]
+      operationId: percolate
+      summary: The saved queries each document matches.
+      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order.
+      parameters:
+        - $ref: "#/components/parameters/WaitForSeq"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                docs:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/DocumentBody" }
+                ids:
+                  type: array
+                  maxItems: 10000
+                  items: { type: string }
+      responses:
+        "200":
+          description: Each document's matching saved queries.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [took_ms, results]
+                properties:
+                  took_ms: { type: integer }
+                  stale: { type: boolean }
+                  results:
+                    type: array
+                    items: { $ref: "#/components/schemas/PercolateResult" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+  /indexes/{index}/_fields:
+    parameters:
+      - $ref: "#/components/parameters/Index"
+    get:
+      tags: [search]
+      operationId: fields
+      summary: The field catalogue, from the mapping, with each list field's top entries.
+      parameters:
+        - name: entries
+          in: query
+          schema: { type: integer, minimum: 0, maximum: 1000, default: 0 }
+          description: How many of each keyword_list field's most frequent entries to list.
+        - $ref: "#/components/parameters/WaitForSeq"
+      responses:
+        "200":
+          description: The fields.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldCatalog" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/TooMany" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        default: { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: A token from tokens_file; read-only tokens may only read.
+
+  parameters:
+    Index:
+      name: index
+      in: path
+      required: true
+      description: 1 to 255 bytes of lowercase letters, digits, '-', '_' and '.', starting with a letter or digit.
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9._-]{0,254}$" }
+    ID:
+      name: id
+      in: path
+      required: true
+      description: A document or saved-query id, 1 to 512 bytes of UTF-8 without NUL; percent-encode '/'.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+    IfSeq:
+      name: if_seq
+      in: query
+      description: Apply only if the target's current seq is this one (409 otherwise).
+      schema: { type: integer, minimum: 1 }
+    OpType:
+      name: op_type
+      in: query
+      description: create applies only if the target does not exist (409 otherwise).
+      schema: { type: string, enum: [create, upsert, index] }
+    Refresh:
+      name: refresh
+      in: query
+      description: true refreshes the written shards at once; wait_for returns once the write is searchable on this node.
+      schema: { type: string, enum: ["true", wait_for, "false"] }
+    WaitForSeq:
+      name: wait_for_seq
+      in: query
+      description: Wait, under the request deadline, until every change up to this seq is searchable on the copies the read uses.
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    Error:
+      description: |
+        Any other problem: 408 request_timeout (a body slower than read_timeout),
+        413 too_large, 429 too_many_requests (backpressure, a full search_queue or
+        in-flight byte budget), 499 client_closed_request, 500 internal, 503
+        unavailable, 504 timeout.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Written:
+      description: Committed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/WriteResponse" }
+    Invalid:
+      description: The request is invalid; `problems` lists where.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unauthorized:
+      description: No valid bearer token.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Forbidden:
+      description: The token is read-only.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    NotFound:
+      description: The index, document or saved query does not exist (code index_not_found, document_not_found, query_not_found or not_found).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Conflict:
+      description: An if_seq or create condition failed (code conflict, with current_seq), or the index exists (index_exists).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooLarge:
+      description: The body, a document or the bulk is over its limit.
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    TooMany:
+      description: Backpressure; retry after Retry-After seconds.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Timeout:
+      description: The request's deadline passed while it waited (wait_for_seq).
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+    Unavailable:
+      description: The database or a shard copy is unavailable, or the node is shutting down.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Status:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string }
+    Acknowledged:
+      type: object
+      additionalProperties: false
+      required: [acknowledged]
+      properties:
+        acknowledged: { type: boolean }
+    Problem:
+      type: object
+      additionalProperties: false
+      description: RFC 9457 problem details.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, description: "urn:searchlight:problem:<code>" }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          enum: [invalid_request, unauthorized, forbidden, not_found, index_not_found, document_not_found, query_not_found,
+            method_not_allowed, index_exists, conflict, too_large, too_many_requests, timeout, request_timeout,
+            client_closed_request, unavailable, internal]
+        detail: { type: string }
+        request_id: { type: string }
+        current_seq: { type: integer, description: A failed if_seq's current seq. }
+        result: { type: string, enum: [not_found], description: A delete of a document or saved query that does not exist (404). }
+        stale: { type: boolean, description: Set on a 404 read from this node's copy while the database cannot be reached. }
+        problems:
+          type: array
+          items: { $ref: "#/components/schemas/ProblemLoc" }
+    ProblemLoc:
+      type: object
+      additionalProperties: false
+      required: [loc, message]
+      properties:
+        loc: { type: string, examples: ["query.all.2.any.0.value"] }
+        message: { type: string }
+    FieldType:
+      type: string
+      enum: [keyword, text, keyword_list, number, bool, date]
+    Mapping:
+      type: object
+      additionalProperties: false
+      properties:
+        dynamic:
+          description: true types a new field from its first value; false keeps it unindexed; strict refuses it.
+          oneOf:
+            - type: boolean
+            - type: string
+              enum: ["true", "false", strict]
+        fields:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/FieldType" }
+    RefreshInterval:
+      description: A positive duration ("1s", "250ms"), or -1 to refresh only on demand.
+      oneOf:
+        - type: string
+        - type: integer
+          const: -1
+    IndexSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        shards: { type: integer, minimum: 1, maximum: 1024, default: 1, description: Fixed at creation. }
+        replicas_per_shard: { type: integer, minimum: 0, maximum: 1024, default: 0, description: 0 means every node holds every shard. }
+        refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
+    IndexInfo:
+      type: object
+      additionalProperties: false
+      required: [name, uid, version, created_at, mapping, settings, docs, queries]
+      properties:
+        name: { type: string }
+        uid: { type: string, description: This incarnation of the index. }
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+        mapping: { $ref: "#/components/schemas/Mapping" }
+        settings: { $ref: "#/components/schemas/IndexSettings" }
+        docs: { type: integer, description: Live documents searchable on this node. }
+        queries: { type: integer, description: Live saved queries searchable on this node. }
+    DocumentBody:
+      type: object
+      description: A document, at most max_doc_bytes of JSON.
+    Document:
+      type: object
+      additionalProperties: false
+      required: [id, body]
+      properties:
+        id: { type: string }
+        seq: { type: integer, description: The seq of the change that last wrote it; pass it as if_seq. Absent on a stale read. }
+        body: { $ref: "#/components/schemas/DocumentBody" }
+        stale: { type: boolean, description: "The database could not be reached: read from this node's copy, which may trail the latest write." }
+    WriteResponse:
+      type: object
+      additionalProperties: false
+      required: [id, seq]
+      properties:
+        id: { type: string }
+        seq: { type: integer, description: The seq the write committed; pass it as wait_for_seq. }
+        timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
+    BulkResponse:
+      type: object
+      additionalProperties: false
+      required: [took_ms, seq, errors, timed_out, items]
+      properties:
+        took_ms: { type: integer }
+        seq: { type: integer, description: The newest seq the request committed (0 when none). }
+        errors: { type: boolean }
+        timed_out: { type: boolean }
+        percolated:
+          type: boolean
+          description: With percolate=true, whether the items carry their matching saved queries (false when the percolation could not finish after the writes committed).
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [op, id, status]
+            properties:
+              op: { type: string, enum: [upsert, delete] }
+              id: { type: string }
+              status: { type: integer }
+              seq: { type: integer }
+              queries:
+                type: array
+                items: { type: string }
+              error: { $ref: "#/components/schemas/Problem" }
+    Query:
+      description: 'A tree of groups and conditions (spec section 4); {"all": []} matches every document.'
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [all]
+          properties:
+            all: { type: array, items: { $ref: "#/components/schemas/Query" } }
+        - type: object
+          additionalProperties: false
+          required: [any]
+          properties:
+            any: { type: array, items: { $ref: "#/components/schemas/Query" } }
+        - type: object
+          additionalProperties: false
+          required: [not]
+          properties:
+            not: { $ref: "#/components/schemas/Query" }
+        - type: object
+          additionalProperties: false
+          required: [field, op]
+          properties:
+            field: { type: string }
+            op:
+              type: string
+              enum: [eq, ne, in, lt, lte, gt, gte, between, exists, contains, contains_any, contains_all, starts_with,
+                words_all, words_any, similar, has, has_any, has_all, empty, nonempty]
+            value: {}
+    SearchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        query: { $ref: "#/components/schemas/Query" }
+        sort:
+          description: 'Field names or {"field": "asc"|"desc"}; the _id breaks ties.'
+          type: array
+          items: {}
+        size: { type: integer, minimum: 0, maximum: 10000, default: 10 }
+        search_after:
+          type: array
+          description: The previous page's next.
+          items: {}
+        track_total:
+          description: true counts exactly, false not past the hits, a number exactly up to it (default 10000).
+          oneOf:
+            - type: boolean
+            - type: integer
+              minimum: 1
+        aggs:
+          type: object
+          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep.'
+        aggregations:
+          type: object
+          description: An alias of aggs.
+        fields:
+          type: array
+          items: { type: string }
+          description: Limit each hit's body to these members.
+        timeout:
+          description: A duration ("250ms") or milliseconds; past it the response holds what was found, with timed_out.
+          oneOf:
+            - type: string
+            - type: number
+    SearchResponse:
+      type: object
+      additionalProperties: false
+      required: [took_ms, timed_out, total, hits, next]
+      properties:
+        took_ms: { type: integer }
+        timed_out: { type: boolean }
+        stale: { type: boolean, description: "The database cannot be reached: the copies answered with what they had, which may trail the latest writes." }
+        total:
+          type: object
+          additionalProperties: false
+          required: [value, relation]
+          properties:
+            value: { type: integer }
+            relation: { type: string, enum: [eq, gte] }
+        hits:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, sort]
+            properties:
+              id: { type: string }
+              sort: { type: array, items: {} }
+              body: { type: object }
+        next:
+          type: [array, "null"]
+          description: The search_after of the next page; null on a short page.
+          items: {}
+        aggs:
+          type: object
+          additionalProperties: true
+    SavedQuery:
+      type: object
+      additionalProperties: false
+      required: [id, seq, query, meta]
+      properties:
+        id: { type: string }
+        seq: { type: integer }
+        query: { $ref: "#/components/schemas/Query" }
+        meta: { type: object }
+        stale: { type: boolean, description: "The database could not be reached: read from this node's copy." }
+    PercolateResult:
+      type: object
+      additionalProperties: false
+      required: [found, queries]
+      properties:
+        id: { type: string, description: A stored document's id; absent for a given document. }
+        found: { type: boolean, description: False for a stored id with no live document. }
+        queries:
+          type: array
+          items: { type: string }
+    FieldCatalog:
+      type: object
+      additionalProperties: false
+      required: [dynamic, fields]
+      properties:
+        dynamic:
+          oneOf:
+            - type: boolean
+            - type: string
+              enum: [strict]
+        fields:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, type]
+            properties:
+              name: { type: string }
+              type: { $ref: "#/components/schemas/FieldType" }
+              entries:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required: [value, count]
+                  properties:
+                    value: { type: string }
+                    count: { type: integer }
+    ClusterHealth:
+      type: object
+      additionalProperties: false
+      required: [status, nodes, indexes, shards, serving_shards, unassigned]
+      properties:
+        status: { type: string, enum: [green, yellow, red] }
+        nodes: { type: integer }
+        indexes: { type: integer }
+        shards: { type: integer }
+        serving_shards: { type: integer }
+        unassigned: { type: integer }
+    NodeInfo:
+      type: object
+      additionalProperties: false
+      required: [id, address, version, self]
+      properties:
+        id: { type: string }
+        address: { type: string }
+        version: { type: string }
+        self: { type: boolean }
+    ShardInfo:
+      type: object
+      additionalProperties: false
+      required: [index, shard, node, state, applied_seq, refreshed_seq, committed_seq, lag, docs]
+      properties:
+        index: { type: string }
+        shard: { type: integer }
+        node: { type: string }
+        state: { type: string, enum: [serving, recovering, halted] }
+        applied_seq: { type: integer }
+        refreshed_seq: { type: integer }
+        committed_seq: { type: integer }
+        lag: { type: integer }
+        docs: { type: integer }
+        error: { type: string }

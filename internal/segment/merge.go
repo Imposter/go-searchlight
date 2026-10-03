@@ -5,10 +5,16 @@ import (
 	"math"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2"
 )
+
+// storedRec is one merged document's id and body, indexed by its new ordinal.
+type storedRec struct {
+	id   string
+	body []byte
+}
 
 // Merge combines inputs into one new segment in dir, dropping every document that is
 // not live: set in its reader's corresponding entry of deletes (which may be nil for an
@@ -18,6 +24,13 @@ import (
 // same live documents would, by construction (both write the same fieldBuilder data
 // through the same section writers); Merge only ever reads from inputs and never
 // rewrites them.
+//
+// Merge has no [BuildOptions] of its own (its signature is fixed), so it parallelizes
+// itself, up to GOMAXPROCS: inputs are split into contiguous, ascending groups of
+// readers, one per worker, each merged into its own fieldBuilder per field exactly as
+// a single-worker Merge would merge all of inputs; the groups are then merged with
+// everything else [writeSegmentParts] merges parts with, so Merge is parallel the same
+// way, and for the same reason, [Build] is.
 func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error) {
 	remaps := make([][]int32, len(inputs))
 	var total uint32
@@ -38,8 +51,88 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 		return Meta{}, fmt.Errorf("segment: merge produces %d documents, over the uint32 ordinal space", total)
 	}
 
+	recs := make([]storedRec, total)
+	groups := splitReaderRanges(len(inputs), runtime.GOMAXPROCS(0))
+	parts := make([]map[string]*fieldBuilder, len(groups))
+	errs := make([]error, len(groups))
+	mergeGroups(inputs, remaps, recs, groups, parts, errs)
+	for _, err := range errs {
+		if err != nil {
+			return Meta{}, err
+		}
+	}
+
+	names := unionFieldNames(parts)
+	name := genName()
+	path := filepath.Join(dir, name+FileExt)
+	meta, err := writeSegmentParts(path, total, names, parts, storedFromSlice(func(ord uint32) (string, []byte) {
+		return recs[ord].id, recs[ord].body
+	}, total))
+	if err != nil {
+		return Meta{}, err
+	}
+	meta.ID = name
+	return meta, nil
+}
+
+// readerRange is a contiguous, half-open range of input-reader indices: one worker's
+// share of a [Merge].
+type readerRange struct{ start, end int }
+
+// splitReaderRanges divides [0, n) readers into workers contiguous, ascending ranges
+// (as [splitRanges] does for document ordinals). Always returns at least one range.
+func splitReaderRanges(n, workers int) []readerRange {
+	switch {
+	case workers < 1:
+		workers = 1
+	case n == 0:
+		workers = 1
+	case workers > n:
+		workers = n
+	}
+	ranges := make([]readerRange, workers)
+	base, rem := n/workers, n%workers
+	start := 0
+	for i := range ranges {
+		size := base
+		if i < rem {
+			size++
+		}
+		ranges[i] = readerRange{start: start, end: start + size}
+		start += size
+	}
+	return ranges
+}
+
+// mergeGroups merges each of groups' readers into parts[i] (and errs[i], if it
+// fails), one goroutine per group when there is more than one.
+func mergeGroups(inputs []*Reader, remaps [][]int32, recs []storedRec, groups []readerRange, parts []map[string]*fieldBuilder, errs []error) {
+	run := func(i int, rg readerRange) {
+		parts[i], errs[i] = mergeGroup(inputs[rg.start:rg.end], remaps[rg.start:rg.end], recs)
+	}
+	if len(groups) == 1 {
+		run(0, groups[0])
+		return
+	}
+	var wg sync.WaitGroup
+	for i, rg := range groups {
+		wg.Add(1)
+		go func(i int, rg readerRange) {
+			defer wg.Done()
+			run(i, rg)
+		}(i, rg)
+	}
+	wg.Wait()
+}
+
+// mergeGroup merges readers (a contiguous slice of Merge's inputs) into one
+// fieldBuilder per field they use, writing each live document's stored record
+// straight into its slot of the shared recs (disjoint across every call: readers'
+// remapped ordinals never overlap between groups), and sorts each builder's term
+// dictionaries ready for the merge-and-write pass.
+func mergeGroup(readers []*Reader, remaps [][]int32, recs []storedRec) (map[string]*fieldBuilder, error) {
 	fieldSet := map[string]bool{}
-	for _, r := range inputs {
+	for _, r := range readers {
 		for name := range r.fields {
 			fieldSet[name] = true
 		}
@@ -48,21 +141,14 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 	for name := range fieldSet {
 		names = append(names, name)
 	}
-	sort.Strings(names)
 
 	builders := make(map[string]*fieldBuilder, len(names))
 	for _, name := range names {
 		builders[name] = newFieldBuilder()
 	}
 
-	type storedRec struct {
-		id   string
-		body []byte
-	}
-	recs := make([]storedRec, total)
-
-	for i, r := range inputs {
-		remap := remaps[i]
+	for ri, r := range readers {
+		remap := remaps[ri]
 		views := fieldViewsFor(r, names)
 		for oldOrd := uint32(0); oldOrd < r.numDocs; oldOrd++ {
 			newOrd := remap[oldOrd]
@@ -71,7 +157,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 			}
 			id, body, err := r.storedRecord(oldOrd)
 			if err != nil {
-				return Meta{}, err
+				return nil, err
 			}
 			recs[newOrd] = storedRec{id: id, body: append([]byte(nil), body...)}
 			for _, name := range names {
@@ -91,20 +177,10 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 			mergeTermsOnly(builders[name], fi, r.data, remap, KindGram)
 		}
 	}
-
-	name := genName()
-	path := filepath.Join(dir, name+FileExt)
-	// Merge has no BuildOptions of its own to take a Threads value from (its public
-	// signature is fixed by the plan), so it parallelizes field preparation itself,
-	// up to GOMAXPROCS - the same lever BuildOptions.Threads gives Build.
-	meta, err := writeSegment(path, total, names, builders, storedFromSlice(func(ord uint32) (string, []byte) {
-		return recs[ord].id, recs[ord].body
-	}, total), runtime.GOMAXPROCS(0))
-	if err != nil {
-		return Meta{}, err
+	for _, b := range builders {
+		b.sortTermGroups()
 	}
-	meta.ID = name
-	return meta, nil
+	return builders, nil
 }
 
 func bitmapOrEmpty(deletes []*roaring.Bitmap, i int) *roaring.Bitmap {

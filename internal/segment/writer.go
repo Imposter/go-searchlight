@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
@@ -25,13 +26,19 @@ type BuildOptions struct {
 	// the name is retired (for example, a merge's inputs, which by the time Merge
 	// returns are no longer the live segment set).
 	Name string
-	// Threads is how many goroutines [Build] (and [Merge]) use for each segment's
-	// per-field preparation: sorting its term pairs and choosing its numeric
-	// encoding, which is where the CPU time goes for high-cardinality fields. 0 or 1
-	// is sequential. The section writer itself - the part that advances the file's
-	// byte offset and so must run in a fixed order - always runs single-threaded
-	// afterward, in sorted field order, so the bytes Build writes are identical
-	// regardless of Threads.
+	// Threads is how many goroutines [Build] uses to accumulate documents into
+	// fields: 0 or 1 is sequential, one worker covering every document. A value
+	// above 1 splits the documents into that many contiguous ordinal ranges, one per
+	// worker, each building its own, independent fieldBuilder per field; the result
+	// is then merged per field - a k-way merge of each worker's already-sorted term
+	// dictionaries, and a concatenation, in range order, of its doc-values and
+	// presence data - into the single dictionary and columns the file holds. That
+	// merge, not the workers, is what the plan's "done when" build-throughput target
+	// is measured against ([BuildOptions.Threads] set to every core), and it is the
+	// same code for one worker as for many: the bytes Build writes are identical for
+	// any Threads value, because a range's own data does not depend on how many
+	// other ranges there are or what order they finish in, only on the (fixed, by
+	// construction) order the ranges themselves cover the documents in.
 	Threads int
 }
 
@@ -54,6 +61,38 @@ func genName() string {
 	return hex.EncodeToString(b[:])
 }
 
+// docRange is a contiguous, half-open range of document ordinals: one worker's share
+// of a [Build], or one group of a [Merge]'s input readers.
+type docRange struct{ start, end uint32 }
+
+// splitRanges divides [0, numDocs) into workers contiguous, ascending, as-equal-as-
+// possible ranges (the last few one document larger, if numDocs does not divide
+// evenly). Always returns at least one range, even for numDocs == 0 (an empty one),
+// so callers never need to special-case "no documents" separately from "one worker".
+func splitRanges(numDocs uint32, workers int) []docRange {
+	switch {
+	case workers < 1:
+		workers = 1
+	case numDocs == 0:
+		workers = 1
+	case uint32(workers) > numDocs: //nolint:gosec // numDocs > 0 here, so this comparison is meaningful
+		workers = int(numDocs)
+	}
+	ranges := make([]docRange, workers)
+	base := numDocs / uint32(workers)
+	rem := numDocs % uint32(workers)
+	var start uint32
+	for i := range ranges {
+		size := base
+		if uint32(i) < rem {
+			size++
+		}
+		ranges[i] = docRange{start: start, end: start + size}
+		start += size
+	}
+	return ranges
+}
+
 // Build writes docs as one immutable segment file in dir and returns its [Meta]. Each
 // document's position in docs is its ordinal in the segment (0 to len(docs)-1), stable
 // for the segment's life.
@@ -66,31 +105,16 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	}
 	numDocs := uint32(len(docs)) //nolint:gosec // checked above
 
-	builders := make(map[string]*fieldBuilder)
-	get := func(name string) *fieldBuilder {
-		b, ok := builders[name]
-		if !ok {
-			b = newFieldBuilder()
-			builders[name] = b
-		}
-		return b
-	}
-	for ord := range docs {
-		for name, v := range docs[ord].Fields {
-			if !v.Present {
-				continue
-			}
-			addValue(get(name), uint32(ord), v)
-		}
-	}
-	names := fieldNames(builders)
+	ranges := splitRanges(numDocs, opts.Threads)
+	parts := buildPartsParallel(docs, ranges)
+	names := unionFieldNames(parts)
 
 	name := opts.Name
 	if name == "" {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegment(path, numDocs, names, builders, storedFromDocs(docs), opts.Threads)
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs))
 	if err != nil {
 		return Meta{}, err
 	}
@@ -98,12 +122,55 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	return meta, nil
 }
 
-// addValue folds one document's field value into its builder, as [Build] and the
-// doc-major pass of [Merge] both do. A duplicate (term, doc) pair - the same word or
-// gram occurring more than once in one document's text - is harmless to add more than
-// once: [writeTermPairsDict] collapses it into one posting when it sorts and writes
-// the dictionary, so there is no need to deduplicate here (which would cost an
-// allocation per document to do with a map).
+// buildPartsParallel builds one part (a field name to fieldBuilder map) per range,
+// each in its own goroutine when there is more than one range.
+func buildPartsParallel(docs []schema.Doc, ranges []docRange) []map[string]*fieldBuilder {
+	parts := make([]map[string]*fieldBuilder, len(ranges))
+	if len(ranges) == 1 {
+		parts[0] = buildPart(docs, ranges[0])
+		return parts
+	}
+	var wg sync.WaitGroup
+	for i, rg := range ranges {
+		wg.Add(1)
+		go func(i int, rg docRange) {
+			defer wg.Done()
+			parts[i] = buildPart(docs, rg)
+		}(i, rg)
+	}
+	wg.Wait()
+	return parts
+}
+
+// buildPart accumulates rg's documents into one fieldBuilder per field they use, and
+// sorts each one's term dictionaries ready for the merge-and-write pass.
+func buildPart(docs []schema.Doc, rg docRange) map[string]*fieldBuilder {
+	builders := make(map[string]*fieldBuilder)
+	for ord := rg.start; ord < rg.end; ord++ {
+		for name, v := range docs[ord].Fields {
+			if !v.Present {
+				continue
+			}
+			b, ok := builders[name]
+			if !ok {
+				b = newFieldBuilder()
+				builders[name] = b
+			}
+			addValue(b, ord, v)
+		}
+	}
+	for _, b := range builders {
+		b.sortTermGroups()
+	}
+	return builders
+}
+
+// addValue folds one document's field value into its builder, as [Build] and
+// [mergeDoc] both do (through their own, analogous per-value cases: this one reads a
+// [schema.Value] directly, where Merge reads a reader's already-analyzed columns). A
+// duplicate (term, doc) pair - the same word or gram occurring more than once in one
+// document's text - is harmless to add more than once: [termPairs.add] collapses it
+// into one posting, so there is no need to deduplicate here.
 func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	b.presence.Add(ord)
 	if v.GramsTruncated {
@@ -136,13 +203,35 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	}
 }
 
-func fieldNames(builders map[string]*fieldBuilder) []string {
-	names := make([]string, 0, len(builders))
-	for name := range builders {
+// unionFieldNames returns every field name any part has a builder for, sorted: the
+// field directory's order, and the order [writeSegmentParts] visits fields in.
+func unionFieldNames(parts []map[string]*fieldBuilder) []string {
+	set := make(map[string]bool)
+	for _, m := range parts {
+		for name := range m {
+			set[name] = true
+		}
+	}
+	names := make([]string, 0, len(set))
+	for name := range set {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+// partsFor returns one *fieldBuilder per part for field name, substituting empty for
+// any part that built nothing for it (a field some ranges' documents never used).
+func partsFor(parts []map[string]*fieldBuilder, name string, empty *fieldBuilder) []*fieldBuilder {
+	out := make([]*fieldBuilder, len(parts))
+	for i, m := range parts {
+		if b, ok := m[name]; ok {
+			out[i] = b
+		} else {
+			out[i] = empty
+		}
+	}
+	return out
 }
 
 // storedSource yields every live document's id and body, by ascending ordinal.
@@ -159,14 +248,13 @@ func storedFromDocs(docs []schema.Doc) storedSource {
 	}
 }
 
-// writeSegment writes every section from builders (by field name, in names's order,
-// which must be sorted) and stored, to a fresh segment file at path. threads is as
-// [BuildOptions.Threads] documents: it only affects how prepareFields parallelizes
-// preparing builders, never the order sections are written in, so the file is
-// byte-for-byte identical for any threads value.
-func writeSegment(path string, numDocs uint32, names []string, builders map[string]*fieldBuilder, stored storedSource, threads int) (Meta, error) {
-	prepareFields(names, builders, numDocs, threads)
-
+// writeSegmentParts writes every section, merging parts (by field name, in names's
+// order, which must be sorted) and stored, to a fresh segment file at path. parts may
+// have any length: one (a sequential build, or any Merge with one effective worker)
+// or many (one per [BuildOptions.Threads] worker, or one per Merge reader group) -
+// writeFieldDicts and friends treat those identically, which is what makes the file
+// byte-for-byte the same either way.
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -183,31 +271,33 @@ func writeSegment(path string, numDocs uint32, names []string, builders map[stri
 	w := newFileWriter(f)
 	w.header()
 
-	outs := make(map[string]*fieldOutput, len(names))
+	empty := newFieldBuilder()
+	scratch := make(map[string]*fieldScratch, len(names))
+	for _, name := range names {
+		scratch[name] = newFieldScratch()
+	}
 
 	w.beginSection(sectionTerms)
 	for _, name := range names {
-		out := &fieldOutput{}
-		outs[name] = out
-		builders[name].writeDicts(w, out)
+		writeFieldDicts(w, partsFor(parts, name, empty), scratch[name])
 	}
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
 	for _, name := range names {
-		builders[name].writeDocValues(w, numDocs, outs[name])
+		writeFieldDocValues(w, partsFor(parts, name, empty), numDocs, scratch[name])
 	}
 	w.endSection()
 
 	w.beginSection(sectionPoints)
 	for _, name := range names {
-		builders[name].writePointsSection(w, numDocs, outs[name])
+		writeFieldPoints(w, numDocs, scratch[name])
 	}
 	w.endSection()
 
 	w.beginSection(sectionPresence)
 	for _, name := range names {
-		builders[name].writePresence(w, outs[name])
+		writeFieldPresence(w, partsFor(parts, name, empty), scratch[name].out)
 	}
 	w.endSection()
 
@@ -230,6 +320,10 @@ func writeSegment(path string, numDocs uint32, names []string, builders map[stri
 	w.endSection()
 
 	w.beginSection(sectionMeta)
+	outs := make(map[string]*fieldOutput, len(names))
+	for _, name := range names {
+		outs[name] = scratch[name].out
+	}
 	writeMeta(w, numDocs, storedIndexOff, names, outs)
 	w.endSection()
 

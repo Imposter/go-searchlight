@@ -53,9 +53,7 @@ func BenchmarkTailThroughput(b *testing.B) {
 			for i := range b.N {
 				b.StopTimer()
 				sh := openShard(b, filepath.Join(b.TempDir(), fmt.Sprint(i)), benchShardOptions())
-				if err := sh.Advance(1); err != nil { // tail, rather than load a snapshot
-					b.Fatal(err)
-				}
+				primeShard(b, st, sh) // tail, rather than load a snapshot
 				opts := testOptions()
 				opts.PollInterval = time.Hour
 				tl := NewTailer(st, sh, id, opts)
@@ -174,5 +172,27 @@ func BenchmarkWriteToSearchable(b *testing.B) {
 			b.ReportMetric(float64(lat[len(lat)/2].Microseconds())/1000, "p50-ms")
 			b.ReportMetric(float64(lat[len(lat)*99/100].Microseconds())/1000, "p99-ms")
 		})
+	}
+}
+
+// primeShard gives an empty shard the index's mapping and incarnation and moves it
+// past seq 1, as if it had applied it: a tailer then tails it rather than loading a
+// snapshot.
+func primeShard(b *testing.B, st store.Store, sh *shard.Shard) {
+	b.Helper()
+	ctx := context.Background()
+	meta, err := st.Indexes().Get(ctx, "b")
+	if err != nil {
+		b.Fatal(err)
+	}
+	m, err := parseMapping(meta.Mapping)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := sh.Load(ctx, []shard.Change{{Kind: shard.Remap, Mapping: m, MappingVersion: meta.MappingVersion, IndexUID: meta.UID}}); err != nil {
+		b.Fatal(err)
+	}
+	if err := sh.Advance(1); err != nil {
+		b.Fatal(err)
 	}
 }

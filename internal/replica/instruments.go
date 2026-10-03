@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"context"
 	"log/slog"
 	"slices"
 
@@ -12,10 +13,15 @@ import (
 )
 
 // instruments are a tailer's metrics (spec section 11), labelled with its index and
-// shard.
+// shard. The lag and halted gauges are observed at each collection from the tailer's
+// state, so they stay live while the copy is stuck.
 type instruments struct {
-	lagSeq        metric.Float64Gauge
-	lagTime       metric.Float64Gauge
+	meter         metric.Meter
+	log           *slog.Logger
+	lagSeq        metric.Float64ObservableGauge
+	lagTime       metric.Float64ObservableGauge
+	halted        metric.Float64ObservableGauge
+	progress      metric.Float64Gauge
 	batchSize     metric.Float64Histogram
 	applyDur      metric.Float64Histogram
 	recoveryDur   metric.Float64Histogram
@@ -35,8 +41,12 @@ func newInstruments(meter metric.Meter, id ShardID, log *slog.Logger) *instrumen
 	in := telemetry.NewInstruments(meter)
 	base := []attribute.KeyValue{attribute.String(telemetry.KeyIndex, id.Index), attribute.Int(telemetry.KeyShard, id.Shard)}
 	i := &instruments{
-		lagSeq:        in.Gauge(telemetry.MetricReplicaLagSeq),
-		lagTime:       in.Gauge(telemetry.MetricReplicaLagTime),
+		meter:         meter,
+		log:           log,
+		lagSeq:        in.ObservableGauge(telemetry.MetricReplicaLagSeq),
+		lagTime:       in.ObservableGauge(telemetry.MetricReplicaLagTime),
+		halted:        in.ObservableGauge(telemetry.MetricReplicaHalted),
+		progress:      in.Gauge(telemetry.MetricReplicaRecoveryProgress),
 		batchSize:     in.Histogram(telemetry.MetricReplicaApplyBatchSize),
 		applyDur:      in.Histogram(telemetry.MetricReplicaApplyDuration),
 		recoveryDur:   in.Histogram(telemetry.MetricReplicaRecoveryDuration),
@@ -51,6 +61,27 @@ func newInstruments(meter metric.Meter, id ShardID, log *slog.Logger) *instrumen
 		log.Error("replica metrics unavailable", slog.Any("error", err))
 	}
 	return i
+}
+
+// observe reports t's lag and halt at every collection until the returned function
+// is called (Run registers it for its life).
+func (i *instruments) observe(t *Tailer) func() {
+	reg, err := i.meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		seq, age := t.Lag()
+		halted := 0.0
+		if t.Halt() != nil {
+			halted = 1
+		}
+		o.ObserveFloat64(i.lagSeq, float64(seq), i.attrs)
+		o.ObserveFloat64(i.lagTime, age.Seconds(), i.attrs)
+		o.ObserveFloat64(i.halted, halted, i.attrs)
+		return nil
+	}, i.lagSeq, i.lagTime, i.halted)
+	if err != nil {
+		i.log.Error("replica lag metrics unavailable", slog.Any("error", err))
+		return func() {}
+	}
+	return func() { _ = reg.Unregister() }
 }
 
 // with returns the base attributes plus extra.

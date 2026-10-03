@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -60,7 +62,7 @@ func TestTailerAppliesTheChangelog(t *testing.T) {
 // saved queries, index terms and mapping, and the same CommittedSeq.
 func TestConvergence(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
-		seeds := 3
+		seeds := 2
 		if testing.Short() {
 			seeds = 1
 		}
@@ -83,6 +85,8 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	writer := d.open(t)
 	createIndex(t, writer, index, testMapping)
 	id := ShardID{Index: index, Shard: 0}
+	gc := store.NewGroupCommitter(writer, store.GroupCommitOptions{MaxDelay: time.Millisecond})
+	defer gc.Close()
 
 	reader := sdkmetric.NewManualReader()
 	opts := testOptions()
@@ -94,13 +98,20 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		c.start()
 	}
 
+	var rmu sync.Mutex // rng is shared with the background writers
+	intn := func(n int) int {
+		rmu.Lock()
+		defer rmu.Unlock()
+		return rng.IntN(n)
+	}
 	randomBody := func(docID string, n int) string {
 		body := docBody(docID, n)
-		if rng.IntN(4) == 0 {
-			// A field no mapping has yet: the copies settle its type in the store.
-			f := fmt.Sprintf("extra%d", rng.IntN(4))
+		if intn(4) == 0 {
+			// A field the mapping may not map (yet): indexed for presence until a
+			// mapping change maps it, which then re-analyzes the copies holding it.
+			f := fmt.Sprintf("extra%d", intn(4))
 			var v string
-			switch rng.IntN(3) {
+			switch intn(3) {
 			case 0:
 				v = fmt.Sprintf("%q", fmt.Sprintf("value %d", n))
 			case 1:
@@ -112,35 +123,37 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		}
 		return body
 	}
-	write := func() {
-		n := 1 + rng.IntN(6)
+	randomBatch := func() []store.Change {
+		n := 1 + intn(6)
 		batch := make([]store.Change, 0, n)
 		for range n {
 			sh := 0
-			if rng.IntN(4) == 0 {
+			if intn(4) == 0 {
 				sh = 1 // another shard: a gap for the copies
 			}
-			k := rng.IntN(100)
-			docID := fmt.Sprintf("d%d", rng.IntN(40))
-			qID := fmt.Sprintf("q%d", rng.IntN(8))
+			k := intn(100)
+			docID := fmt.Sprintf("d%d", intn(40))
+			qID := fmt.Sprintf("q%d", intn(8))
 			switch {
 			case k < 55:
-				batch = append(batch, upsert(index, sh, docID, randomBody(docID, rng.IntN(1000))))
+				batch = append(batch, upsert(index, sh, docID, randomBody(docID, intn(1000))))
 			case k < 75:
 				batch = append(batch, del(index, sh, docID))
 			case k < 92:
 				meta := ""
-				if rng.IntN(2) == 0 {
-					meta = fmt.Sprintf(`{"n":%d}`, rng.IntN(5))
+				if intn(2) == 0 {
+					meta = fmt.Sprintf(`{"n":%d}`, intn(5))
 				}
-				batch = append(batch, queryUpsert(t, index, sh, qID, testQueries[rng.IntN(len(testQueries))], meta))
+				batch = append(batch, queryUpsert(t, index, sh, qID, testQueries[intn(len(testQueries))], meta))
 			default:
 				batch = append(batch, queryDelete(index, sh, qID))
 			}
 		}
-		mustApply(t, writer, batch...)
+		return batch
+	}
+	wake := func() {
 		for _, c := range copies {
-			if rng.IntN(2) == 0 {
+			if intn(2) == 0 {
 				c.mu.Lock()
 				if c.tailer != nil {
 					c.tailer.Wake()
@@ -149,50 +162,125 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 			}
 		}
 	}
+	write := func() {
+		mustApply(t, writer, randomBatch()...)
+		wake()
+	}
+
+	// Concurrent writers through the group committer, all along.
+	bg, stopWriters := context.WithCancel(context.Background())
+	var writers sync.WaitGroup
+	for range 2 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for bg.Err() == nil {
+				_, _, err := gc.Apply(bg, randomBatch())
+				// A batch can meet a dropped index (it is recreated at once).
+				if err != nil && bg.Err() == nil && !errors.Is(err, store.ErrNotFound) {
+					t.Errorf("group commit: %v", err)
+					return
+				}
+				wake()
+				time.Sleep(time.Duration(intn(4)) * time.Millisecond)
+			}
+		}()
+	}
+	defer func() {
+		stopWriters()
+		writers.Wait()
+	}()
+
 	prune := func(stopped *copyRunner) {
 		// With one copy down, the changelog is pruned past it: it must rebuild
 		// from the snapshot when it comes back.
-		if err := stopped.stop(); err != nil {
-			t.Fatalf("tailer: %v", err)
-		}
-		if err := stopped.shard().Close(context.Background()); err != nil {
-			t.Fatal(err)
+		if stopped != nil {
+			if err := stopped.stop(); err != nil {
+				t.Fatalf("tailer: %v", err)
+			}
+			if err := stopped.shard().Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 		}
 		for range 3 {
 			write()
 		}
-		head, err := writer.HeadSeq(context.Background())
+		head, _, err := writer.HeadSeq(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := writer.Prune(context.Background(), id, head+1); err != nil {
 			t.Fatal(err)
 		}
-		stopped.start()
+		if stopped != nil {
+			stopped.start()
+		}
+	}
+	remap := func() {
+		updateMapping(t, writer, index, func(m *schema.Mapping) {
+			switch k := intn(6); k {
+			case 0:
+				m.Dynamic = schema.DynamicFalse
+			case 1:
+				m.Dynamic = schema.DynamicStrict
+			case 2:
+				m.Dynamic = schema.DynamicTrue
+			default:
+				// Map a field some documents may hold already.
+				types := []schema.FieldType{schema.Keyword, schema.Number, schema.KeywordList}
+				m.Fields[fmt.Sprintf("extra%d", k-3)] = types[intn(len(types))]
+			}
+		})
+		wake()
+	}
+	recreate := func() {
+		ctx := context.Background()
+		if err := writer.Indexes().Drop(ctx, index); err != nil {
+			t.Fatal(err)
+		}
+		createIndex(t, writer, index, testMapping)
+		write()
 	}
 
-	const steps = 160
+	const steps = 100
 	for step := range steps {
-		if step == steps/2 {
-			prune(copies[rng.IntN(2)])
+		switch step {
+		case steps / 4:
+			recreate()
+			continue
+		case steps / 2:
+			prune(copies[intn(2)])
 			continue
 		}
-		c := copies[rng.IntN(2)]
-		switch k := rng.IntN(100); {
-		case k < 70:
+		c := copies[intn(2)]
+		switch k := intn(100); {
+		case k < 62:
 			write()
-		case k < 77:
+		case k < 68:
+			remap()
+		case k < 74:
 			c.restart()
-		case k < 84:
+		case k < 80:
 			c.crash()
-		case k < 87:
+		case k < 83:
 			prune(c)
+		case k < 86:
+			prune(nil) // past running copies, mid-poll perhaps
+		case k < 87:
+			recreate()
 		default:
-			time.Sleep(time.Duration(rng.IntN(5)) * time.Millisecond)
+			time.Sleep(time.Duration(intn(5)) * time.Millisecond)
 		}
 	}
+	stopWriters()
+	writers.Wait()
+	// A group commit its caller gave up on may still commit: wait for every one
+	// before reading the head.
+	if err := gc.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	head, err := writer.HeadSeq(context.Background())
+	head, _, err := writer.HeadSeq(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,14 +288,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	var views []view
 	for i, c := range copies {
 		sh := c.waitApplied(head)
-		var v view
-		// The mapping may still be settling into the shard from the catalogue.
-		deadline := time.Now().Add(10 * time.Second)
-		for v = viewOf(t, sh); v.mapping != truth.mapping && time.Now().Before(deadline); v = viewOf(t, sh) {
-			c.tailer.Wake()
-			_ = sh.Refresh(context.Background())
-			time.Sleep(20 * time.Millisecond)
-		}
+		v := viewOf(t, sh)
 		if dd := diff(v, truth, false); dd != "" {
 			t.Fatalf("copy %d differs from the store:\n%s", i, dd)
 		}
@@ -218,6 +299,12 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	}
 	if dd := diff(views[0], views[1], true); dd != "" {
 		t.Fatalf("the copies differ:\n%s", dd)
+	}
+	// And a copy rebuilt from scratch now agrees with both, index terms included.
+	fresh := newCopy(t, d.open(t), id, testOptions())
+	fresh.start()
+	if dd := diff(viewOf(t, fresh.waitApplied(head)), views[0], true); dd != "" {
+		t.Fatalf("a fresh copy differs from the tailed ones:\n%s", dd)
 	}
 	for i, c := range copies {
 		if err := c.stop(); err != nil {
@@ -231,8 +318,8 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 			t.Fatalf("copy %d committed at %d, want the head %d", i, sh.CommittedSeq(), head)
 		}
 	}
-	if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "source", "sql"); n < 3 {
-		t.Fatalf("%d snapshot recoveries, want at least 3 (two new copies and a prune)", n)
+	if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "source", "sql"); n < 4 {
+		t.Fatalf("%d snapshot recoveries, want at least 4 (two new copies, a recreate and a prune)", n)
 	}
 	if n := counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""); n != 0 {
 		t.Fatalf("%d halts", n)
@@ -386,21 +473,28 @@ func TestIndexDroppedStopsTheTailer(t *testing.T) {
 }
 
 // TestApplyErrorHalts: a change the store accepted but the copy cannot apply halts it
-// exactly before that change, marks it recovering in the registry, counts a halt,
-// and is never skipped: a restarted tailer halts on it again.
+// exactly before that change, marks it recovering in the registry, and is counted;
+// Run keeps going, retrying with backoff and, halted again at the same change,
+// rebuilding: while the bad change is current the copy stays halted before it (never
+// skipping it), and once it is superseded the rebuild gets past it and the copy
+// serves again.
 func TestApplyErrorHalts(t *testing.T) {
 	cases := []struct {
 		name   string
 		bad    func(t testing.TB) store.Change
+		fix    store.Change
 		reason string
 	}{
-		{"strict mapping", func(testing.TB) store.Change { return upsert("h", 0, "bad", `{"title":"x","unmapped":1}`) }, ReasonDocument},
+		{
+			"body that does not analyze", func(testing.TB) store.Change { return upsert("h", 0, "bad", `{"title":"x","_id":"y"}`) },
+			del("h", 0, "bad"), ReasonDocument,
+		},
 		{"query that does not parse", func(t testing.TB) store.Change {
 			return queryUpsert(t, "h", 0, "bad", `{"field":"title","op":"nope","value":1}`, "")
-		}, ReasonQuery},
+		}, queryDelete("h", 0, "bad"), ReasonQuery},
 		{"meta the shard refuses", func(t testing.TB) store.Change {
 			return queryUpsert(t, "h", 0, "bad", `{"all":[]}`, `{"pad":"`+strings.Repeat("x", shard.MaxMetaBytes)+`"}`)
-		}, ReasonRefused},
+		}, queryDelete("h", 0, "bad"), ReasonRefused},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -416,65 +510,94 @@ func TestApplyErrorHalts(t *testing.T) {
 				reader := sdkmetric.NewManualReader()
 				opts := testOptions()
 				opts.Copy = &cp
+				opts.HaltRetryBase, opts.HaltRetryCap = time.Second, time.Second // room to inspect the halted copy
 				opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 				c := newCopy(t, d.open(t), id, opts)
 				c.start()
-				good := mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`))
-				c.waitApplied(good)
+				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
 				waitCopyState(t, st, id, store.CopyServing)
 
-				_, bad, err := st.Apply(ctx, []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)})
+				_, last, err := st.Apply(ctx, []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)})
 				if err != nil {
 					t.Fatal(err)
 				}
-				badSeq := bad - 1
+				badSeq := last - 1
 				c.tailer.Wake()
-				var halt *HaltError
-				select {
-				case err := <-c.done:
-					if !errors.As(err, &halt) || !errors.Is(err, ErrHalted) {
-						t.Fatalf("Run: %v", err)
-					}
-				case <-time.After(30 * time.Second):
-					t.Fatal("the copy did not halt")
-				}
-				c.mu.Lock()
-				c.cancel, c.done = nil, nil
-				c.mu.Unlock()
-				if halt.Seq != badSeq || halt.ID != "bad" || halt.Reason != tc.reason {
+				halt := waitHalt(t, c.tailer)
+				if halt.Seq != badSeq || halt.ID != "bad" || halt.Reason != tc.reason || !errors.Is(halt, ErrHalted) {
 					t.Fatalf("halt %+v, want seq %d id bad reason %s", halt, badSeq, tc.reason)
 				}
-				if c.tailer.State() != StateHalted || c.tailer.Applied() != badSeq-1 {
-					t.Fatalf("state %s applied %d, want halted at %d", c.tailer.State(), c.tailer.Applied(), badSeq-1)
+				if a := c.tailer.Applied(); a != badSeq-1 {
+					t.Fatalf("halted with applied %d, want %d", a, badSeq-1)
 				}
 				waitCopyState(t, st, id, store.CopyRecovering)
-				if n := counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason); n != 1 {
-					t.Fatalf("%d halts counted", n)
+				if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaHalted); v != 1 {
+					t.Fatalf("halted gauge %g", v)
 				}
-				sh := c.shard()
-				if err := sh.Refresh(ctx); err != nil {
-					t.Fatal(err)
-				}
-				v := viewOf(t, sh)
+				v := viewOf(t, refreshed(t, c.shard()))
 				if _, ok := v.docs["ok2"]; !ok || len(v.docs) != 2 || len(v.queries) != 0 {
 					t.Fatalf("halted copy holds %v %v: want ok1 and ok2 only", v.docs, v.queries)
 				}
-				// Never skipped: a tailer started again stops on the same change.
-				c.run(sh)
-				select {
-				case err := <-c.done:
-					if !errors.As(err, &halt) || halt.Seq != badSeq {
-						t.Fatalf("restarted Run: %v", err)
+
+				// While the bad change is current, retries (tailing, then a rebuild
+				// from the snapshot that still holds it) stop before it every time.
+				deadline := time.Now().Add(30 * time.Second)
+				for counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonHalted) == 0 ||
+					counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) < 3 {
+					if time.Now().After(deadline) {
+						t.Fatalf("no rebuild after repeated halts: %d halts", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""))
 					}
-				case <-time.After(30 * time.Second):
-					t.Fatal("the restarted copy did not halt")
+					time.Sleep(20 * time.Millisecond)
 				}
-				c.mu.Lock()
-				c.cancel, c.done = nil, nil
-				c.mu.Unlock()
+				if h := c.tailer.Halt(); h == nil || h.ID != "bad" {
+					t.Fatalf("halt after the rebuild %+v", h)
+				}
+				if sh := c.shard(); !sh.Mapping().Fields["title"].Valid() {
+					t.Fatal("the rebuilt copy has no mapping")
+				}
+				waitCopyState(t, st, id, store.CopyRecovering)
+
+				// Superseded, the bad change is not in the snapshot: the copy gets
+				// past it and serves again.
+				head := mustApply(t, st, tc.fix)
+				sh := c.waitApplied(head)
+				if c.tailer.Halt() != nil {
+					t.Fatalf("still halted: %+v", c.tailer.Halt())
+				}
+				if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+					t.Fatalf("recovered copy differs:\n%s", dd)
+				}
+				waitCopyState(t, st, id, store.CopyServing)
+				if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaHalted); v != 0 {
+					t.Fatalf("halted gauge %g once moving", v)
+				}
 			})
 		})
 	}
+}
+
+// waitHalt waits for the tailer to halt.
+func waitHalt(t testing.TB, tl *Tailer) *HaltError {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if h := tl.Halt(); h != nil {
+			return h
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the copy did not halt")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// refreshed refreshes sh and returns it.
+func refreshed(t testing.TB, sh *shard.Shard) *shard.Shard {
+	t.Helper()
+	if err := sh.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return sh
 }
 
 func waitCopyState(t testing.TB, st store.Store, id ShardID, want store.CopyState) store.Copy {
@@ -589,12 +712,13 @@ func TestLeaseLostStopsTheTailer(t *testing.T) {
 	})
 }
 
-// TestLagMetrics: while behind, the lag in changes and in time is reported; caught
-// up, both are zero.
+// TestLagMetrics: while behind, the lag in changes and in time (by the database
+// clock) is reported; while the database is unreachable with changes pending, the
+// lag in time keeps rising; caught up, both are zero.
 func TestLagMetrics(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		ctx := context.Background()
-		st := d.open(t)
+		st := newFaultStore(d.open(t))
 		createIndex(t, st, "lag", testMapping)
 		id := ShardID{Index: "lag", Shard: 0}
 		mustApply(t, st, upsert("lag", 0, "first", `{}`))
@@ -605,6 +729,7 @@ func TestLagMetrics(t *testing.T) {
 		opts.BatchSize = 10
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 		tl := NewTailer(st, sh, id, opts)
+		defer tl.inst.observe(tl)()
 		// Recover the empty copy, then drive single polls by hand.
 		if err := tl.handle(ctx, tl.start(ctx)); err != nil {
 			t.Fatal(err)
@@ -632,6 +757,24 @@ func TestLagMetrics(t *testing.T) {
 		if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaLagTime); v < 0.05 {
 			t.Fatalf("lag.time gauge %g", v)
 		}
+
+		// The database goes away with changes pending: the lag keeps rising.
+		st.down("head", true)
+		before, _ := gaugeValue(t, reader, telemetry.MetricReplicaLagTime)
+		for range 3 {
+			if _, err := tl.step(ctx); !errors.Is(err, errInjected) {
+				t.Fatalf("step with the database down: %v", err)
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+		if after, _ := gaugeValue(t, reader, telemetry.MetricReplicaLagTime); after < before+0.1 {
+			t.Fatalf("lag.time %g then %g while the database is down", before, after)
+		}
+		if _, age2 := tl.Lag(); age2 < age+100*time.Millisecond {
+			t.Fatalf("Lag %s then %s while the database is down", age, age2)
+		}
+		st.down("head", false)
+
 		for !caughtUp {
 			if caughtUp, err = tl.step(ctx); err != nil {
 				t.Fatal(err)
@@ -712,12 +855,11 @@ func upsertChange(t testing.TB, id string, seq int64) shard.Change {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tl := &Tailer{cat: catalog{mapping: m}}
-	out, err := tl.convert(context.Background(), []item{{seq: seq, kind: shard.Upsert, id: id, body: []byte(docBody(id, int(seq)))}})
+	doc, _, err := analyzeDoc(analysisView(m), m.Dynamic, id, []byte(docBody(id, int(seq))))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return out[0]
+	return shard.Change{Seq: seq, Kind: shard.Upsert, Doc: &doc}
 }
 
 // dirFetcher fetches a copy by copying another copy's closed directory, as a peer

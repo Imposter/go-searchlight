@@ -20,10 +20,13 @@ import (
 // segments over the internal API, or a bundle in the store's blobs (spec section 9;
 // the cluster provides it). When a copy must be rebuilt, the tailer wipes its
 // directory and calls Fetch, which fills dir (it exists and is empty) with a shard
-// directory, manifest and segments, of the index's current incarnation. The tailer
-// opens it and replays the changelog from its seq. Any error, or a copy that cannot
-// be used (another incarnation, or one the changelog has been pruned past), makes the
-// tailer wipe dir again and rebuild from the store's ScanShard instead.
+// directory, segments and sidecars first and the manifest last, each fsynced (the
+// manifest is the commit point: a Fetch cut short leaves a directory that opens empty).
+// The copy must be of the index's current incarnation. The tailer opens it and replays
+// the changelog from its seq. Any error, or a copy that cannot be used (another
+// incarnation, an older mapping than the rebuild needs, or one the changelog has been
+// pruned past before it moved), makes the tailer wipe dir again and rebuild from the
+// store's ScanShard instead.
 type Fetcher interface {
 	Fetch(ctx context.Context, id ShardID, dir string) error
 }
@@ -43,16 +46,15 @@ var ErrWipeNeeded = errors.New("replica: the shard copy must be wiped and rebuil
 // Recover readies sh, a shard copy opened from its directory, to tail the changelog of
 // shard id, and returns the seq to tail from. A copy that has applied changes resumes
 // from its seq (CommittedSeq at Open): the changelog is replayed from there. An empty
-// copy is loaded from st's ScanShard snapshot, and resumes from the snapshot's seq. A
-// copy of another incarnation of the index, or one an earlier load left half done, is
-// [ErrWipeNeeded]. A [Tailer] does all of this itself; Recover is for callers that
-// manage the copy's directory on their own.
+// copy is loaded from st's ScanShard snapshot, mapping included, and resumes from the
+// snapshot's seq. A copy of another incarnation of the index, or one an earlier load
+// left half done, is [ErrWipeNeeded]. A [Tailer] does all of this itself; Recover is
+// for callers that manage the copy's directory on their own.
 func Recover(ctx context.Context, sh *shard.Shard, st store.Store, id ShardID) (int64, error) {
 	t := NewTailer(st, sh, id, Options{})
-	if err := t.cat.load(ctx); err != nil {
+	if err := t.cat.load(ctx, id.Shard); err != nil {
 		return 0, err
 	}
-	t.syncMapping(sh)
 	if err := sh.Err(); err != nil {
 		return 0, err
 	}
@@ -65,11 +67,7 @@ func Recover(ctx context.Context, sh *shard.Shard, st store.Store, id ShardID) (
 	if holdsData(sh) {
 		return 0, fmt.Errorf("%w: an earlier load did not finish", ErrWipeNeeded)
 	}
-	asOf, err := t.loadSnapshot(ctx, sh)
-	if err != nil {
-		return 0, err
-	}
-	return asOf, nil
+	return t.loadSnapshot(ctx, sh)
 }
 
 // holdsData reports whether sh's current generation has any segment.
@@ -84,14 +82,14 @@ func holdsData(sh *shard.Shard) bool {
 
 // start checks the copy Run was given against the catalogue and decides how it
 // recovers: it resumes a copy that has applied changes, and asks for a rebuild of an
-// empty one, one of another incarnation, and one a rebuild left half done.
+// empty one, one of another incarnation, and one a rebuild left half done. A failure to
+// read the catalogue decides nothing: Run retries the start.
 func (t *Tailer) start(ctx context.Context) error {
-	if err := t.cat.load(ctx); err != nil {
+	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
 	}
 	t.lastCatalog = time.Now()
 	sh := t.Shard()
-	t.syncMapping(sh)
 	if err := sh.Err(); err != nil {
 		return err
 	}
@@ -118,7 +116,9 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 		}
 	}
 	if t.needRebuild != "" {
-		t.setState(StateRecovering)
+		if !t.halted() {
+			t.setState(StateRecovering)
+		}
 		if err := t.rebuild(ctx, t.needRebuild); err != nil {
 			var rb *rebuildError
 			if errors.As(err, &rb) {
@@ -129,36 +129,36 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			return err
 		}
 		t.needRebuild = ""
+		t.rebuildWait = 0
+		t.clearHalt()
 	}
 	return nil
 }
 
-// refreshCatalog re-reads the catalogue entry: a new incarnation means a rebuild, a
-// grown mapping goes to the shard.
+// refreshCatalog re-reads the catalogue entry: a dropped index (or shard) stops the
+// copy, a new incarnation rebuilds it.
 func (t *Tailer) refreshCatalog(ctx context.Context) error {
-	uid := t.cat.meta.UID
-	if err := t.cat.load(ctx); err != nil {
+	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
 	}
 	t.lastCatalog = time.Now()
-	if t.cat.meta.UID != uid {
+	if uid := t.Shard().IndexUID(); uid != "" && uid != t.cat.meta.UID {
 		return &rebuildError{reason: reasonIncarnation, err: fmt.Errorf("index %q became incarnation %s", t.id.Index, t.cat.meta.UID)}
 	}
-	t.syncMapping(t.Shard())
 	return nil
 }
 
-// openShard opens dir as the copy's shard.
+// openShard opens dir as the copy's shard. Its mapping comes from its manifest, or,
+// for an empty directory, from the snapshot the rebuild loads.
 func (t *Tailer) openShard(ctx context.Context, dir string) (*shard.Shard, error) {
 	if t.opts.OpenShard != nil {
 		return t.opts.OpenShard(ctx, dir)
 	}
-	return shard.Open(ctx, dir, t.cat.mapping, t.shardOpts)
+	return shard.Open(ctx, dir, nil, t.shardOpts)
 }
 
 // swap makes sh the copy's shard.
 func (t *Tailer) swap(sh *shard.Shard) {
-	t.syncMapping(sh)
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
 	if t.opts.OnShard != nil {
@@ -171,7 +171,7 @@ func (t *Tailer) swap(sh *shard.Shard) {
 func (t *Tailer) reopen(ctx context.Context) (err error) {
 	ctx, span := t.startRecoverySpan(ctx, sourceReopen, "failed")
 	start := time.Now()
-	defer func() { t.endRecovery(ctx, span, sourceReopen, start, err) }()
+	defer func() { t.endRecovery(ctx, span, sourceReopen, "failed", start, err) }()
 	old := t.Shard()
 	dir := old.Dir()
 	old.Abandon()
@@ -191,20 +191,20 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 	if err := t.setCopyState(ctx, store.CopyRecovering); err != nil {
 		return err
 	}
-	if err := t.cat.load(ctx); err != nil {
+	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
 	}
 	t.lastCatalog = time.Now()
 	sh := t.Shard()
 	fresh := reason == reasonEmpty && sh.Err() == nil && sh.AppliedSeq() == 0 && !holdsData(sh)
-	// A fetched copy the changelog was pruned past before it applied anything is
-	// not fetched again: the peers are as far behind.
-	useFetcher := t.opts.Fetcher != nil &&
-		(reason != reasonPruned || t.lastSource != sourcePeer || t.Applied() != t.recoveredAt)
+	// A fetched copy that made no progress before it needed rebuilding again (it
+	// was pruned past, or halted at the same change) is not fetched again: the
+	// peers are no better off.
+	useFetcher := t.opts.Fetcher != nil && (t.lastSource != sourcePeer || t.Applied() != t.recoveredAt)
 	if !fresh || useFetcher {
 		dir := sh.Dir()
 		sh.Abandon()
-		if err := wipe(ctx, dir, t.log); err != nil {
+		if err := t.wipe(ctx, dir); err != nil {
 			return err
 		}
 		if useFetcher {
@@ -221,12 +221,12 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 
 	ctx, span := t.startRecoverySpan(ctx, sourceSQL, reason)
 	start := time.Now()
-	defer func() { t.endRecovery(ctx, span, sourceSQL, start, err) }()
+	defer func() { t.endRecovery(ctx, span, sourceSQL, reason, start, err) }()
 	asOf, err := t.loadSnapshot(ctx, sh)
 	if err != nil {
 		return err
 	}
-	t.lastSource, t.recoveredAt = sourceSQL, asOf
+	t.lastSource, t.recoveredAt, t.minMappingVersion = sourceSQL, asOf, 0
 	t.log.InfoContext(ctx, "shard copy rebuilt from the store", slog.String("reason", reason), slog.Int64("seq", asOf),
 		slog.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000))
 	return nil
@@ -238,47 +238,50 @@ func (t *Tailer) fetch(ctx context.Context, reason, dir string) (ok bool, err er
 	ctx, span := t.startRecoverySpan(ctx, sourcePeer, reason)
 	start := time.Now()
 	var used error
-	defer func() { t.endRecovery(ctx, span, sourcePeer, start, used) }()
+	defer func() { t.endRecovery(ctx, span, sourcePeer, reason, start, used) }()
 	if used = os.MkdirAll(dir, 0o750); used == nil { //nolint:gosec // dir is the copy's own directory, the node's choice
 		used = t.opts.Fetcher.Fetch(ctx, t.id, dir)
 	}
 	if used == nil {
 		var sh *shard.Shard
 		if sh, used = t.openShard(ctx, dir); used == nil {
-			uid, seq := sh.IndexUID(), sh.AppliedSeq()
-			if seq > 0 && (uid == "" || uid == t.cat.meta.UID) {
+			uid, seq, mv := sh.IndexUID(), sh.AppliedSeq(), sh.MappingVersion()
+			if seq > 0 && uid == t.cat.meta.UID && mv >= t.minMappingVersion {
 				t.swap(sh)
-				t.lastSource, t.recoveredAt = sourcePeer, seq
+				t.lastSource, t.recoveredAt, t.minMappingVersion = sourcePeer, seq, 0
 				t.log.InfoContext(ctx, "shard copy fetched", slog.String("reason", reason), slog.Int64("seq", seq))
 				return true, nil
 			}
 			sh.Abandon()
-			used = &rebuildError{reason: reasonFetchedStale, err: fmt.Errorf("the fetched copy is at seq %d of incarnation %q", seq, uid)}
+			used = &rebuildError{reason: reasonFetchedStale, err: fmt.Errorf("the fetched copy is at seq %d of incarnation %q, mapping version %d", seq, uid, mv)}
 		}
 	}
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
 	t.log.WarnContext(ctx, "fetching the shard copy failed; rebuilding it from the store", slog.Any("error", used))
-	return false, wipe(ctx, dir, t.log)
+	return false, t.wipe(ctx, dir)
 }
 
 // loadSnapshot loads the store's snapshot of the shard into sh, which has applied
-// nothing, then advances it to the snapshot's seq. The scan holds one transaction
-// open, so its callback only hands each record over; another goroutine analyzes and
-// loads them in batches, waiting out backpressure.
+// nothing, then advances it to the snapshot's seq. The snapshot's first record is the
+// index's mapping as of the snapshot, which every document after it is analyzed under.
+// The scan holds one transaction open, so its callback only hands each record over;
+// another goroutine analyzes and loads them in batches, waiting out backpressure.
 func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	t.inst.progress.Record(ctx, 0, t.inst.with(attribute.String("source", sourceSQL)))
 	records := make(chan store.Record, t.opts.BatchSize)
 	type result struct {
 		bytes, count int64
+		mapped       bool
 		err          error
 	}
 	done := make(chan result, 1)
 	go func() {
 		var r result
-		r.bytes, r.count, r.err = t.consumeSnapshot(ctx, sh, records)
+		r.bytes, r.count, r.mapped, r.err = t.consumeSnapshot(ctx, sh, records)
 		if r.err != nil {
 			cancel() // stop the scan
 			for range records {
@@ -303,6 +306,9 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 	if scanErr != nil {
 		return 0, scanErr
 	}
+	if !res.mapped {
+		return 0, fmt.Errorf("%w: %s is missing from the snapshot", ErrIndexDropped, t.id.Index)
+	}
 	t.inst.recoveryBytes.Add(ctx, res.bytes, t.inst.with(attribute.String("source", sourceSQL)))
 	if err := sh.Advance(asOf); err != nil {
 		return 0, err
@@ -316,6 +322,7 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		}
 		t.log.WarnContext(ctx, "refresh after the snapshot load failed; the background refresh retries it", slog.Any("error", err))
 	}
+	t.inst.progress.Record(ctx, 1, t.inst.with(attribute.String("source", sourceSQL)))
 	t.log.DebugContext(ctx, "snapshot loaded", slog.Int64("seq", asOf), slog.Int64("records", res.count), slog.Int64("bytes", res.bytes))
 	return asOf, nil
 }
@@ -323,26 +330,17 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 // snapshotBatchBytes bounds the record bytes one snapshot batch holds.
 const snapshotBatchBytes = 8 << 20
 
-// consumeSnapshot loads the records the scan hands over, in batches.
-func (t *Tailer) consumeSnapshot(ctx context.Context, sh *shard.Shard, records <-chan store.Record) (bytes, count int64, err error) {
+// consumeSnapshot loads the records the scan hands over, in batches. mapped reports
+// that the snapshot carried the index's mapping (it does whenever the index exists).
+func (t *Tailer) consumeSnapshot(ctx context.Context, sh *shard.Shard, records <-chan store.Record) (bytes, count int64, mapped bool, err error) {
 	batch := make([]item, 0, t.opts.BatchSize)
 	var batchBytes int
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		for i := range batch {
-			if uid := batch[i].uid; uid != "" && uid != t.cat.meta.UID {
-				return &rebuildError{reason: reasonIncarnation, err: fmt.Errorf("the snapshot is of incarnation %s, the copy follows %s", uid, t.cat.meta.UID)}
-			}
-		}
-		converted, cerr := t.convert(ctx, batch)
-		t.syncMapping(sh)
-		if _, err := t.applyBatch(ctx, sh, converted, true); err != nil {
+		if err := t.applyItems(ctx, sh, batch, true); err != nil {
 			return err
-		}
-		if cerr != nil {
-			return cerr
 		}
 		t.inst.batchSize.Record(ctx, float64(len(batch)), t.inst.attrs)
 		count += int64(len(batch))
@@ -350,47 +348,51 @@ func (t *Tailer) consumeSnapshot(ctx context.Context, sh *shard.Shard, records <
 		return nil
 	}
 	for r := range records {
+		if r.Kind == store.RecordMapping {
+			mapped = true
+		}
 		batch = append(batch, itemFromRecord(&r))
 		n := len(r.ID) + len(r.Body) + len(r.Meta)
 		batchBytes += n
 		bytes += int64(n)
 		if len(batch) >= t.opts.BatchSize || batchBytes >= snapshotBatchBytes {
 			if err := flush(); err != nil {
-				return bytes, count, err
+				return bytes, count, mapped, err
 			}
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return bytes, count, err
+		return bytes, count, mapped, err
 	}
-	return bytes, count, flush()
+	return bytes, count, mapped, flush()
 }
 
 // wipe removes a copy's directory, discarding its manifest first so that a crash
 // part way leaves a directory that opens as an empty copy. On Windows a file that is
 // still mapped (a reader holding a generation of the abandoned shard) cannot be
 // removed: it retries until the readers let go, or ctx ends.
-func wipe(ctx context.Context, dir string, log *slog.Logger) error {
+func (t *Tailer) wipe(ctx context.Context, dir string) error {
 	delay := 10 * time.Millisecond
 	for attempt := 1; ; attempt++ {
 		err := shard.Discard(dir)
+		if err == nil && t.opts.hooks != nil && t.opts.hooks.afterDiscard != nil {
+			t.opts.hooks.afterDiscard(ctx, dir)
+			err = ctx.Err()
+		}
 		if err == nil {
 			err = os.RemoveAll(dir) //nolint:gosec // dir is the copy's own directory, the node's choice
 		}
 		if err == nil {
 			return nil
 		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("wiping %s: %w (last error: %w)", dir, ctx.Err(), err)
+		}
 		if attempt%20 == 0 {
-			log.WarnContext(ctx, "shard directory still in use; retrying its removal", slog.String("dir", dir),
+			t.log.WarnContext(ctx, "shard directory still in use; retrying its removal", slog.String("dir", dir),
 				slog.Int("attempt", attempt), slog.Any("error", err))
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return fmt.Errorf("wiping %s: %w (last error: %w)", dir, ctx.Err(), err)
-		case <-timer.C:
-		}
+		sleepCtx(ctx, delay)
 		delay = min(2*delay, time.Second)
 	}
 }
@@ -402,7 +404,7 @@ func (t *Tailer) startRecoverySpan(ctx context.Context, source, reason string) (
 }
 
 // endRecovery records a recovery's outcome and duration.
-func (t *Tailer) endRecovery(ctx context.Context, span trace.Span, source string, start time.Time, err error) {
+func (t *Tailer) endRecovery(ctx context.Context, span trace.Span, source, reason string, start time.Time, err error) {
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -410,6 +412,7 @@ func (t *Tailer) endRecovery(ctx context.Context, span trace.Span, source string
 		span.SetStatus(codes.Error, "recovery failed")
 	}
 	span.End()
-	t.inst.recoveries.Add(ctx, 1, t.inst.with(attribute.String("source", source), attribute.String("result", result)))
+	t.inst.recoveries.Add(ctx, 1, t.inst.with(attribute.String("source", source), attribute.String("reason", reason),
+		attribute.String("result", result)))
 	t.inst.recoveryDur.Record(ctx, time.Since(start).Seconds(), t.inst.with(attribute.String("source", source)))
 }

@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,9 @@ type HubOptions struct {
 }
 
 // Hub turns a store's commit notifications (Postgres LISTEN/NOTIFY) into wake-ups of
-// the tailers of the shards they name, over one connection for a whole node. When the
+// the tailers of the shards they name, over one connection for a whole node: a node
+// runs one Hub and passes it to every tailer (Options.Hub), which otherwise only
+// poll. The connection is the store's pooled one, held for the Hub's life. When the
 // subscription fails it is restarted with backoff; every time it becomes active, every
 // tailer is woken to poll, so a notification lost while it was down never stalls a
 // copy. While it is down the tailers poll at their normal interval.
@@ -81,7 +84,8 @@ func NewHub(st store.Store, opts HubOptions) *Hub {
 // Watching reports whether the subscription is active, so notifications flow.
 func (h *Hub) Watching() bool { return h != nil && h.watching.Load() }
 
-// Run keeps the subscription up until ctx ends; it returns nil then.
+// Run keeps the subscription up until ctx ends (it returns nil then) or the store is
+// closed (store.ErrClosed).
 func (h *Hub) Run(ctx context.Context) error {
 	var retry time.Duration
 	for {
@@ -92,6 +96,9 @@ func (h *Hub) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
+		}
+		if errors.Is(err, store.ErrClosed) {
+			return err
 		}
 		h.reconnects.Add(ctx, 1)
 		if suppressed, ok := h.warn.allow(); ok {

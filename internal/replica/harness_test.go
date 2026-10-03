@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
@@ -90,21 +92,21 @@ func postgresDB(t *testing.T, base string) *db {
 	}
 	admin := stdlib.OpenDB(*cfg)
 	t.Cleanup(func() { _ = admin.Close() })
-	schema := randName("sl_r_")
+	schemaName := randName("sl_r_")
 	ctx := context.Background()
-	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
+	if _, err := admin.ExecContext(ctx, "CREATE SCHEMA "+schemaName); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := admin.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+		if _, err := admin.ExecContext(context.Background(), "DROP SCHEMA "+schemaName+" CASCADE"); err != nil {
 			t.Errorf("drop schema: %v", err)
 		}
 	})
 	q := u.Query()
-	q.Set("search_path", schema)
-	q.Set("application_name", schema)
+	q.Set("search_path", schemaName)
+	q.Set("application_name", schemaName)
 	u.RawQuery = q.Encode()
-	return &db{dialect: "postgres", url: u.String(), appName: schema}
+	return &db{dialect: "postgres", url: u.String(), appName: schemaName}
 }
 
 // mysqlDB creates a database for the test when the account may, and otherwise
@@ -138,7 +140,9 @@ func mysqlDB(t *testing.T, base string) *db {
 	}
 	// The account may not create databases (CI's may not): every test of every
 	// package then shares this one, so they take turns under a named lock, held
-	// by this connection until the test ends.
+	// by this connection until the test ends. A test that opened two such
+	// databases would wait on itself (GET_LOCK is per connection) until the
+	// timeout: open one per test.
 	lockConn, err := admin.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -257,9 +261,130 @@ func openShard(t testing.TB, dir string, opts shard.Options) *shard.Shard {
 func testOptions() Options {
 	return Options{
 		PollInterval: 10 * time.Millisecond, WatchedPollInterval: 200 * time.Millisecond,
-		ReportInterval: 20 * time.Millisecond, CatalogInterval: 100 * time.Millisecond,
-		RetryBase: 5 * time.Millisecond, RetryCap: 50 * time.Millisecond,
+		ReportInterval: 20 * time.Millisecond, CatalogInterval: time.Second,
+		RetryBase: 5 * time.Millisecond, RetryCap: 50 * time.Millisecond, RebuildRetryCap: 100 * time.Millisecond,
+		HaltRetryBase: 20 * time.Millisecond, HaltRetryCap: 100 * time.Millisecond,
 		Logger: quietLogger,
+	}
+}
+
+// errInjected is a store fault a test injects: transient, as the tailer sees it.
+var errInjected = errors.New("injected store fault")
+
+// faultStore wraps a store with injectable faults: fail[op] makes the next n calls
+// of op fail ("head", "changes", "scan", "get"), and onRecord runs for every record a
+// scan hands over (its error ends the scan).
+type faultStore struct {
+	store.Store
+	mu       sync.Mutex
+	fail     map[string]int
+	always   map[string]bool
+	onRecord func(ctx context.Context, n int, r store.Record) error
+}
+
+func newFaultStore(st store.Store) *faultStore {
+	return &faultStore{Store: st, fail: map[string]int{}, always: map[string]bool{}}
+}
+
+func (f *faultStore) take(op string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.always[op] {
+		return errInjected
+	}
+	if f.fail[op] > 0 {
+		f.fail[op]--
+		return errInjected
+	}
+	return nil
+}
+
+func (f *faultStore) inject(op string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail[op] += n
+}
+
+func (f *faultStore) down(op string, down bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.always[op] = down
+}
+
+func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+	if err := f.take("head"); err != nil {
+		return 0, time.Time{}, err
+	}
+	return f.Store.HeadSeq(ctx)
+}
+
+func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {
+	if err := f.take("changes"); err != nil {
+		return nil, err
+	}
+	return f.Store.ChangesAfter(ctx, id, seq, limit)
+}
+
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+	if err := f.take("scan"); err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	hook := f.onRecord
+	f.mu.Unlock()
+	n := 0
+	return f.Store.ScanShard(ctx, id, func(r store.Record) error {
+		n++
+		if hook != nil {
+			if err := hook(ctx, n, r); err != nil {
+				return err
+			}
+		}
+		return fn(r)
+	})
+}
+
+func (f *faultStore) Indexes() store.IndexStore {
+	return faultIndexes{IndexStore: f.Store.Indexes(), f: f}
+}
+
+type faultIndexes struct {
+	store.IndexStore
+	f *faultStore
+}
+
+func (x faultIndexes) Get(ctx context.Context, name string) (store.IndexMeta, error) {
+	if err := x.f.take("get"); err != nil {
+		return store.IndexMeta{}, err
+	}
+	return x.IndexStore.Get(ctx, name)
+}
+
+// updateMapping replaces index's mapping through Indexes().Update, retrying a
+// conflicting version.
+func updateMapping(t testing.TB, st store.Store, index string, mapping func(m *schema.Mapping)) {
+	t.Helper()
+	ctx := context.Background()
+	for {
+		meta, err := st.Indexes().Get(ctx, index)
+		if err != nil {
+			t.Fatalf("get %s: %v", index, err)
+		}
+		m, err := parseMapping(meta.Mapping)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mapping(m)
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta.Mapping = raw
+		if _, err := st.Indexes().Update(ctx, meta); err == nil {
+			return
+		} else if !errors.Is(err, store.ErrConflict) {
+			t.Fatalf("update %s: %v", index, err)
+		}
 	}
 }
 
@@ -351,10 +476,18 @@ func (c *copyRunner) restart() {
 // with whatever it had not committed; then it starts again from the directory.
 func (c *copyRunner) crash() {
 	c.t.Helper()
-	sh := c.shard()
-	sh.Abandon()
-	_ = c.stop() // it may have seen the shard close under it
+	c.crashOnly()
 	c.start()
+}
+
+// crashOnly kills the copy as crash does, without starting it again. The shard is
+// abandoned under the running tailer, as a crash would; the tailer may have swapped
+// in another by the time it stops, which is abandoned too: one shard per directory.
+func (c *copyRunner) crashOnly() {
+	c.t.Helper()
+	c.shard().Abandon()
+	_ = c.stop() // it may have seen the shard close under it
+	c.shard().Abandon()
 }
 
 // waitApplied waits until the copy has applied, and made searchable, seq.
@@ -375,19 +508,27 @@ func (c *copyRunner) waitApplied(seq int64) *shard.Shard {
 		}
 		tl.Wake()
 		sh := tl.Shard()
+		var waitErr error
 		if tl.Applied() >= seq && tl.State() == StateTailing {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			err := sh.WaitRefreshed(ctx, seq)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			waitErr = sh.WaitRefreshed(ctx, seq)
 			cancel()
-			if err == nil {
+			if waitErr == nil {
 				return sh
 			}
-			if !errors.Is(err, shard.ErrClosed) {
-				c.t.Fatalf("WaitRefreshed(%d): %v", seq, err)
+			switch {
+			case errors.Is(waitErr, shard.ErrClosed):
+			case errors.Is(waitErr, context.DeadlineExceeded):
+				// A slow disk: refresh it ourselves, and say why if that fails.
+				if err := sh.Refresh(context.Background()); err != nil && !errors.Is(err, shard.ErrClosed) {
+					c.t.Fatalf("WaitRefreshed(%d) timed out; Refresh: %v", seq, err)
+				}
+			default:
+				c.t.Fatalf("WaitRefreshed(%d): %v", seq, waitErr)
 			}
 		}
 		if time.Now().After(deadline) {
-			c.t.Fatalf("copy at %d (%s), want %d", tl.Applied(), tl.State(), seq)
+			c.t.Fatalf("copy at %d (%s, refreshed %d), want %d: %v", tl.Applied(), tl.State(), sh.RefreshedSeq(), seq, waitErr)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

@@ -46,9 +46,18 @@ func TestNotificationsWakeTheTailer(t *testing.T) {
 		opts.PollInterval, opts.WatchedPollInterval = time.Hour, time.Hour
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 		copyStore := d.open(t)
-		if NewHub(copyStore, HubOptions{}) == nil {
+		hub := NewHub(copyStore, HubOptions{Logger: quietLogger, Meter: opts.Meter, RetryBase: 5 * time.Millisecond})
+		if hub == nil {
 			t.Fatal("a postgres store has no hub")
 		}
+		hubCtx, stopHub := context.WithCancel(context.Background())
+		hubDone := make(chan error, 1)
+		go func() { hubDone <- hub.Run(hubCtx) }()
+		defer func() {
+			stopHub()
+			<-hubDone
+		}()
+		opts.Hub = hub
 		c := newCopy(t, copyStore, id, opts)
 		c.start()
 		waitWatching := func() {

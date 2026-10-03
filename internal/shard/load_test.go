@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"path/filepath"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/query"
@@ -122,4 +123,28 @@ func TestAbandonLosesOnlyTheUncommitted(t *testing.T) {
 	}
 	h.model = committed
 	h.check()
+}
+
+// TestDiscard: a discarded copy opens empty, whatever files are left in it, and a
+// missing directory is already discarded.
+func TestDiscard(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.upsert("a", "b")
+	h.reopen()
+	if err := h.s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Discard(h.dir); err != nil {
+		t.Fatalf("Discard: %v", err)
+	}
+	h.open()
+	if h.s.CommittedSeq() != 0 || h.s.AppliedSeq() != 0 {
+		t.Fatalf("a discarded copy opened at %d", h.s.CommittedSeq())
+	}
+	h.model = map[string]string{}
+	h.check()
+	h.s.Abandon()
+	if err := Discard(filepath.Join(h.dir, "missing")); err != nil {
+		t.Fatalf("Discard of a missing directory: %v", err)
+	}
 }

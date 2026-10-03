@@ -171,6 +171,29 @@ func readManifest(dir string, log *slog.Logger) (*manifest, error) {
 	return &m, nil
 }
 
+// Discard turns the shard copy in dir, which no open Shard may be using, into an empty
+// one at once: it removes the manifest, the commit point, durably. An Open from then on
+// finds no segments, and removes whatever files are left; so a crash while the
+// directory is being removed after Discard leaves a copy that opens empty rather than
+// one that refuses to open. A directory that does not exist is already empty.
+func Discard(dir string) error {
+	err := retryIO(slog.Default(), "remove", filepath.Join(dir, manifestName), func() error {
+		return os.Remove(filepath.Join(dir, manifestName))
+	})
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if _, serr := os.Stat(dir); errors.Is(serr, os.ErrNotExist) {
+			return nil
+		}
+	case err != nil:
+		return fmt.Errorf("shard: discarding %s: %w", dir, err)
+	}
+	if err := segment.SyncDir(dir); err != nil {
+		return fmt.Errorf("shard: discarding %s: %w", dir, err)
+	}
+	return nil
+}
+
 // encodeManifest returns m as the manifest file's bytes.
 func encodeManifest(m *manifest) ([]byte, error) {
 	body, err := json.Marshal(m)

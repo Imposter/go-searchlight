@@ -72,12 +72,12 @@ func sqliteURL(path string) string {
 	return "sqlite:///" + path
 }
 
-func sqliteHarness(t *testing.T) *harness {
+func sqliteHarness(t testing.TB) *harness {
 	return &harness{dialect: "sqlite", url: sqliteURL(filepath.Join(t.TempDir(), "searchlight.db"))}
 }
 
 // postgresHarness creates a schema for the test and points search_path at it.
-func postgresHarness(t *testing.T, base string) *harness {
+func postgresHarness(t testing.TB, base string) *harness {
 	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {
@@ -108,7 +108,7 @@ func postgresHarness(t *testing.T, base string) *harness {
 // mysqlHarness creates a database for the test when the account may, and
 // otherwise empties the configured database of Searchlight's tables (the CI
 // account is limited to its own database).
-func mysqlHarness(t *testing.T, base string) *harness {
+func mysqlHarness(t testing.TB, base string) *harness {
 	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {
@@ -172,7 +172,7 @@ func mysqlHarness(t *testing.T, base string) *harness {
 
 // open opens and migrates a store on the harness database. Each call is
 // another node's connection to the same database.
-func (h *harness) open(t *testing.T, opts ...Option) Store {
+func (h *harness) open(t testing.TB, opts ...Option) Store {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -198,7 +198,7 @@ func engine(st Store) *sqlStore {
 	panic(fmt.Sprintf("unexpected store %T", st))
 }
 
-func mustCreateIndex(t *testing.T, st Store, name string) {
+func mustCreateIndex(t testing.TB, st Store, name string) {
 	t.Helper()
 	if _, err := st.Indexes().Create(context.Background(), IndexMeta{Name: name}); err != nil && !errors.Is(err, ErrExists) {
 		t.Fatalf("create index %s: %v", name, err)

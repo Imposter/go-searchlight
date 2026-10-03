@@ -54,7 +54,7 @@ func (m *unixMapping) Poison() error {
 // inside it durable. Without this, a crash can leave the directory pointing at the old
 // file, or at nothing, even though the new file's own bytes were already fsynced.
 func fsyncDir(dir string) error {
-	d, err := os.Open(dir) //nolint:gosec // dir is an operator-controlled path
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}

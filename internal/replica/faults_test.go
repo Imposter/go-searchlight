@@ -318,7 +318,19 @@ func TestPruneDuringLoad(t *testing.T) {
 		opts, reader := meteredOptions()
 		c := newCopy(t, fs, id, opts)
 		c.start()
-		head := mustApply(t, st, upsert("pl", 0, "end", `{}`))
+		mustApply(t, st, upsert("pl", 0, "end", `{}`))
+		// The hook writes too: wait for it, then for everything there is.
+		deadline := time.Now().Add(30 * time.Second)
+		for !pruned.Load() {
+			if time.Now().After(deadline) {
+				t.Fatal("the load never reached the prune")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		head, _, err := st.HeadSeq(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if dd := diff(viewOf(t, c.waitApplied(head)), truthOf(t, st, id), false); dd != "" {
 			t.Fatalf("copy differs:\n%s", dd)
 		}

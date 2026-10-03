@@ -184,7 +184,7 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	if d.err != nil {
 		return corrupt()
 	}
-	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase)
+	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase, footer.sections[sectionStored].n, r.numDocs)
 	if err != nil {
 		return &CorruptError{Path: r.path, Section: "stored", Reason: err.Error()}
 	}

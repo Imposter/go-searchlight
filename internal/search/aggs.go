@@ -437,19 +437,33 @@ func (c *termsColl) partial() *AggPartial {
 		}
 		return p
 	}
+	// The ordinals to return: every one with documents, or, when this segment is the
+	// shard's only one (so its counts are the shard's), just the shard_size best by
+	// count then ordinal, which is key order: the shard's cut, made before any term
+	// is read, so a field of unique values materializes shard_size strings, not
+	// millions. (Several segments still merge by key: global ordinals are Task 14's.)
+	ords := make([]uint32, 0, 64)
 	for o, n := range c.counts {
-		if n == 0 {
-			continue
+		if n > 0 {
+			ords = append(ords, uint32(o))
 		}
-		var key any
-		switch c.src.kind {
-		case srcKeyword:
-			key = c.src.kc.Term(uint32(o))
-		case srcList:
-			key = c.src.mc.Term(uint32(o))
-		default:
-			key = o == 1
+	}
+	if c.s.p.segments == 1 && len(ords) > c.spec.shardSize {
+		slices.SortFunc(ords, func(a, b uint32) int {
+			if c.counts[a] != c.counts[b] {
+				return int(c.counts[b] - c.counts[a])
+			}
+			return int(a) - int(b)
+		})
+		for _, o := range ords[c.spec.shardSize:] {
+			p.OtherDocCount += c.counts[o]
 		}
+		ords = ords[:c.spec.shardSize]
+		p.DocCountError = c.counts[ords[len(ords)-1]]
+		slices.Sort(ords)
+	}
+	keys := c.keys(ords)
+	for i, o := range ords {
 		var subs []collector
 		if c.subs != nil {
 			subs = c.subs[o]
@@ -457,9 +471,43 @@ func (c *termsColl) partial() *AggPartial {
 		if subs == nil && len(c.spec.subs) > 0 {
 			subs = c.s.newSubs(c.spec)
 		}
-		p.Buckets = append(p.Buckets, &BucketPartial{Key: key, DocCount: n, Aggs: subPartials(c.spec, subs)})
+		p.Buckets = append(p.Buckets, &BucketPartial{Key: keys[i], DocCount: c.counts[o], Aggs: subPartials(c.spec, subs)})
 	}
 	return p
+}
+
+// keys returns the values of ords (ascending): a keyword column's in one walk of its
+// dictionary, each block decoded once.
+func (c *termsColl) keys(ords []uint32) []any {
+	out := make([]any, len(ords))
+	switch c.src.kind {
+	case srcKeyword:
+		k := 0
+		for k < len(ords) {
+			from := k
+			end := (ords[k]/segment.TermsPerBlock + 1) * segment.TermsPerBlock
+			c.src.kc.EachTerm(ords[k], func(o uint32, term []byte) bool {
+				if o == ords[k] {
+					out[k] = string(term)
+					k++
+				}
+				return k < len(ords) && ords[k] < end
+			})
+			if k == from {
+				out[k] = c.src.kc.Term(ords[k])
+				k++
+			}
+		}
+	case srcList:
+		for i, o := range ords {
+			out[i] = c.src.mc.Term(o)
+		}
+	default:
+		for i, o := range ords {
+			out[i] = o == 1
+		}
+	}
+	return out
 }
 
 // rangeColl counts documents per range: From inclusive, To exclusive.
@@ -526,6 +574,12 @@ func (c *histColl) collect(d uint32) {
 	}
 	b := c.buckets[key]
 	if b == nil {
+		if len(c.buckets) == MaxBuckets {
+			if c.s.err == nil {
+				c.s.fail(checkBuckets(&AggPartial{Buckets: make([]*BucketPartial, MaxBuckets+1)}, c.spec))
+			}
+			return
+		}
 		b = &histBucket{subs: c.s.newSubs(c.spec)}
 		c.buckets[key] = b
 	}
@@ -631,7 +685,6 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 		perDoc = append(perDoc, c)
 	}
 	if len(perDoc) > 0 {
-		s.scanned += card(hits)
 		it := hits.ManyIterator()
 		buf := make([]uint32, 512)
 		for {
@@ -780,6 +833,8 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
+	// Truncated is set on a histogram cut at MaxBuckets buckets.
+	Truncated bool
 }
 
 // Bucket is one bucket of a result.
@@ -822,8 +877,9 @@ func (a *AggResult) MarshalJSON() ([]byte, error) {
 		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets)})
 	default:
 		return json.Marshal(struct {
-			Buckets []*Bucket `json:"buckets"`
-		}{nonNil(a.Buckets)})
+			Buckets   []*Bucket `json:"buckets"`
+			Truncated bool      `json:"truncated,omitempty"`
+		}{nonNil(a.Buckets), a.Truncated})
 	}
 }
 

@@ -2,6 +2,7 @@ package search
 
 import (
 	"slices"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -19,8 +20,8 @@ type cands struct {
 	maybe *roaring.Bitmap
 }
 
-// maxPrefixTerms is how many terms a starts_with unions before it falls back to its
-// grams and a residual check.
+// maxPrefixTerms is how many terms a starts_with unions before it scans the keyword
+// column instead.
 const maxPrefixTerms = 4096
 
 // candidates asks the segment's index for lp's candidates. Every case mirrors the
@@ -207,31 +208,35 @@ func (s *segExec) needle(f, t string) cands {
 	return cands{sure: roaring.New(), maybe: roaring.Or(grams, trunc)}
 }
 
-// prefix is starts_with's candidates: the documents of every value with the prefix,
-// exact, or (past maxPrefixTerms values) the prefix's grams with a residual check.
+// prefix is starts_with's matches, exact: the values with the prefix are one run of
+// the keyword column's sorted dictionary, [lo, hi), found by binary search. A short
+// run unions its terms' postings; a long one (a one-letter prefix over unique values)
+// scans the column's ordinals, which reads no term at all.
 func (s *segExec) prefix(f, p string) cands {
-	if p == "" {
-		return cands{sure: roaring.New(), maybe: s.r.Present(f)}
+	kc := s.r.Keywords(f)
+	n := int(kc.NumTerms())
+	lo := sortSearch(n, func(o int) bool { return kc.Term(uint32(o)) >= p })                              //nolint:gosec // o < n
+	hi := lo + sortSearch(n-lo, func(i int) bool { return !strings.HasPrefix(kc.Term(uint32(lo+i)), p) }) //nolint:gosec // below n
+	switch {
+	case hi == lo:
+		return cands{sure: roaring.New()}
+	case hi-lo <= maxPrefixTerms:
+		parts := make([]*roaring.Bitmap, 0, hi-lo)
+		kc.EachTerm(uint32(lo), func(o uint32, term []byte) bool { //nolint:gosec // lo < n
+			if int(o) >= hi {
+				return false
+			}
+			parts = append(parts, s.r.Postings(f, kindValue, string(term)))
+			return true
+		})
+		return cands{sure: union(parts)}
+	default:
+		from, to := uint32(lo), uint32(hi) //nolint:gosec // both at most n
+		return cands{sure: s.columnScan(s.r.Present(f), func(d uint32) bool {
+			o, ok := kc.Ord(d)
+			return ok && o >= from && o < to
+		})}
 	}
-	var terms []string
-	over := false
-	s.r.Terms(f, kindValue, p, func(term string, _ uint32) bool {
-		if len(terms) == maxPrefixTerms && f != IDField && utf8.RuneCountInString(p) >= 3 {
-			over = true
-			return false
-		}
-		terms = append(terms, term)
-		return true
-	})
-	if over {
-		grams := s.intersectTerms(f, kindGram, analysis.Substrings3(p))
-		return cands{sure: roaring.New(), maybe: roaring.Or(grams, s.r.Truncated(f))}
-	}
-	parts := make([]*roaring.Bitmap, len(terms))
-	for i, t := range terms {
-		parts[i] = s.r.Postings(f, kindValue, t)
-	}
-	return cands{sure: union(parts)}
 }
 
 // intersectTerms is the documents holding every term, intersected rarest first.

@@ -137,7 +137,9 @@ func mysqlHarness(t *testing.T, base string) *harness {
 	}
 	// The account may not create databases (CI's may not): every test of every
 	// package then shares this one, so they take turns under a named lock, held
-	// by this connection until the test ends.
+	// by this connection until the test ends. A test that opened two such
+	// databases would wait on itself (GET_LOCK is per connection) until the
+	// timeout: open one per test.
 	lockConn, err := admin.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)

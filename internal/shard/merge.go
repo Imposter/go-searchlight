@@ -323,8 +323,21 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 // ForceMerge merges until the shard has at most maxSegments document segments (and as
 // many query segments) and none with deletes, like Lucene's forceMerge: the smallest
 // segments are merged into one, and a segment with deletes is rewritten without them.
-// It waits for background merges in flight first, and ignores DisableMerges.
+// It waits for background merges in flight first, and ignores DisableMerges. Close
+// cancels it and waits for it to return; after Close it returns ErrClosed.
 func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	s.wg.Add(1) // before closing is set, so before shutdown's wg.Wait
+	s.mu.Unlock()
+	defer s.wg.Done()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(s.bg, cancel)() //nolint:contextcheck // s.bg (cancelled by shutdown) only cancels ctx, which stays derived from the caller's
+
 	ctx, span := s.tr.Start(ctx, "shard.force_merge", trace.WithAttributes(attribute.Int("max_segments", maxSegments)))
 	defer span.End()
 	maxSegments = max(1, maxSegments)

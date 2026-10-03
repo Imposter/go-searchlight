@@ -3,11 +3,13 @@ package shard
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // I1: a sidecar a crash left behind, which garbage collection could not remove at
@@ -160,4 +162,91 @@ func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 	h.open() // whichever manifest survived: here the new one
 	h.check()
 	h.waitNoOrphans()
+}
+
+// I3: Close cancels a ForceMerge in flight (here throttled by a starved I/O budget,
+// under a context that never ends) and waits for it, and a ForceMerge after Close is
+// refused.
+func TestCloseCancelsAndWaitsForForceMerge(t *testing.T) {
+	opts := testOptions()
+	opts.MergeBudget = NewMergeBudget(1, 1) // one byte per second: the merge stalls
+	h := newHarness(t, opts)
+	for i := range 3 {
+		h.upsert(fmt.Sprintf("d%d", i))
+		h.refresh()
+	}
+	merged := make(chan error, 1)
+	go func() { merged <- h.s.ForceMerge(context.Background(), 1) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h.s.commitMu.Lock()
+		inflight := h.s.inflight
+		h.s.commitMu.Unlock()
+		if inflight > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ForceMerge never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // into the throttle
+
+	closed := make(chan error, 1)
+	go func() { closed <- h.s.Close(context.Background()) }()
+	select {
+	case err := <-merged:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrClosed) {
+			t.Fatalf("ForceMerge across Close = %v, want cancelled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not cancel the ForceMerge in flight")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	if err := h.s.ForceMerge(context.Background(), 1); !errors.Is(err, ErrClosed) {
+		t.Fatalf("ForceMerge after Close = %v, want ErrClosed", err)
+	}
+	h.s = nil
+}
+
+// I3: Close returns only after the ForceMerge it cancelled has let go of the shard.
+func TestCloseWaitsForForceMerge(t *testing.T) {
+	inMerge := make(chan struct{})
+	release := make(chan struct{})
+	opts := testOptions()
+	opts.hooks = &testHooks{at: func(point string) error {
+		if point == pointMergeBuilt {
+			close(inMerge)
+			<-release
+		}
+		return nil
+	}}
+	h := newHarness(t, opts)
+	h.upsert("a")
+	h.refresh()
+	h.upsert("b")
+	h.refresh()
+	merged := make(chan error, 1)
+	go func() { merged <- h.s.ForceMerge(context.Background(), 1) }()
+	<-inMerge
+	closed := make(chan error, 1)
+	go func() { closed <- h.s.Close(context.Background()) }()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a ForceMerge was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-merged
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	h.s = nil
 }

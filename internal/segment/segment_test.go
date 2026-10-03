@@ -350,7 +350,7 @@ func TestVersionRefused(t *testing.T) {
 	}
 }
 
-// TestSectionOffsetsAreRelocatable pins down format 1.1's central property (format.go's
+// TestSectionOffsetsAreRelocatable pins down the section-relative offset scheme (format.go's
 // "Offsets, and why most of them are section-relative"): nothing in a dictionary, a
 // doc-values column or a point index is anchored to a fixed absolute position. It
 // splices 4 KB of padding in right after the header - pushing TERMS and every section

@@ -18,11 +18,21 @@
 // All integers are little-endian. [Open] verifies the whole-file checksum and refuses a
 // file whose major version it does not know.
 //
-// # Offsets, and why most of them are section-relative (format 1.1)
+// # Versions
+//
+// Format 2.0 is the current layout. It is incompatible with 1.x, which is why it is a
+// major bump: 1.0 used absolute file offsets throughout, and 1.1 (section-relative
+// offsets, below) never recorded a stored block's uncompressed length and wrote point
+// block offsets relative to the wrong origin. Open refuses every major but
+// [FormatMajor] with a [VersionError], so a 1.x file - which this code would misread,
+// not merely fail to read - is refused outright, whatever its minor. A minor bump is
+// reserved for additions an older reader of the same major can safely ignore.
+//
+// # Offsets, and why most of them are section-relative
 //
 // META holds each field's entry points into TERMS, DOCVALS and POINTS (dictOff,
 // keywordColOff, multiColOff, numberColOff, pointsOff) and into PRESENCE (presOff,
-// truncOff). From format 1.1 on, every one of those is relative to its own section's
+// truncOff). Every one of those is relative to its own section's
 // absolute start (which the footer's section table gives), not to the file: Build and
 // Merge can then build one field's whole contribution to a section - a term
 // dictionary, a doc-values column, a point index - complete and self-contained, in
@@ -46,14 +56,6 @@
 // such nested offsets of their own - they are packed, contiguous data with nothing
 // pointing elsewhere inside themselves - so only their one META or block-table entry
 // needs this treatment.
-//
-// This is a breaking change to the previous 1.0 layout (every one of those offsets was
-// absolute-into-file), bumped as a minor version, not a major one, because nothing
-// built on format 1.0 has ever been written anywhere persistent: there is no deployed
-// file this needs to stay compatible with, or safely refuse, so there is no reason to
-// spend the major version's "Open refuses an unknown major" guarantee on it. A future
-// breaking layout change, once segments exist outside a test run, should bump the
-// major instead.
 package segment
 
 import (
@@ -65,13 +67,12 @@ import (
 
 // File format identification.
 const (
-	// FormatMajor is the segment format's major version. Open refuses any other major.
-	FormatMajor = 1
-	// FormatMinor is the segment format's minor version: ordinarily additions an
-	// older reader of the same major can ignore, but 1 is the one exception - see the
-	// package doc comment's "Offsets, and why most of them are section-relative"
-	// section for why a breaking change to the offset scheme was still a minor bump.
-	FormatMinor = 1
+	// FormatMajor is the segment format's major version. Open refuses any other major,
+	// including every 1.x file (see the package doc comment's "Versions").
+	FormatMajor = 2
+	// FormatMinor is the segment format's minor version: additions an older reader of
+	// the same major can ignore.
+	FormatMinor = 0
 	// FileExt is a segment file's extension.
 	FileExt = ".seg"
 )

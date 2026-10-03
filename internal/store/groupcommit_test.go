@@ -367,6 +367,51 @@ func TestGroupCommitMissingIndexFailsAlone(t *testing.T) {
 	}
 }
 
+// TestGroupCommitMissingIndexNamesOwnIndex checks that when two requests in
+// the same batch each name a different missing index, each one's error
+// names only its own index, not the whole batch's.
+func TestGroupCommitMissingIndexNamesOwnIndex(t *testing.T) {
+	f := &fakeApplier{fail: func(batch []Change) error {
+		// Mirrors sql.go's checkIndexes: Indexes is every missing name in
+		// the combined batch, first-use order; Positions is every position
+		// naming any of them.
+		var e *IndexNotFoundError
+		seen := map[string]bool{}
+		for i, c := range batch {
+			if c.Index == "gone1" || c.Index == "gone2" {
+				if e == nil {
+					e = &IndexNotFoundError{}
+				}
+				if !seen[c.Index] {
+					seen[c.Index] = true
+					e.Indexes = append(e.Indexes, c.Index)
+				}
+				e.Positions = append(e.Positions, i)
+			}
+		}
+		if e != nil {
+			return e
+		}
+		return nil
+	}}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 4, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	req1 := changes("x", 2)
+	req1[0].Index = "gone1"
+	req2 := changes("y", 2)
+	req2[1].Index = "gone2"
+	res := gather(t, g, collected, nil, [][]Change{req1, req2})
+
+	var nf1, nf2 *IndexNotFoundError
+	if !errors.As(res[0].err, &nf1) || fmt.Sprint(nf1.Indexes) != "[gone1]" || fmt.Sprint(nf1.Positions) != "[0]" {
+		t.Fatalf("request 1 (names gone1): %v", res[0].err)
+	}
+	if !errors.As(res[1].err, &nf2) || fmt.Sprint(nf2.Indexes) != "[gone2]" || fmt.Sprint(nf2.Positions) != "[1]" {
+		t.Fatalf("request 2 (names gone2): %v", res[1].err)
+	}
+}
+
 // A request held for a conflict caused by an earlier request is
 // re-evaluated when that earlier request's caller gives up.
 func TestGroupCommitHeldConflictReopens(t *testing.T) {

@@ -297,9 +297,10 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 			return
 		case errors.As(err, &nf):
 			// A missing index does not depend on the other requests: every
-			// request naming one is answered for good.
+			// request naming one is answered for good, each naming only the
+			// indexes its own changes refer to (not the whole batch's).
 			for k, e := range splitPositions(reqs, nf.Positions, nil) {
-				answer(live[k], gcResult{err: &IndexNotFoundError{Indexes: nf.Indexes, Positions: e.Positions}})
+				answer(live[k], gcResult{err: &IndexNotFoundError{Indexes: ownIndexes(reqs[k], e.Positions), Positions: e.Positions}})
 			}
 		case errors.As(err, &ce):
 			// Only the first conflict is certain; hold it until everything
@@ -395,6 +396,23 @@ func splitPositions(reqs []*gcRequest, positions []int, values []int64) map[int]
 		e.Positions = append(e.Positions, pos-start)
 		if values != nil {
 			e.Current = append(e.Current, values[k])
+		}
+	}
+	return out
+}
+
+// ownIndexes reads the index names at r's own changes at positions
+// (relative to r, as splitPositions returns them) and returns them deduped
+// in first-use order, so a request that named several missing indexes is
+// told about only its own, not every missing index in the whole batch.
+func ownIndexes(r *gcRequest, positions []int) []string {
+	seen := make(map[string]bool, 1)
+	var out []string
+	for _, pos := range positions {
+		name := r.changes[pos].Index
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
 		}
 	}
 	return out

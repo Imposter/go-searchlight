@@ -60,6 +60,13 @@ type Config struct {
 	// RefreshInterval is how often each shard's write buffer becomes a
 	// searchable segment.
 	RefreshInterval time.Duration
+	// SeqPersistInterval bounds how long a shard's durable seq (its manifest's) may
+	// trail its refreshed seq when refreshes bring no new segment, only a changelog
+	// position other shards' changes moved. Such a refresh is visible at once but
+	// written to the manifest at most this often (and at the next segment change, and
+	// at shutdown), sparing an fsync per refresh; a restart replays at most this much
+	// more of the changelog.
+	SeqPersistInterval time.Duration
 	// MaxLag is how far a copy may trail the changelog and still serve reads
 	// and report ready.
 	MaxLag time.Duration
@@ -83,17 +90,18 @@ type Config struct {
 // no default.
 func Default() Config {
 	return Config{
-		Listen:          ":8780",
-		AdminListen:     ":8781",
-		NodeID:          hostname(),
-		DataDir:         "data",
-		RefreshInterval: time.Second,
-		MaxLag:          2 * time.Second,
-		MergeBudget:     64 << 20,
-		MergeThreads:    max(1, runtime.GOMAXPROCS(0)/4),
-		SearchThreads:   runtime.GOMAXPROCS(0),
-		LogLevel:        slog.LevelInfo,
-		ShutdownTimeout: 30 * time.Second,
+		Listen:             ":8780",
+		AdminListen:        ":8781",
+		NodeID:             hostname(),
+		DataDir:            "data",
+		RefreshInterval:    time.Second,
+		SeqPersistInterval: 30 * time.Second,
+		MaxLag:             2 * time.Second,
+		MergeBudget:        64 << 20,
+		MergeThreads:       max(1, runtime.GOMAXPROCS(0)/4),
+		SearchThreads:      runtime.GOMAXPROCS(0),
+		LogLevel:           slog.LevelInfo,
+		ShutdownTimeout:    30 * time.Second,
 	}
 }
 
@@ -164,6 +172,11 @@ var settings = []setting{
 		name: "refresh_interval", usage: "how often written documents become searchable",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.RefreshInterval, v) },
 		format: func(c *Config) string { return c.RefreshInterval.String() },
+	},
+	{
+		name: "seq_persist_interval", usage: "how often a shard writes a seq that moved without new segments to its manifest",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.SeqPersistInterval, v) },
+		format: func(c *Config) string { return c.SeqPersistInterval.String() },
 	},
 	{
 		name: "max_lag", usage: "how far a copy may trail the changelog and still serve and report ready",

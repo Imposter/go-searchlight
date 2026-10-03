@@ -65,6 +65,7 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `tokens_file` | (none: API auth off) | API bearer tokens |
 | `cluster_token` | (none) | auth for the internal peer API |
 | `refresh_interval` | `1s` | how often writes become searchable |
+| `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
 | `max_lag` | `2s` | how far a copy may trail the changelog and still serve |
 | `merge_budget` | `64MiB` | bytes per second merges may write (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent background merges |

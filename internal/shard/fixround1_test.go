@@ -326,3 +326,75 @@ func TestSeqPersistedInTheBackground(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// M2: a second Close returns only once the first has finished.
+func TestSecondCloseWaitsForTheFirst(t *testing.T) {
+	inRefresh := make(chan struct{})
+	release := make(chan struct{})
+	opts := testOptions()
+	opts.hooks = &testHooks{at: func(point string) error {
+		if point == pointRefreshBuilt {
+			close(inRefresh)
+			<-release
+		}
+		return nil
+	}}
+	h := newHarness(t, opts)
+	h.upsert("a") // the first Close's final refresh stalls on it
+	first := make(chan error, 1)
+	go func() { first <- h.s.Close(context.Background()) }()
+	<-inRefresh
+	second := make(chan error, 1)
+	go func() { second <- h.s.Close(context.Background()) }()
+	select {
+	case <-second:
+		t.Fatal("a second Close returned while the first was still closing")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	if h.s.Acquire() != nil {
+		t.Fatal("the shard is still open after both Closes returned")
+	}
+	h.s = nil
+}
+
+// M3: ForceMerge ends under a steady stream of deletes: each refresh during a merge
+// leaves the merged segment with deletes, but a segment is rewritten for its deletes
+// once, and segments refreshed meanwhile are not ForceMerge's.
+func TestForceMergeEndsUnderSteadyDeletes(t *testing.T) {
+	var merges atomic.Int64
+	var h *harness
+	next := 0
+	opts := testOptions()
+	opts.hooks = &testHooks{at: func(point string) error {
+		if point != pointMergeBuilt {
+			return nil
+		}
+		merges.Add(1)
+		// Delete one more document and refresh before this merge commits.
+		h.del(fmt.Sprintf("d%03d", next))
+		next++
+		h.refresh()
+		return nil
+	}}
+	h = newHarness(t, opts)
+	for i := range 200 {
+		h.upsert(fmt.Sprintf("d%03d", i))
+		if i%50 == 49 {
+			h.refresh()
+		}
+	}
+	h.del("d199")
+	h.refresh()
+	h.forceMerge(1)
+	if n := merges.Load(); n > 6 {
+		t.Fatalf("ForceMerge ran %d merges under steady deletes, want it bounded", n)
+	}
+	h.check()
+}

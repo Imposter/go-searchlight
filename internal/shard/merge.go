@@ -65,7 +65,7 @@ func (s *Shard) mergeLoop() {
 			s.wg.Add(1)
 			go func(p mergePlan) {
 				defer s.wg.Done()
-				err := s.runMerge(s.bg, p)
+				_, err := s.runMerge(s.bg, p)
 				if err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
 					s.log.WarnContext(s.bg, "merge failed", slog.String("kind", p.kind.String()), slog.Int("segments", len(p.inputs)), slog.Any("error", err))
 				}
@@ -135,8 +135,9 @@ func (s *Shard) unreserve(p mergePlan) {
 	s.commitMu.Unlock()
 }
 
-// runMerge merges p's inputs and commits the result. p is reserved; runMerge releases it.
-func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
+// runMerge merges p's inputs and commits the result, which it returns (nil when the
+// inputs were wholly deleted). p is reserved; runMerge releases it.
+func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err error) {
 	defer s.unreserve(p)
 	ctx, span := s.startSpan(ctx, "shard.merge",
 		attribute.String("kind", p.kind.String()), attribute.Int("segments", len(p.inputs)))
@@ -152,14 +153,14 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 	budget := s.opts.MergeBudget
 	tokens, err := budget.acquire(ctx, budget.Threads())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer budget.release(tokens)
 	start := time.Now()
 
 	g := s.Acquire()
 	if g == nil {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	defer g.Release()
 	list := g.docs
@@ -172,7 +173,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 	for i, ref := range p.inputs {
 		j := slices.IndexFunc(list, func(st segState) bool { return st.ref == ref })
 		if j < 0 {
-			return fmt.Errorf("shard: merge input %s is not in the current generation", ref.id)
+			return nil, fmt.Errorf("shard: merge input %s is not in the current generation", ref.id)
 		}
 		snap[i] = list[j].deletes
 		bases[i] = live
@@ -184,7 +185,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 	if live > 0 {
 		out, written, err = s.writeMerged(ctx, p, snap, g, tokens)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := s.hook(pointMergeBuilt); err != nil {
@@ -197,7 +198,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 		if isCrash(err) {
 			s.fail(err)
 		}
-		return err
+		return nil, err
 	}
 
 	published, err := s.commitMerge(ctx, p, out, snap, bases)
@@ -208,14 +209,14 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 		}
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	d := time.Since(start)
 	s.inst.recordMerge(ctx, d, written)
 	s.log.DebugContext(ctx, "merged", slog.String("kind", p.kind.String()), slog.Int("segments", len(p.inputs)),
 		slog.Uint64("live", live), slog.Int64("bytes", written), slog.Float64(telemetryDuration, float64(d.Microseconds())/1000))
 	s.wakeMerges()
-	return nil
+	return out, nil
 }
 
 // writeMerged writes p's live documents or queries, as of the snapshot deletes, as one
@@ -329,11 +330,13 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 	return s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid)
 }
 
-// ForceMerge merges until the shard has at most maxSegments document segments (and as
-// many query segments) and none with deletes, like Lucene's forceMerge: the smallest
-// segments are merged into one, and a segment with deletes is rewritten without them.
-// It waits for background merges in flight first, and ignores DisableMerges. Close
-// cancels it and waits for it to return; after Close it returns ErrClosed.
+// ForceMerge merges the segments the shard holds when it is called down to at most
+// maxSegments document segments (and as many query segments), and rewrites each of them
+// that has deletes without them, like Lucene's forceMerge: the smallest are merged into
+// one. Segments refreshes add meanwhile are left to the merge policy, and each segment
+// is rewritten for its deletes at most once, so a steady stream of deletes cannot keep
+// it going. It waits for background merges in flight first, and ignores DisableMerges.
+// Close cancels it and waits for it to return; after Close it returns ErrClosed.
 func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	s.mu.Lock()
 	if s.closing {
@@ -350,6 +353,17 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	ctx, span := s.startSpan(ctx, "shard.force_merge", attribute.Int("max_segments", maxSegments))
 	defer span.End()
 	maxSegments = max(1, maxSegments)
+	// eligible: the segments present at entry, and what ForceMerge makes of them.
+	// rewritten: segments already rewritten for their deletes, never again.
+	eligible, rewritten := map[*segRef]bool{}, map[*segRef]bool{}
+	if g := s.Acquire(); g != nil {
+		for _, list := range [][]segState{g.docs, g.queries} {
+			for _, st := range list {
+				eligible[st.ref] = true
+			}
+		}
+		g.Release()
+	}
 	for {
 		if err := s.usable(); err != nil {
 			return err
@@ -370,8 +384,8 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 				return ctx.Err()
 			}
 		}
-		plans := forcePlans(kindDocs, cur.docs, maxSegments)
-		plans = append(plans, forcePlans(kindQueries, cur.queries, maxSegments)...)
+		plans := forcePlans(kindDocs, onlyEligible(cur.docs, eligible), maxSegments, rewritten)
+		plans = append(plans, forcePlans(kindQueries, onlyEligible(cur.queries, eligible), maxSegments, rewritten)...)
 		for _, p := range plans {
 			s.reserve(p)
 		}
@@ -380,7 +394,8 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 			return nil
 		}
 		for i, p := range plans {
-			if err := s.runMerge(ctx, p); err != nil {
+			out, err := s.runMerge(ctx, p)
+			if err != nil {
 				for _, rest := range plans[i+1:] {
 					s.unreserve(rest)
 				}
@@ -388,13 +403,31 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 				span.SetStatus(codes.Error, "force merge failed")
 				return err
 			}
+			if out != nil {
+				eligible[out] = true
+				if len(p.inputs) == 1 {
+					rewritten[out] = true
+				}
+			}
 		}
 	}
 }
 
+// onlyEligible returns the states of list whose segment is in eligible.
+func onlyEligible(list []segState, eligible map[*segRef]bool) []segState {
+	out := make([]segState, 0, len(list))
+	for _, st := range list {
+		if eligible[st.ref] {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
 // forcePlans is ForceMerge's next step for one kind: merge the smallest segments into
-// one when there are more than maxSegments, else rewrite each segment with deletes.
-func forcePlans(kind segKind, list []segState, maxSegments int) []mergePlan {
+// one when there are more than maxSegments, else rewrite each segment with deletes that
+// is not already a rewrite.
+func forcePlans(kind segKind, list []segState, maxSegments int, rewritten map[*segRef]bool) []mergePlan {
 	if len(list) > maxSegments {
 		sorted := slices.Clone(list)
 		slices.SortStableFunc(sorted, func(a, b segState) int {
@@ -414,7 +447,7 @@ func forcePlans(kind segKind, list []segState, maxSegments int) []mergePlan {
 	}
 	var plans []mergePlan
 	for _, st := range list {
-		if !st.deletes.IsEmpty() {
+		if !st.deletes.IsEmpty() && !rewritten[st.ref] {
 			plans = append(plans, mergePlan{kind: kind, inputs: []*segRef{st.ref}})
 		}
 	}

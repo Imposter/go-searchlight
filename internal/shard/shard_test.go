@@ -200,7 +200,10 @@ func TestMergeCarriesDeletesMadeDuringIt(t *testing.T) {
 
 	errc := make(chan error, 1)
 	p := h.planAll(kindDocs)
-	go func() { errc <- h.s.runMerge(context.Background(), p) }()
+	go func() {
+		_, err := h.s.runMerge(context.Background(), p)
+		errc <- err
+	}()
 	<-built
 	// While the merged segment waits to be committed: update, delete, re-add.
 	h.upsert("d01", "d07", "d19")

@@ -300,7 +300,9 @@ type Shard struct {
 	mergeWake   chan struct{}
 	closed      chan struct{}
 	closeOnce   sync.Once
-	jan         *janitor
+	// shutdownDone is closed when shutdown has finished: a second Close waits on it.
+	shutdownDone chan struct{}
+	jan          *janitor
 }
 
 // Open opens the shard copy in dir, creating dir if needed: it reads the manifest,
@@ -343,6 +345,8 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		refreshWake: make(chan struct{}, 1),
 		mergeWake:   make(chan struct{}, 1),
 		closed:      make(chan struct{}),
+
+		shutdownDone: make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
@@ -658,14 +662,21 @@ func (s *Shard) notifyPublished() {
 // Close refreshes the buffer one last time (so the manifest covers every applied
 // change), stops background refresh and merges (an in-flight merge is abandoned), and
 // releases the shard's own reference on its generation. Generations readers still hold
-// stay valid until released; their segments are unmapped then. Close is idempotent.
+// stay valid until released; their segments are unmapped then. Close is idempotent: a
+// second call returns once the first has finished (or ctx ends).
 func (s *Shard) Close(ctx context.Context) error {
 	ctx, span := s.startSpan(ctx, "shard.close")
 	defer span.End()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		return nil
+		// Another Close (or a shutdown) is under way: return once it has finished.
+		select {
+		case <-s.shutdownDone:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	s.closing = true
 	s.mu.Unlock()
@@ -708,6 +719,7 @@ func (s *Shard) shutdown() {
 			g.Release()
 		}
 		s.jan.stop()
+		close(s.shutdownDone)
 	})
 }
 

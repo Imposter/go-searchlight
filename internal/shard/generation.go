@@ -54,8 +54,10 @@ type segRef struct {
 	reader *segment.Reader // kindDocs
 	qs     QuerySegment    // kindQueries
 
-	// refs counts the live generations that list the segment (plus one while a
-	// refresh or merge holds a segment it built but has not yet published).
+	// refs counts the live generations that list the segment. A segment a refresh or
+	// merge has built but not yet published is at 0 and owned by that refresh or
+	// merge, which closes it itself if it is never published; the generation that
+	// publishes it takes its first reference.
 	refs atomic.Int32
 	// obsolete is set once a durable manifest no longer lists the segment: its files
 	// are removed after its final close.

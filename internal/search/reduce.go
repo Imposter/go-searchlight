@@ -8,8 +8,9 @@ import (
 	"slices"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -19,7 +20,15 @@ import (
 // shards' order), the summed total cut at TrackTotal, and the aggregations merged and
 // finished. A nil result (a shard that failed) is skipped.
 func Reduce(rs []*ShardResult, r *Request) *Response {
+	return ReduceContext(context.Background(), rs, r)
+}
+
+// ReduceContext is Reduce under ctx's trace: its span is a child of the request's.
+func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	start := time.Now()
+	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.reduce", trace.WithAttributes(
+		attribute.String(telemetry.KeyIndex, r.Index), attribute.Int("shards", len(rs))))
+	defer span.End()
 	sorts := prepareSorts(r.Sort, nil, new(problems))
 	var specs []*aggSpec
 	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
@@ -41,8 +50,11 @@ func Reduce(rs []*ShardResult, r *Request) *Response {
 		resp.TimedOut = resp.TimedOut || sr.TimedOut
 	}
 	track := int64(r.TrackTotal)
-	if r.TrackTotal == 0 {
+	switch r.TrackTotal {
+	case 0:
 		track = DefaultTrackTotal
+	case TrackTotalNone:
+		track = -1 // no bound to cut at: the total is what the shards confirmed
 	}
 	if track >= 0 && resp.Total > track {
 		resp.Total, resp.TotalRelation = track, RelationGte
@@ -63,8 +75,8 @@ func Reduce(rs []*ShardResult, r *Request) *Response {
 			resp.Aggs[spec.name] = reduceAgg(parts, spec)
 		}
 	}
-	instruments().phase.Record(context.Background(), time.Since(start).Seconds(), metric.WithAttributeSet(attribute.NewSet(
-		attribute.String(telemetry.KeyIndex, r.Index), attribute.String("phase", "reduce"))))
+	instruments().recordPhase(ctx, r.Index, "reduce", time.Since(start))
+	span.SetAttributes(attribute.Int64("total", resp.Total), attribute.Int("hits", len(resp.Hits)))
 	return resp
 }
 
@@ -262,6 +274,12 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 		for _, b := range bs {
 			if b.DocCount < int64(spec.minDoc) {
 				continue
+			}
+			if len(res.Buckets) == MaxBuckets {
+				// Each shard refused more than MaxBuckets; together they can still pass
+				// it: keep the first MaxBuckets, and say so.
+				res.Truncated = true
+				break
 			}
 			out := finishBucket(b, spec)
 			if spec.typ == AggDateHistogram {

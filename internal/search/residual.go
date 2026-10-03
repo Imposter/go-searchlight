@@ -11,6 +11,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 // The residual check.
@@ -24,9 +25,11 @@ import (
 //     the value alone, so it runs once per distinct value (ordinal), and when the
 //     candidates are many it walks the column's dictionary in order instead of
 //     decoding values one at a time;
-//   - a text field's words (a multi-word phrase) from the stored body, re-analyzed
-//     with the generation's mapping (schema.Analyze), since words are not kept as doc
-//     values;
+//   - a text field's words (a multi-word phrase) from the stored body: the queried
+//     member alone, read with Analyze's member rules (schema.FieldValue) and no
+//     mapping, so the check answers as the document was indexed whatever the mapping
+//     has become since; the word postings that made it a candidate already prove the
+//     field was indexed as text, from a string;
 //   - anything else (never needed by today's plans, kept so a fallback is always
 //     exact) from every column: number, list entries, a bool from its postings.
 
@@ -49,34 +52,23 @@ func (s *segExec) verify(lp *leafPlan, cand, out *roaring.Bitmap) {
 	}
 }
 
-// verifyBodies re-analyzes each candidate's stored body, in parallel chunks.
+// verifyBodies reads each candidate's stored body for the queried member's words, in
+// parallel chunks of ascending ordinals (so neighbours share a stored block).
 func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
 	ords := cand.ToArray()
 	keep := make([]bool, len(ords))
-	errs := s.parallelChunks(len(ords), func(lo, hi int) error {
+	err := s.parallelChunks(len(ords), func(lo, hi int) error {
 		for k := lo; k < hi; k++ {
-			ord := ords[k]
-			id, err := s.r.ID(ord)
+			ok, err := s.bodyMatches(lp, ords[k])
 			if err != nil {
 				return err
 			}
-			body, err := s.r.Stored(ord)
-			if err != nil {
-				return err
-			}
-			doc, _, err := schema.Analyze(s.mapping, id, body)
-			if err != nil {
-				// A body the mapping now refuses (it only ever grows, so this is
-				// damage): it matches nothing it cannot be read for.
-				s.warnResidual(id, err)
-				continue
-			}
-			keep[k] = lp.match.Match(&doc)
+			keep[k] = ok
 		}
 		return nil
 	})
-	if errs != nil {
-		s.fail(errs)
+	if err != nil {
+		s.fail(err)
 		return
 	}
 	if s.checkCtx() {
@@ -89,6 +81,48 @@ func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
 	}
 }
 
+// bodyMatches checks a words condition against document ord's stored body.
+func (s *segExec) bodyMatches(lp *leafPlan, ord uint32) (bool, error) {
+	body, err := s.r.Stored(ord)
+	if err != nil {
+		return false, err
+	}
+	v, present, err := schema.FieldValue(body, lp.field)
+	if err != nil {
+		return false, err
+	}
+	val := schema.Value{Present: present}
+	if text, ok := v.(string); ok {
+		val.Words = analysis.Words(text)
+	}
+	return lp.match.Match(&schema.Doc{Fields: map[string]schema.Value{lp.field: val}}), nil
+}
+
+// verifyDoc checks one candidate: the lazy path, for a document that could enter a
+// top-k.
+func (s *segExec) verifyDoc(lp *leafPlan, d uint32) bool {
+	if s.err != nil {
+		return false
+	}
+	s.scanned++
+	if lp.needsBody {
+		ok, err := s.bodyMatches(lp, d)
+		if err != nil {
+			s.fail(err)
+			return false
+		}
+		return ok
+	}
+	one := roaring.BitmapOf(d)
+	out := roaring.New()
+	if s.r.Keywords(lp.field).Exists() {
+		s.verifyTexts(lp, one, out)
+	} else {
+		s.verifyValues(lp, one, out)
+	}
+	return out.Contains(d)
+}
+
 // verifyChunk is how many candidates one parallel task checks.
 const verifyChunk = 512
 
@@ -98,12 +132,14 @@ const verifyChunk = 512
 func (s *segExec) parallelChunks(n int, fn func(lo, hi int) error) error {
 	chunks := (n + verifyChunk - 1) / verifyChunk
 	errs := make([]error, chunks)
-	runParallel(chunks, func(c int) {
+	if err := runParallel(chunks, func(c int) {
 		if s.ctx.Err() != nil {
 			return
 		}
 		errs[c] = fn(c*verifyChunk, min(n, (c+1)*verifyChunk))
-	})
+	}); err != nil {
+		return err
+	}
 	for _, err := range errs {
 		if err != nil {
 			return err
@@ -133,7 +169,7 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 	}
 	list := wanted.ToArray()
 	hit := make([]bool, len(list))
-	_ = s.parallelChunks(len(list), func(lo, hi int) error {
+	if err := s.parallelChunks(len(list), func(lo, hi int) error {
 		var text string
 		doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: true, Text: &text}}}
 		check := func(k int, term []byte) {
@@ -152,14 +188,27 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 			})
 			return nil
 		}
-		for k := lo; k < hi; k++ {
-			kc.EachTerm(list[k], func(_ uint32, term []byte) bool {
-				check(k, term)
-				return false
+		// Sparse: one walk per dictionary block, serving every wanted ordinal in it, so
+		// no lookup re-decodes the block from its start.
+		for k := lo; k < hi; {
+			end := (list[k]/segment.TermsPerBlock + 1) * segment.TermsPerBlock
+			from := k
+			kc.EachTerm(list[k], func(o uint32, term []byte) bool {
+				if o == list[k] {
+					check(k, term)
+					k++
+				}
+				return k < hi && list[k] < end
 			})
+			if k == from {
+				k++ // an ordinal past the dictionary (damage): nothing to check
+			}
 		}
 		return nil
-	})
+	}); err != nil {
+		s.fail(err)
+		return
+	}
 	if s.checkCtx() {
 		return
 	}

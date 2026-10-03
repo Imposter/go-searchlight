@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"strconv"
+	"sync/atomic"
 
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
 
@@ -21,11 +24,18 @@ type prepared struct {
 	// is _id, after which nothing can tie): a total order.
 	sorts []sortSpec
 	// after is SearchAfter, typed per sort key; nil when not paging.
-	after  []any
-	size   int
-	track  int64 // -1: exact however many
+	after []any
+	size  int
+	// need is how many matches the shard must confirm before it may stop verifying
+	// candidates (TrackTotal+1: one past proves "more than"); -1: every one; 0: none.
+	need   int64
 	aggs   []*aggSpec
 	fields []string
+	// segments is how many segments the shard searches.
+	segments int
+	// confirmed counts the matches the shard's segments have confirmed so far, sure
+	// or verified: shared, so segments stop counting together.
+	confirmed atomic.Int64
 }
 
 // sortKind is how a sort key reads its values.
@@ -88,11 +98,13 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	}
 	switch {
 	case r.TrackTotal == 0:
-		p.track = DefaultTrackTotal
+		p.need = DefaultTrackTotal + 1
+	case r.TrackTotal == TrackTotalNone:
+		p.need = 0
 	case r.TrackTotal < 0:
-		p.track = -1
+		p.need = -1
 	default:
-		p.track = int64(r.TrackTotal)
+		p.need = int64(r.TrackTotal) + 1
 	}
 	p.sorts = prepareSorts(r.Sort, m, &ps)
 	if len(r.SearchAfter) > 0 {
@@ -106,7 +118,7 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	if len(ps) > 0 {
 		return nil, &RequestError{Problems: ps}
 	}
-	p.root = compileNode(r.Query)
+	p.root = compileNode(r.Query, requestID(r))
 	return p, nil
 }
 
@@ -348,4 +360,22 @@ func rangeKey(r rangeSpec) string {
 
 func numberKey(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
+}
+
+// requestID identifies a request while it runs (its address): the shards of one
+// request count a leaf's use once between them.
+func requestID(r *Request) uintptr {
+	return reflect.ValueOf(r).Pointer()
+}
+
+// checkBuckets refuses a shard's histogram past MaxBuckets, as Elasticsearch refuses
+// a search with too many buckets.
+func checkBuckets(p *AggPartial, spec *aggSpec) error {
+	if (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && len(p.Buckets) > MaxBuckets {
+		return &RequestError{Problems: []query.Problem{{
+			Loc:     "aggs." + spec.name + "." + spec.typ,
+			Message: fmt.Sprintf("more than %d buckets: widen the interval or narrow the query", MaxBuckets),
+		}}}
+	}
+	return nil
 }

@@ -41,6 +41,9 @@ const (
 	DefaultTrackTotal = 10_000
 	// TrackTotalAll asks for an exact total however many documents match.
 	TrackTotalAll = -1
+	// TrackTotalNone asks for no total (track_total: false): the shards verify only
+	// what the top hits need, and Total is whatever lower bound that gave.
+	TrackTotalNone = -2
 	// MaxSize is the most hits one request returns.
 	MaxSize = 10_000
 	// MaxBuckets bounds the buckets of one response (Elasticsearch's search.max_buckets).
@@ -92,8 +95,8 @@ type Request struct {
 	// page already served (seen twice) or behind the cursor (skipped).
 	SearchAfter []any
 	// TrackTotal is how far Total is exact: a count past it is reported as
-	// TrackTotal with RelationGte. 0 means DefaultTrackTotal; TrackTotalAll (or any
-	// negative value) always counts exactly.
+	// TrackTotal with RelationGte. 0 means DefaultTrackTotal; TrackTotalAll always
+	// counts exactly; TrackTotalNone does not count past what the hits need.
 	TrackTotal int
 	// Aggs are the aggregations to compute over every matching document, by name.
 	Aggs map[string]Agg
@@ -104,6 +107,9 @@ type Request struct {
 	Timeout time.Duration
 	// Index labels the search's spans, logs and metrics.
 	Index string
+	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
+	// query-then-fetch, whose fetch phase is [FetchShard].
+	NoBodies bool
 }
 
 // SortField is one sort key: a field (or IDField), ascending unless Desc.
@@ -115,6 +121,11 @@ type SortField struct {
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
 // date_histogram) may hold metric sub-aggregations (stats, cardinality) in Aggs, one
 // level deep.
+//
+// Text values aggregate as they are indexed and compared: normalized (casefolded,
+// whitespace folded). That includes the _id field, a normalized keyword for queries
+// and aggregations alike (the parity rules), so terms and cardinality over _id count
+// ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string
@@ -233,14 +244,16 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.SearchAfter = after
 		case "track_total":
-			switch {
-			case string(val) == "true":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
 				r.TrackTotal = TrackTotalAll
+			case "false":
+				r.TrackTotal = TrackTotalNone
 			default:
 				if n, ok := intOf(val); ok && n >= 1 {
 					r.TrackTotal = n
 				} else {
-					ps.add("track_total", "track_total is true or a count of at least 1")
+					ps.add("track_total", "track_total is true, false or a count of at least 1")
 				}
 			}
 		case "aggs", "aggregations":
@@ -353,7 +366,7 @@ func parseSort(raw json.RawMessage, ps *problems) []SortField {
 // parseTimeout reads "250ms", "2s", "1m", "1d" or a number of milliseconds.
 func parseTimeout(raw json.RawMessage) (time.Duration, bool) {
 	if ms, ok := floatOf(raw); ok {
-		if ms < 0 {
+		if ms < 0 || ms > maxTimeoutMillis {
 			return 0, false
 		}
 		return time.Duration(ms * float64(time.Millisecond)), true
@@ -366,11 +379,14 @@ func parseTimeout(raw json.RawMessage) (time.Duration, bool) {
 	return d, ok && d >= 0
 }
 
+// maxTimeoutMillis bounds a timeout in milliseconds: a year, far inside a Duration.
+const maxTimeoutMillis = 365 * 24 * 3600 * 1000
+
 // parseDuration reads a Go duration, or a whole number of days ("2d").
 func parseDuration(s string) (time.Duration, bool) {
 	if days, ok := strings.CutSuffix(s, "d"); ok {
 		n, err := strconv.ParseFloat(days, 64)
-		if err != nil || n < 0 || n > 1e5 {
+		if err != nil || n < 0 || n > 365 {
 			return 0, false
 		}
 		return time.Duration(n * float64(24*time.Hour)), true
@@ -530,7 +546,8 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			}
 			for i, rg := range ranges {
 				var out Range
-				for k, v := range rg {
+				for _, k := range slices.Sorted(maps.Keys(rg)) {
+					v := rg[k]
 					rloc := fmt.Sprintf("%s.%d.%s", at, i, k)
 					switch k {
 					case "key":

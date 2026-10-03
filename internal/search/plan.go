@@ -17,29 +17,39 @@ import (
 
 // The plan.
 //
-// A query compiles once per request into a tree of pnodes. Per segment, the tree is
-// evaluated against a scope (the documents still in question) and returns exactly the
-// scope's documents that match:
+// A query compiles once per request into a tree of pnodes. Per segment, it runs in two
+// phases, as Lucene's two-phase iteration does.
 //
-//   - all evaluates its children cheapest first, each within what the previous left,
-//     and stops at an empty scope;
-//   - any evaluates each child within the documents no earlier child matched, so a
-//     costly child never re-checks a document already in;
-//   - not is the scope minus its child (negation over live documents, since the root
-//     scope is the segment's live documents);
+// Approximation ([segExec.approximate]): each node answers over a scope (the documents
+// still in question) with documents that surely match and documents that may, from
+// the index alone:
+//
+//   - all approximates its children cheapest first, each within what the previous
+//     left possible, and stops at an empty scope;
+//   - any approximates each child within the documents no earlier child surely
+//     matched;
+//   - not is the scope minus its child's possible documents, and its child's maybe
+//     ones (negation over live documents: the root scope is the segment's live
+//     documents);
 //   - a leaf asks the index for its candidates: documents that surely match, and
-//     documents that may (a contains needle's grams, a phrase's words). Sure ones are
-//     taken as they are, maybe ones are checked one at a time by the residual
-//     ([segExec.verify]) with the leaf's own compiled matcher.
+//     documents that may (a contains needle's grams, a phrase's words).
+//
+// Verification decides the maybe documents with each leaf's own compiled matcher (the
+// residual, residual.go), only as far as the request needs: every one when there are
+// aggregations or an exact total ([segExec.resolve], in batches); otherwise only the
+// candidates that would enter the top hits ([segExec.check], one at a time), then as
+// many more as it takes to confirm TrackTotal+1 matches across the shard, and no more.
 //
 // Cost: each child's cardinality is estimated from the segment's term statistics
 // (TermFreq, presence, number column stats), and a child that needs a residual check
-// is put after every child that does not, so it checks as few documents as possible.
+// is put after every child that does not, so it is approximated over the fewest
+// documents.
 //
 // Filter cache: a leaf whose bitmap is costly to build (a range, a union of terms, a
 // verified contains) is cached per segment, keyed by its canonical bytes, once the
 // same leaf has been seen in an earlier request ([leafUsage]); a cached entry is the
-// leaf's exact matches over the whole segment, deletes not applied.
+// leaf's exact matches over the whole segment, deletes not applied, and is only ever
+// a fully verified bitmap.
 
 type nodeKind uint8
 
@@ -83,7 +93,7 @@ type leafPlan struct {
 	every   bool
 }
 
-func compileNode(n query.Node) *pnode {
+func compileNode(n query.Node, req uintptr) *pnode {
 	switch x := n.(type) {
 	case *query.All:
 		if x == nil {
@@ -94,7 +104,7 @@ func compileNode(n query.Node) *pnode {
 		}
 		p := &pnode{kind: nAll}
 		for _, c := range x.Children {
-			p.children = append(p.children, compileNode(c))
+			p.children = append(p.children, compileNode(c, req))
 		}
 		return p
 	case *query.Any:
@@ -103,25 +113,25 @@ func compileNode(n query.Node) *pnode {
 		}
 		p := &pnode{kind: nAny}
 		for _, c := range x.Children {
-			p.children = append(p.children, compileNode(c))
+			p.children = append(p.children, compileNode(c, req))
 		}
 		return p
 	case *query.Not:
 		if x == nil {
 			return &pnode{kind: nFalse}
 		}
-		return &pnode{kind: nNot, children: []*pnode{compileNode(x.Child)}}
+		return &pnode{kind: nNot, children: []*pnode{compileNode(x.Child, req)}}
 	case *query.Leaf:
 		if x == nil {
 			return &pnode{kind: nFalse}
 		}
-		return &pnode{kind: nLeaf, leaf: compileLeaf(x)}
+		return &pnode{kind: nLeaf, leaf: compileLeaf(x, req)}
 	default:
 		return &pnode{kind: nFalse}
 	}
 }
 
-func compileLeaf(l *query.Leaf) *leafPlan {
+func compileLeaf(l *query.Leaf, req uintptr) *leafPlan {
 	lp := &leafPlan{
 		leaf: l, field: l.Field, op: l.Op, arg: l.Decoded(),
 		key:   string(query.Canonical(l)),
@@ -164,7 +174,7 @@ func compileLeaf(l *query.Leaf) *leafPlan {
 		lp.cacheable = lp.arg.Kind == query.ArgNumber
 	}
 	if lp.cacheable {
-		lp.useCache = leafUsage.seen(lp.key)
+		lp.useCache = leafUsage.seen(lp.key, req)
 	}
 	return lp
 }
@@ -200,24 +210,47 @@ func argNorms(a *query.Arg) []string {
 
 // usageSketch counts how often leaves are seen, approximately (one row of hashed
 // counters): a leaf is cached only from its second sighting, so one-off conditions
-// never churn the filter cache.
+// never churn the filter cache. A request counts once however many shards it runs on
+// (each slot remembers the last request that counted it), and every counter halves
+// every usageHalfLife counts, so what was popular long ago fades.
 type usageSketch struct {
-	counts [4096]atomic.Uint32
+	slots [usageSlots]usageSlot
+	ticks atomic.Uint64
 }
+
+type usageSlot struct {
+	count atomic.Uint32
+	last  atomic.Uintptr // the request that last counted this slot
+}
+
+const (
+	usageSlots    = 4096
+	usageHalfLife = 64 * usageSlots
+)
 
 var leafUsage usageSketch
 
-// seen counts key and reports whether it was seen before.
-func (u *usageSketch) seen(key string) bool {
-	h := hashString(key)
-	c := &u.counts[h%uint64(len(u.counts))]
-	for {
-		n := c.Load()
-		if n >= 1<<20 {
-			return true
-		}
-		if c.CompareAndSwap(n, n+1) {
-			return n >= 1
+// seen counts key once for request req and reports whether an earlier request saw it.
+func (u *usageSketch) seen(key string, req uintptr) bool {
+	slot := &u.slots[hashString(key)%usageSlots]
+	if slot.last.Swap(req) == req {
+		return slot.count.Load() >= 2 // this request counted it already
+	}
+	n := slot.count.Add(1)
+	if u.ticks.Add(1)%usageHalfLife == 0 {
+		u.halve()
+	}
+	return n >= 2
+}
+
+func (u *usageSketch) halve() {
+	for i := range u.slots {
+		c := &u.slots[i].count
+		for {
+			n := c.Load()
+			if c.CompareAndSwap(n, n/2) {
+				break
+			}
 		}
 	}
 }
@@ -438,88 +471,197 @@ func (s *segExec) order(children []*pnode, ascending bool) []*pnode {
 	return out
 }
 
-// eval returns the documents of scope that n matches, as a new bitmap. It never
-// changes scope.
-func (s *segExec) eval(n *pnode, scope *roaring.Bitmap) *roaring.Bitmap {
+// approx is a node's two-phase answer over its scope (Lucene's two-phase iteration):
+// documents that surely match, and documents that may, which a residual check
+// decides. The two are disjoint and read-only.
+type approx struct {
+	sure, maybe *roaring.Bitmap
+}
+
+func (a approx) possible() *roaring.Bitmap {
+	if a.maybe.IsEmpty() {
+		return a.sure
+	}
+	return roaring.Or(a.sure, a.maybe)
+}
+
+var emptyApprox = approx{sure: roaring.New(), maybe: roaring.New()}
+
+// approximate computes n's approx over scope, recording every node's (and the order
+// its children ran in) for check and resolve. It verifies nothing but leaves the
+// filter cache serves or that it decides to verify whole and cache; a child is
+// evaluated only over the documents its siblings left possible.
+func (s *segExec) approximate(n *pnode, scope *roaring.Bitmap) approx {
+	a := s.approximateNode(n, scope)
+	s.approxes[n] = a
+	return a
+}
+
+func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 	if s.err != nil || scope.IsEmpty() {
-		return roaring.New()
+		return emptyApprox
 	}
 	switch n.kind {
 	case nFalse:
-		return roaring.New()
+		return emptyApprox
 	case nTrue:
-		return scope.Clone()
+		return approx{sure: scope, maybe: roaring.New()}
 	case nNot:
-		out := scope.Clone()
-		out.AndNot(s.eval(n.children[0], scope))
-		return out
+		c := s.approximate(n.children[0], scope)
+		return approx{sure: roaring.AndNot(scope, c.possible()), maybe: c.maybe}
 	case nAll:
-		cur := scope
-		for _, c := range s.order(n.children, true) {
-			cur = s.eval(c, cur)
-			if cur.IsEmpty() {
+		order := s.order(n.children, true)
+		s.orders[n] = order
+		sure, possible := scope, scope
+		for _, c := range order {
+			a := s.approximate(c, possible)
+			sure = roaring.And(sure, a.sure)
+			possible = a.possible()
+			if possible.IsEmpty() {
 				break
 			}
 		}
-		return cur
+		return approx{sure: sure, maybe: roaring.AndNot(possible, sure)}
 	case nAny:
-		out := roaring.New()
+		order := s.order(n.children, false)
+		s.orders[n] = order
+		sure, maybe := roaring.New(), roaring.New()
 		rest := scope
-		for _, c := range s.order(n.children, false) {
-			got := s.eval(c, rest)
-			if got.IsEmpty() {
-				continue
-			}
-			out.Or(got)
-			rest = roaring.AndNot(rest, got)
+		for _, c := range order {
+			a := s.approximate(c, rest)
+			sure.Or(a.sure)
+			maybe.Or(a.maybe)
+			rest = roaring.AndNot(rest, a.sure)
 			if rest.IsEmpty() {
 				break
 			}
 		}
-		return out
+		maybe.AndNot(sure)
+		return approx{sure: sure, maybe: maybe}
 	default:
-		return s.evalLeaf(n.leaf, scope)
+		return s.approximateLeaf(n.leaf, scope)
 	}
 }
 
-// evalLeaf returns the documents of scope that lp matches.
-func (s *segExec) evalLeaf(lp *leafPlan, scope *roaring.Bitmap) *roaring.Bitmap {
+// approximateLeaf is a leaf's approx over scope: its candidates, or the filter
+// cache's exact bitmap. Only a fully verified bitmap is ever cached.
+func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	if lp.never {
-		return roaring.New()
+		return emptyApprox
 	}
 	if lp.useCache {
 		if bm, ok := s.cacheGet(lp); ok {
-			return roaring.And(bm, scope)
+			return approx{sure: roaring.And(bm, scope), maybe: roaring.New()}
 		}
 	}
 	if pred, ok := numericPredicate(lp); ok && scope.GetCardinality() <= docValuesFactor*s.estimateLeaf(lp).card {
 		// Unless the range is far narrower than what is left in question, reading the
 		// documents' values (a few nanoseconds each) beats collecting the range's
 		// documents from the point index (Lucene's IndexOrDocValuesQuery).
-		return s.numericScan(lp.field, pred, scope)
+		return approx{sure: s.numericScan(lp.field, pred, scope), maybe: roaring.New()}
 	}
 	c := s.candidates(lp)
 	if c.maybe == nil || c.maybe.IsEmpty() {
 		if lp.useCache {
-			return roaring.And(s.cachePut(lp, c.sure), scope)
+			return approx{sure: roaring.And(s.cachePut(lp, c.sure), scope), maybe: roaring.New()}
 		}
-		return roaring.And(c.sure, scope)
+		return approx{sure: roaring.And(c.sure, scope), maybe: roaring.New()}
 	}
 	if lp.useCache && 2*scope.GetCardinality() >= uint64(s.n) {
 		// Most of the segment is in question anyway: verify all of it once, and cache.
 		full := c.sure.Clone()
-		check := roaring.AndNot(c.maybe, c.sure)
-		s.verify(lp, check, full)
+		s.verify(lp, roaring.AndNot(c.maybe, c.sure), full)
 		if s.err != nil {
-			return roaring.New()
+			return emptyApprox
 		}
-		return roaring.And(s.cachePut(lp, full), scope)
+		return approx{sure: roaring.And(s.cachePut(lp, full), scope), maybe: roaring.New()}
 	}
-	out := roaring.And(c.sure, scope)
-	check := roaring.And(c.maybe, scope)
-	check.AndNot(out)
-	s.verify(lp, check, out)
-	return out
+	sure := roaring.And(c.sure, scope)
+	maybe := roaring.And(c.maybe, scope)
+	maybe.AndNot(sure)
+	return approx{sure: sure, maybe: maybe}
+}
+
+// resolve returns exactly the documents of d that n matches, verifying in batches:
+// d must lie within n's scope (the root's maybe, or a part of it).
+func (s *segExec) resolve(n *pnode, d *roaring.Bitmap) *roaring.Bitmap {
+	a, ok := s.approxes[n]
+	if !ok || s.err != nil {
+		return roaring.New()
+	}
+	sure := roaring.And(a.sure, d)
+	m := roaring.And(a.maybe, d)
+	if m.IsEmpty() {
+		return sure
+	}
+	switch n.kind {
+	case nLeaf:
+		s.verify(n.leaf, m, sure)
+		return sure
+	case nNot:
+		m.AndNot(s.resolve(n.children[0], m))
+		sure.Or(m)
+		return sure
+	case nAll:
+		for _, c := range s.orders[n] {
+			if m.IsEmpty() {
+				break
+			}
+			m = s.resolve(c, m)
+		}
+		sure.Or(m)
+		return sure
+	case nAny:
+		for _, c := range s.orders[n] {
+			if m.IsEmpty() {
+				break
+			}
+			got := s.resolve(c, m)
+			sure.Or(got)
+			m.AndNot(got)
+		}
+		return sure
+	default:
+		return sure
+	}
+}
+
+// check reports whether n matches document d (within n's scope), verifying only the
+// leaves it must, one document at a time: the lazy half of the two phases, for the
+// few candidates that could enter a top-k.
+func (s *segExec) check(n *pnode, d uint32) bool {
+	a, ok := s.approxes[n]
+	if !ok {
+		return false
+	}
+	if a.sure.Contains(d) {
+		return true
+	}
+	if !a.maybe.Contains(d) {
+		return false
+	}
+	switch n.kind {
+	case nLeaf:
+		return s.verifyDoc(n.leaf, d)
+	case nNot:
+		return !s.check(n.children[0], d)
+	case nAll:
+		for _, c := range s.orders[n] {
+			if !s.check(c, d) {
+				return false
+			}
+		}
+		return true
+	case nAny:
+		for _, c := range s.orders[n] {
+			if s.check(c, d) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // isText reports whether field holds text in this segment (a keyword column): its
@@ -585,40 +727,55 @@ func numericPredicate(lp *leafPlan) (func(float64) bool, bool) {
 	return nil, false
 }
 
-// numericScanChunk is how many ordinals one parallel task of numericScan covers.
-const numericScanChunk = 1 << 16
+// scanChunk is how many ordinals one parallel task of a column scan covers.
+const scanChunk = 1 << 16
 
-// numericScan returns the documents of scope whose number holds pred, scanning
-// stretches of 65536 ordinals in parallel on the search pool.
+// numericScan returns the documents of scope whose number holds pred.
 func (s *segExec) numericScan(field string, pred func(float64) bool, scope *roaring.Bitmap) *roaring.Bitmap {
 	nc := s.r.Numbers(field)
-	if !nc.Exists() || scope.IsEmpty() {
+	if !nc.Exists() {
+		return roaring.New()
+	}
+	return s.columnScan(scope, func(d uint32) bool {
+		v, ok := nc.Value(d)
+		return ok && pred(v)
+	})
+}
+
+// columnScan returns the documents of scope that keep holds, scanning stretches of
+// scanChunk ordinals in parallel on the search pool.
+func (s *segExec) columnScan(scope *roaring.Bitmap, keep func(d uint32) bool) *roaring.Bitmap {
+	if scope.IsEmpty() {
 		return roaring.New()
 	}
 	first, last := scope.Minimum(), scope.Maximum()
-	chunks := int(last/numericScanChunk-first/numericScanChunk) + 1
+	chunks := int(last/scanChunk-first/scanChunk) + 1
 	parts := make([]*roaring.Bitmap, chunks)
-	runParallel(chunks, func(c int) {
-		lo := (first/numericScanChunk + uint32(c)) * numericScanChunk //nolint:gosec // c < chunks
+	err := runParallel(chunks, func(c int) {
+		lo := (first/scanChunk + uint32(c)) * scanChunk //nolint:gosec // c < chunks
 		out := roaring.New()
-		keep := make([]uint32, 0, 256)
+		kept := make([]uint32, 0, 256)
 		it := scope.Iterator()
 		it.AdvanceIfNeeded(lo)
 		for it.HasNext() {
 			d := it.Next()
-			if d-lo >= numericScanChunk {
+			if d-lo >= scanChunk {
 				break
 			}
-			if v, ok := nc.Value(d); ok && pred(v) {
-				keep = append(keep, d)
-				if len(keep) == cap(keep) {
-					out.AddMany(keep)
-					keep = keep[:0]
+			if keep(d) {
+				kept = append(kept, d)
+				if len(kept) == cap(kept) {
+					out.AddMany(kept)
+					kept = kept[:0]
 				}
 			}
 		}
-		out.AddMany(keep)
+		out.AddMany(kept)
 		parts[c] = out
 	})
+	if err != nil {
+		s.fail(err)
+		return roaring.New()
+	}
 	return roaring.FastOr(parts...)
 }

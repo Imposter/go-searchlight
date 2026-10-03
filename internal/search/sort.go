@@ -315,9 +315,16 @@ func (ss *segSorter) collect(h *topHeap, docs *roaring.Bitmap, k int) {
 						continue
 					}
 				}
+				// It would enter: only now is a maybe candidate verified.
+				if !s.accept(d) {
+					continue
+				}
 				// Replace the worst in place, reusing its keys.
 				ss.fill(top, d, k0)
 				heap.Fix(h, 0)
+				continue
+			}
+			if !s.accept(d) {
 				continue
 			}
 			var e entry
@@ -327,7 +334,9 @@ func (ss *segSorter) collect(h *topHeap, docs *roaring.Bitmap, k int) {
 	}
 }
 
-// topK returns the segment's best k hits, best first.
+// topK returns the segment's best k hits among hits, best first. Under lazy
+// verification hits are the candidates, and a maybe one is verified only when it
+// would enter the heap (or the id walk): Lucene's two-phase top-k.
 func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 	if k <= 0 || hits.IsEmpty() {
 		return nil
@@ -445,7 +454,7 @@ func (s *segExec) topByIDWalk(hits *roaring.Bitmap, k int) []segHit {
 		if i%checkEvery == 0 && s.checkCtx() {
 			return false
 		}
-		if !hits.Contains(ord) || (s.p.after != nil && string(id) == from) {
+		if !hits.Contains(ord) || (s.p.after != nil && string(id) == from) || !s.accept(ord) {
 			return true
 		}
 		out = append(out, segHit{seg: s.seg, ord: ord, id: string(id), hasID: true, vals: []any{nil}})
@@ -539,12 +548,14 @@ func cmpValue(a, b any, desc bool) int {
 
 // The rank cache.
 
-// rankCacheBytes bounds the rank arrays kept (4 bytes per document).
+// rankCacheBytes bounds the rank arrays kept (4 bytes per document). A segment of more
+// than rankCacheBytes/4 documents (64M) is never cached: its rank array is rebuilt for
+// each search that needs it.
 const rankCacheBytes = 256 << 20
 
 // rankLRU caches each segment's rank array: ord -> the rank of its id among the
-// segment's ids. Segments never change, so an entry never goes stale; one of a
-// segment merged away ages out.
+// segment's ids. Segments never change, so an entry never goes stale; an entry whose
+// segment has been closed for good is dropped at the next put.
 type rankLRU struct {
 	mu    sync.Mutex
 	lru   list.List // of *rankEntry, most recent first
@@ -553,8 +564,9 @@ type rankLRU struct {
 }
 
 type rankEntry struct {
-	seg   string
-	ranks []uint32
+	seg    string
+	reader *segment.Reader
+	ranks  []uint32
 }
 
 var rankCache = &rankLRU{items: map[string]*list.Element{}}
@@ -569,25 +581,35 @@ func (c *rankLRU) get(seg string) []uint32 {
 	return nil
 }
 
-func (c *rankLRU) put(seg string, ranks []uint32) {
+func (c *rankLRU) put(seg string, r *segment.Reader, ranks []uint32) {
 	size := int64(len(ranks)) * 4
-	if size > rankCacheBytes/4 {
+	if size > rankCacheBytes {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	for el := c.lru.Front(); el != nil; {
+		next := el.Next()
+		if e := el.Value.(*rankEntry); e.reader.Closed() { //nolint:forcetypeassert,errcheck // only rankEntries
+			c.remove(el)
+		}
+		el = next
+	}
 	if _, ok := c.items[seg]; ok {
 		return
 	}
-	c.items[seg] = c.lru.PushFront(&rankEntry{seg: seg, ranks: ranks})
+	c.items[seg] = c.lru.PushFront(&rankEntry{seg: seg, reader: r, ranks: ranks})
 	c.bytes += size
 	for c.bytes > rankCacheBytes {
-		el := c.lru.Back()
-		e := el.Value.(*rankEntry) //nolint:forcetypeassert,errcheck // only rankEntries
-		c.lru.Remove(el)
-		delete(c.items, e.seg)
-		c.bytes -= int64(len(e.ranks)) * 4
+		c.remove(c.lru.Back())
 	}
+}
+
+func (c *rankLRU) remove(el *list.Element) {
+	e := el.Value.(*rankEntry) //nolint:forcetypeassert,errcheck // only rankEntries
+	c.lru.Remove(el)
+	delete(c.items, e.seg)
+	c.bytes -= int64(len(e.ranks)) * 4
 }
 
 // ranksFor returns segment seg's rank array, from the cache or built by one walk of
@@ -605,6 +627,6 @@ func ranksFor(seg string, r *segment.Reader) []uint32 {
 		next++
 		return true
 	})
-	rankCache.put(seg, ranks)
+	rankCache.put(seg, r, ranks)
 	return ranks
 }

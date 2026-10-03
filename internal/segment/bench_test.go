@@ -250,7 +250,7 @@ func BenchmarkMerge(b *testing.B) {
 	defer rB.Close()
 	b.ResetTimer()
 	for range b.N {
-		if _, err := Merge(dir, []*Reader{rA, rB}, nil); err != nil {
+		if _, err := Merge(dir, []*Reader{rA, rB}, nil, MergeOptions{}); err != nil {
 			b.Fatal(err)
 		}
 	}

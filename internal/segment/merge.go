@@ -16,6 +16,21 @@ type storedRec struct {
 	body []byte
 }
 
+// MergeOptions configures [Merge].
+type MergeOptions struct {
+	// Name is the merged segment's file stem, as [BuildOptions.Name]; a random one is
+	// generated when empty. The same uniqueness rule applies.
+	Name string
+	// Threads bounds how many goroutines Merge uses, in both its accumulation and its
+	// writing phase (as [BuildOptions.Threads] does for Build). 0 means GOMAXPROCS.
+	Threads int
+	// Throttle, when set, is called before each chunk (about 64 KiB) of the merged file
+	// is written, with the chunk's size: a shard's I/O budget sleeps in it, and a
+	// cancelled merge returns an error from it, which aborts the merge (Merge then
+	// removes its temp file and returns that error).
+	Throttle func(n int) error
+}
+
 // Merge combines inputs into one new segment in dir, dropping every document that is
 // not live: set in its reader's corresponding entry of deletes (which may be nil for an
 // input with no deletions). Document ordinals are reassigned: input 0's live documents
@@ -25,13 +40,16 @@ type storedRec struct {
 // through the same section writers); Merge only ever reads from inputs and never
 // rewrites them.
 //
-// Merge has no [BuildOptions] of its own (its signature is fixed), so it parallelizes
-// itself, up to GOMAXPROCS: inputs are split into contiguous, ascending groups of
-// readers, one per worker, each merged into its own fieldBuilder per field exactly as
-// a single-worker Merge would merge all of inputs; the groups are then merged with
-// everything else [writeSegmentParts] merges parts with, so Merge is parallel the same
-// way, and for the same reason, [Build] is.
-func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error) {
+// Merge parallelizes itself up to opts.Threads (GOMAXPROCS when 0): inputs are split
+// into contiguous, ascending groups of readers, one per worker, each merged into its
+// own fieldBuilder per field exactly as a single-worker Merge would merge all of
+// inputs; the groups are then merged with everything else [writeSegmentParts] merges
+// parts with, so Merge is parallel the same way, and for the same reason, [Build] is.
+func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOptions) (Meta, error) {
+	threads := opts.Threads
+	if threads < 1 {
+		threads = runtime.GOMAXPROCS(0)
+	}
 	remaps := make([][]int32, len(inputs))
 	var total uint32
 	for i, r := range inputs {
@@ -52,7 +70,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 	}
 
 	recs := make([]storedRec, total)
-	groups := splitReaderRanges(len(inputs), runtime.GOMAXPROCS(0))
+	groups := splitReaderRanges(len(inputs), threads)
 	parts := make([]map[string]*fieldBuilder, len(groups))
 	errs := make([]error, len(groups))
 	mergeGroups(inputs, remaps, recs, groups, parts, errs)
@@ -63,12 +81,14 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 	}
 
 	names := liveFieldNames(parts)
-	name := genName()
+	name := opts.Name
+	if name == "" {
+		name = genName()
+	}
 	path := filepath.Join(dir, name+FileExt)
-	threads := runtime.GOMAXPROCS(0)
 	meta, err := writeSegmentParts(path, total, names, parts, storedFromSlice(func(ord uint32) (string, []byte) {
 		return recs[ord].id, recs[ord].body
-	}, total), threads)
+	}, total), threads, opts.Throttle)
 	if err != nil {
 		return Meta{}, err
 	}

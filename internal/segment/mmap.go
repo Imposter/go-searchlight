@@ -94,3 +94,8 @@ func (m *mapping) release() error {
 	}
 	return err
 }
+
+// SyncDir fsyncs dir itself, making a prior rename, create or unlink of an entry inside
+// it durable (a documented no-op on Windows, where the volume's journal does this; see
+// mmap_windows.go). Shards use it after swapping their manifest.
+func SyncDir(dir string) error { return fsyncDir(dir) }

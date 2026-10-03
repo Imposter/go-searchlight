@@ -501,7 +501,7 @@ func TestMergeEqualsRebuild(t *testing.T) {
 	}
 	defer rB.Close()
 
-	mergedMeta, err := Merge(dir, []*Reader{rA, rB}, []*roaring.Bitmap{delA, delB})
+	mergedMeta, err := Merge(dir, []*Reader{rA, rB}, []*roaring.Bitmap{delA, delB}, MergeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -834,7 +834,7 @@ func TestEmptyTermSortsFirstAcrossParts(t *testing.T) {
 			t.Cleanup(func() { _ = r.Close() })
 			readers = append(readers, r)
 		}
-		meta, err := Merge(dir, readers, nil)
+		meta, err := Merge(dir, readers, nil, MergeOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -993,7 +993,7 @@ func checkMergeEqualsRebuild(t *testing.T, docs []schema.Doc, segs int, withDele
 		}
 		deletes = append(deletes, del)
 	}
-	merged, err := Merge(dir, readers, deletes)
+	merged, err := Merge(dir, readers, deletes, MergeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1005,5 +1005,68 @@ func checkMergeEqualsRebuild(t *testing.T, docs []schema.Doc, segs int, withDele
 	if !bytes.Equal(got, want) {
 		t.Fatalf("%d segments, deletes %v, GOMAXPROCS %d: merge wrote %d bytes, a rebuild of the %d live docs %d bytes, and they differ",
 			segs, withDeletes, runtime.GOMAXPROCS(0), len(got), len(live), len(want))
+	}
+}
+
+func TestMergeOptions(t *testing.T) {
+	docs := testDocs(t)
+	dir := t.TempDir()
+	meta, err := Build(dir, docs, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// Name and Threads are honoured, and the result is the same for any Threads.
+	var files [][]byte
+	for i, threads := range []int{1, 3} {
+		name := fmt.Sprintf("merged-%d", i)
+		m, err := Merge(dir, []*Reader{r}, nil, MergeOptions{Name: name, Threads: threads})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.ID != name || filepath.Base(m.Path) != name+FileExt {
+			t.Fatalf("Merge named %q (%s), want %q", m.ID, m.Path, name)
+		}
+		b, err := os.ReadFile(m.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, b)
+	}
+	if !bytes.Equal(files[0], files[1]) {
+		t.Fatal("Merge with 1 and 3 threads wrote different files")
+	}
+
+	// Throttle sees every byte written, and an error from it aborts the merge and
+	// leaves no file behind.
+	var written int
+	m, err := Merge(dir, []*Reader{r}, nil, MergeOptions{Name: "throttled", Throttle: func(n int) error {
+		written += n
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(m.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if int64(written) != info.Size() {
+		t.Fatalf("Throttle saw %d bytes, the file has %d", written, info.Size())
+	}
+	stop := errors.New("budget exhausted")
+	_, err = Merge(dir, []*Reader{r}, nil, MergeOptions{Name: "aborted", Throttle: func(int) error { return stop }})
+	if !errors.Is(err, stop) {
+		t.Fatalf("Merge with a failing Throttle: err = %v, want %v", err, stop)
+	}
+	for _, name := range []string{"aborted" + FileExt, "aborted" + FileExt + ".tmp"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s left behind by an aborted merge (stat err %v)", name, err)
+		}
 	}
 }

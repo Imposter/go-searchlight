@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -123,7 +124,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), opts.Threads)
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), opts.Threads, nil)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -321,8 +322,9 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 // or many (one per [BuildOptions.Threads] worker, or one per Merge reader group) -
 // writeFieldDicts and friends treat those identically, which is what makes the file
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
-// writing phase itself (as opposed to parts, accumulation's) uses.
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, threads int) (Meta, error) {
+// writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
+// nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, threads int, throttle func(n int) error) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -336,7 +338,11 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 		}
 	}()
 
-	w := newFileWriter(f)
+	var out io.Writer = f
+	if throttle != nil {
+		out = throttledWriter{w: f, throttle: throttle}
+	}
+	w := newFileWriter(out)
 	w.header()
 
 	empty := newFieldBuilder()
@@ -438,4 +444,18 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 		return Meta{}, err
 	}
 	return Meta{Path: path, NumDocs: numDocs}, nil
+}
+
+// throttledWriter calls throttle before each write to w, failing the write with its
+// error.
+type throttledWriter struct {
+	w        io.Writer
+	throttle func(n int) error
+}
+
+func (t throttledWriter) Write(p []byte) (int, error) {
+	if err := t.throttle(len(p)); err != nil {
+		return 0, err
+	}
+	return t.w.Write(p)
 }

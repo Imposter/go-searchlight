@@ -86,7 +86,16 @@ CREATE TABLE IF NOT EXISTS sl_blobs (
 	size BIGINT NOT NULL,
 	chunks INT NOT NULL,
 	sha256 VARCHAR(64) NOT NULL,
-	created_at BIGINT NOT NULL
+	created_at BIGINT NOT NULL,
+	KEY sl_blobs_upload (upload_id)
+) ENGINE=InnoDB;
+
+-- Uploads in progress (touched as they write) and replaced or deleted uploads
+-- awaiting removal (touched_at 0); BlobStore.Sweep clears stale ones.
+CREATE TABLE IF NOT EXISTS sl_blob_uploads (
+	upload_id VARCHAR(64) NOT NULL PRIMARY KEY,
+	name VARBINARY(512) NOT NULL,
+	touched_at BIGINT NOT NULL
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS sl_blob_chunks (

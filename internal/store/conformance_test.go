@@ -15,6 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // The conformance suite runs every test on SQLite, and on Postgres and MySQL
@@ -1288,4 +1291,236 @@ func TestDatabaseClock(t *testing.T) {
 			}
 		}
 	})
+}
+
+func blobChunkCount(t *testing.T, st Store) int {
+	return countRows(t, st, "SELECT COUNT(*) FROM sl_blob_chunks")
+}
+
+// TestBlobSweep covers what crashes leave behind: a Put that dies mid-write,
+// one that dies after switching the pointer but before removing the old
+// upload, and the interplay of Sweep with Puts still writing.
+func TestBlobSweep(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		const chunk = 1024
+		st := h.open(t, WithBlobChunkSize(chunk))
+		bs := st.Blobs()
+		hooks := engine(st).blobs
+		data := bytes.Repeat([]byte("0123456789abcdef"), 4*chunk/16) // 4 chunks
+
+		// A Put crashes after two chunks: nothing is visible, and the
+		// leftovers survive a sweep while fresh but not once stale.
+		n := 0
+		hooks.crash = func(point string) bool { n++; return point == "chunk" && n == 2 }
+		if _, err := bs.Put(ctx, "crashed", bytes.NewReader(data)); !errors.Is(err, errSimulatedCrash) {
+			t.Fatalf("crashing put: %v", err)
+		}
+		hooks.crash = nil
+		if _, err := bs.Stat(ctx, "crashed"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("crashed put is visible: %v", err)
+		}
+		if got := blobChunkCount(t, st); got != 2 {
+			t.Fatalf("%d chunks after the crash, want 2", got)
+		}
+		if removed, err := bs.Sweep(ctx, time.Hour); err != nil || removed != 0 {
+			t.Fatalf("sweep of a fresh upload: %d %v", removed, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if removed, err := bs.Sweep(ctx, 10*time.Millisecond); err != nil || removed != 1 {
+			t.Fatalf("sweep of a stale upload: %d %v", removed, err)
+		}
+		if got := blobChunkCount(t, st); got != 0 {
+			t.Fatalf("%d chunks after the sweep", got)
+		}
+		if got := countRows(t, st, "SELECT COUNT(*) FROM sl_blob_uploads"); got != 0 {
+			t.Fatalf("%d upload registrations after the sweep", got)
+		}
+
+		// A replacing Put crashes after its commit, before removing the old
+		// upload: the new blob is intact, and the old upload's removal was
+		// recorded in the same transaction, so any sweep takes it.
+		if _, err := bs.Put(ctx, "x", bytes.NewReader(data)); err != nil {
+			t.Fatal(err)
+		}
+		hooks.crash = func(point string) bool { return point == "cleanup" }
+		if _, err := bs.Put(ctx, "x", bytes.NewReader(data[:chunk])); !errors.Is(err, errSimulatedCrash) {
+			t.Fatalf("crashing replace: %v", err)
+		}
+		hooks.crash = nil
+		if got := blobChunkCount(t, st); got != 5 {
+			t.Fatalf("%d chunks after the crashed replace, want 5", got)
+		}
+		if removed, err := bs.Sweep(ctx, time.Hour); err != nil || removed != 1 {
+			t.Fatalf("sweep of a replaced upload: %d %v", removed, err)
+		}
+		if got := blobChunkCount(t, st); got != 1 {
+			t.Fatalf("%d chunks after sweeping the replaced upload, want 1", got)
+		}
+		rc, _, err := bs.Get(ctx, "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := io.ReadAll(rc); err != nil || !bytes.Equal(got, data[:chunk]) {
+			t.Fatalf("replaced blob: %d bytes, %v", len(got), err)
+		}
+		_ = rc.Close()
+
+		// Delete registers the removal too, so a later sweep has nothing left.
+		if err := bs.Delete(ctx, "x"); err != nil {
+			t.Fatal(err)
+		}
+		if got := blobChunkCount(t, st); got != 0 {
+			t.Fatalf("%d chunks after delete", got)
+		}
+
+		// A Put still writing survives a sweep for stale uploads...
+		pr, pw := io.Pipe()
+		put := make(chan error, 1)
+		go func() {
+			_, err := bs.Put(ctx, "slow", pr)
+			put <- err
+		}()
+		if _, err := pw.Write(data[:chunk]); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return blobChunkCount(t, st) == 1 })
+		if removed, err := bs.Sweep(ctx, time.Hour); err != nil || removed != 0 {
+			t.Fatalf("sweep during a live put: %d %v", removed, err)
+		}
+		_, _ = pw.Write(data[chunk : 2*chunk])
+		_ = pw.Close()
+		if err := <-put; err != nil {
+			t.Fatalf("live put: %v", err)
+		}
+		// ...but one stalled past olderThan is taken, and its Put fails
+		// rather than commit a blob missing chunks.
+		pr, pw = io.Pipe()
+		go func() {
+			_, err := bs.Put(ctx, "stalled", pr)
+			put <- err
+		}()
+		if _, err := pw.Write(data[:chunk]); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, func() bool { return blobChunkCount(t, st) == 3 })
+		time.Sleep(50 * time.Millisecond)
+		if removed, err := bs.Sweep(ctx, 10*time.Millisecond); err != nil || removed != 1 {
+			t.Fatalf("sweep of a stalled put: %d %v", removed, err)
+		}
+		_, _ = pw.Write(data[chunk : 2*chunk])
+		_ = pw.Close()
+		if err := <-put; !errors.Is(err, ErrConflict) {
+			t.Fatalf("stalled put after the sweep: %v", err)
+		}
+		if _, err := bs.Stat(ctx, "stalled"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("swept put is visible: %v", err)
+		}
+		if _, err := bs.Sweep(ctx, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got := blobChunkCount(t, st); got != 2 {
+			t.Fatalf("%d chunks left, want the 2 of blob slow", got)
+		}
+		if _, err := bs.Sweep(ctx, -time.Second); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("negative age: %v", err)
+		}
+	})
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestBlobListPrefix(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		bs := h.open(t).Blobs()
+		names := []string{"a", "seg/", "seg/0", "seg/1/x", "seg0", "segé", "sef", "\U0010FFFF", "z\U0010FFFF\U0010FFFF", "z\U0010FFFFa"}
+		for _, n := range names {
+			if _, err := bs.Put(ctx, n, strings.NewReader(n)); err != nil {
+				t.Fatalf("put %q: %v", n, err)
+			}
+		}
+		for prefix, want := range map[string]string{
+			"seg/":        "[seg/ seg/0 seg/1/x]",
+			"seg":         "[seg/ seg/0 seg/1/x seg0 segé]",
+			"":            fmt.Sprint(sortedCopy(names)),
+			"z\U0010FFFF": fmt.Sprint([]string{"z\U0010FFFFa", "z\U0010FFFF\U0010FFFF"}),
+			"q":           "[]",
+		} {
+			list, err := bs.List(ctx, prefix)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for _, b := range list {
+				got = append(got, b.Name)
+			}
+			if fmt.Sprint(got) != want && (want != "[]" || got != nil) {
+				t.Fatalf("list %q: %q, want %s", prefix, got, want)
+			}
+		}
+	})
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func TestPrefixEnd(t *testing.T) {
+	for prefix, want := range map[string]string{
+		"abc": "abd", "a\U0010FFFF": "b", "\uD7FF": "\uE000", "é": "ê",
+	} {
+		if got, ok := prefixEnd(prefix); !ok || got != want {
+			t.Fatalf("prefixEnd(%q) = %q, %v", prefix, got, ok)
+		}
+	}
+	for _, p := range []string{"", "\U0010FFFF\U0010FFFF"} {
+		if _, ok := prefixEnd(p); ok {
+			t.Fatalf("prefixEnd(%q) has an end", p)
+		}
+	}
+}
+
+// TestBlobGetSpan checks Get's span lasts until the stream is closed.
+func TestBlobGetSpan(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	st := sqliteHarness(t).open(t, WithTracer(tp.Tracer("test")))
+	ctx := context.Background()
+	if _, err := st.Blobs().Put(ctx, "b", strings.NewReader("hello")); err != nil {
+		t.Fatal(err)
+	}
+	ended := func() bool {
+		for _, s := range rec.Ended() {
+			if s.Name() == "store.blob_get" {
+				return true
+			}
+		}
+		return false
+	}
+	rc, _, err := st.Blobs().Get(ctx, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	if ended() {
+		t.Fatal("blob_get span ended before the stream was closed")
+	}
+	_ = rc.Close()
+	if !ended() {
+		t.Fatal("blob_get span still open after Close")
+	}
 }

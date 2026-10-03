@@ -121,14 +121,16 @@ type RegistryStore interface {
 }
 
 // BlobStore keeps named blobs (segment bundles) in sl_blobs, split into
-// chunks so neither side ever holds a whole bundle in memory.
+// chunks so neither side ever holds a whole bundle in memory. Uploads are
+// tracked, so what a crash leaves behind is found and removed by Sweep.
 type BlobStore interface {
 	// Put stores r under name, replacing any blob of that name once the new
 	// one is complete. Readers see the old blob or the new one, never a mix.
 	Put(ctx context.Context, name string, r io.Reader) (BlobInfo, error)
 	// Get streams a blob. The reader fetches one chunk at a time and fails
 	// with ErrChecksum if the content does not match; it fails with
-	// ErrNotFound if the blob is replaced or deleted mid-read.
+	// ErrNotFound if the blob is replaced or deleted mid-read. Close it: the
+	// operation's span ends then.
 	Get(ctx context.Context, name string) (io.ReadCloser, BlobInfo, error)
 	// Stat describes a blob.
 	Stat(ctx context.Context, name string) (BlobInfo, error)
@@ -136,6 +138,13 @@ type BlobStore interface {
 	List(ctx context.Context, prefix string) ([]BlobInfo, error)
 	// Delete removes a blob; deleting a missing blob is not an error.
 	Delete(ctx context.Context, name string) error
+	// Sweep removes uploads abandoned by crashed or interrupted writers and
+	// cleanups, judging staleness by the database clock: unreferenced uploads
+	// untouched for olderThan, and chunks no upload owns. It works in short
+	// statements and returns how many uploads it removed. olderThan must be
+	// well beyond the time a Put takes to write blobTouchEvery (16) chunks;
+	// an hour is ample. The cluster runs it periodically.
+	Sweep(ctx context.Context, olderThan time.Duration) (int, error)
 }
 
 // IndexStore is the index catalogue in sl_indexes.

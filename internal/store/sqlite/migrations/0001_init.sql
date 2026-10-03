@@ -92,6 +92,16 @@ CREATE TABLE IF NOT EXISTS sl_blobs (
 	created_at INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS sl_blobs_upload ON sl_blobs (upload_id);
+
+-- Uploads in progress (touched as they write) and replaced or deleted uploads
+-- awaiting removal (touched_at 0); BlobStore.Sweep clears stale ones.
+CREATE TABLE IF NOT EXISTS sl_blob_uploads (
+	upload_id TEXT NOT NULL PRIMARY KEY,
+	name TEXT NOT NULL,
+	touched_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sl_blob_chunks (
 	upload_id TEXT NOT NULL,
 	chunk INTEGER NOT NULL,

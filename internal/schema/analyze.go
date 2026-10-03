@@ -66,11 +66,14 @@ type Doc struct {
 }
 
 // ValidateID refuses an id no document may have: empty, longer than MaxIDBytes, holding a
-// NUL or invalid UTF-8.
+// NUL or invalid UTF-8, or "." or ".." (no URL path can address them: they are path
+// steps, which HTTP clients and routers resolve away).
 func ValidateID(id string) error {
 	switch {
 	case id == "":
 		return &ValidationError{Field: IDField, Message: "a document id cannot be empty"}
+	case id == "." || id == "..":
+		return &ValidationError{Field: IDField, Message: `a document id cannot be "." or ".."`}
 	case len(id) > MaxIDBytes:
 		return &ValidationError{Field: IDField, Message: fmt.Sprintf("a document id is at most %d bytes", MaxIDBytes)}
 	case !utf8.ValidString(id):
@@ -103,10 +106,26 @@ func ValidateID(id string) error {
 // buffer, so a caller may reuse it, and a document sliced out of a large request does
 // not pin the whole request in memory for as long as the document lives.
 func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
+	return analyze(m, id, body, false)
+}
+
+// Check validates and types a document exactly as [Analyze] does (the same errors
+// and the same MappingUpdate) and returns its body as Analyze would keep it (invalid
+// UTF-8 replaced), without analyzing its values: what a writer needs before it
+// commits a document, at a fraction of Analyze's memory (no text, words or grams).
+// Unlike Analyze it returns body itself, not a copy, when it is valid UTF-8.
+func Check(m *Mapping, id string, body []byte) ([]byte, MappingUpdate, error) {
+	d, u, err := analyze(m, id, body, true)
+	return d.Body, u, err
+}
+
+func analyze(m *Mapping, id string, body []byte, typesOnly bool) (Doc, MappingUpdate, error) {
 	if err := ValidateID(id); err != nil {
 		return Doc{}, MappingUpdate{}, err
 	}
-	body = validUTF8Copy(body)
+	if !typesOnly || !utf8.Valid(body) {
+		body = validUTF8Copy(body)
+	}
 	object, err := decodeObject(body)
 	if err != nil {
 		return Doc{}, MappingUpdate{}, err
@@ -115,10 +134,14 @@ func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
 		m = &Mapping{}
 	}
 	a := analyzer{
-		mapping: m,
-		doc:     Doc{ID: id, Fields: make(map[string]Value, len(object)+1), Body: body},
+		mapping:   m,
+		typesOnly: typesOnly,
+		doc:       Doc{ID: id, Body: body},
 	}
-	a.doc.Fields[IDField] = textValue(Keyword, id, false)
+	if !typesOnly {
+		a.doc.Fields = make(map[string]Value, len(object)+1)
+		a.doc.Fields[IDField] = textValue(Keyword, id, false)
+	}
 	if hasNULName(object) {
 		// Names that coincide once cleaned resolve by document order, which a map loses.
 		members, err := decodeMembers(body)
@@ -146,11 +169,12 @@ func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
 
 // analyzer is one Analyze call's state.
 type analyzer struct {
-	mapping  *Mapping
-	doc      Doc
-	update   MappingUpdate
-	claimed  map[string]bool // cleaned names taken so far, when names hold NULs
-	unmapped string          // the smallest unmapped name, under DynamicStrict
+	mapping   *Mapping
+	typesOnly bool // Check: type the fields, analyze no value
+	doc       Doc
+	update    MappingUpdate
+	claimed   map[string]bool // cleaned names taken so far, when names hold NULs
+	unmapped  string          // the smallest unmapped name, under DynamicStrict
 }
 
 func (a *analyzer) member(name string, value any) error {
@@ -183,14 +207,18 @@ func (a *analyzer) member(name string, value any) error {
 		default:
 			inferred, ok := infer(value)
 			if !ok {
-				a.doc.Fields[name] = Value{Present: true}
+				if !a.typesOnly {
+					a.doc.Fields[name] = Value{Present: true}
+				}
 				return nil
 			}
 			t = inferred
 			a.update.add(name, t)
 		}
 	}
-	a.doc.Fields[name] = analyzeValue(t, value)
+	if !a.typesOnly {
+		a.doc.Fields[name] = analyzeValue(t, value)
+	}
 	return nil
 }
 

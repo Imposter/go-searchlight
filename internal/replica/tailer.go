@@ -213,6 +213,8 @@ type Tailer struct {
 	recoveredAt int64  // the applied seq that rebuild ended at
 	needRebuild string // a rebuild to (re)try before tailing, by reason
 	needReopen  bool
+	// missingSince is when the catalogue was first seen without the index.
+	missingSince time.Time
 }
 
 // NewTailer returns a tailer that keeps sh, the copy of shard id, in step with st's
@@ -292,18 +294,20 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer cancel()
-	hub := t.opts.Hub
+	hub, own := t.opts.Hub, false
 	if hub == nil {
-		if hub = NewHub(t.st, HubOptions{Logger: t.opts.Logger, Meter: t.opts.Meter, RetryBase: t.opts.RetryBase, RetryCap: t.opts.RetryCap}); hub != nil {
+		hub = NewHub(t.st, HubOptions{Logger: t.opts.Logger, Meter: t.opts.Meter, RetryBase: t.opts.RetryBase, RetryCap: t.opts.RetryCap})
+		own = true
+	}
+	if hub != nil {
+		defer hub.subscribe(t)()
+		if own {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				_ = hub.Run(runCtx)
 			}()
 		}
-	}
-	if hub != nil {
-		defer hub.subscribe(t)()
 	}
 
 	t.log.InfoContext(ctx, "tailer started", slog.Int64("seq", t.Applied()))
@@ -348,7 +352,7 @@ func (t *Tailer) loop(ctx context.Context, hub *Hub) error {
 			}
 			continue
 		}
-		t.retry = 0
+		t.retry, t.missingSince = 0, time.Time{}
 		if caughtUp {
 			t.sleep(ctx, hub)
 		}
@@ -378,7 +382,20 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.needReopen = true
 		t.log.WarnContext(ctx, "shard copy failed; reopening it", slog.Any("error", err))
 		return nil
-	case errors.Is(err, store.ErrLeaseLost), errors.Is(err, ErrIndexDropped), errors.Is(err, shard.ErrClosed),
+	case errors.Is(err, ErrIndexDropped):
+		// A drop followed at once by a create is a new incarnation, not the end:
+		// only an index missing for a whole CatalogInterval stops the copy.
+		if t.missingSince.IsZero() {
+			t.missingSince = time.Now()
+		}
+		if time.Since(t.missingSince) >= t.opts.CatalogInterval {
+			return err
+		}
+		t.log.DebugContext(ctx, "index missing from the catalogue; checking again", slog.Any("error", err))
+		sleepCtx(ctx, t.opts.CatalogInterval)
+		t.lastCatalog = time.Time{} // re-read it at once
+		return nil
+	case errors.Is(err, store.ErrLeaseLost), errors.Is(err, shard.ErrClosed),
 		errors.Is(err, store.ErrClosed), errors.Is(err, store.ErrInvalid):
 		return err
 	}

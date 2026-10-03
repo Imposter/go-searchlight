@@ -367,6 +367,9 @@ func (c *copyRunner) waitApplied(seq int64) *shard.Shard {
 		c.mu.Unlock()
 		select {
 		case err := <-done:
+			c.mu.Lock()
+			c.cancel, c.done = nil, nil
+			c.mu.Unlock()
 			c.t.Fatalf("tailer stopped: %v", err)
 		default:
 		}

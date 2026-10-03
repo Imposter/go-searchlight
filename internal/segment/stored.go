@@ -1,7 +1,9 @@
 package segment
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -26,6 +28,10 @@ import (
 
 // storedBlockTarget is the uncompressed payload size a block is flushed at.
 const storedBlockTarget = 16 << 10
+
+// newBlockEncoder makes one stored-block compressor. A variable only so a test can make
+// it fail ([TestCompressBlocksParallelEncoderFailureNoLeak]).
+var newBlockEncoder = func() (*zstd.Encoder, error) { return zstd.NewWriter(nil) }
 
 type storedBlockInfo struct {
 	off      uint64
@@ -79,14 +85,22 @@ func collectStoredPayloads(src storedSource) ([]storedPayload, error) {
 	return payloads, nil
 }
 
-// compressBlocksParallel zstd-compresses every payload, in payloads' order's result
-// slot but not necessarily order of completion, using up to threads goroutines, each
-// with its own encoder reused across every block it is given (rather than one encoder
-// per block, or one shared encoder guarded by a lock).
+// compressBlocksParallel zstd-compresses every payload into its own result slot (in
+// payloads' order, whatever order they finish in), using up to threads goroutines,
+// each with its own encoder reused across every block it takes (rather than one
+// encoder per block, or one shared encoder guarded by a lock).
+//
+// Workers claim block indices from a shared atomic counter instead of a channel fed
+// by a separate goroutine: a worker that fails to make its encoder simply returns, and
+// once every worker has returned there is nothing left running and nothing left
+// blocked - a feeder goroutine, by contrast, leaked forever when every worker failed
+// before reading from its channel. wg.Wait() is the only synchronization the results
+// need: each slot of compressed is written by exactly one worker (the one whose Add
+// claimed that index), and read only after Wait.
 func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, error) {
 	compressed := make([][]byte, len(payloads))
 	if threads < 2 || len(payloads) < 2 {
-		enc, err := zstd.NewWriter(nil)
+		enc, err := newBlockEncoder()
 		if err != nil {
 			return nil, err
 		}
@@ -96,39 +110,32 @@ func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, er
 		}
 		return compressed, nil
 	}
-	if threads > len(payloads) {
-		threads = len(payloads)
-	}
-	idx := make(chan int)
-	errCh := make(chan error, threads)
+	threads = min(threads, len(payloads))
+	var next atomic.Int64
+	errs := make([]error, threads)
 	var wg sync.WaitGroup
-	for range threads {
+	for t := range threads {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			enc, err := zstd.NewWriter(nil)
+			enc, err := newBlockEncoder()
 			if err != nil {
-				errCh <- err
+				errs[t] = err
 				return
 			}
 			defer enc.Close()
-			for i := range idx {
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= len(payloads) {
+					return
+				}
 				compressed[i] = enc.EncodeAll(payloads[i].data, nil)
 			}
 		}()
 	}
-	go func() {
-		for i := range payloads {
-			idx <- i
-		}
-		close(idx)
-	}()
 	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		if err != nil {
-			return nil, err
-		}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
 	}
 	return compressed, nil
 }
@@ -137,8 +144,10 @@ func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, er
 // parallel (compressBlocksParallel) and writes the compressed blocks and the block
 // table into w, returning the table's offset. Unlike a field's structures (format.go),
 // stored blocks are not written per field and are always placed by one continuous,
-// already-sequential pass here, so their offsets stay plain absolute positions - only
-// compressing them has anything to parallelize.
+// already-sequential pass here - only compressing them has anything to parallelize.
+// Every offset recorded (each block's, and the table's own, which is returned) is
+// relative to the STORED section's start, not the file's; Reader.parseMeta resolves
+// them against the section table once.
 func writeStoredParallel(w *fileWriter, src storedSource, threads int) (uint64, error) {
 	// sectionStart: w.off is already at the STORED section's own absolute start
 	// (writeSegmentParts calls this right after beginSection(sectionStored)), so

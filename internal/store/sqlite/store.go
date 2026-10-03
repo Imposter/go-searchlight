@@ -4,8 +4,14 @@
 // The database runs in WAL mode so readers never block the writer. Writes go
 // through a one-connection pool whose transactions begin with BEGIN
 // IMMEDIATE, taking SQLite's write lock up front: that lock is the counter
-// lock, so sequence numbers are assigned and committed in order. Other
-// processes opening the same file wait on the busy timeout.
+// lock, so sequence numbers are assigned and committed in order, and no
+// writer ever blocks mid-transaction trying to upgrade a deferred lock to a
+// write lock (the SQLITE_BUSY livelock that class of locking invites). Other
+// connections to the same file — another node's Store, or SQLite's own
+// internal busy handler within one connection — wait on the busy timeout;
+// past it, SQLITE_BUSY and SQLITE_LOCKED (and their extended codes) are
+// retried like a Postgres serialization failure or a MySQL deadlock: the
+// whole transaction was never committed, so running it again is safe.
 package sqlite
 
 import (
@@ -17,7 +23,8 @@ import (
 	"net/url"
 	"strings"
 
-	_ "modernc.org/sqlite" // registers the "sqlite" database/sql driver
+	sqlitedriver "modernc.org/sqlite" // registers the "sqlite" database/sql driver
+	sqlite3 "modernc.org/sqlite/lib"  // SQLITE_BUSY, SQLITE_LOCKED result codes
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
@@ -51,6 +58,28 @@ func Dialect() *dialect.Dialect {
 		Claim:       claim,
 		Greatest:    greatest,
 		MaxParams:   32766,
+		Retryable:   retryable,
+	}
+}
+
+// retryable reports SQLITE_BUSY and SQLITE_LOCKED, including their extended
+// variants (SQLITE_BUSY_RECOVERY, _SNAPSHOT, _TIMEOUT; SQLITE_LOCKED_
+// SHAREDCACHE, _VTAB): an extended code's low byte is always its primary
+// code, so masking catches all of them without naming each one. Both mean
+// the transaction's BEGIN IMMEDIATE (or a statement within it) could not get
+// the lock it needed within the busy timeout; SQLite guarantees neither
+// return partway through a write, so the transaction never committed and
+// running it again cannot double-apply it.
+func retryable(err error) bool {
+	var se *sqlitedriver.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -147,3 +147,35 @@ func TestLoadDeletesRefusesMalformedBitmap(t *testing.T) {
 	_, err = LoadDeletes(dir, "seg", 1)
 	wantCorrupt(t, err, "presence")
 }
+
+func BenchmarkCheckBitmap(b *testing.B) {
+	for name, rb := range map[string]*roaring.Bitmap{
+		"array400": func() *roaring.Bitmap {
+			rb := roaring.New()
+			for i := uint32(0); i < 20000; i += 50 {
+				rb.Add(i)
+			}
+			return rb
+		}(),
+		"bitmap": func() *roaring.Bitmap {
+			rb := roaring.New()
+			for i := uint32(0); i < 65536; i += 3 {
+				rb.Add(i)
+			}
+			return rb
+		}(),
+	} {
+		var buf bytes.Buffer
+		if _, err := rb.WriteTo(&buf); err != nil {
+			b.Fatal(err)
+		}
+		data := buf.Bytes()
+		b.Run(name, func(b *testing.B) {
+			for range b.N {
+				if _, ok := checkBitmap(data, 1<<32); !ok {
+					b.Fatal("refused")
+				}
+			}
+		})
+	}
+}

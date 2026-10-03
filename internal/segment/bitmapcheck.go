@@ -122,29 +122,42 @@ func checkBitmapWords(words []byte) (card uint64, last int, ok bool) {
 	if len(words) != bitmapWords*8 {
 		return 0, 0, false
 	}
-	last = -1
-	for w := range bitmapWords {
-		word := binary.LittleEndian.Uint64(words[w*8:])
-		if word != 0 {
-			card += uint64(bits.OnesCount64(word)) //nolint:gosec // a popcount, 0 to 64
-			last = w*64 + 63 - bits.LeadingZeros64(word)
+	for p := words; len(p) >= 32; p = p[32:] {
+		card += uint64(bits.OnesCount64(binary.LittleEndian.Uint64(p)) + //nolint:gosec // popcounts, 0 to 256
+			bits.OnesCount64(binary.LittleEndian.Uint64(p[8:])) +
+			bits.OnesCount64(binary.LittleEndian.Uint64(p[16:])) +
+			bits.OnesCount64(binary.LittleEndian.Uint64(p[24:])))
+	}
+	for w := bitmapWords - 1; w >= 0; w-- {
+		if word := binary.LittleEndian.Uint64(words[w*8:]); word != 0 {
+			return card, w*64 + 63 - bits.LeadingZeros64(word), true
 		}
 	}
-	return card, last, last >= 0
+	return 0, 0, false // no bits set: not a container roaring would write
 }
 
-// checkArray reads one array container's body: strictly ascending values.
+// checkArray reads one array container's body: strictly ascending values. It compares
+// four values per 8-byte load, the hot loop of checking an ordinary term's postings.
 func checkArray(vals []byte) (card uint64, last int, ok bool) {
 	if len(vals) == 0 {
 		return 0, 0, false
 	}
-	last = -1
-	for j := 0; j < len(vals); j += 2 {
-		v := int(binary.LittleEndian.Uint16(vals[j:]))
-		if v <= last {
+	prev := -1
+	p := vals
+	for ; len(p) >= 8; p = p[8:] {
+		x := binary.LittleEndian.Uint64(p)
+		a, b, c, d := int(x&0xFFFF), int(x>>16&0xFFFF), int(x>>32&0xFFFF), int(x>>48)
+		if a <= prev || b <= a || c <= b || d <= c {
 			return 0, 0, false
 		}
-		last = v
+		prev = d
 	}
-	return uint64(len(vals)) / 2, last, true
+	for ; len(p) >= 2; p = p[2:] {
+		v := int(binary.LittleEndian.Uint16(p))
+		if v <= prev {
+			return 0, 0, false
+		}
+		prev = v
+	}
+	return uint64(len(vals)) / 2, prev, true
 }

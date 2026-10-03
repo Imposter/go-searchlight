@@ -209,6 +209,7 @@ func openValid(tb testing.TB, data []byte) *Reader {
 	if err != nil {
 		tb.Fatal(err)
 	}
+	tb.Cleanup(func() { _ = r.Close() })
 	return r
 }
 

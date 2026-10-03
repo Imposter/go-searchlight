@@ -182,3 +182,36 @@ func TestFormatOneRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestMalformedPostingsReadEmpty: a term whose serialized postings fail checkBitmap
+// (here, an array container with a repeated value) reads as empty - on every call,
+// since a failure is never remembered as checked - while a well-formed term in the
+// same dictionary reads correctly, first call and cached call alike.
+func TestMalformedPostingsReadEmpty(t *testing.T) {
+	data := buildFile(t, testDocs(t))
+	valid := openValid(t, data)
+	info, ok := valid.fields["brand"].dicts[KindValue].lookup([]byte("acme"))
+	if !ok || info.docFreq != 2 {
+		t.Fatalf("acme: %+v, %v; want a 2-document serialized bitmap", info, ok)
+	}
+	end := info.post.off + info.post.n // the array's last value is the region's last 2 bytes
+	copy(data[end-2:end], data[end-4:end-2])
+	r, err := openCrafted(t, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if got := r.Postings("brand", KindValue, "acme"); !got.IsEmpty() {
+			t.Fatalf("malformed postings = %v, want empty", got.ToArray())
+		}
+	}
+	if got := r.TermFreq("brand", KindValue, "acme"); got != 2 {
+		t.Fatalf("TermFreq = %d, want the dictionary's 2", got)
+	}
+	tags := r.Postings("tags", KindEntry, "red")
+	for range 2 {
+		if got := r.Postings("tags", KindEntry, "red"); !got.Equals(tags) || got.GetCardinality() != 2 {
+			t.Fatalf("well-formed postings = %v, want [0 1]", got.ToArray())
+		}
+	}
+}

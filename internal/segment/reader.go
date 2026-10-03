@@ -232,35 +232,36 @@ func (r *Reader) NumDocs() uint32 { return r.numDocs }
 // (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping it any
 // longer than that.
 func (r *Reader) Postings(field string, kind TermKind, term string) *roaring.Bitmap {
-	info, ok := r.lookup(field, kind, term)
+	dict, info, ok := r.lookup(field, kind, term)
 	if !ok {
 		return roaring.New()
 	}
-	return bitmapAt(r.data, info, r.numDocs)
+	return dict.postings(info, r.numDocs)
 }
 
 // TermFreq returns how many documents hold term, 0 when there are none.
 func (r *Reader) TermFreq(field string, kind TermKind, term string) uint32 {
-	info, ok := r.lookup(field, kind, term)
+	_, info, ok := r.lookup(field, kind, term)
 	if !ok {
 		return 0
 	}
 	return info.docFreq
 }
 
-func (r *Reader) lookup(field string, kind TermKind, term string) (termInfo, bool) {
+func (r *Reader) lookup(field string, kind TermKind, term string) (*termDict, termInfo, bool) {
 	if !kind.Valid() {
-		return termInfo{}, false
+		return nil, termInfo{}, false
 	}
 	fi := r.fields[field]
 	if fi == nil {
-		return termInfo{}, false
+		return nil, termInfo{}, false
 	}
 	dict := fi.dicts[kind]
 	if dict == nil {
-		return termInfo{}, false
+		return nil, termInfo{}, false
 	}
-	return dict.lookup(stringBytes(term))
+	info, ok := dict.lookup(stringBytes(term))
+	return dict, info, ok
 }
 
 // Terms calls fn with every term of field's kind dictionary that starts with prefix, in
@@ -385,7 +386,7 @@ func (r *Reader) storedRecord(ord uint32) (string, []byte, error) {
 // Ord returns id's document ordinal, through the "_id" field's term dictionary. False
 // when no document has that id.
 func (r *Reader) Ord(id string) (uint32, bool) {
-	info, ok := r.lookup(idFieldName, KindValue, id)
+	dict, info, ok := r.lookup(idFieldName, KindValue, id)
 	if !ok {
 		return 0, false
 	}
@@ -394,7 +395,7 @@ func (r *Reader) Ord(id string) (uint32, bool) {
 	}
 	// Duplicate ids should never reach a segment; fall back to the first document,
 	// read as the bitmap's minimum rather than by listing every document it holds.
-	rb := bitmapAt(r.data, info, r.numDocs)
+	rb := dict.postings(info, r.numDocs)
 	if rb.IsEmpty() {
 		return 0, false
 	}

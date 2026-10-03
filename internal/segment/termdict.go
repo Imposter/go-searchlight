@@ -3,7 +3,10 @@ package segment
 import (
 	"bytes"
 	"encoding/binary"
+	"sync/atomic"
 	"unsafe"
+
+	"github.com/RoaringBitmap/roaring/v2"
 )
 
 // A term dictionary holds one (field, kind)'s terms, sorted by bytes, in blocks of
@@ -176,6 +179,12 @@ type termDict struct {
 	blockOffs  []byte // numBlocks u64, each a distance back from base
 	firstOffs  []byte // numBlocks+1 u32
 	firstTerms []byte
+
+	// checked has bit o set once ordinal o's serialized postings have passed
+	// checkBitmap (see postings). Set with atomic Or and read with atomic Load, so
+	// concurrent Postings calls need no lock: two racing on the same unchecked term
+	// both check it, then both set the same bit, which is harmless.
+	checked []atomic.Uint64
 }
 
 // openDict parses the dictionary whose index starts at the absolute position off.
@@ -208,6 +217,8 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 			return nil, errShort
 		}
 	}
+	// One bit per term: at most an eighth of the bytes the dictionary itself takes.
+	t.checked = make([]atomic.Uint64, (uint64(t.numTerms)+63)/64)
 	return t, nil
 }
 
@@ -221,6 +232,27 @@ func (t *termDict) firstOff(i uint32) uint32 {
 
 func (t *termDict) firstTerm(i uint32) []byte {
 	return t.firstTerms[t.firstOff(i):t.firstOff(i+1)]
+}
+
+// postings returns info's documents (info from this dictionary's lookup or iteration),
+// as [bitmapAt] does, but checks a serialized bitmap only the first time it is asked
+// for: the mapping never changes, so once ordinal info.ord's bitmap has passed
+// checkBitmap it always will, and every later call costs one atomic load instead of a
+// pass over the bitmap. A bitmap that fails is not remembered, and reads as empty
+// every time.
+func (t *termDict) postings(info termInfo, numDocs uint32) *roaring.Bitmap {
+	if info.docFreq <= 1 || info.ord >= t.numTerms {
+		return bitmapAt(t.data, info, numDocs)
+	}
+	word, bit := &t.checked[info.ord/64], uint64(1)<<(info.ord%64)
+	if word.Load()&bit != 0 {
+		return viewBitmap(t.data, info.post)
+	}
+	rb := bitmapAt(t.data, info, numDocs)
+	if !rb.IsEmpty() {
+		word.Or(bit)
+	}
+	return rb
 }
 
 // blockFor returns the last block whose first term is at most term, or false when term

@@ -47,7 +47,8 @@ func TestFieldValueAgreesWithAnalyze(t *testing.T) {
 	if _, ok, _ := FieldValue([]byte(`{"x":1}`), IDField); ok {
 		t.Error("FieldValue reads _id")
 	}
-	if v, ok, _ := FieldValue([]byte(`{"t":"Ünïcode words"}`), "t"); !ok || analysis.Words(v.(string)) != " ünïcode words " {
+	v, ok, _ := FieldValue([]byte(`{"t":"Ünïcode words"}`), "t")
+	if s, isString := v.(string); !ok || !isString || analysis.Words(s) != " ünïcode words " {
 		t.Errorf("words: %v %v", v, ok)
 	}
 }

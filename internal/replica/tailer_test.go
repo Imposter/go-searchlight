@@ -63,7 +63,7 @@ func TestTailerAppliesTheChangelog(t *testing.T) {
 func TestConvergence(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		seeds := 2
-		if testing.Short() {
+		if testing.Short() || raceEnabled {
 			seeds = 1
 		}
 		for seed := range seeds {

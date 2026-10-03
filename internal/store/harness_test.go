@@ -135,6 +135,20 @@ func mysqlHarness(t *testing.T, base string) *harness {
 		u.Path = "/" + name
 		return &harness{dialect: "mysql", url: u.String()}
 	}
+	// The account may not create databases (CI's may not): every test of every
+	// package then shares this one, so they take turns under a named lock, held
+	// by this connection until the test ends. A test that opened two such
+	// databases would wait on itself (GET_LOCK is per connection) until the
+	// timeout: open one per test.
+	lockConn, err := admin.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var locked sql.NullInt64
+	if err := lockConn.QueryRowContext(ctx, "SELECT GET_LOCK('searchlight_shared_test_db', 1800)").Scan(&locked); err != nil || locked.Int64 != 1 {
+		t.Fatalf("lock the shared test database: %v (%v)", err, locked)
+	}
+	t.Cleanup(func() { _ = lockConn.Close() })
 	rows, err := admin.QueryContext(ctx, "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'sl\\_%'")
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +246,16 @@ func allChanges(t *testing.T, st Store, shard ShardID) []Change {
 func scanAll(t *testing.T, st Store, shard ShardID) (map[string]Record, int64) {
 	t.Helper()
 	out := make(map[string]Record)
+	first := true
 	asOf, err := st.ScanShard(context.Background(), shard, func(r Record) error {
+		isFirst := first
+		first = false
+		if r.Kind == RecordMapping {
+			if !isFirst {
+				t.Errorf("the mapping record is not the first")
+			}
+			return nil // scanMapping reads it
+		}
 		k := "d:" + r.ID
 		if r.Kind == RecordQuery {
 			k = "q:" + r.ID

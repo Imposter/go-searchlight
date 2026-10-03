@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -128,7 +129,14 @@ func greatest(a, b string) string { return "GREATEST(" + a + ", " + b + ")" }
 // listen runs LISTEN on conn and calls fn for each notification until ctx
 // ends. The connection is discarded afterwards rather than returned to the
 // pool, because it stays subscribed.
-func listen(ctx context.Context, conn *sql.Conn, channel string, fn func(payload string)) error {
+// listenPingEvery is how long a listening connection waits for a notification
+// before it pings the server, and listenPingTimeout how long the ping may take.
+const (
+	listenPingEvery   = 30 * time.Second
+	listenPingTimeout = 10 * time.Second
+)
+
+func listen(ctx context.Context, conn *sql.Conn, channel string, ready func(), fn func(payload string)) error {
 	err := conn.Raw(func(dc any) error {
 		sc, ok := dc.(*stdlib.Conn)
 		if !ok {
@@ -138,9 +146,25 @@ func listen(ctx context.Context, conn *sql.Conn, channel string, fn func(payload
 		if _, err := pc.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
 			return err
 		}
+		if ready != nil {
+			ready()
+		}
 		for {
-			n, err := pc.WaitForNotification(ctx)
+			// Wake now and then to ping: a half-open socket (the server or
+			// the network gone without a reset) would otherwise wait forever.
+			wctx, cancel := context.WithTimeout(ctx, listenPingEvery)
+			n, err := pc.WaitForNotification(wctx)
+			cancel()
 			if err != nil {
+				if ctx.Err() == nil && pgconn.Timeout(err) {
+					pctx, cancel := context.WithTimeout(ctx, listenPingTimeout)
+					err = pc.Ping(pctx)
+					cancel()
+					if err != nil {
+						return fmt.Errorf("postgres listen: the connection does not answer: %w", err)
+					}
+					continue
+				}
 				return err
 			}
 			fn(n.Payload)

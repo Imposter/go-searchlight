@@ -49,10 +49,22 @@ type Store interface {
 	// when some of those changes have been pruned.
 	ChangesAfter(ctx context.Context, shard ShardID, seq int64, limit int) ([]Change, error)
 
-	// ScanShard calls fn for every document and then every saved query of
+	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
+	// the index does not exist), then every document and every saved query of
 	// shard, from one consistent snapshot, and returns the seq that snapshot
 	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact.
 	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
+
+	// HeadSeq returns the newest committed seq across every shard (0 before
+	// the first change), and the database clock's time as it read it. Every
+	// change with a seq at or below it has committed, so a ChangesAfter that
+	// starts after HeadSeq returns and yields fewer than its limit holds every
+	// change of its shard up to HeadSeq: a tailer may advance its copy to it.
+	//
+	// That holds only while HeadSeq and ChangesAfter read the same database
+	// (the primary): a read replica lagging the primary would break it. Every
+	// dialect reads from the primary (dialect.Pools.Read is the primary's).
+	HeadSeq(ctx context.Context) (seq int64, now time.Time, err error)
 
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
 	Registry() RegistryStore
@@ -163,7 +175,13 @@ type IndexStore interface {
 	// List returns every index by name.
 	List(ctx context.Context) ([]IndexMeta, error)
 	// Update replaces an index's mapping and settings if m.Version is still
-	// current, returning the new entry; ErrConflict otherwise.
+	// current, returning the new entry; ErrConflict otherwise. When the
+	// mapping changes (its bytes differ), MappingVersion moves on and, in the
+	// same transaction, a KindMapping change carrying the new mapping is
+	// logged to every shard of the index (Settings' shard count after the
+	// update), with contiguous seqs: copies adopt it exactly at its seq. Every
+	// mapping change must go through Update. Settings' shard count is fixed at
+	// Create: an Update that changes it fails with ErrInvalid.
 	Update(ctx context.Context, m IndexMeta) (IndexMeta, error)
 	// Drop deletes an index with its documents, queries, changes and shard
 	// copies, or returns ErrNotFound.
@@ -175,8 +193,11 @@ type IndexStore interface {
 // polling remains the safety net.
 type Watcher interface {
 	// Watch calls fn for each committed batch's shards until ctx ends or the
-	// connection fails. fn must not block.
-	Watch(ctx context.Context, fn func(Notification)) error
+	// connection fails. ready, when not nil, is called once the subscription
+	// is active: every change that commits after ready is announced, so a
+	// tailer that polls from ready on misses nothing a lost connection
+	// dropped. Neither fn nor ready may block.
+	Watch(ctx context.Context, ready func(), fn func(Notification)) error
 }
 
 // DefaultChangesLimit is ChangesAfter's limit when the caller passes none.

@@ -20,6 +20,10 @@ import (
 // transaction that changes data; Read runs plain reads and snapshot scans.
 // They are the same pool except on SQLite, whose writer pool begins every
 // transaction with BEGIN IMMEDIATE.
+//
+// Read must reach the same database as Write (the primary), never a replica
+// that lags it: a tailer reads HeadSeq and then ChangesAfter and trusts that
+// every seq at or below the head is visible to the second read.
 type Pools struct {
 	Write *sql.DB
 	Read  *sql.DB
@@ -119,8 +123,9 @@ type Dialect struct {
 	Retryable func(error) bool
 
 	// Notify, when set, is a statement run inside Apply with (channel,
-	// payload) to announce committed changes; Listen receives them. Both are
-	// nil where the engine has no notifications.
+	// payload) to announce committed changes; Listen receives them, calling
+	// ready (when not nil) once it is subscribed. Both are nil where the
+	// engine has no notifications.
 	Notify string
-	Listen func(ctx context.Context, conn *sql.Conn, channel string, fn func(payload string)) error
+	Listen func(ctx context.Context, conn *sql.Conn, channel string, ready func(), fn func(payload string)) error
 }

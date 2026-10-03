@@ -611,7 +611,7 @@ func TestAcquireReleaseAllocatesNothing(t *testing.T) {
 
 func TestReleaseTooOftenPanics(t *testing.T) {
 	h := newHarness(t, testOptions())
-	g := newGeneration(h.s, 0, 0, 0, "", nil, nil)
+	g := newGeneration(h.s, 0, 0, 0, "", &mappingState{}, nil, nil)
 	g.Release()
 	defer func() {
 		if recover() == nil {

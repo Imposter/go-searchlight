@@ -39,8 +39,16 @@ const (
 	KindQueryUpsert Kind = "query_upsert"
 	// KindQueryDelete removes a saved query.
 	KindQueryDelete Kind = "query_delete"
+	// KindMapping changes the index's mapping from this seq on; Payload is the new
+	// mapping's JSON and MappingVersion its version, ID is MappingChangeID. Only
+	// IndexStore.Update writes it, one to every shard of the index; Apply refuses it.
+	KindMapping Kind = "mapping"
 )
 
+// MappingChangeID is the ID of every KindMapping change.
+const MappingChangeID = "_mapping"
+
+// valid reports whether Apply accepts the kind: every kind but KindMapping.
 func (k Kind) valid() bool {
 	switch k {
 	case KindUpsert, KindDelete, KindQueryUpsert, KindQueryDelete:
@@ -87,6 +95,13 @@ type Change struct {
 	// recreated under the same name, and must recover from scratch rather
 	// than resume. Callers leave it zero.
 	IndexUID string
+	// MappingVersion is the index's mapping version when the change committed,
+	// set by the store. The KindMapping change of that version precedes it in
+	// the shard's changelog (Update and Apply both hold the counter lock, so a
+	// mapping change commits wholly before or after any Apply); for a
+	// KindMapping change it is the version that change introduces. Callers leave
+	// it zero.
+	MappingVersion int64
 }
 
 // ShardID returns the shard the change belongs to.
@@ -123,6 +138,9 @@ type RecordKind uint8
 const (
 	RecordDocument RecordKind = iota + 1
 	RecordQuery
+	// RecordMapping is the index's mapping as of the snapshot (Body, with
+	// MappingVersion); ScanShard yields it first.
+	RecordMapping
 )
 
 // Record is the current state of one document or saved query, as ScanShard
@@ -140,6 +158,8 @@ type Record struct {
 	Seq int64
 	// IndexUID is Index's incarnation as of this scan (see Change.IndexUID).
 	IndexUID string
+	// MappingVersion is the index's mapping version as of this scan.
+	MappingVersion int64
 }
 
 // IndexMeta is an index's catalogue entry in sl_indexes.
@@ -154,6 +174,37 @@ type IndexMeta struct {
 	// by Create, so a drop followed by a recreate under the same Name gets a
 	// different UID. It is set by the store, ignored on input.
 	UID string
+	// MappingVersion counts the mapping's changes: 1 at Create, one more for
+	// every Update that changes Mapping. Set by the store, ignored on input.
+	MappingVersion int64
+}
+
+// Shards returns the index's shard count: Settings' "shards", 1 when absent.
+func (m *IndexMeta) Shards() (int, error) {
+	return settingsShards(m.Settings)
+}
+
+// MaxShards bounds an index's shard count.
+const MaxShards = 1 << 10
+
+func settingsShards(settings []byte) (int, error) {
+	if len(settings) == 0 {
+		return 1, nil
+	}
+	var s struct {
+		Shards *json.Number `json:"shards"`
+	}
+	if err := json.Unmarshal(settings, &s); err != nil {
+		return 0, invalidf("settings: %v", err)
+	}
+	if s.Shards == nil {
+		return 1, nil
+	}
+	n, err := strconv.Atoi(s.Shards.String())
+	if err != nil || n < 1 || n > MaxShards {
+		return 0, invalidf("settings: shards is %s, not 1 to %d", s.Shards, MaxShards)
+	}
+	return n, nil
 }
 
 // CopyState is a shard copy's lifecycle state.

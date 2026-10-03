@@ -32,7 +32,7 @@ type instruments struct {
 	changes         metric.Int64Counter
 
 	attrs     metric.MeasurementOption
-	kindAttrs [QueryDelete + 1]metric.AddOption
+	kindAttrs [Remap + 1]metric.AddOption
 }
 
 func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logger) *instruments {
@@ -58,7 +58,7 @@ func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logge
 		changes:         in.Counter(telemetry.MetricIndexChanges),
 		attrs:           metric.WithAttributeSet(attribute.NewSet(base...)),
 	}
-	for k := Upsert; k <= QueryDelete; k++ {
+	for k := Upsert; k <= Remap; k++ {
 		i.kindAttrs[k] = metric.WithAttributeSet(attribute.NewSet(append(base[:2:2], attribute.String("kind", k.String()))...))
 	}
 	if err := in.Err(); err != nil {
@@ -68,11 +68,11 @@ func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logge
 }
 
 func (i *instruments) countChanges(ctx context.Context, changes []Change) {
-	var counts [QueryDelete + 1]int64
+	var counts [Remap + 1]int64
 	for j := range changes {
 		counts[changes[j].Kind]++
 	}
-	for k := Upsert; k <= QueryDelete; k++ {
+	for k := Upsert; k <= Remap; k++ {
 		if counts[k] > 0 {
 			i.changes.Add(ctx, counts[k], i.kindAttrs[k])
 		}

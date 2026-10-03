@@ -144,6 +144,15 @@ const (
 	MetricReplicaLagTime          = "searchlight.replica.lag.time"
 	MetricReplicaRecoveryProgress = "searchlight.replica.recovery.progress"
 	MetricReplicaRecoveryBytes    = "searchlight.replica.recovery.bytes"
+	MetricReplicaRecoveries       = "searchlight.replica.recoveries"
+	MetricReplicaRecoveryDuration = "searchlight.replica.recovery.duration"
+	MetricReplicaApplyBatchSize   = "searchlight.replica.apply.batch_size"
+	MetricReplicaApplyDuration    = "searchlight.replica.apply.duration"
+	MetricReplicaBackpressure     = "searchlight.replica.backpressure"
+	MetricReplicaHalts            = "searchlight.replica.halts"
+	MetricReplicaHalted           = "searchlight.replica.halted"
+	MetricReplicaPollFailing      = "searchlight.replica.poll.failing"
+	MetricReplicaWatchReconnects  = "searchlight.replica.watch.reconnects"
 	MetricClusterLeaseChanges     = "searchlight.cluster.lease.changes"
 	MetricClusterAllocations      = "searchlight.cluster.allocation.changes"
 
@@ -200,6 +209,15 @@ var Catalog = []MetricSpec{
 	{MetricReplicaLagTime, KindGauge, "s", "Age of the oldest change a shard copy has not applied, by index and shard.", nil},
 	{MetricReplicaRecoveryProgress, KindGauge, "1", "Fraction of a recovering shard copy that has been fetched, by index, shard and source (peer, blob or sql).", nil},
 	{MetricReplicaRecoveryBytes, KindCounter, "By", "Bytes fetched by recoveries, by index, shard and source.", nil},
+	{MetricReplicaRecoveries, KindCounter, "{recovery}", "Shard copy recoveries, by index, shard, source (sql, peer or reopen), reason and result (ok or error).", nil},
+	{MetricReplicaRecoveryDuration, KindHistogram, "s", "Shard copy recovery time, by index, shard and source.", SlowBuckets},
+	{MetricReplicaApplyBatchSize, KindHistogram, "{change}", "Changes per batch a tailer applies to its shard copy, by index and shard.", CountBuckets},
+	{MetricReplicaApplyDuration, KindHistogram, "s", "Time a tailer takes to analyze and apply one batch to its shard copy, by index and shard.", FastBuckets},
+	{MetricReplicaBackpressure, KindCounter, "{wait}", "Times a tailer waited out a full write buffer before applying again, by index and shard.", nil},
+	{MetricReplicaHalts, KindCounter, "{halt}", "Shard copies halted by a change they could not apply, by index, shard and reason.", nil},
+	{MetricReplicaHalted, KindGauge, "1", "1 while a shard copy is halted at a change it cannot apply, else 0, by index and shard.", nil},
+	{MetricReplicaPollFailing, KindGauge, "1", "1 while a shard copy's changelog polls fail (its lag in changes is then the last known one), else 0, by index and shard.", nil},
+	{MetricReplicaWatchReconnects, KindCounter, "{reconnect}", "Changelog notification subscriptions restarted after they failed.", nil},
 	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew_failed, expire, release).", nil},
 	{MetricClusterAllocations, KindCounter, "{change}", "Shard copy state transitions by index and state (recovering, serving, retiring).", nil},
 

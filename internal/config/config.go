@@ -70,6 +70,12 @@ type Config struct {
 	// MaxLag is how far a copy may trail the changelog and still serve reads
 	// and report ready.
 	MaxLag time.Duration
+	// ChangelogPollInterval is how often a shard copy polls the changelog for
+	// changes when nothing wakes it sooner. Postgres pushes notifications, and
+	// the node that commits a write wakes its own copies; the poll is what
+	// brings other nodes' writes to a copy on MySQL and SQLite, and the
+	// safety net everywhere.
+	ChangelogPollInterval time.Duration
 	// MergeBudget caps the bytes per second background merges write on this
 	// node; 0 means unlimited. It is the I/O half of the merge budget.
 	MergeBudget int64
@@ -90,18 +96,19 @@ type Config struct {
 // no default.
 func Default() Config {
 	return Config{
-		Listen:             ":8780",
-		AdminListen:        ":8781",
-		NodeID:             hostname(),
-		DataDir:            "data",
-		RefreshInterval:    time.Second,
-		SeqPersistInterval: 30 * time.Second,
-		MaxLag:             2 * time.Second,
-		MergeBudget:        64 << 20,
-		MergeThreads:       max(1, runtime.GOMAXPROCS(0)/4),
-		SearchThreads:      runtime.GOMAXPROCS(0),
-		LogLevel:           slog.LevelInfo,
-		ShutdownTimeout:    30 * time.Second,
+		Listen:                ":8780",
+		AdminListen:           ":8781",
+		NodeID:                hostname(),
+		DataDir:               "data",
+		RefreshInterval:       time.Second,
+		SeqPersistInterval:    30 * time.Second,
+		MaxLag:                2 * time.Second,
+		ChangelogPollInterval: 500 * time.Millisecond,
+		MergeBudget:           64 << 20,
+		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
+		SearchThreads:         runtime.GOMAXPROCS(0),
+		LogLevel:              slog.LevelInfo,
+		ShutdownTimeout:       30 * time.Second,
 	}
 }
 
@@ -182,6 +189,11 @@ var settings = []setting{
 		name: "max_lag", usage: "how far a copy may trail the changelog and still serve and report ready",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.MaxLag, v) },
 		format: func(c *Config) string { return c.MaxLag.String() },
+	},
+	{
+		name: "changelog_poll_interval", usage: "how often a shard copy polls the changelog when nothing wakes it sooner",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.ChangelogPollInterval, v) },
+		format: func(c *Config) string { return c.ChangelogPollInterval.String() },
 	},
 	{
 		name: "merge_budget", usage: "bytes per second merges may write, e.g. 64MiB (0 = unlimited)",

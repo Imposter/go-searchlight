@@ -9,6 +9,9 @@ CREATE TABLE IF NOT EXISTS sl_indexes (
 	settings LONGTEXT CHARACTER SET utf8mb4 NOT NULL,
 	version BIGINT NOT NULL,
 	created_at BIGINT NOT NULL,
+	-- mapping_version counts the mapping's changes: 1 at create, one more for
+	-- every Update that changes it (which logs a mapping change to every shard).
+	mapping_version BIGINT NOT NULL,
 	-- uid identifies this incarnation of the index: fresh on every create, so
 	-- a drop followed by a recreate under the same name gets a new one.
 	uid VARBINARY(32) NOT NULL
@@ -41,6 +44,9 @@ CREATE TABLE IF NOT EXISTS sl_changes (
 	id VARBINARY(512) NOT NULL,
 	payload LONGTEXT CHARACTER SET utf8mb4 NOT NULL,
 	at BIGINT NOT NULL,
+	-- mapping_version is the index's mapping version as of this change: the
+	-- mapping it was written under, logged at a lower seq of the same shard.
+	mapping_version BIGINT NOT NULL,
 	-- index_uid is the index's incarnation (sl_indexes.uid) as of this
 	-- change, so a tailer can tell a drop-and-recreate apart from a
 	-- continuing index without an extra query per batch.

@@ -128,7 +128,8 @@ func (c *cluster) refresh(i int) {
 	if err := c.shards[i].Refresh(context.Background()); err != nil {
 		c.t.Fatalf("Refresh: %v", err)
 	}
-	for _, ch := range c.pending[i] {
+	for k := range c.pending[i] {
+		ch := &c.pending[i][k]
 		if ch.Kind == shard.Upsert {
 			c.visible[i][ch.Doc.ID] = ch.Doc
 		} else {

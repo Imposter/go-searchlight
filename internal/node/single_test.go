@@ -70,6 +70,19 @@ func open(t *testing.T, cfg config.Config, st store.Store, mod func(*node.Option
 	return n
 }
 
+// waitReady waits until n is ready: after a restart its copies recover (resume
+// from their segments) before they serve.
+func waitReady(t *testing.T, n *node.Single) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for n.Ready(ctx(t)) != nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("never ready: %v", n.Ready(ctx(t)))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func ctx(t *testing.T) context.Context {
 	t.Helper()
 	c, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -131,7 +144,8 @@ func TestRestartKeepsData(t *testing.T) {
 		t.Fatal(err)
 	}
 	n2 := open(t, cfg, st, nil)
-	// The copies reopen their segments: everything is searchable at once.
+	// The copies reopen their segments and resume; once ready, all is searchable.
+	waitReady(t, n2)
 	if got := count(t, n2, "r", &query.All{}, 0); got != 50 {
 		t.Fatalf("after a restart count = %d", got)
 	}
@@ -861,13 +875,7 @@ func TestPercolateAfterRestartSeesQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	n2 := open(t, cfg, st, nil)
-	deadline := time.Now().Add(20 * time.Second)
-	for n2.Ready(ctx(t)) != nil {
-		if time.Now().After(deadline) {
-			t.Fatal("never ready")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitReady(t, n2)
 	res, err := n2.Percolate(ctx(t), "p", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"x": 1}`)}}, api.ReadOptions{})
 	if err != nil || fmt.Sprint(res.Results[0].Queries) != "[q]" {
 		t.Errorf("percolation after a restart: %+v %v", res, err)

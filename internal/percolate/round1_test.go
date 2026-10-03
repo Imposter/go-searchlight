@@ -132,6 +132,45 @@ func TestCraftedFieldCountRefusedCheaply(t *testing.T) {
 	}
 }
 
+// The verifications metric counts Match calls by verdict: a verdict memoized for a
+// class is not a call, and misses never go negative.
+func TestVerificationsCountMatchCalls(t *testing.T) {
+	raws := []string{
+		`{"field":"brand","op":"eq","value":"acme"}`,
+		`{"field":"brand","op":"eq","value":" ACME "}`, // the same class as the first
+		`{"field":"brand","op":"in","value":["acme","x"]}`,
+		`{"all":[{"field":"brand","op":"eq","value":"acme"},{"field":"price","op":"gt","value":100}]}`,
+	}
+	qs := make([]shard.StoredQuery, len(raws))
+	for i, raw := range raws {
+		qs[i] = shard.StoredQuery{ID: fmt.Sprintf("q%d", i), Query: parseQuery(t, raw)}
+	}
+	data, err := encodeSegment(context.Background(), qs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seg, err := openData("v", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := new(scratch)
+	sc.fit(seg.NumQueries(), seg.NumEntries())
+	d, _, _ := schema.Analyze(testMapping(), "d", []byte(`{"brand":"Acme","price":5}`))
+	seg.collect(&d, sc)
+	var st docStats
+	if err := verify(&view{seg: seg, n: seg.NumQueries()}, &d, sc, &st); err != nil {
+		t.Fatal(err)
+	}
+	got := sc.results(true)
+	sc.reset()
+	if want := []string{"q0", "q1", "q2"}; !slices.Equal(got, want) {
+		t.Fatalf("matches %v, want %v", got, want)
+	}
+	if st.verifiedMatch != 2 || st.verifiedMiss != 1 || st.matched != 3 {
+		t.Fatalf("Match calls %d match, %d miss; %d matched; want 2, 1, 3", st.verifiedMatch, st.verifiedMiss, st.matched)
+	}
+}
+
 // Anchors come from the stored JSON parsed back: a leaf built by hand with only a
 // Value is anchored exactly as the parsed tree verification compiles.
 func TestAnchorsFromStoredTree(t *testing.T) {

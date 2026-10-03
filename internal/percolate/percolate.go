@@ -113,10 +113,22 @@ type view struct {
 	n       uint32
 }
 
-// docStats are one document's counts, for metrics.
+// docStats are one document's counts, for metrics: candidates gathered, Match calls
+// by verdict (a memoized verdict is not a call), ids returned, and the time spent
+// probing and verifying.
 type docStats struct {
-	candidates, verified, matched int
-	probe, verify                 time.Duration
+	candidates, verifiedMatch, verifiedMiss, matched int
+	probe, verify                                    time.Duration
+}
+
+// add sums o into s.
+func (s *docStats) add(o *docStats) {
+	s.candidates += o.candidates
+	s.verifiedMatch += o.verifiedMatch
+	s.verifiedMiss += o.verifiedMiss
+	s.matched += o.matched
+	s.probe += o.probe
+	s.verify += o.verify
 }
 
 // Percolate returns, for each document, the ids of the live saved queries in g that
@@ -126,6 +138,10 @@ type docStats struct {
 // mapping, as a bulk write analyzes it. Documents are percolated in parallel, at most
 // Options.Threads at a time. g must stay acquired for the call; the ids returned are
 // copies, valid after it.
+//
+// The span records the call's candidates, Match calls and matches, and probe_ms and
+// verify_ms: per-document probe and verify time summed over every worker (busy time,
+// which exceeds the wall time when documents run in parallel).
 //
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match.
@@ -191,19 +207,11 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 				break
 			}
 			out[i] = ids
-			local.candidates += st.candidates
-			local.verified += st.verified
-			local.matched += st.matched
-			local.probe += st.probe
-			local.verify += st.verify
+			local.add(&st)
 		}
 		p.scratchCache.Put(sc)
 		mu.Lock()
-		total.candidates += local.candidates
-		total.verified += local.verified
-		total.matched += local.matched
-		total.probe += local.probe
-		total.verify += local.verify
+		total.add(&local)
 		mu.Unlock()
 	}
 	if workers := min(p.threads, len(docs)); workers <= 1 {
@@ -216,13 +224,15 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		wg.Wait()
 	}
 
-	if total.matched > 0 {
-		p.verified.Add(ctx, int64(total.matched), p.matchSet)
+	if total.verifiedMatch > 0 {
+		p.verified.Add(ctx, int64(total.verifiedMatch), p.matchSet)
 	}
-	if miss := total.verified - total.matched; miss > 0 {
-		p.verified.Add(ctx, int64(miss), p.missSet)
+	if total.verifiedMiss > 0 {
+		p.verified.Add(ctx, int64(total.verifiedMiss), p.missSet)
 	}
-	span.SetAttributes(attribute.Int("candidates", total.candidates), attribute.Int("verified", total.verified),
+	// probe_ms and verify_ms are per-document time summed over every worker: with
+	// several workers they exceed the call's wall time.
+	span.SetAttributes(attribute.Int("candidates", total.candidates), attribute.Int("verified", total.verifiedMatch+total.verifiedMiss),
 		attribute.Int("matches", total.matched), attribute.Int("always_check", always),
 		attribute.Float64("probe_ms", float64(total.probe.Microseconds())/1000), attribute.Float64("verify_ms", float64(total.verify.Microseconds())/1000))
 	if firstErr != nil {
@@ -310,11 +320,12 @@ func verify(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 			if err != nil {
 				return err
 			}
-			st.verified++
 			hit = c.Match(d)
 			if hit {
+				st.verifiedMatch++
 				sc.memo[rep] = memoMatch
 			} else {
+				st.verifiedMiss++
 				sc.memo[rep] = memoMiss
 			}
 			sc.memoSet = append(sc.memoSet, rep)
@@ -342,11 +353,13 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 			return err
 		}
 		st.candidates++
-		st.verified++
-		if query.Match(q.Query, d) {
-			st.matched++
-			sc.hits = append(sc.hits, []byte(q.ID))
+		if !query.Match(q.Query, d) {
+			st.verifiedMiss++
+			continue
 		}
+		st.verifiedMatch++
+		st.matched++
+		sc.hits = append(sc.hits, []byte(q.ID))
 	}
 	return nil
 }

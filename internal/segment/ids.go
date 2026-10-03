@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"slices"
@@ -98,4 +99,38 @@ func (r *Reader) Ord(id string) (uint32, bool) {
 		return 0, false
 	}
 	return info.single, true
+}
+
+// IDsFrom calls fn with every document id at or after from (exact ids, byte order, as
+// [Reader.Ord] takes them) and its ordinal, ascending, until fn returns false or the
+// ids run out: the segment's documents in id order, deleted ones included. id is a
+// buffer the next call overwrites: copy it to keep it.
+func (r *Reader) IDsFrom(from string, fn func(id []byte, ord uint32) bool) {
+	if r.ids == nil {
+		return
+	}
+	fb := stringBytes(from)
+	block, ok := r.ids.blockFor(fb)
+	if !ok {
+		block = 0
+	}
+	it := r.ids.iter(block)
+	for it.next() {
+		if bytes.Compare(it.term, fb) < 0 {
+			continue
+		}
+		if !fn(it.term, it.info.single) {
+			return
+		}
+	}
+}
+
+// IDAt returns the i-th smallest document id (exact, byte order; deleted documents
+// included), false past the last: with a rank from an [Reader.IDsFrom] walk, an id
+// without reading the stored record.
+func (r *Reader) IDAt(i uint32) (string, bool) {
+	if r.ids == nil || i >= r.ids.numTerms {
+		return "", false
+	}
+	return string(r.ids.termAt(nil, i)), true
 }

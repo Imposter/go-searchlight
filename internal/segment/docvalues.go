@@ -560,3 +560,26 @@ func (m MultiColumn) Lookup(term string) (uint32, bool) {
 	info, ok := m.c.dict.lookup(stringBytes(term))
 	return info.ord, ok
 }
+
+// TermsPerBlock is how many terms one dictionary block holds: a lookup by ordinal
+// decodes its block from the start, so ordinals read together should be grouped by
+// ord/TermsPerBlock.
+const TermsPerBlock = blockTerms
+
+// EachTerm calls fn with the ordinal and value of every term from ordinal from on, in
+// order, until fn returns false or the terms run out: a walk that decodes each
+// dictionary block once and allocates nothing. term is valid only during the call.
+func (k KeywordColumn) EachTerm(from uint32, fn func(ord uint32, term []byte) bool) {
+	if k.c == nil || from >= k.c.dict.numTerms {
+		return
+	}
+	it := k.c.dict.iter(from / blockTerms)
+	for it.next() {
+		if it.info.ord < from {
+			continue
+		}
+		if !fn(it.info.ord, it.term) {
+			return
+		}
+	}
+}

@@ -21,6 +21,23 @@ type fieldInfo struct {
 // Reader is an open, immutable segment, read through mmap. Its methods never allocate
 // more than the result they return, and are safe to call from many goroutines at once,
 // including concurrently with [Reader.Close] (see [Reader.Retain]).
+//
+// For performance, several methods ([Reader.Postings], [Reader.Present],
+// [Reader.Truncated]) return roaring.Bitmap values that are zero-copy views straight
+// over the mmap, not fresh copies. Such a result is valid only while this Reader, or a
+// handle from [Reader.Retain], stays open: once every handle on the segment is Closed,
+// the mapping is unmapped and any further read of that bitmap is a use-after-free. A
+// caller that needs the bitmap to outlive this Reader - cached across a refresh, handed
+// to another goroutine with no lifetime relationship to this one, and so on - must call
+// its Clone() method first, which does copy. (Task 5's Generation is expected to keep
+// its segments' Readers retained for exactly as long as the generation is acquired, so
+// bitmaps it hands out stay valid for that whole window without copying.)
+//
+// Built with the searchlight_debug tag, a Reader poisons its mapping instead of
+// unmapping it when the last handle closes, so a bitmap kept past that point faults
+// immediately on access instead of silently returning stale or reused memory - see
+// debug_on.go. That tag trades a process-lifetime address and file descriptor leak for
+// a deterministic crash, which is only ever a good trade in a test binary.
 type Reader struct {
 	path      string
 	m         *mapping
@@ -148,6 +165,10 @@ func (r *Reader) NumDocs() uint32 { return r.numDocs }
 
 // Postings returns term's documents, or an empty bitmap when field has no such
 // dictionary or term is not in it.
+//
+// The result is a zero-copy view over the segment's mmap: valid only while this Reader
+// (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping it any
+// longer than that.
 func (r *Reader) Postings(field string, kind TermKind, term string) *roaring.Bitmap {
 	info, ok := r.lookup(field, kind, term)
 	if !ok {
@@ -249,6 +270,10 @@ func (r *Reader) Entries(field string) MultiColumn {
 // Present returns field's present documents, or an empty bitmap when no document ever
 // had it. A present field is recorded even when it is untyped or does not fit its
 // mapped type.
+//
+// The result is a zero-copy view over the segment's mmap: valid only while this Reader
+// (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping it any
+// longer than that.
 func (r *Reader) Present(field string) *roaring.Bitmap {
 	fi := r.fields[field]
 	if fi == nil {
@@ -260,6 +285,10 @@ func (r *Reader) Present(field string) *roaring.Bitmap {
 // Truncated returns the documents whose field value was too long to have grams
 // ([schema.Value.GramsTruncated]): candidates for any contains or starts_with needle
 // that shares no gram with the index.
+//
+// The result is a zero-copy view over the segment's mmap: valid only while this Reader
+// (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping it any
+// longer than that.
 func (r *Reader) Truncated(field string) *roaring.Bitmap {
 	fi := r.fields[field]
 	if fi == nil || fi.truncRegion.n == 0 {

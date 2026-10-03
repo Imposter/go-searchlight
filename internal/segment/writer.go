@@ -16,8 +16,23 @@ import (
 // BuildOptions configures [Build].
 type BuildOptions struct {
 	// Name is the segment's file stem, without extension. A random one is generated
-	// when empty.
+	// when empty. An explicit Name must be unique for as long as a segment of that
+	// name might still be open anywhere in the process (or on the machine, since the
+	// file is memory-mapped): Build writes to a fresh temp file and renames it into
+	// place, but renaming over a file Windows currently has mapped fails with
+	// "Access is denied", where POSIX would silently replace it out from under any
+	// open mapping. Prefer leaving Name empty unless the caller already guarantees
+	// the name is retired (for example, a merge's inputs, which by the time Merge
+	// returns are no longer the live segment set).
 	Name string
+	// Threads is how many goroutines [Build] (and [Merge]) use for each segment's
+	// per-field preparation: sorting its term pairs and choosing its numeric
+	// encoding, which is where the CPU time goes for high-cardinality fields. 0 or 1
+	// is sequential. The section writer itself - the part that advances the file's
+	// byte offset and so must run in a fixed order - always runs single-threaded
+	// afterward, in sorted field order, so the bytes Build writes are identical
+	// regardless of Threads.
+	Threads int
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -241,6 +256,12 @@ func writeSegment(path string, numDocs uint32, names []string, builders map[stri
 	}
 	ok = true
 	if err := os.Rename(tmp, path); err != nil {
+		return Meta{}, err
+	}
+	// The rename is only durable once the directory entry itself is fsynced: without
+	// this, a crash can leave the directory pointing at the old file (or nothing),
+	// even though the new file's own bytes were already fsynced above.
+	if err := fsyncDir(filepath.Dir(path)); err != nil {
 		return Meta{}, err
 	}
 	return Meta{Path: path, NumDocs: numDocs}, nil

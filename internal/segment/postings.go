@@ -45,7 +45,7 @@ func (e *postingsEncoder) encode(docs []uint32) []byte {
 }
 
 // bitmapAt returns a term's postings: a fresh bitmap for an inline document, or a view
-// over the mapping for a serialized one.
+// over the mapping for a serialized one. See [viewBitmap] for the view's lifetime.
 func bitmapAt(data []byte, info termInfo) *roaring.Bitmap {
 	if info.docFreq == 0 {
 		return roaring.New()
@@ -56,8 +56,12 @@ func bitmapAt(data []byte, info termInfo) *roaring.Bitmap {
 	return viewBitmap(data, info.post)
 }
 
-// viewBitmap reads the serialized bitmap at r in place. A region that does not hold
-// one (which a checksummed file cannot have) reads as empty.
+// viewBitmap reads the serialized bitmap at r in place, with no copy: its containers
+// hold slices of data itself. The result is only valid for as long as data's backing
+// mapping stays mapped - callers that return it to package callers (Postings, Present,
+// Truncated) document that lifetime there; a caller that needs it to outlive the
+// mapping must Clone() it. A region that does not hold one (which a checksummed file
+// cannot have) reads as empty.
 func viewBitmap(data []byte, r region) *roaring.Bitmap {
 	rb := roaring.New()
 	b, ok := r.slice(data)

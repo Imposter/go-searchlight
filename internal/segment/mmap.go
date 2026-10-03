@@ -13,6 +13,15 @@ type mmapHandle interface {
 	Data() []byte
 	// Close unmaps. Idempotent.
 	Close() error
+	// Poison makes the mapping's address range inaccessible without releasing it
+	// (mprotect/VirtualProtect to no-access, never munmap/UnmapViewOfFile), so a stale
+	// reference to Data (for example a zero-copy roaring.Bitmap returned by
+	// [Reader.Postings], kept past [Reader.Close]) faults immediately and
+	// deterministically instead of silently reading whatever the OS later maps at the
+	// same address. Used only when built with the searchlight_debug tag; it leaks the
+	// address range (and, on close, the file descriptor stays open too) for the rest
+	// of the process, which is fine for tests and never used in a release build.
+	Poison() error
 }
 
 // mmapOpen maps f's first size bytes read-only. size 0 returns an empty, no-op mapping
@@ -26,8 +35,9 @@ func mmapOpen(f *os.File, size int64) (mmapHandle, error) {
 
 type emptyMapping struct{}
 
-func (emptyMapping) Data() []byte { return nil }
-func (emptyMapping) Close() error { return nil }
+func (emptyMapping) Data() []byte  { return nil }
+func (emptyMapping) Close() error  { return nil }
+func (emptyMapping) Poison() error { return nil }
 
 // mapping is a reference-counted mmap: the file handle and the mapping stay open as
 // long as any [Reader] holds a reference (through [Reader.Retain]), and are released
@@ -62,12 +72,21 @@ func openFileMapping(path string) (*mapping, error) {
 // retain adds one reference.
 func (m *mapping) retain() { m.refs.Add(1) }
 
-// release drops one reference, unmapping and closing the file when it reaches zero.
+// release drops one reference, unmapping and closing the file when it reaches zero. A
+// searchlight_debug build poisons the mapping instead of unmapping it (see
+// [mmapHandle.Poison]), so a reference kept past the last Close faults instead of
+// silently reading stale or reused memory; a release build always does the cheap,
+// resource-reclaiming thing and unmaps for real.
 func (m *mapping) release() error {
 	if m.refs.Add(-1) != 0 {
 		return nil
 	}
-	err := m.h.Close()
+	var err error
+	if debugGuard {
+		err = m.h.Poison()
+	} else {
+		err = m.h.Close()
+	}
 	if cerr := m.f.Close(); err == nil {
 		err = cerr
 	}

@@ -53,3 +53,20 @@ func (m *windowsMapping) Close() error {
 	}
 	return err
 }
+
+// Poison switches the view to PAGE_NOACCESS in place, rather than unmapping it: the
+// address range stays reserved (so nothing else can be mapped there) and any further
+// read raises an access violation. See [mmapHandle.Poison].
+func (m *windowsMapping) Poison() error {
+	if m.addr == 0 {
+		return nil
+	}
+	var old uint32
+	return windows.VirtualProtect(m.addr, uintptr(len(m.data)), windows.PAGE_NOACCESS, &old)
+}
+
+// fsyncDir is a documented no-op on Windows: NTFS does not expose a way to fsync a
+// directory handle the way POSIX does, and a rename's directory-entry durability is the
+// volume's own journal's job, not the application's. See fsyncDir in mmap_unix.go for
+// the real thing.
+func fsyncDir(string) error { return nil }

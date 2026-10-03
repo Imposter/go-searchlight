@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -489,4 +490,124 @@ func TestConcurrentReaderClose(t *testing.T) {
 		_ = r.Close()
 	}()
 	wg.Wait()
+}
+
+// TestBitmapValidAcrossRetainClose pins down the fix for the zero-copy aliasing bug:
+// a bitmap fetched from one handle must keep reading correctly after a DIFFERENT
+// handle on the same segment closes, as long as the handle the bitmap came from (or
+// another Retain of it) is still open - the pattern Task 5's Generation relies on.
+func TestBitmapValidAcrossRetainClose(t *testing.T) {
+	docs := testDocs(t)
+	dir := t.TempDir()
+	meta, err := Build(dir, docs, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := Open(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained := original.Retain()
+
+	want := roaring.BitmapOf(0, 1) // brand=acme covers d1, d2
+	got := retained.Postings("brand", KindValue, "acme")
+	if !got.Equals(want) {
+		t.Fatalf("before Close: Postings = %v, want %v", got.ToArray(), want.ToArray())
+	}
+
+	// Closing the handle the bitmap did NOT come from must not disturb it: the
+	// mapping stays alive because retained is still open.
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equals(want) {
+		t.Fatalf("after closing the other handle: Postings = %v, want %v (stale read)", got.ToArray(), want.ToArray())
+	}
+
+	// A fresh fetch from the still-open handle must also still work.
+	got2 := retained.Postings("brand", KindValue, "acme")
+	if !got2.Equals(want) {
+		t.Fatalf("fresh fetch after closing the other handle: Postings = %v, want %v", got2.ToArray(), want.ToArray())
+	}
+	present := retained.Present("title")
+	if present.IsEmpty() {
+		t.Fatal("Present after closing the other handle returned empty")
+	}
+	truncated := retained.Truncated("title").Clone() // outlives this Reader by design
+
+	if err := retained.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !truncated.Contains(4) {
+		t.Fatal("a Clone()'d bitmap did not survive Close, as documented it should")
+	}
+}
+
+// TestDebugGuardFaultsOnUseAfterClose only runs when built with -tags
+// searchlight_debug (see debug_on.go): it re-execs itself as a subprocess that keeps a
+// zero-copy Postings bitmap past the segment's last Close and then reads it, and
+// checks the subprocess crashed rather than returning wrong data. Plain `go test`
+// (without the tag) skips it, since debugGuard is false and there is nothing to
+// demonstrate.
+func TestDebugGuardFaultsOnUseAfterClose(t *testing.T) {
+	if !debugGuard {
+		t.Skip("only meaningful with -tags searchlight_debug")
+	}
+	if os.Getenv("SEARCHLIGHT_DEBUG_GUARD_CHILD") == "1" {
+		runUseAfterCloseChild()
+		return // unreachable if the guard works: the access above should fault first
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run", "TestDebugGuardFaultsOnUseAfterClose", "-test.v")
+	cmd.Env = append(os.Environ(), "SEARCHLIGHT_DEBUG_GUARD_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("child process exited cleanly instead of faulting on the poisoned mapping; output:\n%s", out)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("child process failed to even start: %v", err)
+	}
+	t.Logf("child faulted as expected (%v); output:\n%s", exitErr, out)
+}
+
+// runUseAfterCloseChild is the body of the subprocess TestDebugGuardFaultsOnUseAfterClose
+// launches: it must crash, not return, so the parent never gets to assert on got.
+func runUseAfterCloseChild() {
+	dir, err := os.MkdirTemp("", "searchlight-debug-guard")
+	if err != nil {
+		panic(err)
+	}
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword}}
+	// Two documents sharing the term forces the roaring-serialized (docFreq > 1) path,
+	// a real zero-copy view over the mapping - a single document would hit the inline
+	// (docFreq == 1) path, which is already a fresh, non-aliasing bitmap and would not
+	// exercise the bug this guards against.
+	doc1, _, err := schema.Analyze(m, "d1", []byte(`{"brand": "acme"}`))
+	if err != nil {
+		panic(err)
+	}
+	doc2, _, err := schema.Analyze(m, "d2", []byte(`{"brand": "acme"}`))
+	if err != nil {
+		panic(err)
+	}
+	meta, err := Build(dir, []schema.Doc{doc1, doc2}, BuildOptions{})
+	if err != nil {
+		panic(err)
+	}
+	r, err := Open(meta.Path)
+	if err != nil {
+		panic(err)
+	}
+	got := r.Postings("brand", KindValue, "acme")
+	if err := r.Close(); err != nil {
+		panic(err)
+	}
+	// The mapping is now poisoned (PROT_NONE / PAGE_NOACCESS), not merely unmapped.
+	// got's containers still point into it, so this read must fault.
+	_ = got.ToArray()
 }

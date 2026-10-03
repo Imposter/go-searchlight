@@ -61,7 +61,10 @@ func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bit
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return fsyncDir(segmentDir)
 }
 
 // LoadDeletes reads segmentID's generation gen deletes sidecar, or an empty bitmap when

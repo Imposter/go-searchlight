@@ -663,6 +663,16 @@ func scanRows(ctx context.Context, tx *sql.Tx, q string, shard ShardID, scan fun
 	return rows.Err()
 }
 
+func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, err error) {
+	ctx, end := s.start(ctx, "head_seq")
+	defer end(&err)
+	if s.closed.Load() {
+		return 0, ErrClosed
+	}
+	err = s.r.QueryRowContext(ctx, s.q.readCounter).Scan(&seq)
+	return seq, err
+}
+
 // --- Pruning ---------------------------------------------------------------
 
 // pruneStep bounds the seq range one prune DELETE covers, so no single
@@ -742,7 +752,7 @@ func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int
 // watchingStore adds Watch on dialects with notifications.
 type watchingStore struct{ *sqlStore }
 
-func (s *watchingStore) Watch(ctx context.Context, fn func(Notification)) error {
+func (s *watchingStore) Watch(ctx context.Context, ready func(), fn func(Notification)) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
@@ -751,7 +761,7 @@ func (s *watchingStore) Watch(ctx context.Context, fn func(Notification)) error 
 		return err
 	}
 	defer conn.Close()
-	return s.d.Listen(ctx, conn, notifyChannel, func(payload string) {
+	return s.d.Listen(ctx, conn, notifyChannel, ready, func(payload string) {
 		var n notification
 		if err := json.Unmarshal([]byte(payload), &n); err != nil {
 			s.log.WarnContext(ctx, "ignoring a malformed change notification", slog.String("payload", payload))

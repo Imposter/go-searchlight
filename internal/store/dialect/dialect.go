@@ -119,8 +119,9 @@ type Dialect struct {
 	Retryable func(error) bool
 
 	// Notify, when set, is a statement run inside Apply with (channel,
-	// payload) to announce committed changes; Listen receives them. Both are
-	// nil where the engine has no notifications.
+	// payload) to announce committed changes; Listen receives them, calling
+	// ready (when not nil) once it is subscribed. Both are nil where the
+	// engine has no notifications.
 	Notify string
-	Listen func(ctx context.Context, conn *sql.Conn, channel string, fn func(payload string)) error
+	Listen func(ctx context.Context, conn *sql.Conn, channel string, ready func(), fn func(payload string)) error
 }

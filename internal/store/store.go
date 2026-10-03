@@ -54,6 +54,13 @@ type Store interface {
 	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact.
 	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
 
+	// HeadSeq returns the newest committed seq across every shard (0 before
+	// the first change). Every change with a seq at or below it has
+	// committed, so a ChangesAfter that starts after HeadSeq returns and
+	// yields fewer than its limit holds every change of its shard up to
+	// HeadSeq: a tailer may advance its copy to it.
+	HeadSeq(ctx context.Context) (int64, error)
+
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
 	Registry() RegistryStore
 	// Blobs stores segment bundles for recovery without a peer.
@@ -175,8 +182,11 @@ type IndexStore interface {
 // polling remains the safety net.
 type Watcher interface {
 	// Watch calls fn for each committed batch's shards until ctx ends or the
-	// connection fails. fn must not block.
-	Watch(ctx context.Context, fn func(Notification)) error
+	// connection fails. ready, when not nil, is called once the subscription
+	// is active: every change that commits after ready is announced, so a
+	// tailer that polls from ready on misses nothing a lost connection
+	// dropped. Neither fn nor ready may block.
+	Watch(ctx context.Context, ready func(), fn func(Notification)) error
 }
 
 // DefaultChangesLimit is ChangesAfter's limit when the caller passes none.

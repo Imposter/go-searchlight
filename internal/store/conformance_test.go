@@ -1394,7 +1394,8 @@ func TestIndexes(t *testing.T) {
 	})
 }
 
-// TestWatch covers LISTEN/NOTIFY, which only Postgres has.
+// TestWatch covers LISTEN/NOTIFY, which only Postgres has: once ready is
+// called, the very next commit is announced.
 func TestWatch(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		if h.dialect != "postgres" {
@@ -1407,29 +1408,63 @@ func TestWatch(t *testing.T) {
 		}
 		mustCreateIndex(t, st, "w")
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		got := make(chan Notification, 16)
+		ready := make(chan struct{})
 		done := make(chan error, 1)
-		go func() { done <- w.Watch(ctx, func(n Notification) { got <- n }) }()
-		// LISTEN is asynchronous to this goroutine: write until one arrives.
-		deadline := time.After(10 * time.Second)
-		var want int64
+		go func() {
+			done <- w.Watch(ctx, func() { close(ready) }, func(n Notification) { got <- n })
+		}()
+		select {
+		case <-ready:
+		case err := <-done:
+			t.Fatalf("watch ended before it was ready: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("watch never became ready")
+		}
+		_, last := mustApply(t, st, upsert("w", 2, "a", `{}`), upsert("w", 2, "b", `{}`))
 		for {
-			_, last := mustApply(t, st, upsert("w", 2, "a", `{}`), upsert("w", 2, "b", `{}`))
-			want = last
 			select {
 			case n := <-got:
-				if n.Shard != (ShardID{Index: "w", Shard: 2}) || n.Seq > want || n.Seq < 2 {
-					t.Fatalf("notification %+v, latest seq %d", n, want)
+				if n.Shard != (ShardID{Index: "w", Shard: 2}) || n.Seq != last {
+					continue // another test's schema shares the channel
 				}
 				cancel()
 				if err := <-done; !errors.Is(err, context.Canceled) {
 					t.Fatalf("watch ended with %v", err)
 				}
 				return
-			case <-time.After(100 * time.Millisecond):
-			case <-deadline:
-				t.Fatal("no notification")
+			case <-time.After(10 * time.Second):
+				t.Fatalf("no notification of seq %d after ready", last)
 			}
+		}
+	})
+}
+
+// TestHeadSeq: the head is the newest committed seq across shards, and a
+// tailer reading it before ChangesAfter never advances past a change of its
+// shard that it has not seen.
+func TestHeadSeq(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		if head, err := st.HeadSeq(ctx); err != nil || head != 0 {
+			t.Fatalf("empty store head = %d, %v", head, err)
+		}
+		mustCreateIndex(t, st, "h")
+		mustApply(t, st, upsert("h", 0, "a", `{}`), upsert("h", 1, "b", `{}`))
+		_, last := mustApply(t, st, upsert("h", 1, "c", `{}`))
+		head, err := st.HeadSeq(ctx)
+		if err != nil || head != last {
+			t.Fatalf("head = %d, %v; want %d", head, err, last)
+		}
+		page, err := st.ChangesAfter(ctx, ShardID{Index: "h", Shard: 0}, 1, 10)
+		if err != nil || len(page) != 0 {
+			t.Fatalf("shard 0 after 1: %v, %v", page, err)
+		}
+		_ = st.Close()
+		if _, err := st.HeadSeq(ctx); !errors.Is(err, ErrClosed) {
+			t.Fatalf("head after close: %v", err)
 		}
 	})
 }

@@ -128,7 +128,7 @@ func greatest(a, b string) string { return "GREATEST(" + a + ", " + b + ")" }
 // listen runs LISTEN on conn and calls fn for each notification until ctx
 // ends. The connection is discarded afterwards rather than returned to the
 // pool, because it stays subscribed.
-func listen(ctx context.Context, conn *sql.Conn, channel string, fn func(payload string)) error {
+func listen(ctx context.Context, conn *sql.Conn, channel string, ready func(), fn func(payload string)) error {
 	err := conn.Raw(func(dc any) error {
 		sc, ok := dc.(*stdlib.Conn)
 		if !ok {
@@ -137,6 +137,9 @@ func listen(ctx context.Context, conn *sql.Conn, channel string, fn func(payload
 		pc := sc.Conn()
 		if _, err := pc.Exec(ctx, "LISTEN "+pgx.Identifier{channel}.Sanitize()); err != nil {
 			return err
+		}
+		if ready != nil {
+			ready()
 		}
 		for {
 			n, err := pc.WaitForNotification(ctx)

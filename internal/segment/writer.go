@@ -90,7 +90,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegment(path, numDocs, names, builders, storedFromDocs(docs))
+	meta, err := writeSegment(path, numDocs, names, builders, storedFromDocs(docs), opts.Threads)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -99,7 +99,11 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 }
 
 // addValue folds one document's field value into its builder, as [Build] and the
-// doc-major pass of [Merge] both do.
+// doc-major pass of [Merge] both do. A duplicate (term, doc) pair - the same word or
+// gram occurring more than once in one document's text - is harmless to add more than
+// once: [writeTermPairsDict] collapses it into one posting when it sorts and writes
+// the dictionary, so there is no need to deduplicate here (which would cost an
+// allocation per document to do with a map).
 func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	b.presence.Add(ord)
 	if v.GramsTruncated {
@@ -108,9 +112,9 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	switch {
 	case v.Text != nil:
 		b.addValueTerm(ord, *v.Text)
-		b.textDocs = append(b.textDocs, docString{doc: ord, s: *v.Text})
+		b.hasText = true
 		if v.Words != "" {
-			for _, word := range dedupeStrings(strings.Fields(v.Words)) {
+			for _, word := range strings.Fields(v.Words) {
 				b.addWordTerm(ord, word)
 			}
 		}
@@ -129,23 +133,7 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 		for _, e := range v.Entries {
 			b.addEntryTerm(ord, e)
 		}
-		b.entriesDocs = append(b.entriesDocs, docEntries{doc: ord, es: v.Entries})
 	}
-}
-
-func dedupeStrings(ss []string) []string {
-	if len(ss) < 2 {
-		return ss
-	}
-	seen := make(map[string]bool, len(ss))
-	out := ss[:0]
-	for _, s := range ss {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 func fieldNames(builders map[string]*fieldBuilder) []string {
@@ -172,8 +160,13 @@ func storedFromDocs(docs []schema.Doc) storedSource {
 }
 
 // writeSegment writes every section from builders (by field name, in names's order,
-// which must be sorted) and stored, to a fresh segment file at path.
-func writeSegment(path string, numDocs uint32, names []string, builders map[string]*fieldBuilder, stored storedSource) (Meta, error) {
+// which must be sorted) and stored, to a fresh segment file at path. threads is as
+// [BuildOptions.Threads] documents: it only affects how prepareFields parallelizes
+// preparing builders, never the order sections are written in, so the file is
+// byte-for-byte identical for any threads value.
+func writeSegment(path string, numDocs uint32, names []string, builders map[string]*fieldBuilder, stored storedSource, threads int) (Meta, error) {
+	prepareFields(names, builders, numDocs, threads)
+
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -191,22 +184,18 @@ func writeSegment(path string, numDocs uint32, names []string, builders map[stri
 	w.header()
 
 	outs := make(map[string]*fieldOutput, len(names))
-	valueOrdsByField := make(map[string]map[string]uint32, len(names))
-	entryOrdsByField := make(map[string]map[string]uint32, len(names))
 
 	w.beginSection(sectionTerms)
 	for _, name := range names {
 		out := &fieldOutput{}
 		outs[name] = out
-		vo, eo := builders[name].writeDicts(w, out)
-		valueOrdsByField[name] = vo
-		entryOrdsByField[name] = eo
+		builders[name].writeDicts(w, out)
 	}
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
 	for _, name := range names {
-		builders[name].writeDocValues(w, numDocs, outs[name], valueOrdsByField[name], entryOrdsByField[name])
+		builders[name].writeDocValues(w, numDocs, outs[name])
 	}
 	w.endSection()
 

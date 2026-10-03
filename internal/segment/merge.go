@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"runtime"
 	"sort"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -93,9 +94,12 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 
 	name := genName()
 	path := filepath.Join(dir, name+FileExt)
+	// Merge has no BuildOptions of its own to take a Threads value from (its public
+	// signature is fixed by the plan), so it parallelizes field preparation itself,
+	// up to GOMAXPROCS - the same lever BuildOptions.Threads gives Build.
 	meta, err := writeSegment(path, total, names, builders, storedFromSlice(func(ord uint32) (string, []byte) {
 		return recs[ord].id, recs[ord].body
-	}, total))
+	}, total), runtime.GOMAXPROCS(0))
 	if err != nil {
 		return Meta{}, err
 	}
@@ -172,9 +176,8 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 	switch {
 	case fi.keywordCol != nil:
 		if ord, ok := (KeywordColumn{c: fi.keywordCol}).Ord(oldOrd); ok {
-			term := string(fi.dicts[KindValue].termAt(nil, ord))
-			b.addValueTerm(newOrd, term)
-			b.textDocs = append(b.textDocs, docString{doc: newOrd, s: term})
+			b.addValueTerm(newOrd, string(fi.dicts[KindValue].termAt(nil, ord)))
+			b.hasText = true
 		}
 	case fv.trueBM != nil && fv.trueBM.Contains(oldOrd):
 		b.addValueTerm(newOrd, TermTrue)
@@ -182,16 +185,8 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 		b.addValueTerm(newOrd, TermFalse)
 	}
 	if fi.multiCol != nil {
-		ords := (MultiColumn{c: fi.multiCol}).Ords(oldOrd, nil)
-		if len(ords) > 0 {
-			es := make([]string, len(ords))
-			for i, o := range ords {
-				es[i] = string(fi.dicts[KindEntry].termAt(nil, o))
-			}
-			for _, e := range es {
-				b.addEntryTerm(newOrd, e)
-			}
-			b.entriesDocs = append(b.entriesDocs, docEntries{doc: newOrd, es: es})
+		for _, o := range (MultiColumn{c: fi.multiCol}).Ords(oldOrd, nil) {
+			b.addEntryTerm(newOrd, string(fi.dicts[KindEntry].termAt(nil, o)))
 		}
 	}
 	if fi.numberCol != nil {

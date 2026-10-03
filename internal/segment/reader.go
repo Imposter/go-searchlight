@@ -346,6 +346,14 @@ const idFieldName = "_id"
 // Retain returns a second handle on the same open segment, so it stays mapped even
 // after the original is Closed. The returned *Reader is independent: Close it when
 // done, separately from the one it was retained from.
+//
+// Retain must be called while r (or some other handle on the same segment) is
+// definitely still open - that is, with a happens-before relationship to any Close of
+// the handle Retain is called on, as a normal owned reference gives for free. Calling
+// it concurrently with, and unordered against, the only Close that could otherwise
+// bring the mapping's reference count to zero is a use-after-close on r itself, not
+// something Retain can rescue: incrementing a reference count after the mapping was
+// already unmapped does not re-map it.
 func (r *Reader) Retain() *Reader {
 	r.m.retain()
 	nr := &Reader{

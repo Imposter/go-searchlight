@@ -96,10 +96,6 @@ func scaledInt(v float64, s int) (int64, bool) {
 	return k, math.Float64bits(back) == math.Float64bits(v)
 }
 
-// numberSource yields a column's values in ascending document order; it may be called
-// more than once and must yield the same values each time.
-type numberSource func(yield func(doc uint32, v float64))
-
 // Stats are a number column's aggregates over the documents that have a value.
 type Stats struct {
 	Count    uint32
@@ -108,52 +104,69 @@ type Stats struct {
 }
 
 // chooseEncoding picks the column's encoding and computes its stats and has-value
-// bitset (nil when every document has a value).
-func chooseEncoding(numDocs uint32, src numberSource) (numEncoding, Stats, []uint64) {
+// bitset (nil when every document has a value), in two passes over values regardless
+// of cardinality (down from four, plus a fifth that writeNumberColumn used to make on
+// its own to find the packed width - eliminated below by deriving it from Stats.Max
+// instead of a separate scan):
+//
+//   - pass 1 computes the running stats and the smallest scale (0 to maxScale) whose
+//     exact-integer representation ([scaledInt]) covers every value seen so far,
+//     exactly as before;
+//   - pass 2, now that the final scale is fixed, re-validates every value is exact at
+//     it (bailing out at the first that is not, straight to float mode) and computes
+//     kmin and the encoding's gcd in the same loop, using the first value as the gcd's
+//     reference point rather than kmin: gcd(k_i - k_0) equals gcd(k_i - kmin) for any
+//     fixed reference drawn from the k_i themselves, a standard fact about the
+//     subgroup a finite set of integers' pairwise differences generates, so kmin need
+//     not be known until the loop (and hence the pass) is done.
+//
+// values must be sorted by doc, ascending (as [fieldBuilder.prepareField] leaves them);
+// chooseEncoding does not sort them itself.
+func chooseEncoding(numDocs uint32, values []docFloat) (numEncoding, Stats, []uint64) {
 	st := Stats{Min: math.Inf(1), Max: math.Inf(-1)}
 	present := make([]uint64, (uint64(numDocs)+63)/64)
 	scale := 0
-	src(func(doc uint32, v float64) {
+	for _, dv := range values {
 		st.Count++
-		st.Min = math.Min(st.Min, v)
-		st.Max = math.Max(st.Max, v)
-		st.Sum += v
-		present[doc/64] |= 1 << (doc % 64)
+		st.Min = math.Min(st.Min, dv.v)
+		st.Max = math.Max(st.Max, dv.v)
+		st.Sum += dv.v
+		present[dv.doc/64] |= 1 << (dv.doc % 64)
 		for scale <= maxScale {
-			if _, ok := scaledInt(v, scale); ok {
+			if _, ok := scaledInt(dv.v, scale); ok {
 				break
 			}
 			scale++
 		}
-	})
+	}
 	if st.Count == numDocs {
 		present = nil
 	}
 	enc := numEncoding{mode: modeFloat, gcd: 1}
 	if scale <= maxScale {
-		// Every value has an exact scaled integer at its own smallest scale; check them
-		// all at the largest, then find kmin and the gcd of the differences.
-		ok, first := true, true
-		var kmin int64
-		src(func(_ uint32, v float64) {
-			k, exact := scaledInt(v, scale)
-			ok = ok && exact
-			if first || k < kmin {
-				kmin, first = k, false
-			}
-		})
+		ok := true
+		var kmin, k0 int64
 		var g uint64
-		if ok {
-			src(func(_ uint32, v float64) {
-				k, _ := scaledInt(v, scale)
-				g = gcd(g, uint64(k-kmin)) //nolint:gosec // k >= kmin
-			})
+		for i, dv := range values {
+			k, exact := scaledInt(dv.v, scale)
+			if !exact {
+				ok = false
+				break
+			}
+			if i == 0 {
+				kmin, k0 = k, k
+				continue
+			}
+			if k < kmin {
+				kmin = k
+			}
+			g = gcd(g, absDiff(k, k0))
 		}
 		if g == 0 {
 			g = 1
 		}
 		if ok {
-			enc = numEncoding{mode: modeInt, scale: uint8(scale), base: uint64(kmin), gcd: g} //nolint:gosec // scale <= maxScale; kmin stored as bits
+			enc = numEncoding{mode: modeInt, scale: uint8(scale), base: uint64(kmin), gcd: g}
 		}
 	}
 	if enc.mode == modeFloat {
@@ -169,15 +182,22 @@ func gcd(a, b uint64) uint64 {
 	return a
 }
 
-// writeNumberColumn writes a number column and returns its offset and encoding; false
-// when src yields nothing.
-func writeNumberColumn(w *fileWriter, numDocs uint32, src numberSource) (uint64, numEncoding, bool) {
-	enc, st, present := chooseEncoding(numDocs, src)
-	if st.Count == 0 {
-		return 0, enc, false
+// absDiff returns |a - b| as a uint64, without risking int64 overflow on the subtraction.
+func absDiff(a, b int64) uint64 {
+	if a >= b {
+		return uint64(a - b) //nolint:gosec // a >= b, so the difference is non-negative
 	}
-	var maxKey uint64
-	src(func(_ uint32, v float64) { maxKey = max(maxKey, enc.key(v)) })
+	return uint64(b - a) //nolint:gosec // b > a, so the difference is non-negative
+}
+
+// writeNumberColumn writes a number column from its already-chosen encoding, stats and
+// has-value bitset ([chooseEncoding], normally run once in [fieldBuilder.prepareField]
+// rather than here) and returns its offset. values must be sorted by doc, ascending.
+func writeNumberColumn(w *fileWriter, numDocs uint32, enc numEncoding, st Stats, present []uint64, values []docFloat) uint64 {
+	// The maximum key belongs to the maximum value: both scaledInt's rounding (int
+	// mode) and sortableBits (float mode) are monotonic in v, so there is no need to
+	// rescan values for it.
+	maxKey := enc.key(st.Max)
 	width := packedWidth(bitsFor(maxKey))
 	off := w.off
 	var h encoder
@@ -201,18 +221,18 @@ func writeNumberColumn(w *fileWriter, numDocs uint32, src numberSource) (uint64,
 	w.write(h.b)
 	p := newPacker(w, width)
 	next := uint32(0)
-	src(func(doc uint32, v float64) {
-		for ; next < doc; next++ {
+	for _, dv := range values {
+		for ; next < dv.doc; next++ {
 			p.add(0)
 		}
-		p.add(enc.key(v))
-		next = doc + 1
-	})
+		p.add(enc.key(dv.v))
+		next = dv.doc + 1
+	}
 	for ; next < numDocs; next++ {
 		p.add(0)
 	}
 	p.finish()
-	return off, enc, true
+	return off
 }
 
 // numberColumn reads a number column in place.

@@ -1,9 +1,7 @@
 package segment
 
 import (
-	"cmp"
 	"encoding/binary"
-	"slices"
 
 	"github.com/RoaringBitmap/roaring/v2"
 )
@@ -23,19 +21,11 @@ type pointPair struct {
 	doc uint32
 }
 
-// writePoints writes src's (key, doc) pairs sorted by key and returns the index's
-// offset. src must yield the same (doc, value) pairs as the column built with enc.
-func writePoints(w *fileWriter, numDocs uint32, enc numEncoding, src numberSource) uint64 {
-	var pairs []pointPair
-	src(func(doc uint32, v float64) {
-		pairs = append(pairs, pointPair{key: enc.key(v), doc: doc})
-	})
-	slices.SortFunc(pairs, func(a, b pointPair) int {
-		if c := cmp.Compare(a.key, b.key); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.doc, b.doc)
-	})
+// writeSortedPoints writes pairs - a number column's (key, doc) pairs, already sorted
+// by (key, doc) ascending (by [fieldBuilder.prepareField], concurrently with other
+// fields' preparation; writeSortedPoints does not sort them itself) - and returns the
+// index's offset.
+func writeSortedPoints(w *fileWriter, numDocs uint32, pairs []pointPair) uint64 {
 	n := len(pairs)
 	numBlocks := (n + pointsBlockSize - 1) / pointsBlockSize
 	var maxKey uint64
@@ -134,12 +124,17 @@ func inRange(v, lo, hi float64, incLo, incHi bool) bool {
 	return okLo && okHi
 }
 
-// rangeDocs returns the documents whose value is within [lo, hi].
+// rangeDocs returns the documents whose value is within [lo, hi]. Matches are
+// collected per block and added with one AddMany call each, rather than one Add call
+// per document: AddMany amortizes roaring's container lookup and growth over the whole
+// batch instead of repeating it per match, which matters here since a range query's
+// match count is typically a sizeable fraction of the column, not a handful of terms.
 func (p *points) rangeDocs(lo, hi float64, incLo, incHi bool) *roaring.Bitmap {
 	result := roaring.New()
 	if p == nil {
 		return result
 	}
+	var buf []uint32
 	for i := range p.numBlocks {
 		minKey, maxKey, count, off := p.blockRange(i)
 		bmin, bmax := p.enc.value(minKey), p.enc.value(maxKey)
@@ -153,16 +148,20 @@ func (p *points) rangeDocs(lo, hi float64, incLo, incHi bool) *roaring.Bitmap {
 		keyBytes := packedSize(uint64(count), p.keyWidth)
 		keys := p.data[off : off+keyBytes]
 		docs := p.data[off+keyBytes : off+keyBytes+packedSize(uint64(count), p.docWidth)]
+		buf = buf[:0]
 		for j := range uint64(count) {
 			doc := uint32(unpack(docs, j, p.docWidth)) //nolint:gosec // written from a uint32
 			if fullyIn {
-				result.Add(doc)
+				buf = append(buf, doc)
 				continue
 			}
 			v := p.enc.value(unpack(keys, j, p.keyWidth))
 			if inRange(v, lo, hi, incLo, incHi) {
-				result.Add(doc)
+				buf = append(buf, doc)
 			}
+		}
+		if len(buf) > 0 {
+			result.AddMany(buf)
 		}
 	}
 	return result

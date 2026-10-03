@@ -3,6 +3,7 @@ package segment
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -32,13 +33,47 @@ func benchMapping() *schema.Mapping {
 	}}
 }
 
-var descWords = strings.Fields(strings.Repeat("the quick brown fox jumps over lazy dog near river bank while sun sets slowly behind distant hills casting long shadows across empty field ", 5))
+// descPool is a few thousand distinct synthetic words: large enough that picking 60 of
+// them per document, pseudo-randomly, gives each word a plausible real-catalog
+// repetition rate (every word in a real product description - "wireless", "stainless",
+// a model number - tends to recur across some sizeable fraction of a catalog, but not
+// across all of it) instead of either extreme: a single fixed sentence reused for
+// every document (so every word AND every trigram is shared by all 20,000 documents -
+// pathologically low cardinality for the occurrence count, which makes a sorted-pairs
+// term dictionary look artificially worse than a map) or words so unique that nothing
+// is ever shared (unrealistically high cardinality, which would make a map's hashing
+// look artificially worse than it does in practice).
+var descPool = func() []string {
+	words := make([]string, 4000)
+	for i := range words {
+		words[i] = fmt.Sprintf("tok%d", i)
+	}
+	return words
+}()
+
+func genDescription(i int) string {
+	// A small, fast PRNG (splitmix64) seeded from the document index, not
+	// math/rand, so genCorpus stays allocation-free and deterministic across runs.
+	state := uint64(i)*0x9E3779B97F4A7C15 + 1
+	next := func() uint64 {
+		state += 0x9E3779B97F4A7C15
+		z := state
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+		return z ^ (z >> 31)
+	}
+	words := make([]string, 60)
+	for j := range words {
+		words[j] = descPool[next()%uint64(len(descPool))]
+	}
+	return strings.Join(words, " ")
+}
 
 func genCorpus(n int) []schema.Doc {
 	m := benchMapping()
 	docs := make([]schema.Doc, n)
 	for i := range n {
-		desc := strings.Join(descWords[:60], " ")
+		desc := genDescription(i)
 		body := fmt.Sprintf(`{
 			"title": "Product number %d for testing",
 			"description": %q,
@@ -70,22 +105,35 @@ func mustAnalyzeBench(m *schema.Mapping, id, body string) schema.Doc {
 	return doc
 }
 
+// BenchmarkBuild reports docs/s and bytes/doc for sequential (Threads: 0) and threaded
+// (Threads: runtime.NumCPU()) Build, as sub-benchmarks: run with
+// -bench BenchmarkBuild to get both.
 func BenchmarkBuild(b *testing.B) {
-	docs := genCorpus(20000)
-	dir := b.TempDir()
-	var lastPath string
-	b.ResetTimer()
-	for range b.N {
-		meta, err := Build(dir, docs, BuildOptions{})
-		if err != nil {
-			b.Fatal(err)
-		}
-		lastPath = meta.Path
-	}
-	elapsed := b.Elapsed().Seconds()
-	b.ReportMetric(float64(len(docs))*float64(b.N)/elapsed, "docs/s")
-	if info, err := os.Stat(lastPath); err == nil {
-		b.ReportMetric(float64(info.Size())/float64(len(docs)), "bytes/doc")
+	for _, tc := range []struct {
+		name    string
+		threads int
+	}{
+		{"Sequential", 0},
+		{"Threaded", runtime.NumCPU()},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			docs := genCorpus(20000)
+			dir := b.TempDir()
+			var lastPath string
+			b.ResetTimer()
+			for range b.N {
+				meta, err := Build(dir, docs, BuildOptions{Threads: tc.threads})
+				if err != nil {
+					b.Fatal(err)
+				}
+				lastPath = meta.Path
+			}
+			elapsed := b.Elapsed().Seconds()
+			b.ReportMetric(float64(len(docs))*float64(b.N)/elapsed, "docs/s")
+			if info, err := os.Stat(lastPath); err == nil {
+				b.ReportMetric(float64(info.Size())/float64(len(docs)), "bytes/doc")
+			}
+		})
 	}
 }
 
@@ -145,6 +193,37 @@ func BenchmarkStoredFetch(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkStoredFetchParallel drives Stored from many goroutines at once (as Task 6's
+// concurrent hit fetches will), with each hitting a random ordinal rather than the
+// sequential access BenchmarkStoredFetch exercises - the pattern that showed a single
+// mutex-guarded decoder cache thrashing under review.
+func BenchmarkStoredFetchParallel(b *testing.B) {
+	docs := genCorpus(20000)
+	dir := b.TempDir()
+	meta, err := Build(dir, docs, BuildOptions{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	r, err := Open(meta.Path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer r.Close()
+	n := uint32(len(docs))
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		// A distinct pseudo-random sequence per goroutine, deterministic enough to
+		// need no synchronization of its own.
+		x := uint32(1) + uint32(os.Getpid())
+		for pb.Next() {
+			x = x*1664525 + 1013904223 // a small, fast LCG; only used to pick an ordinal
+			if _, err := r.Stored(x % n); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func BenchmarkMerge(b *testing.B) {

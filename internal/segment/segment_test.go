@@ -263,6 +263,39 @@ func TestEmptyBuild(t *testing.T) {
 	}
 }
 
+// TestBuildThreadsByteIdentical pins down the review's requirement that
+// BuildOptions.Threads only changes how fast Build runs, never what it writes:
+// parallelizing field preparation must produce the exact same bytes as the sequential
+// path, since the section writer itself always runs single-threaded afterward, in
+// sorted field order.
+func TestBuildThreadsByteIdentical(t *testing.T) {
+	docs := genCorpus(2000) // enough fields and cardinality to exercise every column kind
+	dir := t.TempDir()
+
+	seq, err := Build(dir, docs, BuildOptions{Name: "sequential", Threads: 1})
+	if err != nil {
+		t.Fatalf("Build(Threads: 1): %v", err)
+	}
+	for _, threads := range []int{0, 2, 4, 17} {
+		par, err := Build(dir, docs, BuildOptions{Name: fmt.Sprintf("threads-%d", threads), Threads: threads})
+		if err != nil {
+			t.Fatalf("Build(Threads: %d): %v", threads, err)
+		}
+		seqBytes, err := os.ReadFile(seq.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parBytes, err := os.ReadFile(par.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(seqBytes, parBytes) {
+			t.Fatalf("Threads: %d produced different bytes than Threads: 1 (%d vs %d bytes)",
+				threads, len(parBytes), len(seqBytes))
+		}
+	}
+}
+
 func TestCorruptDetected(t *testing.T) {
 	docs := testDocs(t)
 	dir := t.TempDir()
@@ -466,12 +499,23 @@ func TestConcurrentReaderClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Retain every handle up front, while r is unambiguously still open (Retain's own
+	// contract: it must not race an unordered Close of the handle it is called on -
+	// see its doc comment). What this test means to exercise is the next part: the
+	// mapping must stay alive under concurrent use and Close of many handles, with
+	// the original's Close racing the others, not whether Retain itself is safe to
+	// call concurrently with a Close that could already be dropping the last
+	// reference.
+	retained := make([]*Reader, 20)
+	for i := range retained {
+		retained[i] = r.Retain()
+	}
+
 	var wg sync.WaitGroup
-	for range 20 {
+	for _, rr := range retained {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rr := r.Retain()
 			for range 50 {
 				rr.Postings("brand", KindValue, "acme")
 				_, _ = rr.Stored(0)

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -218,7 +219,7 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 	if !c.Kind.valid() {
 		return invalidf("kind %q", c.Kind)
 	}
-	if c.IfSeq < IfAbsent {
+	if c.IfSeq < IfExists {
 		return invalidf("if_seq %d", c.IfSeq)
 	}
 	if c.IfSeq != 0 {
@@ -226,6 +227,9 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 	}
 	switch c.Kind {
 	case KindUpsert:
+		if size := len(c.ID) + len(c.Payload); size > MaxPayloadBytes {
+			return invalidf("the document is %d bytes with its id, more than %d", size, MaxPayloadBytes)
+		}
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
 		}
@@ -307,16 +311,41 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
 		return 0, 0, fmt.Errorf("lock counter: %w", err)
 	}
-	first, last = counter+1, counter+int64(len(batch))
+	for i := range batch {
+		batch[i].Seq = 0
+	}
+	all := batch
+	var keptAt []int // the kept changes' positions in all; nil when all are kept
 
 	idx, err := s.checkIndexes(ctx, tx, batch)
 	if err != nil {
 		return 0, 0, err
 	}
 	if p.conditional {
-		if err := s.checkConditions(ctx, tx, batch, first); err != nil {
+		skip, err := s.checkConditions(ctx, tx, batch, counter+1)
+		if err != nil {
 			return 0, 0, err
 		}
+		if skip != nil {
+			// IfExists misses are dropped here, inside the transaction: the
+			// rest takes contiguous seqs.
+			kept := make([]Change, 0, len(batch))
+			kp := &prepared{conditional: true}
+			keptAt = make([]int, 0, len(batch))
+			for i := range batch {
+				if !skip[i] {
+					keptAt = append(keptAt, i)
+					kept = append(kept, batch[i])
+					kp.payload = append(kp.payload, p.payload[i])
+					kp.query = append(kp.query, p.query[i])
+				}
+			}
+			batch, p = kept, kp
+		}
+	}
+	first, last = counter+1, counter+int64(len(batch))
+	if len(batch) == 0 {
+		return first, last, nil // nothing to write: every change was skipped
 	}
 
 	// The changelog. Each row carries the uid of the incarnation of its
@@ -351,6 +380,13 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		return 0, 0, fmt.Errorf("commit: %w", err)
 	}
 	committed = true
+	for k := range batch {
+		i := k
+		if keptAt != nil {
+			i = keptAt[k]
+		}
+		all[i].Seq = first + int64(k)
+	}
 	return first, last, nil
 }
 
@@ -392,6 +428,18 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 				missing.Indexes = append(missing.Indexes, name)
 			}
 		}
+		if want := batch[i].IndexUID; uid != "" && want != "" && want != uid {
+			// The caller meant an incarnation that was dropped: for it, the
+			// index is missing.
+			if missing == nil {
+				missing = &IndexNotFoundError{}
+			}
+			if !slices.Contains(missing.Indexes, name) {
+				missing.Indexes = append(missing.Indexes, name)
+			}
+			missing.Positions = append(missing.Positions, i)
+			continue
+		}
 		if uid == "" {
 			missing.Positions = append(missing.Positions, i)
 		}
@@ -404,8 +452,10 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 
 // checkConditions evaluates IfSeq conditions in batch order, as if each
 // change before that passed its condition applied, and fails with a
-// *ConflictError listing every failure.
-func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) error {
+// *ConflictError listing every failure. An IfExists change whose target is
+// missing is not a failure: it is reported in skip, and treated as not
+// applied by the changes after it.
+func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) (skip []bool, err error) {
 	cur := make(map[recKey]int64)
 	var conflict *ConflictError
 	for i := range batch {
@@ -423,8 +473,15 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 				case errors.Is(err, sql.ErrNoRows):
 					seq = 0
 				case err != nil:
-					return fmt.Errorf("check if_seq: %w", err)
+					return nil, fmt.Errorf("check if_seq: %w", err)
 				}
+			}
+			if c.IfSeq == IfExists && seq == 0 {
+				if skip == nil {
+					skip = make([]bool, len(batch))
+				}
+				skip[i] = true
+				continue
 			}
 			if (c.IfSeq == IfAbsent && seq != 0) || (c.IfSeq > 0 && seq != c.IfSeq) {
 				if conflict == nil {
@@ -442,9 +499,9 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 		}
 	}
 	if conflict != nil {
-		return conflict
+		return nil, conflict
 	}
-	return nil
+	return skip, nil
 }
 
 // applyState writes the batch's net effect on sl_documents and sl_queries:

@@ -120,7 +120,8 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 }
 
 // Apply commits batch as part of a group-commit transaction and returns its
-// seq range, like Store.Apply.
+// seq range, setting each applied change's Seq, like Store.Apply (a request
+// whose every change was a skipped IfExists gets 0, 0).
 func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last int64, err error) {
 	if len(batch) == 0 {
 		return 0, 0, nil
@@ -280,18 +281,31 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 		for k, i := range live {
 			reqs[k] = batch[i]
 		}
-		first, err := g.commit(reqs)
+		changes, err := g.commit(reqs)
 
 		var ce *ConflictError
 		var nf *IndexNotFoundError
 		switch {
 		case err == nil:
-			off := first
+			// Each request's changes get their seqs back (a skipped IfExists
+			// change keeps 0), and its range spans the ones applied.
+			off := 0
 			for _, i := range live {
-				n := int64(len(batch[i].changes))
+				var res gcResult
+				for j := range batch[i].changes {
+					seq := changes[off+j].Seq
+					batch[i].changes[j].Seq = seq
+					if seq == 0 {
+						continue
+					}
+					if res.first == 0 {
+						res.first = seq
+					}
+					res.last = seq
+				}
+				off += len(batch[i].changes)
 				state[i] = gcDone
-				batch[i].result <- gcResult{first: off, last: off + n - 1}
-				off += n
+				batch[i].result <- res
 			}
 			finish(nil)
 			return
@@ -316,8 +330,9 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 	}
 }
 
-// commit runs one transaction for reqs and returns its first seq.
-func (g *GroupCommitter) commit(reqs []*gcRequest) (int64, error) {
+// commit runs one transaction for reqs and returns the combined batch, each applied
+// change's Seq set.
+func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 	total := 0
 	links := make([]trace.Link, 0, len(reqs))
 	for _, r := range reqs {
@@ -357,18 +372,26 @@ func (g *GroupCommitter) commit(reqs []*gcRequest) (int64, error) {
 
 	g.flushes.Add(1)
 	g.batchSize.Record(ctx, float64(total))
-	var first int64
+	var first, last int64
 	var err error
 	if pa, ok := g.st.(preparedApplier); ok {
-		first, _, err = pa.applyPrepared(ctx, changes, prep)
+		first, last, err = pa.applyPrepared(ctx, changes, prep)
 	} else {
-		first, _, err = g.st.Apply(ctx, changes)
+		first, last, err = g.st.Apply(ctx, changes)
 	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
+		return changes, err
 	}
-	return first, err
+	// An Applier that does not report each change's Seq applied them all, in
+	// order, as first..last.
+	if last-first+1 == int64(len(changes)) && len(changes) > 0 && changes[0].Seq == 0 {
+		for i := range changes {
+			changes[i].Seq = first + int64(i)
+		}
+	}
+	return changes, nil
 }
 
 // preparedApplier is the store's Apply without re-validation.

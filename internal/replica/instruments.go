@@ -21,6 +21,7 @@ type instruments struct {
 	lagSeq        metric.Float64ObservableGauge
 	lagTime       metric.Float64ObservableGauge
 	halted        metric.Float64ObservableGauge
+	pollFailing   metric.Float64ObservableGauge
 	progress      metric.Float64Gauge
 	batchSize     metric.Float64Histogram
 	applyDur      metric.Float64Histogram
@@ -46,6 +47,7 @@ func newInstruments(meter metric.Meter, id ShardID, log *slog.Logger) *instrumen
 		lagSeq:        in.ObservableGauge(telemetry.MetricReplicaLagSeq),
 		lagTime:       in.ObservableGauge(telemetry.MetricReplicaLagTime),
 		halted:        in.ObservableGauge(telemetry.MetricReplicaHalted),
+		pollFailing:   in.ObservableGauge(telemetry.MetricReplicaPollFailing),
 		progress:      in.Gauge(telemetry.MetricReplicaRecoveryProgress),
 		batchSize:     in.Histogram(telemetry.MetricReplicaApplyBatchSize),
 		applyDur:      in.Histogram(telemetry.MetricReplicaApplyDuration),
@@ -68,15 +70,12 @@ func newInstruments(meter metric.Meter, id ShardID, log *slog.Logger) *instrumen
 func (i *instruments) observe(t *Tailer) func() {
 	reg, err := i.meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		seq, age := t.Lag()
-		halted := 0.0
-		if t.Halt() != nil {
-			halted = 1
-		}
 		o.ObserveFloat64(i.lagSeq, float64(seq), i.attrs)
 		o.ObserveFloat64(i.lagTime, age.Seconds(), i.attrs)
-		o.ObserveFloat64(i.halted, halted, i.attrs)
+		o.ObserveFloat64(i.halted, flag(t.Halt() != nil), i.attrs)
+		o.ObserveFloat64(i.pollFailing, flag(t.PollFailing()), i.attrs)
 		return nil
-	}, i.lagSeq, i.lagTime, i.halted)
+	}, i.lagSeq, i.lagTime, i.halted, i.pollFailing)
 	if err != nil {
 		i.log.Error("replica lag metrics unavailable", slog.Any("error", err))
 		return func() {}
@@ -87,4 +86,11 @@ func (i *instruments) observe(t *Tailer) func() {
 // with returns the base attributes plus extra.
 func (i *instruments) with(extra ...attribute.KeyValue) metric.MeasurementOption {
 	return metric.WithAttributeSet(attribute.NewSet(append(slices.Clip(i.base), extra...)...))
+}
+
+func flag(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }

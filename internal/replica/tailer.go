@@ -85,6 +85,7 @@ const (
 	DefaultRebuildRetryCap = 2 * time.Minute
 	DefaultHaltRetryBase   = 30 * time.Second
 	DefaultHaltRetryCap    = 10 * time.Minute
+	DefaultRemapDebounce   = 2 * time.Second
 )
 
 // Options configures a [Tailer]. The zero value is usable.
@@ -119,6 +120,12 @@ type Options struct {
 	// HaltRetryBase and HaltRetryCap bound the backoff of a halted copy's retries.
 	// 0 means DefaultHaltRetryBase and DefaultHaltRetryCap.
 	HaltRetryBase, HaltRetryCap time.Duration
+	// RemapDebounce is how long a copy that a mapping change must rebuild waits,
+	// applying nothing, for more mapping changes to come, so that a burst of them
+	// costs one rebuild (at the latest seq) rather than one each. The wait restarts
+	// while new mapping versions keep arriving, up to five times over. 0 means
+	// DefaultRemapDebounce; negative means no wait.
+	RemapDebounce time.Duration
 	// Hub delivers store notifications (Postgres): share one per node, run by the
 	// node. Nil means the tailer only polls, woken early by Wake.
 	Hub *Hub
@@ -184,6 +191,9 @@ func (o *Options) resolve() {
 		o.HaltRetryCap = DefaultHaltRetryCap
 	}
 	o.HaltRetryCap = max(o.HaltRetryCap, o.HaltRetryBase)
+	if o.RemapDebounce == 0 {
+		o.RemapDebounce = DefaultRemapDebounce
+	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
 	}
@@ -270,6 +280,17 @@ type Tailer struct {
 	minMappingVersion int64
 	// guardedSeq is the change the halt guard last rebuilt the copy for.
 	guardedSeq int64
+	// gate is the halt a snapshot load stopped at: the copy is half-loaded and
+	// can only be rebuilt, which waits until the halted row is superseded.
+	gate *HaltError
+	// scanFor and scanFrom are where the search for a change superseding a halted
+	// one got to.
+	scanFor  *HaltError
+	scanFrom int64
+	// remapSince and remapVersion are when a remap's rebuild started waiting, and
+	// the newest mapping version seen since.
+	remapSince   time.Time
+	remapVersion int64
 }
 
 // lagState is the lag as last observed, behind a mutex: the age keeps growing from
@@ -280,6 +301,11 @@ type lagState struct {
 	behind bool
 	age    time.Duration // by the database clock, at obs
 	obs    time.Time     // local, monotonic
+	// failing is set while polls (or the recoveries that stand in for them) fail;
+	// lastOK is when the last poll succeeded, by the local monotonic clock (the
+	// database's cannot be read then).
+	failing bool
+	lastOK  time.Time
 }
 
 // NewTailer returns a tailer that keeps sh, the copy of shard id, in step with st's
@@ -300,6 +326,7 @@ func NewTailer(st store.Store, sh *shard.Shard, id ShardID, opts Options) *Taile
 		warn:      rateLimitedWarn{every: 30 * time.Second},
 	}
 	t.inst = newInstruments(opts.Meter, id, t.log)
+	t.lag.lastOK = time.Now()
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
 	if opts.Copy != nil {
@@ -320,16 +347,42 @@ func (t *Tailer) Shard() *shard.Shard { return t.sh.Load() }
 func (t *Tailer) Applied() int64 { return t.applied.Load() }
 
 // Lag returns how far the copy trails the changelog: in changes (the head seq minus
-// the applied one, at the last poll) and in time (the age, by the database clock, of
-// the oldest change it has not applied; zero when caught up). The age keeps growing
-// while the copy is stuck: halted, or unable to reach the database.
+// the applied one, at the last poll that succeeded) and in time (the age, by the
+// database clock, of the oldest change it has not applied; zero when caught up). The
+// age keeps growing while the copy is stuck: halted, or unable to reach the
+// database. While polls fail the copy cannot know what it misses, so the age is at
+// least the time since the last poll that succeeded (other nodes may be writing),
+// and the seq lag is the last known one ([Tailer.PollFailing] says so).
 func (t *Tailer) Lag() (seq int64, age time.Duration) {
 	t.lag.mu.Lock()
 	defer t.lag.mu.Unlock()
-	if !t.lag.behind {
-		return t.lag.seq, 0
+	if t.lag.behind {
+		age = t.lag.age + time.Since(t.lag.obs)
 	}
-	return t.lag.seq, t.lag.age + time.Since(t.lag.obs)
+	if t.lag.failing {
+		age = max(age, time.Since(t.lag.lastOK))
+	}
+	return t.lag.seq, age
+}
+
+// PollFailing reports whether the copy's polls of the changelog are failing now.
+func (t *Tailer) PollFailing() bool {
+	t.lag.mu.Lock()
+	defer t.lag.mu.Unlock()
+	return t.lag.failing
+}
+
+// pollFailed records a failed poll (or recovery step); pollOK a successful one.
+func (t *Tailer) pollFailed() {
+	t.lag.mu.Lock()
+	defer t.lag.mu.Unlock()
+	t.lag.failing = true
+}
+
+func (t *Tailer) pollOK() {
+	t.lag.mu.Lock()
+	defer t.lag.mu.Unlock()
+	t.lag.failing, t.lag.lastOK = false, time.Now()
 }
 
 // observeLag records a poll's view: head and applied seqs, and the age of the oldest
@@ -382,6 +435,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		defer hub.subscribe(t)()
 	}
 	defer t.inst.observe(t)()
+	t.pollOK() // the lag is judged from now
 
 	t.log.InfoContext(ctx, "tailer started", slog.Int64("seq", t.Applied()))
 	err = t.loop(runCtx, hub)
@@ -485,6 +539,7 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		return err
 	}
 	// Transient: the database, or a refresh.
+	t.pollFailed()
 	if suppressed, ok := t.warn.allow(); ok {
 		t.log.WarnContext(ctx, "tailer retrying after a failure", slog.Any("error", err), slog.Int("suppressed", suppressed))
 	}
@@ -553,16 +608,20 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	}
 	head, dbNow, err := t.st.HeadSeq(ctx)
 	if err != nil {
+		t.pollFailed()
 		return false, err
 	}
 	from := t.Applied()
 	changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 	if errors.Is(err, store.ErrPruned) {
+		t.pollOK()
 		return false, &rebuildError{reason: reasonPruned, err: err}
 	}
 	if err != nil {
+		t.pollFailed()
 		return false, err
 	}
+	t.pollOK()
 	if n := len(changes); n > 0 {
 		head = max(head, changes[n-1].Seq)
 		t.observeLag(head, from, true, dbNow.Sub(changes[0].At))

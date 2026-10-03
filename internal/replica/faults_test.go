@@ -327,3 +327,106 @@ func TestPruneDuringLoad(t *testing.T) {
 		}
 	})
 }
+
+// TestLagWhileTheDatabaseIsUnreachable is the partition case: a caught-up copy loses
+// the database while other nodes may keep writing. It cannot see what it misses, so
+// its lag in time grows from its last good poll, past max_lag, and the poll.failing
+// gauge says why; reachable again, both go back to zero.
+func TestLagWhileTheDatabaseIsUnreachable(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		st := d.open(t)
+		createIndex(t, st, "part", testMapping)
+		id := ShardID{Index: "part", Shard: 0}
+		fs := newFaultStore(d.open(t))
+		opts, reader := meteredOptions()
+		opts.MaxLag = 200 * time.Millisecond
+		c := newCopy(t, fs, id, opts)
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("part", 0, "a", `{}`)))
+		if _, age := c.tailer.Lag(); age != 0 {
+			t.Fatalf("lag %s when caught up", age)
+		}
+
+		fs.down("head", true)
+		fs.down("changes", true)
+		mustApply(t, st, upsert("part", 0, "b", `{}`)) // another node writes
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			_, age := c.tailer.Lag()
+			if age > 2*opts.MaxLag && c.tailer.PollFailing() {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("lag %s with the database unreachable; want past max_lag %s", age, opts.MaxLag)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaLagTime); v <= opts.MaxLag.Seconds() {
+			t.Fatalf("lag.time gauge %g", v)
+		}
+		if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaPollFailing); v != 1 {
+			t.Fatalf("poll.failing gauge %g", v)
+		}
+
+		fs.down("head", false)
+		fs.down("changes", false)
+		head, _, err := st.HeadSeq(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.waitApplied(head)
+		deadline = time.Now().Add(30 * time.Second)
+		for c.tailer.PollFailing() || lagAge(c.tailer) != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("lag %s, failing %v once reachable", lagAge(c.tailer), c.tailer.PollFailing())
+			}
+			c.tailer.Wake()
+			time.Sleep(10 * time.Millisecond)
+		}
+		if v, _ := gaugeValue(t, reader, telemetry.MetricReplicaPollFailing); v != 0 {
+			t.Fatalf("poll.failing gauge %g once reachable", v)
+		}
+	})
+}
+
+func lagAge(tl *Tailer) time.Duration {
+	_, age := tl.Lag()
+	return age
+}
+
+// TestRemapDebounce: a burst of mapping changes that each map a field live documents
+// hold costs one rebuild, at the end of the burst, and the copy ends right.
+func TestRemapDebounce(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		st := d.open(t)
+		createIndex(t, st, "db", `{"dynamic":false,"fields":{"title":"text"}}`)
+		id := ShardID{Index: "db", Shard: 0}
+		opts, reader := meteredOptions()
+		opts.RemapDebounce = 400 * time.Millisecond
+		c := newCopy(t, d.open(t), id, opts)
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("db", 0, "d1", `{"title":"x","brand":"A","color":"red","size":3,"weight":1}`)))
+		for _, f := range []struct {
+			name string
+			typ  schema.FieldType
+		}{{"brand", schema.Keyword}, {"color", schema.Keyword}, {"size", schema.Number}, {"weight", schema.Number}} {
+			updateMapping(t, st, "db", func(m *schema.Mapping) { m.Fields[f.name] = f.typ })
+			c.tailer.Wake()
+			time.Sleep(50 * time.Millisecond)
+		}
+		head := mustApply(t, st, upsert("db", 0, "d2", `{"title":"y","brand":"B"}`))
+		v := viewOf(t, c.waitApplied(head))
+		if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonRemap); n != 1 {
+			t.Fatalf("%d rebuilds for a burst of 4 mapping changes; want 1", n)
+		}
+		fresh := newCopy(t, d.open(t), id, testOptions())
+		fresh.start()
+		if dd := diff(v, viewOf(t, fresh.waitApplied(head)), true); dd != "" {
+			t.Fatalf("the debounced copy differs from a fresh one:\n%s", dd)
+		}
+		if !postingsHold(v, "brand", "d1") || !postingsHold(v, "color", "d1") ||
+			!strings.Contains(v.terms["num/size"], "d1=3") || !strings.Contains(v.terms["num/weight"], "d1=1") {
+			t.Fatalf("d1 is not indexed under every field the burst mapped: %v", v.terms)
+		}
+	})
+}

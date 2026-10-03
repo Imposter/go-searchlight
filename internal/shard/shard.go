@@ -320,9 +320,9 @@ type Shard struct {
 	merging  map[*segRef]bool
 	inflight int
 	// forceEligible is the running ForceMerge's segments (nil when none runs);
-	// forceMu runs ForceMerges one at a time.
+	// forceSem, a one-slot semaphore, runs ForceMerges one at a time.
 	forceEligible map[*segRef]bool
-	forceMu       sync.Mutex
+	forceSem      chan struct{}
 	mergeDone     chan struct{} // closed and replaced when a merge finishes
 	committed     atomic.Int64
 	// manifestBytes is the manifest's size, for the disk-size metric.
@@ -381,6 +381,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		buf:         newBuffer(),
 		merging:     map[*segRef]bool{},
 		mergeDone:   make(chan struct{}),
+		forceSem:    make(chan struct{}, 1),
 		waitCh:      make(chan struct{}),
 		refreshWake: make(chan struct{}, 1),
 		mergeWake:   make(chan struct{}, 1),

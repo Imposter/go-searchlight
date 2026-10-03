@@ -329,13 +329,19 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 	}
 	published, err := s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid)
 	if published && out != nil && s.forceEligible != nil {
-		// A merge of segments a ForceMerge is responsible for (a background merge in
-		// flight when it started, or its own) makes a segment it is responsible for.
+		// A merge of only segments a ForceMerge is responsible for (a background merge
+		// in flight when it started, whose inputs all existed then, or its own) makes a
+		// segment it is responsible for. One that also took a segment refreshed since
+		// does not: ForceMerge would otherwise keep adopting new writes.
+		all := true
 		for _, ref := range p.inputs {
-			if s.forceEligible[ref] {
-				s.forceEligible[out] = true
+			if !s.forceEligible[ref] {
+				all = false
 				break
 			}
+		}
+		if all {
+			s.forceEligible[out] = true
 		}
 	}
 	return published, err
@@ -367,8 +373,15 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	ctx, span := s.startSpan(ctx, "shard.force_merge", attribute.Int("max_segments", maxSegments))
 	defer span.End()
 	maxSegments = max(1, maxSegments)
-	s.forceMu.Lock()
-	defer s.forceMu.Unlock()
+	// One ForceMerge at a time; waiting for another ends with ctx or the shard.
+	select {
+	case s.forceSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.bg.Done():
+		return ErrClosed
+	}
+	defer func() { <-s.forceSem }()
 	// s.forceEligible: the segments ForceMerge is responsible for (see above), kept
 	// under commitMu so commitMerge adds every merge's output of them.
 	// rewritten: segments already rewritten for their deletes, never again.

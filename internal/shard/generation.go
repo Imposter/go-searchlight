@@ -232,8 +232,12 @@ func (g *Generation) retireAll() {
 	}
 }
 
-// Gen is the commit that published the generation; it grows with every refresh and
-// merge.
+// Gen identifies the generation's segment set: the commit that wrote the segments and
+// deletes it exposes. A refresh with nothing to write (a seq-only publish) reuses the
+// current Gen, so it does not grow on every refresh; it grows with each refresh that
+// writes a segment or deletes, each merge, and each lazy persist of a moved seq (which
+// commits the same segments under a new Gen). Two generations with the same Gen expose
+// the same segments and deletes.
 func (g *Generation) Gen() uint64 { return g.gen }
 
 // Seq is the changelog position the generation covers: every change with a seq at or

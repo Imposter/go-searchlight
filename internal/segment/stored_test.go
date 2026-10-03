@@ -3,6 +3,7 @@ package segment
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +17,9 @@ func TestCompressBlocksParallelEncoderFailureNoLeak(t *testing.T) {
 	errBoom := errors.New("no encoder for you")
 	orig := newBlockEncoder
 	newBlockEncoder = func() (*zstd.Encoder, error) { return nil, errBoom }
-	defer func() { newBlockEncoder = orig }()
+	origPool := blockEncoders
+	blockEncoders = &sync.Pool{} // no idle encoder to fall back on
+	defer func() { newBlockEncoder, blockEncoders = orig, origPool }()
 
 	payloads := make([]storedPayload, 64)
 	for i := range payloads {

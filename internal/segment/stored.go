@@ -60,8 +60,28 @@ const storedEntryLen = 8 + 4 + 4 + 4 + 4
 var ErrDocTooLarge = errors.New("segment: document exceeds MaxStoredBytes")
 
 // newBlockEncoder makes one stored-block compressor. A variable only so a test can make
-// it fail ([TestCompressBlocksParallelEncoderFailureNoLeak]).
-var newBlockEncoder = func() (*zstd.Encoder, error) { return zstd.NewWriter(nil) }
+// it fail ([TestCompressBlocksParallelEncoderFailureNoLeak]). Each compressing goroutine
+// uses its encoder for one block at a time (EncodeAll), so it needs only one of the
+// encoder's internal block encoders: the default, one per GOMAXPROCS, each with its own
+// match tables, made every Build allocate about 10 MiB per worker for nothing.
+var newBlockEncoder = func() (*zstd.Encoder, error) { return zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1)) }
+
+// blockEncoders keeps idle stored-block encoders between builds: a shard refreshes
+// every second, and an encoder's tables are worth reusing. A variable so a test can
+// start from an empty pool.
+var blockEncoders = &sync.Pool{}
+
+// getBlockEncoder returns an idle encoder, or a new one.
+func getBlockEncoder() (*zstd.Encoder, error) {
+	if enc, ok := blockEncoders.Get().(*zstd.Encoder); ok {
+		return enc, nil
+	}
+	return newBlockEncoder()
+}
+
+// putBlockEncoder returns enc to the pool. EncodeAll keeps no state between calls, so
+// the next user starts clean.
+func putBlockEncoder(enc *zstd.Encoder) { blockEncoders.Put(enc) }
 
 type storedBlockInfo struct {
 	off      uint64
@@ -134,11 +154,11 @@ func collectStoredPayloads(src storedSource) ([]storedPayload, error) {
 func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, error) {
 	compressed := make([][]byte, len(payloads))
 	if threads < 2 || len(payloads) < 2 {
-		enc, err := newBlockEncoder()
+		enc, err := getBlockEncoder()
 		if err != nil {
 			return nil, err
 		}
-		defer enc.Close()
+		defer putBlockEncoder(enc)
 		for i, p := range payloads {
 			compressed[i] = enc.EncodeAll(p.data, nil)
 		}
@@ -152,12 +172,12 @@ func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, er
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			enc, err := newBlockEncoder()
+			enc, err := getBlockEncoder()
 			if err != nil {
 				errs[t] = err
 				return
 			}
-			defer enc.Close()
+			defer putBlockEncoder(enc)
 			for {
 				i := int(next.Add(1) - 1)
 				if i >= len(payloads) {

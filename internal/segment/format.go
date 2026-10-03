@@ -1,0 +1,309 @@
+// Package segment is Searchlight's on-disk segment format: an immutable file of analyzed
+// documents, written once ([Build], [Merge]) and read through mmap ([Open]).
+//
+// A segment file is a header, a run of sections and a footer:
+//
+//	header   magic (8 bytes), format major (u16), format minor (u16), reserved (u32)
+//	TERMS    per (field, kind) term dictionaries, each one's postings interleaved with
+//	         its prefix-compressed term blocks, then its sparse block index
+//	DOCVALS  per field columns: numbers (frame-of-reference bit-packed), keyword
+//	         ordinals, multi-valued entry ordinals
+//	POINTS   per number field: (value, doc) sorted into blocks with min/max (BKD-lite)
+//	PRESENCE per field roaring bitmaps: present docs, and docs whose grams were truncated
+//	STORED   zstd blocks of about 16 KB holding each document's id and JSON body
+//	META     the field directory: names, types and where every structure starts
+//	footer   section table (kind, offset, length, CRC32C), section count, end magic,
+//	         CRC32C of every byte before it
+//
+// All integers are little-endian. [Open] verifies the whole-file checksum and refuses a
+// file whose major version it does not know.
+package segment
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math/bits"
+)
+
+// File format identification.
+const (
+	// FormatMajor is the segment format's major version. Open refuses any other major.
+	FormatMajor = 1
+	// FormatMinor is the segment format's minor version: additions an older reader of
+	// the same major can ignore.
+	FormatMinor = 0
+	// FileExt is a segment file's extension.
+	FileExt = ".seg"
+)
+
+// magic opens every segment file; the CR LF and SUB bytes catch text-mode mangling.
+var magic = [8]byte{'S', 'L', 'S', 'E', 'G', '\r', '\n', 0x1a}
+
+// endMagic closes every segment file, just before the file checksum.
+var endMagic = [8]byte{'S', 'L', 'S', 'E', 'G', 'E', 'N', 'D'}
+
+const (
+	headerSize = 16
+	// tailSize is the fixed end of the footer: section count, end magic, file CRC.
+	tailSize = 4 + 8 + 4
+	// sectionEntrySize is one section table entry: kind, offset, length, CRC.
+	sectionEntrySize = 4 + 8 + 8 + 4
+)
+
+// sectionKind names a section in the footer's table.
+type sectionKind uint32
+
+const (
+	sectionTerms sectionKind = iota + 1
+	sectionDocValues
+	sectionPoints
+	sectionPresence
+	sectionStored
+	sectionMeta
+)
+
+var sectionNames = map[sectionKind]string{
+	sectionTerms:     "terms",
+	sectionDocValues: "docvalues",
+	sectionPoints:    "points",
+	sectionPresence:  "presence",
+	sectionStored:    "stored",
+	sectionMeta:      "meta",
+}
+
+func (k sectionKind) String() string {
+	if name, ok := sectionNames[k]; ok {
+		return name
+	}
+	return fmt.Sprintf("section(%d)", uint32(k))
+}
+
+// sectionOrder is the order sections are written in.
+var sectionOrder = [...]sectionKind{
+	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionMeta,
+}
+
+// TermKind is which of a field's term dictionaries a term belongs to.
+type TermKind uint8
+
+// The term kinds.
+const (
+	// KindValue is a keyword or text field's whole normalized value, or a bool field's
+	// TermTrue or TermFalse.
+	KindValue TermKind = iota
+	// KindEntry is one entry of a keyword_list field.
+	KindEntry
+	// KindWord is one word of a text field.
+	KindWord
+	// KindGram is one 3-rune substring of a keyword or text field's value.
+	KindGram
+
+	numKinds = 4
+)
+
+// The KindValue terms of a bool field.
+const (
+	TermTrue  = "true"
+	TermFalse = "false"
+)
+
+var kindNames = [numKinds]string{"value", "entry", "word", "gram"}
+
+func (k TermKind) String() string {
+	if k < numKinds {
+		return kindNames[k]
+	}
+	return fmt.Sprintf("TermKind(%d)", uint8(k))
+}
+
+// Valid reports whether k is one of the term kinds.
+func (k TermKind) Valid() bool { return k < numKinds }
+
+// CorruptError is a segment file that fails its checksum or does not parse.
+type CorruptError struct {
+	Path    string
+	Section string // the damaged section, when one can be named
+	Reason  string
+}
+
+func (e *CorruptError) Error() string {
+	if e.Section != "" {
+		return fmt.Sprintf("segment %s: corrupt %s section: %s", e.Path, e.Section, e.Reason)
+	}
+	return fmt.Sprintf("segment %s: corrupt: %s", e.Path, e.Reason)
+}
+
+// VersionError is a segment file written by a format major this build does not read.
+type VersionError struct {
+	Path         string
+	Major, Minor uint16
+}
+
+func (e *VersionError) Error() string {
+	return fmt.Sprintf("segment %s: format %d.%d is not readable by format %d.%d",
+		e.Path, e.Major, e.Minor, FormatMajor, FormatMinor)
+}
+
+// errShort is a structure that runs past the end of its bytes.
+var errShort = errors.New("truncated structure")
+
+// bitsFor returns how many bits hold every value in [0, max].
+func bitsFor(maxValue uint64) uint8 {
+	return uint8(bits.Len64(maxValue)) //nolint:gosec // at most 64
+}
+
+// packedWidth rounds a bit width the single-load unpacker cannot read (57 to 63) up to 64.
+func packedWidth(b uint8) uint8 {
+	if b > 56 {
+		return 64
+	}
+	return b
+}
+
+// packedSize is the bytes n values of width b take, including the 8 bytes of padding
+// that let every read be one unaligned 8-byte load.
+func packedSize(n uint64, b uint8) uint64 {
+	return (n*uint64(b)+7)/8 + 8
+}
+
+// unpack returns value i of a bit-packed array of width b (0..56 or 64).
+func unpack(data []byte, i uint64, b uint8) uint64 {
+	switch b {
+	case 0:
+		return 0
+	case 64:
+		return binary.LittleEndian.Uint64(data[i*8:])
+	}
+	pos := i * uint64(b)
+	return binary.LittleEndian.Uint64(data[pos>>3:]) >> (pos & 7) & (1<<b - 1)
+}
+
+// packer bit-packs values of one width into a byteSink, LSB first.
+type packer struct {
+	out   byteSink
+	acc   uint64
+	nbits uint8
+	width uint8
+	buf   [8]byte
+}
+
+// byteSink is where packed bytes go: a section writer or an in-memory buffer.
+type byteSink interface {
+	writeByte(b byte)
+	write(p []byte)
+}
+
+func newPacker(out byteSink, width uint8) *packer {
+	return &packer{out: out, width: width}
+}
+
+func (p *packer) add(v uint64) {
+	switch p.width {
+	case 0:
+		return
+	case 64:
+		binary.LittleEndian.PutUint64(p.buf[:], v)
+		p.out.write(p.buf[:])
+		return
+	}
+	p.acc |= v << p.nbits
+	p.nbits += p.width
+	for p.nbits >= 8 {
+		p.out.writeByte(byte(p.acc)) //nolint:gosec // intentional truncation: packing one byte at a time
+		p.acc >>= 8
+		p.nbits -= 8
+	}
+}
+
+// finish flushes the last partial byte and the 8 bytes of read padding.
+func (p *packer) finish() {
+	if p.nbits > 0 {
+		p.out.writeByte(byte(p.acc)) //nolint:gosec // intentional truncation: packing the last partial byte
+		p.acc, p.nbits = 0, 0
+	}
+	p.out.write(make([]byte, 8))
+}
+
+// decoder reads the varints and fixed integers of a structure, remembering the first
+// overrun instead of panicking.
+type decoder struct {
+	b   []byte
+	pos int
+	err error
+}
+
+func (d *decoder) uvarint() uint64 {
+	if d.err != nil {
+		return 0
+	}
+	v, n := binary.Uvarint(d.b[d.pos:])
+	if n <= 0 {
+		d.err = errShort
+		return 0
+	}
+	d.pos += n
+	return v
+}
+
+func (d *decoder) u8() uint8 {
+	if d.err != nil || d.pos >= len(d.b) {
+		d.err = errShort
+		return 0
+	}
+	v := d.b[d.pos]
+	d.pos++
+	return v
+}
+
+func (d *decoder) u32() uint32 {
+	if d.err != nil || d.pos+4 > len(d.b) {
+		d.err = errShort
+		return 0
+	}
+	v := binary.LittleEndian.Uint32(d.b[d.pos:])
+	d.pos += 4
+	return v
+}
+
+func (d *decoder) u64() uint64 {
+	if d.err != nil || d.pos+8 > len(d.b) {
+		d.err = errShort
+		return 0
+	}
+	v := binary.LittleEndian.Uint64(d.b[d.pos:])
+	d.pos += 8
+	return v
+}
+
+func (d *decoder) bytes(n uint64) []byte {
+	if d.err != nil || d.pos > len(d.b) || n > uint64(len(d.b)-d.pos) { //nolint:gosec // d.pos <= len(d.b) is this type's invariant
+		d.err = errShort
+		return nil
+	}
+	v := d.b[d.pos : d.pos+int(n)] //nolint:gosec // n <= len(d.b)-d.pos, checked above
+	d.pos += int(n)                //nolint:gosec // n <= len(d.b)-d.pos, checked above
+	return v
+}
+
+// encoder appends varints and fixed integers to a byte slice.
+type encoder struct{ b []byte }
+
+func (e *encoder) uvarint(v uint64) { e.b = binary.AppendUvarint(e.b, v) }
+func (e *encoder) u8(v uint8)       { e.b = append(e.b, v) }
+func (e *encoder) u32(v uint32)     { e.b = binary.LittleEndian.AppendUint32(e.b, v) }
+func (e *encoder) u64(v uint64)     { e.b = binary.LittleEndian.AppendUint64(e.b, v) }
+func (e *encoder) bytes(p []byte) {
+	e.uvarint(uint64(len(p)))
+	e.b = append(e.b, p...)
+}
+
+// region is a byte range of the file: an absolute offset and a length.
+type region struct{ off, n uint64 }
+
+func (r region) slice(data []byte) ([]byte, bool) {
+	if r.off > uint64(len(data)) || r.n > uint64(len(data))-r.off {
+		return nil, false
+	}
+	return data[r.off : r.off+r.n], true
+}

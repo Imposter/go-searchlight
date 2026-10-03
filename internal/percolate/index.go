@@ -1073,7 +1073,7 @@ func (s *Segment) buildGramFilters() {
 // lookupGram is lookup of an AtomGram term of field f, through its prefilter.
 func (s *Segment) lookupGram(f *fieldInfo, field uint32, gram string) []byte {
 	h := hashTerm(AtomGram, field, gram)
-	if bit := hi32(h) & (gramFilterBits - 1); f.grams == nil || f.grams[bit>>6]&(1<<(bit&63)) == 0 {
+	if bit := hi32(h) & (gramFilterBits - 1); len(f.grams) == 0 || f.grams[bit>>6]&(1<<(bit&63)) == 0 {
 		return nil
 	}
 	return s.lookupHashed(AtomGram, field, gram, h)

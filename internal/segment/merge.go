@@ -62,7 +62,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 		}
 	}
 
-	names := unionFieldNames(parts)
+	names := liveFieldNames(parts)
 	name := genName()
 	path := filepath.Join(dir, name+FileExt)
 	threads := runtime.GOMAXPROCS(0)
@@ -74,6 +74,25 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 	}
 	meta.ID = name
 	return meta, nil
+}
+
+// liveFieldNames is [unionFieldNames] restricted to fields at least one live document
+// has. mergeGroup starts a builder for every field its readers know, so a field whose
+// every document was deleted still has one, but empty; a [Build] of the same live
+// documents never sees that field at all, so leaving it in would add a META entry (and
+// an empty presence bitmap) that a rebuild does not have.
+func liveFieldNames(parts []map[string]*fieldBuilder) []string {
+	names := unionFieldNames(parts)
+	live := names[:0]
+	for _, name := range names {
+		for _, m := range parts {
+			if b, ok := m[name]; ok && !b.presence.IsEmpty() {
+				live = append(live, name)
+				break
+			}
+		}
+	}
+	return live
 }
 
 // readerRange is a contiguous, half-open range of input-reader indices: one worker's

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -828,4 +829,165 @@ func TestEmptyTermSortsFirstAcrossParts(t *testing.T) {
 		defer r.Close()
 		checkEmptyTermSegment(t, r)
 	})
+}
+
+// sparseDocs builds n documents where every field is present only some of the time and
+// values deliberately include the edge cases a dense corpus never hits: "" keywords and
+// text, empty and blank-only lists, a field only one document has, and a field nothing
+// but deleted documents might have. Deterministic for a given n.
+func sparseDocs(t *testing.T, n int) []schema.Doc {
+	t.Helper()
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{
+		"title":   schema.Text,
+		"brand":   schema.Keyword,
+		"tags":    schema.KeywordList,
+		"price":   schema.Number,
+		"active":  schema.Bool,
+		"created": schema.Date,
+	}}
+	brands := []string{`""`, `"b"`, `"a"`, `"Ä"`, `" "`, `"zz"`}
+	titles := []string{`""`, `"x"`, `"red shoe"`, `"Straße"`, `"a  b"`}
+	tags := []string{`[]`, `[""]`, `"a, , b"`, `["b", "a"]`, `""`, `["only"]`}
+	state := uint64(12345)
+	next := func(k int) int {
+		state = state*6364136223846793005 + 1442695040888963407
+		return int((state >> 33) % uint64(k)) //nolint:gosec // k is a small positive pool size
+	}
+	docs := make([]schema.Doc, 0, n)
+	for i := range n {
+		var parts []string
+		if next(3) == 0 {
+			parts = append(parts, `"brand": `+brands[next(len(brands))])
+		}
+		if next(4) == 0 {
+			parts = append(parts, `"title": `+titles[next(len(titles))])
+		}
+		if next(3) == 0 {
+			parts = append(parts, `"tags": `+tags[next(len(tags))])
+		}
+		if next(5) == 0 {
+			parts = append(parts, fmt.Sprintf(`"price": %d.%d`, next(7)-3, next(10)))
+		}
+		if next(6) == 0 {
+			parts = append(parts, fmt.Sprintf(`"active": %t`, next(2) == 0))
+		}
+		if next(9) == 0 {
+			parts = append(parts, `"created": "2026-01-02T03:04:05Z"`)
+		}
+		if i == n/2 {
+			parts = append(parts, `"lonely": "one document has this"`)
+		}
+		body := "{" + strings.Join(parts, ", ") + "}"
+		docs = append(docs, mustAnalyze(t, m, fmt.Sprintf("s%d", i), body))
+	}
+	return docs
+}
+
+// identityCorpora is the corpus matrix N8 asks for: dense and sparse documents, the
+// Review Focus 1 edge cases, a single document, and none at all.
+func identityCorpora(t *testing.T) map[string][]schema.Doc {
+	t.Helper()
+	return map[string][]schema.Doc{
+		"dense":      genCorpus(300),
+		"sparse":     sparseDocs(t, 300),
+		"testDocs":   testDocs(t),
+		"emptyTerm":  emptyTermDocs(t),
+		"singleDoc":  sparseDocs(t, 1),
+		"singleDoc2": testDocs(t)[:1],
+		"noDocs":     nil,
+	}
+}
+
+func buildBytes(t *testing.T, dir, name string, docs []schema.Doc, threads int) []byte {
+	t.Helper()
+	meta, err := Build(dir, docs, BuildOptions{Name: name, Threads: threads})
+	if err != nil {
+		t.Fatalf("Build(%s, Threads: %d): %v", name, threads, err)
+	}
+	b, err := os.ReadFile(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestBuildThreadsByteIdenticalMatrix extends TestBuildThreadsByteIdentical over
+// identityCorpora and thread counts below, at, and far above the document count.
+func TestBuildThreadsByteIdenticalMatrix(t *testing.T) {
+	for name, docs := range identityCorpora(t) {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			want := buildBytes(t, dir, "t1", docs, 1)
+			for _, threads := range []int{0, 2, 5, 17, 64, 301} {
+				got := buildBytes(t, dir, fmt.Sprintf("t%d", threads), docs, threads)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("Threads: %d wrote different bytes than Threads: 1 (%d vs %d bytes)", threads, len(got), len(want))
+				}
+			}
+		})
+	}
+}
+
+// TestMergeByteIdenticalToRebuild is the merge half of N8: for every corpus, split into
+// several segment counts (one document per segment included), with and without deletes,
+// at several GOMAXPROCS values (Merge's own worker count), the merged file must be
+// byte-for-byte a fresh Build of the live documents in merge order.
+func TestMergeByteIdenticalToRebuild(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
+	for name, docs := range identityCorpora(t) {
+		t.Run(name, func(t *testing.T) {
+			for _, segs := range []int{1, 2, 5, 17} {
+				for _, withDeletes := range []bool{false, true} {
+					for _, procs := range []int{1, 3, 16} {
+						runtime.GOMAXPROCS(procs)
+						checkMergeEqualsRebuild(t, docs, segs, withDeletes)
+					}
+				}
+			}
+		})
+	}
+}
+
+func checkMergeEqualsRebuild(t *testing.T, docs []schema.Doc, segs int, withDeletes bool) {
+	t.Helper()
+	dir := t.TempDir()
+	ranges := splitRanges(uint32(len(docs)), segs) //nolint:gosec // test corpora are small
+	readers := make([]*Reader, 0, len(ranges))
+	deletes := make([]*roaring.Bitmap, 0, len(ranges))
+	var live []schema.Doc
+	for i, rg := range ranges {
+		part := docs[rg.start:rg.end]
+		meta, err := Build(dir, part, BuildOptions{Name: fmt.Sprintf("in%d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := Open(meta.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Close() })
+		readers = append(readers, r)
+		del := roaring.New()
+		for j := range part {
+			if withDeletes && (j+i)%3 == 0 {
+				del.Add(uint32(j)) //nolint:gosec // test corpora are small
+				continue
+			}
+			live = append(live, part[j])
+		}
+		deletes = append(deletes, del)
+	}
+	merged, err := Merge(dir, readers, deletes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(merged.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := buildBytes(t, dir, "rebuild", live, 1)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("%d segments, deletes %v, GOMAXPROCS %d: merge wrote %d bytes, a rebuild of the %d live docs %d bytes, and they differ",
+			segs, withDeletes, runtime.GOMAXPROCS(0), len(got), len(live), len(want))
+	}
 }

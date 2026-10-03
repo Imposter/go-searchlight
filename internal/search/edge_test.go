@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
 func mustParse(t testing.TB, raw string) query.Node {
@@ -282,3 +285,254 @@ func TestResultsMarshal(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// Lazy verification: candidates are verified only as the top hits and the total
+// need them, and the total stays exact up to TrackTotal, a lower bound past it.
+func TestLazyVerificationTotals(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 60 {
+		title := "abc bcd filler" // every gram of "abcd", never "abcd": a candidate only
+		if i < 20 {               // the matches come first, so counting reaches TrackTotal early
+			title = "xabcdx"
+		}
+		c.upsert(fmt.Sprintf("d%02d", i), fmt.Sprintf(`{"title":%q,"price":%d}`, title, i))
+	}
+	c.refreshAll()
+	countChunk = 3 // count in small steps, so stopping early is visible
+	defer func() { countChunk = 4096 }()
+	for _, tc := range []struct {
+		track    int
+		total    int64
+		relation string
+	}{
+		{20, 20, RelationEq},
+		{21, 20, RelationEq},
+		{19, 19, RelationGte},
+		{1, 1, RelationGte},
+		{TrackTotalAll, 20, RelationEq},
+		{0, 20, RelationEq},
+	} {
+		// A condition of its own each time, so the filter cache never serves it and
+		// every request verifies lazily.
+		q := mustParse(t, fmt.Sprintf(`{"field":"title","op":"contains_any","value":["abcd","unique-%d"]}`, tc.track))
+		resp, err := c.search(&Request{Query: q, Size: 3, Sort: []SortField{{Field: "price"}}, TrackTotal: tc.track})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Total != tc.total || resp.TotalRelation != tc.relation {
+			t.Errorf("track %d: total %d %s, want %d %s", tc.track, resp.Total, resp.TotalRelation, tc.total, tc.relation)
+		}
+		if ids := hitIDs(resp.Hits); !slices.Equal(ids, []string{"d00", "d01", "d02"}) {
+			t.Errorf("track %d: hits %q", tc.track, ids)
+		}
+	}
+	// No total: only what the top hits need is verified.
+	g := c.shards[0].Acquire()
+	defer g.Release()
+	// A condition no earlier request used, so the filter cache stays out of it.
+	fresh := mustParse(t, `{"field":"title","op":"contains_any","value":["abcd","lazy-test-unique"]}`)
+	res, err := ExecuteShard(context.Background(), g, &Request{Query: fresh, Size: 1, Sort: []SortField{{Field: "price", Desc: true}}, TrackTotal: TrackTotalNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Scanned >= 60 || res.TotalRelation != RelationGte || len(res.Hits) != 1 || res.Hits[0].ID != "d19" {
+		t.Errorf("track none: scanned %d, %d %s, hits %v", res.Scanned, res.Total, res.TotalRelation, hitIDs(res.Hits))
+	}
+	if r, ps := ParseRequest([]byte(`{"track_total": false}`)); len(ps) > 0 || r.TrackTotal != TrackTotalNone {
+		t.Errorf("track_total false: %v %v", r, ps)
+	}
+}
+
+// openShard opens one shard with mapping m (tests that change mappings).
+func openShard(t *testing.T, m *schema.Mapping) *shard.Shard {
+	t.Helper()
+	s, err := shard.Open(context.Background(), t.TempDir(), m, shard.Options{
+		RefreshInterval: -1, DisableMerges: true, Logger: quiet, FilterCache: shard.NewFilterCache(1<<20, nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	return s
+}
+
+func put(t *testing.T, s *shard.Shard, m *schema.Mapping, seq int64, id, body string) {
+	t.Helper()
+	d, _, err := schema.Analyze(m, id, []byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Apply(context.Background(), []shard.Change{{Seq: seq, Kind: shard.Upsert, Doc: &d}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func searchIDs(t *testing.T, s *shard.Shard, raw string) []string {
+	t.Helper()
+	g := s.Acquire()
+	defer g.Release()
+	res, err := ExecuteShard(context.Background(), g, &Request{Query: mustParse(t, raw), Size: 100, TrackTotal: TrackTotalAll})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hitIDs(res.Hits)
+}
+
+// A phrase's residual reads the document as it was indexed, whatever the mapping
+// has become: (B) a field the generation's mapping no longer holds (dynamic false),
+// (C) a strict mapping that now refuses another member of the body.
+func TestPhraseResidualIgnoresMappingDrift(t *testing.T) {
+	phrase := `{"field":"notes","op":"words_all","value":"red blue"}`
+	t.Run("dynamic false", func(t *testing.T) {
+		indexed := &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"notes": schema.Text}}
+		s := openShard(t, indexed)
+		put(t, s, indexed, 1, "a", `{"notes":"Red blue green"}`)
+		put(t, s, indexed, 2, "b", `{"notes":"blue red"}`)
+		s.SetMapping(&schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"other": schema.Text}})
+		put(t, s, indexed, 3, "c", `{"other":"x"}`) // a new generation, with the new mapping
+		if got := searchIDs(t, s, phrase); !slices.Equal(got, []string{"a"}) {
+			t.Fatalf("phrase: %q, want [a]", got)
+		}
+	})
+	t.Run("strict", func(t *testing.T) {
+		indexed := &schema.Mapping{Dynamic: schema.DynamicStrict, Fields: map[string]schema.FieldType{"notes": schema.Text, "extra": schema.Keyword}}
+		s := openShard(t, indexed)
+		put(t, s, indexed, 1, "a", `{"notes":"red blue","extra":"e"}`)
+		put(t, s, indexed, 2, "b", `{"notes":"red  , blue!","extra":"e"}`)
+		put(t, s, indexed, 3, "c", `{"notes":"blue red","extra":"e"}`)
+		s.SetMapping(&schema.Mapping{Dynamic: schema.DynamicStrict, Fields: map[string]schema.FieldType{"notes": schema.Text}})
+		put(t, s, indexed, 4, "d", `{"notes":"x"}`)
+		if got := searchIDs(t, s, phrase); !slices.Equal(got, []string{"a", "b"}) {
+			t.Fatalf("phrase: %q, want [a b]", got)
+		}
+	})
+}
+
+// Two words_* conditions that normalize alike but have different words are cached
+// apart: the second does not get the first's bitmap.
+func TestWordsCacheKeysKeepPhrases(t *testing.T) {
+	c := newCluster(t, 1)
+	c.upsert("ss", `{"title":"ss x"}`)
+	c.upsert("acute", `{"title":"s\u015b x"}`)
+	c.refreshAll()
+	for range 3 { // past the second sighting, so both are cached
+		checkQuery(t, c, `{"field":"title","op":"words_all","value":"\u00df\u0301 x"}`)
+		checkQuery(t, c, `{"field":"title","op":"words_all","value":"s\u015b x"}`)
+	}
+}
+
+func TestHistogramBucketLimit(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 3 {
+		c.upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"price":%d}`, i*int(1e6)))
+	}
+	c.refreshAll()
+	r := &Request{Query: &query.All{}, Aggs: map[string]Agg{"h": {Type: AggHistogram, Field: "price", Interval: 1}}}
+	resp, err := c.search(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := resp.Aggs["h"]; len(h.Buckets) != 3 || h.Truncated {
+		t.Fatalf("filling past MaxBuckets: %d buckets, truncated %v", len(h.Buckets), h.Truncated)
+	}
+	for i := range MaxBuckets + 1 {
+		c.upsert(fmt.Sprintf("e%d", i), fmt.Sprintf(`{"price":%d}`, i))
+	}
+	c.refreshAll()
+	var re *RequestError
+	if _, err := c.search(r); !errors.As(err, &re) {
+		t.Fatalf("more than MaxBuckets: %v, want a RequestError", err)
+	}
+}
+
+func TestNoBodiesThenFetch(t *testing.T) {
+	c := newCluster(t, 1)
+	c.upsert("a", `{"title":"one","price":1}`)
+	c.upsert("b", `{"title":"two","price":2}`)
+	c.refreshAll()
+	g := c.shards[0].Acquire()
+	defer g.Release()
+	res, err := ExecuteShard(context.Background(), g, &Request{Query: &query.All{}, Size: 2, NoBodies: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range res.Hits {
+		if h.Body != nil || h.Ref == nil {
+			t.Fatalf("query phase hit %+v", h)
+		}
+	}
+	if err := FetchShard(context.Background(), g, res.Hits, []string{"price"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(res.Hits[0].Body) + string(res.Hits[1].Body); got != `{"price":1}{"price":2}` {
+		t.Fatalf("fetched %s", got)
+	}
+	stale := []Hit{{ID: "a", Ref: &HitRef{Segment: "gone", Ord: 0}}}
+	if err := FetchShard(context.Background(), g, stale, nil); !errors.Is(err, ErrStaleHit) {
+		t.Fatalf("stale ref: %v", err)
+	}
+}
+
+func TestRunParallelRecoversPanics(t *testing.T) {
+	var ran atomic.Int64
+	err := runParallel(8, func(i int) {
+		ran.Add(1)
+		if i == 5 {
+			panic("boom")
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "boom") || ran.Load() != 8 {
+		t.Fatalf("err %v, ran %d", err, ran.Load())
+	}
+}
+
+func TestRankCacheDropsClosedSegments(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 20 {
+		c.upsert(fmt.Sprintf("d%02d", i), `{"price":1}`)
+	}
+	c.refreshAll()
+	g := c.shards[0].Acquire()
+	seg := g.Segments[0]
+	ranksFor(seg.ID, seg.Reader)
+	g.Release()
+	if rankCache.get(seg.ID) == nil {
+		t.Fatal("rank array not cached")
+	}
+	c.upsert("d99", `{"price":1}`)
+	c.refreshAll()
+	c.merge(0, 1) // the old segment is merged away and closed
+	g = c.shards[0].Acquire()
+	ranksFor(g.Segments[0].ID, g.Segments[0].Reader) // a put sweeps closed segments
+	g.Release()
+	deadline := time.Now().Add(5 * time.Second)
+	for rankCache.get(seg.ID) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("a closed segment's rank array is still cached")
+		}
+		time.Sleep(10 * time.Millisecond)
+		g = c.shards[0].Acquire()
+		rankCache.put("probe", g.Segments[0].Reader, nil)
+		g.Release()
+	}
+}
+
+func TestUsageCountsOncePerRequest(t *testing.T) {
+	var u usageSketch
+	for range 3 {
+		if u.seen("k", 1) {
+			t.Fatal("one request saw its own counts")
+		}
+	}
+	if !u.seen("k", 2) {
+		t.Fatal("a second request did not see the first")
+	}
+	u.halve()
+	u.halve()
+	if u.seen("k", 3) {
+		t.Fatal("halving did not fade the count")
+	}
+}

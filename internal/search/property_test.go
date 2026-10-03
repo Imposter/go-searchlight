@@ -55,7 +55,7 @@ func checkRandomSearch(t *testing.T, c *cluster, rng *rand.Rand, step int) {
 		Query:      q,
 		Sort:       sorts,
 		Size:       pick(rng, []int{0, 1, 3, 10, 1000}),
-		TrackTotal: pick(rng, []int{0, 1, 5, TrackTotalAll}),
+		TrackTotal: pick(rng, []int{0, 1, 5, TrackTotalAll, TrackTotalNone}),
 	}
 	want := brute(c.docs(), q, sorts)
 	got, err := c.search(r)
@@ -95,6 +95,11 @@ func checkTotal(t *testing.T, got *Response, n int64, trackTotal int, fail func(
 		track = DefaultTrackTotal
 	}
 	switch {
+	case trackTotal == TrackTotalNone:
+		// No total asked for: whatever is reported must be honest.
+		if got.Total > n || (got.TotalRelation == RelationEq && got.Total != n) {
+			fail("total %d %s with %d matched", got.Total, got.TotalRelation, n)
+		}
 	case track >= 0 && n > track:
 		if got.Total != track || got.TotalRelation != RelationGte {
 			fail("total %d %s, want %d gte (%d matched)", got.Total, got.TotalRelation, track, n)

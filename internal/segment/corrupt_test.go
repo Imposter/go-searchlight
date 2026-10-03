@@ -162,24 +162,76 @@ func TestDocTooLargeRefused(t *testing.T) {
 	}
 }
 
-// TestFormatOneRefused pins N2: a 1.x file - 1.0 (absolute offsets) or 1.1 (no stored
-// rawLen, points offsets from the wrong origin) - must be refused with a VersionError,
-// never parsed with the 2.x layout. The checksums are made valid, so only the version
-// check stands between such a file and a misread.
-func TestFormatOneRefused(t *testing.T) {
+// TestOlderFormatsRefused pins N2 and the 3.0 bump: a 1.x file (1.0 absolute offsets,
+// 1.1 no stored rawLen and points offsets from the wrong origin) or a 2.x file (no IDS
+// section, so no exact-id lookup) must be refused with a VersionError, never parsed
+// with the 3.x layout. The checksums are made valid, so only the version check stands
+// between such a file and a misread.
+func TestOlderFormatsRefused(t *testing.T) {
 	data := buildFile(t, testDocs(t))
-	if major, minor := binary.LittleEndian.Uint16(data[8:]), binary.LittleEndian.Uint16(data[10:]); major != 2 || minor != 0 {
-		t.Fatalf("Build wrote format %d.%d, want 2.0", major, minor)
+	if major, minor := binary.LittleEndian.Uint16(data[8:]), binary.LittleEndian.Uint16(data[10:]); major != 3 || minor != 0 {
+		t.Fatalf("Build wrote format %d.%d, want 3.0", major, minor)
 	}
-	for _, minor := range []uint16{0, 1, 7} {
-		old := append([]byte(nil), data...)
-		binary.LittleEndian.PutUint16(old[8:], 1)
-		binary.LittleEndian.PutUint16(old[10:], minor)
-		_, err := openCrafted(t, old)
-		var ve *VersionError
-		if !errors.As(err, &ve) || ve.Major != 1 || ve.Minor != minor {
-			t.Fatalf("Open of format 1.%d: err = %v (%T), want *VersionError{Major: 1, Minor: %d}", minor, err, err, minor)
+	for _, major := range []uint16{1, 2} {
+		for _, minor := range []uint16{0, 1, 7} {
+			old := append([]byte(nil), data...)
+			binary.LittleEndian.PutUint16(old[8:], major)
+			binary.LittleEndian.PutUint16(old[10:], minor)
+			_, err := openCrafted(t, old)
+			var ve *VersionError
+			if !errors.As(err, &ve) || ve.Major != major || ve.Minor != minor {
+				t.Fatalf("Open of format %d.%d: err = %v (%T), want *VersionError{Major: %d, Minor: %d}", major, minor, err, err, major, minor)
+			}
 		}
+	}
+}
+
+// idsTrailer returns the absolute position of the IDS section's trailer in data.
+func idsTrailer(t testing.TB, data []byte) uint64 {
+	t.Helper()
+	sec := layoutOf(t, data).sections[sectionIDs]
+	return sec.off + sec.n - 8
+}
+
+// TestIDsSectionDamageRefused: each way a checksum-valid IDS section can disagree with
+// the segment is refused at Open, naming the section.
+func TestIDsSectionDamageRefused(t *testing.T) {
+	cases := map[string]func(t *testing.T, data []byte){
+		"trailer past the section": func(t *testing.T, data []byte) {
+			binary.LittleEndian.PutUint64(data[idsTrailer(t, data):], 1<<40)
+		},
+		"no dictionary for documents": func(t *testing.T, data []byte) {
+			binary.LittleEndian.PutUint64(data[idsTrailer(t, data):], 0)
+		},
+		"term count differs from the documents": func(t *testing.T, data []byte) {
+			dict := openValid(t, data).ids
+			binary.LittleEndian.PutUint32(data[dict.base:], dict.numTerms-1)
+		},
+	}
+	for name, damage := range cases {
+		t.Run(name, func(t *testing.T) {
+			data := buildFile(t, testDocs(t))
+			damage(t, data)
+			_, err := openCrafted(t, data)
+			wantCorrupt(t, err, "ids")
+		})
+	}
+}
+
+// An inline ordinal past the segment's documents reads as no match, never as a
+// document the segment does not have.
+func TestIDsOrdinalOutOfRangeReadsAbsent(t *testing.T) {
+	r, err := openData("crafted", craftIDsOrdinal(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	id, err := r.ID(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ord, ok := r.Ord(id); ok {
+		t.Fatalf("Ord(%q) = %d, true for an ordinal past %d documents", id, ord, r.NumDocs())
 	}
 }
 

@@ -115,6 +115,10 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	}
 	numDocs := uint32(len(docs)) //nolint:gosec // checked above
 
+	ids, err := sortedIDs(numDocs, func(ord uint32) string { return docs[ord].ID })
+	if err != nil {
+		return Meta{}, err
+	}
 	ranges := splitRanges(numDocs, opts.Threads)
 	parts := buildPartsParallel(docs, ranges)
 	names := unionFieldNames(parts)
@@ -124,7 +128,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), opts.Threads, nil)
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -324,7 +328,7 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
 // writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
 // nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, threads int, throttle func(n int) error) (Meta, error) {
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -413,6 +417,10 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	if err != nil {
 		return Meta{}, err
 	}
+	w.endSection()
+
+	w.beginSection(sectionIDs)
+	writeIDs(w, ids)
 	w.endSection()
 
 	w.beginSection(sectionMeta)

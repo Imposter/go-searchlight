@@ -45,6 +45,7 @@ type Reader struct {
 	numDocs   uint32
 	fields    map[string]*fieldInfo
 	stored    storedIndex
+	ids       *termDict // the IDS section; nil for a segment with no documents
 	cache     *storedCache
 	ownsCache bool
 	closed    atomic.Bool
@@ -83,6 +84,9 @@ func openData(path string, data []byte) (*Reader, error) {
 		return nil, &CorruptError{Path: path, Section: "meta", Reason: "section runs outside the file"}
 	}
 	if err := r.parseMeta(metaBytes, footer); err != nil {
+		return nil, err
+	}
+	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
 	}
 	cache, err := newStoredCache()
@@ -383,30 +387,6 @@ func (r *Reader) storedRecord(ord uint32) (string, []byte, error) {
 	return r.cache.record(r.data, b, ord)
 }
 
-// Ord returns id's document ordinal, through the "_id" field's term dictionary. False
-// when no document has that id.
-func (r *Reader) Ord(id string) (uint32, bool) {
-	dict, info, ok := r.lookup(idFieldName, KindValue, id)
-	if !ok {
-		return 0, false
-	}
-	if info.docFreq == 1 {
-		return info.single, true
-	}
-	// Duplicate ids should never reach a segment; fall back to the first document,
-	// read as the bitmap's minimum rather than by listing every document it holds.
-	rb := dict.postings(info, r.numDocs)
-	if rb.IsEmpty() {
-		return 0, false
-	}
-	return rb.Minimum(), true
-}
-
-// idFieldName is the pseudo-field [schema.IDField] holds a document's id under. segment
-// does not import schema to avoid a dependency cycle risk; the name is fixed by
-// schema.Analyze.
-const idFieldName = "_id"
-
 // Retain returns a second handle on the same open segment, so it stays mapped even
 // after the original is Closed. The returned *Reader is independent: Close it when
 // done, separately from the one it was retained from.
@@ -429,6 +409,7 @@ func (r *Reader) Retain() *Reader {
 		numDocs: r.numDocs,
 		fields:  r.fields,
 		stored:  r.stored,
+		ids:     r.ids,
 	}
 	if cache, err := newStoredCache(); err == nil {
 		nr.cache = cache

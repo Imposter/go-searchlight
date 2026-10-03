@@ -1070,3 +1070,95 @@ func TestMergeOptions(t *testing.T) {
 		}
 	}
 }
+
+// Ord finds a document by its exact id, as given: ids that _id's normalization folds
+// together (case, ß, İ, runs of spaces) stay distinct, in a built and a merged segment.
+func TestExactIDs(t *testing.T) {
+	m := testMapping()
+	ids := []string{"SKU-1", "sku-1", "Sku-1", "Straße", "STRASSE", "strasse", "İstanbul", "i̇stanbul", "a  b", "a b", " a", "a", "ﬁle", "file"}
+	var docs []schema.Doc
+	for _, id := range ids {
+		docs = append(docs, mustAnalyze(t, m, id, `{"brand":"x"}`))
+	}
+	check := func(r *Reader, name string, want map[string]uint32) {
+		t.Helper()
+		for id, ord := range want {
+			got, ok := r.Ord(id)
+			if !ok || got != ord {
+				t.Fatalf("%s: Ord(%q) = %d, %v; want %d", name, id, got, ok, ord)
+			}
+			if back, err := r.ID(ord); err != nil || back != id {
+				t.Fatalf("%s: ID(%d) = %q, %v; want %q", name, ord, back, err, id)
+			}
+		}
+		for _, absent := range []string{"SKU-2", "sKU-1", "straße ", "", "a   b"} {
+			if ord, ok := r.Ord(absent); ok {
+				t.Fatalf("%s: Ord(%q) = %d for an id no document has", name, absent, ord)
+			}
+		}
+	}
+	built := mustBuild(t, docs)
+	want := map[string]uint32{}
+	for i, id := range ids {
+		want[id] = uint32(i)
+	}
+	check(built, "built", want)
+
+	// Merged with some deleted: the survivors keep exact lookups at their new ordinals.
+	dir := t.TempDir()
+	del := roaring.BitmapOf(1, 4, 9)
+	meta, err := Merge(dir, []*Reader{built}, []*roaring.Bitmap{del}, MergeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := Open(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer merged.Close()
+	want = map[string]uint32{}
+	next := uint32(0)
+	for i, id := range ids {
+		if !del.Contains(uint32(i)) {
+			want[id] = next
+			next++
+		}
+	}
+	check(merged, "merged", want)
+	for _, gone := range []string{"sku-1", "STRASSE", "a b"} {
+		if _, ok := merged.Ord(gone); ok {
+			t.Fatalf("merged: deleted %q still found", gone)
+		}
+	}
+	// An empty segment has no ids at all.
+	empty := mustBuild(t, nil)
+	if _, ok := empty.Ord("x"); ok {
+		t.Fatal("an empty segment found an id")
+	}
+}
+
+func TestDuplicateIDsRefused(t *testing.T) {
+	m := testMapping()
+	a := mustAnalyze(t, m, "same", `{"brand":"a"}`)
+	b := mustAnalyze(t, m, "same", `{"brand":"b"}`)
+	c := mustAnalyze(t, m, "Same", `{"brand":"c"}`) // a different exact id
+	dir := t.TempDir()
+	_, err := Build(dir, []schema.Doc{a, c, b}, BuildOptions{})
+	var de *DuplicateIDError
+	if !errors.As(err, &de) || de.ID != "same" {
+		t.Fatalf("Build with a duplicate id: %v, want a DuplicateIDError for %q", err, "same")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("a refused Build left %d files", len(entries))
+	}
+	// Two segments that each hold "same", merged with neither deleted.
+	r1 := mustBuild(t, []schema.Doc{a, c})
+	r2 := mustBuild(t, []schema.Doc{b})
+	if _, err := Merge(dir, []*Reader{r1, r2}, nil, MergeOptions{}); !errors.As(err, &de) || de.ID != "same" {
+		t.Fatalf("Merge of a duplicate id: %v", err)
+	}
+	// With one of the copies deleted, the merge is fine.
+	if _, err := Merge(dir, []*Reader{r1, r2}, []*roaring.Bitmap{roaring.BitmapOf(0)}, MergeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}

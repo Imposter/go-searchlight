@@ -139,7 +139,7 @@ func exerciseReader(r *Reader) {
 	_, _ = r.Ord("no-such-id")
 
 	retained := r.Retain()
-	consumeBitmap(retained.Present(idFieldName))
+	consumeBitmap(retained.Present("_id"))
 	_ = retained.Close()
 }
 
@@ -199,7 +199,31 @@ func craftedCases() []craftedCase {
 		{"point block outside the file", craftPointBlockOffset},
 		{"multi column offsets past its ordinals", craftMultiOffsets},
 		{"dictionary term count wraps uint32", craftDictTermCount},
+		{"ids ordinal past the documents", craftIDsOrdinal},
+		{"ids trailer outside the section", func(tb testing.TB) []byte {
+			data := buildFile(tb, testDocs(tb))
+			binary.LittleEndian.PutUint64(data[idsTrailer(tb, data):], math.MaxUint64)
+			fixChecksums(data)
+			return data
+		}},
 	}
+}
+
+// craftIDsOrdinal: the first id's inline ordinal is 200, past the segment's documents.
+func craftIDsOrdinal(tb testing.TB) []byte {
+	data := buildFile(tb, testDocs(tb))
+	dict := openValid(tb, data).ids
+	c := dict.cursor(0)
+	if _, _, ok := c.next(); !ok || c.entry.docFreq != 1 {
+		tb.Fatal("craftIDsOrdinal: no first id")
+	}
+	// The entry ends with its ordinal: a one-byte uvarint for these small segments.
+	if c.entry.single > 0x7f {
+		tb.Fatal("craftIDsOrdinal: the ordinal is not one byte")
+	}
+	data[c.d.pos-1] = 0x48 // 72: past testDocs' documents, still one byte
+	fixChecksums(data)
+	return data
 }
 
 // openValid opens a valid segment held in data, for locating the structure to damage.

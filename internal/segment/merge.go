@@ -80,6 +80,10 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 		}
 	}
 
+	ids, err := sortedIDs(total, func(ord uint32) string { return recs[ord].id })
+	if err != nil {
+		return Meta{}, err
+	}
 	names := liveFieldNames(parts)
 	name := opts.Name
 	if name == "" {
@@ -88,7 +92,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 	path := filepath.Join(dir, name+FileExt)
 	meta, err := writeSegmentParts(path, total, names, parts, storedFromSlice(func(ord uint32) (string, []byte) {
 		return recs[ord].id, recs[ord].body
-	}, total), threads, opts.Throttle)
+	}, total), ids, threads, opts.Throttle)
 	if err != nil {
 		return Meta{}, err
 	}

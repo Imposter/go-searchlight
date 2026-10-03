@@ -11,6 +11,10 @@
 //	POINTS   per number field: (value, doc) sorted into blocks with min/max (BKD-lite)
 //	PRESENCE per field roaring bitmaps: present docs, and docs whose grams were truncated
 //	STORED   zstd blocks of about 16 KB holding each document's id and JSON body
+//	IDS      the primary key: every document's exact id (as given, never normalized)
+//	         to its ordinal, a term dictionary whose terms each hold one ordinal
+//	         inline, then u64 (the dictionary's index offset in the section) + 1, or
+//	         0 for a segment with no documents
 //	META     the field directory: names, types and where every structure starts
 //	footer   section table (kind, offset, length, CRC32C), section count, end magic,
 //	         CRC32C of every byte before it
@@ -20,13 +24,16 @@
 //
 // # Versions
 //
-// Format 2.0 is the current layout. It is incompatible with 1.x, which is why it is a
-// major bump: 1.0 used absolute file offsets throughout, and 1.1 (section-relative
-// offsets, below) never recorded a stored block's uncompressed length and wrote point
-// block offsets relative to the wrong origin. Open refuses every major but
-// [FormatMajor] with a [VersionError], so a 1.x file - which this code would misread,
-// not merely fail to read - is refused outright, whatever its minor. A minor bump is
-// reserved for additions an older reader of the same major can safely ignore.
+// Format 3.0 is the current layout: 2.0 plus the IDS section. [Reader.Ord] finds a
+// document by its exact id there; 2.0 had only the _id field's dictionary, whose terms
+// are normalized ("SKU-1" and "sku-1" share one), so a 2.0 file cannot answer it and is
+// refused. 2.0 was incompatible with 1.x: 1.0 used absolute file offsets throughout,
+// and 1.1 (section-relative offsets, below) never recorded a stored block's
+// uncompressed length and wrote point block offsets relative to the wrong origin. Open
+// refuses every major but [FormatMajor] with a [VersionError], so an older file -
+// which this code would misread or could not serve, not merely fail to read - is
+// refused outright, whatever its minor. A minor bump is reserved for additions an
+// older reader of the same major can safely ignore.
 //
 // # Offsets, and why most of them are section-relative
 //
@@ -69,7 +76,7 @@ import (
 const (
 	// FormatMajor is the segment format's major version. Open refuses any other major,
 	// including every 1.x file (see the package doc comment's "Versions").
-	FormatMajor = 2
+	FormatMajor = 3
 	// FormatMinor is the segment format's minor version: additions an older reader of
 	// the same major can ignore.
 	FormatMinor = 0
@@ -101,6 +108,7 @@ const (
 	sectionPresence
 	sectionStored
 	sectionMeta
+	sectionIDs
 )
 
 var sectionNames = map[sectionKind]string{
@@ -110,6 +118,7 @@ var sectionNames = map[sectionKind]string{
 	sectionPresence:  "presence",
 	sectionStored:    "stored",
 	sectionMeta:      "meta",
+	sectionIDs:       "ids",
 }
 
 func (k sectionKind) String() string {
@@ -121,7 +130,7 @@ func (k sectionKind) String() string {
 
 // sectionOrder is the order sections are written in.
 var sectionOrder = [...]sectionKind{
-	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionMeta,
+	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionIDs, sectionMeta,
 }
 
 // TermKind is which of a field's term dictionaries a term belongs to.

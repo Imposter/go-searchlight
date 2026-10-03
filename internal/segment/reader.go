@@ -443,6 +443,10 @@ func (r *Reader) Retain() *Reader {
 	return nr
 }
 
+// Closed reports whether this handle has been closed: a cache keyed by the segment
+// can drop what it holds for it.
+func (r *Reader) Closed() bool { return r.closed.Load() }
+
 // Close unmaps the segment, once every handle from [Reader.Retain] (and the one Open
 // returned) has also been closed. Idempotent, and safe to call concurrently with any
 // other method.

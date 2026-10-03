@@ -99,4 +99,11 @@ func TestKeywordEachTerm(t *testing.T) {
 		t.Errorf("EachTerm(1): %q, want %q", got, want)
 	}
 	kc.EachTerm(kc.NumTerms(), func(uint32, []byte) bool { t.Error("past the last term"); return false })
+	if r.Closed() {
+		t.Error("open reader reports closed")
+	}
+	_ = r.Close()
+	if !r.Closed() {
+		t.Error("closed reader reports open")
+	}
 }

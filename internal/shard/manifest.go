@@ -1,0 +1,168 @@
+package shard
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"path/filepath"
+	"strconv"
+
+	"github.com/Imposter/go-searchlight/internal/segment"
+)
+
+// The manifest is the shard's commit point: the one file that says which segments, with
+// which deletes, make up the durable shard, and which changelog seq they cover.
+//
+// It is a header line, then JSON:
+//
+//	SLMANIFEST <format> <crc32c of the JSON, 8 hex digits> <JSON length>\n
+//	{"gen":7,"seq":1234,"max_seq":1230,"index_uid":"...",
+//	 "segments":[{"id":"9f..","docs":1000,"bytes":81234,"del_gen":7,"deleted":12}],
+//	 "query_segments":[{"id":"4c..","docs":10,"bytes":2048,"format":"default/1"}]}
+//
+// gen numbers every commit (refresh or merge), and names the deletes sidecars that
+// commit wrote (segment.WriteDeletes(dir, id, gen, ...)): a segment's live sidecar is
+// del_gen's, and none when del_gen is 0. seq is the changelog position the segments
+// cover (every change at or below it is in them, gaps included); max_seq is the newest
+// change they hold. Segments are listed in the order their base ordinals follow.
+//
+// It is replaced atomically: written to manifest.tmp, fsynced, renamed over manifest,
+// and the directory fsynced. A reader therefore sees the old manifest or the new one,
+// whole, and the checksum catches a torn or damaged one.
+
+const (
+	manifestName   = "manifest"
+	manifestFormat = 1
+	manifestMagic  = "SLMANIFEST"
+)
+
+type manifest struct {
+	Gen           uint64            `json:"gen"`
+	Seq           int64             `json:"seq"`
+	MaxSeq        int64             `json:"max_seq"`
+	IndexUID      string            `json:"index_uid,omitempty"`
+	Segments      []manifestSegment `json:"segments"`
+	QuerySegments []manifestSegment `json:"query_segments"`
+}
+
+type manifestSegment struct {
+	ID string `json:"id"`
+	// Docs is the segment's document (or query) ordinals, live and deleted.
+	Docs  uint32 `json:"docs"`
+	Bytes int64  `json:"bytes"`
+	// DelGen is the generation whose deletes sidecar is the segment's; 0: none.
+	DelGen uint64 `json:"del_gen,omitempty"`
+	// Deleted is that sidecar's cardinality, checked at Open.
+	Deleted uint32 `json:"deleted,omitempty"`
+	// Format is a query segment's QueryIndexBuilder format.
+	Format string `json:"format,omitempty"`
+}
+
+// ManifestError is a manifest that cannot be read: damaged, or of an unknown format.
+// The copy must be recovered.
+type ManifestError struct {
+	Path   string
+	Reason string
+}
+
+func (e *ManifestError) Error() string {
+	return fmt.Sprintf("shard manifest %s: %s", e.Path, e.Reason)
+}
+
+// readManifest reads dir's manifest; an empty manifest when there is none.
+func readManifest(dir string) (*manifest, error) {
+	path := filepath.Join(dir, manifestName)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &manifest{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("shard: %w", err)
+	}
+	bad := func(why string) error { return &ManifestError{Path: path, Reason: why} }
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		return nil, bad("no header")
+	}
+	fields := bytes.Fields(data[:nl])
+	if len(fields) != 4 || string(fields[0]) != manifestMagic {
+		return nil, bad("bad header")
+	}
+	format, err := strconv.Atoi(string(fields[1]))
+	if err != nil {
+		return nil, bad("bad format")
+	}
+	if format != manifestFormat {
+		return nil, bad(fmt.Sprintf("format %d is not %d", format, manifestFormat))
+	}
+	sum, err := strconv.ParseUint(string(fields[2]), 16, 32)
+	if err != nil {
+		return nil, bad("bad checksum field")
+	}
+	n, err := strconv.Atoi(string(fields[3]))
+	if err != nil {
+		return nil, bad("bad length field")
+	}
+	body := data[nl+1:]
+	if len(body) != n {
+		return nil, bad(fmt.Sprintf("body is %d bytes, header says %d", len(body), n))
+	}
+	if uint64(crc32.Checksum(body, castagnoli)) != sum {
+		return nil, bad("checksum mismatch")
+	}
+	var m manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, bad(err.Error())
+	}
+	return &m, nil
+}
+
+// encodeManifest returns m as the manifest file's bytes.
+func encodeManifest(m *manifest) ([]byte, error) {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	header := fmt.Sprintf("%s %d %08x %d\n", manifestMagic, manifestFormat, crc32.Checksum(body, castagnoli), len(body))
+	return append([]byte(header), body...), nil
+}
+
+// writeManifest replaces dir's manifest with m atomically. renamed reports whether the
+// new manifest was renamed into place (a failure after that, the directory fsync,
+// leaves the swap's durability unknown); hook is the shard's kill-point hook.
+func writeManifest(dir string, m *manifest, hook func(point string) error) (renamed bool, err error) {
+	data, err := encodeManifest(m)
+	if err != nil {
+		return false, err
+	}
+	path := filepath.Join(dir, manifestName)
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return false, err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return false, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
+	}
+	if err := hook(pointManifestWritten); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return false, err
+	}
+	if err := hook(pointManifestRenamed); err != nil {
+		return true, err
+	}
+	return true, segment.SyncDir(dir)
+}

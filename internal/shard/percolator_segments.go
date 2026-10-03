@@ -72,10 +72,11 @@ type QueryIndexBuilder interface {
 	// query can never fail a refresh. Build must not fail on a query Check accepted
 	// (I/O errors aside).
 	Check(q *StoredQuery) error
-	// Build writes queries as the query segment name in dir, durably (fsynced, and
-	// renamed into place if it renames), and returns the bytes it wrote. stats are the
-	// shard's document statistics, valid for the call only. A failed or cancelled Build
-	// may leave files behind: the shard removes them.
+	// Build writes queries as the query segment name in dir, each file fsynced (and
+	// renamed into place if it renames), and returns the bytes it wrote. It need not
+	// fsync the directory: the shard's commit does, once, after its manifest rename.
+	// stats are the shard's document statistics, valid for the call only. A failed or
+	// cancelled Build may leave files behind: the shard removes them.
 	Build(ctx context.Context, dir, name string, queries []StoredQuery, stats TermStats) (int64, error)
 	// Open opens the query segment name in dir.
 	Open(dir, name string) (QuerySegment, error)
@@ -327,8 +328,8 @@ func writeGroup(buf *bytes.Buffer, key string, children []query.Node) error {
 	return nil
 }
 
-// writeFileSync writes data to path durably: a temp file, fsynced, renamed into place,
-// and the directory fsynced.
+// writeFileSync writes data to path: a temp file, fsynced, renamed into place. The
+// directory is not fsynced: the shard's commit does that once, after the manifest.
 func writeFileSync(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -353,5 +354,5 @@ func writeFileSync(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return segment.SyncDir(filepath.Dir(path))
+	return nil
 }

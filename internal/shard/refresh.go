@@ -18,7 +18,6 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -31,9 +30,11 @@ import (
 // readers keep the old generation until they release it. A refresh with nothing new
 // is a no-op. When it fails before its commit, the buffer is put back, so the next
 // refresh retries it.
+//
+// A refresh whose buffer is empty, when only the changelog position moved ([Advance]),
+// publishes the new seq at once but does not write the manifest: CommittedSeq catches
+// up at the next commit, at most every Options.SeqPersistInterval, and at Close.
 func (s *Shard) Refresh(ctx context.Context) error {
-	ctx, span := s.tr.Start(ctx, "shard.refresh")
-	defer span.End()
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if err := s.usable(); err != nil {
@@ -47,15 +48,23 @@ func (s *Shard) Refresh(ctx context.Context) error {
 	s.mu.Lock()
 	fb := s.buf
 	seq, maxSeq, uid := s.applied, s.maxChange, s.indexUID
-	if fb.empty() && seq == cur.seq && uid == cur.uid {
+	if fb.empty() {
 		s.mu.Unlock()
+		if seq == cur.seq && uid == cur.uid {
+			return nil
+		}
+		ctx, span := s.startSpan(ctx, "shard.refresh", attribute.Int64("seq", seq), attribute.Bool("seq_only", true))
+		defer span.End()
+		s.publishSeq(ctx, seq, maxSeq, uid)
 		return nil
 	}
 	s.buf = newBuffer()
 	s.mu.Unlock()
 
+	ctx, span := s.startSpan(ctx, "shard.refresh",
+		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
+	defer span.End()
 	start := time.Now()
-	span.SetAttributes(attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	published, err := s.refresh(ctx, fb, seq, maxSeq, uid)
 	if err != nil {
 		if !published && !isCrash(err) {
@@ -66,6 +75,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		}
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "refresh failed")
+		s.inst.refreshFailures.Add(ctx, 1, s.inst.attrs)
 		return err
 	}
 	d := time.Since(start)
@@ -145,13 +155,15 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 
 // buildDocSegment writes docs as a new segment and opens it.
 func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef, error) {
-	_, span := s.tr.Start(ctx, "shard.build_segment", trace.WithAttributes(attribute.Int("documents", len(docs))))
+	_, span := s.startSpan(ctx, "shard.build_segment", attribute.Int("documents", len(docs)))
 	defer span.End()
 	name := newSegmentName()
 	// Each Build worker keeps its own per-term structures for its range of documents,
 	// so a small refresh split many ways mostly multiplies that overhead.
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
-	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads})
+	// No directory fsync here: the commit syncs the directory once, after the manifest
+	// rename, for every file it wrote (see commit).
+	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoDirSync: true})
 	if err != nil {
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, fmt.Errorf("shard: building a segment: %w", err)
@@ -182,7 +194,7 @@ func (s *Shard) openDocSegment(meta segment.Meta) (*segRef, error) {
 
 // buildQuerySegment writes queries as a new query segment and opens it.
 func (s *Shard) buildQuerySegment(ctx context.Context, queries []StoredQuery, stats TermStats) (*segRef, error) {
-	ctx, span := s.tr.Start(ctx, "shard.build_query_segment", trace.WithAttributes(attribute.Int("queries", len(queries))))
+	ctx, span := s.startSpan(ctx, "shard.build_query_segment", attribute.Int("queries", len(queries)))
 	defer span.End()
 	qi := s.opts.QueryIndex
 	name := newSegmentName()
@@ -258,6 +270,15 @@ func (s *Shard) mask(states []segState, ids []string) []segState {
 // reports whether the generation was published: a failure after the manifest was
 // renamed into place (its directory fsync) publishes anyway, since the manifest may
 // well be durable, and fails the shard.
+//
+// Syncs: every file a commit relies on (the segments and query segments built for it,
+// its sidecars, the manifest) is fsynced on its own when written, but renamed into
+// place with no directory fsync; the one directory fsync, after the manifest rename,
+// makes all of their names durable together. A journaling file system (ext4, XFS,
+// ZFS, NTFS) applies directory operations in order, so a manifest rename that
+// survives a crash comes with the renames before it. On one that does not, the worst
+// a crash at that moment leaves is a manifest naming a missing file, which Open
+// refuses (the copy recovers from a peer or the changelog), never a silent misread.
 func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []*segRef, seq, maxSeq int64, uid string) (published bool, err error) {
 	s.gen++
 	gen := s.gen // never reused, even if this commit fails
@@ -285,7 +306,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	sidecarErrs := make([]error, len(dirty))
 	parallel(len(dirty), sidecarWriters, func(i int) {
 		st := dirty[i]
-		sidecarErrs[i] = segment.WriteDeletes(s.dir, st.ref.id, gen, st.deletes)
+		sidecarErrs[i] = segment.WriteDeletes(s.dir, st.ref.id, gen, st.deletes, segment.DeletesOptions{NoDirSync: true})
 	})
 	for i, st := range dirty {
 		written = append(written, filepath.Join(s.dir, deletesName(st.ref.id, gen)))
@@ -329,6 +350,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	old := s.cur.Swap(g)
 	if !uncertain {
 		s.committed.Store(seq)
+		s.committedUID = uid
 	}
 	if old != nil {
 		old.Release()
@@ -339,6 +361,41 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
 	return true, err
+}
+
+// publishSeq publishes the current segments as covering seq: a refresh with nothing
+// to write. Nothing is written, so CommittedSeq stays where it was ([persistSeq]).
+func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string) {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	cur := s.cur.Load()
+	if cur == nil {
+		return
+	}
+	g := newGeneration(s, cur.gen, seq, maxSeq, uid, slices.Clone(cur.docs), slices.Clone(cur.queries))
+	s.cur.Store(g)
+	cur.Release()
+	s.notifyPublished()
+	s.recordGeneration(ctx, g)
+}
+
+// persistSeq commits the current generation when its seq (or index uid) is ahead of
+// the manifest's: the lazy half of a seq-only refresh.
+func (s *Shard) persistSeq(ctx context.Context) error {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	cur := s.cur.Load()
+	if cur == nil {
+		return ErrClosed
+	}
+	if err := s.Err(); err != nil {
+		return err
+	}
+	if cur.seq == s.committed.Load() && cur.uid == s.committedUID {
+		return nil
+	}
+	_, err := s.commit(ctx, slices.Clone(cur.docs), slices.Clone(cur.queries), nil, cur.seq, cur.maxSeq, cur.uid)
+	return err
 }
 
 func buildManifest(gen uint64, seq, maxSeq int64, uid string, docs, queries []segState) *manifest {

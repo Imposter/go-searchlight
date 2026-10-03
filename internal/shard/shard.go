@@ -165,6 +165,11 @@ type Options struct {
 	// (refresh_interval). 0 means one second; a negative value disables background
 	// refresh (Refresh still works).
 	RefreshInterval time.Duration
+	// SeqPersistInterval is how often a seq that moved with no new segment (a refresh
+	// of an empty buffer after Advance) is written to the manifest
+	// (seq_persist_interval). 0 means 30 seconds; negative means only at the next
+	// commit and at Close.
+	SeqPersistInterval time.Duration
 	// RefreshThreads bounds the goroutines a refresh's segment build uses; 0 means
 	// GOMAXPROCS. A refresh is on the write-to-visible path, so it is not budgeted.
 	RefreshThreads int
@@ -201,6 +206,7 @@ type Options struct {
 // Defaults.
 const (
 	DefaultRefreshInterval  = time.Second
+	DefaultSeqPersist       = 30 * time.Second
 	DefaultFlushBytes       = 64 << 20
 	DefaultDeleteRetry      = 5 * time.Second
 	DefaultFilterCacheBytes = 64 << 20
@@ -209,6 +215,9 @@ const (
 func (o *Options) resolve() {
 	if o.RefreshInterval == 0 {
 		o.RefreshInterval = DefaultRefreshInterval
+	}
+	if o.SeqPersistInterval == 0 {
+		o.SeqPersistInterval = DefaultSeqPersist
 	}
 	if o.RefreshThreads <= 0 {
 		o.RefreshThreads = runtime.GOMAXPROCS(0)
@@ -249,6 +258,8 @@ type Shard struct {
 	log  *slog.Logger
 	tr   trace.Tracer
 	inst *instruments
+	// spanAttrs label every span: the index and shard.
+	spanAttrs []attribute.KeyValue
 
 	mapping atomic.Pointer[schema.Mapping]
 
@@ -276,6 +287,8 @@ type Shard struct {
 	inflight  int
 	mergeDone chan struct{} // closed and replaced when a merge finishes
 	committed atomic.Int64
+	// committedUID is the manifest's index uid.
+	committedUID string
 
 	waitMu sync.Mutex
 	waitCh chan struct{} // closed and replaced at every publish
@@ -332,6 +345,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		closed:      make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
+	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
 	if m != nil {
 		s.mapping.Store(m)
@@ -358,6 +372,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s.applied = man.Seq
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
+	s.committedUID = man.IndexUID
 	s.committed.Store(man.Seq)
 	s.cur.Store(g)
 	s.recordGeneration(ctx, g)
@@ -372,6 +387,13 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		slog.String("dir", dir), slog.Int64("seq", man.Seq), slog.Int("segments", len(g.Segments)),
 		slog.Int("query_segments", len(g.QuerySegments)), slog.Uint64("documents", g.NumDocs()))
 	return s, nil
+}
+
+// startSpan starts a span labelled with the shard's index and shard, and attrs.
+func (s *Shard) startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	all := make([]attribute.KeyValue, 0, len(s.spanAttrs)+len(attrs))
+	all = append(append(all, s.spanAttrs...), attrs...)
+	return s.tr.Start(ctx, name, trace.WithAttributes(all...))
 }
 
 // Dir returns the shard's directory.
@@ -394,7 +416,8 @@ func (s *Shard) SetMapping(m *schema.Mapping) { s.mapping.Store(m) }
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change
 // with a seq at or below it is in the committed segments. After a crash, replay the
-// changelog from here.
+// changelog from here. It can trail RefreshedSeq: a refresh that only moved the seq is
+// persisted lazily (Options.SeqPersistInterval).
 func (s *Shard) CommittedSeq() int64 { return s.committed.Load() }
 
 // AppliedSeq returns the highest seq applied (or advanced to), refreshed or not.
@@ -447,7 +470,7 @@ func (s *Shard) usable() error {
 // (a document over segment.MaxStoredBytes, refused here so it can never fail a
 // refresh), [ErrSeqOrder], [ErrIndexUID] or [ErrInvalidChange].
 func (s *Shard) Apply(ctx context.Context, changes []Change) error {
-	ctx, span := s.tr.Start(ctx, "shard.apply", trace.WithAttributes(attribute.Int("changes", len(changes))))
+	ctx, span := s.startSpan(ctx, "shard.apply", attribute.Int("changes", len(changes)))
 	defer span.End()
 	buffered, err := s.apply(changes)
 	if err != nil {
@@ -637,7 +660,7 @@ func (s *Shard) notifyPublished() {
 // releases the shard's own reference on its generation. Generations readers still hold
 // stay valid until released; their segments are unmapped then. Close is idempotent.
 func (s *Shard) Close(ctx context.Context) error {
-	ctx, span := s.tr.Start(ctx, "shard.close")
+	ctx, span := s.startSpan(ctx, "shard.close")
 	defer span.End()
 	s.mu.Lock()
 	if s.closing {
@@ -650,6 +673,9 @@ func (s *Shard) Close(ctx context.Context) error {
 	var err error
 	if s.Err() == nil {
 		err = s.Refresh(ctx)
+		if err == nil {
+			err = s.persistSeq(ctx)
+		}
 	}
 	s.shutdown()
 	if err != nil {
@@ -695,16 +721,28 @@ func wake(ch chan struct{}) {
 
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
-	var tick <-chan time.Time
+	var tick, persist <-chan time.Time
 	if s.opts.RefreshInterval > 0 {
 		t := time.NewTicker(s.opts.RefreshInterval)
 		defer t.Stop()
 		tick = t.C
 	}
+	if s.opts.SeqPersistInterval > 0 {
+		t := time.NewTicker(s.opts.SeqPersistInterval)
+		defer t.Stop()
+		persist = t.C
+	}
 	for {
 		select {
 		case <-s.bg.Done():
 			return
+		case <-persist:
+			if s.Err() == nil {
+				if err := s.persistSeq(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
+					s.log.WarnContext(s.bg, "persisting the seq failed", slog.Any("error", err))
+				}
+			}
+			continue
 		case <-tick:
 		case <-s.refreshWake:
 		}

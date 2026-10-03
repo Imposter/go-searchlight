@@ -448,7 +448,7 @@ func TestDeletesSidecar(t *testing.T) {
 		t.Fatal("LoadDeletes before any write is not empty")
 	}
 	want := roaring.BitmapOf(1, 3, 5)
-	if err := WriteDeletes(dir, "seg1", 7, want); err != nil {
+	if err := WriteDeletes(dir, "seg1", 7, want, DeletesOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := LoadDeletes(dir, "seg1", 7)
@@ -1160,5 +1160,52 @@ func TestDuplicateIDsRefused(t *testing.T) {
 	// With one of the copies deleted, the merge is fine.
 	if _, err := Merge(dir, []*Reader{r1, r2}, []*roaring.Bitmap{roaring.BitmapOf(0)}, MergeOptions{}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// NoDirSync still fsyncs each file, but leaves the directory fsync to the caller.
+func TestNoDirSync(t *testing.T) {
+	docs := testDocs(t)
+	dir := t.TempDir()
+	count := func(f func()) SyncStats {
+		before := SyncCounts()
+		f()
+		after := SyncCounts()
+		return SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
+	}
+	var meta Meta
+	if got := count(func() {
+		var err error
+		if meta, err = Build(dir, docs, BuildOptions{NoDirSync: true}); err != nil {
+			t.Fatal(err)
+		}
+	}); got.Files < 1 || got.Dirs != 0 {
+		t.Fatalf("Build with NoDirSync: %+v syncs, want the file's and no directory's", got)
+	}
+	if got := count(func() {
+		if _, err := Build(dir, docs, BuildOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}); got.Files < 1 || got.Dirs != 1 {
+		t.Fatalf("Build: %+v syncs, want the file's and the directory's", got)
+	}
+	r, err := Open(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if got := count(func() {
+		if _, err := Merge(dir, []*Reader{r}, nil, MergeOptions{NoDirSync: true}); err != nil {
+			t.Fatal(err)
+		}
+	}); got.Files < 1 || got.Dirs != 0 {
+		t.Fatalf("Merge with NoDirSync: %+v syncs", got)
+	}
+	if got := count(func() {
+		if err := WriteDeletes(dir, meta.ID, 1, roaring.BitmapOf(1), DeletesOptions{NoDirSync: true}); err != nil {
+			t.Fatal(err)
+		}
+	}); got.Files != 1 || got.Dirs != 0 {
+		t.Fatalf("WriteDeletes with NoDirSync: %+v syncs", got)
 	}
 }

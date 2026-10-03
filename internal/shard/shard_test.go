@@ -354,8 +354,9 @@ func TestWaitRefreshedWithGaps(t *testing.T) {
 	if err := h.s.WaitRefreshed(ctx, 30); err != nil {
 		t.Fatal(err)
 	}
-	if h.s.CommittedSeq() != 30 {
-		t.Fatalf("CommittedSeq %d after Advance(30) and a refresh, want 30", h.s.CommittedSeq())
+	// A seq-only refresh is visible at once and persisted lazily (TestSeqOnlyRefresh).
+	if h.s.CommittedSeq() != 20 || h.s.RefreshedSeq() != 30 {
+		t.Fatalf("CommittedSeq %d RefreshedSeq %d after Advance(30) and a refresh, want 20 and 30", h.s.CommittedSeq(), h.s.RefreshedSeq())
 	}
 	g := h.s.Acquire()
 	if g.Seq() != 30 || g.MaxSeq() != 20 {

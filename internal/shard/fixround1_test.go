@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 // I1: a sidecar a crash left behind, which garbage collection could not remove at
@@ -249,4 +251,78 @@ func TestCloseWaitsForForceMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.s = nil
+}
+
+// syncsDuring returns the fsyncs f asked for.
+func syncsDuring(f func()) segment.SyncStats {
+	before := segment.SyncCounts()
+	f()
+	after := segment.SyncCounts()
+	return segment.SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
+}
+
+// I4: a refresh that only moves the seq publishes it with no fsync at all; the
+// manifest catches up at the next commit, every SeqPersistInterval, and at Close. A
+// refresh that writes a segment syncs each file it wrote and the directory once.
+func TestSeqOnlyRefresh(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.upsert("a")
+	h.refresh()
+	h.del("a") // a sidecar on the first segment, as well as the second segment
+	h.upsert("b")
+	if got := syncsDuring(h.refresh); got.Files != 3 || got.Dirs != 1 {
+		t.Fatalf("a refresh with a segment and a sidecar: %+v syncs, want 3 files (segment, sidecar, manifest) and 1 directory", got)
+	}
+	committed := h.s.CommittedSeq()
+	h.seq += 10
+	if err := h.s.Advance(h.seq); err != nil {
+		t.Fatal(err)
+	}
+	if got := syncsDuring(h.refresh); got.Files != 0 || got.Dirs != 0 {
+		t.Fatalf("a seq-only refresh: %+v syncs, want none", got)
+	}
+	if err := h.s.WaitRefreshed(context.Background(), h.seq); err != nil {
+		t.Fatal(err)
+	}
+	if h.s.CommittedSeq() != committed {
+		t.Fatalf("CommittedSeq %d, want %d until the seq is persisted", h.s.CommittedSeq(), committed)
+	}
+	h.snapshots[h.seq] = h.snapshots[committed]
+	h.check()
+	// The next commit persists it.
+	h.upsert("c")
+	h.refresh()
+	if h.s.CommittedSeq() != h.seq {
+		t.Fatalf("CommittedSeq %d after a commit, want %d", h.s.CommittedSeq(), h.seq)
+	}
+	// So does Close.
+	h.seq += 5
+	if err := h.s.Advance(h.seq); err != nil {
+		t.Fatal(err)
+	}
+	h.refresh()
+	h.reopen()
+	if h.s.CommittedSeq() != h.seq {
+		t.Fatalf("CommittedSeq %d after Close, want %d", h.s.CommittedSeq(), h.seq)
+	}
+	h.check()
+}
+
+// I4: in the background, a seq-only move is persisted within SeqPersistInterval.
+func TestSeqPersistedInTheBackground(t *testing.T) {
+	opts := testOptions()
+	opts.RefreshInterval = 5 * time.Millisecond
+	opts.SeqPersistInterval = 20 * time.Millisecond
+	h := newHarness(t, opts)
+	h.upsert("a")
+	if err := h.s.Advance(100); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for h.s.CommittedSeq() != 100 {
+		if time.Now().After(deadline) {
+			t.Fatalf("CommittedSeq %d, want 100 within the persist interval", h.s.CommittedSeq())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

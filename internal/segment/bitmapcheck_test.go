@@ -116,7 +116,7 @@ func TestCheckBitmapRefusesMalformed(t *testing.T) {
 // panics on first use.
 func TestLoadDeletesRefusesMalformedBitmap(t *testing.T) {
 	dir := t.TempDir()
-	if err := WriteDeletes(dir, "seg", 1, roaring.BitmapOf(3, 4, 5, 6, 7, 8)); err != nil {
+	if err := WriteDeletes(dir, "seg", 1, roaring.BitmapOf(3, 4, 5, 6, 7, 8), DeletesOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	path := deletesPath(dir, "seg", 1)

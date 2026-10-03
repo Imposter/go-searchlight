@@ -23,10 +23,16 @@ func deletesPath(segmentDir, segmentID string, gen uint64) string {
 	return filepath.Join(segmentDir, fmt.Sprintf("%s.%d%s", segmentID, gen, deletesExt))
 }
 
+// DeletesOptions configures [WriteDeletes].
+type DeletesOptions struct {
+	// NoDirSync is [BuildOptions.NoDirSync].
+	NoDirSync bool
+}
+
 // WriteDeletes writes segmentID's generation gen deletes bitmap to segmentDir, replacing
 // any sidecar already there for that generation. Write to a temp file, fsync, then
 // rename, as a segment file is.
-func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bitmap) error {
+func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bitmap, opts DeletesOptions) error {
 	path := deletesPath(segmentDir, segmentID, gen)
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -63,6 +69,9 @@ func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bit
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return err
+	}
+	if opts.NoDirSync {
+		return nil
 	}
 	return SyncDir(segmentDir)
 }

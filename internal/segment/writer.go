@@ -50,6 +50,11 @@ type BuildOptions struct {
 	// buffer is placed, which does not depend on how many fields were written
 	// concurrently. TestBuildThreadsByteIdentical checks this directly.
 	Threads int
+	// NoDirSync skips the directory fsync after the file is renamed into place: the
+	// file's own bytes are still fsynced, but the rename is durable only once the
+	// caller syncs the directory ([SyncDir]). A shard does that once per commit, for
+	// every file it wrote, instead of once per file.
+	NoDirSync bool
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -128,7 +133,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil)
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -327,8 +332,9 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 // writeFieldDicts and friends treat those identically, which is what makes the file
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
 // writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
-// nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error) (Meta, error) {
+// nil, is called before every chunk written to the file ([MergeOptions.Throttle]);
+// syncDir fsyncs the directory after the rename ([BuildOptions.NoDirSync]).
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -447,9 +453,12 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	}
 	// The rename is only durable once the directory entry itself is fsynced: without
 	// this, a crash can leave the directory pointing at the old file (or nothing),
-	// even though the new file's own bytes were already fsynced above.
-	if err := SyncDir(filepath.Dir(path)); err != nil {
-		return Meta{}, err
+	// even though the new file's own bytes were already fsynced above. A caller that
+	// syncs the directory itself, once for many files, skips this one.
+	if syncDir {
+		if err := SyncDir(filepath.Dir(path)); err != nil {
+			return Meta{}, err
+		}
 	}
 	return Meta{Path: path, NumDocs: numDocs}, nil
 }

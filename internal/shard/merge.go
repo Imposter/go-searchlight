@@ -11,7 +11,6 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -131,12 +130,13 @@ func (s *Shard) unreserve(p mergePlan) {
 // runMerge merges p's inputs and commits the result. p is reserved; runMerge releases it.
 func (s *Shard) runMerge(ctx context.Context, p mergePlan) (err error) {
 	defer s.unreserve(p)
-	ctx, span := s.tr.Start(ctx, "shard.merge", trace.WithAttributes(
-		attribute.String("kind", p.kind.String()), attribute.Int("segments", len(p.inputs))))
+	ctx, span := s.startSpan(ctx, "shard.merge",
+		attribute.String("kind", p.kind.String()), attribute.Int("segments", len(p.inputs)))
 	defer func() {
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, "merge failed")
+			s.inst.mergeFailures.Add(ctx, 1, s.inst.attrs)
 		}
 		span.End()
 	}()
@@ -241,8 +241,9 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 	var written int64
 	name := newSegmentName()
 	meta, err := segment.Merge(s.dir, readers, snap, segment.MergeOptions{
-		Name:    name,
-		Threads: threads,
+		Name:      name,
+		Threads:   threads,
+		NoDirSync: true, // the commit syncs the directory (see commit)
 		Throttle: func(n int) error {
 			written += int64(n)
 			return s.opts.MergeBudget.throttle(ctx, n)
@@ -338,7 +339,7 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	defer cancel()
 	defer context.AfterFunc(s.bg, cancel)() //nolint:contextcheck // s.bg (cancelled by shutdown) only cancels ctx, which stays derived from the caller's
 
-	ctx, span := s.tr.Start(ctx, "shard.force_merge", trace.WithAttributes(attribute.Int("max_segments", maxSegments)))
+	ctx, span := s.startSpan(ctx, "shard.force_merge", attribute.Int("max_segments", maxSegments))
 	defer span.End()
 	maxSegments = max(1, maxSegments)
 	for {

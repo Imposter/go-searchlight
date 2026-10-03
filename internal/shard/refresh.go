@@ -309,7 +309,11 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		sidecarErrs[i] = segment.WriteDeletes(s.dir, st.ref.id, gen, st.deletes, segment.DeletesOptions{NoDirSync: true})
 	})
 	for i, st := range dirty {
-		written = append(written, filepath.Join(s.dir, deletesName(st.ref.id, gen)))
+		path := filepath.Join(s.dir, deletesName(st.ref.id, gen))
+		written = append(written, path)
+		if info, err := os.Stat(path); err == nil {
+			st.delBytes = info.Size()
+		}
 		if st.delGen > 0 {
 			obsolete = append(obsolete, filepath.Join(s.dir, deletesName(st.ref.id, st.delGen)))
 		}
@@ -322,7 +326,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		return fail(err)
 	}
 	man := buildManifest(gen, seq, maxSeq, uid, docs, queries)
-	renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget)
+	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget)
 	if err != nil {
 		if !renamed {
 			return fail(fmt.Errorf("shard: writing the manifest: %w", err))
@@ -348,6 +352,7 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		}
 	}
 	old := s.cur.Swap(g)
+	s.manifestBytes.Store(manBytes)
 	if !uncertain {
 		s.committed.Store(seq)
 		s.committedUID = uid

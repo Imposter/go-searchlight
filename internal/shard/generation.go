@@ -2,6 +2,7 @@ package shard
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 
@@ -85,10 +86,11 @@ func (r *segRef) close() error {
 
 // segState is a segment as one generation sees it: with that generation's deletes.
 type segState struct {
-	ref     *segRef
-	deletes *roaring.Bitmap // owned and never changed once published; emptyDeletes when none
-	delGen  uint64          // the sidecar holding deletes; 0: none
-	dirty   bool            // deletes changed in the commit being prepared: write a sidecar
+	ref      *segRef
+	deletes  *roaring.Bitmap // owned and never changed once published; emptyDeletes when none
+	delGen   uint64          // the sidecar holding deletes; 0: none
+	delBytes int64           // that sidecar's size
+	dirty    bool            // deletes changed in the commit being prepared: write a sidecar
 }
 
 // emptyDeletes is the deletes of every segment with none. Read-only, like every deletes
@@ -368,5 +370,8 @@ func (s *Shard) loadDeletes(st *segState, ms manifestSegment) error {
 		return fmt.Errorf("shard: segment %s: a delete past its %d documents", ms.ID, st.ref.numDocs)
 	}
 	st.deletes, st.delGen = del, ms.DelGen
+	if info, err := os.Stat(filepath.Join(s.dir, deletesName(ms.ID, ms.DelGen))); err == nil {
+		st.delBytes = info.Size()
+	}
 	return nil
 }

@@ -136,37 +136,38 @@ func encodeManifest(m *manifest) ([]byte, error) {
 //
 // forget is called with manifest.tmp's path before it is written: garbage collection
 // may have left it pending removal.
-func writeManifest(dir string, m *manifest, hook func(point string) error, forget func(paths ...string)) (renamed bool, err error) {
+func writeManifest(dir string, m *manifest, hook func(point string) error, forget func(paths ...string)) (size int64, renamed bool, err error) {
 	data, err := encodeManifest(m)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
+	size = int64(len(data))
 	path := filepath.Join(dir, manifestName)
 	tmp := path + ".tmp"
 	forget(tmp)
 	f, err := os.Create(tmp)
 	if err != nil {
-		return false, err
+		return size, false, err
 	}
 	if _, err := f.Write(data); err != nil {
 		_ = f.Close()
-		return false, err
+		return size, false, err
 	}
 	if err := segment.SyncFile(f); err != nil {
 		_ = f.Close()
-		return false, err
+		return size, false, err
 	}
 	if err := f.Close(); err != nil {
-		return false, err
+		return size, false, err
 	}
 	if err := hook(pointManifestWritten); err != nil {
-		return false, err
+		return size, false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		return false, err
+		return size, false, err
 	}
 	if err := hook(pointManifestRenamed); err != nil {
-		return true, err
+		return size, true, err
 	}
-	return true, segment.SyncDir(dir)
+	return size, true, segment.SyncDir(dir)
 }

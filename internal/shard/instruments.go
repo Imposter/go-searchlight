@@ -26,6 +26,9 @@ type instruments struct {
 	bufferDocs      metric.Float64Gauge
 	documents       metric.Float64Gauge
 	diskBytes       metric.Float64Gauge
+	terms           metric.Float64Gauge
+	resident        metric.Float64ObservableGauge
+	residentCB      metric.Registration
 	changes         metric.Int64Counter
 
 	attrs     metric.MeasurementOption
@@ -50,6 +53,8 @@ func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logge
 		bufferDocs:      in.Gauge(telemetry.MetricShardBufferDocs),
 		documents:       in.Gauge(telemetry.MetricShardDocuments),
 		diskBytes:       in.Gauge(telemetry.MetricShardDiskSize),
+		terms:           in.Gauge(telemetry.MetricShardTerms),
+		resident:        in.ObservableGauge(telemetry.MetricShardMmapResident),
 		changes:         in.Counter(telemetry.MetricIndexChanges),
 		attrs:           metric.WithAttributeSet(attribute.NewSet(base...)),
 	}
@@ -93,16 +98,57 @@ func (i *instruments) recordBacklog(ctx context.Context, segments int) {
 	i.backlog.Record(ctx, float64(segments), i.attrs)
 }
 
-// recordGeneration records a newly published generation's size.
+// observeResident reports, at each collection, how much of the current generation's
+// segment mappings is resident in memory (where the platform can say).
+func (i *instruments) observeResident(meter metric.Meter, s *Shard) {
+	if meter == nil {
+		return
+	}
+	reg, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		g := s.Acquire()
+		if g == nil {
+			return nil
+		}
+		defer g.Release()
+		var total int64
+		for _, sv := range g.Segments {
+			n, err := sv.Reader.ResidentBytes()
+			if err != nil {
+				return nil // unsupported here, or closed: nothing to report
+			}
+			total += n
+		}
+		o.ObserveFloat64(i.resident, float64(total), i.attrs)
+		return nil
+	}, i.resident)
+	if err != nil {
+		s.log.Error("shard resident-memory metric unavailable", slog.Any("error", err))
+		return
+	}
+	i.residentCB = reg
+}
+
+// stop unregisters the shard's metric callbacks.
+func (i *instruments) stop() {
+	if i.residentCB != nil {
+		_ = i.residentCB.Unregister()
+	}
+}
+
+// recordGeneration records a newly published generation's size: its segments, their
+// deletes sidecars and the manifest on disk, and its terms.
 func (s *Shard) recordGeneration(ctx context.Context, g *Generation) {
-	var disk int64
+	disk := s.manifestBytes.Load()
+	var terms uint64
 	for i := range g.docs {
-		disk += g.docs[i].ref.bytes
+		disk += g.docs[i].ref.bytes + g.docs[i].delBytes
+		terms += g.docs[i].ref.reader.NumTerms()
 	}
 	for i := range g.queries {
-		disk += g.queries[i].ref.bytes
+		disk += g.queries[i].ref.bytes + g.queries[i].delBytes
 	}
 	s.inst.segments.Record(ctx, float64(len(g.docs)+len(g.queries)), s.inst.attrs)
 	s.inst.documents.Record(ctx, float64(g.numDocs), s.inst.attrs)
 	s.inst.diskBytes.Record(ctx, float64(disk), s.inst.attrs)
+	s.inst.terms.Record(ctx, float64(terms), s.inst.attrs)
 }

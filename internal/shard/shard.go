@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -287,6 +288,8 @@ type Shard struct {
 	inflight  int
 	mergeDone chan struct{} // closed and replaced when a merge finishes
 	committed atomic.Int64
+	// manifestBytes is the manifest's size, for the disk-size metric.
+	manifestBytes atomic.Int64
 	// committedUID is the manifest's index uid.
 	committedUID string
 
@@ -349,6 +352,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		shutdownDone: make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
+	s.inst.observeResident(opts.Meter, s)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
 	if m != nil {
@@ -378,6 +382,9 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s.indexUID = man.IndexUID
 	s.committedUID = man.IndexUID
 	s.committed.Store(man.Seq)
+	if info, err := os.Stat(filepath.Join(dir, manifestName)); err == nil {
+		s.manifestBytes.Store(info.Size())
+	}
 	s.cur.Store(g)
 	s.recordGeneration(ctx, g)
 
@@ -719,8 +726,29 @@ func (s *Shard) shutdown() {
 			g.Release()
 		}
 		s.jan.stop()
+		s.inst.stop()
 		close(s.shutdownDone)
 	})
+}
+
+// rateLimitedWarn lets a recurring failure be logged at most once per every, counting
+// the occurrences it held back.
+type rateLimitedWarn struct {
+	every      time.Duration
+	last       time.Time
+	suppressed int
+}
+
+// allow reports whether to log this occurrence and, if so, how many were held back
+// since the last one logged.
+func (w *rateLimitedWarn) allow() (suppressed int, ok bool) {
+	if now := time.Now(); now.Sub(w.last) >= w.every {
+		suppressed = w.suppressed
+		w.last, w.suppressed = now, 0
+		return suppressed, true
+	}
+	w.suppressed++
+	return 0, false
 }
 
 // wake signals ch without blocking.
@@ -733,6 +761,7 @@ func wake(ch chan struct{}) {
 
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
+	warn := rateLimitedWarn{every: time.Minute}
 	var tick, persist <-chan time.Time
 	if s.opts.RefreshInterval > 0 {
 		t := time.NewTicker(s.opts.RefreshInterval)
@@ -762,7 +791,9 @@ func (s *Shard) refreshLoop() {
 			continue // a failed shard stays as it is until it is reopened
 		}
 		if err := s.Refresh(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
-			s.log.WarnContext(s.bg, "background refresh failed", slog.Any("error", err))
+			if suppressed, ok := warn.allow(); ok {
+				s.log.WarnContext(s.bg, "background refresh failed", slog.Any("error", err), slog.Int("suppressed", suppressed))
+			}
 		}
 	}
 }

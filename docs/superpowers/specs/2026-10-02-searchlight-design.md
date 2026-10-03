@@ -151,8 +151,9 @@ The API is in the Elasticsearch style:
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /indexes` | List every index |
 | `PUT/GET/DELETE /indexes/{i}` | Create (with mapping and settings), inspect, drop an index |
-| `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` or the replica target |
+| `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` (applied at once, `-1` for on demand only) or the replica target |
 | `PUT/GET/DELETE /indexes/{i}/docs/{id}` | One document (`if_seq`, `refresh=true\|wait_for`) |
 | `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per request; `?percolate=true` also returns each upserted document's matching saved queries |
 | `POST /indexes/{i}/_search` | `{query, sort, size, search_after, track_total, aggs, fields, timeout}` |

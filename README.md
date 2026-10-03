@@ -62,7 +62,8 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `advertise_address` | from `listen` and the host name | the address peers use to reach this node |
 | `node_id` | host name | the node's name in the registry, logs and telemetry |
 | `data_dir` | `data` | local segments |
-| `tokens_file` | (none: API auth off) | API bearer tokens |
+| `tokens_file` | (none) | API bearer tokens, one per line: `<token>` (read-write) or `<token> read` (read-only); required unless `insecure_no_auth` |
+| `insecure_no_auth` | `false` | serve the API with no auth when `tokens_file` is empty (logged as a warning; never on a reachable node) |
 | `cluster_token` | (none) | auth for the internal peer API |
 | `refresh_interval` | `1s` | how often writes become searchable |
 | `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
@@ -74,6 +75,19 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `log_level` | `info` | `debug`, `info`, `warn` or `error` |
 | `pprof` | `false` | serve `/debug/pprof/*` on the admin listener |
 | `shutdown_timeout` | `30s` | how long a graceful shutdown may take |
+| `max_body_bytes` | `16MiB` | largest API request body (at most 32MiB less 1KiB, below a segment's largest document) |
+| `max_doc_bytes` | `4MiB` | largest document JSON, in a PUT or a `_bulk` line |
+| `max_bulk_ops` | `10000` | most operations in one `_bulk` request |
+| `request_timeout` | `30s` | deadline of every API request |
+| `read_timeout` | `1m` | how long reading a request's headers and body may take |
+| `search_queue` | `1000` | reads in progress at once before more get a 429 |
+| `max_inflight_write_bytes` | `512MiB` | heap the writes in progress may take (body bytes times `inflight_amplification`) before more get a 429 |
+| `max_inflight_read_bytes` | `256MiB` | the same for reads |
+| `inflight_amplification` | `8` | heap a request takes per byte of body at its peak: measured about 4.5 for a bulk, 8 for a bulk with `percolate=true` or a percolation (`BenchmarkBulkPeakHeap`) |
+| `max_index_fields` | `1000` | most fields one index's mapping holds (Elasticsearch's `index.mapping.total_fields.limit`) |
+| `drop_timeout` | `10m` | how long dropping an index from the store may take |
+| `shutdown_grace` | `2s` | how long the API keeps serving after readiness turns false at shutdown |
+| `tls_cert`, `tls_key` | (none) | serve the API over TLS; without them, put a TLS-terminating proxy in front |
 
 The binary stops gracefully on SIGINT or SIGTERM.
 

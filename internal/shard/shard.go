@@ -415,7 +415,9 @@ func (s *Shard) Err() error {
 
 func (s *Shard) fail(err error) {
 	wrapped := fmt.Errorf("%w: %w", ErrFailed, err)
-	s.failed.CompareAndSwap(nil, &wrapped)
+	if s.failed.CompareAndSwap(nil, &wrapped) {
+		s.notifyPublished() // a failed shard never refreshes: wake WaitRefreshed
+	}
 }
 
 // usable returns the error any write-side operation fails with now, or nil.
@@ -585,7 +587,7 @@ func (s *Shard) Acquire() *Generation {
 
 // WaitRefreshed blocks until a generation covering seq is published (the first refresh
 // whose applied seq is at or past seq; seq need not be one of this shard's changes),
-// ctx ends, or the shard closes.
+// ctx ends, or the shard closes or fails (it returns [ErrClosed] or the failure).
 func (s *Shard) WaitRefreshed(ctx context.Context, seq int64) error {
 	for {
 		s.waitMu.Lock()
@@ -597,6 +599,9 @@ func (s *Shard) WaitRefreshed(ctx context.Context, seq int64) error {
 		}
 		if g.seq >= seq {
 			return nil
+		}
+		if err := s.Err(); err != nil {
+			return err
 		}
 		select {
 		case <-ch:

@@ -86,6 +86,9 @@ func TestCrashAtKillPoints(t *testing.T) {
 			if !errors.Is(h.s.Err(), ErrFailed) {
 				t.Fatalf("Err() = %v after a crash", h.s.Err())
 			}
+			if err := h.s.WaitRefreshed(context.Background(), h.seq+1); !errors.Is(err, ErrFailed) {
+				t.Fatalf("WaitRefreshed on a failed shard = %v", err)
+			}
 			h.abandon()
 
 			h.opts.hooks = nil

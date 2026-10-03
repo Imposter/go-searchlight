@@ -257,7 +257,7 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 		g.Release()
 	}
 	lat := make([]time.Duration, 0, b.N)
-	var total int64
+	var total, verified int64
 	b.ResetTimer()
 	for range b.N {
 		r := next(rng)
@@ -271,6 +271,7 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 		resp := Reduce([]*ShardResult{res}, r)
 		lat = append(lat, time.Duration(nanotime()-start))
 		total += resp.Total
+		verified += res.Scanned
 	}
 	b.StopTimer()
 	slices.Sort(lat)
@@ -281,6 +282,7 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 	b.ReportMetric(pct(0.50), "p50-µs")
 	b.ReportMetric(pct(0.99), "p99-µs")
 	b.ReportMetric(float64(total)/float64(b.N), "total/op")
+	b.ReportMetric(float64(verified)/float64(b.N), "verified/op")
 }
 
 func leaf(field, op string, value any) *query.Leaf {
@@ -394,5 +396,31 @@ func BenchmarkTermsAggFiltered(b *testing.B) {
 		return &Request{Query: leaf("price", query.OpBetween, []float64{lo, lo + 300}), Aggs: map[string]Agg{
 			"brands": {Type: AggTerms, Field: "brand", Size: 10, Aggs: map[string]Agg{"p": {Type: AggStats, Field: "price"}}},
 		}}
+	})
+}
+
+// BenchmarkStartsWithShortPrefix: a prefix shared by many unique values (sku), from
+// every document to a few thousand.
+func BenchmarkStartsWithShortPrefix(b *testing.B) {
+	runBench(b, func(rng *rand.Rand) *Request {
+		p := pick(rng, []string{"s", "sku-0", "sku-00", fmt.Sprintf("sku-%03d", rng.IntN(1000))})
+		return &Request{Query: leaf("sku", query.OpStartsWith, p), Size: 10}
+	})
+}
+
+// BenchmarkContainsNoTotal: the cold contains, with track_total false: only what the
+// top hits need is verified.
+func BenchmarkContainsNoTotal(b *testing.B) {
+	_, c := openBench(b)
+	runBench(b, func(rng *rand.Rand) *Request {
+		needle := c.words[20+rng.IntN(2000)]
+		return &Request{Query: leaf("description", query.OpContains, needle), Size: 10, TrackTotal: TrackTotalNone}
+	})
+}
+
+// BenchmarkTermsAggUnique: a terms aggregation over a field of unique values (sku).
+func BenchmarkTermsAggUnique(b *testing.B) {
+	runBench(b, func(_ *rand.Rand) *Request {
+		return &Request{Query: &query.All{}, Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10}}}
 	})
 }

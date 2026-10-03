@@ -329,6 +329,9 @@ func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []
 		return fail(err)
 	}
 	man, err := buildManifest(gen, seq, maxSeq, uid, mp, docs, queries)
+	if err == nil && s.marksUntyped {
+		man.UntypedMarks = untypedMarksFormat
+	}
 	if err != nil {
 		return fail(err)
 	}

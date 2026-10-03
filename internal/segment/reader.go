@@ -74,7 +74,7 @@ func Open(path string) (*Reader, error) {
 	if !sliceOK {
 		return nil, &CorruptError{Path: path, Section: "meta", Reason: "section runs outside the file"}
 	}
-	if err := r.parseMeta(metaBytes); err != nil {
+	if err := r.parseMeta(metaBytes, footer); err != nil {
 		return nil, err
 	}
 	cache, err := newStoredCache()
@@ -87,8 +87,20 @@ func Open(path string) (*Reader, error) {
 	return r, nil
 }
 
-func (r *Reader) parseMeta(b []byte) error {
+// parseMeta reads the META section (b) and resolves every field's structures. Every
+// offset META stores is relative to the section it lands in (format.go's "Offsets, and
+// why most of them are section-relative"), so this is the one place that adds each
+// section's absolute start (from footer, the just-verified footer) - once per offset -
+// to get the absolute mmap position openDict/openKeywordColumn/.../openStoredIndex
+// each take.
+func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	corrupt := func() error { return &CorruptError{Path: r.path, Section: "meta", Reason: "truncated or malformed"} }
+	termsBase := footer.sections[sectionTerms].off
+	docValuesBase := footer.sections[sectionDocValues].off
+	pointsBase := footer.sections[sectionPoints].off
+	presenceBase := footer.sections[sectionPresence].off
+	storedBase := footer.sections[sectionStored].off
+
 	d := decoder{b: b}
 	r.numDocs = d.u32()
 	storedIndexOff := d.u64()
@@ -96,16 +108,36 @@ func (r *Reader) parseMeta(b []byte) error {
 	for range numFields {
 		name := string(d.bytes(d.uvarint()))
 		fi := &fieldInfo{}
-		fi.presRegion = region{off: d.u64(), n: d.u64()}
-		fi.truncRegion = region{off: d.u64(), n: d.u64()}
+		// Every offset read here (presOff/truncOff/dictOffs/keywordColOff/...) is
+		// stored as (section-relative offset) + 1, 0 meaning absent - see
+		// fieldOutput's doc comment in fields.go for why. Resolving one to the
+		// absolute mmap position openDict and friends take is "subtract the 1 back
+		// out, then add the section's own absolute start", in that order.
+		presOff, presLen := d.u64(), d.u64()
+		truncOff, truncLen := d.u64(), d.u64()
+		fi.presRegion = region{off: presenceBase + presOff - 1, n: presLen}
+		if truncLen > 0 {
+			fi.truncRegion = region{off: presenceBase + truncOff - 1, n: truncLen}
+		}
 		var dictOffs [numKinds]uint64
 		for k := range numKinds {
-			dictOffs[k] = d.u64()
+			if v := d.u64(); v != 0 {
+				dictOffs[k] = termsBase + v - 1
+			}
 		}
-		keywordColOff := d.u64()
-		multiColOff := d.u64()
-		numberColOff := d.u64()
-		pointsOff := d.u64()
+		var keywordColOff, multiColOff, numberColOff, pointsOff uint64
+		if v := d.u64(); v != 0 {
+			keywordColOff = docValuesBase + v - 1
+		}
+		if v := d.u64(); v != 0 {
+			multiColOff = docValuesBase + v - 1
+		}
+		if v := d.u64(); v != 0 {
+			numberColOff = docValuesBase + v - 1
+		}
+		if v := d.u64(); v != 0 {
+			pointsOff = pointsBase + v - 1
+		}
 		if d.err != nil {
 			return corrupt()
 		}
@@ -152,7 +184,7 @@ func (r *Reader) parseMeta(b []byte) error {
 	if d.err != nil {
 		return corrupt()
 	}
-	stored, err := openStoredIndex(r.data, storedIndexOff)
+	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase)
 	if err != nil {
 		return &CorruptError{Path: r.path, Section: "stored", Reason: err.Error()}
 	}

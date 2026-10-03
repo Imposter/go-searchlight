@@ -12,7 +12,8 @@ import (
 // inspecting them.
 //
 //	header  u32 numEntries, u32 numBlocks, u8 keyWidth, u8 docWidth
-//	table   per block: u64 minKey, u64 maxKey, u32 count, u64 blockOffset (absolute)
+//	table   per block: u64 minKey, u64 maxKey, u32 count, u64 blockOffset (relative to
+//	        this index's own start, like termDict's blockOffset - see termdict.go)
 //	blocks  per block: packed keys (count, keyWidth), packed docs (count, docWidth)
 const pointsBlockSize = 128
 
@@ -77,9 +78,14 @@ func writeSortedPoints(w *fileWriter, numDocs uint32, pairs []pointPair) uint64 
 	return off
 }
 
-// points reads a BKD-lite index in place.
+// points reads a BKD-lite index in place. Like termDict, blockRange's blockOffset is
+// relative to the index's own absolute start (base), so it can be built in its own
+// private buffer independently of every other field; Open resolves base once (openPoints)
+// and blockRange adds it, so every other reader of the position it returns needs no
+// further change.
 type points struct {
 	data       []byte
+	base       uint64 // this index's own absolute start in data
 	enc        numEncoding
 	numEntries uint32
 	numBlocks  uint32
@@ -93,7 +99,7 @@ func openPoints(data []byte, off uint64, enc numEncoding) (*points, error) {
 		return nil, errShort
 	}
 	d := decoder{b: data, pos: int(off)} //nolint:gosec // bounded by len(data)
-	p := &points{data: data, enc: enc}
+	p := &points{data: data, base: off, enc: enc}
 	p.numEntries = d.u32()
 	p.numBlocks = d.u32()
 	p.keyWidth = d.u8()
@@ -114,7 +120,7 @@ func openPoints(data []byte, off uint64, enc numEncoding) (*points, error) {
 
 func (p *points) blockRange(i uint32) (minKey, maxKey uint64, count uint32, off uint64) {
 	e := p.table[i*28:]
-	return binary.LittleEndian.Uint64(e), binary.LittleEndian.Uint64(e[8:]), binary.LittleEndian.Uint32(e[16:]), binary.LittleEndian.Uint64(e[20:])
+	return binary.LittleEndian.Uint64(e), binary.LittleEndian.Uint64(e[8:]), binary.LittleEndian.Uint32(e[16:]), p.base + binary.LittleEndian.Uint64(e[20:])
 }
 
 // inRange reports whether v is within [lo, hi], each bound inclusive per incLo/incHi.

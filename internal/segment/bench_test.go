@@ -257,3 +257,28 @@ func BenchmarkMerge(b *testing.B) {
 	elapsed := b.Elapsed().Seconds()
 	b.ReportMetric(float64(len(docs))*float64(b.N)/elapsed, "docs/s")
 }
+
+// BenchmarkBuildSweep reports Build's docs/s at a range of Threads values on the
+// realistic corpus, showing how throughput scales (or stops scaling) with workers.
+func BenchmarkBuildSweep(b *testing.B) {
+	for _, threads := range []int{1, 2, 4, 8, 16} {
+		b.Run(fmt.Sprintf("T%d", threads), func(b *testing.B) {
+			docs := genCorpus(20000)
+			dir := b.TempDir()
+			var lastPath string
+			b.ResetTimer()
+			for range b.N {
+				meta, err := Build(dir, docs, BuildOptions{Threads: threads})
+				if err != nil {
+					b.Fatal(err)
+				}
+				lastPath = meta.Path
+			}
+			elapsed := b.Elapsed().Seconds()
+			b.ReportMetric(float64(len(docs))*float64(b.N)/elapsed, "docs/s")
+			if info, err := os.Stat(lastPath); err == nil {
+				b.ReportMetric(float64(info.Size())/float64(len(docs)), "bytes/doc")
+			}
+		})
+	}
+}

@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"os"
+	"io"
 )
 
 // castagnoli is the CRC32C table; the standard library uses the CPU's CRC instructions.
@@ -20,10 +20,14 @@ type sectionEntry struct {
 	crc  uint32
 }
 
-// fileWriter streams a segment file: it tracks the offset, a CRC32C per section and one
-// over the whole file, and keeps the first error.
+// fileWriter streams a segment file - or, for a field's self-contained contribution to
+// a section (see format.go), a private in-memory buffer with its own offset starting
+// at 0 - tracking the running offset, a CRC32C per section and one over the whole
+// file, and keeping the first error. Any io.Writer works as the target: *os.File for
+// the real segment file, or a *bytes.Buffer for a private buffer that gets
+// concatenated into one later.
 type fileWriter struct {
-	f        *os.File
+	out      io.Writer
 	chunk    []byte
 	off      uint64 // bytes written, including those still in chunk
 	fileCRC  uint32
@@ -36,8 +40,8 @@ type fileWriter struct {
 
 const writeChunk = 256 << 10
 
-func newFileWriter(f *os.File) *fileWriter {
-	return &fileWriter{f: f, chunk: make([]byte, 0, writeChunk)}
+func newFileWriter(out io.Writer) *fileWriter {
+	return &fileWriter{out: out, chunk: make([]byte, 0, writeChunk)}
 }
 
 func (w *fileWriter) flush() {
@@ -47,7 +51,7 @@ func (w *fileWriter) flush() {
 	w.fileCRC = crc32.Update(w.fileCRC, castagnoli, w.chunk)
 	w.secCRC = crc32.Update(w.secCRC, castagnoli, w.chunk)
 	if w.err == nil {
-		_, w.err = w.f.Write(w.chunk)
+		_, w.err = w.out.Write(w.chunk)
 	}
 	w.chunk = w.chunk[:0]
 }

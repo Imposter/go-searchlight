@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -26,19 +27,27 @@ type BuildOptions struct {
 	// the name is retired (for example, a merge's inputs, which by the time Merge
 	// returns are no longer the live segment set).
 	Name string
-	// Threads is how many goroutines [Build] uses to accumulate documents into
-	// fields: 0 or 1 is sequential, one worker covering every document. A value
-	// above 1 splits the documents into that many contiguous ordinal ranges, one per
-	// worker, each building its own, independent fieldBuilder per field; the result
-	// is then merged per field - a k-way merge of each worker's already-sorted term
-	// dictionaries, and a concatenation, in range order, of its doc-values and
-	// presence data - into the single dictionary and columns the file holds. That
-	// merge, not the workers, is what the plan's "done when" build-throughput target
-	// is measured against ([BuildOptions.Threads] set to every core), and it is the
-	// same code for one worker as for many: the bytes Build writes are identical for
-	// any Threads value, because a range's own data does not depend on how many
-	// other ranges there are or what order they finish in, only on the (fixed, by
-	// construction) order the ranges themselves cover the documents in.
+	// Threads bounds how many goroutines Build uses, in two separate phases:
+	//
+	//  1. Accumulation: 0 or 1 is sequential, one worker covering every document. A
+	//     value above 1 splits the documents into that many contiguous ordinal
+	//     ranges, one per worker, each building its own, independent fieldBuilder
+	//     per field.
+	//  2. Writing: each section (terms, doc values, points, presence) merges and
+	//     writes every field's contribution in parallel, up to Threads workers -
+	//     made possible by every offset a field's structures bake in being relative
+	//     to that structure's own start (format.go), so one field's dictionary,
+	//     column or point index can be built, complete and self-contained, in its
+	//     own buffer independently of every other field's. Stored fields compress
+	//     their ~16 KB blocks in parallel the same way, then concatenate.
+	//
+	// Both phases produce identical bytes for any Threads value: accumulation merges
+	// ranges by a k-way merge of each worker's already-sorted term groups and a
+	// concatenation, in range order, of its doc-values and presence data, which does
+	// not depend on how many ranges there are; writing fixes up each field's section-
+	// relative offsets by the field's own position within the section once its
+	// buffer is placed, which does not depend on how many fields were written
+	// concurrently. TestBuildThreadsByteIdentical checks this directly.
 	Threads int
 }
 
@@ -114,7 +123,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs))
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), opts.Threads)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -248,13 +257,72 @@ func storedFromDocs(docs []schema.Doc) storedSource {
 	}
 }
 
+// runParallel calls work(i) for every i in [0, n), using up to threads goroutines (0
+// or 1: plain sequential loop, no goroutines spawned at all).
+func runParallel(n, threads int, work func(i int)) {
+	if threads < 2 || n < 2 {
+		for i := range n {
+			work(i)
+		}
+		return
+	}
+	if threads > n {
+		threads = n
+	}
+	idx := make(chan int)
+	var wg sync.WaitGroup
+	for range threads {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idx {
+				work(i)
+			}
+		}()
+	}
+	for i := range n {
+		idx <- i
+	}
+	close(idx)
+	wg.Wait()
+}
+
+// writeFieldSectionParallel writes one section's per-field contributions: writeOne(fw,
+// name) builds name's whole contribution into its own private buffer fw (offset
+// starting at 0, exactly as if it were the only field in the section), for every name
+// in names, up to threads of those running at once; the buffers are then written into
+// w, in field order (so the file is identical regardless of how many ran
+// concurrently), and fixup(name, fieldBase) is called for each, with fieldBase its
+// buffer's offset from the section's own start, to turn the 0-based offsets writeOne
+// left in that field's fieldOutput into offsets relative to the section (format.go).
+func writeFieldSectionParallel(w *fileWriter, names []string, threads int, writeOne func(fw *fileWriter, name string), fixup func(name string, fieldBase uint64)) {
+	sectionStart := w.off
+	bufs := make([][]byte, len(names))
+	runParallel(len(names), threads, func(i int) {
+		var buf bytes.Buffer
+		fw := newFileWriter(&buf)
+		writeOne(fw, names[i])
+		// fileWriter only flushes its internal chunk to its target when the chunk
+		// fills (or a section boundary asks for it) - neither of which a small
+		// private buffer ever hits on its own, so without this, buf stays empty.
+		fw.flush()
+		bufs[i] = buf.Bytes()
+	})
+	for i, name := range names {
+		fieldBase := w.off - sectionStart
+		w.write(bufs[i])
+		fixup(name, fieldBase)
+	}
+}
+
 // writeSegmentParts writes every section, merging parts (by field name, in names's
 // order, which must be sorted) and stored, to a fresh segment file at path. parts may
 // have any length: one (a sequential build, or any Merge with one effective worker)
 // or many (one per [BuildOptions.Threads] worker, or one per Merge reader group) -
 // writeFieldDicts and friends treat those identically, which is what makes the file
-// byte-for-byte the same either way.
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource) (Meta, error) {
+// byte-for-byte the same either way; so does threads, the degree of parallelism the
+// writing phase itself (as opposed to parts, accumulation's) uses.
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, threads int) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -278,43 +346,65 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	}
 
 	w.beginSection(sectionTerms)
-	for _, name := range names {
-		writeFieldDicts(w, partsFor(parts, name, empty), scratch[name])
-	}
+	writeFieldSectionParallel(w, names, threads,
+		func(fw *fileWriter, name string) { writeFieldDicts(fw, partsFor(parts, name, empty), scratch[name]) },
+		func(name string, fieldBase uint64) {
+			out := scratch[name].out
+			for k := range numKinds {
+				if out.dictOff[k] != 0 {
+					out.dictOff[k] += fieldBase
+				}
+			}
+		})
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
-	for _, name := range names {
-		writeFieldDocValues(w, partsFor(parts, name, empty), numDocs, scratch[name])
-	}
+	writeFieldSectionParallel(w, names, threads,
+		func(fw *fileWriter, name string) {
+			writeFieldDocValues(fw, partsFor(parts, name, empty), numDocs, scratch[name])
+		},
+		func(name string, fieldBase uint64) {
+			out := scratch[name].out
+			if out.keywordColOff != 0 {
+				out.keywordColOff += fieldBase
+			}
+			if out.multiColOff != 0 {
+				out.multiColOff += fieldBase
+			}
+			if out.numberColOff != 0 {
+				out.numberColOff += fieldBase
+			}
+		})
 	w.endSection()
 
 	w.beginSection(sectionPoints)
-	for _, name := range names {
-		writeFieldPoints(w, numDocs, scratch[name])
-	}
+	writeFieldSectionParallel(w, names, threads,
+		func(fw *fileWriter, name string) { writeFieldPoints(fw, numDocs, scratch[name]) },
+		func(name string, fieldBase uint64) {
+			out := scratch[name].out
+			if out.pointsOff != 0 {
+				out.pointsOff += fieldBase
+			}
+		})
 	w.endSection()
 
 	w.beginSection(sectionPresence)
-	for _, name := range names {
-		writeFieldPresence(w, partsFor(parts, name, empty), scratch[name].out)
-	}
+	writeFieldSectionParallel(w, names, threads,
+		func(fw *fileWriter, name string) {
+			writeFieldPresence(fw, partsFor(parts, name, empty), scratch[name].out)
+		},
+		func(name string, fieldBase uint64) {
+			out := scratch[name].out
+			out.presOff += fieldBase
+			if out.truncOff != 0 {
+				out.truncOff += fieldBase
+			}
+		})
 	w.endSection()
 
 	w.beginSection(sectionStored)
-	sw, err := newStoredWriter(w)
+	storedIndexOff, err := writeStoredParallel(w, stored, threads)
 	if err != nil {
-		return Meta{}, err
-	}
-	if err := stored(func(ord uint32, id string, body []byte) error {
-		sw.add(ord, id, body)
-		return nil
-	}); err != nil {
-		_ = sw.close()
-		return Meta{}, err
-	}
-	storedIndexOff := sw.finish()
-	if err := sw.close(); err != nil {
 		return Meta{}, err
 	}
 	w.endSection()

@@ -65,9 +65,10 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap) (Meta, error
 	names := unionFieldNames(parts)
 	name := genName()
 	path := filepath.Join(dir, name+FileExt)
+	threads := runtime.GOMAXPROCS(0)
 	meta, err := writeSegmentParts(path, total, names, parts, storedFromSlice(func(ord uint32) (string, []byte) {
 		return recs[ord].id, recs[ord].body
-	}, total))
+	}, total), threads)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -147,6 +148,10 @@ func mergeGroup(readers []*Reader, remaps [][]int32, recs []storedRec) (map[stri
 		builders[name] = newFieldBuilder()
 	}
 
+	// ordsScratch is reused across every mergeDoc call in this group for
+	// MultiColumn.Ords' dst, instead of each call allocating its own small slice.
+	var ordsScratch []uint32
+
 	for ri, r := range readers {
 		remap := remaps[ri]
 		views := fieldViewsFor(r, names)
@@ -165,7 +170,7 @@ func mergeGroup(readers []*Reader, remaps [][]int32, recs []storedRec) (map[stri
 				if fv == nil {
 					continue
 				}
-				mergeDoc(builders[name], fv, oldOrd, uint32(newOrd))
+				ordsScratch = mergeDoc(builders[name], fv, oldOrd, uint32(newOrd), ordsScratch)
 			}
 		}
 		for _, name := range names {
@@ -239,10 +244,13 @@ func fieldViewsFor(r *Reader, names []string) map[string]*fieldViews {
 
 // mergeDoc folds one reader's document oldOrd into b under its new ordinal, using the
 // per-document accessors doc values give (fast and exact), and bool bitmap membership
-// for the one kind, bool, that has no doc-values column.
-func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
+// for the one kind, bool, that has no doc-values column. ordsScratch is the caller's
+// reusable buffer for MultiColumn.Ords' dst (its capacity is kept and returned, so one
+// buffer can serve every document in a merge group instead of each call to this
+// function allocating its own); pass its current value in and keep the one returned.
+func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32, ordsScratch []uint32) []uint32 {
 	if !fv.presence.Contains(oldOrd) {
-		return
+		return ordsScratch
 	}
 	b.presence.Add(newOrd)
 	if fv.truncated != nil && fv.truncated.Contains(oldOrd) {
@@ -261,7 +269,8 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 		b.addValueTerm(newOrd, TermFalse)
 	}
 	if fi.multiCol != nil {
-		for _, o := range (MultiColumn{c: fi.multiCol}).Ords(oldOrd, nil) {
+		ordsScratch = (MultiColumn{c: fi.multiCol}).Ords(oldOrd, ordsScratch[:0])
+		for _, o := range ordsScratch {
 			b.addEntryTerm(newOrd, string(fi.dicts[KindEntry].termAt(nil, o)))
 		}
 	}
@@ -270,6 +279,7 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 			b.numDocs = append(b.numDocs, docFloat{doc: newOrd, v: v})
 		}
 	}
+	return ordsScratch
 }
 
 // mergeTermsOnly merges one kind that has no doc-values column (word, gram): term by

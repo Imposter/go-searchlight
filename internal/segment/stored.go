@@ -7,24 +7,25 @@ import (
 )
 
 // Stored fields are each document's id and original body, packed id-then-body
-// (uvarint length prefixes) into ~16 KB blocks and zstd-compressed one block at a time.
-// A block holds a contiguous run of document ordinals, so looking one up is a binary
-// search over block start ordinals, then one decompress and a short linear scan.
+// (uvarint length prefixes) into ~16 KB blocks and zstd-compressed. A block holds a
+// contiguous run of document ordinals, so looking one up is a binary search over
+// block start ordinals, then one decompress and a short linear scan. Blocks are
+// compressed in parallel (compressBlocksParallel) but always placed by one
+// sequential, already-ordered pass (writeStoredParallel): unlike a field's own
+// structures (format.go), there is only ever one of these per segment, not one per
+// field built independently in parallel, so there is no "self-contained in its own
+// buffer" requirement driving the offset scheme here. They are still relative to the
+// STORED section's own start, though (not plain absolute file offsets), for the same
+// reason every other section's internal offsets are: so relocating the section - as
+// Open never does on its own, but TestSectionOffsetsAreRelocatable does, standing in
+// for anything that might someday need to - does not break it.
 //
 //	index   u32 numBlocks, per block: u64 offset, u32 compressedLen, u32 firstOrd, u32 count
-//	blocks  compressed bytes, back to back (their offsets are absolute file offsets)
+//	blocks  compressed bytes, back to back (offsets relative to the STORED section's
+//	        own absolute start, which Reader.parseMeta resolves once)
 
 // storedBlockTarget is the uncompressed payload size a block is flushed at.
 const storedBlockTarget = 16 << 10
-
-type storedWriter struct {
-	w        *fileWriter
-	enc      *zstd.Encoder
-	payload  []byte
-	blocks   []storedBlockInfo
-	firstOrd uint32
-	count    uint32
-}
 
 type storedBlockInfo struct {
 	off      uint64
@@ -33,61 +34,145 @@ type storedBlockInfo struct {
 	count    uint32
 }
 
-func newStoredWriter(w *fileWriter) (*storedWriter, error) {
-	enc, err := zstd.NewWriter(nil)
+// storedPayload is one block's raw (not yet compressed) bytes, collected by
+// collectStoredPayloads and compressed by compressBlocksParallel - split out as its
+// own step so compression, the expensive part, can run in parallel across blocks,
+// while collecting (just concatenating each document's id and body) and placing (just
+// writing already-compressed bytes one after another) stay simple, sequential passes.
+type storedPayload struct {
+	firstOrd uint32
+	count    uint32
+	data     []byte
+}
+
+// collectStoredPayloads runs src, splitting every live document's id and body into
+// ~16 KB raw payload blocks, in ascending ordinal order.
+func collectStoredPayloads(src storedSource) ([]storedPayload, error) {
+	var payloads []storedPayload
+	var cur []byte
+	var firstOrd, count uint32
+	flush := func() {
+		if count == 0 {
+			return
+		}
+		payloads = append(payloads, storedPayload{firstOrd: firstOrd, count: count, data: cur})
+		cur, count = nil, 0
+	}
+	err := src(func(ord uint32, id string, body []byte) error {
+		if count == 0 {
+			firstOrd = ord
+		}
+		var e encoder
+		e.bytes([]byte(id))
+		e.bytes(body)
+		cur = append(cur, e.b...)
+		count++
+		if len(cur) >= storedBlockTarget {
+			flush()
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &storedWriter{w: w, enc: enc}, nil
+	flush()
+	return payloads, nil
 }
 
-// add appends document ord's id and body; ords must ascend.
-func (s *storedWriter) add(ord uint32, id string, body []byte) {
-	if s.count == 0 {
-		s.firstOrd = ord
+// compressBlocksParallel zstd-compresses every payload, in payloads' order's result
+// slot but not necessarily order of completion, using up to threads goroutines, each
+// with its own encoder reused across every block it is given (rather than one encoder
+// per block, or one shared encoder guarded by a lock).
+func compressBlocksParallel(payloads []storedPayload, threads int) ([][]byte, error) {
+	compressed := make([][]byte, len(payloads))
+	if threads < 2 || len(payloads) < 2 {
+		enc, err := zstd.NewWriter(nil)
+		if err != nil {
+			return nil, err
+		}
+		defer enc.Close()
+		for i, p := range payloads {
+			compressed[i] = enc.EncodeAll(p.data, nil)
+		}
+		return compressed, nil
 	}
-	var e encoder
-	e.bytes([]byte(id))
-	e.bytes(body)
-	s.payload = append(s.payload, e.b...)
-	s.count++
-	if len(s.payload) >= storedBlockTarget {
-		s.flush()
+	if threads > len(payloads) {
+		threads = len(payloads)
 	}
+	idx := make(chan int)
+	errCh := make(chan error, threads)
+	var wg sync.WaitGroup
+	for range threads {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			enc, err := zstd.NewWriter(nil)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			defer enc.Close()
+			for i := range idx {
+				compressed[i] = enc.EncodeAll(payloads[i].data, nil)
+			}
+		}()
+	}
+	go func() {
+		for i := range payloads {
+			idx <- i
+		}
+		close(idx)
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return nil, err
+		}
+	}
+	return compressed, nil
 }
 
-func (s *storedWriter) flush() {
-	if s.count == 0 {
-		return
+// writeStoredParallel collects src's documents into blocks, compresses them in
+// parallel (compressBlocksParallel) and writes the compressed blocks and the block
+// table into w, returning the table's offset. Unlike a field's structures (format.go),
+// stored blocks are not written per field and are always placed by one continuous,
+// already-sequential pass here, so their offsets stay plain absolute positions - only
+// compressing them has anything to parallelize.
+func writeStoredParallel(w *fileWriter, src storedSource, threads int) (uint64, error) {
+	// sectionStart: w.off is already at the STORED section's own absolute start
+	// (writeSegmentParts calls this right after beginSection(sectionStored)), so
+	// every offset recorded below, relative to it, is relative to the section - the
+	// same scheme format.go documents for a field's own structures, just with one
+	// shared section start instead of one private buffer per field.
+	sectionStart := w.off
+	payloads, err := collectStoredPayloads(src)
+	if err != nil {
+		return 0, err
 	}
-	compressed := s.enc.EncodeAll(s.payload, nil)
-	off := s.w.off
-	s.w.write(compressed)
-	s.blocks = append(s.blocks, storedBlockInfo{
-		off: off, clen: uint32(len(compressed)), firstOrd: s.firstOrd, count: s.count, //nolint:gosec // segment files stay far below 4 GiB
-	})
-	s.payload = s.payload[:0]
-	s.count = 0
-}
-
-// finish flushes the last block, writes the index and returns its offset. The caller
-// must also Close the encoder.
-func (s *storedWriter) finish() uint64 {
-	s.flush()
-	off := s.w.off
+	compressed, err := compressBlocksParallel(payloads, threads)
+	if err != nil {
+		return 0, err
+	}
 	var h encoder
-	h.u32(uint32(len(s.blocks))) //nolint:gosec // a segment holds far fewer than 4 billion blocks
-	for _, b := range s.blocks {
-		h.u64(b.off)
-		h.u32(b.clen)
-		h.u32(b.firstOrd)
-		h.u32(b.count)
+	h.u32(uint32(len(payloads))) //nolint:gosec // a segment holds far fewer than 4 billion blocks
+	for i, p := range payloads {
+		blockOff := w.off - sectionStart
+		w.write(compressed[i])
+		h.u64(blockOff)
+		h.u32(uint32(len(compressed[i]))) //nolint:gosec // one compressed block stays far below 4 GiB
+		h.u32(p.firstOrd)
+		h.u32(p.count)
 	}
-	s.w.write(h.b)
-	return off
+	// The table's own offset, returned to the caller for META: captured only now,
+	// after every block above has actually been written, so it correctly points
+	// past them, at the table itself - not before them, where it would read the
+	// first block's bytes as if they were the table. Relative to sectionStart, like
+	// the block offsets above.
+	off := w.off - sectionStart
+	w.write(h.b)
+	return off, nil
 }
-
-func (s *storedWriter) close() error { return s.enc.Close() }
 
 // storedIndex is the parsed block table, read in place.
 type storedIndex struct {
@@ -95,7 +180,12 @@ type storedIndex struct {
 	blocks []storedBlockInfo
 }
 
-func openStoredIndex(data []byte, off uint64) (storedIndex, error) {
+// openStoredIndex parses the block table at the absolute position off (base +
+// META's section-relative storedIndexOff), materializing each block's own offset
+// (also stored relative to base) as an absolute position immediately, once, here -
+// so every other reader of a storedBlockInfo.off (blockFor, storedCache.record) needs
+// no further change.
+func openStoredIndex(data []byte, off, base uint64) (storedIndex, error) {
 	if off > uint64(len(data)) {
 		return storedIndex{}, errShort
 	}
@@ -103,7 +193,7 @@ func openStoredIndex(data []byte, off uint64) (storedIndex, error) {
 	n := d.u32()
 	blocks := make([]storedBlockInfo, n)
 	for i := range blocks {
-		blocks[i] = storedBlockInfo{off: d.u64(), clen: d.u32(), firstOrd: d.u32(), count: d.u32()}
+		blocks[i] = storedBlockInfo{off: base + d.u64(), clen: d.u32(), firstOrd: d.u32(), count: d.u32()}
 	}
 	if d.err != nil {
 		return storedIndex{}, d.err

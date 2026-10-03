@@ -12,17 +12,34 @@ import (
 //
 //	[postings of block 0][block 0][postings of block 1][block 1] ... [index]
 //
-//	block  uvarint postingsBase (absolute offset of the block's first postings)
+//	block  uvarint postingsLen (this block's postings' byte length, so its postings
+//	       start postingsLen bytes before the block itself - see below)
 //	       then per term: uvarint shared prefix (with the previous term in the block),
 //	       uvarint suffix length, suffix, uvarint docFreq, and either uvarint doc
 //	       (docFreq 1, the postings inline) or uvarint postings length (laid out
-//	       back to back from postingsBase)
-//	index  u32 numTerms, u32 numBlocks, u64 sumDocFreq, u64 blockOffset[numBlocks],
+//	       back to back, working backward from the block's own start)
+//	index  u32 numTerms, u32 numBlocks, u64 sumDocFreq, u64 blockBack[numBlocks] (each
+//	       block's distance back from the index itself to its own start),
 //	       u32 firstTermOffset[numBlocks+1], the blocks' first terms back to back
 //
 // The index is the sparse block index: Open keeps views of its arrays, a lookup binary
 // searches the first terms (O(log blocks)) and scans one block. Term ordinals are
 // positions in the sorted dictionary, so ordinal o lives in block o/blockTerms.
+//
+// Every position a dictionary's own bytes bake in is stored as a distance back from a
+// point the reader already has in hand, not as a forward offset from some notional
+// "dictionary start": a block's own start is "this many bytes before the index" (which
+// Open already knows: it is where it started parsing, termDict.base), and that block's
+// postings start is "this many bytes before the block" (which blockFor/blockOff already
+// computed to find the block at all). Every one of those distances is translation
+// invariant - unaffected by where either endpoint ends up in the final file - so a
+// field's dictionary (every kind of it: value, entry, word and gram share one write
+// pass and one buffer) can be built complete, in its own private buffer, independently
+// of and in parallel with every other field's, and nothing about where that buffer (or
+// even where this one dictionary within it) ends up concatenated needs to be known
+// until the moment it is, which is also the only moment META's one offset per
+// dictionary (resolved once, in Reader.parseMeta, from the TERMS section's own absolute
+// start in the footer plus META's section-relative dictOff) is filled in.
 
 // blockTerms is how many terms a block holds (the last may hold fewer).
 const blockTerms = 32
@@ -79,14 +96,18 @@ func (d *dictWriter) flushBlock() {
 	if len(d.pending) == 0 {
 		return
 	}
-	base := d.w.off
+	postingsStart := d.w.off
 	d.w.write(d.postBuf)
-	d.blockOffs = append(d.blockOffs, d.w.off)
+	blockStart := d.w.off
+	d.blockOffs = append(d.blockOffs, blockStart)
 	d.firstOffs = append(d.firstOffs, uint32(len(d.firstTerms))) //nolint:gosec // first terms stay far below 4 GiB
 	first := d.pending[0]
 	d.firstTerms = append(d.firstTerms, d.termBuf[first.start:first.end]...)
 	d.block.b = d.block.b[:0]
-	d.block.uvarint(base)
+	// postingsLen, not postingsStart itself: a distance back from this block's own
+	// start (blockStart, which the reader already has - it is how it found this
+	// block), not a forward offset from anywhere - see the type comment above.
+	d.block.uvarint(blockStart - postingsStart)
 	d.prev = d.prev[:0]
 	for _, p := range d.pending {
 		term := d.termBuf[p.start:p.end]
@@ -119,7 +140,9 @@ func (d *dictWriter) finish() (uint64, bool) {
 	d.w.u32(uint32(len(d.blockOffs))) //nolint:gosec // blocks fit uint32
 	d.w.u64(d.sumDocFreq)
 	for _, o := range d.blockOffs {
-		d.w.u64(o)
+		// A distance back from the index (off, written here) to that block's own
+		// start (o), not o itself - see the type comment above.
+		d.w.u64(off - o)
 	}
 	for _, o := range d.firstOffs {
 		d.w.u32(o)
@@ -139,24 +162,29 @@ func commonPrefix(a, b []byte) int {
 	return n
 }
 
-// termDict reads one dictionary in place.
+// termDict reads one dictionary in place. base is the index's own absolute position
+// (exactly what Open resolved META's dictOff to, and what openDict is called with);
+// blockOff and cursor's postings position are both resolved by subtracting a stored
+// distance from a point already in hand (base, or a block's own start) rather than
+// adding to one - see the type comment above for why.
 type termDict struct {
 	data       []byte // the whole mapping
+	base       uint64 // the index's own absolute position in data
 	numTerms   uint32
 	numBlocks  uint32
 	sumDocFreq uint64
-	blockOffs  []byte // numBlocks u64
+	blockOffs  []byte // numBlocks u64, each a distance back from base
 	firstOffs  []byte // numBlocks+1 u32
 	firstTerms []byte
 }
 
-// openDict parses the index at off.
+// openDict parses the dictionary whose index starts at the absolute position off.
 func openDict(data []byte, off uint64) (*termDict, error) {
 	if off > uint64(len(data)) {
 		return nil, errShort
 	}
 	d := decoder{b: data, pos: int(off)} //nolint:gosec // bounded by len(data)
-	t := &termDict{data: data}
+	t := &termDict{data: data, base: off}
 	t.numTerms = d.u32()
 	t.numBlocks = d.u32()
 	t.sumDocFreq = d.u64()
@@ -173,7 +201,8 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 		return nil, errShort
 	}
 	for i := range t.numBlocks {
-		if t.blockOff(i) >= uint64(len(data)) || t.firstOff(i) > t.firstOff(i+1) {
+		back := binary.LittleEndian.Uint64(t.blockOffs[i*8:])
+		if back > t.base || t.firstOff(i) > t.firstOff(i+1) {
 			return nil, errShort
 		}
 	}
@@ -181,7 +210,7 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 }
 
 func (t *termDict) blockOff(i uint32) uint64 {
-	return binary.LittleEndian.Uint64(t.blockOffs[i*8:])
+	return t.base - binary.LittleEndian.Uint64(t.blockOffs[i*8:])
 }
 
 func (t *termDict) firstOff(i uint32) uint32 {
@@ -220,12 +249,18 @@ type blockCursor struct {
 }
 
 func (t *termDict) cursor(block uint32) blockCursor {
+	blockStart := t.blockOff(block)
 	c := blockCursor{
-		d:    decoder{b: t.data, pos: int(t.blockOff(block))}, //nolint:gosec // checked at open
+		d:    decoder{b: t.data, pos: int(blockStart)}, //nolint:gosec // checked at open
 		ord:  block * blockTerms,
 		left: min(blockTerms, t.numTerms-block*blockTerms),
 	}
-	c.post = c.d.uvarint()
+	// postingsLen is a distance back from this block's own start (blockStart, just
+	// resolved above), not a forward offset from anywhere; postings regions built
+	// from it (blockCursor.next) come out as ordinary absolute mmap positions, so
+	// every other reader of one - bitmapAt, viewBitmap, appendDocs - needs no change.
+	postingsLen := c.d.uvarint()
+	c.post = blockStart - postingsLen
 	return c
 }
 

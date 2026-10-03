@@ -17,6 +17,43 @@
 //
 // All integers are little-endian. [Open] verifies the whole-file checksum and refuses a
 // file whose major version it does not know.
+//
+// # Offsets, and why most of them are section-relative (format 1.1)
+//
+// META holds each field's entry points into TERMS, DOCVALS and POINTS (dictOff,
+// keywordColOff, multiColOff, numberColOff, pointsOff) and into PRESENCE (presOff,
+// truncOff). From format 1.1 on, every one of those is relative to its own section's
+// absolute start (which the footer's section table gives), not to the file: Build and
+// Merge can then build one field's whole contribution to a section - a term
+// dictionary, a doc-values column, a point index - complete and self-contained, in
+// its own private buffer, independently of (and in parallel with) every other field's,
+// because nothing in it depends on knowing where it will land until the moment it is
+// concatenated into the section, which is when its META entry is filled in. Open adds
+// each section's absolute start, from the footer, to these entries exactly once, while
+// parsing META (see [Reader.parseMeta]).
+//
+// A field's own structures can themselves bake in further offsets - a term
+// dictionary's block index and each block's postings offset ([termDict.base]; see
+// termdict.go), a point index's block table ([points.base]; see points.go) - and those
+// are relative to that structure's own absolute start in turn (its META entry plus its
+// section's start), for the same reason: so the structure is self-contained down to its
+// own bytes, not just positioned independently of other fields. Open resolves each such
+// base once, when it opens that structure, and every other accessor of a value derived
+// from it (a postings region, a block's byte range) already works with an ordinary
+// absolute mmap position and needs no further change.
+//
+// Doc-values columns (keyword, multi, number) and the stored-fields block table have no
+// such nested offsets of their own - they are packed, contiguous data with nothing
+// pointing elsewhere inside themselves - so only their one META or block-table entry
+// needs this treatment.
+//
+// This is a breaking change to the previous 1.0 layout (every one of those offsets was
+// absolute-into-file), bumped as a minor version, not a major one, because nothing
+// built on format 1.0 has ever been written anywhere persistent: there is no deployed
+// file this needs to stay compatible with, or safely refuse, so there is no reason to
+// spend the major version's "Open refuses an unknown major" guarantee on it. A future
+// breaking layout change, once segments exist outside a test run, should bump the
+// major instead.
 package segment
 
 import (
@@ -30,9 +67,11 @@ import (
 const (
 	// FormatMajor is the segment format's major version. Open refuses any other major.
 	FormatMajor = 1
-	// FormatMinor is the segment format's minor version: additions an older reader of
-	// the same major can ignore.
-	FormatMinor = 0
+	// FormatMinor is the segment format's minor version: ordinarily additions an
+	// older reader of the same major can ignore, but 1 is the one exception - see the
+	// package doc comment's "Offsets, and why most of them are section-relative"
+	// section for why a breaking change to the offset scheme was still a minor bump.
+	FormatMinor = 1
 	// FileExt is a segment file's extension.
 	FileExt = ".seg"
 )

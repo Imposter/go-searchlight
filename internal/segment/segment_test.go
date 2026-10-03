@@ -2,12 +2,14 @@ package segment
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -344,6 +346,94 @@ func TestVersionRefused(t *testing.T) {
 	var ve *VersionError
 	if !errors.As(err, &ve) {
 		t.Fatalf("Open error = %v (%T), want *VersionError", err, err)
+	}
+}
+
+// TestSectionOffsetsAreRelocatable pins down format 1.1's central property (format.go's
+// "Offsets, and why most of them are section-relative"): nothing in a dictionary, a
+// doc-values column or a point index is anchored to a fixed absolute position. It
+// splices 4 KB of padding in right after the header - pushing TERMS and every section
+// after it, plus the footer's own section table, later by exactly that much - updates
+// only the section table's recorded offsets and the whole-file checksum (every
+// section's own bytes and per-section CRC are untouched, since no section's content
+// changed, only where it starts), and checks the result still opens and reads
+// correctly. If any reader path assumed a section - or a field's dictionary or column
+// within one - sat at some fixed offset rather than the one the footer and META
+// actually record, this is what would catch it.
+func TestSectionOffsetsAreRelocatable(t *testing.T) {
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword}}
+	var docs []schema.Doc
+	for i := range 40 {
+		docs = append(docs, mustAnalyze(t, m, fmt.Sprintf("d%d", i), `{"brand": "shared"}`))
+	}
+	dir := t.TempDir()
+	meta, err := Build(dir, docs, BuildOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig, err := os.ReadFile(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	footer, err := verifyFile(meta.Path, orig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const pad = 4096
+	padding := bytes.Repeat([]byte{0xAA}, pad)
+	relocated := make([]byte, 0, len(orig)+pad)
+	relocated = append(relocated, orig[:headerSize]...)
+	relocated = append(relocated, padding...)
+	relocated = append(relocated, orig[headerSize:]...)
+
+	kinds := make([]sectionKind, 0, len(footer.sections))
+	for k := range footer.sections {
+		kinds = append(kinds, k)
+	}
+	sort.Slice(kinds, func(i, j int) bool { return footer.sections[kinds[i]].off < footer.sections[kinds[j]].off })
+	tableStart := len(relocated) - tailSize - len(kinds)*sectionEntrySize
+	for i, k := range kinds {
+		e := relocated[tableStart+i*sectionEntrySize:]
+		binary.LittleEndian.PutUint64(e[4:], footer.sections[k].off+pad)
+	}
+	binary.LittleEndian.PutUint32(relocated[len(relocated)-4:], crc32c(relocated[:len(relocated)-4]))
+
+	path := filepath.Join(dir, "relocated.seg")
+	if err := os.WriteFile(path, relocated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	original, err := Open(meta.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Close()
+	r, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open of a relocated segment: %v", err)
+	}
+	defer r.Close()
+
+	if r.NumDocs() != original.NumDocs() {
+		t.Fatalf("NumDocs = %d, want %d", r.NumDocs(), original.NumDocs())
+	}
+	want := allDocs(40)
+	if got := r.Postings("brand", KindValue, "shared"); !got.Equals(want) {
+		t.Fatalf("Postings after relocation = %v, want %v", got.ToArray(), want.ToArray())
+	}
+	for i := range uint32(40) {
+		id, err := r.ID(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantID, err := original.ID(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != wantID {
+			t.Fatalf("ID(%d) after relocation = %q, want %q", i, id, wantID)
+		}
 	}
 }
 

@@ -67,8 +67,16 @@ func (b *fieldBuilder) sortTermGroups() {
 	b.gramPairs.sortGroups()
 }
 
-// fieldOutput is where one field's structures landed in the file, 0 meaning absent
-// (every section starts past the header, so 0 is never a real offset).
+// fieldOutput is where one field's structures landed in the file, 0 meaning absent -
+// every offset here is stored as (real offset) + 1, never the real offset itself, so
+// that 0 unambiguously means absent even though each structure is built into its own
+// private buffer (format.go) with its own offset starting at 0: a structure that
+// happens to be the very first thing in its buffer has a real offset of 0, which 0-as-
+// "absent" could not otherwise be told apart from. The writers in this file
+// (writeFieldDicts and friends) are what add the 1; writeSegmentParts' per-section
+// fixup adds a field's position within the section on top of that (still leaving 0
+// alone, still meaning absent), and Reader.parseMeta subtracts the 1 back out, after
+// adding the section's own absolute start, before calling openDict and friends.
 type fieldOutput struct {
 	presOff, presLen   uint64
 	truncOff, truncLen uint64
@@ -385,22 +393,33 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 		}
 		return out
 	}
-	s.out.dictOff[KindValue], s.numValueTerms = writeMergedDict(w,
+	var off uint64
+	off, s.numValueTerms = writeMergedDict(w,
 		sel(func(p *fieldBuilder) *termPairs { return &p.valuePairs }),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
 			}
 		})
-	s.out.dictOff[KindEntry], s.numEntryTerms = writeMergedDict(w,
+	if s.numValueTerms > 0 {
+		s.out.dictOff[KindValue] = off + 1
+	}
+	off, s.numEntryTerms = writeMergedDict(w,
 		sel(func(p *fieldBuilder) *termPairs { return &p.entryPairs }),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
 			}
 		})
-	s.out.dictOff[KindWord], _ = writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), nil)
-	s.out.dictOff[KindGram], _ = writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), nil)
+	if s.numEntryTerms > 0 {
+		s.out.dictOff[KindEntry] = off + 1
+	}
+	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), nil); n > 0 {
+		s.out.dictOff[KindWord] = off + 1
+	}
+	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), nil); n > 0 {
+		s.out.dictOff[KindGram] = off + 1
+	}
 }
 
 func sortByDoc(pairs []docOrd) {
@@ -429,16 +448,17 @@ func writeFieldDocValues(w *fileWriter, parts []*fieldBuilder, numDocs uint32, s
 	if hasText && len(s.valueDocOrds) > 0 {
 		sortByDoc(s.valueDocOrds)
 		vd := s.valueDocOrds
-		s.out.keywordColOff = writeKeywordColumn(w, numDocs, s.numValueTerms, func(yield func(doc, ord uint32)) {
+		off := writeKeywordColumn(w, numDocs, s.numValueTerms, func(yield func(doc, ord uint32)) {
 			for _, p := range vd {
 				yield(p.doc, p.ord)
 			}
 		})
+		s.out.keywordColOff = off + 1
 	}
 	if len(s.entryDocOrds) > 0 {
 		sortByDoc(s.entryDocOrds)
 		ed := s.entryDocOrds
-		s.out.multiColOff = writeMultiColumn(w, numDocs, s.numEntryTerms, func(yield func(doc uint32, ords []uint32)) {
+		off := writeMultiColumn(w, numDocs, s.numEntryTerms, func(yield func(doc uint32, ords []uint32)) {
 			buf := make([]uint32, 0, 8)
 			i := 0
 			for i < len(ed) {
@@ -453,6 +473,7 @@ func writeFieldDocValues(w *fileWriter, parts []*fieldBuilder, numDocs uint32, s
 				i = j
 			}
 		})
+		s.out.multiColOff = off + 1
 	}
 	var combined []docFloat
 	for _, p := range parts {
@@ -465,7 +486,8 @@ func writeFieldDocValues(w *fileWriter, parts []*fieldBuilder, numDocs uint32, s
 	if st.Count == 0 {
 		return
 	}
-	s.out.numberColOff = writeNumberColumn(w, numDocs, enc, st, present, combined)
+	off := writeNumberColumn(w, numDocs, enc, st, present, combined)
+	s.out.numberColOff = off + 1
 	s.numEnc = enc
 	s.combinedNumDocs = combined
 }
@@ -486,7 +508,8 @@ func writeFieldPoints(w *fileWriter, numDocs uint32, s *fieldScratch) {
 		}
 		return cmp.Compare(a.doc, c.doc)
 	})
-	s.out.pointsOff = writeSortedPoints(w, numDocs, pairs)
+	off := writeSortedPoints(w, numDocs, pairs)
+	s.out.pointsOff = off + 1
 }
 
 // writeFieldPresence writes one field's presence and truncated bitmaps (presence
@@ -501,11 +524,11 @@ func writeFieldPresence(w *fileWriter, parts []*fieldBuilder, out *fieldOutput) 
 		truncated.Or(p.truncated)
 	}
 	blob := serializeBitmap(presence)
-	out.presOff, out.presLen = w.off, uint64(len(blob))
+	out.presOff, out.presLen = w.off+1, uint64(len(blob))
 	w.write(blob)
 	if !truncated.IsEmpty() {
 		blob2 := serializeBitmap(truncated)
-		out.truncOff, out.truncLen = w.off, uint64(len(blob2))
+		out.truncOff, out.truncLen = w.off+1, uint64(len(blob2))
 		w.write(blob2)
 	}
 }

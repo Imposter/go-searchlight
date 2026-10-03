@@ -16,7 +16,7 @@ import (
 
 func testConfig(t *testing.T) config.Config {
 	t.Helper()
-	cfg, err := config.Load([]string{"--admin_listen=127.0.0.1:0", "--listen=127.0.0.1:0", "--shutdown_timeout=5s"},
+	cfg, err := config.Load([]string{"--admin_listen=127.0.0.1:0", "--listen=127.0.0.1:0", "--shutdown_timeout=5s", "--insecure_no_auth"},
 		func(k string) string {
 			if k == "SEARCHLIGHT_STORE_URL" {
 				return "sqlite:///tmp/searchlight-test.db"
@@ -94,6 +94,8 @@ func TestRunStopsWhenCancelled(t *testing.T) {
 			return "127.0.0.1:0"
 		case "SEARCHLIGHT_LOG_LEVEL":
 			return "error"
+		case "SEARCHLIGHT_INSECURE_NO_AUTH":
+			return "true"
 		}
 		return ""
 	}

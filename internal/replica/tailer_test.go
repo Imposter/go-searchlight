@@ -299,6 +299,9 @@ func TestIndexRecreatedIsRebuilt(t *testing.T) {
 		createIndex(t, st, "r", testMapping)
 		id := ShardID{Index: "r", Shard: 0}
 		opts := testOptions()
+		// The drop-to-create gap must stay within one catalogue interval (the
+		// grace before a missing index stops the copy), even on a loaded disk.
+		opts.CatalogInterval = 2 * time.Second
 		swapped := make(chan *shard.Shard, 8)
 		opts.OnShard = func(sh *shard.Shard) { swapped <- sh }
 		c := newCopy(t, d.open(t), id, opts)

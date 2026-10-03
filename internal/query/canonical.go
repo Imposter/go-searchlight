@@ -6,6 +6,8 @@ import (
 	"maps"
 	"math"
 	"slices"
+
+	"github.com/Imposter/go-searchlight/internal/analysis"
 )
 
 // Canonical returns a deterministic byte encoding of n: semantically equivalent trees
@@ -18,6 +20,10 @@ import (
 //     equal to anything.
 //   - exists with no value and exists: true canonicalize the same way, as they mean
 //     the same thing; so do the other shapes [Validate] holds equivalent.
+//   - words_all and words_any encode their phrases' words (analysis.Words of each text
+//     as written, sorted and distinct), which is what the matcher compares: two texts
+//     with one normalized form can still have different words (a combining sequence
+//     NFKC composes differently from case folding).
 //   - A list value whose order does not change the condition (in, has_any, has_all,
 //     contains_any, contains_all, words_any, words_all: each is a set) is sorted and
 //     deduplicated after normalizing. between's [lo, hi] is ordered and keeps its
@@ -92,6 +98,8 @@ const (
 	valString
 	valList
 	valObject
+	valWords // words_*: the phrases as the matcher reads them
+	valNever // a condition that never holds
 )
 
 func appendLeafValue(buf []byte, l *Leaf) []byte {
@@ -101,6 +109,9 @@ func appendLeafValue(buf []byte, l *Leaf) []byte {
 		// wanted, exactly as compileLeaf derives it.
 		want := a.Kind != ArgBool || a.Scalar.Bool
 		return appendScalar(buf, Scalar{Kind: ArgBool, Bool: want})
+	}
+	if l.Op == OpWordsAll || l.Op == OpWordsAny {
+		return appendWords(buf, &a, l.Op == OpWordsAll)
 	}
 	switch a.Kind {
 	case ArgBool, ArgNumber, ArgString:
@@ -175,6 +186,35 @@ func appendObject(buf []byte, object map[string]Scalar) []byte {
 	for _, k := range keys {
 		buf = appendString(buf, k)
 		buf = appendScalar(buf, object[k])
+	}
+	return buf
+}
+
+// appendWords encodes words_all's or words_any's phrases as the matcher compiles them
+// (setWords): each string's words (analysis.Words of the text as written, not of its
+// normalized form, which can differ on combining sequences), sorted and distinct; a
+// phrase with no word drops out of words_any and makes words_all never hold.
+func appendWords(buf []byte, a *Arg, every bool) []byte {
+	var phrases []string
+	for _, s := range a.texts() {
+		w := analysis.Words(s.Text)
+		if w == analysis.NoWords {
+			if every {
+				return append(buf, valNever)
+			}
+			continue
+		}
+		phrases = append(phrases, w)
+	}
+	if len(phrases) == 0 {
+		return append(buf, valNever)
+	}
+	slices.Sort(phrases)
+	phrases = slices.Compact(phrases)
+	buf = append(buf, valWords)
+	buf = binary.AppendUvarint(buf, uint64(len(phrases)))
+	for _, p := range phrases {
+		buf = appendString(buf, p)
 	}
 	return buf
 }

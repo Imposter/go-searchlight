@@ -142,11 +142,11 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	if err := tx.QueryRowContext(ctx, s.q.lockCounter).Scan(&counter, &nowMs); err != nil {
 		return fmt.Errorf("lock counter: %w", err)
 	}
-	var oldMapping []byte
+	var oldMapping, oldSettings []byte
 	var version, mappingVersion int64
 	var uid string
-	err = tx.QueryRowContext(ctx, s.bind("SELECT mapping, version, mapping_version, uid FROM sl_indexes WHERE name = ?"), m.Name).
-		Scan(&oldMapping, &version, &mappingVersion, &uid)
+	err = tx.QueryRowContext(ctx, s.bind("SELECT mapping, settings, version, mapping_version, uid FROM sl_indexes WHERE name = ?"), m.Name).
+		Scan(&oldMapping, &oldSettings, &version, &mappingVersion, &uid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("index %q: %w", m.Name, ErrNotFound)
 	}
@@ -155,6 +155,17 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	}
 	if version != m.Version {
 		return fmt.Errorf("index %q version %d: %w", m.Name, m.Version, ErrConflict)
+	}
+	// The shard count is fixed at creation (spec section 2): documents are placed
+	// by it, so changing it would orphan them.
+	oldShards, err := settingsShards(oldSettings)
+	if err != nil {
+		return err
+	}
+	if newShards, err := m.Shards(); err != nil {
+		return err
+	} else if newShards != oldShards {
+		return invalidf("settings: shards is %d and cannot change (to %d)", oldShards, newShards)
 	}
 	remap := !bytes.Equal(oldMapping, m.Mapping)
 	if remap {

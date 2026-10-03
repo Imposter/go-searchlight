@@ -180,7 +180,8 @@ type IndexStore interface {
 	// same transaction, a KindMapping change carrying the new mapping is
 	// logged to every shard of the index (Settings' shard count after the
 	// update), with contiguous seqs: copies adopt it exactly at its seq. Every
-	// mapping change must go through Update.
+	// mapping change must go through Update. Settings' shard count is fixed at
+	// Create: an Update that changes it fails with ErrInvalid.
 	Update(ctx context.Context, m IndexMeta) (IndexMeta, error)
 	// Drop deletes an index with its documents, queries, changes and shard
 	// copies, or returns ErrNotFound.

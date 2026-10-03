@@ -1999,3 +1999,36 @@ func TestMappingChangesOrderWithApply(t *testing.T) {
 		}
 	})
 }
+
+// TestShardCountImmutable: an index's shard count is fixed at Create; Update refuses
+// to change it, whether it is spelled out or left to its default.
+func TestShardCountImmutable(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		ix := st.Indexes()
+		m, err := ix.Create(ctx, IndexMeta{Name: "sc", Settings: []byte(`{"shards":3}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, settings := range []string{`{"shards":2}`, `{"shards":4}`, `{}`} {
+			bad := m
+			bad.Settings = []byte(settings)
+			if _, err := ix.Update(ctx, bad); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("update to %s: %v", settings, err)
+			}
+		}
+		m.Settings = []byte(`{"shards":3,"refresh_interval":"5s"}`)
+		if _, err := ix.Update(ctx, m); err != nil {
+			t.Fatalf("update keeping the shard count: %v", err)
+		}
+		one, err := ix.Create(ctx, IndexMeta{Name: "sc1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		one.Settings = []byte(`{"shards":1}`)
+		if _, err := ix.Update(ctx, one); err != nil {
+			t.Fatalf("spelling out the default: %v", err)
+		}
+	})
+}

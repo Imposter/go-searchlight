@@ -28,7 +28,8 @@ const applyAttempts = 3
 type sqlStore struct {
 	d      *dialect.Dialect
 	pools  dialect.Pools
-	w, r   *sql.DB
+	w      *gatedDB
+	r      *sql.DB
 	log    *slog.Logger
 	tracer trace.Tracer
 	dur    metric.Float64Histogram
@@ -49,7 +50,7 @@ type sqlStore struct {
 func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore, error) {
 	in := telemetry.NewInstruments(o.meter)
 	s := &sqlStore{
-		d: d, pools: pools, w: pools.Write, r: pools.Read,
+		d: d, pools: pools, w: &gatedDB{DB: pools.Write}, r: pools.Read,
 		log:    o.logger.With(slog.String("component", "store"), slog.String("dialect", d.Name)),
 		tracer: o.tracer,
 		dur:    in.Histogram(telemetry.MetricStoreOperationDuration),
@@ -59,6 +60,10 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 	}
 	if err := in.Err(); err != nil {
 		return nil, fmt.Errorf("store instruments: %w", err)
+	}
+	if pools.Write.Stats().MaxOpenConnections == 1 {
+		// One write connection (SQLite): queue writers in lanes (gate.go).
+		s.w.g = &gate{}
 	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
@@ -136,10 +141,15 @@ func (s *sqlStore) Ping(ctx context.Context) (err error) {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	if s.w.g != nil {
+		// One write connection (SQLite): a long commit holds it, which says nothing
+		// about whether the database answers. A read connection does.
+		return s.r.PingContext(ctx)
+	}
 	if err := s.w.PingContext(ctx); err != nil {
 		return err
 	}
-	if s.r != s.w {
+	if s.r != s.w.DB {
 		return s.r.PingContext(ctx)
 	}
 	return nil

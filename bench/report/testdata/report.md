@@ -74,7 +74,7 @@ Fields: title and description (text, about 60 Zipfian words), brand (2,000 value
 
 ## Disk and memory
 
-The larger of two measurements: right after the load (once every document was searchable), and again once every workload had run, to catch growth from merges, the percolator index and the mixed workload.
+The running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load.
 
 | engine | disk | disk per 1M docs | RSS | RSS per 1M docs | how |
 | --- | --- | --- | --- | --- | --- |

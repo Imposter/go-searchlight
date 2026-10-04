@@ -304,7 +304,7 @@ func renderFootprint(w io.Writer, r *Run) {
 	if len(rows) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "## Disk and memory\n\nThe larger of two measurements: right after the load (once every document was searchable), and again once every workload had run, to catch growth from merges, the percolator index and the mixed workload.\n\n")
+	fmt.Fprintf(w, "## Disk and memory\n\nThe running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load.\n\n")
 	table(w, []string{"engine", "disk", "disk per 1M docs", "RSS", "RSS per 1M docs", "how"}, rows)
 }
 

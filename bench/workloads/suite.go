@@ -50,6 +50,13 @@ type Config struct {
 	PercolateIterations, PercolateSingle int
 	BulkPercolateIterations              int
 
+	// VisibleIterations measures refresh_visible and refresh_wait_for, each at
+	// Concurrency 1 (queueing would change what the latency means). Its default,
+	// 1000, is minSamples(0.99): the fewest a trusted p99 needs. At the ~1.1 s per
+	// iteration measured in bench/testdata/smoke-report.md (300 iterations took
+	// about 5m25s and 5m28s there), 1000 costs roughly 18 minutes per direction,
+	// ~36 minutes for both -- comfortably inside bench.yml's 180-minute job timeout
+	// alongside everything else, which the same run finished in under a minute.
 	VisibleIterations int
 
 	MixedDuration                          time.Duration
@@ -92,7 +99,7 @@ func (c *Config) defaults() {
 	set(&c.PercolateIterations, 50)
 	set(&c.PercolateSingle, 300)
 	set(&c.BulkPercolateIterations, 20)
-	set(&c.VisibleIterations, 300)
+	set(&c.VisibleIterations, 1000)
 	set(&c.MixedReaders, 4)
 	set(&c.MixedWriters, 1)
 	set(&c.MixedBatch, 500)
@@ -169,15 +176,21 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 	if err := s.dataset(); err != nil {
 		return nil, err
 	}
+	var sampler *footprintSampler
+	var stopSampler func()
+	if !cfg.LoadOnly {
+		sampler, stopSampler = s.startFootprintSampler(ctx)
+	}
 	steps := []func(context.Context) error{s.load, s.crossCheckSearches, s.searches, s.visibility, s.mixed, s.percolation, s.restart}
 	if cfg.LoadOnly {
 		steps = steps[:1]
 	}
 	const crossCheckStep = 1 // s.crossCheckSearches, above
+	var stepErr error
 	for i, step := range steps {
 		if err := step(ctx); err != nil {
-			s.run.FinishedAt = time.Now().UTC()
-			return s.run, err
+			stepErr = err
+			break
 		}
 		if i == crossCheckStep && cfg.StopOnMismatch && s.run.CrossCheck.Failed() {
 			s.run.Notes = append(s.run.Notes, "Stopped after the cross-check found an unresolved mismatch (--stop-on-mismatch): "+
@@ -185,10 +198,14 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 			break
 		}
 	}
-	if !cfg.LoadOnly {
-		s.peakFootprint(ctx)
+	if stopSampler != nil {
+		stopSampler() // blocks until the last sample is folded in
+		s.mergeFootprintPeak(sampler)
 	}
 	s.run.FinishedAt = time.Now().UTC()
+	if stepErr != nil {
+		return s.run, stepErr
+	}
 	s.run.Targets = report.Evaluate(s.run)
 	return s.run, nil
 }
@@ -280,42 +297,102 @@ func (s *suite) load(ctx context.Context) error {
 	return nil
 }
 
-// peakFootprint re-measures disk and RSS once every workload has run, and keeps the
-// larger of that and the load-time measurement in the "footprint" result: RSS in
-// particular can grow well past its post-load level once merges, the percolator
-// index and the mixed workload have run, and spec section 1's T6 target is about the
-// engine's real footprint over the run, not just right after loading. Best-effort: a
-// measurement error here leaves the load-time numbers in place.
-func (s *suite) peakFootprint(ctx context.Context) {
-	for _, eng := range s.engines {
-		idx := -1
-		for i := range s.run.Results {
-			if s.run.Results[i].Workload == "footprint" && s.run.Results[i].Engine == eng.Name() {
-				idx = i
-				break
-			}
-		}
-		if idx < 0 {
-			continue
-		}
-		r, err := eng.Resources(ctx, s.cfg.Index)
+// footprintSampleInterval is how often the sampler re-measures disk and RSS while
+// the suite runs. A var, not a const, so a test can shorten it.
+var footprintSampleInterval = 1500 * time.Millisecond
+
+// footprintSampler periodically re-measures every engine's disk and RSS while the
+// suite runs, keeping a running maximum: a measurement taken once after the load
+// and once at the end misses mid-run spikes (a merge, the percolator load, the
+// mixed workload), which is exactly the footprint spec section 1's T6 cares about.
+type footprintSampler struct {
+	mu   sync.Mutex
+	peak map[string]report.Resources // by engine name
+}
+
+func newFootprintSampler() *footprintSampler {
+	return &footprintSampler{peak: map[string]report.Resources{}}
+}
+
+// sample measures every engine once and folds it into the running maximum.
+// Best-effort: a measurement error for one engine does not affect the others or
+// stop future samples.
+func (f *footprintSampler) sample(ctx context.Context, engines []Engine, index string) {
+	for _, eng := range engines {
+		r, err := eng.Resources(ctx, index)
 		if err != nil {
 			continue
 		}
-		fp := &s.run.Results[idx]
+		f.mu.Lock()
+		p := f.peak[eng.Name()]
+		if r.DiskBytes > p.DiskBytes {
+			p.DiskBytes, p.DiskSource = r.DiskBytes, r.DiskSource
+		}
+		if r.RSSBytes > p.RSSBytes {
+			p.RSSBytes, p.RSSSource = r.RSSBytes, r.RSSSource
+		}
+		f.peak[eng.Name()] = p
+		f.mu.Unlock()
+	}
+}
+
+func (f *footprintSampler) peakOf(name string) report.Resources {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.peak[name]
+}
+
+// startFootprintSampler samples every engine's disk and RSS every
+// footprintSampleInterval until the returned stop function is called; stop blocks
+// until the sampling goroutine has actually exited, so the caller can safely read
+// the sampler's peaks right after it returns.
+func (s *suite) startFootprintSampler(ctx context.Context) (sampler *footprintSampler, stop func()) {
+	sampler = newFootprintSampler()
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		t := time.NewTicker(footprintSampleInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+				sampler.sample(ctx, s.engines, s.cfg.Index)
+			}
+		}
+	}()
+	return sampler, func() {
+		close(done)
+		<-stopped
+	}
+}
+
+// mergeFootprintPeak folds sampler's running maximum into each engine's "footprint"
+// result, replacing the load-time snapshot's numbers wherever the sampler saw
+// something larger while the rest of the suite ran.
+func (s *suite) mergeFootprintPeak(sampler *footprintSampler) {
+	for i := range s.run.Results {
+		fp := &s.run.Results[i]
+		if fp.Workload != "footprint" {
+			continue
+		}
+		p := sampler.peakOf(fp.Engine)
 		peaked := false
-		if disk := float64(r.DiskBytes); disk > fp.Values["disk_bytes"] {
+		if disk := float64(p.DiskBytes); disk > fp.Values["disk_bytes"] {
 			fp.Values["disk_bytes"], fp.Values["disk_per_million"] = disk, disk/float64(s.loaded)*1e6
 			peaked = true
 		}
-		if rss := float64(r.RSSBytes); rss > fp.Values["rss_bytes"] {
+		if rss := float64(p.RSSBytes); rss > fp.Values["rss_bytes"] {
 			fp.Values["rss_bytes"], fp.Values["rss_per_million"] = rss, rss/float64(s.loaded)*1e6
 			peaked = true
 		}
 		if peaked {
-			fp.Description = "disk: " + r.DiskSource + "; RSS: " + r.RSSSource + " (peak across the run)"
+			fp.Description = fmt.Sprintf("disk: %s; RSS: %s (peak across the run, sampled every %s)", p.DiskSource, p.RSSSource, footprintSampleInterval)
 		}
-		s.logf("  footprint %s (peak): disk %s, RSS %s", eng.Name(),
+		s.logf("  footprint %s (peak): disk %s, RSS %s", fp.Engine,
 			report.FormatBytes(fp.Values["disk_bytes"]), report.FormatBytes(fp.Values["rss_bytes"]))
 	}
 }

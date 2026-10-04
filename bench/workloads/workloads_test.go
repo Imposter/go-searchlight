@@ -9,13 +9,36 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
+	"github.com/Imposter/go-searchlight/bench/report"
 	"github.com/Imposter/go-searchlight/internal/search"
 )
+
+// fakeFootprintEngine answers Resources with a fixed sequence (repeating its last
+// entry); every other Engine method is unused here and left to panic on a nil
+// embedded Engine if ever called by mistake.
+type fakeFootprintEngine struct {
+	Engine
+	name string
+	mu   sync.Mutex
+	seq  []report.Resources
+	i    int
+}
+
+func (f *fakeFootprintEngine) Name() string { return f.name }
+
+func (f *fakeFootprintEngine) Resources(context.Context, string) (report.Resources, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.seq[min(f.i, len(f.seq)-1)]
+	f.i++
+	return r, nil
+}
 
 func TestRunClosedLoopCountsOnlyMeasured(t *testing.T) {
 	var calls atomic.Int64
@@ -92,6 +115,45 @@ func TestRunSelfTimedOverridesWallClock(t *testing.T) {
 	s := m.Hist.Summary()
 	if s.Max >= 4000 || s.Min < 1900 { // µs: ~2 ms, not the ~5 ms wall time
 		t.Fatalf("min %v max %v µs: self-timed latency was not used", s.Min, s.Max)
+	}
+}
+
+// TestFootprintSamplerRunningMax checks that the sampler keeps the largest disk and
+// RSS it has seen across several samples, even when a later sample is smaller on one
+// axis (a RSS spike followed by a disk spike must not erase either peak).
+func TestFootprintSamplerRunningMax(t *testing.T) {
+	eng := &fakeFootprintEngine{name: "x", seq: []report.Resources{
+		{DiskBytes: 100, DiskSource: "a", RSSBytes: 200, RSSSource: "b"},
+		{DiskBytes: 50, DiskSource: "a", RSSBytes: 500, RSSSource: "b"},  // RSS spikes
+		{DiskBytes: 300, DiskSource: "a", RSSBytes: 100, RSSSource: "b"}, // disk spikes
+	}}
+	sampler := newFootprintSampler()
+	for range 3 {
+		sampler.sample(context.Background(), []Engine{eng}, "idx")
+	}
+	if p := sampler.peakOf("x"); p.DiskBytes != 300 || p.RSSBytes != 500 {
+		t.Fatalf("peak = %+v, want disk 300 rss 500", p)
+	}
+	if p := sampler.peakOf("missing"); p.DiskBytes != 0 || p.RSSBytes != 0 {
+		t.Fatalf("an engine never sampled: %+v, want zero", p)
+	}
+}
+
+// TestStartFootprintSamplerStopWaitsForLastSample checks that stop only returns
+// once the background goroutine has actually exited, so its peak is final and safe
+// to read the moment stop returns (RunSuite relies on exactly this).
+func TestStartFootprintSamplerStopWaitsForLastSample(t *testing.T) {
+	old := footprintSampleInterval
+	footprintSampleInterval = 2 * time.Millisecond
+	defer func() { footprintSampleInterval = old }()
+
+	eng := &fakeFootprintEngine{name: "x", seq: []report.Resources{{DiskBytes: 1, RSSBytes: 1}, {DiskBytes: 9, RSSBytes: 9}}}
+	s := &suite{engines: []Engine{eng}, cfg: Config{Index: "idx"}}
+	sampler, stop := s.startFootprintSampler(context.Background())
+	time.Sleep(30 * time.Millisecond) // several ticks at 2 ms
+	stop()
+	if p := sampler.peakOf("x"); p.DiskBytes == 0 {
+		t.Fatal("stop returned before any sample was taken")
 	}
 }
 

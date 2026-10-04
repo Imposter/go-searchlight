@@ -111,6 +111,18 @@ func TestEvaluateWithoutBaselineOrWithMismatch(t *testing.T) {
 	if got["T7"].Status != Pass {
 		t.Errorf("T7 is absolute and should still pass: %s", got["T7"].Status)
 	}
+	// T2's own under-sampled p99 renders as "n/a (n=...)" via formatQuantile, the
+	// same as a single workload's table row -- cosmetic consistency with T5 and T7,
+	// not just a status: a NO BASELINE target still shouldn't print a number it
+	// can't back up.
+	for i := range r.Results {
+		if r.Results[i].Workload == "filter_term" {
+			r.Results[i].Latency.Count = 300
+		}
+	}
+	if sl := byID(Evaluate(r))["T2"].Searchlight; !strings.Contains(sl, "n/a (n=300)") {
+		t.Errorf("T2 without a baseline and an under-sampled workload: Searchlight=%q, want it to contain %q", sl, "n/a (n=300)")
+	}
 
 	r = sampleRun()
 	r.CrossCheck.Mismatches = append(r.CrossCheck.Mismatches, Mismatch{Name: "x", Problems: []string{"total 1 vs 2"}})

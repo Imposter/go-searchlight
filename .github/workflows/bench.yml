@@ -31,6 +31,10 @@ jobs:
   bench:
     name: slbench vs Elasticsearch
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    # The default --visible-iterations (1000, minSamples(0.99)) costs roughly 36
+    # extra minutes by itself (bench/workloads/suite.go's VisibleIterations comment
+    # has the measured per-iteration cost); 180 still leaves ample room for a
+    # 1M-document run's load, searches, aggregations and percolation beside it.
     timeout-minutes: 180
     env:
       DOCS: ${{ inputs.docs || '1m' }}

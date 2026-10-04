@@ -188,6 +188,7 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 	won, compared := 0, 0
 	var losses []string
 	var slP50, slP99, esP50, esP99 []float64
+	var slCount, esCount []int64
 	for _, w := range c.Workloads {
 		s, e := r.Find(w, Searchlight), r.Find(w, Elasticsearch)
 		switch {
@@ -199,7 +200,7 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 			losses = append(losses, w+": Searchlight errored")
 			continue
 		}
-		slP50, slP99 = append(slP50, s.Latency.P50), append(slP99, s.Latency.P99)
+		slP50, slP99, slCount = append(slP50, s.Latency.P50), append(slP99, s.Latency.P99), append(slCount, s.Latency.Count)
 		switch {
 		case e == nil:
 			c.Status = worst(c.Status, NoBaseline)
@@ -209,7 +210,7 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 			losses = append(losses, w+": Elasticsearch errored")
 			continue
 		}
-		esP50, esP99 = append(esP50, e.Latency.P50), append(esP99, e.Latency.P99)
+		esP50, esP99, esCount = append(esP50, e.Latency.P50), append(esP99, e.Latency.P99), append(esCount, e.Latency.Count)
 		if !sufficient(s.Latency) || !sufficient(e.Latency) {
 			c.Status = worst(c.Status, InsufficientSamples)
 			losses = append(losses, fmt.Sprintf("%s: insufficient samples for p99 (searchlight n=%d, elasticsearch n=%d; need ≥%d)",
@@ -225,8 +226,8 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 		losses = append(losses, fmt.Sprintf("%s (p50 %s vs %s, p99 %s vs %s)", w,
 			FormatMicros(s.Latency.P50), FormatMicros(e.Latency.P50), FormatMicros(s.Latency.P99), FormatMicros(e.Latency.P99)))
 	}
-	c.Searchlight = spread(slP50, slP99)
-	c.Elasticsearch = spread(esP50, esP99)
+	c.Searchlight = spread(slP50, slP99, slCount)
+	c.Elasticsearch = spread(esP50, esP99, esCount)
 	if compared > 0 {
 		c.Detail = fmt.Sprintf("%d of %d workloads at or under Elasticsearch on both p50 and p99.", won, compared)
 	}
@@ -236,19 +237,33 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 	return c
 }
 
-// spread summarizes p50s and p99s across workloads as ranges.
-func spread(p50, p99 []float64) string {
+// spread summarizes p50s and p99s across workloads as ranges. An end of a range
+// that doesn't have enough samples to trust renders as formatQuantile does for a
+// single workload's table row ("n/a (n=…)"), not as a number.
+func spread(p50, p99 []float64, counts []int64) string {
 	if len(p50) == 0 {
 		return "—"
 	}
-	rng := func(v []float64) string {
-		lo, hi := slices.Min(v), slices.Max(v)
-		if lo == hi {
-			return FormatMicros(lo)
+	return "p50 " + quantileSpread(p50, counts, 0.50) + ", p99 " + quantileSpread(p99, counts, 0.99)
+}
+
+// quantileSpread formats one quantile's range across workloads: the lowest and
+// highest value, each checked against its own workload's sample count.
+func quantileSpread(v []float64, counts []int64, q float64) string {
+	loI, hiI := 0, 0
+	for i, x := range v {
+		if x < v[loI] {
+			loI = i
 		}
-		return FormatMicros(lo) + "–" + FormatMicros(hi)
+		if x > v[hiI] {
+			hiI = i
+		}
 	}
-	return "p50 " + rng(p50) + ", p99 " + rng(p99)
+	lo := formatQuantile(v[loI], counts[loI], q)
+	if loI == hiI {
+		return lo
+	}
+	return lo + "–" + formatQuantile(v[hiI], counts[hiI], q)
 }
 
 func (r *Run) percolation() TargetCheck {

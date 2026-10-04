@@ -54,6 +54,28 @@ func (n *Single) Hosted(id store.ShardID) (store.Copy, bool) {
 // (in the background while readers still map its segments). It is a no-op when the
 // node hosts no copy of id.
 func (n *Single) UnhostCopy(ctx context.Context, id store.ShardID, wipe bool) error {
+	mode := unhostClose
+	if wipe {
+		mode = unhostWipe
+	}
+	return n.unhost(ctx, id, mode)
+}
+
+// AbandonCopy stops this node's copy of id as a crash would: no final commit, the
+// directory kept as it is (tests of node loss).
+func (n *Single) AbandonCopy(ctx context.Context, id store.ShardID) error {
+	return n.unhost(ctx, id, unhostAbandon)
+}
+
+type unhostMode int
+
+const (
+	unhostClose unhostMode = iota
+	unhostWipe
+	unhostAbandon
+)
+
+func (n *Single) unhost(ctx context.Context, id store.ShardID, mode unhostMode) error {
 	n.mu.RLock()
 	idx := n.indexes[id.Index]
 	n.mu.RUnlock()
@@ -71,16 +93,16 @@ func (n *Single) UnhostCopy(ctx context.Context, id store.ShardID, wipe bool) er
 	<-c.done
 	var err error
 	if sh := c.shard(); sh != nil {
-		if wipe {
-			sh.Abandon()
-		} else {
+		if mode == unhostClose {
 			err = sh.Close(ctx)
+		} else {
+			sh.Abandon()
 		}
 	}
-	if wipe {
+	if mode == unhostWipe {
 		n.removeLater(ctx, idx.copyRoot(id.Shard))
 	}
-	n.log.InfoContext(ctx, "shard copy unhosted", slog.String(telemetry.KeyIndex, id.Index), slog.Int(telemetry.KeyShard, id.Shard), slog.Bool("wiped", wipe))
+	n.log.InfoContext(ctx, "shard copy unhosted", slog.String(telemetry.KeyIndex, id.Index), slog.Int(telemetry.KeyShard, id.Shard), slog.Int("mode", int(mode)))
 	return err
 }
 

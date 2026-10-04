@@ -515,12 +515,56 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 	return nil
 }
 
-// Allocate implements node.Cluster: this node claims its copies of a new index now.
+// Allocate implements node.Cluster: this node claims its copies of a new index now,
+// and answers once the registry shows them serving (up to newIndexServeWait), so
+// that every node routes reads of the index to them at once.
 func (h *clusterHooks) Allocate(ctx context.Context, index string) error {
 	if err := h.n.refreshView(ctx); err != nil {
 		return err
 	}
-	return h.n.allocatePass(ctx, index, false, true)
+	if err := h.n.allocatePass(ctx, index, false, true); err != nil {
+		return err
+	}
+	h.n.awaitServing(ctx, index)
+	return nil
+}
+
+// newIndexServeWait bounds how long creating an index waits for its copies here to be
+// marked serving: a copy is recovering until its tailer first catches up.
+const newIndexServeWait = 5 * time.Second
+
+// awaitServing waits until the registry shows every copy this node holds of index
+// serving, or newIndexServeWait passes.
+func (n *Node) awaitServing(ctx context.Context, index string) {
+	ctx, cancel := context.WithTimeout(ctx, newIndexServeWait)
+	defer cancel()
+	delay := time.Millisecond
+	for {
+		copies, err := n.reg.Copies(ctx, index)
+		if err == nil && n.allServing(copies) {
+			_ = n.refreshView(ctx)
+			return
+		}
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			n.log.WarnContext(ctx, "a new index's copies here are not marked serving yet; other nodes route reads of it once they are",
+				slog.String("index", index))
+			return
+		case <-t.C:
+		}
+		delay = min(2*delay, 20*time.Millisecond)
+	}
+}
+
+func (n *Node) allServing(copies []store.Copy) bool {
+	for i := range copies {
+		if copies[i].NodeID == n.id && copies[i].State != store.CopyServing {
+			return false
+		}
+	}
+	return true
 }
 
 // CopyStopped implements node.Cluster: a copy whose tailer stopped on its own (its

@@ -643,10 +643,13 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 		for k := range 5 {
 			name := fmt.Sprintf("fresh%d", k)
 			createIndex(t, a.n, name, 2, 0)
+			if got, err := count(tctx(t), b.n, name, 0); err != nil || got != 0 {
+				t.Fatalf("read of %s on the other node right after it was created: %d, %v", name, got, err)
+			}
 			seq := mustWrite(t, a.n, name, upsertOp("x", 1))
 			got, err := count(tctx(t), b.n, name, seq)
 			if err != nil || got != 1 {
-				t.Fatalf("read of %s on the other node right after it was created: %d, %v", name, got, err)
+				t.Fatalf("read of %s on the other node right after a write: %d, %v", name, got, err)
 			}
 		}
 		_, err := (&clusterHooks{b.n}).Remote(tctx(t), store.ShardID{Index: "nowhere", Shard: 0}, 0)

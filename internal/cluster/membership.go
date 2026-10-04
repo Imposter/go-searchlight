@@ -442,7 +442,9 @@ func (v *view) takenOver(l *lease) bool {
 	return false
 }
 
-// refreshView reads the registry.
+// refreshView reads the registry and publishes the view, unless a read that began
+// later has published one already (reads run concurrently: the view loop, the
+// allocator, routing misses).
 func (n *Node) refreshView(ctx context.Context) error {
 	readAt := n.clock.Now()
 	nodes, err := n.reg.Nodes(ctx)
@@ -474,7 +476,15 @@ func (n *Node) refreshView(ctx context.Context) error {
 			n.loseCopy(ctx, l)
 		}
 	}
-	n.view.Store(v)
+	for {
+		cur := n.view.Load()
+		if cur != nil && cur.read > v.read {
+			return nil
+		}
+		if n.view.CompareAndSwap(cur, v) {
+			break
+		}
+	}
 	n.inst.nodes.Store(int64(len(v.live)))
 	return nil
 }

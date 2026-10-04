@@ -300,7 +300,7 @@ func TestStoppedNodeKeepsItsTail(t *testing.T) {
 	id := store.ShardID{Index: "tail", Shard: 0}
 	var applied, epoch int64
 	eventually(t, time.Minute, "node-1 reports its applied seq", func() error {
-		for _, cp := range liveCopies(t, a.st, id) { //nolint:gocritic // a short list
+		for _, cp := range liveCopies(t, a.st, id) {
 			if cp.NodeID == b.n.id && cp.AppliedSeq >= last {
 				applied, epoch = cp.AppliedSeq, cp.Epoch
 				return nil

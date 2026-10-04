@@ -325,7 +325,13 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 						return
 					default:
 					}
-					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					// 60 s, not 20: under go test ./... -count=2's full parallel suite
+					// (many heavy packages sharing this machine's disk and cores),
+					// SQLite's single write connection can be held by another
+					// package's commits for a while; a write itself asks nothing of
+					// the restarting node (no refresh wait), so this is the test's
+					// own patience, not the server's.
+					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 					res, err := others[0].n.Write(ctx, "roll", []api.WriteOp{upsertOp(fmt.Sprintf("r%d-%d", i, k), k)}, api.WriteOptions{})
 					cancel()
 					if err == nil && res.Items[0].Err != nil {

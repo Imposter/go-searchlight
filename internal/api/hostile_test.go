@@ -49,9 +49,32 @@ func TestHostileRequests(t *testing.T) {
 	t.Run("oversized body without a length", func(t *testing.T) {
 		e := e.with(t)
 		// A reader with no length is sent chunked: the limit applies as it is read.
+		// The server answers 413 at the limit, then drains the rest (up to 1 MiB
+		// here) before it closes, so the client, still sending, reads the answer
+		// rather than a reset.
 		body := io.MultiReader(strings.NewReader(`{"pad": "`), io.LimitReader(neverEnding('x'), 1<<20))
 		got := e.doReader("POST", "/indexes/h/_search", body)
 		e.problem(got, http.StatusRequestEntityTooLarge, "too_large")
+	})
+	t.Run("far oversized body without a length", func(t *testing.T) {
+		// Past what the server drains, it closes on the client: the client sees the
+		// 413, or a reset while it is still writing. Either way the server refused.
+		before := api.TooLargeAnswered(e.srv)
+		body := io.MultiReader(strings.NewReader(`{"pad": "`), io.LimitReader(neverEnding('x'), 8<<20))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, e.url+"/indexes/h/_search", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := e.client.Do(req)
+		if err == nil {
+			_ = res.Body.Close()
+			if res.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Fatalf("an 8 MiB body: HTTP %d", res.StatusCode)
+			}
+		}
+		if got := api.TooLargeAnswered(e.srv); got != before+1 {
+			t.Fatalf("the server answered %d 413s for an 8 MiB body (client error: %v)", got-before, err)
+		}
 	})
 	t.Run("oversized document", func(t *testing.T) {
 		e := e.with(t)

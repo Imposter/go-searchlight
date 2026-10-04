@@ -50,6 +50,8 @@ type Server struct {
 	errs                  metric.Int64Counter
 	inflight              metric.Int64UpDownCounter
 	draining              atomic.Bool
+	// tooLarge counts 413 answers (tests confirm a refusal with it).
+	tooLarge atomic.Int64
 }
 
 // route is one endpoint.
@@ -358,12 +360,18 @@ func (s *Server) wrap(rt *route) http.Handler {
 			s.finish(ctx, rt, r, sw, span, failure, start)
 		}()
 
+		// body sees what the handler reads of the request body, so a refusal knows
+		// how much is left.
+		body := &trackedBody{r: r.Body}
+		r.Body = body
 		fail := func(e *Error) {
 			failure = e
 			if e.Status == http.StatusRequestEntityTooLarge {
-				sw.Header().Set("Connection", "close") // do not read the rest of the body
+				sw.Header().Set("Connection", "close") // no more requests on this connection
+				s.tooLarge.Add(1)
 			}
 			writeProblem(sw, e, id)
+			s.drain(sw, r, body)
 		}
 		if e := s.auth.check(r, rt.scope); e != nil {
 			fail(e)
@@ -489,4 +497,54 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 	w.WriteHeader(status)
 	_, _ = w.Write(append(b, '\n'))
 	return nil
+}
+
+// Draining a refused request's unread body.
+const (
+	// minDrainBytes is the least drain reads past a refusal, whatever max_body_bytes.
+	minDrainBytes = 1 << 20
+	// drainTimeout bounds the drain: a client that sends slowly is cut off then.
+	drainTimeout = time.Second
+)
+
+// trackedBody counts what is read of a request body and whether it was read to the
+// end.
+type trackedBody struct {
+	r   io.ReadCloser
+	n   int64
+	eof bool
+}
+
+func (b *trackedBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.n += int64(n)
+	if errors.Is(err, io.EOF) {
+		b.eof = true
+	}
+	return n, err
+}
+
+func (b *trackedBody) Close() error { return b.r.Close() }
+
+// drain reads and discards what is left of a refused request's body, after flushing
+// the answer, so that a client still sending its body (a 413 refuses one as soon as
+// it passes the limit) finishes sending and then reads the answer. Closing a
+// connection with request bytes unread makes the operating system reset it, and a
+// client still writing then sees the reset (on Windows it even loses the answer it
+// had already received) instead of the 413. net/http drains 256 KiB the same way
+// after a handler that did not read its body; this drains up to max_body_bytes (at
+// least 1 MiB) and for at most a second, so a client that sends far more, or slowly,
+// is still cut off: one that declares more than that is not drained at all.
+func (s *Server) drain(w http.ResponseWriter, r *http.Request, body *trackedBody) {
+	if body.eof || r.ContentLength == 0 {
+		return
+	}
+	limit := max(s.cfg.MaxBodyBytes, minDrainBytes)
+	if r.ContentLength > 0 && r.ContentLength-body.n > limit {
+		return
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.Flush()
+	_ = rc.SetReadDeadline(time.Now().Add(drainTimeout))
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, limit))
 }

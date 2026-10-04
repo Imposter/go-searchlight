@@ -313,6 +313,19 @@ These are the inputs most likely to break the engine for a real user. Each is pi
 
 Run `slbench` in CI, or on a Linux host with Docker, against Elasticsearch. Profile with pprof and fix the bottlenecks until every spec §1 target is met. Record the results in `docs/benchmarks.md`.
 
+## Task 15: Timers (epic [#9](https://github.com/Imposter/go-searchlight/issues/9))
+
+Added 2026-10-04 after the T7 write-to-visible diagnosis and the slow, flaky test runs in Tasks 9–11. Each part is its own GitHub issue, with full scope and done-when criteria there.
+
+| Part | Issue | Depends on | Summary |
+|---|---|---|---|
+| 15a | [#10](https://github.com/Imposter/go-searchlight/issues/10) | — | `internal/clock` (Real and Fake). Route every engine timer through it: shard refresh, replica polling and backoff, cluster leases, heartbeats and maintenance, group-commit window, readiness and staleness. Convert the slow timing tests to the fake clock. Forbid direct `time.*` calls with a lint rule. |
+| 15b | [#11](https://github.com/Imposter/go-searchlight/issues/11) | 15a | Fixed-grid refresh scheduling. Today the period is the interval plus the refresh time, because the timer re-arms only after each refresh ends. |
+| 15c | [#12](https://github.com/Imposter/go-searchlight/issues/12) | — | Split refresh from flush: publish without fsync, and flush (fsync, manifest, `CommittedSeq`) on its own cadence. Promoted from Task 14. |
+| 15d | [#13](https://github.com/Imposter/go-searchlight/issues/13) | 15a helps | Fast-by-default tests: `-short` tier under about 2 minutes, a heavy tier, SQLite `synchronous=OFF` in non-durability tests, separate CI jobs. |
+
+**Target** (with 15b and 15c): write-to-visible p50 about 0.5s and p99 ≤ 1.07s at a 1s interval, quiet or under disk load. A refresh drops from 66–108ms to 6–10ms.
+
 ---
 
 ## Execution order
@@ -327,7 +340,8 @@ Run `slbench` in CI, or on a Linux host with Docker, against Elasticsearch. Prof
 | 6 | Task 9 |
 | 7 | Task 10 |
 | 8 | Task 11 |
-| 9 | Tasks 12 and 13 |
-| 10 | Task 14 |
+| 9 | Tasks 12 and 13; Task 15a and 15c may start in parallel once Task 11 merges (they touch the same timers) |
+| 10 | Task 15b and 15d (after 15a) |
+| 11 | Task 14 |
 
 Parallel tasks run in separate git worktrees of this repository, and the controller merges them. Use `go mod tidy` on `go.mod`/`go.sum` conflicts.

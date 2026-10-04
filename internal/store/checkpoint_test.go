@@ -27,14 +27,12 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := []byte(fmt.Sprintf(`{"pad":%q}`, strings.Repeat("x", 4000)))
-	for b := range 6 {
-		batch := make([]Change, 1000)
-		for i := range batch {
-			batch[i] = Change{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("b%d-%d", b, i), Payload: body}
-		}
-		if _, _, err := st.Apply(ctx, batch); err != nil {
-			t.Fatal(err)
-		}
+	burst := make([]Change, 6000)
+	for i := range burst {
+		burst[i] = Change{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("b%d", i), Payload: body}
+	}
+	if _, _, err := st.Apply(ctx, burst); err != nil {
+		t.Fatal(err)
 	}
 	if size := s.walSize(); size < 4*sqlite.JournalSizeLimit {
 		t.Fatalf("the burst left a %d-byte log: the test proves nothing", size)

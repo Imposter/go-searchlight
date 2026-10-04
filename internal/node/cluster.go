@@ -32,8 +32,9 @@ type Cluster interface {
 	// serves when CreateIndex answers.
 	Allocate(ctx context.Context, index string) error
 	// CopyStopped reports that a hosted copy's tailer stopped on its own (its lease
-	// was lost, it could not go on): the cluster unhosts it. It must not block.
-	CopyStopped(id store.ShardID, err error)
+	// was lost, it could not go on): the cluster unhosts it. c is the copy's registry
+	// copy. It must not block.
+	CopyStopped(c store.Copy, err error)
 	// Counts returns the live documents and saved queries of a serving copy of id on
 	// another node.
 	Counts(ctx context.Context, id store.ShardID) (docs, queries uint64, err error)

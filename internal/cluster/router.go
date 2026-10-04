@@ -429,14 +429,14 @@ func (h *clusterHooks) Allocate(ctx context.Context, index string) error {
 // CopyStopped implements node.Cluster: a copy whose tailer stopped on its own (its
 // lease was lost at a registry write, or it could not go on) is unhosted; the
 // allocator claims it again if the node may still hold it.
-func (h *clusterHooks) CopyStopped(id store.ShardID, err error) {
+func (h *clusterHooks) CopyStopped(c store.Copy, err error) {
 	n := h.n
-	n.log.Warn("a shard copy's tailer stopped; unhosting it", slog.String("shard", id.String()), slog.Any("error", err))
+	n.log.Warn("a shard copy's tailer stopped; unhosting it", slog.String("shard", c.Shard.String()), slog.Any("error", err))
 	if errors.Is(err, store.ErrLeaseLost) {
 		n.inst.lease(context.Background(), "lost")
 	}
 	n.background(func(ctx context.Context) {
-		if l := n.leaseFor(id); l != nil {
+		if l := n.leaseFor(c.Shard); l != nil && l.copy.Epoch == c.Epoch {
 			n.loseCopy(ctx, l)
 		}
 	})

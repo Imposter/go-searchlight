@@ -79,7 +79,12 @@ func (n *Node) allocatePass(ctx context.Context, only string, startup, eager boo
 // allocateShard claims, keeps or releases this node's copy of id.
 func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id store.ShardID, startup, eager bool) error {
 	if l := n.leaseFor(id); l != nil {
-		return n.maybeRelease(ctx, v, iv, l)
+		if c, ok := n.Hosted(id); (ok && c.Epoch == l.copy.Epoch) || l.retired.Load() {
+			return n.maybeRelease(ctx, v, iv, l)
+		}
+		// The lease of a copy no longer hosted: its index was dropped (maybe
+		// recreated under the same name), or the copy stopped. Claim afresh.
+		n.dropLease(id)
 	}
 	target := iv.ReplicasPerShard
 	mine, live, retiring := false, 0, 0
@@ -160,7 +165,7 @@ func (n *Node) maybeRelease(ctx context.Context, v *view, iv node.IndexView, l *
 	n.log.InfoContext(ctx, "releasing an extra shard copy: the copy target was lowered", slog.String("shard", l.copy.Shard.String()),
 		slog.Int("slot", l.copy.Slot), slog.Int("target", target))
 	n.dropLease(l.copy.Shard)
-	if err := n.UnhostCopy(ctx, l.copy.Shard, true); err != nil {
+	if err := n.UnhostCopy(ctx, l.copy, true); err != nil {
 		n.log.WarnContext(ctx, "closing a released copy failed", slog.Any("error", err))
 	}
 	if err := n.reg.ReleaseCopy(ctx, l.copy); err != nil && !errors.Is(err, store.ErrLeaseLost) {

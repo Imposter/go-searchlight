@@ -395,7 +395,7 @@ func (n *Node) Drain(ctx context.Context) {
 // retire stops a copy's tailer and its serving, then marks it retiring in the registry
 // (in that order: a running tailer could still promote it to serving).
 func (n *Node) retire(ctx context.Context, l *lease) {
-	if err := n.UnhostCopy(ctx, l.copy.Shard, false); err != nil {
+	if err := n.UnhostCopy(ctx, l.copy, false); err != nil {
 		n.log.WarnContext(ctx, "closing a retiring copy failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
 	}
 	if err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); err != nil && !errors.Is(err, store.ErrLeaseLost) {
@@ -421,7 +421,7 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.closeBackground()
 		var errs []error
 		for _, l := range n.leaseList() {
-			if err := n.UnhostCopy(ctx, l.copy.Shard, false); err != nil {
+			if err := n.UnhostCopy(ctx, l.copy, false); err != nil {
 				errs = append(errs, err)
 			}
 			if !l.retired.Load() {
@@ -468,7 +468,7 @@ func (n *Node) kill() {
 		n.closeBackground()
 		ctx := context.Background()
 		for _, l := range n.leaseList() {
-			_ = n.AbandonCopy(ctx, l.copy.Shard)
+			_ = n.AbandonCopy(ctx, l.copy)
 			n.dropLease(l.copy.Shard)
 		}
 		n.hints.close()

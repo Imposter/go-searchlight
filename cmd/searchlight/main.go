@@ -1,6 +1,7 @@
 // Command searchlight runs a Searchlight node. Settings come from --flags and
-// SEARCHLIGHT_* environment variables (run with -h for the list); only store_url is
-// required, and store_url and cluster_token may be read from SEARCHLIGHT_<NAME>_FILE.
+// SEARCHLIGHT_* environment variables (run with -h for the list). store_url is required,
+// and so is tokens_file unless insecure_no_auth is set; store_url and cluster_token may
+// be read from SEARCHLIGHT_<NAME>_FILE.
 //
 // A node is always a cluster.Node, a cluster of one included. It starts in this order:
 // telemetry and the admin listener (/healthz, /readyz, /metrics and, when enabled,

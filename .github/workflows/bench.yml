@@ -13,6 +13,10 @@ on:
         description: "saved-search set sizes (comma-separated)"
         default: "1k,10k,100k"
         required: false
+      runner:
+        description: "runner label; the default ubuntu-latest (~7 GB RAM) caps 'docs' at 1,000,000 — use a self-hosted or larger runner for more"
+        default: "ubuntu-latest"
+        required: false
   schedule:
     - cron: "0 7 * * 1" # Monday 07:00 UTC
 
@@ -26,11 +30,12 @@ concurrency:
 jobs:
   bench:
     name: slbench vs Elasticsearch
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 180
     env:
       DOCS: ${{ inputs.docs || '1m' }}
       SEARCHES: ${{ inputs.searches || '1k,10k,100k' }}
+      RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-latest' }}
       DATA_DIR: ${{ github.workspace }}/.bench-data
       SL_DIR: ${{ github.workspace }}/.bench-sl
     steps:
@@ -40,6 +45,37 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: size the run to the runner
+        run: |
+          to_n() {
+            case "$1" in
+              *m) echo $(( ${1%m} * 1000000 ));;
+              *k) echo $(( ${1%k} * 1000 ));;
+              *) echo "$1";;
+            esac
+          }
+          N=$(to_n "$DOCS")
+          echo "DOCS_N=$N" >> "$GITHUB_ENV"
+          # ubuntu-latest has ~7 GB RAM: Elasticsearch's heap, Searchlight's RSS, Docker
+          # and the OS all have to fit beside the dataset's indexes. Measured so far
+          # (bench/testdata/smoke-report.md, an in-process 50k-document run) only
+          # bounds a smoke-sized dataset; until a real standalone-process measurement
+          # at 1M exists, 1,000,000 documents is the agreed ceiling on this runner.
+          # Pass a 'runner' input naming a self-hosted or larger runner for more.
+          if [ "$RUNNER_LABEL" = "ubuntu-latest" ] && [ "$N" -gt 1000000 ]; then
+            echo "::error::$DOCS documents (>1,000,000) does not fit the default ubuntu-latest runner (~7 GB RAM). Re-run with a 'runner' input naming a self-hosted or larger runner." >&2
+            exit 1
+          fi
+          # Size the Elasticsearch heap to the dataset: roughly 1 GiB per 300k
+          # documents, floor 1g; on the default runner, capped at 3g to leave room for
+          # Searchlight, Docker and the OS in ~7 GB total. A larger 'runner' lifts the
+          # cap along with the document ceiling above.
+          HEAP_GB=$(( (N + 299999) / 300000 ))
+          if [ "$HEAP_GB" -lt 1 ]; then HEAP_GB=1; fi
+          if [ "$RUNNER_LABEL" = "ubuntu-latest" ] && [ "$HEAP_GB" -gt 3 ]; then HEAP_GB=3; fi
+          echo "ES_HEAP=${HEAP_GB}g" >> "$GITHUB_ENV"
+          echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g, runner $RUNNER_LABEL"
+
       - name: build slbench and slserver
         run: |
           go build -o /tmp/slbench ./bench/cmd/slbench
@@ -47,8 +83,6 @@ jobs:
 
       - name: start Elasticsearch
         run: docker compose -f bench/docker-compose.es.yml up -d
-        env:
-          ES_HEAP: 4g
 
       - name: wait for Elasticsearch
         run: |
@@ -70,13 +104,24 @@ jobs:
             > "$SL_DIR/slserver.log" 2>&1 &
           echo $! > "$SL_DIR/slserver.pid"
           for i in $(seq 1 60); do
-            if [ -s "$SL_DIR/info.json" ]; then
-              echo "searchlight is up"
+            [ -s "$SL_DIR/info.json" ] && break
+            sleep 1
+          done
+          if [ ! -s "$SL_DIR/info.json" ]; then
+            echo "searchlight did not write its info file" >&2
+            cat "$SL_DIR/slserver.log" || true
+            exit 1
+          fi
+          SL_URL=$(jq -r .url "$SL_DIR/info.json")
+          echo "SL_URL=$SL_URL" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do
+            if curl -sf "$SL_URL/readyz" >/dev/null; then
+              echo "searchlight is ready"
               exit 0
             fi
             sleep 1
           done
-          echo "searchlight did not report ready" >&2
+          echo "searchlight did not become ready" >&2
           cat "$SL_DIR/slserver.log" || true
           exit 1
 
@@ -96,11 +141,13 @@ jobs:
             --sets "$SEARCHES" \
             --sl-info "$SL_DIR/info.json" \
             --es-url "http://127.0.0.1:9200" \
-            --es-config "heap_max=4.0 GiB" \
+            --es-config "heap_max=${ES_HEAP}" \
             --label "CI (${{ github.sha }})" \
             --out "$DATA_DIR/bench-results.json" \
             --md docs/benchmarks.md \
-            --allow-mismatch
+            --stop-on-mismatch
+          # No --allow-mismatch: an untolerated engine disagreement must fail this job
+          # (exit code 3), not just a line in the report.
         continue-on-error: true
 
       - name: stop Searchlight

@@ -307,12 +307,12 @@ func TestNodeLossMidRecovery(t *testing.T) {
 	var entered atomic.Bool
 	c := newCluster(t, d, func(i int, o *Options) {
 		if i == 0 {
-			o.hooks = &testHooks{peerFile: func(_ string, w httpResponseWriter) httpResponseWriter {
+			o.hooks.peerFile = func(_ string, w httpResponseWriter) httpResponseWriter {
 				if entered.CompareAndSwap(false, true) {
-					<-slow // hold the first file until the node is killed
+					<-slow
 				}
 				return w
-			}}
+			}
 		}
 	})
 	a := c.start(0)

@@ -180,9 +180,9 @@ func TestPeerRecovery100k(t *testing.T) {
 	c := newCluster(t, d, func(i int, o *Options) {
 		heavyLoad(i, o)
 		if i == 0 {
-			o.hooks = &testHooks{peerFile: func(name string, w http.ResponseWriter) http.ResponseWriter {
+			o.hooks.peerFile = func(name string, w http.ResponseWriter) http.ResponseWriter {
 				return bad.wrap(name, cut.wrap(name, w))
-			}}
+			}
 		}
 	})
 	a := c.start(0)
@@ -242,7 +242,7 @@ func TestRecoveryResumesAcrossAttempts(t *testing.T) {
 	failManifest := true
 	c := newCluster(t, d, func(i int, o *Options) {
 		if i == 0 {
-			o.hooks = &testHooks{peerFile: func(name string, w http.ResponseWriter) http.ResponseWriter {
+			o.hooks.peerFile = func(name string, w http.ResponseWriter) http.ResponseWriter {
 				mu.Lock()
 				defer mu.Unlock()
 				if name == "manifest" && failManifest {
@@ -250,7 +250,7 @@ func TestRecoveryResumesAcrossAttempts(t *testing.T) {
 					return &cutWriter{ResponseWriter: w, left: 0}
 				}
 				return w
-			}}
+			}
 		}
 	})
 	a := c.start(0)

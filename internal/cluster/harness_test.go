@@ -318,7 +318,7 @@ func (c *cluster) tryStart(i int) (*tnode, error) {
 	if _, ok := raw.(store.Watcher); ok {
 		tn.st = watchingFaultStore{tn.wrap} // Postgres: the replica Hub runs
 	}
-	o := Options{Store: tn.st, Config: cfg, Version: "test", Logger: quietLogger, AllowSQLiteCluster: true}
+	o := Options{Store: tn.st, Config: cfg, Version: "test", Logger: quietLogger, hooks: &testHooks{allowSQLiteCluster: true}}
 	fastOptions(&o)
 	o.Engine = func(eo *node.Options) {
 		eo.Logger = quietLogger

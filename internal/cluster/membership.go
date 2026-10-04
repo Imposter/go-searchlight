@@ -62,9 +62,9 @@ type lease struct {
 	margin     time.Duration
 	clock      Clock
 	quarantine time.Duration // Clock.Now until which the copy serves nothing; 0: none
-	// claimed is when the claim that granted the lease began (wall clock): a view of
+	// claimed is when the claim that granted the lease began, by Clock.Now: a view of
 	// the registry read before it cannot judge it.
-	claimed time.Time
+	claimed time.Duration
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
 
@@ -109,7 +109,7 @@ func (l *lease) extend(from time.Duration, wall time.Time) {
 }
 
 func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time) *lease {
-	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock, claimed: wall}
+	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock, claimed: from}
 	l.deadline.Store(int64(from + l.ttl))
 	l.wallBefore.Store(wall.UnixNano())
 	if c.TakenFrom != "" && c.TakenFrom != n.id {
@@ -387,6 +387,7 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 // view is the registry as last read: the nodes and every shard's copies.
 type view struct {
 	at     time.Time
+	read   time.Duration // Clock.Now when the registry read began
 	nodes  map[string]store.Node
 	live   map[string]bool
 	copies map[store.ShardID][]store.Copy
@@ -428,7 +429,7 @@ func (v *view) servingBelow(id store.ShardID, self string, slot int) int {
 // takenOver reports whether the registry, read after l's claim, shows its slot held by
 // another node, or by another incarnation.
 func (v *view) takenOver(l *lease) bool {
-	if v.at.IsZero() || !v.at.After(l.claimed) {
+	if v.at.IsZero() || v.read <= l.claimed {
 		return false
 	}
 	c := &l.copy
@@ -443,7 +444,7 @@ func (v *view) takenOver(l *lease) bool {
 
 // refreshView reads the registry.
 func (n *Node) refreshView(ctx context.Context) error {
-	readAt := n.clock.Wall()
+	readAt := n.clock.Now()
 	nodes, err := n.reg.Nodes(ctx)
 	if err != nil {
 		n.NoteDB(err)
@@ -454,7 +455,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v := &view{at: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
+	v := &view{at: time.Now(), read: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
 	for _, nd := range nodes {
 		v.nodes[nd.ID] = nd
 		if nd.HeartbeatAge < n.opts.DeadAfter {

@@ -78,8 +78,7 @@ type fetcher struct {
 	mu      sync.Mutex
 	running map[store.ShardID]*atomic.Int64
 	fetched map[store.ShardID]*atomic.Int64
-	// ended is when each shard's last recovery here ended (staging collection).
-	ended map[store.ShardID]time.Time
+	ended   map[store.ShardID]time.Time
 }
 
 // begin marks id recovering; the returned func ends it.
@@ -148,7 +147,7 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 		delay := 100 * time.Millisecond
 		for attempt := 1; attempt <= fetchAttempts; attempt++ {
 			start := time.Now()
-			progress.Store(0) // per attempt: a retry that redoes the work is no progress
+			progress.Store(0)
 			bytes, err := f.fetchFrom(ctx, c, id, dir, staging)
 			if err == nil {
 				_ = os.RemoveAll(staging)

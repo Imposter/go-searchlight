@@ -333,9 +333,9 @@ func TestStoppedNodeKeepsItsTail(t *testing.T) {
 // TestSQLiteServesOneNode (fix round 2): on SQLite a second live node refuses to join
 // (production SQLite is single-node); once the first has stopped and deregistered,
 // another node may take its place. In-process tests opt in to multi-node SQLite with
-// Options.AllowSQLiteCluster.
+// their test hooks.
 func TestSQLiteServesOneNode(t *testing.T) {
-	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.AllowSQLiteCluster = false })
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.hooks.allowSQLiteCluster = false })
 	a := c.start(0)
 	createIndex(t, a.n, "one", 1, 0)
 	if _, err := c.tryStart(1); !errors.Is(err, ErrSQLiteCluster) {
@@ -397,5 +397,18 @@ func TestProgressHighWaterMark(t *testing.T) {
 		if got := n.progressMark(k, step.now); got != step.want {
 			t.Fatalf("progress %d after %d, want %d", got, step.now, step.want)
 		}
+	}
+	// A copy no longer held (another epoch now) is forgotten.
+	n.forgetProgress(map[copyKey]bool{{node: "n", epoch: 2}: true})
+	if got := n.progressMark(k, 5); got != 5 {
+		t.Fatalf("a forgotten copy's mark is %d, want 5", got)
+	}
+	var p pruneState
+	id := store.ShardID{Index: "i"}
+	p.observe(copyKey{shard: id, node: "a", epoch: 1}, 1, 1, time.Now())
+	p.setBelow(id, 10)
+	p.forget(&view{copies: map[store.ShardID][]store.Copy{}})
+	if len(p.progress) != 0 || len(p.below) != 0 {
+		t.Fatalf("the leader remembers gone copies: %v %v", p.progress, p.below)
 	}
 }

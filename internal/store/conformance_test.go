@@ -1047,8 +1047,13 @@ func TestRetireCopy(t *testing.T) {
 		if retired.Load() != 1 {
 			t.Fatalf("%d copies retired, want 1", retired.Load())
 		}
-		// A copy of n1's slot at an epoch no claim ever gave is fenced off: its row
-		// keeps whatever state it had.
+		// A copy of n1's slot at an epoch no claim ever gave, while n2 serves, passes the
+		// check and is fenced off at the write: its row keeps its state.
+		for _, c := range copies {
+			if err := st.Registry().SetCopyState(ctx, c, CopyServing); err != nil {
+				t.Fatal(err)
+			}
+		}
 		before, err := st.Registry().Copies(ctx, "ret")
 		if err != nil {
 			t.Fatal(err)
@@ -1058,8 +1063,8 @@ func TestRetireCopy(t *testing.T) {
 			stale.Epoch = max(stale.Epoch, c.Epoch)
 		}
 		stale.Epoch += 1000
-		if ok, err := st.Registry().RetireCopy(ctx, stale); ok || (err != nil && !errors.Is(err, ErrLeaseLost)) {
-			t.Fatalf("a stale incarnation's retire: %v %v", ok, err)
+		if ok, err := st.Registry().RetireCopy(ctx, stale); ok || !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("a stale incarnation's retire: %v %v, want ErrLeaseLost", ok, err)
 		}
 		after, err := st.Registry().Copies(ctx, "ret")
 		if err != nil {

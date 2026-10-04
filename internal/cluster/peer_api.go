@@ -378,16 +378,31 @@ func (p *peerAPI) copies(*http.Request) (any, error) {
 func (n *Node) localPeerCopies() []peerCopy {
 	local := n.LocalCopies()
 	out := make([]peerCopy, 0, len(local))
+	held := make(map[copyKey]bool, len(local))
+	defer n.forgetProgress(held)
 	for i := range local {
 		lc := &local[i]
 		id := store.ShardID{Index: lc.Info.Index, Shard: lc.Info.Shard}
 		now := lc.Info.AppliedSeq + int64(lc.Info.Docs) + n.fetch.progressOf(id) //nolint:gosec // a document count
+		k := copyKey{shard: id, node: n.id, epoch: lc.Copy.Epoch}
+		held[k] = true
 		out = append(out, peerCopy{
 			ShardInfo: lc.Info, Epoch: lc.Copy.Epoch, Paused: lc.Paused,
-			Progress: n.progressMark(copyKey{shard: id, node: n.id, epoch: lc.Copy.Epoch}, now),
+			Progress: n.progressMark(k, now),
 		})
 	}
 	return out
+}
+
+// forgetProgress drops the high-water marks of copies (or epochs) no longer held.
+func (n *Node) forgetProgress(held map[copyKey]bool) {
+	n.progressMu.Lock()
+	defer n.progressMu.Unlock()
+	for k := range n.progressHW {
+		if !held[k] {
+			delete(n.progressHW, k)
+		}
+	}
 }
 
 // progressMark raises copy k's progress high-water mark to now and returns it.

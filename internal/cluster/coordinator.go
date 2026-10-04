@@ -135,11 +135,6 @@ type Options struct {
 	// Clock is the monotonic clock lease deadlines are kept by; nil means the
 	// process's.
 	Clock Clock
-	// AllowSQLiteCluster lets several live nodes share a SQLite store. Tests only:
-	// in-process clusters over one file. In production SQLite serves one node, and
-	// Start refuses a second (ErrSQLiteCluster); there is no flag for it.
-	AllowSQLiteCluster bool
-
 	// Engine, when set, adjusts the engine's options (tests: fake tailers, small
 	// shards).
 	Engine func(*node.Options)
@@ -156,6 +151,10 @@ type Options struct {
 
 // testHooks are test seams.
 type testHooks struct {
+	// allowSQLiteCluster lets several live nodes share a SQLite store: in-process
+	// clusters over one file.
+	allowSQLiteCluster bool
+
 	// peerFile wraps the writer a snapshot file is streamed to.
 	peerFile func(name string, w http.ResponseWriter) http.ResponseWriter
 }
@@ -274,12 +273,9 @@ type Node struct {
 	// leases of dropped indexes. Renewals do not take it: they wait on nothing.
 	allocMu sync.Mutex
 
-	// progressHW are this node's copies' progress high-water marks.
 	progressMu sync.Mutex
 	progressHW map[copyKey]int64
 
-	// startedAt is when the node was built: copy directories and staging an earlier
-	// run left count as unused from then.
 	startedAt time.Time
 
 	pins  *pinTable
@@ -445,11 +441,11 @@ func (n *Node) Start(ctx context.Context) error {
 var ErrSQLiteCluster = errors.New("cluster: a SQLite store serves a single node; use Postgres or MySQL for a cluster")
 
 // singleSQLite refuses to join when the store is SQLite and another live node is
-// registered (unless Options.AllowSQLiteCluster, for in-process tests). The node checks
+// registered (in-process tests aside). The node checks
 // after registering, so of two nodes starting at once at least one sees the other; it
 // deregisters before it fails.
 func (n *Node) singleSQLite(ctx context.Context) error {
-	if n.st.Dialect() != "sqlite" || n.opts.AllowSQLiteCluster {
+	if n.st.Dialect() != "sqlite" || (n.opts.hooks != nil && n.opts.hooks.allowSQLiteCluster) {
 		return nil
 	}
 	v := n.view.Load()

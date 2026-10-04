@@ -145,7 +145,31 @@ func (n *Node) pruneAll(ctx context.Context) error {
 			n.prune.setBelow(id, floor+1)
 		}
 	}
+	n.prune.forget(v)
 	return nil
+}
+
+// forget drops what the leader remembers of copies and shards the registry no longer
+// has.
+func (p *pruneState) forget(v *view) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	present := map[copyKey]bool{}
+	for id, list := range v.copies {
+		for i := range list {
+			present[copyKey{shard: id, node: list[i].NodeID, epoch: list[i].Epoch}] = true
+		}
+	}
+	for k := range p.progress {
+		if !present[k] {
+			delete(p.progress, k)
+		}
+	}
+	for id := range p.below {
+		if _, ok := v.copies[id]; !ok {
+			delete(p.below, id)
+		}
+	}
 }
 
 // releaseDecommissioned deletes the retiring rows of nodes gone from sl_nodes (they
@@ -357,7 +381,7 @@ func (n *Node) collectUnused(ctx context.Context) {
 	for _, d := range n.UnhostedCopyDirs() {
 		since := d.UnhostedAt
 		if since.IsZero() {
-			since = n.startedAt // left by an earlier run: unused since this one began
+			since = n.startedAt
 		}
 		if n.leaseFor(d.Shard) != nil || !settled(d.Shard) || time.Since(since) < n.opts.CopyDirGrace {
 			continue

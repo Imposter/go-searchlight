@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,7 @@ type sqlStore struct {
 	beforeCommit func(ctx context.Context, first, last int64)
 
 	gateKey string // the shared gate's key, released at Close
+	walPath string // the write-ahead log file (SQLite)
 	// stopBg stops the background checkpointer; bg waits for it.
 	stopBg context.CancelFunc
 	bg     sync.WaitGroup
@@ -70,7 +72,7 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 	if pools.Write.Stats().MaxOpenConnections == 1 {
 		// One write connection (SQLite): queue writers in lanes (gate.go), one gate
 		// for every store of this process on the same database file.
-		s.w.g, s.gateKey = acquireGate(o.gateKey), o.gateKey
+		s.w.g, s.gateKey, s.walPath = acquireGate(o.gateKey), o.gateKey, o.walPath
 	}
 	if d.Checkpoint != "" && d.CheckpointEvery > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -191,6 +193,11 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if s.d.CheckpointMinLog > 0 && s.walPath != "" {
+			if info, err := os.Stat(s.walPath); err == nil && info.Size() < s.d.CheckpointMinLog {
+				continue // the log is short: no checkpoint (and no fsync) yet
+			}
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
 		if _, err := s.r.ExecContext(cctx, s.d.Checkpoint); err != nil && ctx.Err() == nil {

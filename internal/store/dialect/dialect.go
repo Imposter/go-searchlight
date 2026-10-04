@@ -77,8 +77,9 @@ type Dialect struct {
 	// TruncateAbove the store empties it with TruncateCheckpoint, which blocks every
 	// writer while it runs. It does so on the write connection: when the writers are
 	// idle and at most TruncateMaxPending is left to copy; or, when they have not been
-	// idle for TruncateAfterTicks checks, next in line after the commit in flight
-	// (whatever that commit left to copy).
+	// idle for TruncateAfterTicks checks or the file has grown past twice
+	// TruncateAbove, next in line after the commit in flight (whatever the commits
+	// since the last checkpoint left to copy).
 	Checkpoint         string
 	TruncateCheckpoint string
 	TruncateAbove      int64

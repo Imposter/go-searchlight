@@ -76,7 +76,10 @@ func (n *Node) allocatePass(ctx context.Context, only string, startup, eager boo
 	return errors.Join(errs...)
 }
 
-// allocateShard claims, keeps or releases this node's copy of id.
+// allocateShard claims, keeps or releases this node's copy of id. A shard no node has
+// claimed yet (a new index) is left for three heartbeats to the node that created its
+// index, which claims eagerly: so CreateIndex answers once a copy of every shard
+// serves.
 func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id store.ShardID, startup, eager bool) error {
 	if l := n.leaseFor(id); l != nil {
 		if c, ok := n.Hosted(id); (ok && c.Epoch == l.copy.Epoch) || l.retired.Load() {
@@ -111,7 +114,8 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 		if n.opts.Capacity > 0 && n.leaseCount() >= n.opts.Capacity {
 			return nil
 		}
-		if target > 0 && !eager && !n.firstInLine(v, id) && !n.alloc.waited(id, 3*n.opts.HeartbeatInterval) {
+		unclaimed := len(v.copies[id]) == 0
+		if !eager && (unclaimed || (target > 0 && !n.firstInLine(v, id))) && !n.alloc.waited(id, 3*n.opts.HeartbeatInterval) {
 			return nil
 		}
 	}

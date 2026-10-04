@@ -220,12 +220,12 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
 		frames, copied, err := s.checkpoint(cctx)
-		if err == nil && oversized && copied == frames {
+		if err == nil && oversized {
 			var truncated bool
 			switch {
 			case s.writersIdle():
 				truncated, err = s.truncate(cctx, s.d.TruncateMaxPending)
-			case busyTicks+1 >= s.d.TruncateAfterTicks:
+			case busyTicks+1 >= s.d.TruncateAfterTicks || size > 2*s.d.TruncateAbove:
 				truncated, err = s.truncate(withHighLane(cctx), -1)
 			}
 			busyTicks++

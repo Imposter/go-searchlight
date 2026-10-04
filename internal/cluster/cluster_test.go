@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -789,4 +790,35 @@ func TestEnsureIndexAcrossNodes(t *testing.T) {
 	if !cachedOnce {
 		t.Skip("every create on A outlasted the 404 B remembered; the sequence was not exercised")
 	}
+}
+
+// TestUnclaimedShardIsLeftToItsCreator: a shard no node has claimed (an index the
+// creating node has not allocated yet) is left alone by the other nodes for three
+// heartbeats, so the creator's eager claim wins it; after that another node takes it.
+func TestUnclaimedShardIsLeftToItsCreator(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	c.start(1)
+	settings, err := json.Marshal(api.IndexSettings{Shards: 1, ReplicasPerShard: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.st.Indexes().Create(tctx(t), store.IndexMeta{Name: "orphan", Mapping: []byte(`{}`), Settings: settings}); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now()
+	id := store.ShardID{Index: "orphan", Shard: 0}
+	heartbeat := 200 * time.Millisecond
+	for time.Since(created) < 2*heartbeat {
+		if copies, err := a.st.Registry().Copies(tctx(t), "orphan"); err != nil || len(copies) > 0 {
+			t.Fatalf("a shard no node created was claimed %s after the index appeared: %+v, %v", time.Since(created), copies, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	eventually(t, 30*time.Second, "another node claims the shard", func() error {
+		if n, nodes := serving(t, a.st, id); n != 1 {
+			return fmt.Errorf("%d serving on %v", n, nodes)
+		}
+		return nil
+	})
 }

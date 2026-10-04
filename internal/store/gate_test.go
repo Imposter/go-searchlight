@@ -158,7 +158,8 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	if limit := 8*commit + 300*time.Millisecond + truncateHold; worst > limit {
 		t.Fatalf("a renewal took %s under bulk load (limit %s, a truncation of the log included): it queued behind several commits", worst, limit)
 	}
-	if limit := 2 * s.d.TruncateAbove; s.walSize() > limit {
-		t.Fatalf("a steady stream of commits left a %d-byte log (limit %d): it never restarts on its own, and was not truncated", s.walSize(), limit)
+	if limit := 3 * s.d.TruncateAbove; s.truncates.Load() == 0 || s.walSize() > limit {
+		t.Fatalf("a steady stream of commits left a %d-byte log after %d truncations (limit %d): it never restarts on its own",
+			s.walSize(), s.truncates.Load(), limit)
 	}
 }

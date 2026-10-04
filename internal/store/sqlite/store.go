@@ -72,7 +72,7 @@ func Dialect() *dialect.Dialect {
 		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
 		TruncateAbove:      4 * JournalSizeLimit,
 		TruncateMaxPending: 512 << 10,
-		TruncateAfterTicks: 4,
+		TruncateAfterTicks: 2,
 		CheckpointEvery:    CheckpointEvery,
 		CheckpointMinLog:   JournalSizeLimit,
 		PendingLog:         PendingLog,

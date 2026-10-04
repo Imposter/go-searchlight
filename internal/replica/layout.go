@@ -77,7 +77,14 @@ func copyRoot(dir string) string {
 
 // newCopyDir names a fresh copy directory under root.
 func newCopyDir(root string) string {
-	return filepath.Join(root, copyPrefix+strconv.FormatInt(time.Now().UnixNano(), 10))
+	n := time.Now().UnixNano()
+	for {
+		dir := filepath.Join(root, copyPrefix+strconv.FormatInt(n, 10))
+		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+			return dir
+		}
+		n++
+	}
 }
 
 // makeCurrent makes dir root's current copy: a temp file renamed over CURRENT, then the

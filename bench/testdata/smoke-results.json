@@ -1,0 +1,990 @@
+{
+  "schema": 1,
+  "label": "Local smoke (in-process Searchlight only, 50k docs, 1k saved searches)",
+  "started_at": "2026-10-04T13:43:57.5593234Z",
+  "finished_at": "2026-10-04T13:48:22.4147462Z",
+  "environment": {
+    "os": "windows",
+    "arch": "amd64",
+    "kernel": "Windows 10 Pro build 22621",
+    "cpu": "AMD Ryzen 7 3700X 8-Core Processor             ",
+    "cpus": 16,
+    "mem_total_bytes": 0,
+    "go_version": "go1.25.6",
+    "hostname": "Imposter-PC"
+  },
+  "engines": [
+    {
+      "name": "searchlight",
+      "url": "http://127.0.0.1:9680",
+      "version": "bench-inprocess",
+      "config": {
+        "nodes": "1",
+        "store": "SQLite (synchronous=FULL, WAL), in-process"
+      }
+    }
+  ],
+  "dataset": {
+    "docs": 50000,
+    "seed": 1,
+    "file": "E:/tmp/sl-bench-data/products-50k.ndjson",
+    "file_bytes": 43595670,
+    "fields": 18,
+    "saved_search_sets": [
+      1000
+    ],
+    "saved_search_file": "E:/tmp/sl-bench-data/searches-1k.ndjson",
+    "shards": 1,
+    "avg_doc_bytes": 871.9134
+  },
+  "options": {
+    "warmup": 100,
+    "iterations": 1000,
+    "concurrency": 1,
+    "variants": 64,
+    "bulk_batch": 1000,
+    "bulk_concurrency": 4,
+    "percolate_batch": 100,
+    "percolate_concurrency": 4,
+    "page_depth": 10000,
+    "mixed_seconds": 30
+  },
+  "results": [
+    {
+      "workload": "bulk_index",
+      "group": "indexing",
+      "engine": "searchlight",
+      "description": "50000 documents, 1000 per _bulk",
+      "concurrency": 4,
+      "iterations": 50,
+      "ops": 50,
+      "docs": 50000,
+      "errors": 0,
+      "elapsed_s": 90.9182677,
+      "ops_per_s": 0.5499444860188422,
+      "docs_per_s": 549.9444860188422,
+      "latency": {
+        "count": 50,
+        "min_us": 694043.1,
+        "mean_us": 7010459.068,
+        "p50_us": 6933184.511,
+        "p90_us": 8883535.871,
+        "p99_us": 10094016.9,
+        "p999_us": 10094016.9,
+        "max_us": 10094016.9
+      },
+      "values": {
+        "batch": 1000
+      }
+    },
+    {
+      "workload": "footprint",
+      "group": "footprint",
+      "engine": "searchlight",
+      "description": "disk: du E:\\tmp\\sl-bench-data\\sl\\data + E:\\tmp\\sl-bench-data\\sl\\db; RSS: /metrics process_resident_memory_bytes",
+      "ops": 1,
+      "errors": 0,
+      "elapsed_s": 0,
+      "ops_per_s": 0,
+      "values": {
+        "disk_bytes": 200173296,
+        "disk_per_million": 4003465920,
+        "rss_bytes": 248827904,
+        "rss_per_million": 4976558080
+      }
+    },
+    {
+      "workload": "filter_term",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "brand eq (keyword term)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6861506,
+      "ops_per_s": 1457.4059980418292,
+      "docs_per_s": 1457.4059980418292,
+      "latency": {
+        "count": 1000,
+        "min_us": 481.5,
+        "mean_us": 685.2165,
+        "p50_us": 599.039,
+        "p90_us": 1000.447,
+        "p99_us": 1316.863,
+        "p999_us": 1642.495,
+        "max_us": 1761.9
+      }
+    },
+    {
+      "workload": "filter_has",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "tags has_any (keyword list)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6672494,
+      "ops_per_s": 1498.6899950753048,
+      "docs_per_s": 1498.6899950753048,
+      "latency": {
+        "count": 1000,
+        "min_us": 443,
+        "mean_us": 666.5846,
+        "p50_us": 587.263,
+        "p90_us": 981.503,
+        "p99_us": 1439.743,
+        "p999_us": 1620.991,
+        "max_us": 1885.8
+      }
+    },
+    {
+      "workload": "filter_range",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "price between (number range)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6204254,
+      "ops_per_s": 1611.797324867744,
+      "docs_per_s": 1611.797324867744,
+      "latency": {
+        "count": 1000,
+        "min_us": 448.4,
+        "mean_us": 619.5774,
+        "p50_us": 548.351,
+        "p90_us": 902.655,
+        "p99_us": 1437.695,
+        "p999_us": 1610.751,
+        "max_us": 2737.6
+      }
+    },
+    {
+      "workload": "filter_date_range",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "updated_at gte (date range)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.7031183,
+      "ops_per_s": 1422.2357745488916,
+      "docs_per_s": 1422.2357745488916,
+      "latency": {
+        "count": 1000,
+        "min_us": 469.4,
+        "mean_us": 702.6944,
+        "p50_us": 588.799,
+        "p90_us": 949.759,
+        "p99_us": 1709.055,
+        "p999_us": 1908.735,
+        "max_us": 2335.4
+      }
+    },
+    {
+      "workload": "filter_bool",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "category eq ∧ price lte ∧ in_stock ∧ ¬condition eq used",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.7696453,
+      "ops_per_s": 1299.2998203198279,
+      "docs_per_s": 1299.2998203198279,
+      "latency": {
+        "count": 1000,
+        "min_us": 409.2,
+        "mean_us": 768.0949,
+        "p50_us": 663.039,
+        "p90_us": 1111.039,
+        "p99_us": 1773.567,
+        "p999_us": 2215.935,
+        "max_us": 2330.4
+      }
+    },
+    {
+      "workload": "filter_contains",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "title contains (substring)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6381068,
+      "ops_per_s": 1567.1357835396834,
+      "docs_per_s": 1567.1357835396834,
+      "latency": {
+        "count": 1000,
+        "min_us": 393.2,
+        "mean_us": 637.2543000000001,
+        "p50_us": 579.071,
+        "p90_us": 814.079,
+        "p99_us": 1566.719,
+        "p999_us": 1938.431,
+        "max_us": 2006.2
+      }
+    },
+    {
+      "workload": "filter_words",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "title words_all / description words_any (phrases)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6462513,
+      "ops_per_s": 1547.3856687019431,
+      "docs_per_s": 1547.3856687019431,
+      "latency": {
+        "count": 1000,
+        "min_us": 366.5,
+        "mean_us": 645.5375,
+        "p50_us": 588.799,
+        "p90_us": 750.079,
+        "p99_us": 1676.287,
+        "p999_us": 4993.023,
+        "max_us": 8265.4
+      }
+    },
+    {
+      "workload": "filter_prefix",
+      "group": "filter",
+      "engine": "searchlight",
+      "description": "sku starts_with",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.6089142,
+      "ops_per_s": 1642.2674984423095,
+      "docs_per_s": 1642.2674984423095,
+      "latency": {
+        "count": 1000,
+        "min_us": 273.4,
+        "mean_us": 608.0629,
+        "p50_us": 564.735,
+        "p90_us": 696.319,
+        "p99_us": 1567.743,
+        "p999_us": 1892.351,
+        "max_us": 1903.3
+      }
+    },
+    {
+      "workload": "sorted_price_top100",
+      "group": "sorted",
+      "engine": "searchlight",
+      "description": "category eq, sort price desc, size 100",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 3.2667714,
+      "ops_per_s": 306.1126346336937,
+      "docs_per_s": 306.1126346336937,
+      "latency": {
+        "count": 1000,
+        "min_us": 1967,
+        "mean_us": 3266.1626,
+        "p50_us": 3000.319,
+        "p90_us": 4202.495,
+        "p99_us": 5054.463,
+        "p999_us": 6483.967,
+        "max_us": 6940.9
+      }
+    },
+    {
+      "workload": "sorted_recent_top10",
+      "group": "sorted",
+      "engine": "searchlight",
+      "description": "in_stock (most documents), sort updated_at desc, size 10",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.7099687,
+      "ops_per_s": 1408.5127978177065,
+      "docs_per_s": 1408.5127978177065,
+      "latency": {
+        "count": 1000,
+        "min_us": 529.2,
+        "mean_us": 709.3704,
+        "p50_us": 650.751,
+        "p90_us": 829.951,
+        "p99_us": 1829.887,
+        "p999_us": 2310.143,
+        "max_us": 2674.7
+      }
+    },
+    {
+      "workload": "paging_search_after_10000",
+      "group": "sorted",
+      "engine": "searchlight",
+      "description": "in_stock, sort price asc, pages of 100 via search_after to depth 10000 (latency per page)",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 500,
+      "ops": 500,
+      "docs": 500,
+      "errors": 0,
+      "elapsed_s": 1.6322483,
+      "ops_per_s": 306.32594317911065,
+      "docs_per_s": 306.32594317911065,
+      "latency": {
+        "count": 500,
+        "min_us": 927,
+        "mean_us": 3263.1097999999997,
+        "p50_us": 3137.535,
+        "p90_us": 4227.071,
+        "p99_us": 4800.511,
+        "p999_us": 5671.7,
+        "max_us": 5671.7
+      }
+    },
+    {
+      "workload": "agg_terms",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "terms brand size 10",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 1.4152065,
+      "ops_per_s": 706.6106607056992,
+      "docs_per_s": 706.6106607056992,
+      "latency": {
+        "count": 1000,
+        "min_us": 527.6,
+        "mean_us": 1414.5827,
+        "p50_us": 923.135,
+        "p90_us": 2648.063,
+        "p99_us": 3901.439,
+        "p999_us": 4263.935,
+        "max_us": 4540.3
+      }
+    },
+    {
+      "workload": "agg_terms_stats",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "terms category size 10 with a stats(price) sub-aggregation",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 1.1960871,
+      "ops_per_s": 836.0595143948965,
+      "docs_per_s": 836.0595143948965,
+      "latency": {
+        "count": 1000,
+        "min_us": 591.2,
+        "mean_us": 1195.1315,
+        "p50_us": 887.807,
+        "p90_us": 2041.855,
+        "p99_us": 2990.079,
+        "p999_us": 4007.935,
+        "max_us": 4191.6
+      }
+    },
+    {
+      "workload": "agg_range",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "range price, 6 buckets",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.4712061,
+      "ops_per_s": 2122.2136131089983,
+      "docs_per_s": 2122.2136131089983,
+      "latency": {
+        "count": 1000,
+        "min_us": 285.5,
+        "mean_us": 470.67879999999997,
+        "p50_us": 360.191,
+        "p90_us": 735.231,
+        "p99_us": 1190.911,
+        "p999_us": 1480.703,
+        "max_us": 1987
+      }
+    },
+    {
+      "workload": "agg_histogram",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "histogram rating interval 0.5",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.4625996,
+      "ops_per_s": 2161.6966378699854,
+      "docs_per_s": 2161.6966378699854,
+      "latency": {
+        "count": 1000,
+        "min_us": 267.1,
+        "mean_us": 461.8898,
+        "p50_us": 329.471,
+        "p90_us": 803.327,
+        "p99_us": 1116.159,
+        "p999_us": 1405.951,
+        "max_us": 1494.4
+      }
+    },
+    {
+      "workload": "agg_date_histogram",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "date_histogram first_seen calendar month",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.7038833,
+      "ops_per_s": 1420.6900490464825,
+      "docs_per_s": 1420.6900490464825,
+      "latency": {
+        "count": 1000,
+        "min_us": 363.3,
+        "mean_us": 702.9721,
+        "p50_us": 451.583,
+        "p90_us": 1352.703,
+        "p99_us": 1850.367,
+        "p999_us": 2347.007,
+        "max_us": 2393
+      }
+    },
+    {
+      "workload": "agg_stats",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "stats price",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 0.2676876,
+      "ops_per_s": 3735.697880663878,
+      "docs_per_s": 3735.697880663878,
+      "latency": {
+        "count": 1000,
+        "min_us": 198.4,
+        "mean_us": 267.15009999999995,
+        "p50_us": 253.311,
+        "p90_us": 285.439,
+        "p99_us": 807.935,
+        "p999_us": 1037.823,
+        "max_us": 1094.3
+      }
+    },
+    {
+      "workload": "agg_cardinality",
+      "group": "aggs",
+      "engine": "searchlight",
+      "description": "cardinality brand",
+      "concurrency": 1,
+      "warmup": 100,
+      "iterations": 1000,
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 1.8096290000000002,
+      "ops_per_s": 552.5994554684966,
+      "docs_per_s": 552.5994554684966,
+      "latency": {
+        "count": 1000,
+        "min_us": 620.4,
+        "mean_us": 1808.3445,
+        "p50_us": 988.159,
+        "p90_us": 3860.479,
+        "p99_us": 5079.039,
+        "p999_us": 5701.631,
+        "max_us": 7133.9
+      }
+    },
+    {
+      "workload": "refresh_visible",
+      "group": "visibility",
+      "engine": "searchlight",
+      "description": "write without refresh, poll every 10 ms until searchable (latency from the write's start)",
+      "concurrency": 1,
+      "warmup": 2,
+      "iterations": 20,
+      "ops": 20,
+      "docs": 20,
+      "errors": 0,
+      "elapsed_s": 40.1064115,
+      "ops_per_s": 0.49867338542616807,
+      "docs_per_s": 0.49867338542616807,
+      "latency": {
+        "count": 20,
+        "min_us": 1707224,
+        "mean_us": 2005325.195,
+        "p50_us": 1996488.703,
+        "p90_us": 2227175.423,
+        "p99_us": 2451572.5,
+        "p999_us": 2451572.5,
+        "max_us": 2451572.5
+      }
+    },
+    {
+      "workload": "refresh_wait_for",
+      "group": "visibility",
+      "engine": "searchlight",
+      "description": "write with refresh=wait_for (the write's latency); visible on return",
+      "concurrency": 1,
+      "warmup": 2,
+      "iterations": 20,
+      "ops": 20,
+      "docs": 20,
+      "errors": 0,
+      "elapsed_s": 39.1540451,
+      "ops_per_s": 0.5108029055215039,
+      "docs_per_s": 0.5108029055215039,
+      "latency": {
+        "count": 20,
+        "min_us": 1489965,
+        "mean_us": 1957691.385,
+        "p50_us": 1924136.959,
+        "p90_us": 2329935.871,
+        "p99_us": 2419173.1,
+        "p999_us": 2419173.1,
+        "max_us": 2419173.1
+      }
+    },
+    {
+      "workload": "mixed_read",
+      "group": "mixed",
+      "engine": "searchlight",
+      "description": "4 readers (filter, sorted, terms) beside 1 bulk writers",
+      "concurrency": 4,
+      "ops": 91467,
+      "docs": 91467,
+      "errors": 0,
+      "elapsed_s": 30.000503,
+      "ops_per_s": 3048.8488809670957,
+      "docs_per_s": 3048.8488809670957,
+      "latency": {
+        "count": 91467,
+        "min_us": 501.8,
+        "mean_us": 1310.2536750959364,
+        "p50_us": 919.551,
+        "p90_us": 2381.823,
+        "p99_us": 6152.191,
+        "p999_us": 9748.479,
+        "max_us": 18083.3
+      }
+    },
+    {
+      "workload": "mixed_write",
+      "group": "mixed",
+      "engine": "searchlight",
+      "description": "1 writers updating 500 documents per _bulk beside the readers",
+      "concurrency": 1,
+      "ops": 31,
+      "docs": 15500,
+      "errors": 0,
+      "elapsed_s": 30.9341769,
+      "ops_per_s": 1.0021278439123427,
+      "docs_per_s": 501.0639219561714,
+      "latency": {
+        "count": 31,
+        "min_us": 217630.9,
+        "mean_us": 997871.8677419355,
+        "p50_us": 470286.335,
+        "p90_us": 2334130.175,
+        "p99_us": 3602586.5,
+        "p999_us": 3602586.5,
+        "max_us": 3602586.5
+      }
+    },
+    {
+      "workload": "percolator_load_1000",
+      "group": "percolate",
+      "engine": "searchlight",
+      "description": "store saved searches 0..1000",
+      "ops": 1000,
+      "docs": 1000,
+      "errors": 0,
+      "elapsed_s": 20.0705346,
+      "ops_per_s": 49.82428320569
+    },
+    {
+      "workload": "percolate_batch_1000",
+      "group": "percolate",
+      "engine": "searchlight",
+      "description": "100 documents per request against 1000 saved searches",
+      "concurrency": 4,
+      "warmup": 5,
+      "iterations": 50,
+      "ops": 50,
+      "docs": 4996,
+      "errors": 0,
+      "elapsed_s": 0.1598418,
+      "ops_per_s": 312.80929018567105,
+      "docs_per_s": 31255.90427535225,
+      "latency": {
+        "count": 50,
+        "min_us": 10925.1,
+        "mean_us": 12473.706,
+        "p50_us": 12156.927,
+        "p90_us": 13533.183,
+        "p99_us": 15974.1,
+        "p999_us": 15974.1,
+        "max_us": 15974.1
+      }
+    },
+    {
+      "workload": "percolate_single_1000",
+      "group": "percolate",
+      "engine": "searchlight",
+      "description": "one document per request against 1000 saved searches (per-document latency)",
+      "concurrency": 1,
+      "warmup": 30,
+      "iterations": 300,
+      "ops": 300,
+      "docs": 300,
+      "errors": 0,
+      "elapsed_s": 0.0855817,
+      "ops_per_s": 3505.4223040673414,
+      "docs_per_s": 3505.4223040673414,
+      "latency": {
+        "count": 300,
+        "min_us": 225,
+        "mean_us": 284.1913333333333,
+        "p50_us": 278.527,
+        "p90_us": 308.991,
+        "p99_us": 393.215,
+        "p999_us": 1337.2,
+        "max_us": 1337.2
+      }
+    },
+    {
+      "workload": "bulk_percolate",
+      "group": "percolate",
+      "engine": "searchlight",
+      "description": "500 documents written and percolated per request against 1000 saved searches (Elasticsearch: _bulk then percolate)",
+      "concurrency": 1,
+      "warmup": 2,
+      "iterations": 20,
+      "ops": 20,
+      "docs": 10000,
+      "errors": 0,
+      "elapsed_s": 12.0984862,
+      "ops_per_s": 1.6530993770113156,
+      "docs_per_s": 826.5496885056579,
+      "latency": {
+        "count": 20,
+        "min_us": 188581.4,
+        "mean_us": 604816.745,
+        "p50_us": 351797.247,
+        "p90_us": 1675624.447,
+        "p99_us": 2077452.7,
+        "p999_us": 2077452.7,
+        "max_us": 2077452.7
+      }
+    }
+  ],
+  "cross_check": {
+    "ran": false,
+    "checked": 0,
+    "matched": 0,
+    "tolerated": 0,
+    "skipped": "needs both engines"
+  },
+  "caveats": [
+    {
+      "area": "text normalization",
+      "difference": "Searchlight folds text with Python's str.casefold (ß→ss, ligatures, Cherokee), its str.isspace whitespace set, and NFKC before words; Elasticsearch's lowercase filter is Java's per-code-point toLowerCase and stock Elasticsearch has no NFKC or case folding without the ICU plugin.",
+      "choice": "A custom normalizer: two pattern_replace char filters (trim, then fold runs of Python's whitespace set to one space) and lowercase. It equals Searchlight on every ASCII text and on all whitespace.",
+      "benchmark": "Generated data is ASCII, so the normalizations agree exactly; the cross-check would flag any disagreement."
+    },
+    {
+      "area": "eq, ne, in, starts_with on keyword and text",
+      "difference": "None for ASCII: both compare the whole normalized value.",
+      "choice": "term / terms / prefix on the normalized keyword (the field itself); ne is bool.must_not, which like Searchlight matches documents missing the field.",
+      "benchmark": "Exact."
+    },
+    {
+      "area": "contains, contains_any, contains_all",
+      "difference": "Searchlight tests substrings of the normalized value with a 3-gram prefilter it builds for every keyword and text field. Elasticsearch has no substring index by default; the options are a wildcard query on a keyword (exact, but scans the term dictionary per query), the wildcard field type (an n-gram index, but it takes no normalizer, so case-insensitive matching would need case_insensitive queries that it serves less well), or an n-gram subfield.",
+      "choice": "A 3-gram subfield (ngram tokenizer, min=max=3, every character kept, after the same trim/whitespace char filters, lowercased, positions indexed, no norms). A needle of three or more characters becomes a match_phrase of its 3-grams, which is exact: consecutive windows at consecutive positions are precisely the needle's occurrences. A shorter needle falls back to an exact wildcard *needle* on the normalized keyword. Only fields the workloads query with contains (the title) get the subfield, so Elasticsearch does not pay disk for 3-grams of fields nobody queries that way, while Searchlight indexes 3-grams of every keyword and text field.",
+      "benchmark": "Exact. Disk comparisons favour Elasticsearch here (fewer 3-gram fields)."
+    },
+    {
+      "area": "words_all, words_any",
+      "difference": "Searchlight's words are runs of Python \\w characters after NFKC and case folding, matched as a contiguous padded substring; Elasticsearch's pattern tokenizer [^\\p{L}\\p{N}_]+ is Java's Unicode classes, which differ from Python's str.isalnum on a few code points (combining marks, some numerics).",
+      "choice": "A words subfield (pattern tokenizer [^\\p{L}\\p{N}_]+, lowercase, positions, no norms); each phrase is a match_phrase (slop 0), which is the contiguous-words test.",
+      "benchmark": "Exact on ASCII data."
+    },
+    {
+      "area": "similar",
+      "difference": "pg_trgm similarity has no Elasticsearch query. The fuzzy and more_like_this queries score differently and cannot reproduce a similarity threshold.",
+      "choice": "A painless script query computing pg_trgm similarity over the normalized keyword's doc value (Character.isLetterOrDigit runs, two spaces before and one after, distinct 3-grams, rounded to float like pg_trgm). It is exact for ASCII but evaluates every candidate document, so it is not benchmarked; it needs doc values on the field.",
+      "benchmark": "Cross-checked on the brand field; not a timed workload (Searchlight's trigram index would make the comparison one-sided)."
+    },
+    {
+      "area": "exists, empty and nonempty on lists",
+      "difference": "Searchlight counts an empty list ([]) or a list of blank entries as present (exists: true) with no entries (empty: true); Elasticsearch indexes nothing for [] (exists: false) and indexes a blank entry as the term \"\".",
+      "choice": "exists → exists; exists:false and empty → must_not exists; nonempty → exists.",
+      "benchmark": "The generator never writes an empty list or a blank entry (a listing without tags omits the field), so all three agree."
+    },
+    {
+      "area": "_id",
+      "difference": "Searchlight queries the id normalized (casefolded) and sorts on the exact id; Elasticsearch 8 queries _id exactly and does not sort on it.",
+      "choice": "eq/ne/in on _id become ids queries with the normalized id; every Elasticsearch document carries sl_id, a doc-values-only keyword copy of the id, for sorting and the tie-breaker. contains, starts_with and similar on _id are refused (Elasticsearch's _id field does not support them).",
+      "benchmark": "Generated ids are lowercase (p000000123), so normalized and exact agree. sl_id costs Elasticsearch a little disk."
+    },
+    {
+      "area": "sort and search_after",
+      "difference": "Both sort missing values last in both directions and break ties on the id. Elasticsearch's search_after cursor for a missing value is a sentinel, Searchlight's is null.",
+      "choice": "sort entries get missing: _last and a final sl_id ascending; each engine pages with its own cursor.",
+      "benchmark": "Exact order, compared hit by hit."
+    },
+    {
+      "area": "number fields",
+      "difference": "Searchlight stores every number as float64. Elasticsearch could store whole-number fields as long or scaled_float (smaller), but a term query with a fraction on a long field does not behave as Searchlight's float equality does.",
+      "choice": "double for every number field, so eq, in and ranges compare exactly as Searchlight does.",
+      "benchmark": "Exact. Elasticsearch might save some disk with narrower types."
+    },
+    {
+      "area": "dates",
+      "difference": "None: both store Unix milliseconds, parse RFC 3339 and bare dates, and bucket calendar intervals in UTC with Monday weeks.",
+      "choice": "date with format strict_date_optional_time||epoch_millis.",
+      "benchmark": "Exact."
+    },
+    {
+      "area": "terms aggregation",
+      "difference": "Both order buckets by count, then key; both use shard_size = size*1.5+10 and report doc_count_error_upper_bound. With several shards both may be approximate in the same way, not necessarily on the same buckets. A bool terms key is true/false in Searchlight and 1/0 (key_as_string \"true\") in Elasticsearch.",
+      "choice": "terms with the same size, shard_size and min_doc_count; keys are compared through key_as_string for bools.",
+      "benchmark": "The cross-check compares buckets exactly, and tolerates a difference only when an engine reports a nonzero error bound."
+    },
+    {
+      "area": "cardinality",
+      "difference": "Both are HyperLogLog++ but with different parameters: Searchlight's precision p (default 14, exact below 2^(p-2) values), Elasticsearch's precision_threshold (exact-ish below it, at most 40000).",
+      "choice": "precision_threshold = min(2^(p-2), 40000).",
+      "benchmark": "The cross-check allows 3% relative difference."
+    },
+    {
+      "area": "stats",
+      "difference": "Sums are added in a different order (per segment, per shard), so the last bits of sum and avg can differ.",
+      "choice": "stats.",
+      "benchmark": "The cross-check allows 1e-9 relative difference on sum and avg; count, min and max are exact."
+    },
+    {
+      "area": "percolation",
+      "difference": "Searchlight's _percolate and _bulk?percolate return each document's matching saved-query ids; Elasticsearch's percolate query returns each matching query once with the slots of the documents it matched, limited to max_result_window hits per request. _bulk?percolate (write and percolate in one request) has no Elasticsearch equivalent.",
+      "choice": "A percolator index with the same field mappings; each batch is one percolate query in filter context (no scoring), paged by qid when more than 10000 queries match; the bulk-and-percolate workload sends Elasticsearch a _bulk then a percolate of the same documents.",
+      "benchmark": "Match sets are cross-checked per document."
+    },
+    {
+      "area": "caching",
+      "difference": "Elasticsearch's shard request cache returns a whole cached response for a repeated size-0 request (aggregations); Searchlight has no response cache, only a filter cache like Elasticsearch's node query cache.",
+      "choice": "Every Elasticsearch search is sent with request_cache=false; both filter caches stay on. Each workload also cycles through many query variants.",
+      "benchmark": "Aggregation latencies measure computing the aggregation, on both engines."
+    },
+    {
+      "area": "durability and refresh",
+      "difference": "Searchlight acknowledges a write once its SQL transaction commits (SQLite with synchronous=FULL in the bench); Elasticsearch once its translog is fsynced (index.translog.durability=request, its default).",
+      "choice": "Both acknowledged-means-durable; both refresh every 1 s (set explicitly on Elasticsearch, which also disables its search-idle refresh skipping); one replica-less node each.",
+      "benchmark": "Bulk throughput is compared at equal durability, as spec section 1 requires."
+    },
+    {
+      "area": "scoring",
+      "difference": "Searchlight does not score (v1 non-goal); Elasticsearch scores unless a query is in filter context.",
+      "choice": "Every translated search and percolation runs in constant_score filter context, so Elasticsearch skips scoring and can cache filters.",
+      "benchmark": "No engine pays for relevance."
+    }
+  ],
+  "notes": [
+    "Searchlight ran in the slbench process (bench/internal/slserver over SQLite), so its RSS includes the harness's own memory and the harness shares its CPUs."
+  ],
+  "targets": [
+    {
+      "id": "T1",
+      "area": "Bulk indexing throughput (docs/s per node)",
+      "target": "≥ Elasticsearch, at equal durability (acknowledged = durable)",
+      "workloads": [
+        "bulk_index"
+      ],
+      "searchlight": "550 docs/s",
+      "elasticsearch": "—",
+      "status": "NO BASELINE",
+      "detail": ""
+    },
+    {
+      "id": "T2",
+      "area": "Filter / boolean search latency, p50 and p99",
+      "target": "≤ Elasticsearch",
+      "workloads": [
+        "filter_term",
+        "filter_has",
+        "filter_range",
+        "filter_date_range",
+        "filter_bool",
+        "filter_contains",
+        "filter_words",
+        "filter_prefix"
+      ],
+      "searchlight": "p50 548 µs–663 µs, p99 1.32 ms–1.77 ms",
+      "elasticsearch": "—",
+      "status": "NO BASELINE",
+      "detail": ""
+    },
+    {
+      "id": "T3",
+      "area": "Sorted and paged search, p50 and p99",
+      "target": "≤ Elasticsearch",
+      "workloads": [
+        "sorted_price_top100",
+        "sorted_recent_top10",
+        "paging_search_after_10000"
+      ],
+      "searchlight": "p50 651 µs–3.14 ms, p99 1.83 ms–5.05 ms",
+      "elasticsearch": "—",
+      "status": "NO BASELINE",
+      "detail": ""
+    },
+    {
+      "id": "T4",
+      "area": "Aggregation latency (terms, range, histogram, stats)",
+      "target": "≤ Elasticsearch",
+      "workloads": [
+        "agg_terms",
+        "agg_terms_stats",
+        "agg_range",
+        "agg_histogram",
+        "agg_date_histogram",
+        "agg_stats",
+        "agg_cardinality"
+      ],
+      "searchlight": "p50 253 µs–988 µs, p99 808 µs–5.08 ms",
+      "elasticsearch": "—",
+      "status": "NO BASELINE",
+      "detail": ""
+    },
+    {
+      "id": "T5",
+      "area": "Percolation throughput (docs/s against 10k / 100k saved queries)",
+      "target": "≥ 10× Elasticsearch's percolator, with p99 per document \u003c 1 ms at 100k queries",
+      "workloads": [
+        "percolator_load_1000",
+        "percolate_batch_1000",
+        "percolate_single_1000",
+        "bulk_percolate"
+      ],
+      "searchlight": "10k: —; 100k: —",
+      "elasticsearch": "10k: —; 100k: —",
+      "status": "NOT MEASURED",
+      "detail": "percolate_batch_10000 not run (the run's largest saved-search set is smaller). percolate_batch_100000 not run (the run's largest saved-search set is smaller). percolate_single_100000 not run, so the 1 ms p99 is unchecked."
+    },
+    {
+      "id": "T6",
+      "area": "Index size on disk and resident memory per million documents",
+      "target": "≤ Elasticsearch",
+      "workloads": [
+        "footprint"
+      ],
+      "searchlight": "disk 3.73 GiB/M, RSS 4.63 GiB/M",
+      "elasticsearch": "—",
+      "status": "NO BASELINE",
+      "detail": ""
+    },
+    {
+      "id": "T7",
+      "area": "Write-to-visible latency",
+      "target": "≤ 1 s by default (the refresh interval), and refresh=wait_for like Elasticsearch",
+      "workloads": [
+        "refresh_visible",
+        "refresh_wait_for"
+      ],
+      "searchlight": "visible p50 2 s p99 2.45 s; wait_for p50 1.92 s p99 2.42 s",
+      "elasticsearch": "—",
+      "status": "FAIL",
+      "detail": "p99 write-to-visible 2.45 s exceeds 1 s + 100 ms."
+    },
+    {
+      "id": "T8",
+      "area": "New replica from zero to serving (10M docs)",
+      "target": "≤ Elasticsearch peer recovery",
+      "workloads": null,
+      "searchlight": "",
+      "elasticsearch": "",
+      "status": "NOT MEASURED",
+      "detail": "Needs the cluster (Task 11: peer recovery) and a second node; slbench has no recovery workload until the cluster is merged."
+    },
+    {
+      "id": "T9",
+      "area": "Node restart to serving",
+      "target": "seconds, not proportional to index size (segments are reopened, not rebuilt)",
+      "workloads": [
+        "restart"
+      ],
+      "searchlight": "",
+      "elasticsearch": "",
+      "status": "NOT MEASURED",
+      "detail": "No restart command was given (slbench run --sl-restart-cmd)."
+    },
+    {
+      "id": "T10",
+      "area": "Replica failure",
+      "target": "no lost acknowledged write, no client-visible error with ≥ 2 replicas",
+      "workloads": null,
+      "searchlight": "",
+      "elasticsearch": "",
+      "status": "NOT MEASURED",
+      "detail": "A correctness property under failure: the chaos suite's job (Task 13b), not a performance workload."
+    },
+    {
+      "id": "T11",
+      "area": "Scale",
+      "target": "larger than RAM per node (memory-mapped segments), many nodes through shards",
+      "workloads": null,
+      "searchlight": "",
+      "elasticsearch": "",
+      "status": "NOT MEASURED",
+      "detail": "Needs a dataset larger than the host's RAM (slbench gen --docs 10000000 on a small host) and the cluster for many nodes."
+    }
+  ]
+}

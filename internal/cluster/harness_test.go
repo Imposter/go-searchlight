@@ -372,13 +372,19 @@ func (c *cluster) live() []*tnode {
 	return out
 }
 
-// stop shuts node i down gracefully, as a rolling restart does: drain, then the
-// listener, then the node.
+// stopGrace is how long a stopping node's listener keeps serving after it drains, as
+// the API's shutdown_grace (2 s by default) does, scaled to the test's 25 ms view
+// interval: peers route new reads elsewhere, and reads under way finish their fetches.
+const stopGrace = 500 * time.Millisecond
+
+// stop shuts node i down gracefully, as a rolling restart does: drain, the grace, then
+// the listener, then the node.
 func (tn *tnode) stop() {
 	tn.c.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	tn.n.Drain(ctx)
+	time.Sleep(stopGrace)
 	_ = tn.srv.Shutdown(ctx)
 	if err := tn.n.Stop(ctx); err != nil {
 		tn.c.t.Errorf("stop node %d: %v", tn.i, err)

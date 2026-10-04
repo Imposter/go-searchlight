@@ -51,6 +51,7 @@ type sqlStore struct {
 	bg          sync.WaitGroup
 	walGauge    metric.Float64Gauge
 	checkpoints atomic.Int64
+	truncates   atomic.Int64
 	logWarn     atomic.Int64
 
 	reg   *registry
@@ -187,12 +188,14 @@ func (s *sqlStore) Close() error {
 	return s.pools.Close()
 }
 
-// checkpointLoop checkpoints the write-ahead log off the write path until ctx ends:
-// every CheckpointEvery it reads how much of the log is pending and records the log's
-// size; it runs Checkpoint once CheckpointMinLog is pending, and TruncateCheckpoint
-// when the file has grown past that with little pending, which empties the file. A
-// checkpoint a long reader keeps from copying every frame, with the log past
-// LogWarnBytes, is warned about at most once a minute.
+// checkpointLoop checkpoints the write-ahead log off the write path until ctx ends.
+// Every CheckpointEvery it records the log's size and how much of it is pending, and
+// runs Checkpoint once CheckpointMinLog is pending. A log copied back in full is
+// restarted by the next write, and journal_size_limit cuts its file down then; under
+// a steady stream of writes that moment never comes, so once the file has grown past
+// TruncateAbove the loop also empties it (truncate). A checkpoint a long reader keeps
+// from copying every frame, with the log past LogWarnBytes, is warned about at most
+// once a minute.
 func (s *sqlStore) checkpointLoop(ctx context.Context) {
 	t := time.NewTicker(s.d.CheckpointEvery)
 	defer t.Stop()
@@ -210,18 +213,16 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 		}
 		s.walGauge.Record(ctx, float64(size), metric.WithAttributes(s.attr, attribute.Bool("pending", false)))
 		s.walGauge.Record(ctx, float64(pending), metric.WithAttributes(s.attr, attribute.Bool("pending", true)))
-		stmt := s.d.Checkpoint
-		switch {
-		case pending >= s.d.CheckpointMinLog:
-		case size > s.d.CheckpointMinLog && s.d.TruncateCheckpoint != "":
-			stmt = s.d.TruncateCheckpoint
-		default:
+		oversized := pending > 0 && s.d.TruncateCheckpoint != "" && size > s.d.TruncateAbove
+		if pending < s.d.CheckpointMinLog && !oversized {
 			continue
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
-		frames, copied, err := s.checkpoint(cctx, stmt)
+		frames, copied, err := s.checkpoint(cctx)
+		if err == nil && oversized && copied == frames {
+			err = s.truncate(cctx)
+		}
 		cancel()
-		s.checkpoints.Add(1)
 		switch {
 		case err != nil:
 			if ctx.Err() == nil {
@@ -235,35 +236,48 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 	}
 }
 
-// truncateBusyMS bounds how long a truncating checkpoint waits for readers: it holds
-// the write lock while it waits, so every writer waits with it.
+// checkpoint runs Checkpoint on a read connection, beside the writers, and returns
+// the log's frames and those copied back.
+func (s *sqlStore) checkpoint(ctx context.Context) (frames, copied int64, err error) {
+	s.checkpoints.Add(1)
+	var busy int64
+	err = s.r.QueryRowContext(ctx, s.d.Checkpoint).Scan(&busy, &frames, &copied)
+	return frames, copied, err
+}
+
+// truncateBusyMS bounds how long truncate waits for readers while it holds the write
+// connection.
 const truncateBusyMS = 50
 
-// checkpoint runs stmt on a read connection and returns the log's frames and those
-// copied back. A truncating checkpoint gives up after truncateBusyMS on readers.
-func (s *sqlStore) checkpoint(ctx context.Context, stmt string) (frames, copied int64, err error) {
-	conn, err := s.r.Conn(ctx)
+// truncate empties the log file with TruncateCheckpoint, right after a passive one so
+// that little is left to copy. It blocks every writer while it runs, so it takes the
+// write connection in the high lane, as soon as the commit in flight ends, leaving
+// only that commit's frames to copy (more than CheckpointMinLog: it leaves the log to
+// a later tick), and gives up after truncateBusyMS on readers.
+func (s *sqlStore) truncate(ctx context.Context) error {
+	conn, err := s.w.Conn(withHighLane(ctx))
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	defer conn.Close()
-	if stmt == s.d.TruncateCheckpoint {
-		var was int64
-		if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&was); err != nil {
-			return 0, 0, err
-		}
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", truncateBusyMS)); err != nil {
-			return 0, 0, err
-		}
-		defer func() {
-			if _, rerr := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout = %d", was)); rerr != nil {
-				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-			}
-		}()
+	if pending, err := s.d.PendingLog(s.dbPath); err != nil || pending > s.d.CheckpointMinLog {
+		return err
 	}
-	var busy int64
-	err = conn.QueryRowContext(ctx, stmt).Scan(&busy, &frames, &copied)
-	return frames, copied, err
+	var was int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&was); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", truncateBusyMS)); err != nil {
+		return err
+	}
+	defer func() {
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout = %d", was)); err != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+	}()
+	s.truncates.Add(1)
+	var busy, frames, copied int64
+	return conn.QueryRowContext(ctx, s.d.TruncateCheckpoint).Scan(&busy, &frames, &copied)
 }
 
 // walSize is the write-ahead log file's size, 0 when there is none.

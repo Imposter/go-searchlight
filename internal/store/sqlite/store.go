@@ -70,6 +70,7 @@ func Dialect() *dialect.Dialect {
 		// a read connection keeps the log short instead, off every commit's path.
 		Checkpoint:         "PRAGMA wal_checkpoint(PASSIVE)",
 		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
+		TruncateAbove:      4 * JournalSizeLimit,
 		CheckpointEvery:    CheckpointEvery,
 		CheckpointMinLog:   JournalSizeLimit,
 		PendingLog:         PendingLog,

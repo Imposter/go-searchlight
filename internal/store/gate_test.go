@@ -138,14 +138,21 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	sorted := slices.Clone(renewals)
 	slices.Sort(sorted)
 	median := sorted[len(sorted)/2]
-	t.Logf("renewals: median %s, slowest %s; a bulk commit (2000 changes) holds the connection %s on average (%d commits)",
-		median, worst, commit, done)
-	// Typically one commit in flight; now and then that commit is the one that runs
-	// SQLite's WAL checkpoint, several times longer.
+	s, ok := st.(*sqlStore)
+	if !ok {
+		t.Fatalf("%T is not the SQL store", st)
+	}
+	t.Logf("renewals: median %s, slowest %s; a bulk commit (2000 changes) holds the connection %s on average (%d commits); log file %d bytes, %d truncations",
+		median, worst, commit, done, s.walSize(), s.truncates.Load())
+	// Typically one commit in flight; now and then the write connection is truncating
+	// the log instead.
 	if limit := 2*commit + 50*time.Millisecond; median > limit {
 		t.Fatalf("the median renewal took %s under bulk load, more than about one commit in flight (%s)", median, limit)
 	}
 	if limit := 6*commit + 200*time.Millisecond; worst > limit {
 		t.Fatalf("a renewal took %s under bulk load (limit %s): it queued behind several commits", worst, limit)
+	}
+	if limit := 2 * s.d.TruncateAbove; s.walSize() > limit {
+		t.Fatalf("a steady stream of commits left a %d-byte log (limit %d): it never restarts on its own, and was not truncated", s.walSize(), limit)
 	}
 }

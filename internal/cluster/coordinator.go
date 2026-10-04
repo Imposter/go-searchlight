@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -324,6 +325,10 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	if o.Config.TLSCert != "" {
 		n.scheme = "https"
 	}
+	if n.scheme == "http" && o.Config.ClusterToken != "" && !loopbackAddress(o.Config.AdvertiseAddress) {
+		n.log.WarnContext(ctx, "cluster_token is sent in the clear: advertise_address is not loopback and tls_cert is unset",
+			slog.String("address", o.Config.AdvertiseAddress))
+	}
 	n.inst = newInstruments(o.Meter, n.log)
 	transport := o.Transport
 	if transport == nil {
@@ -364,6 +369,19 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	n.Single = single
 	n.loopCtx, n.loopCancel = context.WithCancel(context.WithoutCancel(ctx))
 	return n, nil
+}
+
+// loopbackAddress reports whether addr (a host:port, or a bare host) resolves to the
+// loopback interface: a plain-http cluster_token never leaves the machine then.
+// A host that is not a literal IP (a hostname) is treated as non-loopback, since it may
+// resolve to a reachable address depending on DNS.
+func loopbackAddress(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ID is the node's id.

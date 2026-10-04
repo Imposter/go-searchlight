@@ -92,7 +92,7 @@ The whole dataset loaded through `_bulk` at a fixed concurrency; each batch is a
 
 ## Refresh to searchable
 
-`refresh_visible`: one document written without refresh, then polled (every 10 ms) until a search finds it; latency runs from the write's start. `refresh_wait_for`: the write's own latency with `refresh=wait_for`, then an immediate search must find it.
+Each measured write first sleeps a random, unmeasured delay uniform on [0, refresh interval) — seeded and identical for both engines at the same iteration — so writes land at a random point in the refresh cycle instead of, as a closed loop otherwise would, right after the previous one's own refresh. `refresh_visible`: one document written without refresh, then polled (every 10 ms) until a search finds it; latency runs from the write's start (after its delay). `refresh_wait_for`: the write's own latency with `refresh=wait_for` (also after its delay), then an immediate search must find it.
 
 | workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

@@ -450,3 +450,127 @@ func TestBulkLoadSurfacesRealErrorNotContextCanceled(t *testing.T) {
 		t.Fatalf("err = %v (%T), want the *StatusError (429) that actually failed the load", err, err)
 	}
 }
+
+// TestWriteJitterDeterministicAndBounded checks writeJitter's contract: uniform on
+// [0, interval), the same (seed, workload, i) always gives the same delay (so a run
+// is reproducible and, at a given i, identical across engines), and different i
+// mostly gives different delays (it is not a constant in disguise).
+func TestWriteJitterDeterministicAndBounded(t *testing.T) {
+	const interval = 150 * time.Millisecond
+	seen := map[time.Duration]bool{}
+	for i := range 50 {
+		d := writeJitter(7, "refresh_visible", i, interval)
+		if d < 0 || d >= interval {
+			t.Fatalf("writeJitter(i=%d) = %v, want [0, %v)", i, d, interval)
+		}
+		if again := writeJitter(7, "refresh_visible", i, interval); again != d {
+			t.Fatalf("writeJitter(i=%d) = %v then %v: not deterministic", i, d, again)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 25 {
+		t.Fatalf("only %d distinct delays across 50 i's, want a spread, not a near-constant", len(seen))
+	}
+	// A different workload name must not collapse to the same sequence (refresh_visible
+	// and refresh_wait_for, run back to back for the same engine, would otherwise apply
+	// identical delays at identical i's for no reason).
+	if writeJitter(7, "refresh_wait_for", 3, interval) == writeJitter(7, "refresh_visible", 3, interval) {
+		t.Fatalf("refresh_visible and refresh_wait_for got the same delay at i=3: want them independent")
+	}
+	// interval 0 (an engine with refresh disabled) never sleeps.
+	if d := writeJitter(7, "refresh_visible", 0, 0); d != 0 {
+		t.Fatalf("writeJitter with interval 0 = %v, want 0", d)
+	}
+}
+
+// fakeVisWork is how long fakeVisEngine's Bulk and Search each pretend to take: real
+// enough to measure (a real HTTP round trip never clocks in at exactly 0, but an
+// in-process fake call can, on a coarse clock), yet tiny next to the test's jitter
+// interval, so a recorded latency near fakeVisWork means the jitter was excluded and
+// one near the interval means it leaked in.
+const fakeVisWork = 2 * time.Millisecond
+
+// fakeVisEngine is an Engine whose Bulk and Search each take fakeVisWork and then
+// succeed (Prepare needs no real translation): standing in for a real engine's
+// write-then-poll in TestVisibilityExcludesJitterFromMeasuredLatency, so that test's
+// measured latency is close to the refresh interval if the jitter is not excluded,
+// and close to fakeVisWork if it is.
+type fakeVisEngine struct {
+	Engine
+	name string
+}
+
+func (f *fakeVisEngine) Name() string { return f.name }
+
+type fakePrepared struct{}
+
+func (fakePrepared) isPrepared() {}
+
+func (f *fakeVisEngine) Prepare([]byte) (Prepared, error) { return fakePrepared{}, nil }
+
+func (f *fakeVisEngine) Bulk(context.Context, string, []Doc, string) error {
+	time.Sleep(fakeVisWork)
+	return nil
+}
+
+func (f *fakeVisEngine) Search(context.Context, string, Prepared, []any) (SearchResult, error) {
+	time.Sleep(fakeVisWork)
+	return SearchResult{Total: 1, Relation: "eq"}, nil
+}
+
+// TestVisibilityExcludesJitterFromMeasuredLatency is the regression test for the
+// coordinator's requested change: the visibility workloads must sleep a random,
+// seeded, per-iteration delay before a measured write (so writes do not land in
+// lockstep right after the previous refresh), and that delay must not count toward
+// the recorded latency. fakeVisEngine's writes and searches return immediately, so
+// if the jitter leaked into the measurement, the recorded p99 would be close to the
+// refresh interval; excluded, it stays near zero.
+func TestVisibilityExcludesJitterFromMeasuredLatency(t *testing.T) {
+	const (
+		interval   = 80 * time.Millisecond
+		iterations = 30
+	)
+	eng := &fakeVisEngine{name: "fake"}
+	s := &suite{
+		engines: []Engine{eng},
+		cfg: Config{
+			Index: "idx", Seed: 1, VisibleIterations: iterations,
+			Only: []string{"refresh_visible"}, Log: io.Discard,
+		},
+		run: &report.Run{Engines: []report.EngineInfo{
+			{Name: "fake", Config: map[string]string{"refresh_interval": interval.String()}},
+		}},
+	}
+
+	start := time.Now()
+	if err := s.visibility(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wall := time.Since(start)
+
+	// warmup (min(2, iterations)) + measured iterations all sleep a jitter delay,
+	// uniform on [0, interval): its sum is very unlikely to fall much below half its
+	// mean, so a wall time near that confirms the delay really was slept.
+	minWant := time.Duration(float64(2+iterations)*float64(interval)/2) / 3
+	if wall < minWant {
+		t.Fatalf("visibility() took %v, want at least roughly %v: the pre-write jitter was not applied", wall, minWant)
+	}
+
+	r := findResult(s.run.Results, "refresh_visible", "fake")
+	if r == nil || r.Latency == nil {
+		t.Fatal("no refresh_visible/fake result with latency")
+	}
+	if got := time.Duration(r.Latency.P99 * float64(time.Microsecond)); got >= interval/4 {
+		t.Fatalf("recorded p99 latency %v, want well under the %v refresh interval: the jitter leaked into the measurement", got, interval)
+	}
+}
+
+// findResult returns the result for workload/engine, or nil.
+func findResult(rs []report.Result, workload, engine string) *report.Result {
+	for i := range rs {
+		if rs[i].Workload == workload && rs[i].Engine == engine {
+			return &rs[i]
+		}
+	}
+	return nil
+}

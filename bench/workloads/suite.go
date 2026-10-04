@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"runtime"
@@ -682,7 +684,63 @@ func idQuery(id string) []byte {
 	return body(q{"query": cond("_id", "eq", id), "size": 0, "track_total": true})
 }
 
+// defaultRefreshInterval is read-to-visible's assumed refresh interval when an
+// engine's reported Config has no "refresh_interval" (Searchlight's own default,
+// config.Default().RefreshInterval, and also Elasticsearch's).
+const defaultRefreshInterval = time.Second
+
+// refreshInterval is eng's refresh interval, from the EngineInfo.Config it reported
+// to RunSuite ("refresh_interval", a time.ParseDuration string), or
+// defaultRefreshInterval when it did not report one or reported one that does not
+// parse to a positive duration.
+func (s *suite) refreshInterval(eng Engine) time.Duration {
+	for _, info := range s.run.Engines {
+		if info.Name != eng.Name() {
+			continue
+		}
+		if v, ok := info.Config["refresh_interval"]; ok {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				return d
+			}
+		}
+	}
+	return defaultRefreshInterval
+}
+
+// writeJitter is the delay a measured visibility write sleeps before it starts,
+// standing in for a real client's write landing at a random point in the refresh
+// cycle rather than, as a closed loop otherwise does, right after the previous
+// write's own refresh. It is uniform on [0, interval), and deterministic in
+// (seed, workload, i): the same call gives every engine the identical delay at the
+// same iteration, so the comparison stays apples to apples, and a run is
+// reproducible.
+func writeJitter(seed uint64, workload string, i int, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s:%d", workload, i)
+	r := rand.New(rand.NewPCG(seed, h.Sum64())) //nolint:gosec // reproducible benchmark jitter, not secrets
+	return time.Duration(r.Int64N(int64(interval)))
+}
+
+// sleepJitter sleeps d, unless ctx ends first.
+func sleepJitter(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // visibility measures write-to-visible latency (refresh_visible) and refresh=wait_for.
+// Each measured write sleeps a random, unmeasured delay first (writeJitter): a real
+// client does not write in lockstep right after the engine's previous refresh, which
+// a closed loop at concurrency 1 would otherwise do every iteration.
 func (s *suite) visibility(ctx context.Context) error {
 	for _, w := range []string{"refresh_visible", "refresh_wait_for"} {
 		if !s.cfg.wants(w, report.GroupVisibility) {
@@ -690,6 +748,7 @@ func (s *suite) visibility(ctx context.Context) error {
 		}
 		for _, eng := range s.engines {
 			o := RunOptions{Warmup: min(2, s.cfg.VisibleIterations), Iterations: s.cfg.VisibleIterations, Concurrency: 1}
+			interval := s.refreshInterval(eng)
 			op := func(ctx context.Context, i int) (int, time.Duration, error) {
 				id := fmt.Sprintf("v%s-%06d", strings.TrimPrefix(w, "refresh_"), i)
 				p, err := eng.Prepare(idQuery(id))
@@ -697,11 +756,15 @@ func (s *suite) visibility(ctx context.Context) error {
 					return 0, 0, err
 				}
 				doc := Doc{ID: id, Body: datasets.AppendProduct(nil, s.cfg.Seed, s.loaded+1_000_000+int64(i))}
+				if err := sleepJitter(ctx, writeJitter(s.cfg.Seed, w, i, interval)); err != nil {
+					return 0, 0, err
+				}
 				if w == "refresh_wait_for" {
 					// Only the write is timed: refresh=wait_for's latency is the write's
 					// own, and the confirming search is an untimed correctness check
 					// (it fails the iteration if the write was not visible on return,
-					// but its own latency is not part of what T7 measures).
+					// but its own latency is not part of what T7 measures). The jitter
+					// above ran before t0, so it is never part of timed either.
 					t0 := time.Now()
 					bulkErr := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for")
 					timed := time.Since(t0)
@@ -717,6 +780,7 @@ func (s *suite) visibility(ctx context.Context) error {
 					}
 					return 1, timed, nil
 				}
+				t0 := time.Now()
 				if err := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, ""); err != nil {
 					return 0, 0, err
 				}
@@ -727,7 +791,7 @@ func (s *suite) visibility(ctx context.Context) error {
 						return 0, 0, err
 					}
 					if res.Total == 1 {
-						return 1, 0, nil
+						return 1, time.Since(t0), nil
 					}
 					if time.Now().After(deadline) {
 						return 0, 0, fmt.Errorf("%s not visible after 10 s", id)
@@ -735,9 +799,9 @@ func (s *suite) visibility(ctx context.Context) error {
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
-			desc := "write without refresh, poll every 10 ms until searchable (latency from the write's start)"
+			desc := "write without refresh, poll every 10 ms until searchable (latency from the write's start, after a random pre-write delay of up to one refresh interval, unmeasured)"
 			if w == "refresh_wait_for" {
-				desc = "write with refresh=wait_for (the write's latency); visible on return"
+				desc = "write with refresh=wait_for (the write's latency); visible on return (also after the same random pre-write delay, unmeasured)"
 			}
 			s.add(s.result(w, report.GroupVisibility, desc, eng, o, Run(ctx, o, op)))
 		}

@@ -1,0 +1,779 @@
+{
+  "all_root_empty": {
+    "elasticsearch": {
+      "match_all": {}
+    },
+    "searchlight": {
+      "all": []
+    }
+  },
+  "any": {
+    "elasticsearch": {
+      "bool": {
+        "minimum_should_match": 1,
+        "should": [
+          {
+            "term": {
+              "brand": "acme"
+            }
+          },
+          {
+            "range": {
+              "price": {
+                "lt": 5
+              }
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "any": [
+        {
+          "field": "brand",
+          "op": "eq",
+          "value": "Acme"
+        },
+        {
+          "field": "price",
+          "op": "lt",
+          "value": 5
+        }
+      ]
+    }
+  },
+  "between": {
+    "elasticsearch": {
+      "range": {
+        "price": {
+          "gte": 10,
+          "lte": 50
+        }
+      }
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "between",
+      "value": [
+        10,
+        50
+      ]
+    }
+  },
+  "between_empty": {
+    "elasticsearch": {
+      "match_none": {}
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "between",
+      "value": [
+        50,
+        10
+      ]
+    }
+  },
+  "contains_all": {
+    "elasticsearch": {
+      "bool": {
+        "filter": [
+          {
+            "match_phrase": {
+              "title.tri": "acme"
+            }
+          },
+          {
+            "match_phrase": {
+              "title.tri": "pro"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "contains_all",
+      "value": [
+        "acme",
+        "pro"
+      ]
+    }
+  },
+  "contains_any": {
+    "elasticsearch": {
+      "bool": {
+        "minimum_should_match": 1,
+        "should": [
+          {
+            "match_phrase": {
+              "title.tri": "drill"
+            }
+          },
+          {
+            "match_phrase": {
+              "title.tri": "saw"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "contains_any",
+      "value": [
+        "drill",
+        "saw",
+        "drill"
+      ]
+    }
+  },
+  "contains_no_subfield": {
+    "elasticsearch": {
+      "wildcard": {
+        "plain": {
+          "value": "*a\\*b\\?c*"
+        }
+      }
+    },
+    "searchlight": {
+      "field": "plain",
+      "op": "contains",
+      "value": "a*b?c"
+    }
+  },
+  "contains_short": {
+    "elasticsearch": {
+      "wildcard": {
+        "title": {
+          "value": "*x2*"
+        }
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "contains",
+      "value": "x2"
+    }
+  },
+  "contains_trigram": {
+    "elasticsearch": {
+      "match_phrase": {
+        "title.tri": "cordless drill"
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "contains",
+      "value": "Cordless  Drill"
+    }
+  },
+  "empty": {
+    "elasticsearch": {
+      "bool": {
+        "must_not": [
+          {
+            "exists": {
+              "field": "tags"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "empty"
+    }
+  },
+  "eq_bool": {
+    "elasticsearch": {
+      "term": {
+        "in_stock": true
+      }
+    },
+    "searchlight": {
+      "field": "in_stock",
+      "op": "eq",
+      "value": true
+    }
+  },
+  "eq_date": {
+    "elasticsearch": {
+      "term": {
+        "first_seen": 1735689600000
+      }
+    },
+    "searchlight": {
+      "field": "first_seen",
+      "op": "eq",
+      "value": 1735689600000
+    }
+  },
+  "eq_id": {
+    "elasticsearch": {
+      "ids": {
+        "values": [
+          "p000000007"
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "_id",
+      "op": "eq",
+      "value": "P000000007"
+    }
+  },
+  "eq_keyword": {
+    "elasticsearch": {
+      "term": {
+        "brand": "acme tools"
+      }
+    },
+    "searchlight": {
+      "field": "brand",
+      "op": "eq",
+      "value": "  ACME   Tools "
+    }
+  },
+  "eq_number": {
+    "elasticsearch": {
+      "term": {
+        "price": 19.99
+      }
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "eq",
+      "value": 19.99
+    }
+  },
+  "eq_text": {
+    "elasticsearch": {
+      "term": {
+        "title": "acme drill"
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "eq",
+      "value": "Acme Drill"
+    }
+  },
+  "eq_wrong_kind": {
+    "elasticsearch": {
+      "match_none": {}
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "eq",
+      "value": "cheap"
+    }
+  },
+  "exists_bare": {
+    "elasticsearch": {
+      "exists": {
+        "field": "tags"
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "exists"
+    }
+  },
+  "exists_false": {
+    "elasticsearch": {
+      "bool": {
+        "must_not": [
+          {
+            "exists": {
+              "field": "list_price"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "list_price",
+      "op": "exists",
+      "value": false
+    }
+  },
+  "exists_true": {
+    "elasticsearch": {
+      "exists": {
+        "field": "list_price"
+      }
+    },
+    "searchlight": {
+      "field": "list_price",
+      "op": "exists",
+      "value": true
+    }
+  },
+  "fold_all_with_never": {
+    "elasticsearch": {
+      "match_none": {}
+    },
+    "searchlight": {
+      "all": [
+        {
+          "field": "brand",
+          "op": "eq",
+          "value": "Acme"
+        },
+        {
+          "field": "price",
+          "op": "eq",
+          "value": "x"
+        }
+      ]
+    }
+  },
+  "fold_any_with_always": {
+    "elasticsearch": {
+      "match_all": {}
+    },
+    "searchlight": {
+      "any": [
+        {
+          "field": "brand",
+          "op": "eq",
+          "value": "Acme"
+        },
+        {
+          "field": "price",
+          "op": "ne",
+          "value": "x"
+        }
+      ]
+    }
+  },
+  "gt": {
+    "elasticsearch": {
+      "range": {
+        "reviews": {
+          "gt": 10
+        }
+      }
+    },
+    "searchlight": {
+      "field": "reviews",
+      "op": "gt",
+      "value": 10
+    }
+  },
+  "gte_date": {
+    "elasticsearch": {
+      "range": {
+        "updated_at": {
+          "gte": 1735689600000
+        }
+      }
+    },
+    "searchlight": {
+      "field": "updated_at",
+      "op": "gte",
+      "value": 1735689600000
+    }
+  },
+  "has": {
+    "elasticsearch": {
+      "term": {
+        "tags": "sale"
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "has",
+      "value": "Sale"
+    }
+  },
+  "has_all": {
+    "elasticsearch": {
+      "bool": {
+        "filter": [
+          {
+            "term": {
+              "tags": "sale"
+            }
+          },
+          {
+            "term": {
+              "tags": "new"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "has_all",
+      "value": [
+        "sale",
+        "new"
+      ]
+    }
+  },
+  "has_any": {
+    "elasticsearch": {
+      "terms": {
+        "tags": [
+          "sale",
+          "new"
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "has_any",
+      "value": [
+        "sale",
+        "new"
+      ]
+    }
+  },
+  "in_id": {
+    "elasticsearch": {
+      "ids": {
+        "values": [
+          "p1",
+          "p2"
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "_id",
+      "op": "in",
+      "value": [
+        "p1",
+        "p2"
+      ]
+    }
+  },
+  "in_keyword": {
+    "elasticsearch": {
+      "terms": {
+        "brand": [
+          "acme",
+          "globex"
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "brand",
+      "op": "in",
+      "value": [
+        "Acme",
+        "acme",
+        "Globex",
+        3
+      ]
+    }
+  },
+  "in_nothing_matches": {
+    "elasticsearch": {
+      "match_none": {}
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "in",
+      "value": [
+        "a",
+        "b"
+      ]
+    }
+  },
+  "in_number": {
+    "elasticsearch": {
+      "terms": {
+        "stock": [
+          0,
+          1,
+          2
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "stock",
+      "op": "in",
+      "value": [
+        0,
+        1,
+        2
+      ]
+    }
+  },
+  "lt": {
+    "elasticsearch": {
+      "range": {
+        "price": {
+          "lt": 100
+        }
+      }
+    },
+    "searchlight": {
+      "field": "price",
+      "op": "lt",
+      "value": 100
+    }
+  },
+  "lte": {
+    "elasticsearch": {
+      "range": {
+        "rating": {
+          "lte": 4.5
+        }
+      }
+    },
+    "searchlight": {
+      "field": "rating",
+      "op": "lte",
+      "value": 4.5
+    }
+  },
+  "ne_keyword": {
+    "elasticsearch": {
+      "bool": {
+        "must_not": [
+          {
+            "term": {
+              "condition": "used"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "condition",
+      "op": "ne",
+      "value": "used"
+    }
+  },
+  "ne_wrong_kind": {
+    "elasticsearch": {
+      "match_all": {}
+    },
+    "searchlight": {
+      "field": "in_stock",
+      "op": "ne",
+      "value": 1
+    }
+  },
+  "nested": {
+    "elasticsearch": {
+      "bool": {
+        "filter": [
+          {
+            "bool": {
+              "minimum_should_match": 1,
+              "should": [
+                {
+                  "match_phrase": {
+                    "title.tri": "drill"
+                  }
+                },
+                {
+                  "match_phrase": {
+                    "title.words": "saw"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "bool": {
+              "must_not": [
+                {
+                  "term": {
+                    "tags": "refurbished"
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "range": {
+              "price": {
+                "gte": 10,
+                "lte": 200
+              }
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "all": [
+        {
+          "any": [
+            {
+              "field": "title",
+              "op": "contains",
+              "value": "drill"
+            },
+            {
+              "field": "title",
+              "op": "words_any",
+              "value": [
+                "saw"
+              ]
+            }
+          ]
+        },
+        {
+          "not": {
+            "field": "tags",
+            "op": "has",
+            "value": "refurbished"
+          }
+        },
+        {
+          "field": "price",
+          "op": "between",
+          "value": [
+            10,
+            200
+          ]
+        }
+      ]
+    }
+  },
+  "nonempty": {
+    "elasticsearch": {
+      "exists": {
+        "field": "tags"
+      }
+    },
+    "searchlight": {
+      "field": "tags",
+      "op": "nonempty"
+    }
+  },
+  "not": {
+    "elasticsearch": {
+      "bool": {
+        "must_not": [
+          {
+            "term": {
+              "brand": "acme"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "not": {
+        "field": "brand",
+        "op": "eq",
+        "value": "Acme"
+      }
+    }
+  },
+  "similar": {
+    "elasticsearch": {
+      "script": {
+        "script": {
+          "lang": "painless",
+          "params": {
+            "f": "brand",
+            "min": 0.3,
+            "q": [
+              "  a",
+              " ak",
+              "akm",
+              "kme",
+              "me "
+            ]
+          },
+          "source": "if (doc[params.f].size() == 0) { return false; }\nString s = doc[params.f].value; Set g = new HashSet(); int n = s.length(); int i = 0;\nwhile (i \u003c n) {\n  while (i \u003c n \u0026\u0026 !Character.isLetterOrDigit(s.charAt(i))) { i++; }\n  if (i \u003e= n) { break; }\n  int j = i;\n  while (j \u003c n \u0026\u0026 Character.isLetterOrDigit(s.charAt(j))) { j++; }\n  String w = '  ' + s.substring(i, j) + ' ';\n  for (int k = 0; k + 3 \u003c= w.length(); k++) { g.add(w.substring(k, k + 3)); }\n  i = j;\n}\nif (g.isEmpty()) { return false; }\nint shared = 0;\nfor (def t : params.q) { if (g.contains(t)) { shared++; } }\ndouble r = (double) (float) ((double) shared / (g.size() + params.q.size() - shared));\nreturn r \u003e= params.min;"
+        }
+      }
+    },
+    "searchlight": {
+      "field": "brand",
+      "op": "similar",
+      "value": {
+        "text": "Akme",
+        "min": 0.3
+      }
+    }
+  },
+  "starts_with": {
+    "elasticsearch": {
+      "prefix": {
+        "sku": "acm-"
+      }
+    },
+    "searchlight": {
+      "field": "sku",
+      "op": "starts_with",
+      "value": "ACM-"
+    }
+  },
+  "words_all": {
+    "elasticsearch": {
+      "bool": {
+        "filter": [
+          {
+            "match_phrase": {
+              "title.words": "heavy duty drill"
+            }
+          },
+          {
+            "match_phrase": {
+              "title.words": "pro"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "words_all",
+      "value": [
+        "Heavy-Duty drill",
+        "pro"
+      ]
+    }
+  },
+  "words_all_no_word": {
+    "elasticsearch": {
+      "match_none": {}
+    },
+    "searchlight": {
+      "field": "title",
+      "op": "words_all",
+      "value": [
+        "drill",
+        "--"
+      ]
+    }
+  },
+  "words_any": {
+    "elasticsearch": {
+      "bool": {
+        "minimum_should_match": 1,
+        "should": [
+          {
+            "match_phrase": {
+              "description.words": "cordless"
+            }
+          },
+          {
+            "match_phrase": {
+              "description.words": "free shipping"
+            }
+          }
+        ]
+      }
+    },
+    "searchlight": {
+      "field": "description",
+      "op": "words_any",
+      "value": [
+        "cordless",
+        "...",
+        "free shipping"
+      ]
+    }
+  }
+}

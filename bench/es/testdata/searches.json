@@ -1,0 +1,416 @@
+{
+  "agg_cardinality": {
+    "elasticsearch": {
+      "aggs": {
+        "c": {
+          "cardinality": {
+            "field": "brand",
+            "precision_threshold": 4096
+          }
+        },
+        "c8": {
+          "cardinality": {
+            "field": "category",
+            "precision_threshold": 64
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "c": {
+          "cardinality": {
+            "field": "brand"
+          }
+        },
+        "c8": {
+          "cardinality": {
+            "field": "category",
+            "precision": 8
+          }
+        }
+      }
+    }
+  },
+  "agg_date_histogram_calendar": {
+    "elasticsearch": {
+      "aggs": {
+        "d": {
+          "date_histogram": {
+            "calendar_interval": "month",
+            "field": "first_seen",
+            "min_doc_count": 0
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "d": {
+          "date_histogram": {
+            "field": "first_seen",
+            "calendar_interval": "month"
+          }
+        }
+      }
+    }
+  },
+  "agg_date_histogram_fixed": {
+    "elasticsearch": {
+      "aggs": {
+        "d": {
+          "date_histogram": {
+            "field": "updated_at",
+            "fixed_interval": "43200000ms",
+            "min_doc_count": 1,
+            "offset": "-3600000ms"
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "d": {
+          "date_histogram": {
+            "field": "updated_at",
+            "fixed_interval": "12h",
+            "offset": "-1h",
+            "min_doc_count": 1
+          }
+        }
+      }
+    }
+  },
+  "agg_histogram": {
+    "elasticsearch": {
+      "aggs": {
+        "h": {
+          "histogram": {
+            "field": "rating",
+            "interval": 0.5,
+            "min_doc_count": 0,
+            "offset": 0.25
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "h": {
+          "histogram": {
+            "field": "rating",
+            "interval": 0.5,
+            "offset": 0.25
+          }
+        }
+      }
+    }
+  },
+  "agg_range": {
+    "elasticsearch": {
+      "aggs": {
+        "prices": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              {
+                "key": "*-10",
+                "to": 10
+              },
+              {
+                "from": 10,
+                "key": "mid",
+                "to": 100
+              },
+              {
+                "from": 100,
+                "key": "100-*"
+              }
+            ]
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "prices": {
+          "range": {
+            "field": "price",
+            "ranges": [
+              {
+                "to": 10
+              },
+              {
+                "from": 10,
+                "to": 100,
+                "key": "mid"
+              },
+              {
+                "from": 100
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "agg_stats": {
+    "elasticsearch": {
+      "aggs": {
+        "s": {
+          "stats": {
+            "field": "price"
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "s": {
+          "stats": {
+            "field": "price"
+          }
+        }
+      }
+    }
+  },
+  "agg_terms": {
+    "elasticsearch": {
+      "aggs": {
+        "brands": {
+          "aggs": {
+            "price": {
+              "stats": {
+                "field": "price"
+              }
+            }
+          },
+          "terms": {
+            "field": "brand",
+            "min_doc_count": 2,
+            "size": 20
+          }
+        }
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0
+    },
+    "searchlight": {
+      "size": 0,
+      "aggs": {
+        "brands": {
+          "terms": {
+            "field": "brand",
+            "size": 20,
+            "min_doc_count": 2
+          },
+          "aggs": {
+            "price": {
+              "stats": {
+                "field": "price"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "default": {
+    "elasticsearch": {
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 10,
+      "sort": [
+        {
+          "sl_id": {
+            "order": "asc"
+          }
+        }
+      ]
+    },
+    "searchlight": {}
+  },
+  "fields_timeout": {
+    "elasticsearch": {
+      "_source": {
+        "includes": [
+          "title",
+          "price"
+        ]
+      },
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 0,
+      "timeout": "250ms",
+      "track_total_hits": 500
+    },
+    "searchlight": {
+      "fields": [
+        "title",
+        "price"
+      ],
+      "timeout": "250ms",
+      "track_total": 500,
+      "size": 0
+    }
+  },
+  "sort_by_id": {
+    "elasticsearch": {
+      "query": {
+        "constant_score": {
+          "filter": {
+            "match_all": {}
+          }
+        }
+      },
+      "size": 5,
+      "sort": [
+        {
+          "sl_id": {
+            "order": "desc"
+          }
+        }
+      ],
+      "track_total_hits": false
+    },
+    "searchlight": {
+      "sort": [
+        {
+          "_id": "desc"
+        },
+        "price"
+      ],
+      "size": 5,
+      "track_total": false
+    }
+  },
+  "sorted_paged": {
+    "elasticsearch": {
+      "query": {
+        "constant_score": {
+          "filter": {
+            "term": {
+              "brand": "acme"
+            }
+          }
+        }
+      },
+      "search_after": [
+        19.99,
+        1735689600000,
+        "p000000001"
+      ],
+      "size": 100,
+      "sort": [
+        {
+          "price": {
+            "missing": "_last",
+            "order": "desc"
+          }
+        },
+        {
+          "updated_at": {
+            "missing": "_last",
+            "order": "asc"
+          }
+        },
+        {
+          "sl_id": {
+            "order": "asc"
+          }
+        }
+      ],
+      "track_total_hits": true
+    },
+    "searchlight": {
+      "query": {
+        "field": "brand",
+        "op": "eq",
+        "value": "Acme"
+      },
+      "sort": [
+        {
+          "price": "desc"
+        },
+        "updated_at"
+      ],
+      "size": 100,
+      "search_after": [
+        19.99,
+        1735689600000,
+        "p000000001"
+      ],
+      "track_total": true
+    }
+  }
+}

@@ -135,6 +135,11 @@ type Options struct {
 	// Clock is the monotonic clock lease deadlines are kept by; nil means the
 	// process's.
 	Clock Clock
+	// AllowSQLiteCluster lets several live nodes share a SQLite store. Tests only:
+	// in-process clusters over one file. In production SQLite serves one node, and
+	// Start refuses a second (ErrSQLiteCluster); there is no flag for it.
+	AllowSQLiteCluster bool
+
 	// Engine, when set, adjusts the engine's options (tests: fake tailers, small
 	// shards).
 	Engine func(*node.Options)
@@ -403,6 +408,9 @@ func (n *Node) Start(ctx context.Context) error {
 	if err := n.refreshView(ctx); err != nil {
 		return fmt.Errorf("cluster: read the registry: %w", err)
 	}
+	if err := n.singleSQLite(ctx); err != nil {
+		return err
+	}
 	if err := n.SyncCatalog(ctx); err != nil {
 		return fmt.Errorf("cluster: read the catalogue: %w", err)
 	}
@@ -420,6 +428,35 @@ func (n *Node) Start(ctx context.Context) error {
 	n.goLoop(n.janitorLoop)
 	n.log.InfoContext(ctx, "cluster node started", slog.String("address", n.cfg.AdvertiseAddress), slog.Int("copies", n.leaseCount()))
 	return nil
+}
+
+// ErrSQLiteCluster is returned by Start on a SQLite store that another live node
+// already uses: SQLite serves one node (spec sections 9 and 12); a cluster needs
+// Postgres or MySQL.
+var ErrSQLiteCluster = errors.New("cluster: a SQLite store serves a single node; use Postgres or MySQL for a cluster")
+
+// singleSQLite refuses to join when the store is SQLite and another live node is
+// registered (unless Options.AllowSQLiteCluster, for in-process tests). The node checks
+// after registering, so of two nodes starting at once at least one sees the other; it
+// deregisters before it fails.
+func (n *Node) singleSQLite(ctx context.Context) error {
+	if n.st.Dialect() != "sqlite" || n.opts.AllowSQLiteCluster {
+		return nil
+	}
+	v := n.view.Load()
+	var others []string
+	for _, id := range v.liveNodes() {
+		if id != n.id {
+			others = append(others, id)
+		}
+	}
+	if len(others) == 0 {
+		return nil
+	}
+	if err := n.reg.RemoveNode(context.WithoutCancel(ctx), n.id); err != nil {
+		n.log.WarnContext(ctx, "deregistering after refusing to join failed; the node ages out", slog.Any("error", err))
+	}
+	return fmt.Errorf("%w (node %q found live node(s) %s on it)", ErrSQLiteCluster, n.id, strings.Join(others, ", "))
 }
 
 // goLoop runs fn until the node stops.

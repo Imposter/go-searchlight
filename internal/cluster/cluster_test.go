@@ -318,6 +318,7 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			stopW := make(chan struct{})
 			var wg sync.WaitGroup
 			var werr atomic.Pointer[error]
+			var slowestWrite atomic.Int64
 			wg.Go(func() {
 				for k := 0; ; k++ {
 					select {
@@ -325,15 +326,16 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 						return
 					default:
 					}
-					// 60 s, not 20: under go test ./... -count=2's full parallel suite
-					// (many heavy packages sharing this machine's disk and cores),
-					// SQLite's single write connection can be held by another
-					// package's commits for a while; a write itself asks nothing of
-					// the restarting node (no refresh wait), so this is the test's
-					// own patience, not the server's.
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+					began := time.Now()
 					res, err := others[0].n.Write(ctx, "roll", []api.WriteOp{upsertOp(fmt.Sprintf("r%d-%d", i, k), k)}, api.WriteOptions{})
 					cancel()
+					for d := int64(time.Since(began)); ; {
+						cur := slowestWrite.Load()
+						if d <= cur || slowestWrite.CompareAndSwap(cur, d) {
+							break
+						}
+					}
 					if err == nil && res.Items[0].Err != nil {
 						err = res.Items[0].Err
 					}
@@ -356,6 +358,13 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			if e := werr.Load(); e != nil {
 				t.Fatalf("a write failed during the restart of node %d: %v", i, *e)
 			}
+			tails := map[string]time.Duration{}
+			for _, tn := range c.live() {
+				for op, d := range tn.wrap.tails() {
+					tails[op] = max(tails[op], d)
+				}
+			}
+			t.Logf("restart of node %d: slowest write %s; slowest store calls %v", i, time.Duration(slowestWrite.Load()).Round(time.Millisecond), roundAll(tails))
 		}
 		st := c.node(0).st
 		head, _, err := st.HeadSeq(tctx(t))
@@ -366,6 +375,14 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			waitCount(t, tn.n, "roll", head, acked.Load())
 		}
 	})
+}
+
+// roundAll rounds durations to the millisecond, for logs.
+func roundAll(m map[string]time.Duration) map[string]time.Duration {
+	for k, d := range m {
+		m[k] = d.Round(time.Millisecond)
+	}
+	return m
 }
 
 // TestPartitionedNodeStopsServingBeforeSteal (split-brain safety): a node cut off from

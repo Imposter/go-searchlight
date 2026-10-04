@@ -64,6 +64,41 @@ func TestRunClosedLoopCountsOnlyMeasured(t *testing.T) {
 	}
 }
 
+// TestFloorElapsedGuaranteesPositiveWhenOpsRan is the regression test for a flake in
+// TestRunClosedLoopCountsOnlyMeasured: a fast closed loop's two time.Now() readings
+// (both from Go's monotonic clock) landed close enough together that time.Since
+// reported 0 on a coarse Windows timer, even though 100 real ops ran — and
+// Throughput/DocsPerSec treat Elapsed<=0 as "no data", reporting a false 0 rate for
+// work that demonstrably happened. 0 is not a legitimate answer whenever at least
+// one op ran (it is legitimate when none did: nothing happened, instantaneously), so
+// floorElapsed guarantees Elapsed is positive in the former case and leaves it alone
+// in the latter.
+func TestFloorElapsedGuaranteesPositiveWhenOpsRan(t *testing.T) {
+	opsRan := &Measurement{Ops: 5, Elapsed: 0}
+	floorElapsed(opsRan)
+	if opsRan.Elapsed <= 0 {
+		t.Fatalf("Elapsed = %v, want > 0 once ops ran", opsRan.Elapsed)
+	}
+
+	errorsOnly := &Measurement{Errors: 1, Elapsed: 0}
+	floorElapsed(errorsOnly)
+	if errorsOnly.Elapsed <= 0 {
+		t.Fatalf("Elapsed = %v, want > 0 once an op ran, even if it only ever errored", errorsOnly.Elapsed)
+	}
+
+	nothingRan := &Measurement{Elapsed: 0}
+	floorElapsed(nothingRan)
+	if nothingRan.Elapsed != 0 {
+		t.Fatalf("Elapsed = %v, want left at 0: nothing ran, so instantaneous is legitimate", nothingRan.Elapsed)
+	}
+
+	realElapsed := &Measurement{Ops: 3, Elapsed: 5 * time.Millisecond}
+	floorElapsed(realElapsed)
+	if realElapsed.Elapsed != 5*time.Millisecond {
+		t.Fatalf("Elapsed = %v, want the real measured value left untouched", realElapsed.Elapsed)
+	}
+}
+
 func TestRunErrorsAreCountedNotRecorded(t *testing.T) {
 	boom := errors.New("boom")
 	m := Run(context.Background(), RunOptions{Iterations: 20, Concurrency: 2}, func(_ context.Context, i int) (int, time.Duration, error) {
@@ -330,6 +365,28 @@ func TestSearchSpecsTranslateAndCover(t *testing.T) {
 	}
 }
 
+// TestRetryDelayClampsRetryAfter checks that a server-given Retry-After is honored
+// up to maxRetryAfter but never beyond it: a misbehaving (or hostile) server must
+// not be able to stretch a single retry's wait, and so the whole request's total
+// retry time across maxRetries of them, without bound.
+func TestRetryDelayClampsRetryAfter(t *testing.T) {
+	if got := retryDelay(0, time.Hour); got != maxRetryAfter {
+		t.Fatalf("retryDelay with a 1h Retry-After = %v, want capped at maxRetryAfter (%v)", got, maxRetryAfter)
+	}
+	if got := retryDelay(0, maxRetryAfter); got != maxRetryAfter {
+		t.Fatalf("retryDelay at exactly maxRetryAfter = %v, want it unchanged (%v)", got, maxRetryAfter)
+	}
+	const under = 10 * time.Second
+	if got := retryDelay(0, under); got != under {
+		t.Fatalf("retryDelay with a %v Retry-After (under the cap) = %v, want it unchanged", under, got)
+	}
+	// No Retry-After: the exponential backoff, itself bounded by retryMaxDelay (well
+	// under maxRetryAfter), applies instead.
+	if got := retryDelay(0, 0); got != retryBaseDelay {
+		t.Fatalf("retryDelay(0, 0) = %v, want the base backoff %v", got, retryBaseDelay)
+	}
+}
+
 // TestClientRetriesBackpressureThenSucceeds checks that a 429 (e.g. the shard write
 // buffer backpressure a bulk load can hit) is retried, honoring Retry-After, instead
 // of failing the request on the first refusal.
@@ -483,21 +540,17 @@ func TestWriteJitterDeterministicAndBounded(t *testing.T) {
 	}
 }
 
-// fakeVisWork is how long fakeVisEngine's Bulk and Search each pretend to take: real
-// enough to measure (a real HTTP round trip never clocks in at exactly 0, but an
-// in-process fake call can, on a coarse clock), yet tiny next to the test's jitter
-// interval, so a recorded latency near fakeVisWork means the jitter was excluded and
-// one near the interval means it leaked in.
-const fakeVisWork = 2 * time.Millisecond
-
-// fakeVisEngine is an Engine whose Bulk and Search each take fakeVisWork and then
-// succeed (Prepare needs no real translation): standing in for a real engine's
-// write-then-poll in TestVisibilityExcludesJitterFromMeasuredLatency, so that test's
-// measured latency is close to the refresh interval if the jitter is not excluded,
-// and close to fakeVisWork if it is.
+// fakeVisEngine is an Engine whose Bulk and Search each advance a fake clock by a
+// fixed, known amount and then succeed (Prepare needs no real translation): standing
+// in for a real engine's write-then-poll in
+// TestVisibilityExcludesJitterFromMeasuredLatency. It never really sleeps, so that
+// test is exact and deterministic instead of a wall-clock comparison against a
+// possibly busy, shared CI runner's scheduling noise.
 type fakeVisEngine struct {
 	Engine
-	name string
+	name    string
+	advance func(time.Duration)
+	work    time.Duration
 }
 
 func (f *fakeVisEngine) Name() string { return f.name }
@@ -509,12 +562,12 @@ func (fakePrepared) isPrepared() {}
 func (f *fakeVisEngine) Prepare([]byte) (Prepared, error) { return fakePrepared{}, nil }
 
 func (f *fakeVisEngine) Bulk(context.Context, string, []Doc, string) error {
-	time.Sleep(fakeVisWork)
+	f.advance(f.work)
 	return nil
 }
 
 func (f *fakeVisEngine) Search(context.Context, string, Prepared, []any) (SearchResult, error) {
-	time.Sleep(fakeVisWork)
+	f.advance(f.work)
 	return SearchResult{Total: 1, Relation: "eq"}, nil
 }
 
@@ -522,15 +575,28 @@ func (f *fakeVisEngine) Search(context.Context, string, Prepared, []any) (Search
 // coordinator's requested change: the visibility workloads must sleep a random,
 // seeded, per-iteration delay before a measured write (so writes do not land in
 // lockstep right after the previous refresh), and that delay must not count toward
-// the recorded latency. fakeVisEngine's writes and searches return immediately, so
-// if the jitter leaked into the measurement, the recorded p99 would be close to the
-// refresh interval; excluded, it stays near zero.
+// the recorded latency.
+//
+// It injects the fake clock and sleeper suite.now/suite.sleep stand in for, instead
+// of asserting on a wall-clock margin (which flaked under package-wide load: a
+// coarse Windows timer plus scheduling noise from other tests running at once can
+// stretch even a few milliseconds of real work well past a tight threshold). The
+// fake clock only advances when told to: the injected sleeper advances it by exactly
+// the jitter delay without really blocking, and fakeVisEngine's Bulk/Search each
+// advance it by a known, fixed work duration. So the recorded latency is exactly
+// computable: 2*fakeWork if the jitter is excluded, or that plus the jitter delay if
+// it leaked in, nothing in between and nothing left to timing chance.
 func TestVisibilityExcludesJitterFromMeasuredLatency(t *testing.T) {
 	const (
-		interval   = 80 * time.Millisecond
-		iterations = 30
+		interval   = 500 * time.Millisecond
+		fakeWork   = 2 * time.Millisecond
+		iterations = 5
 	)
-	eng := &fakeVisEngine{name: "fake"}
+	var clock atomic.Int64 // fake nanoseconds since an arbitrary epoch
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	advance := func(d time.Duration) { clock.Add(int64(d)) }
+
+	eng := &fakeVisEngine{name: "fake", advance: advance, work: fakeWork}
 	s := &suite{
 		engines: []Engine{eng},
 		cfg: Config{
@@ -540,28 +606,38 @@ func TestVisibilityExcludesJitterFromMeasuredLatency(t *testing.T) {
 		run: &report.Run{Engines: []report.EngineInfo{
 			{Name: "fake", Config: map[string]string{"refresh_interval": interval.String()}},
 		}},
+		now:   now,
+		sleep: func(_ context.Context, d time.Duration) error { advance(d); return nil },
 	}
 
-	start := time.Now()
 	if err := s.visibility(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wall := time.Since(start)
 
-	// warmup (min(2, iterations)) + measured iterations all sleep a jitter delay,
-	// uniform on [0, interval): its sum is very unlikely to fall much below half its
-	// mean, so a wall time near that confirms the delay really was slept.
-	minWant := time.Duration(float64(2+iterations)*float64(interval)/2) / 3
-	if wall < minWant {
-		t.Fatalf("visibility() took %v, want at least roughly %v: the pre-write jitter was not applied", wall, minWant)
+	// Every iteration (warmup, min(2, iterations), plus the measured ones) sleeps a
+	// jitter delay and does the fake work: the fake clock's final value must equal
+	// that exactly, proving the delay really was applied at every iteration, not
+	// just the measured ones.
+	total := min(2, iterations) + iterations
+	var wantClock int64
+	for i := range total {
+		wantClock += int64(writeJitter(1, "refresh_visible", i, interval)) + 2*int64(fakeWork)
+	}
+	if got := clock.Load(); got != wantClock {
+		t.Fatalf("fake clock ended at %v, want exactly %v: the jitter delay was not applied at every iteration", time.Duration(got), time.Duration(wantClock))
 	}
 
 	r := findResult(s.run.Results, "refresh_visible", "fake")
 	if r == nil || r.Latency == nil {
 		t.Fatal("no refresh_visible/fake result with latency")
 	}
-	if got := time.Duration(r.Latency.P99 * float64(time.Microsecond)); got >= interval/4 {
-		t.Fatalf("recorded p99 latency %v, want well under the %v refresh interval: the jitter leaked into the measurement", got, interval)
+	wantMicros := float64(2*fakeWork) / float64(time.Microsecond)
+	// The histogram is HDR-style (0.1% precision), not exact storage, so compare
+	// with a tolerance well above that but minuscule next to the 500 ms interval a
+	// leaked jitter would add.
+	if tol := wantMicros * 0.05; r.Latency.Min < wantMicros-tol || r.Latency.Max > wantMicros+tol {
+		t.Fatalf("recorded latency min %g µs max %g µs, want %g µs ± %g%%: the jitter leaked into the measurement",
+			r.Latency.Min, r.Latency.Max, wantMicros, 5.0)
 	}
 }
 

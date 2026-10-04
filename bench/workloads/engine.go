@@ -102,10 +102,13 @@ func retryableStatus(code int) bool {
 const maxRetries = 8
 
 // retryBaseDelay and retryMaxDelay bound the backoff used when a response carries
-// no Retry-After header.
+// no Retry-After header. maxRetryAfter caps a server-given Retry-After itself, so a
+// misbehaving or malicious server cannot stretch a single retry's wait (and so the
+// whole request, across maxRetries of them) without bound.
 const (
 	retryBaseDelay = 200 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
+	maxRetryAfter  = 6 * retryMaxDelay // 30s
 )
 
 // client is an HTTP client tuned for benchmarking: many kept-alive connections per
@@ -136,10 +139,11 @@ func newClient(base, token string, log io.Writer) *client {
 }
 
 // retryDelay is how long to wait before retrying attempt (0-based), honoring a
-// server-given Retry-After over the default exponential backoff.
+// server-given Retry-After (capped at maxRetryAfter) over the default exponential
+// backoff.
 func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		return retryAfter
+		return min(retryAfter, maxRetryAfter)
 	}
 	d := retryBaseDelay << attempt
 	if d <= 0 || d > retryMaxDelay { // overflow, or past the cap

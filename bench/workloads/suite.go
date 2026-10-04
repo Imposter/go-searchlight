@@ -143,6 +143,29 @@ type suite struct {
 	engines []Engine
 	run     *report.Run
 	loaded  int64
+	// now and sleep stand in for time.Now and sleepJitter in the visibility
+	// workload's measured write (writeJitter's delay, and the write-to-visible
+	// timing around it): nil in production, where they default to the real clock
+	// and a real wait. A test can inject both to make "the delay is excluded from
+	// the recorded latency" an exact, deterministic check instead of a wall-clock
+	// comparison against a noisy, shared CI runner's scheduling.
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+}
+
+// clock and sleeper return s.now and s.sleep, defaulting to the real ones.
+func (s *suite) clock() func() time.Time {
+	if s.now != nil {
+		return s.now
+	}
+	return time.Now
+}
+
+func (s *suite) sleeper() func(context.Context, time.Duration) error {
+	if s.sleep != nil {
+		return s.sleep
+	}
+	return sleepJitter
 }
 
 func (s *suite) logf(format string, args ...any) {
@@ -749,6 +772,7 @@ func (s *suite) visibility(ctx context.Context) error {
 		for _, eng := range s.engines {
 			o := RunOptions{Warmup: min(2, s.cfg.VisibleIterations), Iterations: s.cfg.VisibleIterations, Concurrency: 1}
 			interval := s.refreshInterval(eng)
+			now, sleep := s.clock(), s.sleeper()
 			op := func(ctx context.Context, i int) (int, time.Duration, error) {
 				id := fmt.Sprintf("v%s-%06d", strings.TrimPrefix(w, "refresh_"), i)
 				p, err := eng.Prepare(idQuery(id))
@@ -756,7 +780,7 @@ func (s *suite) visibility(ctx context.Context) error {
 					return 0, 0, err
 				}
 				doc := Doc{ID: id, Body: datasets.AppendProduct(nil, s.cfg.Seed, s.loaded+1_000_000+int64(i))}
-				if err := sleepJitter(ctx, writeJitter(s.cfg.Seed, w, i, interval)); err != nil {
+				if err := sleep(ctx, writeJitter(s.cfg.Seed, w, i, interval)); err != nil {
 					return 0, 0, err
 				}
 				if w == "refresh_wait_for" {
@@ -765,9 +789,9 @@ func (s *suite) visibility(ctx context.Context) error {
 					// (it fails the iteration if the write was not visible on return,
 					// but its own latency is not part of what T7 measures). The jitter
 					// above ran before t0, so it is never part of timed either.
-					t0 := time.Now()
+					t0 := now()
 					bulkErr := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for")
-					timed := time.Since(t0)
+					timed := now().Sub(t0)
 					if bulkErr != nil {
 						return 0, 0, bulkErr
 					}
@@ -780,7 +804,7 @@ func (s *suite) visibility(ctx context.Context) error {
 					}
 					return 1, timed, nil
 				}
-				t0 := time.Now()
+				t0 := now()
 				if err := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, ""); err != nil {
 					return 0, 0, err
 				}
@@ -791,7 +815,7 @@ func (s *suite) visibility(ctx context.Context) error {
 						return 0, 0, err
 					}
 					if res.Total == 1 {
-						return 1, time.Since(t0), nil
+						return 1, now().Sub(t0), nil
 					}
 					if time.Now().After(deadline) {
 						return 0, 0, fmt.Errorf("%s not visible after 10 s", id)

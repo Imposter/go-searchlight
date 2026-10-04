@@ -16,14 +16,23 @@ import (
 	"time"
 )
 
+const (
+	smokeGrace   = 200 * time.Millisecond
+	smokeTimeout = 20 * time.Second
+)
+
 // TestSmokeBinary builds the searchlight binary and runs it as an operator would, on
 // SQLite in a temporary directory: it creates an index, bulk-loads it, searches and
 // percolates, then interrupts the process (SIGTERM; CTRL_BREAK on Windows). The process
-// must exit 0 having written every shard's final manifest at or past the last write's
-// seq, and a restarted node must reopen those shards at that seq and serve the data.
+// must exit 0 within its shutdown budget having written every shard's final manifest at
+// or past the last write's seq, and a restarted node must reopen those shards (not
+// rebuild them) at that seq and serve the data.
 func TestSmokeBinary(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and runs the binary")
+	}
+	if ok, why := canInterrupt(); !ok {
+		t.Skip(why)
 	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
@@ -52,8 +61,8 @@ func TestSmokeBinary(t *testing.T) {
 		"--node_id=smoke",
 		"--listen=127.0.0.1:0",
 		"--admin_listen=127.0.0.1:0",
-		"--shutdown_grace=200ms",
-		"--shutdown_timeout=20s",
+		"--shutdown_grace=" + smokeGrace.String(),
+		"--shutdown_timeout=" + smokeTimeout.String(),
 		"--log_level=debug",
 	}
 
@@ -144,6 +153,7 @@ func TestSmokeBinary(t *testing.T) {
 		}
 		return serving == 2
 	})
+	assertReopened(t, n, lastSeq)
 	for _, s := range shards.Shards {
 		if s.CommittedSeq < lastSeq {
 			t.Errorf("shard %d reopened at committed seq %d, below the last write's %d", s.Shard, s.CommittedSeq, lastSeq)
@@ -159,7 +169,6 @@ func TestSmokeBinary(t *testing.T) {
 	n.stop(t)
 }
 
-// binaryNode is a running searchlight process.
 type binaryNode struct {
 	cmd           *exec.Cmd
 	logs          *logWatch
@@ -169,7 +178,6 @@ type binaryNode struct {
 	token         string
 }
 
-// startBinary starts bin with args and waits until its admin listener reports ready.
 func startBinary(t *testing.T, bin string, args []string) *binaryNode {
 	t.Helper()
 	logs := newLogWatch()
@@ -208,7 +216,6 @@ func startBinary(t *testing.T, bin string, args []string) *binaryNode {
 	return n
 }
 
-// stop interrupts the process and checks it exits 0 after a clean shutdown.
 func (n *binaryNode) stop(t *testing.T) {
 	t.Helper()
 	if err := interrupt(n.cmd); err != nil {
@@ -219,11 +226,11 @@ func (n *binaryNode) stop(t *testing.T) {
 		if n.exitErr != nil {
 			t.Fatalf("the node exited with %v after the interrupt\n%s", n.exitErr, n.logs.text())
 		}
-	case <-time.After(time.Minute):
-		t.Fatalf("the node did not exit within a minute of the interrupt\n%s", n.logs.text())
+	case <-time.After(smokeGrace + smokeTimeout + 10*time.Second):
+		t.Fatalf("the node did not exit within its shutdown budget\n%s", n.logs.text())
 	}
 	for _, msg := range []string{"searchlight stopping", "cluster node stopped", "searchlight stopped"} {
-		if n.logs.find(msg, 0) == nil {
+		if n.logs.find(msg) == nil {
 			t.Errorf("no %q log line at shutdown", msg)
 		}
 	}
@@ -268,9 +275,6 @@ func hitIDs(hits []hit) []string {
 	return ids
 }
 
-// readManifests returns the changelog seq each shard manifest under dataDir covers, by
-// path. A manifest is a header line, "SLMANIFEST <format> <crc32c> <length>", then its
-// JSON.
 func readManifests(t *testing.T, dataDir string) map[string]int64 {
 	t.Helper()
 	out := map[string]int64{}
@@ -299,4 +303,28 @@ func readManifests(t *testing.T, dataDir string) map[string]int64 {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func assertReopened(t *testing.T, n *binaryNode, lastSeq int64) {
+	t.Helper()
+	opened := n.logs.all("shard opened")
+	if len(opened) != 2 {
+		t.Errorf("%d shards opened on restart, want 2", len(opened))
+	}
+	for _, m := range opened {
+		seq, _ := m["seq"].(float64)
+		docs, _ := m["documents"].(float64)
+		if int64(seq) < lastSeq || docs == 0 {
+			t.Errorf("a shard reopened at seq %v with %v documents, want its manifest's (seq >= %d, documents)", m["seq"], m["documents"], lastSeq)
+		}
+	}
+	if m := n.logs.find("shard copy must be rebuilt"); m != nil {
+		t.Errorf("a copy was rebuilt on restart rather than reopened: %v", m)
+	}
+	_, metrics := get(t, n.admin+"/metrics")
+	for line := range strings.Lines(metrics) {
+		if strings.HasPrefix(line, "searchlight_replica_recoveries_total{") {
+			t.Errorf("a copy recovered on restart: %s", strings.TrimSpace(line))
+		}
+	}
 }

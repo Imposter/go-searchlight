@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -45,6 +47,82 @@ func TestBoundAdvertise(t *testing.T) {
 	}
 }
 
+func TestLoopback(t *testing.T) {
+	for addr, want := range map[string]bool{
+		"127.0.0.1:8781": true, "[::1]:8781": true, "localhost:8781": true,
+		":8781": false, "0.0.0.0:8781": false, "10.0.0.7:8781": false, "node-a:8781": false, "junk": false,
+	} {
+		if got := loopback(addr); got != want {
+			t.Errorf("loopback(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
+func TestHealthcheck(t *testing.T) {
+	var readyz atomic.Int32
+	readyz.Store(http.StatusServiceUnavailable)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/readyz" {
+			w.WriteHeader(int(readyz.Load()))
+		}
+	}))
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := func(addr string) func(string) string {
+		return func(k string) string {
+			if k == "SEARCHLIGHT_ADMIN_LISTEN" {
+				return addr
+			}
+			return ""
+		}
+	}
+	unspecified, empty := env("0.0.0.0:"+port), env(":"+port)
+	for _, c := range []struct {
+		name string
+		args []string
+		env  func(string) string
+		want int
+	}{
+		{"not ready", nil, unspecified, 1},
+		{"live", []string{"--live"}, unspecified, 0},
+		{"not ready, empty host", nil, empty, 1},
+		{"bad admin_listen", nil, env("no-port"), 1},
+		{"unknown flag", []string{"--bogus"}, unspecified, 1},
+	} {
+		if got := healthcheck(c.args, c.env, io.Discard); got != c.want {
+			t.Errorf("%s: healthcheck = %d, want %d", c.name, got, c.want)
+		}
+	}
+	readyz.Store(http.StatusOK)
+	if got := healthcheck(nil, empty, io.Discard); got != 0 {
+		t.Errorf("ready: healthcheck = %d, want 0", got)
+	}
+	srv.Close()
+	if got := healthcheck(nil, unspecified, io.Discard); got != 1 {
+		t.Errorf("stopped: healthcheck = %d, want 1", got)
+	}
+}
+
+func TestRunStopsCleanlyWhenSignalledDuringStartup(t *testing.T) {
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	dir := t.TempDir()
+	env := map[string]string{
+		"SEARCHLIGHT_STORE_URL":        "sqlite:///" + filepath.ToSlash(filepath.Join(dir, "searchlight.db")),
+		"SEARCHLIGHT_DATA_DIR":         filepath.Join(dir, "data"),
+		"SEARCHLIGHT_ADMIN_LISTEN":     "127.0.0.1:0",
+		"SEARCHLIGHT_LISTEN":           "127.0.0.1:0",
+		"SEARCHLIGHT_INSECURE_NO_AUTH": "true",
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := run(ctx, nil, func(k string) string { return env[k] }, io.Discard); err != nil {
+		t.Errorf("run with a signal during startup = %v, want a clean stop", err)
+	}
+}
+
 // TestRunServesAndStopsWhenCancelled runs a node in process on SQLite: the admin
 // listener answers its probes and metrics, the public API serves, and cancelling the
 // context stops everything cleanly.
@@ -59,8 +137,8 @@ func TestRunServesAndStopsWhenCancelled(t *testing.T) {
 		"SEARCHLIGHT_LISTEN":           "127.0.0.1:0",
 		"SEARCHLIGHT_NODE_ID":          "inproc",
 		"SEARCHLIGHT_INSECURE_NO_AUTH": "true",
-		"SEARCHLIGHT_SHUTDOWN_GRACE":   "0s",
-		"SEARCHLIGHT_SHUTDOWN_TIMEOUT": "10s",
+		"SEARCHLIGHT_SHUTDOWN_GRACE":   "200ms",
+		"SEARCHLIGHT_SHUTDOWN_TIMEOUT": "4s",
 	}
 	logs := newLogWatch()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -88,7 +166,19 @@ func TestRunServesAndStopsWhenCancelled(t *testing.T) {
 		code, _ := get(t, admin+"/readyz")
 		return code == http.StatusOK
 	})
+	adminEnv := func(k string) string {
+		if k == "SEARCHLIGHT_ADMIN_LISTEN" {
+			return strings.TrimPrefix(admin, "http://")
+		}
+		return ""
+	}
+	for _, args := range [][]string{nil, {"--live"}} {
+		if code := healthcheck(args, adminEnv, io.Discard); code != 0 {
+			t.Errorf("healthcheck %v = %d, want 0", args, code)
+		}
+	}
 
+	stopped := time.Now()
 	cancel()
 	select {
 	case err := <-done:
@@ -98,6 +188,9 @@ func TestRunServesAndStopsWhenCancelled(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("run did not stop after cancellation")
 	}
+	if took := time.Since(stopped); took > 200*time.Millisecond+4*time.Second {
+		t.Errorf("the shutdown took %v, past shutdown_grace plus shutdown_timeout", took)
+	}
 	for _, addr := range []string{admin, public} {
 		if conn, err := net.DialTimeout("tcp", strings.TrimPrefix(addr, "http://"), time.Second); err == nil {
 			_ = conn.Close()
@@ -106,7 +199,6 @@ func TestRunServesAndStopsWhenCancelled(t *testing.T) {
 	}
 }
 
-// logWatch collects a node's JSON log lines and finds them by message.
 type logWatch struct {
 	*io.PipeWriter
 	mu    sync.Mutex
@@ -143,41 +235,40 @@ func (l *logWatch) collect(r io.Reader) {
 	_, _ = io.Copy(io.Discard, r)
 }
 
-// find returns the first line logged with msg after the first skip of them, or nil.
-func (l *logWatch) find(msg string, skip int) map[string]any {
+func (l *logWatch) find(msg string) map[string]any {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for _, m := range l.lines {
 		if m["msg"] == msg {
-			if skip == 0 {
-				return m
-			}
-			skip--
+			return m
 		}
 	}
 	return nil
 }
 
-// text returns everything logged so far.
+func (l *logWatch) all(msg string) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []map[string]any
+	for _, m := range l.lines {
+		if m["msg"] == msg {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func (l *logWatch) text() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.raw.String()
 }
 
-// wait returns the first line logged with msg, failing the test after a minute.
 func (l *logWatch) wait(t *testing.T, msg string) map[string]any {
-	t.Helper()
-	return l.waitNth(t, msg, 0)
-}
-
-// waitNth returns the line logged with msg after the first skip of them, failing the
-// test after a minute.
-func (l *logWatch) waitNth(t *testing.T, msg string, skip int) map[string]any {
 	t.Helper()
 	deadline := time.After(time.Minute)
 	for {
-		if m := l.find(msg, skip); m != nil {
+		if m := l.find(msg); m != nil {
 			return m
 		}
 		select {
@@ -188,7 +279,6 @@ func (l *logWatch) waitNth(t *testing.T, msg string, skip int) map[string]any {
 	}
 }
 
-// address returns the address the first line logged with msg names.
 func (l *logWatch) address(t *testing.T, msg string) string {
 	t.Helper()
 	addr, ok := l.wait(t, msg)["address"].(string)

@@ -64,7 +64,7 @@ func TestMigrate(t *testing.T) {
 
 		// A database migrated by a newer binary is refused.
 		s := engine(st)
-		if _, err := s.w.ExecContext(ctx, s.bind("INSERT INTO sl_schema_migrations (version, name, applied_at) VALUES (?, ?, 0)"), 9999, "future"); err != nil {
+		if _, err := s.w.ExecContext(ctx, rebind(s, "INSERT INTO sl_schema_migrations (version, name, applied_at) VALUES (?, ?, 0)"), 9999, "future"); err != nil {
 			t.Fatal(err)
 		}
 		if err := st.Migrate(ctx); !errors.Is(err, ErrNewerSchema) {
@@ -188,8 +188,10 @@ func TestApplyAndRead(t *testing.T) {
 	})
 }
 
-// TestBigBatch covers multi-statement inserts (more rows than one INSERT
-// carries) and in-batch rewrites of the same document.
+// TestBigBatch covers a large batch with in-batch rewrites and deletes of the
+// same documents. At the engines' own limits it fits one statement a table on
+// Postgres and MySQL (SQLite writes a row a statement); TestSplitWrites
+// drives the multi-statement paths with shrunk limits.
 func TestBigBatch(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		st := h.open(t)
@@ -1276,7 +1278,7 @@ func TestBlobs(t *testing.T) {
 
 		// Corruption is caught at the end of the stream.
 		s := engine(st)
-		if _, err := s.w.ExecContext(ctx, s.bind("UPDATE sl_blob_chunks SET data = ? WHERE chunk = 0 AND upload_id = (SELECT upload_id FROM sl_blobs WHERE name = ?)"),
+		if _, err := s.w.ExecContext(ctx, rebind(s, "UPDATE sl_blob_chunks SET data = ? WHERE chunk = 0 AND upload_id = (SELECT upload_id FROM sl_blobs WHERE name = ?)"),
 			[]byte("y"), "snapshots/x"); err != nil {
 			t.Fatal(err)
 		}
@@ -1536,7 +1538,7 @@ func TestDatabaseClock(t *testing.T) {
 		ctx := context.Background()
 		s := engine(h.open(t))
 		var dbNow int64
-		if err := s.r.QueryRowContext(ctx, "SELECT "+s.d.Now).Scan(&dbNow); err != nil {
+		if err := s.r.QueryRowContext(ctx, s.d.Blobs.Clock).Scan(&dbNow); err != nil {
 			t.Fatal(err)
 		}
 		if skew := time.Since(time.UnixMilli(dbNow)); skew.Abs() > 5*time.Second {

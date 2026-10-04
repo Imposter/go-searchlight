@@ -2,13 +2,19 @@
 // go-sql-driver/mysql.
 //
 // Apply locks the counter row with SELECT ... FOR UPDATE under READ
-// COMMITTED, so sequence numbers are assigned and committed in order. MySQL
-// DDL is not transactional, so migrations run on one connection holding a
-// GET_LOCK named after an MD5 hash of the database (a name can run to 64
+// COMMITTED, so sequence numbers are assigned and committed in order, and
+// writes a batch as multi-row INSERTs sized to MySQL's placeholder and packet
+// limits.
+// MySQL DDL is not transactional, so migrations run on one connection holding
+// a GET_LOCK named after an MD5 hash of the database (a name can run to 64
 // bytes, which a long database name alone could exceed), and each file is
 // recorded as it completes. Identifiers and names are VARBINARY: ids compare
-// byte for byte,
-// as on the other dialects, instead of under a case-insensitive collation.
+// byte for byte, as on the other dialects, instead of under a
+// case-insensitive collation.
+//
+// It needs MySQL 8.0.19 or later (upserts use the row alias, INSERT ... AS new
+// ON DUPLICATE KEY UPDATE col = new.col) and is tested on 8.4 LTS. The
+// server's max_allowed_packet must be at least 64 MB, the default.
 package mysql
 
 import (
@@ -29,8 +35,6 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-const now = "CAST(UNIX_TIMESTAMP(NOW(3)) * 1000 AS SIGNED)"
-
 // Dialect returns the MySQL dialect.
 func Dialect() *dialect.Dialect {
 	sub, err := fs.Sub(migrations, "migrations")
@@ -38,26 +42,18 @@ func Dialect() *dialect.Dialect {
 		panic(err) // the embedded directory always exists
 	}
 	return &dialect.Dialect{
-		Name:       "mysql",
-		Open:       open,
-		Migrations: sub,
-		VersionTable: `CREATE TABLE IF NOT EXISTS sl_schema_migrations (
-	version INT NOT NULL PRIMARY KEY,
-	name VARCHAR(255) NOT NULL,
-	applied_at BIGINT NOT NULL
-) ENGINE=InnoDB`,
-		MigrateInTx:   false,
-		SessionLock:   "SELECT GET_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())), 120)",
-		SessionUnlock: "SELECT RELEASE_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())))",
-		ForUpdate:     " FOR UPDATE",
-		Now:           now,
-		Upsert:        onDuplicateKey,
-		Claim:         claim,
-		Greatest:      greatest,
-		ApplyTx:       &sql.TxOptions{Isolation: sql.LevelReadCommitted},
-		SnapshotTx:    &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
-		MaxParams:     65535,
-		Retryable:     retryable,
+		Name:        "mysql",
+		Open:        open,
+		Migrations:  sub,
+		ApplyTx:     &sql.TxOptions{Isolation: sql.LevelReadCommitted},
+		SnapshotTx:  &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
+		Retryable:   retryable,
+		Changelog:   changelog,
+		Records:     records,
+		Registry:    registry,
+		Blobs:       blobs,
+		Indexes:     indexes,
+		Maintenance: maintenance,
 	}
 }
 
@@ -100,6 +96,9 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.InterpolateParams = true
 	cfg.ClientFoundRows = true
+	// Read max_allowed_packet from the server, so a statement the server
+	// would take is never refused, or interpolated past it, client-side.
+	cfg.MaxAllowedPacket = 0
 	cfg.MultiStatements = false
 	cfg.Loc = time.UTC
 	if cfg.Params == nil {
@@ -133,33 +132,3 @@ func open(u *url.URL) (dialect.Pools, error) {
 	db.SetConnMaxLifetime(30 * time.Minute)
 	return dialect.Pools{Write: db, Read: db}, nil
 }
-
-func onDuplicateKey(_, update []string) string {
-	var b strings.Builder
-	b.WriteString(" ON DUPLICATE KEY UPDATE ")
-	for i, c := range update {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(c + " = VALUES(" + c + ")")
-	}
-	return b.String()
-}
-
-// MySQL evaluates ON DUPLICATE KEY UPDATE assignments left to right, each
-// seeing the ones before, so node_id changes after state, applied_seq and
-// epoch have read the old owner, and lease_until last.
-var claimQuery = strings.ReplaceAll(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
-VALUES (?, ?, ?, ?, 'recovering', 0, NOW + ?, ?)
-ON DUPLICATE KEY UPDATE
-	state = IF(node_id = VALUES(node_id), state, IF(lease_until < NOW, VALUES(state), state)),
-	applied_seq = IF(node_id = VALUES(node_id), applied_seq, IF(lease_until < NOW, 0, applied_seq)),
-	epoch = IF(node_id = VALUES(node_id), epoch, IF(lease_until < NOW, VALUES(epoch), epoch)),
-	node_id = IF(lease_until < NOW, VALUES(node_id), node_id),
-	lease_until = IF(node_id = VALUES(node_id), VALUES(lease_until), lease_until)`, "NOW", now)
-
-func claim(a dialect.ClaimArgs) (string, []any) {
-	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
-}
-
-func greatest(a, b string) string { return "GREATEST(" + a + ", " + b + ")" }

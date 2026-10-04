@@ -262,8 +262,9 @@ The logical schema is the same in every dialect.
 | `sl_blobs` | optional segment bundles for recovery without a peer |
 
 - **Write ordering.** `Apply` locks the counter row, takes contiguous `seq` values and commits. Visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: concurrent requests on a coordinator are coalesced into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs.
-- **Portable SQL only.** JSON is stored as text, upserts are spelled per dialect, and there are no dialect JSON functions.
+- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). JSON is stored as text and no dialect JSON functions are used.
 - **Drivers:** `pgx/v5/stdlib`, `go-sql-driver/mysql`, `modernc.org/sqlite`.
+- **Supported versions:** Postgres (tested on 17), MySQL 8.0.19+ (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default), SQLite 3.35+ (bundled by modernc.org/sqlite).
 - **Migrations** are embedded and run under a lock.
 
 ## 9. Cluster: plug-and-play replicas

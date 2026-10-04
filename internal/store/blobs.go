@@ -88,8 +88,8 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 	if err != nil {
 		return info, err
 	}
-	reg := s.bind("INSERT INTO sl_blob_uploads (upload_id, name, touched_at) VALUES (?, ?, " + s.d.Now + ")")
-	if _, err := s.w.ExecContext(ctx, reg, upload, name); err != nil {
+	q := &s.d.Blobs
+	if _, err := s.w.ExecContext(ctx, q.Register, upload, name); err != nil {
 		return info, fmt.Errorf("register blob upload: %w", err)
 	}
 	// committed becomes true once switchTo's transaction makes upload the
@@ -104,8 +104,6 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 		}
 	}()
 
-	ins := s.bind("INSERT INTO sl_blob_chunks (upload_id, chunk, data) VALUES (?, ?, ?)")
-	touch := s.bind("UPDATE sl_blob_uploads SET touched_at = " + s.d.Now + " WHERE upload_id = ?")
 	h := sha256.New()
 	buf := make([]byte, s.chunk)
 	var size int64
@@ -114,7 +112,7 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 		n, rerr := io.ReadFull(r, buf)
 		if n > 0 {
 			h.Write(buf[:n])
-			if _, err := s.w.ExecContext(ctx, ins, upload, chunks, buf[:n]); err != nil {
+			if _, err := s.w.ExecContext(ctx, q.WriteChunk, upload, chunks, buf[:n]); err != nil {
 				return info, fmt.Errorf("write blob chunk %d: %w", chunks, err)
 			}
 			chunks++
@@ -123,7 +121,7 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 				return info, errSimulatedCrash
 			}
 			if chunks%blobTouchEvery == 0 {
-				res, err := s.w.ExecContext(ctx, touch, upload)
+				res, err := s.w.ExecContext(ctx, q.Touch, upload)
 				if err := sweptCheck(res, err, name); err != nil {
 					return info, err
 				}
@@ -191,6 +189,7 @@ func sweptCheck(res sql.Result, err error, name string) error {
 // so the caller can report the result without a second read.
 func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int64, chunks int, sum string) (old string, createdAt int64, err error) {
 	s := b.s
+	q := &s.d.Blobs
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
 		return "", 0, err
@@ -198,26 +197,24 @@ func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int6
 	defer rollback(tx)
 	// One read of the database clock serves both the row and the return
 	// value, so they can never disagree.
-	if err := tx.QueryRowContext(ctx, "SELECT "+s.d.Now).Scan(&createdAt); err != nil {
+	if err := tx.QueryRowContext(ctx, q.Clock).Scan(&createdAt); err != nil {
 		return "", 0, err
 	}
 	// The upload must still be registered, or Sweep has started removing it.
-	res, err := tx.ExecContext(ctx, s.bind("DELETE FROM sl_blob_uploads WHERE upload_id = ?"), upload)
+	res, err := tx.ExecContext(ctx, q.Unregister, upload)
 	if err := sweptCheck(res, err, name); err != nil {
 		return "", 0, err
 	}
 	// Make sure the row exists and lock it, so that of two concurrent Puts
 	// the second sees the first's upload as the one it replaces.
-	ensure := "INSERT INTO sl_blobs (name, upload_id, size, chunks, sha256, created_at) VALUES (?, '', 0, 0, '', 0)" +
-		s.d.Upsert([]string{"name"}, []string{"name"})
-	if _, err := tx.ExecContext(ctx, s.bind(ensure), name); err != nil {
+	row, err := returningRow(ctx, tx, q.Take, []any{name}, []any{name})
+	if err != nil {
 		return "", 0, err
 	}
-	if err := tx.QueryRowContext(ctx, s.bind("SELECT upload_id FROM sl_blobs WHERE name = ?"+s.d.ForUpdate), name).Scan(&old); err != nil {
+	if err := row.Scan(&old); err != nil {
 		return "", 0, err
 	}
-	set := s.bind("UPDATE sl_blobs SET upload_id = ?, size = ?, chunks = ?, sha256 = ?, created_at = ? WHERE name = ?")
-	if _, err := tx.ExecContext(ctx, set, upload, size, chunks, sum, createdAt, name); err != nil {
+	if _, err := tx.ExecContext(ctx, q.Point, upload, size, chunks, sum, createdAt, name); err != nil {
 		return "", 0, err
 	}
 	if old != "" {
@@ -242,7 +239,7 @@ func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int6
 // registerGarbage records an upload that is no longer referenced with
 // touched_at 0, so Sweep removes it if nothing else does.
 func (b *blobStore) registerGarbage(ctx context.Context, tx *sql.Tx, upload, name string) error {
-	_, err := tx.ExecContext(ctx, b.s.bind("INSERT INTO sl_blob_uploads (upload_id, name, touched_at) VALUES (?, ?, 0)"), upload, name)
+	_, err := tx.ExecContext(ctx, b.s.d.Blobs.RegisterGarbage, upload, name)
 	return err
 }
 
@@ -256,7 +253,7 @@ func (b *blobStore) removeUpload(ctx context.Context, upload string) {
 		b.s.log.WarnContext(ctx, "could not remove a blob upload", slog.String("upload_id", upload), slog.Any("error", err))
 		return
 	}
-	if _, err := b.s.w.ExecContext(ctx, b.s.bind("DELETE FROM sl_blob_uploads WHERE upload_id = ?"), upload); err != nil {
+	if _, err := b.s.w.ExecContext(ctx, b.s.d.Blobs.Unregister, upload); err != nil {
 		b.s.log.WarnContext(ctx, "could not remove a blob upload", slog.String("upload_id", upload), slog.Any("error", err))
 	}
 }
@@ -265,10 +262,10 @@ func (b *blobStore) removeUpload(ctx context.Context, upload string) {
 func (b *blobStore) deleteChunks(ctx context.Context, upload string) error {
 	s := b.s
 	var maxChunk sql.NullInt64
-	if err := s.r.QueryRowContext(ctx, s.bind("SELECT MAX(chunk) FROM sl_blob_chunks WHERE upload_id = ?"), upload).Scan(&maxChunk); err != nil {
+	if err := s.r.QueryRowContext(ctx, s.d.Blobs.MaxChunk, upload).Scan(&maxChunk); err != nil {
 		return err
 	}
-	q := s.bind("DELETE FROM sl_blob_chunks WHERE upload_id = ? AND chunk >= ? AND chunk < ?")
+	q := s.d.Blobs.DeleteChunks
 	for lo := int64(0); maxChunk.Valid && lo <= maxChunk.Int64; lo += blobDeleteStep {
 		if _, err := s.w.ExecContext(ctx, q, upload, lo, lo+blobDeleteStep); err != nil {
 			return err
@@ -289,14 +286,12 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 	// Registered uploads that are unreferenced and stale. Deleting the
 	// registration first (only if still stale) makes a Put still writing it
 	// fail rather than commit a blob with missing chunks.
-	stale, err := b.uploadIDs(ctx, "SELECT upload_id FROM sl_blob_uploads u WHERE touched_at < "+s.d.Now+" - ?"+
-		" AND NOT EXISTS (SELECT 1 FROM sl_blobs b WHERE b.upload_id = u.upload_id)", ms)
+	stale, err := b.uploadIDs(ctx, s.d.Blobs.Stale, ms)
 	if err != nil {
 		return 0, err
 	}
-	claim := s.bind("DELETE FROM sl_blob_uploads WHERE upload_id = ? AND touched_at < " + s.d.Now + " - ?")
 	for _, id := range stale {
-		res, err := s.w.ExecContext(ctx, claim, id, ms)
+		res, err := s.w.ExecContext(ctx, s.d.Blobs.ClaimStale, id, ms)
 		if err != nil {
 			return removed, err
 		}
@@ -314,9 +309,7 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 	// Chunks of uploads that are neither referenced nor registered: left by
 	// an interrupted cleanup, or written after a sweep took the upload.
 	// Uploads register before their first chunk, so these are never live.
-	orphans, err := b.uploadIDs(ctx, "SELECT DISTINCT upload_id FROM sl_blob_chunks c"+
-		" WHERE NOT EXISTS (SELECT 1 FROM sl_blobs b WHERE b.upload_id = c.upload_id)"+
-		" AND NOT EXISTS (SELECT 1 FROM sl_blob_uploads u WHERE u.upload_id = c.upload_id)")
+	orphans, err := b.uploadIDs(ctx, s.d.Blobs.Orphans)
 	if err != nil {
 		return removed, err
 	}
@@ -330,7 +323,7 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 }
 
 func (b *blobStore) uploadIDs(ctx context.Context, q string, args ...any) ([]string, error) {
-	rows, err := b.s.r.QueryContext(ctx, b.s.bind(q), args...)
+	rows, err := b.s.r.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +344,7 @@ func (b *blobStore) stat(ctx context.Context, name string) (BlobInfo, string, er
 	info := BlobInfo{Name: name}
 	var upload string
 	var created int64
-	err := s.r.QueryRowContext(ctx, s.bind("SELECT upload_id, size, chunks, sha256, created_at FROM sl_blobs WHERE name = ?"), name).
+	err := s.r.QueryRowContext(ctx, s.d.Blobs.Stat, name).
 		Scan(&upload, &info.Size, &info.Chunks, &info.SHA256, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return info, "", fmt.Errorf("blob %q: %w", name, ErrNotFound)
@@ -404,13 +397,11 @@ func (b *blobStore) List(ctx context.Context, prefix string) (out []BlobInfo, er
 	defer end(&err)
 	// Names compare byte for byte on every dialect, so the prefix is a key
 	// range.
-	q := "SELECT name, size, chunks, sha256, created_at FROM sl_blobs WHERE name >= ?"
-	args := []any{prefix}
+	q, args := s.d.Blobs.ListFrom, []any{prefix}
 	if hi, ok := prefixEnd(prefix); ok {
-		q += " AND name < ?"
-		args = append(args, hi)
+		q, args = s.d.Blobs.ListRange, []any{prefix, hi}
 	}
-	rows, err := s.r.QueryContext(ctx, s.bind(q+" ORDER BY name"), args...)
+	rows, err := s.r.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -443,14 +434,14 @@ func (b *blobStore) Delete(ctx context.Context, name string) (err error) {
 	}
 	defer rollback(tx)
 	var upload string
-	err = tx.QueryRowContext(ctx, s.bind("SELECT upload_id FROM sl_blobs WHERE name = ?"+s.d.ForUpdate), name).Scan(&upload)
+	err = tx.QueryRowContext(ctx, s.d.Blobs.LockForDelete, name).Scan(&upload)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, s.bind("DELETE FROM sl_blobs WHERE name = ?"), name); err != nil {
+	if _, err := tx.ExecContext(ctx, s.d.Blobs.Delete, name); err != nil {
 		return err
 	}
 	if err := b.registerGarbage(ctx, tx, upload, name); err != nil {
@@ -495,7 +486,7 @@ func (r *blobReader) Read(p []byte) (int, error) {
 			return 0, r.err
 		}
 		var data []byte
-		err := r.s.r.QueryRowContext(r.ctx, r.s.bind("SELECT data FROM sl_blob_chunks WHERE upload_id = ? AND chunk = ?"),
+		err := r.s.r.QueryRowContext(r.ctx, r.s.d.Blobs.ReadChunk,
 			r.upload, r.next).Scan(&data)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):

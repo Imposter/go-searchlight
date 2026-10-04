@@ -3,12 +3,15 @@
 // record, the index catalogue, the cluster registry and shard-copy leases
 // (spec §9), and optional segment blobs.
 //
-// One engine runs on every dialect (sqlite, postgres, mysql), which differ
-// only in the SQL spellings described by package dialect. Apply locks the
-// single counter row, takes contiguous sequence numbers and commits, so
-// commit order equals seq order and a tailer reading ChangesAfter never
-// skips a change that commits later. GroupCommitter coalesces concurrent
-// Apply calls on a node into one transaction.
+// The logic is written once, here, for every dialect (sqlite, postgres,
+// mysql): transaction shapes and retries, seq allocation under the counter
+// lock, lease and epoch fencing, the blob protocol and the Apply guards. Each
+// dialect package owns its SQL, as the statement tables of package dialect,
+// and spells each statement its engine's best way. Apply locks the single
+// counter row, takes contiguous sequence numbers and commits, so commit order
+// equals seq order and a tailer reading ChangesAfter never skips a change
+// that commits later. GroupCommitter coalesces concurrent Apply calls on a
+// node into one transaction.
 package store
 
 import (

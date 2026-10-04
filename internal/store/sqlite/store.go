@@ -12,6 +12,17 @@
 // past it, SQLITE_BUSY and SQLITE_LOCKED (and their extended codes) are
 // retried like a Postgres serialization failure or a MySQL deadlock: the
 // whole transaction was never committed, so running it again is safe.
+//
+// A batch is written one row a statement, not as multi-row VALUES lists:
+// the store prepares each statement text once per batch and steps it for
+// every row. SQLite runs in process, so there are no round trips for long
+// VALUES lists to save, while compiling a list of hundreds of rows costs more
+// than stepping a prepared statement per row. Measured with fixed iterations,
+// Apply of 1000 1 KB documents runs about 2.1 times as fast as with VALUES
+// lists sized to the variable limit, and about 1.8 times as fast as main's
+// 500-row lists (BenchmarkApply in package store). The store's limits are
+// therefore unused here. Writes that are read back use RETURNING (SQLite 3.35
+// and later).
 package sqlite
 
 import (
@@ -43,22 +54,16 @@ func Dialect() *dialect.Dialect {
 		panic(err) // the embedded directory always exists
 	}
 	return &dialect.Dialect{
-		Name:       "sqlite",
-		Open:       open,
-		Migrations: sub,
-		VersionTable: `CREATE TABLE IF NOT EXISTS sl_schema_migrations (
-	version INTEGER NOT NULL PRIMARY KEY,
-	name TEXT NOT NULL,
-	applied_at INTEGER NOT NULL
-)`,
-		MigrateInTx: true, // BEGIN IMMEDIATE excludes every other writer
-		ForUpdate:   "",
-		Now:         "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)",
-		Upsert:      onConflict,
-		Claim:       claim,
-		Greatest:    greatest,
-		MaxParams:   32766,
+		Name:        "sqlite",
+		Open:        open,
+		Migrations:  sub,
 		Retryable:   retryable,
+		Changelog:   changelog,
+		Records:     records,
+		Registry:    registry,
+		Blobs:       blobs,
+		Indexes:     indexes,
+		Maintenance: maintenance,
 	}
 }
 
@@ -168,37 +173,3 @@ func open(u *url.URL) (dialect.Pools, error) {
 	r.SetMaxIdleConns(16)
 	return dialect.Pools{Write: w, Read: r}, nil
 }
-
-func onConflict(keys, update []string) string {
-	var b strings.Builder
-	b.WriteString(" ON CONFLICT (")
-	b.WriteString(strings.Join(keys, ", "))
-	b.WriteString(") DO UPDATE SET ")
-	for i, c := range update {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(c + " = excluded." + c)
-	}
-	return b.String()
-}
-
-const claimSQL = `INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)
-VALUES (?1, ?2, ?3, ?4, 'recovering', 0, (NOW) + ?5, ?6)
-ON CONFLICT (index_name, shard, slot) DO UPDATE SET
-	state = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.state ELSE excluded.state END,
-	applied_seq = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.applied_seq ELSE 0 END,
-	epoch = CASE WHEN sl_shard_copies.node_id = excluded.node_id THEN sl_shard_copies.epoch ELSE excluded.epoch END,
-	node_id = excluded.node_id,
-	lease_until = excluded.lease_until
-WHERE sl_shard_copies.node_id = excluded.node_id OR sl_shard_copies.lease_until < (NOW)`
-
-var claimQuery = strings.ReplaceAll(claimSQL, "NOW", "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)")
-
-func claim(a dialect.ClaimArgs) (string, []any) {
-	return claimQuery, []any{a.Index, a.Shard, a.Slot, a.Node, a.TTLms, a.Epoch}
-}
-
-// greatest uses SQLite's multi-argument MAX, which (unlike single-argument
-// MAX) is the scalar function, not the aggregate.
-func greatest(a, b string) string { return "MAX(" + a + ", " + b + ")" }

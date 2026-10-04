@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -364,6 +365,9 @@ func (s *Server) wrap(rt *route) http.Handler {
 		// how much is left.
 		body := &trackedBody{r: r.Body}
 		r.Body = body
+		// releaseBudget gives back the request's in-flight budget; a refusal calls
+		// it before draining, so a drain holds none.
+		releaseBudget := func() {}
 		fail := func(e *Error) {
 			failure = e
 			if e.Status == http.StatusRequestEntityTooLarge {
@@ -371,7 +375,8 @@ func (s *Server) wrap(rt *route) http.Handler {
 				s.tooLarge.Add(1)
 			}
 			writeProblem(sw, e, id)
-			s.drain(sw, r, body)
+			releaseBudget()
+			s.drain(sw, r, body, e.Status)
 		}
 		if e := s.auth.check(r, rt.scope); e != nil {
 			fail(e)
@@ -403,11 +408,13 @@ func (s *Server) wrap(rt *route) http.Handler {
 				fail(overBudget(b))
 				return
 			}
-			defer b.release(cost)
+			releaseBudget = sync.OnceFunc(func() { b.release(cost) })
+			defer releaseBudget()
 		} else if r.ContentLength < 0 {
 			br := &budgetReader{r: r.Body, b: b}
 			r.Body = br
-			defer br.releaseAll()
+			releaseBudget = sync.OnceFunc(br.releaseAll)
+			defer releaseBudget()
 		}
 		ctx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
 		defer cancel()
@@ -503,6 +510,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 const (
 	// minDrainBytes is the least drain reads past a refusal, whatever max_body_bytes.
 	minDrainBytes = 1 << 20
+	// authDrainBytes is the most drain reads past a 401 or 403: the cheapest refusal
+	// to provoke, so the least it may cost.
+	authDrainBytes = 256 << 10
 	// drainTimeout bounds the drain: a client that sends slowly is cut off then.
 	drainTimeout = time.Second
 )
@@ -528,23 +538,34 @@ func (b *trackedBody) Close() error { return b.r.Close() }
 
 // drain reads and discards what is left of a refused request's body, after flushing
 // the answer, so that a client still sending its body (a 413 refuses one as soon as
-// it passes the limit) finishes sending and then reads the answer. Closing a
+// it passes the limit) finishes sending and then reads the answer. Closing an HTTP/1
 // connection with request bytes unread makes the operating system reset it, and a
 // client still writing then sees the reset (on Windows it even loses the answer it
-// had already received) instead of the 413. net/http drains 256 KiB the same way
-// after a handler that did not read its body; this drains up to max_body_bytes (at
-// least 1 MiB) and for at most a second, so a client that sends far more, or slowly,
-// is still cut off: one that declares more than that is not drained at all.
-func (s *Server) drain(w http.ResponseWriter, r *http.Request, body *trackedBody) {
-	if body.eof || r.ContentLength == 0 {
-		return
+// had already received) instead of the answer. net/http drains 256 KiB the same way
+// after a handler that did not read its body.
+//
+// It drains up to max_body_bytes (at least 1 MiB), or 256 KiB after a 401 or 403 (no
+// token is needed to provoke one), and for at most a second, so a client that sends
+// far more, or slowly, is still cut off; a body declared longer than that is not
+// drained at all. The second is a read deadline: when it cannot be set the body is not
+// drained, so a drain never runs unbounded. HTTP/2 needs no drain: a stream is reset
+// on its own, the connection and the answer survive it.
+func (s *Server) drain(w http.ResponseWriter, r *http.Request, body *trackedBody, status int) int64 {
+	if body.eof || r.ContentLength == 0 || r.ProtoMajor >= 2 {
+		return 0
 	}
 	limit := max(s.cfg.MaxBodyBytes, minDrainBytes)
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		limit = authDrainBytes
+	}
 	if r.ContentLength > 0 && r.ContentLength-body.n > limit {
-		return
+		return 0
 	}
 	rc := http.NewResponseController(w)
+	if err := rc.SetReadDeadline(time.Now().Add(drainTimeout)); err != nil {
+		return 0 // unbounded in time: close instead
+	}
 	_ = rc.Flush()
-	_ = rc.SetReadDeadline(time.Now().Add(drainTimeout))
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, limit))
+	n, _ := io.Copy(io.Discard, io.LimitReader(body, limit))
+	return n
 }

@@ -473,3 +473,41 @@ func TestInvalidUTF8CannotPoisonTheChangelog(t *testing.T) {
 		t.Errorf("health = %v", h)
 	}
 }
+
+// Over TLS the API speaks HTTP/2 (ServeTLS enables it). A body refused at the limit
+// is answered 413 without a drain: HTTP/2 resets the stream alone, and the client
+// reads the answer on a connection that survives.
+func TestOversizedBodyOverHTTP2(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxBodyBytes = 64 << 10
+	cfg.MaxDocBytes = 64 << 10
+	srv, err := api.NewServer(&stub{}, nil, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := httptest.NewUnstartedServer(srv)
+	hs.EnableHTTP2 = true
+	hs.StartTLS()
+	t.Cleanup(hs.Close)
+	for i := range 20 {
+		body := io.MultiReader(strings.NewReader(`{"pad": "`), io.LimitReader(neverEnding('x'), 4<<20))
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, hs.URL+"/indexes/h/_search", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := hs.Client().Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+		_ = res.Body.Close()
+		if res.ProtoMajor != 2 || res.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Fatalf("request %d: %s %d, want HTTP/2 413", i, res.Proto, res.StatusCode)
+		}
+	}
+	// The connection survived the refusals: a request after them succeeds on it.
+	res, err := hs.Client().Get(hs.URL + "/healthz")
+	if err != nil || res.StatusCode != http.StatusOK {
+		t.Fatalf("healthz after the refusals: %v %v", res, err)
+	}
+	_ = res.Body.Close()
+}

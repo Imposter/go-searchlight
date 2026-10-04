@@ -1,0 +1,130 @@
+name: bench
+
+# Comparative numbers drift with every commit and ES has real cost to run, so this never
+# runs on push or pull_request: only on demand, or once a week to catch regressions.
+on:
+  workflow_dispatch:
+    inputs:
+      docs:
+        description: "product documents to generate (e.g. 50k, 1m, 10m)"
+        default: "1m"
+        required: false
+      searches:
+        description: "saved-search set sizes (comma-separated)"
+        default: "1k,10k,100k"
+        required: false
+  schedule:
+    - cron: "0 7 * * 1" # Monday 07:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: slbench vs Elasticsearch
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DOCS: ${{ inputs.docs || '1m' }}
+      SEARCHES: ${{ inputs.searches || '1k,10k,100k' }}
+      DATA_DIR: ${{ github.workspace }}/.bench-data
+      SL_DIR: ${{ github.workspace }}/.bench-sl
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: build slbench and slserver
+        run: |
+          go build -o /tmp/slbench ./bench/cmd/slbench
+          go build -o /tmp/slserver ./bench/cmd/slserver
+
+      - name: start Elasticsearch
+        run: docker compose -f bench/docker-compose.es.yml up -d
+        env:
+          ES_HEAP: 4g
+
+      - name: wait for Elasticsearch
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null; then
+              echo "elasticsearch is up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "elasticsearch did not become healthy" >&2
+          docker compose -f bench/docker-compose.es.yml logs
+          exit 1
+
+      - name: start Searchlight
+        run: |
+          mkdir -p "$SL_DIR"
+          nohup /tmp/slserver -dir "$SL_DIR" -addr 127.0.0.1:8780 -token auto -info "$SL_DIR/info.json" \
+            > "$SL_DIR/slserver.log" 2>&1 &
+          echo $! > "$SL_DIR/slserver.pid"
+          for i in $(seq 1 60); do
+            if [ -s "$SL_DIR/info.json" ]; then
+              echo "searchlight is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "searchlight did not report ready" >&2
+          cat "$SL_DIR/slserver.log" || true
+          exit 1
+
+      - name: generate dataset
+        run: |
+          mkdir -p "$DATA_DIR"
+          /tmp/slbench gen -out "$DATA_DIR" -docs "$DOCS" -searches "$SEARCHES" -seed 1
+
+      - name: run workloads
+        id: run
+        run: |
+          DATA_FILE=$(ls "$DATA_DIR"/products-*.ndjson | head -1)
+          SEARCH_FILE=$(ls "$DATA_DIR"/searches-*.ndjson | sort -t- -k2 -V | tail -1)
+          /tmp/slbench run \
+            --data "$DATA_FILE" \
+            --searches "$SEARCH_FILE" \
+            --sets "$SEARCHES" \
+            --sl-info "$SL_DIR/info.json" \
+            --es-url "http://127.0.0.1:9200" \
+            --es-config "heap_max=4.0 GiB" \
+            --label "CI (${{ github.sha }})" \
+            --out "$DATA_DIR/bench-results.json" \
+            --md docs/benchmarks.md \
+            --allow-mismatch
+        continue-on-error: true
+
+      - name: stop Searchlight
+        if: always()
+        run: |
+          if [ -f "$SL_DIR/slserver.pid" ]; then
+            kill "$(cat "$SL_DIR/slserver.pid")" 2>/dev/null || true
+          fi
+
+      - name: stop Elasticsearch
+        if: always()
+        run: docker compose -f bench/docker-compose.es.yml down -v
+
+      - name: upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: |
+            docs/benchmarks.md
+            ${{ env.DATA_DIR }}/bench-results.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: fail if the run failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1

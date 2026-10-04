@@ -156,7 +156,7 @@ func Start(ctx context.Context, o Options) (*Server, error) {
 	if dbDir != "" {
 		s.DiskPaths = append(s.DiskPaths, dbDir)
 	}
-	go func() { s.done <- srv.Run(rctx, ln) }()
+	go func() { s.done <- srv.Run(rctx, ln, srv) }()
 	return s, nil
 }
 

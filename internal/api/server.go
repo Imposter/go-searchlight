@@ -206,15 +206,18 @@ func (s *Server) HTTPServer() *http.Server {
 	}
 }
 
-// Run serves s on ln until ctx ends, over TLS when tls_cert and tls_key are set
-// (otherwise put a TLS-terminating proxy in front), then shuts down gracefully:
+// Run serves h on ln until ctx ends, over TLS when tls_cert and tls_key are set
+// (otherwise put a TLS-terminating proxy in front). h is s itself, or s mounted in a
+// handler of its coordinator's (cluster.Node.Handler adds the internal peer API). It
+// then shuts down gracefully:
 // readiness turns false and the API keeps serving for shutdown_grace, so load
 // balancers stop sending it traffic; then the listener stops accepting and requests in
 // flight finish within shutdown_timeout (those still running then are cut off);
 // finally the coordinator is closed, flushing every shard copy, within a
 // shutdown_timeout of its own. It owns ln.
-func (s *Server) Run(ctx context.Context, ln net.Listener) error {
+func (s *Server) Run(ctx context.Context, ln net.Listener, h http.Handler) error {
 	srv := s.HTTPServer()
+	srv.Handler = h
 	srv.BaseContext = func(net.Listener) context.Context { return context.WithoutCancel(ctx) }
 	errc := make(chan error, 1)
 	go func() {

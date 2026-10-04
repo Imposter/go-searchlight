@@ -166,7 +166,7 @@ func TestRunTLSAndShutdownGrace(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(ctx, ln) }()
+	go func() { done <- srv.Run(ctx, ln, srv) }()
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	e := &env{t: t, url: "https://" + ln.Addr().String(), client: client}
 	e.must(http.StatusOK, "GET", "/readyz", "")

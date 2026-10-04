@@ -45,7 +45,7 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- srv.Run(ctx, ln) }()
+	go func() { done <- srv.Run(ctx, ln, srv) }()
 	base := "http://" + ln.Addr().String()
 	client := &http.Client{Timeout: 30 * time.Second}
 	call := func(method, path, body string) (int, []byte, error) {

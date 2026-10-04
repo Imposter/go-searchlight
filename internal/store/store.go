@@ -115,7 +115,8 @@ type RegistryStore interface {
 	// target live copies: it takes a free slot below target, or steals one
 	// whose lease has expired. A node that already holds a copy keeps it and
 	// has its lease renewed. It reports whether nodeID holds a copy
-	// afterwards, and that copy. A new copy starts recovering at seq 0.
+	// afterwards, and that copy. A new copy starts recovering at seq 0; a
+	// stolen slot's copy names its previous holder in TakenFrom.
 	ClaimCopy(ctx context.Context, shard ShardID, nodeID string, target int, ttl time.Duration) (Copy, bool, error)
 	// RenewLeases extends every unexpired lease nodeID holds to ttl from now
 	// and returns those shards. A lease that has already expired is not
@@ -135,6 +136,10 @@ type RegistryStore interface {
 	// ReportApplied records the seq a copy has applied. It returns
 	// ErrLeaseLost unless the slot still holds this incarnation.
 	ReportApplied(ctx context.Context, c Copy, seq int64) error
+	// RetireCopy marks c retiring, as SetCopyState does, but only while another
+	// node's copy of the shard serves under an unexpired lease, atomically with
+	// that check; it reports whether it did. ErrLeaseLost as SetCopyState.
+	RetireCopy(ctx context.Context, c Copy) (bool, error)
 }
 
 // BlobStore keeps named blobs (segment bundles) in sl_blobs, split into

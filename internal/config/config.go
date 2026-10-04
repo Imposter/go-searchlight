@@ -62,6 +62,25 @@ type Config struct {
 	InsecureNoAuth bool
 	// ClusterToken authenticates the internal peer API.
 	ClusterToken string
+	// PeerCAFile, when set, is a PEM bundle of the certificate authorities that sign
+	// peers' TLS certificates (the peer API runs over TLS when tls_cert is set); unset,
+	// the system roots.
+	PeerCAFile string
+	// LeaseTTL is how long a shard copy's lease lasts unrenewed (renewed every 2 s).
+	// 0 picks the store's default: 30 s on SQLite, whose single writer can delay a
+	// renewal behind a long commit, 10 s elsewhere.
+	LeaseTTL time.Duration
+	// PruneStallTimeout is how long a copy behind its shard's others may hold the
+	// changelog's prune floor without progress (halted, stuck recovering, or its node
+	// silent) before pruning goes on without it; it rebuilds when it moves again.
+	PruneStallTimeout time.Duration
+	// RetiringRetention is how long the changelog is kept for a copy whose node shut
+	// down cleanly (its row left retiring, its lease run out), so a node restarted
+	// within it replays the tail rather than rebuilding.
+	RetiringRetention time.Duration
+	// ChangelogRetention caps how old a change may grow before it is pruned whatever
+	// copy still needs it (that copy rebuilds).
+	ChangelogRetention time.Duration
 	// RefreshInterval is how often each shard's write buffer becomes a
 	// searchable segment.
 	RefreshInterval time.Duration
@@ -191,6 +210,9 @@ func Default() Config {
 		MaxInflightReadBytes:  256 << 20,
 		InflightAmplification: 10,
 		DropTimeout:           10 * time.Minute,
+		PruneStallTimeout:     15 * time.Minute,
+		RetiringRetention:     15 * time.Minute,
+		ChangelogRetention:    24 * time.Hour,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
 	}
@@ -270,6 +292,38 @@ var settings = []setting{
 		parse:   func(c *Config, v string) error { c.ClusterToken = v; return nil },
 		format:  func(c *Config) string { return c.ClusterToken },
 		display: func(c *Config) string { return redacted(c.ClusterToken) },
+	},
+	{
+		name: "peer_ca_file", usage: "PEM bundle of the CAs that sign peers' TLS certificates (default: the system roots)",
+		parse:  func(c *Config, v string) error { c.PeerCAFile = v; return nil },
+		format: func(c *Config) string { return c.PeerCAFile },
+	},
+	{
+		name: "lease_ttl", usage: "how long a shard copy's lease lasts unrenewed (0 = 30s on SQLite, 10s elsewhere)",
+		parse: func(c *Config, v string) error {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 || (d > 0 && d < 3*time.Second) {
+				return fmt.Errorf("want 0 or a duration of at least 3s, got %q", v)
+			}
+			c.LeaseTTL = d
+			return nil
+		},
+		format: func(c *Config) string { return c.LeaseTTL.String() },
+	},
+	{
+		name: "prune_stall_timeout", usage: "how long a copy making no progress may hold the changelog's prune floor",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.PruneStallTimeout, v) },
+		format: func(c *Config) string { return c.PruneStallTimeout.String() },
+	},
+	{
+		name: "retiring_retention", usage: "how long the changelog is kept for a cleanly stopped node's copies to replay on restart",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RetiringRetention, v) },
+		format: func(c *Config) string { return c.RetiringRetention.String() },
+	},
+	{
+		name: "changelog_retention", usage: "the oldest a change may grow before it is pruned whatever copy still needs it",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.ChangelogRetention, v) },
+		format: func(c *Config) string { return c.ChangelogRetention.String() },
 	},
 	{
 		name: "refresh_interval", usage: "how often written documents become searchable",

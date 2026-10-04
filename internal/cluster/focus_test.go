@@ -37,25 +37,27 @@ func truth(t testing.TB, st store.Store, id store.ShardID) map[string]string {
 }
 
 // localDocs reads a node's own copy of a shard, once it has seq searchable: id to body.
-func localDocs(t testing.TB, n *Node, id store.ShardID, seq int64) map[string]string {
-	t.Helper()
-	tg, err := n.LocalTarget(tctx(t), id.Index, id.Shard, seq)
+// A copy still recovering is an error to wait out.
+func localDocs(n *Node, id store.ShardID, seq int64) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tg, err := n.LocalTarget(ctx, id.Index, id.Shard, seq)
 	if err != nil {
-		t.Fatalf("node %s, %s: %v", n.id, id, err)
+		return nil, fmt.Errorf("node %s, %s: %w", n.id, id, err)
 	}
 	defer tg.Release()
-	res, err := tg.Search(tctx(t), &search.Request{Query: &query.All{}, Size: search.MaxSize, TrackTotal: search.TrackTotalAll, Index: id.Index})
+	res, err := tg.Search(ctx, &search.Request{Query: &query.All{}, Size: search.MaxSize, TrackTotal: search.TrackTotalAll, Index: id.Index})
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	out := map[string]string{}
 	for _, h := range res.Hits {
 		out[h.ID] = string(h.Body)
 	}
 	if int64(len(out)) != res.Total {
-		t.Fatalf("node %s, %s: %d hits of %d", n.id, id, len(out), res.Total)
+		return nil, fmt.Errorf("node %s, %s: %d hits of %d", n.id, id, len(out), res.Total)
 	}
-	return out
+	return out, nil
 }
 
 // sameDocs compares two shard contents, as JSON values.
@@ -125,7 +127,11 @@ func converge(t testing.TB, c *cluster, st store.Store, index string, shards int
 				continue
 			}
 			eventually(t, time.Minute, fmt.Sprintf("node %d's copy of %s converges", tn.i, id), func() error {
-				return sameDocs(localDocs(t, tn.n, id, head), want)
+				got, err := localDocs(tn.n, id, head)
+				if err != nil {
+					return err
+				}
+				return sameDocs(got, want)
 			})
 		}
 	}
@@ -287,9 +293,7 @@ func TestNodeLossMidBulk(t *testing.T) {
 			want += int64(len(truth(t, a.st, store.ShardID{Index: "mb", Shard: s})))
 		}
 		for _, tn := range c.live() {
-			if got, err := count(tctx(t), tn.n, "mb", head); err != nil || got != want {
-				t.Fatalf("node %d counts %d (%v), want %d", tn.i, got, err, want)
-			}
+			waitCount(t, tn.n, "mb", head, want)
 		}
 	})
 }
@@ -314,9 +318,7 @@ func TestNodeLossMidRecovery(t *testing.T) {
 	a := c.start(0)
 	createIndex(t, a.n, "mr", 1, 0)
 	last := bulkLoad(t, a.n, "mr", 0, 4000, 2000)
-	if got, err := count(tctx(t), a.n, "mr", last); err != nil || got != 4000 {
-		t.Fatalf("node-0 counts %d (%v)", got, err)
-	}
+	waitCount(t, a.n, "mr", last, int64(4000))
 	b := c.start(1)
 	eventually(t, time.Minute, "node-1's recovery reaches node-0", func() error {
 		if !entered.Load() {

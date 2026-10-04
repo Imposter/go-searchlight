@@ -45,6 +45,29 @@ func bulkLoad(t testing.TB, n *Node, index string, from, count, batch int) int64
 	return last
 }
 
+// heavyLoad gives a test that bulk-loads one SQLite file long leases: under a full
+// parallel test run a renewal can wait seconds behind the bulks' write transactions.
+func heavyLoad(_ int, o *Options) {
+	o.LeaseTTL = 20 * time.Second
+	o.DeadAfter = 15 * time.Second
+}
+
+// waitCount waits until a match-all search on n with wait_for_seq counts want: a copy
+// re-claimed after a lapse recovers first.
+func waitCount(t testing.TB, n *Node, index string, seq, want int64) {
+	t.Helper()
+	eventually(t, 2*time.Minute, fmt.Sprintf("%s counts %d on %s", index, want, n.id), func() error {
+		got, err := count(context.Background(), n, index, seq)
+		if err != nil {
+			return err
+		}
+		if got != want {
+			return fmt.Errorf("counts %d", got)
+		}
+		return nil
+	})
+}
+
 // cutOnce makes the first stream of a file named match stop dead after limit bytes:
 // the connection drops mid-transfer.
 type cutOnce struct {
@@ -155,6 +178,7 @@ func TestPeerRecovery100k(t *testing.T) {
 	cut := &cutOnce{}
 	bad := &cutOnce{corrupt: true}
 	c := newCluster(t, d, func(i int, o *Options) {
+		heavyLoad(i, o)
 		if i == 0 {
 			o.hooks = &testHooks{peerFile: func(name string, w http.ResponseWriter) http.ResponseWriter {
 				return bad.wrap(name, cut.wrap(name, w))
@@ -167,9 +191,7 @@ func TestPeerRecovery100k(t *testing.T) {
 	last := bulkLoad(t, a.n, "big", 0, docs, 5000)
 	t.Logf("loaded %d documents in %s", docs, time.Since(began))
 	id := store.ShardID{Index: "big", Shard: 0}
-	if got, err := count(tctx(t), a.n, "big", last); err != nil || got != int64(docs) {
-		t.Fatalf("node-0 counts %d (%v)", got, err)
-	}
+	waitCount(t, a.n, "big", last, int64(docs))
 	if err := a.n.LocalCopies()[0].Info.State; err != api.ShardServing {
 		t.Fatalf("node-0's copy is %s", err)
 	}
@@ -199,14 +221,10 @@ func TestPeerRecovery100k(t *testing.T) {
 	if fetched < total || fetched > total+extra+(1<<20) {
 		t.Fatalf("fetched %d bytes for a %d-byte copy", fetched, total)
 	}
-	if got, err := count(tctx(t), b.n, "big", last); err != nil || got != int64(docs) {
-		t.Fatalf("node-1 counts %d (%v), want %d", got, err, docs)
-	}
+	waitCount(t, b.n, "big", last, int64(docs))
 	// The recovered copy tails on.
 	last = mustWrite(t, a.n, "big", upsertOp("after", 1))
-	if got, err := count(tctx(t), b.n, "big", last); err != nil || got != int64(docs)+1 {
-		t.Fatalf("node-1 counts %d (%v) after a new write", got, err)
-	}
+	waitCount(t, b.n, "big", last, int64(docs)+1)
 	// The staging directory is gone once the copy is in.
 	if _, err := os.Stat(filepath.Join(b.cfg.DataDir, "recovery")); err == nil {
 		entries, _ := os.ReadDir(filepath.Join(b.cfg.DataDir, "recovery"))
@@ -238,16 +256,12 @@ func TestRecoveryResumesAcrossAttempts(t *testing.T) {
 	a := c.start(0)
 	createIndex(t, a.n, "res", 1, 0)
 	last := bulkLoad(t, a.n, "res", 0, 3000, 1000)
-	if got, err := count(tctx(t), a.n, "res", last); err != nil || got != 3000 {
-		t.Fatalf("node-0 counts %d (%v)", got, err)
-	}
+	waitCount(t, a.n, "res", last, int64(3000))
 	id := store.ShardID{Index: "res", Shard: 0}
 	total := snapshotBytes(t, a, id)
 	b := c.start(1)
 	waitCopies(t, a.st, "res", 1, 2, time.Minute)
-	if got, err := count(tctx(t), b.n, "res", last); err != nil || got != 3000 {
-		t.Fatalf("node-1 counts %d (%v)", got, err)
-	}
+	waitCount(t, b.n, "res", last, int64(3000))
 	mu.Lock()
 	cutDone := !failManifest
 	mu.Unlock()

@@ -317,7 +317,8 @@ func (n *Node) ID() string { return n.id }
 // catalogue, takes this node's share of the copies (the ones it held before a
 // restart first) and starts the heartbeat, lease, allocation, routing and
 // maintenance loops. The copies it takes recover in the background; Ready reports
-// when they have.
+// when they have. Serve [Node.Handler] on advertise_address before calling it: peers
+// may call the node as soon as it registers.
 func (n *Node) Start(ctx context.Context) error {
 	if n.stopped.Load() {
 		return errors.New("cluster: the node was stopped")

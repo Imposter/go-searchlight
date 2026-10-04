@@ -1,0 +1,25 @@
+# Searchlight's non-secret settings, as SEARCHLIGHT_* variables (docs/operations.md lists
+# every one). The secrets (store_url, cluster_token, tokens_file) come from the
+# "searchlight" Secret, mounted as files by statefulset.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searchlight
+  labels:
+    app.kubernetes.io/name: searchlight
+data:
+  SEARCHLIGHT_LISTEN: ":8780"
+  SEARCHLIGHT_ADMIN_LISTEN: ":8781"
+  SEARCHLIGHT_DATA_DIR: /var/lib/searchlight
+  SEARCHLIGHT_LOG_LEVEL: info
+  SEARCHLIGHT_PPROF: "false"
+  # The shutdown phases (drain, listener, node stop) are each bounded by
+  # shutdown_timeout; statefulset.yaml's terminationGracePeriodSeconds (120) covers the
+  # preStop sleep, shutdown_grace and all three.
+  SEARCHLIGHT_SHUTDOWN_GRACE: 5s
+  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 30s
+  # The memory budgets the container's limit is sized against (statefulset.yaml).
+  SEARCHLIGHT_MAX_BODY_BYTES: 16MiB
+  SEARCHLIGHT_INFLIGHT_AMPLIFICATION: "10"
+  SEARCHLIGHT_MAX_INFLIGHT_WRITE_BYTES: 512MiB
+  SEARCHLIGHT_MAX_INFLIGHT_READ_BYTES: 256MiB

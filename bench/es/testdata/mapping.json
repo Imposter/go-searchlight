@@ -1,0 +1,354 @@
+{
+  "documents": {
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "brand": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "category": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "condition": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "description": {
+          "doc_values": false,
+          "fields": {
+            "words": {
+              "analyzer": "sl_words",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            }
+          },
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "first_seen": {
+          "format": "strict_date_optional_time||epoch_millis",
+          "type": "date"
+        },
+        "in_stock": {
+          "type": "boolean"
+        },
+        "list_price": {
+          "type": "double"
+        },
+        "on_sale": {
+          "type": "boolean"
+        },
+        "price": {
+          "type": "double"
+        },
+        "rating": {
+          "type": "double"
+        },
+        "reviews": {
+          "type": "double"
+        },
+        "sku": {
+          "doc_values": false,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "sl_id": {
+          "doc_values": true,
+          "index": false,
+          "type": "keyword"
+        },
+        "source": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "stock": {
+          "type": "double"
+        },
+        "tags": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "title": {
+          "doc_values": false,
+          "fields": {
+            "tri": {
+              "analyzer": "sl_tri",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            },
+            "words": {
+              "analyzer": "sl_words",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            }
+          },
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "updated_at": {
+          "format": "strict_date_optional_time||epoch_millis",
+          "type": "date"
+        },
+        "url": {
+          "doc_values": false,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        }
+      }
+    },
+    "settings": {
+      "analysis": {
+        "analyzer": {
+          "sl_tri": {
+            "char_filter": [
+              "sl_trim",
+              "sl_ws"
+            ],
+            "filter": [
+              "lowercase"
+            ],
+            "tokenizer": "sl_tri",
+            "type": "custom"
+          },
+          "sl_words": {
+            "filter": [
+              "lowercase"
+            ],
+            "tokenizer": "sl_words",
+            "type": "custom"
+          }
+        },
+        "char_filter": {
+          "sl_trim": {
+            "pattern": "^[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+|[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+$",
+            "replacement": "",
+            "type": "pattern_replace"
+          },
+          "sl_ws": {
+            "pattern": "[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+",
+            "replacement": " ",
+            "type": "pattern_replace"
+          }
+        },
+        "normalizer": {
+          "sl_norm": {
+            "char_filter": [
+              "sl_trim",
+              "sl_ws"
+            ],
+            "filter": [
+              "lowercase"
+            ],
+            "type": "custom"
+          }
+        },
+        "tokenizer": {
+          "sl_tri": {
+            "max_gram": 3,
+            "min_gram": 3,
+            "type": "ngram"
+          },
+          "sl_words": {
+            "pattern": "[^\\p{L}\\p{N}_]+",
+            "type": "pattern"
+          }
+        }
+      },
+      "number_of_replicas": 0,
+      "number_of_shards": 2,
+      "refresh_interval": "1s",
+      "translog.durability": "request"
+    }
+  },
+  "percolator": {
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "brand": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "category": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "condition": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "description": {
+          "doc_values": false,
+          "fields": {
+            "words": {
+              "analyzer": "sl_words",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            }
+          },
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "first_seen": {
+          "format": "strict_date_optional_time||epoch_millis",
+          "type": "date"
+        },
+        "in_stock": {
+          "type": "boolean"
+        },
+        "list_price": {
+          "type": "double"
+        },
+        "meta": {
+          "enabled": false,
+          "type": "object"
+        },
+        "on_sale": {
+          "type": "boolean"
+        },
+        "price": {
+          "type": "double"
+        },
+        "qid": {
+          "type": "keyword"
+        },
+        "query": {
+          "type": "percolator"
+        },
+        "rating": {
+          "type": "double"
+        },
+        "reviews": {
+          "type": "double"
+        },
+        "sku": {
+          "doc_values": false,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "sl_id": {
+          "doc_values": true,
+          "index": false,
+          "type": "keyword"
+        },
+        "source": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "stock": {
+          "type": "double"
+        },
+        "tags": {
+          "doc_values": true,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "title": {
+          "doc_values": false,
+          "fields": {
+            "tri": {
+              "analyzer": "sl_tri",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            },
+            "words": {
+              "analyzer": "sl_words",
+              "index_options": "positions",
+              "norms": false,
+              "type": "text"
+            }
+          },
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        },
+        "updated_at": {
+          "format": "strict_date_optional_time||epoch_millis",
+          "type": "date"
+        },
+        "url": {
+          "doc_values": false,
+          "normalizer": "sl_norm",
+          "type": "keyword"
+        }
+      }
+    },
+    "settings": {
+      "analysis": {
+        "analyzer": {
+          "sl_tri": {
+            "char_filter": [
+              "sl_trim",
+              "sl_ws"
+            ],
+            "filter": [
+              "lowercase"
+            ],
+            "tokenizer": "sl_tri",
+            "type": "custom"
+          },
+          "sl_words": {
+            "filter": [
+              "lowercase"
+            ],
+            "tokenizer": "sl_words",
+            "type": "custom"
+          }
+        },
+        "char_filter": {
+          "sl_trim": {
+            "pattern": "^[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+|[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+$",
+            "replacement": "",
+            "type": "pattern_replace"
+          },
+          "sl_ws": {
+            "pattern": "[\\s\\x1c-\\x1f\\x85\\xa0\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}]+",
+            "replacement": " ",
+            "type": "pattern_replace"
+          }
+        },
+        "normalizer": {
+          "sl_norm": {
+            "char_filter": [
+              "sl_trim",
+              "sl_ws"
+            ],
+            "filter": [
+              "lowercase"
+            ],
+            "type": "custom"
+          }
+        },
+        "tokenizer": {
+          "sl_tri": {
+            "max_gram": 3,
+            "min_gram": 3,
+            "type": "ngram"
+          },
+          "sl_words": {
+            "pattern": "[^\\p{L}\\p{N}_]+",
+            "type": "pattern"
+          }
+        }
+      },
+      "number_of_replicas": 0,
+      "number_of_shards": 1,
+      "refresh_interval": "1s",
+      "translog.durability": "request"
+    }
+  }
+}

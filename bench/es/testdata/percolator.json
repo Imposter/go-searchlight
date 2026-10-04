@@ -1,0 +1,71 @@
+{
+  "document": {
+    "meta": {
+      "name": "saved search 0",
+      "search_id": 0
+    },
+    "qid": "q000000000",
+    "query": {
+      "bool": {
+        "filter": [
+          {
+            "match_phrase": {
+              "title.tri": "grinder"
+            }
+          },
+          {
+            "range": {
+              "price": {
+                "gte": 105,
+                "lte": 400
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "percolate": {
+    "_source": false,
+    "query": {
+      "constant_score": {
+        "filter": {
+          "percolate": {
+            "documents": [
+              {
+                "title": "Acme drill"
+              }
+            ],
+            "field": "query"
+          }
+        }
+      }
+    },
+    "size": 10000,
+    "track_total_hits": true
+  },
+  "saved_search": {
+    "id": "q000000000",
+    "query": {
+      "all": [
+        {
+          "field": "title",
+          "op": "contains",
+          "value": "grinder"
+        },
+        {
+          "field": "price",
+          "op": "between",
+          "value": [
+            105,
+            400
+          ]
+        }
+      ]
+    },
+    "meta": {
+      "name": "saved search 0",
+      "search_id": 0
+    }
+  }
+}

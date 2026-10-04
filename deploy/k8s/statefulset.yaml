@@ -12,6 +12,11 @@
 # recovers its shard copies from them. Scale with kubectl scale; every node holds every
 # shard unless an index sets replicas_per_shard. SQLite serves one node only: use
 # Postgres or MySQL 8.0.19+ here.
+#
+# For production, spread the nodes over hosts and zones as a rule rather than a
+# preference: make the podAntiAffinity below requiredDuringScheduling..., or add
+# topologySpreadConstraints on topology.kubernetes.io/zone, so one host or zone failure
+# never takes every copy of a shard.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -34,15 +39,16 @@ spec:
       labels:
         app.kubernetes.io/name: searchlight
     spec:
-      # Covers the preStop sleep (5 s), shutdown_grace (5 s) and the three shutdown
-      # phases, each bounded by shutdown_timeout (30 s): retiring the copies others can
-      # stand in for, draining the listener, and stopping the node (final manifests).
-      terminationGracePeriodSeconds: 120
+      # shutdown_grace (10 s) plus shutdown_timeout (60 s), the node's whole shutdown
+      # budget (ConfigMap), plus 10 s of slack before the kubelet kills it.
+      terminationGracePeriodSeconds: 80
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       affinity:
@@ -75,7 +81,7 @@ spec:
             - name: SEARCHLIGHT_NODE_ID
               value: $(POD_NAME)
             - name: SEARCHLIGHT_ADVERTISE_ADDRESS
-              value: $(POD_NAME).searchlight-peers.$(POD_NAMESPACE).svc.cluster.local:8780
+              value: $(POD_NAME).searchlight-peers.$(POD_NAMESPACE).svc:8780
             - name: SEARCHLIGHT_STORE_URL_FILE
               value: /etc/searchlight/secrets/store_url
             - name: SEARCHLIGHT_CLUSTER_TOKEN_FILE
@@ -101,21 +107,19 @@ spec:
           #     the limit but reclaimed under pressure, so the headroom above GOMEMLIMIT
           #     is what keeps hot segments cached.
           # The limit below fits the in-flight budgets, a few busy shard copies and
-          # about 1 GiB of page cache. GOMAXPROCS follows the CPU limit, and with it
-          # search_threads and merge_threads.
+          # about 1 GiB of page cache; the request equals it, so the node is never
+          # evicted for memory it was promised. GOMAXPROCS follows the CPU limit, and with
+          # it search_threads and merge_threads.
           resources:
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
             limits:
               cpu: "4"
               memory: 4Gi
-          startupProbe:
-            httpGet:
-              path: /healthz
-              port: admin
-            periodSeconds: 5
-            failureThreshold: 60
+          # /healthz answers as soon as the admin listener is up, before the store is
+          # opened, so liveness never kills a node that is retrying the database or
+          # migrating; /readyz gates traffic until its copies have recovered.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -129,13 +133,7 @@ spec:
               port: admin
             periodSeconds: 5
             timeoutSeconds: 3
-            failureThreshold: 2
-          lifecycle:
-            # Endpoints drop the pod while it still serves; the node then flips its
-            # own readiness and drains on SIGTERM.
-            preStop:
-              sleep:
-                seconds: 5
+            failureThreshold: 6
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

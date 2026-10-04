@@ -7,17 +7,17 @@
 #   docker build -f deploy/Dockerfile --build-arg VERSION=$(git describe --tags --always) -t searchlight:dev .
 #
 # Only store_url is required (SEARCHLIGHT_STORE_URL, or SEARCHLIGHT_STORE_URL_FILE for a
-# mounted secret); data_dir is /var/lib/searchlight, a volume. Every other setting is a
-# SEARCHLIGHT_* variable or a --flag: see docs/operations.md.
+# mounted secret), with tokens_file; data_dir is /var/lib/searchlight, a volume. Every
+# other setting is a SEARCHLIGHT_* variable or a --flag: see docs/operations.md.
 #
-# There is no HEALTHCHECK: the image has no shell and no HTTP client to run one with.
-# Probe the admin listener from outside the container instead: GET :8781/healthz for
-# liveness, GET :8781/readyz for readiness (deploy/k8s does so with httpGet probes,
-# deploy/compose.yml with a probe binary mounted from a volume).
+# The admin listener is :8781 here (loopback outside a container), so probes and
+# Prometheus reach it; keep that port private. The HEALTHCHECK runs the binary's own
+# probe, "searchlight healthcheck", against /readyz; Kubernetes probes the admin port
+# with httpGet instead.
+#
+# The base images are pinned by digest; Dependabot (.github/dependabot.yml) bumps them.
 
-ARG GO_VERSION=1.25
-
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
+FROM --platform=$BUILDPLATFORM golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
@@ -31,7 +31,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/searchlight ./cmd/searchlight \
  && mkdir -p /out/data
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG VERSION=dev
 ARG REVISION=unknown
 ARG CREATED=unknown
@@ -53,4 +53,5 @@ USER 65532:65532
 EXPOSE 8780 8781
 VOLUME ["/var/lib/searchlight"]
 STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=5s --timeout=3s --start-period=2m CMD ["/usr/local/bin/searchlight", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/searchlight"]

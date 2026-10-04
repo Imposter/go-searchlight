@@ -1,6 +1,6 @@
 # searchlight-peers is the StatefulSet's governing headless Service: it gives each pod
 # the stable DNS name its advertise_address uses
-# (searchlight-0.searchlight-peers.<namespace>.svc.cluster.local:8780). It publishes
+# (searchlight-0.searchlight-peers.<namespace>.svc:8780). It publishes
 # pods that are not ready yet, because a node registers in the database, and peers may
 # call it, before its copies have recovered and it reports ready.
 apiVersion: v1

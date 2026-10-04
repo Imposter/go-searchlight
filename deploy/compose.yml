@@ -1,7 +1,7 @@
 # A three-node Searchlight cluster on Postgres 17, for trying a cluster out on one
 # machine. From the repository root:
 #
-#   docker compose -f deploy/compose.yml up --build --wait
+#   docker compose -f deploy/compose.yml up --build -d
 #
 # The secrets are generated on the first start, into the "secrets" volume, by the
 # one-shot "secrets" service: a Postgres password and the store_url built from it, a
@@ -14,8 +14,11 @@
 # (/healthz, /readyz, /metrics) on 127.0.0.1:8781, :8783 and :8785. Any node takes any
 # request; put a load balancer in front for real use.
 #
-# The image has no shell or HTTP client, so the nodes' healthchecks run a static
-# busybox wget that the secrets service copies into the "probe" volume.
+# The nodes' healthchecks run the binary's own probe, "searchlight healthcheck", which
+# GETs /readyz on the admin listener.
+#
+# A node stops within shutdown_grace (5 s) plus shutdown_timeout (60 s, the default);
+# stop_grace_period leaves 10 s more before Docker kills it.
 #
 # The peer API runs over plain HTTP here (the nodes log that the cluster_token is sent
 # in the clear): set tls_cert, tls_key and peer_ca_file outside a private network.
@@ -33,9 +36,9 @@ x-searchlight: &searchlight
   depends_on:
     postgres:
       condition: service_healthy
-  stop_grace_period: 2m
+  stop_grace_period: 75s
   healthcheck:
-    test: ["CMD", "/probe/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8781/readyz"]
+    test: ["CMD", "/usr/local/bin/searchlight", "healthcheck"]
     interval: 5s
     timeout: 3s
     retries: 3
@@ -46,16 +49,15 @@ x-searchlight-env: &searchlight-env
   SEARCHLIGHT_CLUSTER_TOKEN_FILE: /run/secrets/searchlight/cluster_token
   SEARCHLIGHT_TOKENS_FILE: /run/secrets/searchlight/tokens
   SEARCHLIGHT_SHUTDOWN_GRACE: 5s
-  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 30s
+  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 60s
   SEARCHLIGHT_LOG_LEVEL: info
 
 services:
   secrets:
-    image: busybox:1.37-musl
+    image: busybox:1.37-musl@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092
     restart: "no"
     volumes:
       - secrets:/secrets
-      - probe:/probe
     command:
       - sh
       - -euc
@@ -67,10 +69,9 @@ services:
         [ -s cluster_token ] || gen > cluster_token
         [ -s tokens ] || printf '# <token> write | <token> read\n%s write\n%s read\n' "$$(gen)" "$$(gen)" > tokens
         chmod 0444 postgres_password store_url cluster_token tokens
-        cp /bin/busybox /probe/wget
 
   postgres:
-    image: postgres:17
+    image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
     # Each node may hold 64 connections plus one for LISTEN.
     command: ["postgres", "-c", "max_connections=300"]
     restart: unless-stopped
@@ -85,7 +86,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - secrets:/run/secrets/searchlight:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "searchlight", "-d", "searchlight"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "searchlight", "-d", "searchlight"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -103,7 +104,6 @@ services:
     volumes:
       - data-1:/var/lib/searchlight
       - secrets:/run/secrets/searchlight:ro
-      - probe:/probe:ro
 
   searchlight-2:
     <<: *searchlight
@@ -118,7 +118,6 @@ services:
     volumes:
       - data-2:/var/lib/searchlight
       - secrets:/run/secrets/searchlight:ro
-      - probe:/probe:ro
 
   searchlight-3:
     <<: *searchlight
@@ -133,11 +132,9 @@ services:
     volumes:
       - data-3:/var/lib/searchlight
       - secrets:/run/secrets/searchlight:ro
-      - probe:/probe:ro
 
 volumes:
   secrets:
-  probe:
   pgdata:
   data-1:
   data-2:

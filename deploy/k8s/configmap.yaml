@@ -13,11 +13,13 @@ data:
   SEARCHLIGHT_DATA_DIR: /var/lib/searchlight
   SEARCHLIGHT_LOG_LEVEL: info
   SEARCHLIGHT_PPROF: "false"
-  # The shutdown phases (drain, listener, node stop) are each bounded by
-  # shutdown_timeout; statefulset.yaml's terminationGracePeriodSeconds (120) covers the
-  # preStop sleep, shutdown_grace and all three.
-  SEARCHLIGHT_SHUTDOWN_GRACE: 5s
-  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 30s
+  # A terminating pod leaves the Services' endpoints at once; shutdown_grace keeps it
+  # serving while that reaches every proxy, so no preStop hook is needed.
+  # shutdown_timeout is then the whole budget for the rest (drain, listener, node
+  # stop with final manifests, store and telemetry); statefulset.yaml's
+  # terminationGracePeriodSeconds (80) is the two plus 10 s.
+  SEARCHLIGHT_SHUTDOWN_GRACE: 10s
+  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 60s
   # The memory budgets the container's limit is sized against (statefulset.yaml).
   SEARCHLIGHT_MAX_BODY_BYTES: 16MiB
   SEARCHLIGHT_INFLIGHT_AMPLIFICATION: "10"

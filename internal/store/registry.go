@@ -30,6 +30,7 @@ func ttlMillis(ttl time.Duration) (int64, error) {
 func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "heartbeat", attribute.String("node_id", n.ID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(n.ID); err != nil {
 		return err
@@ -44,6 +45,7 @@ func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 func (g *registry) RemoveNode(ctx context.Context, nodeID string) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "remove_node", attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(nodeID); err != nil {
 		return err
@@ -90,6 +92,7 @@ func (g *registry) ClaimCopy(ctx context.Context, shard ShardID, nodeID string, 
 	s := g.s
 	ctx, end := s.start(ctx, "claim_copy", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard),
 		attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validShard(shard); err != nil {
 		return c, false, err
@@ -217,6 +220,7 @@ func (g *registry) nextEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
 func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) (out []ShardID, err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "renew_leases", attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(nodeID); err != nil {
 		return nil, err
@@ -275,6 +279,7 @@ func copyAttrs(c *Copy) []attribute.KeyValue {
 func (g *registry) ReleaseCopy(ctx context.Context, c Copy) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "release_copy", copyAttrs(&c)...)
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	res, err := s.w.ExecContext(ctx, s.d.Registry.Release, fenceArgs(&c)...)
 	return leaseResult(res, err, &c)
@@ -306,6 +311,7 @@ func (g *registry) Copies(ctx context.Context, index string) (out []Copy, err er
 func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "set_copy_state", append(copyAttrs(&c), attribute.String("state", string(state)))...)
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validShard(c.Shard); err != nil {
 		return err

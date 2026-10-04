@@ -5,64 +5,113 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/store"
 )
 
-// Clock is the monotonic clock lease deadlines are kept by. Now is the time elapsed
-// since a fixed point of the clock's choosing; it never goes back.
+// Clock is what lease deadlines are kept by. Now is the time elapsed since a fixed
+// point of the clock's choosing, by a monotonic clock: it never goes back. Wall is the
+// wall clock, which keeps running while the machine sleeps (a monotonic clock may
+// not: Linux's stops during suspend).
 type Clock interface {
 	Now() time.Duration
+	Wall() time.Time
 }
 
-// NewClock returns the process's monotonic clock.
-func NewClock() Clock { return monotonic{start: time.Now()} }
+// NewClock returns the process's clocks.
+func NewClock() Clock { return processClock{start: time.Now()} }
 
-type monotonic struct{ start time.Time }
+type processClock struct{ start time.Time }
 
-func (c monotonic) Now() time.Duration { return time.Since(c.start) }
+func (c processClock) Now() time.Duration { return time.Since(c.start) }
+func (c processClock) Wall() time.Time    { return time.Now().Round(0) } // no monotonic reading
 
-// lease is a copy this node holds, and the local deadline of its lease.
+// lease is a copy this node holds, and what the node knows of its lease.
 //
-// The deadline is taken by the node's own monotonic clock: the clock's reading just
-// before the call that granted or renewed the lease, plus the lease's TTL. The
-// database starts the TTL later (when it runs the statement), so its lease_until is
-// never earlier than this deadline (up to the clocks' rate difference, which
-// LeaseMargin covers). Another node can steal the slot only once the database's
-// lease_until has passed; the copy stops serving at the local deadline less the
-// margin, which is earlier. So a node cut off from the database stops serving every
-// copy it may have lost before another node can take any of them over.
+// Its local deadline is taken by the node's own clocks: the clocks' readings just
+// before the call that granted or renewed the lease, plus the lease's TTL. The database
+// starts the TTL later (when it runs the statement), so its lease_until is never
+// earlier than this deadline, by the database's clock. The lease is held for sure
+// while both the monotonic and the wall clock say less than TTL less the margin has
+// passed since that reading (the wall clock covers a suspended machine, whose monotonic
+// clock may stand still; the margin covers the clocks' rate difference over one TTL).
+//
+// A lease is in one of three states:
+//
+//   - held: renewals succeed; the copy serves everyone.
+//   - lapsed: the local deadline passed without a renewal (the database is
+//     unreachable, or slow): the copy's tailer is paused (it writes nothing), it
+//     serves no peer, and this node reads it only as a last resort, stale. A renewal or
+//     a re-claim of the same slot at the same epoch resumes it at once.
+//   - lost: confirmed (the store renewed the other leases but not this one and a
+//     re-claim did not get it back, a registry write was fenced off, or the registry
+//     shows another holder): the copy is unhosted.
+//
+// A copy whose claim took the slot over from another node (whose lease expired by the
+// database's clock) is also quarantined: it serves nothing until TTL plus margin have
+// passed since the claim by this node's own clock, so even a database clock that
+// stepped forward cannot make it serve while the previous holder's copy still does.
 type lease struct {
-	copy     store.Copy
-	deadline atomic.Int64 // Clock nanoseconds
-	margin   time.Duration
-	clock    Clock
+	copy       store.Copy
+	deadline   atomic.Int64 // Clock.Now nanoseconds
+	wallBefore atomic.Int64 // Clock.Wall Unix nanoseconds of the last grant's start
+	ttl        time.Duration
+	margin     time.Duration
+	clock      Clock
+	quarantine time.Duration // Clock.Now until which the copy serves nothing; 0: none
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
+
+	// mu serializes the copy's transitions (pause, resume, loss).
+	mu     sync.Mutex
+	paused bool
+	lost   bool
 }
 
-// valid reports whether the copy may still serve: its lease holds by the local
-// deadline, less the margin.
+// valid reports whether the lease surely holds: by both clocks, less than TTL less the
+// margin has passed since the last grant began.
 func (l *lease) valid() bool {
-	return l.clock.Now() < time.Duration(l.deadline.Load())-l.margin
+	if l.clock.Now() >= time.Duration(l.deadline.Load())-l.margin {
+		return false
+	}
+	return l.clock.Wall().Sub(time.Unix(0, l.wallBefore.Load())) < l.ttl-l.margin
 }
 
-// extend moves the deadline to from+ttl, never back.
-func (l *lease) extend(from, ttl time.Duration) {
-	next := int64(from + ttl)
+// quarantined reports whether the copy may not serve yet: it took over another node's
+// slot less than TTL plus margin ago, by this node's clock.
+func (l *lease) quarantined() bool {
+	return l.quarantine > 0 && l.clock.Now() < l.quarantine
+}
+
+// extend moves the lease to a grant that began at from (monotonic) and wall, never
+// back.
+func (l *lease) extend(from time.Duration, wall time.Time) {
+	next := int64(from + l.ttl)
 	for {
 		cur := l.deadline.Load()
 		if next <= cur || l.deadline.CompareAndSwap(cur, next) {
+			break
+		}
+	}
+	w := wall.UnixNano()
+	for {
+		cur := l.wallBefore.Load()
+		if w <= cur || l.wallBefore.CompareAndSwap(cur, w) {
 			return
 		}
 	}
 }
 
-func (n *Node) newLease(c store.Copy, from time.Duration) *lease {
-	l := &lease{copy: c, margin: n.opts.LeaseMargin, clock: n.clock}
-	l.deadline.Store(int64(from + n.opts.LeaseTTL))
+func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time) *lease {
+	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock}
+	l.deadline.Store(int64(from + l.ttl))
+	l.wallBefore.Store(wall.UnixNano())
+	if c.TakenFrom != "" && c.TakenFrom != n.id {
+		l.quarantine = from + l.ttl + l.margin
+	}
 	return l
 }
 
@@ -90,10 +139,12 @@ func (n *Node) leaseFor(id store.ShardID) *lease {
 	return n.leases[id]
 }
 
-func (n *Node) dropLease(id store.ShardID) {
+func (n *Node) dropLease(l *lease) {
 	n.leaseMu.Lock()
 	defer n.leaseMu.Unlock()
-	delete(n.leases, id)
+	if n.leases[l.copy.Shard] == l {
+		delete(n.leases, l.copy.Shard)
+	}
 }
 
 // heartbeat registers the node or refreshes its registration.
@@ -161,9 +212,10 @@ func (n *Node) allocLoop(ctx context.Context) {
 	}
 }
 
-// renew extends every lease this node holds. The local deadlines move to the clock's
-// reading before the call plus the TTL; a copy whose lease the store did not renew
-// (it expired, and maybe another node took the slot) is stopped at once.
+// renew extends every lease this node holds. The local deadlines move to the clocks'
+// readings before the call plus the TTL. A lease the store did not renew (it expired
+// by the database's clock) is claimed again: the same slot at the same epoch resumes
+// the copy, anything else is a confirmed loss.
 func (n *Node) renew(ctx context.Context) {
 	// Only the copies held before the renewal ran are judged by its result: one
 	// claimed meanwhile is not in this list.
@@ -171,13 +223,13 @@ func (n *Node) renew(ctx context.Context) {
 	if len(leases) == 0 {
 		return
 	}
-	before := n.clock.Now()
+	before, wall := n.clock.Now(), n.clock.Wall()
 	renewed, err := n.reg.RenewLeases(ctx, n.id, n.opts.LeaseTTL)
 	n.NoteDB(err)
 	if err != nil {
 		if ctx.Err() == nil {
 			n.inst.lease(ctx, "renew_failed")
-			n.log.WarnContext(ctx, "renewing the leases failed; the copies stop serving at their deadlines unless a renewal succeeds", slog.Any("error", err))
+			n.log.WarnContext(ctx, "renewing the leases failed; a copy past its deadline pauses (no peer reads it) until a renewal succeeds", slog.Any("error", err))
 		}
 		return
 	}
@@ -191,31 +243,119 @@ func (n *Node) renew(ctx context.Context) {
 	}
 	for _, l := range leases {
 		if held[l.copy.Shard] {
-			l.extend(before, n.opts.LeaseTTL)
+			l.extend(before, wall)
 			n.inst.lease(ctx, "renew")
+			n.resumeIfPaused(ctx, l)
 			continue
 		}
-		n.log.WarnContext(ctx, "a lease was not renewed: it expired; stopping the copy", slog.String("shard", l.copy.Shard.String()))
-		n.inst.lease(ctx, "expire")
-		n.loseCopy(ctx, l)
+		n.reclaim(ctx, l)
 	}
 }
 
-// loseCopy stops a copy whose lease is (or may be) lost: it stops serving, its tailer
-// stops and its shard closes; the directory is kept, so a later claim resumes it.
-func (n *Node) loseCopy(ctx context.Context, l *lease) {
-	if cur := n.leaseFor(l.copy.Shard); cur != l {
+// reclaim claims a lease the store did not renew. The same slot at the same epoch (no
+// other node took it meanwhile) holds again, and a paused copy resumes; anything else
+// is a confirmed loss. A failure to reach the store leaves the lease as it is.
+func (n *Node) reclaim(ctx context.Context, l *lease) {
+	before, wall := n.clock.Now(), n.clock.Wall()
+	c, ok, err := n.reg.ClaimCopy(ctx, l.copy.Shard, n.id, n.claimTarget(l.copy.Shard), n.opts.LeaseTTL)
+	n.NoteDB(err)
+	switch {
+	case err != nil && !errors.Is(err, store.ErrNotFound):
+		return
+	case err == nil && ok && c.Slot == l.copy.Slot && c.Epoch == l.copy.Epoch:
+		l.extend(before, wall)
+		n.inst.lease(ctx, "reclaim")
+		n.resumeIfPaused(ctx, l)
 		return
 	}
-	n.dropLease(l.copy.Shard)
-	if err := n.UnhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
+	n.log.WarnContext(ctx, "a lease expired and its slot could not be claimed back at the same epoch; dropping the copy",
+		slog.String("shard", l.copy.Shard.String()), slog.Bool("claimed", ok), slog.Any("error", err))
+	n.inst.lease(ctx, "lost")
+	n.loseCopy(ctx, l)
+	// A slot the claim did get (another one) is the allocator's to host: its next
+	// pass claims it again and finds this node already holds it.
+}
+
+// claimTarget is the target a claim of id may fill: the index's copy target (every
+// node: more slots than any cluster has nodes).
+func (n *Node) claimTarget(id store.ShardID) int {
+	for _, iv := range n.Indexes() {
+		if iv.Name == id.Index && iv.ReplicasPerShard > 0 {
+			return iv.ReplicasPerShard
+		}
+	}
+	return everyNode
+}
+
+// pause stops a lapsed copy's tailer: it writes nothing and serves no peer, and stays
+// open for this node's own last-resort reads.
+func (n *Node) pause(ctx context.Context, l *lease) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.paused || l.lost {
+		return
+	}
+	if err := n.PauseCopy(ctx, l.copy); err != nil {
+		n.log.WarnContext(ctx, "pausing a lapsed copy failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+		return
+	}
+	l.paused = true
+	n.inst.lease(ctx, "lapse")
+}
+
+// resumeIfPaused restarts a paused copy whose lease holds again (renewed, or claimed
+// back at the same epoch). It recovers from where it stopped, marked recovering until
+// its tailer has caught up.
+func (n *Node) resumeIfPaused(ctx context.Context, l *lease) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.paused || l.lost || !l.valid() {
+		return
+	}
+	cp := l.copy
+	if cp.State != store.CopyRecovering && !l.retired.Load() {
+		if err := n.reg.SetCopyState(ctx, cp, store.CopyRecovering); err != nil {
+			n.log.WarnContext(ctx, "marking a resumed copy recovering failed", slog.String("shard", cp.Shard.String()), slog.Any("error", err))
+			return
+		}
+		cp.State = store.CopyRecovering
+		l.copy.State = cp.State
+	}
+	if err := n.ResumeCopy(ctx, cp); err != nil {
+		n.log.WarnContext(ctx, "resuming a copy failed; dropping it", slog.String("shard", cp.Shard.String()), slog.Any("error", err))
+		l.lost = true
+		n.dropLease(l)
+		_ = n.unhostCopy(context.WithoutCancel(ctx), cp, false)
+		return
+	}
+	l.paused = false
+	n.inst.lease(ctx, "resume")
+}
+
+// loseCopy unhosts a copy whose lease is lost for sure; the directory is kept, so a
+// later claim resumes it.
+func (n *Node) loseCopy(ctx context.Context, l *lease) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lost {
+		return
+	}
+	l.lost = true
+	n.dropLease(l)
+	if err := n.unhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
 		n.log.WarnContext(ctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
 	}
 }
 
-// leaseWatchdog stops every copy whose lease has run out by its local deadline, at
-// once: the copy has already stopped serving (lease.valid), and its tailer must not
-// write on.
+// unhostCopy unhosts a copy and forgets what the node cached of its files.
+func (n *Node) unhostCopy(ctx context.Context, cp store.Copy, wipe bool) error {
+	n.sums.drop(cp.Shard)
+	return n.UnhostCopy(ctx, cp, wipe)
+}
+
+// leaseWatchdog pauses every copy whose lease lapses by the local clocks, at once (its
+// peers already stopped reading it: lease.valid), and drops the copies the registry
+// shows another holder of.
 func (n *Node) leaseWatchdog(ctx context.Context) {
 	period := min(50*time.Millisecond, max(time.Millisecond, n.opts.LeaseMargin/2))
 	t := time.NewTicker(period)
@@ -226,11 +366,16 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		v := n.view.Load()
 		for _, l := range n.leaseList() {
-			if !l.valid() {
-				n.log.WarnContext(ctx, "a lease ran out by the local clock; stopping the copy", slog.String("shard", l.copy.Shard.String()))
-				n.inst.lease(ctx, "expire")
+			if v.takenOver(&l.copy) {
+				n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
+				n.inst.lease(ctx, "lost")
 				n.loseCopy(ctx, l)
+				continue
+			}
+			if !l.valid() {
+				n.pause(ctx, l)
 			}
 		}
 	}
@@ -261,14 +406,35 @@ func (v *view) usable(c *store.Copy) bool {
 
 // servingElsewhere counts the serving copies of id on live nodes other than self.
 func (v *view) servingElsewhere(id store.ShardID, self string) int {
+	return v.servingBelow(id, self, -1)
+}
+
+// servingBelow counts the serving copies of id on live nodes other than self in slots
+// below slot (any slot when it is negative).
+func (v *view) servingBelow(id store.ShardID, self string, slot int) int {
 	k := 0
 	for i := range v.copies[id] {
 		c := &v.copies[id][i]
-		if c.NodeID != self && c.State == store.CopyServing && v.usable(c) {
+		if c.NodeID != self && c.State == store.CopyServing && v.usable(c) && (slot < 0 || c.Slot < slot) {
 			k++
 		}
 	}
 	return k
+}
+
+// takenOver reports whether the registry shows c's slot held by another node, or by
+// another incarnation.
+func (v *view) takenOver(c *store.Copy) bool {
+	if v.at.IsZero() {
+		return false
+	}
+	for i := range v.copies[c.Shard] {
+		e := &v.copies[c.Shard][i]
+		if e.Slot == c.Slot {
+			return e.NodeID != c.NodeID || e.Epoch != c.Epoch
+		}
+	}
+	return false
 }
 
 // refreshView reads the registry.
@@ -290,8 +456,8 @@ func (n *Node) refreshView(ctx context.Context) error {
 			v.live[nd.ID] = true
 		}
 	}
-	for _, c := range copies {
-		v.copies[c.Shard] = append(v.copies[c.Shard], c)
+	for i := range copies {
+		v.copies[copies[i].Shard] = append(v.copies[copies[i].Shard], copies[i])
 	}
 	n.view.Store(v)
 	n.inst.nodes.Store(int64(len(v.live)))
@@ -334,7 +500,7 @@ func (n *Node) catalogLoop(ctx context.Context) {
 
 // forgetDropped drops the leases of copies whose index was dropped (or recreated as a
 // new incarnation) meanwhile: the engine has stopped them, and the store deleted their
-// rows. A copy merely unhosted (retiring, before Stop releases it) keeps its lease.
+// rows.
 func (n *Node) forgetDropped() {
 	n.allocMu.Lock()
 	defer n.allocMu.Unlock()
@@ -344,7 +510,7 @@ func (n *Node) forgetDropped() {
 	}
 	for _, l := range n.leaseList() {
 		if !known[l.copy.Shard.Index] {
-			n.dropLease(l.copy.Shard)
+			n.dropLease(l)
 		}
 	}
 }

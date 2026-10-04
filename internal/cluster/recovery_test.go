@@ -170,10 +170,10 @@ func snapshotBytes(t testing.TB, tn *tnode, id store.ShardID) int64 {
 // arrives corrupted once and is fetched again after it fails its checksum. The
 // recovered copy holds every document and then tails the changelog.
 func TestPeerRecovery100k(t *testing.T) {
-	docs := 100_000
 	if testing.Short() {
-		docs = 20_000
+		t.Skip("a 100,000-document recovery: not in -short")
 	}
+	docs := 100_000
 	d := sqliteDB(t)
 	cut := &cutOnce{}
 	bad := &cutOnce{corrupt: true}

@@ -2,17 +2,24 @@ package cluster
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"net/url"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/store/postgres"
 )
 
 // liveCopies returns the copies of id held under a live lease, as st reads the
@@ -24,7 +31,7 @@ func liveCopies(t testing.TB, st store.Store, id store.ShardID) []store.Copy {
 		t.Fatal(err)
 	}
 	var out []store.Copy
-	for _, c := range list {
+	for _, c := range list { //nolint:gocritic // a short list
 		if c.Shard == id && c.LeaseLeft > 0 {
 			out = append(out, c)
 		}
@@ -35,7 +42,7 @@ func liveCopies(t testing.TB, st store.Store, id store.ShardID) []store.Copy {
 // serving counts id's serving copies under a live lease.
 func serving(t testing.TB, st store.Store, id store.ShardID) (n int, nodes []string) {
 	t.Helper()
-	for _, c := range liveCopies(t, st, id) {
+	for _, c := range liveCopies(t, st, id) { //nolint:gocritic // a short list
 		if c.State == store.CopyServing {
 			n++
 			nodes = append(nodes, c.NodeID)
@@ -53,7 +60,7 @@ func waitCopies(t testing.TB, st store.Store, index string, shards, want int, d 
 			id := store.ShardID{Index: index, Shard: s}
 			if n, nodes := serving(t, st, id); n != want || len(liveCopies(t, st, id)) != want {
 				var rows []string
-				for _, c := range liveCopies(t, st, id) {
+				for _, c := range liveCopies(t, st, id) { //nolint:gocritic // a short list
 					rows = append(rows, fmt.Sprintf("%s/slot%d/%s/e%d/%s", c.NodeID, c.Slot, c.State, c.Epoch, c.LeaseLeft))
 				}
 				return fmt.Errorf("shard %d: %d serving (%v), %d live: %v", s, n, nodes, len(rows), rows)
@@ -356,107 +363,181 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 }
 
 // TestPartitionedNodeStopsServingBeforeSteal (split-brain safety): a node cut off from
-// the database cannot renew its leases. It stops serving each copy at its local lease
-// deadline (by its own monotonic clock, less the margin), which comes before the
-// database's lease_until, so before any other node can claim the slot.
+// the database cannot renew its leases. Its copy stops serving peers at its local lease
+// deadline (by its own clocks, less the margin), which comes before the database's
+// lease_until, so before any other node can claim the slot; and the thief's copy is
+// quarantined besides. The cut-off node keeps its copy open, paused, for its own
+// last-resort reads (stale) until the loss is confirmed: once healed it finds the slot
+// taken, drops the copy and reads through the new one.
+//
+// The p2 variant (probe P2) also steps the database's clock forward: the lease expires
+// in the database at once, so another node steals the slot while the cut-off node's
+// local deadline is still ahead. The thief's quarantine (TTL plus margin after its
+// claim, by its own clock) keeps the two from serving at once all the same.
 func TestPartitionedNodeStopsServingBeforeSteal(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
-		c := newCluster(t, d, nil)
-		a := c.start(0)
-		createIndex(t, a.n, "sb", 1, 1)
-		waitCopies(t, a.st, "sb", 1, 1, 30*time.Second)
-		mustWrite(t, a.n, "sb", upsertOp("x", 1))
-		b := c.start(1)
-		c.waitHealth(t, api.StatusGreen, 30*time.Second)
-		id := store.ShardID{Index: "sb", Shard: 0}
-		if _, nodes := serving(t, b.st, id); !slices.Equal(nodes, []string{a.n.id}) {
-			t.Fatalf("the copy is on %v, want node-0 alone", nodes)
+	for _, stepClock := range []bool{false, true} {
+		name := "partition"
+		if stepClock {
+			name = "p2-db-clock-step"
 		}
-		if a.n.leaseFor(id) == nil {
-			t.Fatal("node-0 holds no lease")
-		}
+		t.Run(name, func(t *testing.T) {
+			forEachDialect(t, func(t *testing.T, d *db) {
+				if stepClock && d.dialect == "mysql" {
+					t.Skip("the clock step is simulated on SQLite and Postgres")
+				}
+				testPartition(t, d, stepClock)
+			})
+		})
+	}
+}
 
-		var stoppedAt, stolenAt atomic.Int64 // Unix nanoseconds
-		start := time.Now()
-		a.wrap.cut(true) // the partition
-		done := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Go(func() { // when does node-0 stop serving the copy?
+func testPartition(t *testing.T, d *db, stepClock bool) {
+	c := newCluster(t, d, nil)
+	a := c.start(0)
+	createIndex(t, a.n, "sb", 1, 1)
+	waitCopies(t, a.st, "sb", 1, 1, 30*time.Second)
+	mustWrite(t, a.n, "sb", upsertOp("x", 1))
+	b := c.start(1)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	id := store.ShardID{Index: "sb", Shard: 0}
+	if _, nodes := serving(t, b.st, id); !slices.Equal(nodes, []string{a.n.id}) {
+		t.Fatalf("the copy is on %v, want node-0 alone", nodes)
+	}
+	if a.n.leaseFor(id) == nil {
+		t.Fatal("node-0 holds no lease")
+	}
+	// peerServes reports whether tn's copy serves peers now: what a peer's read of it
+	// gets.
+	peerServes := func(tn *tnode) bool {
+		tg, err := tn.n.LocalTarget(context.Background(), "sb", 0, 0)
+		if err != nil {
+			return false
+		}
+		tg.Release()
+		return true
+	}
+
+	var stoppedAt, startedAt atomic.Int64 // Unix nanoseconds
+	start := time.Now()
+	a.wrap.cut(true) // the partition
+	if stepClock {
+		expireLeases(t, d, "sb") // the database's clock jumps past lease_until
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	watch := func(tn *tnode, at *atomic.Int64, want bool) {
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
 					return
 				default:
 				}
-				served := false
-				for _, lc := range a.n.LocalCopies() {
-					if lc.Info.Index == "sb" && lc.Serving {
-						served = true
-					}
-				}
-				if !served {
-					stoppedAt.CompareAndSwap(0, time.Now().UnixNano())
+				if peerServes(tn) == want {
+					at.CompareAndSwap(0, time.Now().UnixNano())
 					return
 				}
 				time.Sleep(time.Millisecond)
 			}
 		})
-		wg.Go(func() { // when does the registry let another node take the slot?
-			for {
-				select {
-				case <-done:
-					return
-				default:
-				}
-				for _, cp := range liveCopies(t, b.st, id) {
-					if cp.NodeID == b.n.id {
-						stolenAt.CompareAndSwap(0, time.Now().UnixNano())
-						return
-					}
-				}
-				time.Sleep(time.Millisecond)
-			}
-		})
-		eventually(t, 30*time.Second, "node-1 takes the copy over", func() error {
-			if stolenAt.Load() == 0 || stoppedAt.Load() == 0 {
-				return fmt.Errorf("stopped %d, stolen %d", stoppedAt.Load(), stolenAt.Load())
-			}
-			return nil
-		})
-		close(done)
-		wg.Wait()
-		stop, steal := time.Unix(0, stoppedAt.Load()), time.Unix(0, stolenAt.Load())
-		t.Logf("partitioned; node-0 stopped serving after %s, node-1 claimed the slot after %s", stop.Sub(start), steal.Sub(start))
-		if !stop.Before(steal) {
-			t.Fatalf("node-0 served until %s, after node-1 claimed the copy at %s", stop.Sub(start), steal.Sub(start))
+	}
+	watch(a, &stoppedAt, false) // when does node-0 stop serving peers?
+	watch(b, &startedAt, true)  // when does node-1's copy start?
+	eventually(t, 60*time.Second, "node-1 takes the copy over and serves it", func() error {
+		if startedAt.Load() == 0 || stoppedAt.Load() == 0 {
+			return fmt.Errorf("stopped %d, started %d", stoppedAt.Load(), startedAt.Load())
 		}
-		if limit := a.n.opts.LeaseTTL + 500*time.Millisecond; stop.Sub(start) > limit {
-			t.Fatalf("node-0 stopped serving %s after the partition, beyond its lease (%s)", stop.Sub(start), a.n.opts.LeaseTTL)
-		}
+		return nil
+	})
+	close(done)
+	wg.Wait()
+	stop, begin := time.Unix(0, stoppedAt.Load()), time.Unix(0, startedAt.Load())
+	t.Logf("partitioned; node-0 stopped serving peers after %s, node-1 began serving after %s", stop.Sub(start), begin.Sub(start))
+	if !stop.Before(begin) {
+		t.Fatalf("node-0 served peers until %s, after node-1 began serving the copy at %s", stop.Sub(start), begin.Sub(start))
+	}
+	if limit := a.n.opts.LeaseTTL + 500*time.Millisecond; stop.Sub(start) > limit {
+		t.Fatalf("node-0 stopped serving peers %s after the partition, beyond its lease (%s)", stop.Sub(start), a.n.opts.LeaseTTL)
+	}
+	// Still cut off, node-0 cannot confirm the loss: it keeps its copy paused, for its
+	// own reads only, stale.
+	lc := a.n.LocalCopies()
+	if len(lc) != 1 || !lc[0].Paused || lc[0].Serving {
+		t.Fatalf("node-0's copy while cut off: %+v", lc)
+	}
+	res, err := a.n.Search(tctx(t), "sb", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{})
+	if err != nil || !res.Stale {
+		t.Fatalf("node-0's last-resort read while cut off: %+v %v", res, err)
+	}
+	// Healed, node-0 finds the slot taken, drops its copy and reads through node-1's.
+	a.wrap.cut(false)
+	eventually(t, 60*time.Second, "node-0 drops its copy and reads through node-1", func() error {
 		if lc := a.n.LocalCopies(); len(lc) != 0 {
-			t.Fatalf("node-0 still hosts %+v", lc)
+			return fmt.Errorf("node-0 still hosts %+v", lc)
 		}
-		// Healed, node-0 serves again through node-1's copy.
-		a.wrap.cut(false)
-		eventually(t, 30*time.Second, "node-0 reads through node-1", func() error {
-			got, err := count(context.Background(), a.n, "sb", 0)
-			if err != nil {
-				return err
-			}
-			if got != 1 {
-				return fmt.Errorf("counts %d", got)
-			}
-			return nil
-		})
+		res, err := a.n.Search(context.Background(), "sb", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{})
+		if err != nil {
+			return err
+		}
+		if res.Total != 1 || res.Stale {
+			return fmt.Errorf("total %d, stale %v", res.Total, res.Stale)
+		}
+		return nil
 	})
 }
 
-// TestLeaseDeadlineByFakeClock: a lease's local deadline is the clock's reading taken
-// before the renewal plus the TTL, less the margin, by the node's own clock alone.
+// expireLeases makes the database consider every lease of index expired at once, as a
+// forward step of its clock would.
+func expireLeases(t testing.TB, d *db, index string) {
+	t.Helper()
+	var driver, dsn string
+	switch d.dialect {
+	case "sqlite":
+		u, err := url.Parse(d.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		driver, dsn = "sqlite", strings.TrimPrefix(u.Path, "/")
+		if _, err := os.Stat(dsn); err != nil {
+			dsn = u.Path
+		}
+	case "postgres":
+		u, err := url.Parse(d.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := postgres.Config(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db := stdlib.OpenDB(*cfg)
+		defer db.Close()
+		if _, err := db.ExecContext(context.Background(), "UPDATE sl_shard_copies SET lease_until = 0 WHERE index_name = $1", index); err != nil {
+			t.Fatal(err)
+		}
+		return
+	default:
+		t.Fatalf("no clock step on %s", d.dialect)
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(context.Background(), "UPDATE sl_shard_copies SET lease_until = 0 WHERE index_name = ?", index); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLeaseDeadlineByFakeClock: a lease surely holds until TTL less the margin after
+// the clocks' readings taken before its last grant, by the monotonic clock and by the
+// wall clock both (a suspended machine's monotonic clock may stand still); a slot taken
+// over from another node is quarantined for TTL plus margin after the claim began.
 func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	clk := &fakeClock{}
-	l := &lease{margin: 100 * time.Millisecond, clock: clk}
-	l.deadline.Store(int64(time.Second))
+	clk.wall.Store(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC).UnixNano())
+	l := &lease{ttl: time.Second, margin: 100 * time.Millisecond, clock: clk}
+	l.extend(0, clk.Wall())
 	if !l.valid() {
 		t.Fatal("a fresh lease is not valid")
 	}
@@ -468,11 +549,11 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if l.valid() {
 		t.Fatal("valid within the margin of its deadline")
 	}
-	l.extend(500*time.Millisecond, time.Second) // renewed: from the reading before the call
+	l.extend(500*time.Millisecond, clk.Wall().Add(-400*time.Millisecond)) // renewed: from the readings before the call
 	if !l.valid() {
 		t.Fatal("not valid after a renewal")
 	}
-	l.extend(100*time.Millisecond, time.Second) // a late answer to an older renewal never moves it back
+	l.extend(100*time.Millisecond, clk.Wall().Add(-800*time.Millisecond)) // a late answer to an older renewal never moves it back
 	if time.Duration(l.deadline.Load()) != 1500*time.Millisecond {
 		t.Fatalf("deadline %s", time.Duration(l.deadline.Load()))
 	}
@@ -480,9 +561,41 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if l.valid() {
 		t.Fatal("valid past deadline less margin")
 	}
+
+	// Suspend: the wall clock runs on while the monotonic one stands still.
+	l.extend(clk.Now(), clk.Wall())
+	clk.wall.Add(int64(5 * time.Second))
+	if l.valid() {
+		t.Fatal("valid after the machine slept past the lease, by its monotonic clock alone")
+	}
+
+	// Quarantine: a stolen slot serves nothing for TTL plus margin after its claim.
+	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: clk, id: "me"}
+	from := clk.Now()
+	q := n.newLease(store.Copy{TakenFrom: "other"}, from, clk.Wall())
+	if !q.quarantined() || !q.valid() {
+		t.Fatalf("a stolen slot: quarantined %v, valid %v", q.quarantined(), q.valid())
+	}
+	clk.set(from + 1099*time.Millisecond)
+	if !q.quarantined() {
+		t.Fatal("the quarantine ended before TTL plus margin")
+	}
+	clk.set(from + 1100*time.Millisecond)
+	if q.quarantined() {
+		t.Fatal("still quarantined after TTL plus margin")
+	}
+	if mine := n.newLease(store.Copy{TakenFrom: ""}, clk.Now(), clk.Wall()); mine.quarantined() {
+		t.Fatal("a free slot is quarantined")
+	}
 }
 
-type fakeClock struct{ now atomic.Int64 }
+// fakeClock is a Clock a test moves: a monotonic reading and a wall clock that run
+// together unless a test steps one alone.
+type fakeClock struct{ now, wall atomic.Int64 }
 
-func (c *fakeClock) Now() time.Duration  { return time.Duration(c.now.Load()) }
-func (c *fakeClock) set(d time.Duration) { c.now.Store(int64(d)) }
+func (c *fakeClock) Now() time.Duration { return time.Duration(c.now.Load()) }
+func (c *fakeClock) Wall() time.Time    { return time.Unix(0, c.wall.Load()) }
+func (c *fakeClock) set(d time.Duration) {
+	c.wall.Add(int64(d) - c.now.Load())
+	c.now.Store(int64(d))
+}

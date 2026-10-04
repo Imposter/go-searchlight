@@ -194,8 +194,9 @@ func (n *Node) peerCopies(ctx context.Context, v *view) map[copyID]api.ShardInfo
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			for _, c := range reply.Copies {
-				out[copyID{node: id, shard: store.ShardID{Index: c.Index, Shard: c.Shard}}] = c
+			for i := range reply.Copies {
+				c := &reply.Copies[i]
+				out[copyID{node: id, shard: store.ShardID{Index: c.Index, Shard: c.Shard}}] = c.ShardInfo
 			}
 		})
 	}

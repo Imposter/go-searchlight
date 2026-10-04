@@ -29,11 +29,17 @@ const (
 )
 
 // shardRef names one shard copy's shard and the seq a read needs searchable on it.
+// Without AllowStale a peer whose copy is stale (it trails by more than max_lag, its
+// node cannot reach the database) refuses the read with a retryable 503 (codeStale).
 type shardRef struct {
-	Index   string `json:"index"`
-	Shard   int    `json:"shard"`
-	WaitSeq int64  `json:"wait_seq,omitempty"`
+	Index      string `json:"index"`
+	Shard      int    `json:"shard"`
+	WaitSeq    int64  `json:"wait_seq,omitempty"`
+	AllowStale bool   `json:"allow_stale,omitempty"`
 }
+
+// codeStale is the problem code of a read a peer refused because its copy is stale.
+const codeStale = "stale_copy"
 
 // wireRequest is a search.Request on the wire: the query as its DSL JSON.
 type wireRequest struct {
@@ -167,7 +173,17 @@ type wireFile struct {
 
 // copiesReply lists a peer's copies.
 type copiesReply struct {
-	Copies []api.ShardInfo `json:"copies"`
+	Copies []peerCopy `json:"copies"`
+}
+
+// peerCopy is one copy a peer holds: its description, its registry epoch, and a
+// progress counter that moves while the copy applies, loads or fetches anything (the
+// prune leader's stall detection).
+type peerCopy struct {
+	api.ShardInfo
+	Epoch    int64 `json:"epoch"`
+	Progress int64 `json:"progress"`
+	Paused   bool  `json:"paused,omitempty"`
 }
 
 // errorReply is an error on the wire.

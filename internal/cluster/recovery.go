@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,6 +73,48 @@ type fetcher struct {
 	// bytes and resumes count what recoveries fetched and how often a file was
 	// resumed (tests, benchmarks).
 	bytes, resumes atomic.Int64
+	// running are the shards recovering now, with the bytes each has fetched (their
+	// progress, for the prune leader's stall detection).
+	mu      sync.Mutex
+	running map[store.ShardID]*atomic.Int64
+	fetched map[store.ShardID]*atomic.Int64
+}
+
+// begin marks id recovering; the returned func ends it.
+func (f *fetcher) begin(id store.ShardID) (*atomic.Int64, func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.running == nil {
+		f.running, f.fetched = map[store.ShardID]*atomic.Int64{}, map[store.ShardID]*atomic.Int64{}
+	}
+	ctr := f.fetched[id]
+	if ctr == nil {
+		ctr = &atomic.Int64{}
+		f.fetched[id] = ctr
+	}
+	f.running[id] = ctr
+	return ctr, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		delete(f.running, id)
+	}
+}
+
+// active reports whether id is recovering from a peer now.
+func (f *fetcher) active(id store.ShardID) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running[id] != nil
+}
+
+// progressOf is the bytes recoveries of id have fetched on this node.
+func (f *fetcher) progressOf(id store.ShardID) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.fetched[id]; c != nil {
+		return c.Load()
+	}
+	return 0
 }
 
 var _ replica.Fetcher = (*fetcher)(nil)
@@ -84,6 +127,9 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 		return errNoSource
 	}
 	staging := n.stagingDir(id)
+	progress, end := f.begin(id)
+	defer end()
+	ctx = context.WithValue(ctx, progressKey{}, progress)
 	var errs []error
 	for _, c := range cands {
 		delay := 100 * time.Millisecond
@@ -174,11 +220,15 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 	if sum := sha256.Sum256(man); hex.EncodeToString(sum[:]) != manifest.SHA256 {
 		return fetched, fmt.Errorf("cluster: the manifest of %s from %s fails its checksum", id, c.node)
 	}
-	// Every file is staged and checked: move them in, then commit the manifest.
+	// Every file is staged and checked: move them in, make their names durable, then
+	// commit the manifest.
 	for _, wf := range files {
 		if err := os.Rename(filepath.Join(staging, wf.Name), filepath.Join(dir, wf.Name)); err != nil {
 			return fetched, err
 		}
+	}
+	if err := segment.SyncDir(dir); err != nil {
+		return fetched, err
 	}
 	if err := writeSynced(dir, shard.ManifestName, man); err != nil {
 		return fetched, err
@@ -281,10 +331,37 @@ func (n *Node) fileURL(c candidate, snapID, name string) string {
 	return n.scheme + "://" + c.addr + peerPrefix + "snapshots/" + url.PathEscape(snapID) + "/files/" + url.PathEscape(name)
 }
 
+// progressKey carries a recovery's byte counter in its context.
+type progressKey struct{}
+
+// idleReader cuts a stream (cancels its request) that delivers nothing for idle.
+type idleReader struct {
+	r     io.Reader
+	timer *time.Timer
+	idle  time.Duration
+	ctr   *atomic.Int64
+}
+
+func (r *idleReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.idle)
+		if r.ctr != nil {
+			r.ctr.Add(int64(n))
+		}
+	}
+	return n, err
+}
+
 // streamTo appends a snapshot file's bytes from off to part, and fsyncs it. It returns
-// the bytes it wrote.
+// the bytes it wrote. A stream idle for PeerIdleTimeout is cut (and resumed by the
+// caller).
 func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part string, off int64) (int64, error) {
 	n := f.n
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timer := time.AfterFunc(n.opts.PeerIdleTimeout, cancel)
+	defer timer.Stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.fileURL(c, snapID, name), http.NoBody)
 	if err != nil {
 		return 0, err
@@ -317,7 +394,8 @@ func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part 
 		_ = fh.Close()
 		return 0, err
 	}
-	k, cerr := io.Copy(fh, resp.Body)
+	ctr, _ := ctx.Value(progressKey{}).(*atomic.Int64)
+	k, cerr := io.Copy(fh, &idleReader{r: resp.Body, timer: timer, idle: n.opts.PeerIdleTimeout, ctr: ctr})
 	f.bytes.Add(k)
 	n.inst.recoveryBytes(ctx, k)
 	serr := segment.SyncFile(fh)

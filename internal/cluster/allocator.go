@@ -84,7 +84,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 		}
 		// The lease of a copy no longer hosted: its index was dropped (maybe
 		// recreated under the same name), or the copy stopped. Claim afresh.
-		n.dropLease(id)
+		n.dropLease(l)
 	}
 	target := iv.ReplicasPerShard
 	mine, live, retiring := false, 0, 0
@@ -94,15 +94,17 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 			mine = true // a slot this node held before it restarted: claim it back
 			continue
 		}
-		if v.usable(c) {
+		switch {
+		case c.State == store.CopyRetiring && c.LeaseLeft > 0:
+			// A retiring copy (its node draining or stopped, maybe gone already)
+			// holds its slot until its lease runs out, but does not count.
+			retiring++
+		case v.usable(c):
 			live++
-			if c.State == store.CopyRetiring {
-				retiring++
-			}
 		}
 	}
 	if !mine {
-		if target > 0 && live-retiring >= target {
+		if target > 0 && live >= target {
 			n.alloc.clear(id)
 			return nil
 		}
@@ -117,7 +119,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	if target > 0 {
 		claim = target + retiring
 	}
-	before := n.clock.Now()
+	before, wall := n.clock.Now(), n.clock.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, id, n.id, claim, n.opts.LeaseTTL)
 	n.NoteDB(err)
 	switch {
@@ -129,43 +131,48 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 		return nil // the target was met meanwhile
 	}
 	n.alloc.clear(id)
-	if c.State == store.CopyRetiring {
-		// This node's own slot, left retiring by a shutdown that could not release
-		// it: it recovers again (the tailer never promotes a retiring copy).
+	if c.State != store.CopyRecovering {
+		// This node's own slot from before a restart (left serving by a crash, or
+		// retiring by a shutdown): it recovers again until its copy, reopened, has
+		// caught up (the tailer promotes only a recovering copy).
 		if err := n.reg.SetCopyState(ctx, c, store.CopyRecovering); err != nil {
 			return err
 		}
 		c.State = store.CopyRecovering
 	}
-	l := n.newLease(c, before)
+	l := n.newLease(c, before, wall)
 	n.leaseMu.Lock()
 	n.leases[id] = l
 	n.leaseMu.Unlock()
 	n.inst.lease(ctx, "claim")
 	n.inst.allocation(ctx, id, string(c.State))
-	if err := n.HostCopy(ctx, node.HostSpec{Copy: c, LeaseValid: l.valid, Fetcher: n.fetch, Startup: startup}); err != nil {
-		n.dropLease(id)
+	if err := n.HostCopy(ctx, node.HostSpec{Copy: c, Held: l.valid, Quarantined: l.quarantined, Fetcher: n.fetch, Startup: startup}); err != nil {
+		n.dropLease(l)
 		if rerr := n.reg.ReleaseCopy(ctx, c); rerr == nil {
 			n.inst.lease(ctx, "release")
 		}
 		return err
 	}
 	n.log.InfoContext(ctx, "shard copy claimed", slog.String("shard", id.String()), slog.Int("slot", c.Slot),
-		slog.Int64("epoch", c.Epoch), slog.String("state", string(c.State)))
+		slog.Int64("epoch", c.Epoch), slog.String("taken_from", c.TakenFrom))
 	return nil
 }
 
 // maybeRelease releases this node's copy when the index's target fell below its slot
-// and at least target other copies serve.
+// and at least target other copies serve in slots below it (so the copies the target
+// keeps are serving ones, not ones still recovering).
 func (n *Node) maybeRelease(ctx context.Context, v *view, iv node.IndexView, l *lease) error {
 	target := iv.ReplicasPerShard
-	if target == 0 || l.copy.Slot < target || v.servingElsewhere(l.copy.Shard, n.id) < target {
+	if target == 0 || l.copy.Slot < target || v.servingBelow(l.copy.Shard, n.id, target) < target {
 		return nil
 	}
 	n.log.InfoContext(ctx, "releasing an extra shard copy: the copy target was lowered", slog.String("shard", l.copy.Shard.String()),
 		slog.Int("slot", l.copy.Slot), slog.Int("target", target))
-	n.dropLease(l.copy.Shard)
-	if err := n.UnhostCopy(ctx, l.copy, true); err != nil {
+	l.mu.Lock()
+	l.lost = true
+	l.mu.Unlock()
+	n.dropLease(l)
+	if err := n.unhostCopy(ctx, l.copy, true); err != nil {
 		n.log.WarnContext(ctx, "closing a released copy failed", slog.Any("error", err))
 	}
 	if err := n.reg.ReleaseCopy(ctx, l.copy); err != nil && !errors.Is(err, store.ErrLeaseLost) {

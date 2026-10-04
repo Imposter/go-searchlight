@@ -94,7 +94,7 @@ func BenchmarkPeerRecovery(b *testing.B) {
 		start := time.Now()
 		tn := c.start(i)
 		eventually(b, 5*time.Minute, "the copy serves", func() error {
-			for _, cp := range liveCopies(b, a.st, id) {
+			for _, cp := range liveCopies(b, a.st, id) { //nolint:gocritic // a short list
 				if cp.NodeID == tn.n.id && cp.State == store.CopyServing {
 					return nil
 				}

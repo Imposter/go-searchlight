@@ -50,15 +50,35 @@ func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidat
 	return n.candidates(id)
 }
 
+// missRefreshEvery is the least time between two registry reads routing misses make:
+// a shard no node serves, read in a loop, costs the registry at most one read per
+// interval, and each miss waits at most that long for a fresh view.
+const missRefreshEvery = 75 * time.Millisecond
+
 // refreshOnMiss re-reads the registry for routing, unless a read that began after the
-// call did meanwhile: concurrent misses share one registry read.
+// call did meanwhile: concurrent misses share one registry read. Reads it makes are
+// missRefreshEvery apart.
 func (n *Node) refreshOnMiss(ctx context.Context) {
 	asked := n.clock.Now()
 	n.missMu.Lock()
 	defer n.missMu.Unlock()
-	if v := n.view.Load(); v != nil && v.read >= asked {
+	fresh := func() bool { v := n.view.Load(); return v != nil && v.readBegan >= asked }
+	if fresh() {
 		return
 	}
+	if wait := missRefreshEvery - time.Since(n.missReadAt); wait > 0 {
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		if fresh() {
+			return
+		}
+	}
+	n.missReadAt = time.Now()
 	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
 		n.log.DebugContext(ctx, "reading the registry for a shard with no copy in view failed", slog.Any("error", err))
 	}

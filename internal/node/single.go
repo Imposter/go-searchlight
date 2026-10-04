@@ -140,6 +140,8 @@ type Single struct {
 	reserved map[string]bool
 	closed   bool
 
+	absent absentIndexes
+
 	// bgCancel stops the Background loops; bg waits for them.
 	bgCancel context.CancelFunc
 	bg       sync.WaitGroup
@@ -188,9 +190,9 @@ type shardSlot struct {
 	written  atomic.Int64
 	querySeq atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
-	host       sync.Mutex
-	local      atomic.Pointer[copyState]
-	unhostedAt atomic.Int64 // Unix nanoseconds
+	host           sync.Mutex
+	local          atomic.Pointer[copyState]
+	unhostedAtNano atomic.Int64
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.

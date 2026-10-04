@@ -386,11 +386,11 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 
 // view is the registry as last read: the nodes and every shard's copies.
 type view struct {
-	at     time.Time
-	read   time.Duration // Clock.Now when the registry read began
-	nodes  map[string]store.Node
-	live   map[string]bool
-	copies map[store.ShardID][]store.Copy
+	at        time.Time
+	readBegan time.Duration
+	nodes     map[string]store.Node
+	live      map[string]bool
+	copies    map[store.ShardID][]store.Copy
 }
 
 // liveNodes lists the live nodes' ids, sorted.
@@ -429,7 +429,7 @@ func (v *view) servingBelow(id store.ShardID, self string, slot int) int {
 // takenOver reports whether the registry, read after l's claim, shows its slot held by
 // another node, or by another incarnation.
 func (v *view) takenOver(l *lease) bool {
-	if v.at.IsZero() || v.read <= l.claimed {
+	if v.at.IsZero() || v.readBegan <= l.claimed {
 		return false
 	}
 	c := &l.copy
@@ -457,7 +457,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v := &view{at: time.Now(), read: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
+	v := &view{at: time.Now(), readBegan: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
 	for _, nd := range nodes {
 		v.nodes[nd.ID] = nd
 		if nd.HeartbeatAge < n.opts.DeadAfter {
@@ -478,7 +478,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	}
 	for {
 		cur := n.view.Load()
-		if cur != nil && cur.read > v.read {
+		if cur != nil && cur.readBegan > v.readBegan {
 			return nil
 		}
 		if n.view.CompareAndSwap(cur, v) {

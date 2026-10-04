@@ -394,7 +394,6 @@ func (n *Node) localPeerCopies() []peerCopy {
 	return out
 }
 
-// forgetProgress drops the high-water marks of copies (or epochs) no longer held.
 func (n *Node) forgetProgress(held map[copyKey]bool) {
 	n.progressMu.Lock()
 	defer n.progressMu.Unlock()

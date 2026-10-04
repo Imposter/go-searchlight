@@ -286,7 +286,7 @@ func (c *cluster) config(i int) config.Config {
 	cfg.RemapDebounce = 0
 	cfg.RequestTimeout = 20 * time.Second
 	cfg.ShutdownTimeout = 10 * time.Second
-	cfg.ShutdownGrace = 0
+	cfg.ShutdownGrace = stopGrace
 	cfg.MergeThreads = 1
 	cfg.SearchThreads = 2
 	return cfg
@@ -384,7 +384,7 @@ func (tn *tnode) stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	tn.n.Drain(ctx)
-	time.Sleep(stopGrace)
+	time.Sleep(tn.cfg.ShutdownGrace)
 	_ = tn.srv.Shutdown(ctx)
 	if err := tn.n.Stop(ctx); err != nil {
 		tn.c.t.Errorf("stop node %d: %v", tn.i, err)
@@ -496,7 +496,9 @@ type faultStore struct {
 	mu   sync.Mutex
 	down bool
 	// slowest is each store operation's longest call (tests that measure tails).
-	slowest map[string]time.Duration
+	slowest    map[string]time.Duration
+	nodesReads atomic.Int64
+	indexGets  atomic.Int64
 }
 
 // timed records an operation's duration: defer f.timed("op")().
@@ -574,6 +576,7 @@ func (x *faultIndexes) Create(ctx context.Context, m store.IndexMeta) (store.Ind
 }
 
 func (x *faultIndexes) Get(ctx context.Context, name string) (store.IndexMeta, error) {
+	x.f.indexGets.Add(1)
 	if x.f.isDown() {
 		return store.IndexMeta{}, errPartitioned
 	}
@@ -669,6 +672,7 @@ func (r *faultRegistry) Heartbeat(ctx context.Context, n store.Node) error {
 }
 
 func (r *faultRegistry) Nodes(ctx context.Context) ([]store.Node, error) {
+	r.f.nodesReads.Add(1)
 	if r.f.isDown() {
 		return nil, errPartitioned
 	}

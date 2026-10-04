@@ -151,8 +151,6 @@ type Options struct {
 
 // testHooks are test seams.
 type testHooks struct {
-	// allowSQLiteCluster lets several live nodes share a SQLite store: in-process
-	// clusters over one file.
 	allowSQLiteCluster bool
 
 	// peerFile wraps the writer a snapshot file is streamed to.
@@ -266,6 +264,7 @@ type Node struct {
 	ars         *ars
 	view        atomic.Pointer[view]
 	missMu      sync.Mutex
+	missReadAt  time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
@@ -339,6 +338,10 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	if n.scheme == "http" && o.Config.ClusterToken != "" && !loopbackAddress(o.Config.AdvertiseAddress) {
 		n.log.WarnContext(ctx, "cluster_token is sent in the clear: advertise_address is not loopback and tls_cert is unset",
 			slog.String("address", o.Config.AdvertiseAddress))
+	}
+	if o.Config.ShutdownGrace < o.ViewInterval {
+		n.log.WarnContext(ctx, "shutdown_grace is shorter than the routing view interval: while this node stops, peers still route reads to it after its listener closes, and those reads fail",
+			slog.Duration("shutdown_grace", o.Config.ShutdownGrace), slog.Duration("view_interval", o.ViewInterval))
 	}
 	n.inst = newInstruments(o.Meter, n.log)
 	transport := o.Transport

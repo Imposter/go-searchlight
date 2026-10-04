@@ -149,8 +149,6 @@ func (n *Node) pruneAll(ctx context.Context) error {
 	return nil
 }
 
-// forget drops what the leader remembers of copies and shards the registry no longer
-// has.
 func (p *pruneState) forget(v *view) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

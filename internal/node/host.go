@@ -177,7 +177,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 		return nil
 	}
 	sl.local.Store(nil)
-	sl.unhostedAt.Store(time.Now().UnixNano())
+	sl.unhostedAtNano.Store(time.Now().UnixNano())
 	c.cancel()
 	<-c.done
 	var err error
@@ -392,10 +392,16 @@ func (n *Single) SyncCatalog(ctx context.Context) error {
 }
 
 // adoptIndex opens index name when the store has it (another node created it): the
-// index, or nil when the store has none.
+// index, or nil when the store has none. A name the store did not have is not looked
+// up again for absentTTL, unless this node creates it meanwhile.
 func (n *Single) adoptIndex(ctx context.Context, name string) (*index, error) {
+	gen, absent := n.absent.check(name)
+	if absent {
+		return nil, nil
+	}
 	m, err := n.st.Indexes().Get(ctx, name)
 	if errors.Is(err, store.ErrNotFound) {
+		n.absent.note(name, gen)
 		return nil, nil
 	}
 	if err != nil {
@@ -510,7 +516,7 @@ func (n *Single) UnhostedCopyDirs() []CopyDir {
 			root := idx.copyRoot(s)
 			if _, err := os.Stat(root); err == nil {
 				d := CopyDir{Shard: sl.id, Path: root}
-				if at := sl.unhostedAt.Load(); at > 0 {
+				if at := sl.unhostedAtNano.Load(); at > 0 {
 					d.UnhostedAt = time.Unix(0, at)
 				}
 				out = append(out, d)

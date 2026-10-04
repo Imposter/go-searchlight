@@ -62,6 +62,7 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	}()
 
 	meta, err := n.st.Indexes().Create(ctx, store.IndexMeta{Name: name, Mapping: mapping, Settings: settings})
+	n.absent.forget(name)
 	if errors.Is(err, store.ErrExists) {
 		return nil, api.Conflict(api.CodeIndexExists, "index %q already exists", name)
 	}

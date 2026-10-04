@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -658,4 +659,100 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 			t.Fatalf("a shard no node serves: %v, want ErrNoServingCopy's 503", err)
 		}
 	})
+}
+
+// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made in a loop
+// from several clients, re-read the registry at most once per missRefreshEvery.
+func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.HeartbeatInterval = 10 * time.Second
+		o.LeaseTTL = 40 * time.Second
+		o.DeadAfter = time.Minute
+		o.ViewInterval = time.Hour
+		o.CatalogInterval = time.Hour
+		o.PruneInterval = time.Hour
+	})
+	a := c.start(0)
+	hooks := &clusterHooks{a.n}
+	id := store.ShardID{Index: "nowhere", Shard: 0}
+	before := a.wrap.nodesReads.Load()
+	began := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for time.Since(began) < 600*time.Millisecond {
+				if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
+					t.Errorf("a shard no node serves: %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	reads, limit := a.wrap.nodesReads.Load()-before, int64(time.Since(began)/missRefreshEvery)+3
+	t.Logf("%d registry reads in %s", reads, time.Since(began).Round(time.Millisecond))
+	if reads > limit {
+		t.Fatalf("%d registry reads for reads of a shard no node serves (limit %d)", reads, limit)
+	}
+}
+
+// TestUnknownIndexLookupsAreCached: requests for an index no node has ask the store
+// about it once per absentTTL, not once each; creating it here is seen at once.
+func TestUnknownIndexLookupsAreCached(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	a := c.start(0)
+	before := a.wrap.indexGets.Load()
+	for range 50 {
+		var ae *api.Error
+		if _, err := count(tctx(t), a.n, "ghost", 0); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
+			t.Fatalf("an index no node has: %v, want a 404", err)
+		}
+	}
+	if gets := a.wrap.indexGets.Load() - before; gets > 2 {
+		t.Fatalf("%d store lookups for 50 requests of an unknown index", gets)
+	}
+	createIndex(t, a.n, "ghost", 1, 0)
+	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {
+		t.Fatalf("the index just created here: %d, %v", got, err)
+	}
+}
+
+// TestShortShutdownGraceWarns: a cluster node whose shutdown_grace is shorter than its
+// routing view interval warns at startup.
+func TestShortShutdownGraceWarns(t *testing.T) {
+	for _, grace := range []time.Duration{0, time.Second} {
+		logs := &warnings{}
+		c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+			o.Config.ShutdownGrace = grace
+			o.ViewInterval = 500 * time.Millisecond
+			o.Logger = slog.New(logs)
+		})
+		c.start(0)
+		if got, want := logs.has("shutdown_grace is shorter than the routing view interval"), grace == 0; got != want {
+			t.Fatalf("shutdown_grace %s: warned %v, want %v", grace, got, want)
+		}
+	}
+}
+
+type warnings struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *warnings) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelWarn }
+
+func (h *warnings) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *warnings) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *warnings) WithGroup(string) slog.Handler      { return h }
+
+func (h *warnings) has(prefix string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.ContainsFunc(h.msgs, func(m string) bool { return strings.HasPrefix(m, prefix) })
 }

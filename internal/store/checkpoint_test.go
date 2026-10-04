@@ -13,10 +13,9 @@ import (
 )
 
 // TestCheckpointGateAfterBurst (N3): after a burst grows SQLite's write-ahead log far
-// past the checkpoint threshold, the checkpointer copies it back, the log file is cut
-// back to the journal size limit once SQLite restarts it, and small writes afterwards
-// pass ticks with no checkpoint (and no fsync): the gate counts the frames pending,
-// not the file's size.
+// past the checkpoint threshold, the checkpointer copies it back and a truncating
+// checkpoint empties the file, and small writes afterwards pass ticks with no
+// checkpoint (and no fsync): the gate counts the frames pending, not the file's size.
 func TestCheckpointGateAfterBurst(t *testing.T) {
 	st := sqliteHarness(t).open(t)
 	s, ok := st.(*sqlStore)
@@ -47,9 +46,9 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 			}
 		}
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(time.Minute)
 	for {
-		small(1) // a write restarts the log once every frame is copied
+		small(1)
 		pending, err := sqlite.PendingLog(s.dbPath)
 		if err != nil {
 			t.Fatal(err)

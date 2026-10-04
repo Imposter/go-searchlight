@@ -68,17 +68,18 @@ func Dialect() *dialect.Dialect {
 		Retryable:  retryable,
 		// The writer's automatic checkpoints are off (DSNs): a PASSIVE checkpoint on
 		// a read connection keeps the log short instead, off every commit's path.
-		Checkpoint:       "PRAGMA wal_checkpoint(PASSIVE)",
-		CheckpointEvery:  CheckpointEvery,
-		CheckpointMinLog: JournalSizeLimit,
-		PendingLog:       PendingLog,
-		LogWarnBytes:     64 << 20,
-		Changelog:        changelog,
-		Records:          records,
-		Registry:         registry,
-		Blobs:            blobs,
-		Indexes:          indexes,
-		Maintenance:      maintenance,
+		Checkpoint:         "PRAGMA wal_checkpoint(PASSIVE)",
+		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
+		CheckpointEvery:    CheckpointEvery,
+		CheckpointMinLog:   JournalSizeLimit,
+		PendingLog:         PendingLog,
+		LogWarnBytes:       64 << 20,
+		Changelog:          changelog,
+		Records:            records,
+		Registry:           registry,
+		Blobs:              blobs,
+		Indexes:            indexes,
+		Maintenance:        maintenance,
 	}
 }
 

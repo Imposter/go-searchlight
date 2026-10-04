@@ -62,6 +62,9 @@ type lease struct {
 	margin     time.Duration
 	clock      Clock
 	quarantine time.Duration // Clock.Now until which the copy serves nothing; 0: none
+	// claimed is when the claim that granted the lease began (wall clock): a view of
+	// the registry read before it cannot judge it.
+	claimed time.Time
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
 
@@ -106,7 +109,7 @@ func (l *lease) extend(from time.Duration, wall time.Time) {
 }
 
 func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time) *lease {
-	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock}
+	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock, claimed: wall}
 	l.deadline.Store(int64(from + l.ttl))
 	l.wallBefore.Store(wall.UnixNano())
 	if c.TakenFrom != "" && c.TakenFrom != n.id {
@@ -368,7 +371,7 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 		}
 		v := n.view.Load()
 		for _, l := range n.leaseList() {
-			if v.takenOver(&l.copy) {
+			if v.takenOver(l) {
 				n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
 				n.inst.lease(ctx, "lost")
 				n.loseCopy(ctx, l)
@@ -422,12 +425,13 @@ func (v *view) servingBelow(id store.ShardID, self string, slot int) int {
 	return k
 }
 
-// takenOver reports whether the registry shows c's slot held by another node, or by
-// another incarnation.
-func (v *view) takenOver(c *store.Copy) bool {
-	if v.at.IsZero() {
+// takenOver reports whether the registry, read after l's claim, shows its slot held by
+// another node, or by another incarnation.
+func (v *view) takenOver(l *lease) bool {
+	if v.at.IsZero() || !v.at.After(l.claimed) {
 		return false
 	}
+	c := &l.copy
 	for i := range v.copies[c.Shard] {
 		e := &v.copies[c.Shard][i]
 		if e.Slot == c.Slot {
@@ -439,6 +443,7 @@ func (v *view) takenOver(c *store.Copy) bool {
 
 // refreshView reads the registry.
 func (n *Node) refreshView(ctx context.Context) error {
+	readAt := n.clock.Wall()
 	nodes, err := n.reg.Nodes(ctx)
 	if err != nil {
 		n.NoteDB(err)
@@ -449,7 +454,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v := &view{at: time.Now(), nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
+	v := &view{at: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
 	for _, nd := range nodes {
 		v.nodes[nd.ID] = nd
 		if nd.HeartbeatAge < n.opts.DeadAfter {
@@ -458,6 +463,15 @@ func (n *Node) refreshView(ctx context.Context) error {
 	}
 	for i := range copies {
 		v.copies[copies[i].Shard] = append(v.copies[copies[i].Shard], copies[i])
+	}
+	// A copy the registry shows another holder of is dropped before the view is
+	// published: no read routed by this view can fall back to it.
+	for _, l := range n.leaseList() {
+		if v.takenOver(l) {
+			n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
+			n.inst.lease(ctx, "lost")
+			n.loseCopy(ctx, l)
+		}
 	}
 	n.view.Store(v)
 	n.inst.nodes.Store(int64(len(v.live)))

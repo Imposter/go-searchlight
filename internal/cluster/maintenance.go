@@ -121,6 +121,7 @@ func (n *Node) pruneAll(ctx context.Context) error {
 		return err
 	}
 	v := n.view.Load()
+	n.releaseDecommissioned(ctx, v)
 	progress := n.copyProgress(ctx, v)
 	now := time.Now()
 	cutoff := now.Add(-n.opts.ChangelogRetention)
@@ -145,6 +146,28 @@ func (n *Node) pruneAll(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// releaseDecommissioned deletes the retiring rows of nodes gone from sl_nodes (they
+// stopped cleanly and never came back) once their leases ran out more than
+// RetiringRetention ago, by the database's clock: they no longer hold the prune floor,
+// and nothing else needs them.
+func (n *Node) releaseDecommissioned(ctx context.Context, v *view) {
+	for _, list := range v.copies {
+		for i := range list {
+			c := &list[i]
+			if _, registered := v.nodes[c.NodeID]; registered || c.State != store.CopyRetiring || c.LeaseLeft > -n.opts.RetiringRetention {
+				continue
+			}
+			if err := n.reg.ReleaseCopy(ctx, *c); err != nil && !errors.Is(err, store.ErrLeaseLost) {
+				n.log.WarnContext(ctx, "releasing a decommissioned node's copy failed", slog.String("shard", c.Shard.String()),
+					slog.String("node", c.NodeID), slog.Any("error", err))
+				continue
+			}
+			n.inst.lease(ctx, "release")
+			n.log.InfoContext(ctx, "released a decommissioned node's copy", slog.String("shard", c.Shard.String()), slog.String("node", c.NodeID))
+		}
+	}
 }
 
 // pruneFloor is the seq a shard's changelog may be pruned up to (inclusive) on account
@@ -332,7 +355,11 @@ func (n *Node) collectUnused(ctx context.Context) {
 		return t > 0 && v.servingElsewhere(id, n.id) >= t
 	}
 	for _, d := range n.UnhostedCopyDirs() {
-		if n.leaseFor(d.Shard) != nil || !settled(d.Shard) || !olderThan(d.Path, n.opts.CopyDirGrace) {
+		since := d.UnhostedAt
+		if since.IsZero() {
+			since = n.startedAt // left by an earlier run: unused since this one began
+		}
+		if n.leaseFor(d.Shard) != nil || !settled(d.Shard) || time.Since(since) < n.opts.CopyDirGrace {
 			continue
 		}
 		if err := n.RemoveCopyDir(ctx, d.Shard); err != nil {
@@ -347,7 +374,11 @@ func (n *Node) collectUnused(ctx context.Context) {
 	for _, e := range entries {
 		path := filepath.Join(root, e.Name())
 		id, ok := stagingShard(e.Name())
-		if !ok || n.fetch.active(id) || !olderThan(path, n.opts.CopyDirGrace) {
+		since := n.fetch.idleSince(id)
+		if since.IsZero() {
+			since = n.startedAt
+		}
+		if !ok || n.fetch.active(id) || time.Since(since) < n.opts.CopyDirGrace {
 			continue
 		}
 		if _, known := targets[id.Index]; known && !settled(id) && !n.peerValid(id) {
@@ -371,10 +402,4 @@ func stagingShard(name string) (store.ShardID, bool) {
 		return store.ShardID{}, false
 	}
 	return store.ShardID{Index: index, Shard: s}, true
-}
-
-// olderThan reports whether path was last modified at least d ago.
-func olderThan(path string, d time.Duration) bool {
-	info, err := os.Stat(path)
-	return err == nil && time.Since(info.ModTime()) >= d
 }

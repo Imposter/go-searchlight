@@ -78,6 +78,8 @@ type fetcher struct {
 	mu      sync.Mutex
 	running map[store.ShardID]*atomic.Int64
 	fetched map[store.ShardID]*atomic.Int64
+	// ended is when each shard's last recovery here ended (staging collection).
+	ended map[store.ShardID]time.Time
 }
 
 // begin marks id recovering; the returned func ends it.
@@ -97,7 +99,18 @@ func (f *fetcher) begin(id store.ShardID) (*atomic.Int64, func()) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		delete(f.running, id)
+		if f.ended == nil {
+			f.ended = map[store.ShardID]time.Time{}
+		}
+		f.ended[id] = time.Now()
 	}
+}
+
+// idleSince is when id's last recovery here ended (zero: none this run).
+func (f *fetcher) idleSince(id store.ShardID) time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ended[id]
 }
 
 // active reports whether id is recovering from a peer now.
@@ -107,7 +120,7 @@ func (f *fetcher) active(id store.ShardID) bool {
 	return f.running[id] != nil
 }
 
-// progressOf is the bytes recoveries of id have fetched on this node.
+// progressOf is the bytes the latest recovery attempt of id has fetched on this node.
 func (f *fetcher) progressOf(id store.ShardID) int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -135,6 +148,7 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 		delay := 100 * time.Millisecond
 		for attempt := 1; attempt <= fetchAttempts; attempt++ {
 			start := time.Now()
+			progress.Store(0) // per attempt: a retry that redoes the work is no progress
 			bytes, err := f.fetchFrom(ctx, c, id, dir, staging)
 			if err == nil {
 				_ = os.RemoveAll(staging)

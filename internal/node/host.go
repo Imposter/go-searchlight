@@ -177,6 +177,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 		return nil
 	}
 	sl.local.Store(nil)
+	sl.unhostedAt.Store(time.Now().UnixNano())
 	c.cancel()
 	<-c.done
 	var err error
@@ -491,6 +492,9 @@ func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, e
 type CopyDir struct {
 	Shard store.ShardID
 	Path  string
+	// UnhostedAt is when this node stopped hosting the copy; zero when it has not
+	// hosted it this run (an earlier run left the directory).
+	UnhostedAt time.Time
 }
 
 // UnhostedCopyDirs lists the copy directories of open indexes this node holds no copy
@@ -505,7 +509,11 @@ func (n *Single) UnhostedCopyDirs() []CopyDir {
 			}
 			root := idx.copyRoot(s)
 			if _, err := os.Stat(root); err == nil {
-				out = append(out, CopyDir{Shard: sl.id, Path: root})
+				d := CopyDir{Shard: sl.id, Path: root}
+				if at := sl.unhostedAt.Load(); at > 0 {
+					d.UnhostedAt = time.Unix(0, at)
+				}
+				out = append(out, d)
 			}
 		}
 	}

@@ -421,6 +421,11 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 					m.Errors++
 					if m.FirstErr == nil {
 						m.FirstErr = err
+						// Logged as soon as it happens, and not just returned at the end: once
+						// cancel wakes the reader loop below, its own ctx.Err() ("context
+						// canceled") would otherwise be the only error anyone sees, hiding the
+						// real cause (a 429, a 503, a timeout, ...).
+						s.logf("  %s: bulk failed, stopping the load: %v", eng.Name(), err)
 						cancel()
 					}
 				} else {
@@ -464,13 +469,17 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 	close(batches)
 	wg.Wait()
 	m.Elapsed = time.Since(t0)
-	if readErr != nil && !errors.Is(readErr, errStop) {
-		return m, n, readErr
-	}
-	if m.FirstErr != nil {
+	// m.FirstErr (a worker's real failure) wins over readErr: once a worker's error
+	// calls cancel, the reader above gets ctx.Err() ("context canceled") from its own
+	// batches<- select, which would otherwise mask the actual cause.
+	switch {
+	case m.FirstErr != nil:
 		return m, n, m.FirstErr
+	case readErr != nil && !errors.Is(readErr, errStop):
+		return m, n, readErr
+	default:
+		return m, n, nil
 	}
-	return m, n, nil
 }
 
 func (s *suite) waitSearchable(ctx context.Context, eng Engine, want int64) error {

@@ -167,12 +167,12 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 			c["store"] = "SQLite (synchronous=FULL, WAL), in-process"
 		}
 		engines = append(engines, workloads.NewSearchlight(workloads.SearchlightOptions{
-			URL: *slURL, Token: *slToken, DiskPaths: splitList(*slDisk), PID: *slPID, Config: c,
+			URL: *slURL, Token: *slToken, DiskPaths: splitList(*slDisk), PID: *slPID, Config: c, Log: stdout,
 		}))
 	}
 	if *esURL != "" {
 		engines = append(engines, workloads.NewElasticsearch(workloads.ElasticsearchOptions{
-			URL: *esURL, PID: *esPID, Config: keyValues(*esConfig), Fields: datasets.Products,
+			URL: *esURL, PID: *esPID, Config: keyValues(*esConfig), Fields: datasets.Products, Log: stdout,
 		}))
 	}
 	if len(engines) == 0 {

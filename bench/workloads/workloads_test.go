@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -324,5 +327,126 @@ func TestSearchSpecsTranslateAndCover(t *testing.T) {
 				t.Fatalf("%s variant %d differs between two calls", specs[i].Name, j)
 			}
 		}
+	}
+}
+
+// TestClientRetriesBackpressureThenSucceeds checks that a 429 (e.g. the shard write
+// buffer backpressure a bulk load can hit) is retried, honoring Retry-After, instead
+// of failing the request on the first refusal.
+func TestClientRetriesBackpressureThenSucceeds(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.Header().Set("Retry-After", "0") // keep the test fast
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"detail":"the write buffer is full while refreshes catch up; retry"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	var log bytes.Buffer
+	c := newClient(srv.URL, "", &log)
+	b, err := c.do(context.Background(), http.MethodPost, "/x", "", nil)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	_ = b
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3 (2 retried 429s then a 200)", calls.Load())
+	}
+	if !strings.Contains(log.String(), "HTTP 429") {
+		t.Fatalf("log = %q, want it to mention the 429s it retried", log.String())
+	}
+}
+
+// TestClientRetryExhaustedReturnsRealStatusError checks that once retries run out,
+// the caller gets the actual *StatusError (its status and body), never a bare
+// context error that would hide why the request failed.
+func TestClientRetryExhaustedReturnsRealStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("draining"))
+	}))
+	defer srv.Close()
+	var log bytes.Buffer
+	c := newClient(srv.URL, "", &log)
+	_, err := c.do(context.Background(), http.MethodPost, "/x", "", nil)
+	var st *StatusError
+	if !errors.As(err, &st) || st.Status != http.StatusServiceUnavailable {
+		t.Fatalf("err = %v (%T), want a 503 *StatusError", err, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v: a context error masking the real 503", err)
+	}
+}
+
+// fakeBulkEngine is an Engine whose Bulk fails once, on a chosen call, with a
+// caller-given error, and otherwise succeeds after a short delay (so a failure can
+// race ahead of its concurrent siblings, as in the real incident).
+type fakeBulkEngine struct {
+	Engine
+	mu      sync.Mutex
+	calls   int
+	failAt  int
+	failErr error
+}
+
+func (f *fakeBulkEngine) Name() string { return "fake" }
+
+func (f *fakeBulkEngine) Bulk(ctx context.Context, _ string, _ []Doc, _ string) error {
+	f.mu.Lock()
+	i := f.calls
+	f.calls++
+	f.mu.Unlock()
+	if i == f.failAt {
+		return f.failErr
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(20 * time.Millisecond):
+	}
+	return nil
+}
+
+// TestBulkLoadSurfacesRealErrorNotContextCanceled is the regression test for the
+// incident this fixes: one worker's bulk request fails (here with the 429 a
+// backpressured shard answers), bulkLoad cancels the others so they stop early, and
+// the error that reaches the caller must be the real cause, not the "context
+// canceled" their own canceled-context sends turn into.
+func TestBulkLoadSurfacesRealErrorNotContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "products.ndjson")
+	var b strings.Builder
+	for i := range 40 {
+		fmt.Fprintf(&b, `{"id":"p%d","doc":{"x":1}}`+"\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := &StatusError{
+		Method: "POST", URL: "http://x/_bulk", Status: http.StatusTooManyRequests,
+		Body: "the write buffer is full while refreshes catch up; retry",
+	}
+	eng := &fakeBulkEngine{failAt: 1, failErr: boom}
+	s := &suite{
+		engines: []Engine{eng},
+		cfg:     Config{Index: "idx", DataFile: path, BulkBatch: 2, BulkConcurrency: 4, Log: io.Discard},
+		run:     &report.Run{},
+	}
+
+	_, _, err := s.bulkLoad(context.Background(), eng)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("bulkLoad returned %v: context.Canceled is hiding the real cause", err)
+	}
+	var st *StatusError
+	if !errors.As(err, &st) || st.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v (%T), want the *StatusError (429) that actually failed the load", err, err)
 	}
 }

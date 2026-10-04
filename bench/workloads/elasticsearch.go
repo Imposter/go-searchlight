@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,6 +30,9 @@ type ElasticsearchOptions struct {
 	Config map[string]string
 	// QueryBatch is how many saved queries go in one _bulk (default 1000).
 	QueryBatch int
+	// Log receives a line for every 429/503 retry and every request that
+	// ultimately fails (nil discards them).
+	Log io.Writer
 }
 
 // Elasticsearch is the Elasticsearch 8.x engine, over its REST API, with requests
@@ -47,7 +51,7 @@ func NewElasticsearch(opts ElasticsearchOptions) *Elasticsearch {
 	if opts.Fields == nil {
 		opts.Fields = datasets.Products
 	}
-	return &Elasticsearch{c: newClient(opts.URL, ""), opts: opts, tr: es.NewTranslator(opts.Fields)}
+	return &Elasticsearch{c: newClient(opts.URL, "", opts.Log), opts: opts, tr: es.NewTranslator(opts.Fields)}
 }
 
 // Name implements Engine.

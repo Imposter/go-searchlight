@@ -70,6 +70,11 @@ type Dialect struct {
 	// copies the log into the database.
 	Checkpoint      string
 	CheckpointEvery time.Duration
+	// CheckpointMinLog, when set, skips a checkpoint while the database's write-ahead
+	// log file (its path plus "-wal") is smaller: as SQLite's automatic checkpoint
+	// does (1,000 pages), but off the commit path, and with no extra fsync while the
+	// log is short.
+	CheckpointMinLog int64
 
 	// Retryable reports a transient error (deadlock, serialization failure,
 	// lock wait timeout) after which the whole transaction, rolled back by the

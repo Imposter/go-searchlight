@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -226,6 +227,7 @@ type options struct {
 	logger    *slog.Logger
 	blobChunk int
 	gateKey   string // the database a single-writer dialect's write gate is shared by
+	walPath   string // its write-ahead log file
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -292,7 +294,12 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 			if abs, err := filepath.Abs(p); err == nil {
 				p = abs
 			}
-			o.gateKey = strings.ToLower(filepath.Clean(p))
+			p = filepath.Clean(p)
+			o.walPath = p + "-wal"
+			o.gateKey = p
+			if runtime.GOOS == "windows" {
+				o.gateKey = strings.ToLower(p) // one file, however its path is cased
+			}
 		}
 	}
 	pools, err := d.Open(u)

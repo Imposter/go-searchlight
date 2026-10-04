@@ -24,8 +24,11 @@ the same; any node takes any request.
 | 8780 (`listen`) | public | the API, and the internal peer API under `/_internal/` (cluster_token auth) |
 | 8781 (`admin_listen`) | admin | `GET /healthz`, `GET /readyz`, `GET /metrics` (no auth), `/debug/pprof/*` when `pprof` is on |
 
-Keep the admin port private (Prometheus and probes only). Peers reach each other on the
-public port, at `advertise_address`.
+- **Admin listener.** It binds to loopback, `127.0.0.1:8781`, by default. The image and
+  the Kubernetes ConfigMap set `:8781` explicitly, so probes and Prometheus can reach it.
+  Wherever it is reachable, keep the port private: Prometheus and probes only. A node
+  with `pprof=true` on a non-loopback `admin_listen` logs a warning at start.
+- **Peers** reach each other on the public port, at `advertise_address`.
 
 ### The binary
 
@@ -39,21 +42,31 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 ```
 
 - **Start.** It logs `searchlight starting`, with its configuration and secrets redacted.
-  It serves `/healthz` as soon as the admin listener is up, and `/readyz` turns 200 once
-  every shard copy has finished its startup recovery.
-- **Stop.** SIGINT or SIGTERM stops it gracefully (see
-  [rolling restarts](#upgrades-and-rolling-restarts)). A second signal kills it at once.
+  - `/healthz` answers as soon as the admin listener is up.
+  - While the database cannot be reached, the node retries opening and migrating it with
+    backoff (1 s, doubling, up to 30 s), and logs each failure. It refuses to start only
+    on an error that retrying cannot fix, such as a schema newer than the binary.
+  - `/readyz` turns 200 once the node has joined the cluster and every shard copy has
+    finished its startup recovery.
+- **Stop.** SIGINT or SIGTERM stops it gracefully, within `shutdown_grace` plus
+  `shutdown_timeout` (see [rolling restarts](#upgrades-and-rolling-restarts)). A signal
+  during startup stops it cleanly too. A second signal kills it at once.
 - **Exit codes.**
   - 0 after a clean stop.
-  - 1, with one line on standard error, when it cannot start (a bad setting, an
-    unreachable database, a SQLite store another node uses) or when its shutdown
-    failed.
+  - 1, with one line on standard error, when it cannot start (a bad setting, a SQLite
+    store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
+- **`searchlight healthcheck [--live]`** probes the node on this host, for container
+  healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
+  where an empty or unspecified host means `127.0.0.1`. It waits at most 2 s, and exits 0
+  on a 200, else 1.
 
 ### Docker
 
 [`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
-`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`.
+`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`. The base images are
+pinned by digest, and Dependabot (`.github/dependabot.yml`) proposes updates for them,
+for the compose images, for the Go modules and for the CI actions.
 
 ```sh
 make docker                                  # searchlight:dev; IMAGE=... to rename
@@ -69,9 +82,8 @@ docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
 - **Defaults.** `SEARCHLIGHT_LISTEN=:8780`, `SEARCHLIGHT_ADMIN_LISTEN=:8781` and
   `SEARCHLIGHT_DATA_DIR=/var/lib/searchlight`, which is a volume.
 - **Labels.** It carries the OCI labels (version, revision, created, source).
-- **No `HEALTHCHECK`.** The image has no shell and no HTTP client to run one with. Probe
-  `:8781/healthz` (liveness) and `:8781/readyz` (readiness) from outside, as the compose
-  file and the Kubernetes manifests do.
+- **`HEALTHCHECK`.** It runs `searchlight healthcheck` (readiness) every 5 s, with a
+  2-minute start period. The image has no shell, so the binary probes itself.
 
 ### Docker Compose: a three-node cluster
 
@@ -90,8 +102,10 @@ curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
 - **Ports.** The nodes serve the API on `127.0.0.1:8780`, `:8782` and `:8784`, and
   their admin listeners on `:8781`, `:8783` and `:8785`.
 - **Addresses.** Each node's `advertise_address` is its service name.
-- **Health.** The healthchecks probe `/readyz` with a static busybox `wget` that the
-  `secrets` service copies into a volume, so the image itself stays distroless.
+- **Health.** Postgres is checked with `pg_isready`, and each node with
+  `searchlight healthcheck`.
+- **Stopping.** `stop_grace_period` is 75 s: `shutdown_grace` (5 s) plus
+  `shutdown_timeout` (60 s), plus 10 s of slack.
 - **TLS.** The peer API runs in plain HTTP on the compose network, and the nodes log a
   warning that `cluster_token` crosses it in the clear.
 
@@ -99,8 +113,8 @@ curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
 
 [`deploy/k8s/`](../deploy/k8s) holds a StatefulSet of three, a headless Service for peer
 addresses, a client Service, an admin Service for Prometheus, a PodDisruptionBudget and a
-ConfigMap. It has been validated with `kubeconform -strict` against Kubernetes 1.30 and
-master. It needs Kubernetes 1.30 or later, for the `preStop` `sleep` action.
+ConfigMap. It has been validated with `kubeconform -strict` against Kubernetes 1.27 and
+master.
 
 ```sh
 kubectl create secret generic searchlight \
@@ -109,19 +123,28 @@ kubectl apply -f deploy/k8s/
 ```
 
 - **Identity.** Each pod's `node_id` is its pod name. Its `advertise_address` is
-  `<pod>.searchlight-peers.<namespace>.svc.cluster.local:8780`.
+  `<pod>.searchlight-peers.<namespace>.svc:8780`.
 - **Peer DNS.** The headless Service publishes not-ready pods: a node registers, and
   peers may call it, before it is ready.
-- **Probes.** All three run on the admin port. The startup probe checks `/healthz`, for
-  up to 5 minutes of migrations. Liveness checks `/healthz`, and readiness checks
-  `/readyz`.
-- **Termination.** `terminationGracePeriodSeconds` is 120. That covers the `preStop`
-  sleep (5 s), `shutdown_grace` (5 s), and the three shutdown phases, each bounded by
-  `shutdown_timeout` (30 s).
+- **Probes.** Both run on the admin port.
+  - **Liveness** checks `/healthz`. It answers from the moment the admin listener is up,
+    before the store is opened, so a node that is retrying the database or migrating is
+    not restarted. No startup probe is needed.
+  - **Readiness** checks `/readyz` every 5 s, and takes the pod out after 6 failures.
+- **Termination.** No `preStop` hook is needed: a terminating pod leaves the Services'
+  endpoints at once, and `shutdown_grace` (10 s) keeps it serving while that reaches
+  every proxy. `terminationGracePeriodSeconds` is 80: `shutdown_grace` plus
+  `shutdown_timeout` (60 s), plus 10 s.
 - **Disruptions.** The PodDisruptionBudget allows one node down at a time.
+- **Placement.** The example prefers spreading the nodes over hosts. For production,
+  require it: make the pod anti-affinity `requiredDuringSchedulingIgnoredDuringExecution`,
+  or add `topologySpreadConstraints` over `topology.kubernetes.io/zone`. Then one host or
+  zone failing never takes every copy of a shard.
 - **Security.** The pods run as non-root with a read-only root filesystem, no
-  capabilities and the RuntimeDefault seccomp profile.
-- **Resources** are sized in [Sizing](#sizing).
+  capabilities and the RuntimeDefault seccomp profile. They mount no service-account
+  token, and the volume's ownership is fixed only when its root does not match
+  (`fsGroupChangePolicy: OnRootMismatch`).
+- **Resources** are sized in [Sizing](#sizing). The memory request equals the limit.
 
 ## Configuration
 
@@ -168,7 +191,7 @@ unless `insecure_no_auth` is set.
 |---|---|---|
 | `store_url` | (required) | SQL database URL; also `SEARCHLIGHT_STORE_URL_FILE` |
 | `listen` | `:8780` | public API address (`host:port`); port 0 picks a free port, which is then advertised |
-| `admin_listen` | `:8781` | admin listener for `/healthz`, `/readyz`, `/metrics` and pprof; must differ from `listen` |
+| `admin_listen` | `127.0.0.1:8781` | admin listener for `/healthz`, `/readyz`, `/metrics` and pprof; must differ from `listen`. Loopback by default: set `:8781` (as the image does) for probes and Prometheus from elsewhere |
 | `advertise_address` | `listen`, with this host's name when `listen` has no host | the `host:port` peers dial to reach this node |
 | `node_id` | host name | this node's name in the registry, logs and telemetry; keep it stable across restarts so the node reclaims its own copies |
 | `data_dir` | `data` | local segments, and recovery staging |
@@ -203,7 +226,7 @@ unless `insecure_no_auth` is set.
 | `inflight_amplification` | `10` | heap a request is charged per byte of its body (see [Sizing](#sizing)) |
 | `drop_timeout` | `10m` | how long dropping an index from the database may take |
 | `shutdown_grace` | `2s` | how long the API keeps serving after readiness turns false, so load balancers stop sending traffic first |
-| `shutdown_timeout` | `30s` | the bound on each shutdown phase |
+| `shutdown_timeout` | `60s` | the whole budget of a graceful shutdown after `shutdown_grace`, split as in [rolling restarts](#upgrades-and-rolling-restarts) |
 | `log_level` | `info` | `debug`, `info`, `warn` or `error` |
 | `pprof` | `false` | serve `/debug/pprof/*` on the admin listener |
 
@@ -329,19 +352,21 @@ rebuilt.**
 
 Restart or upgrade **one node at a time**:
 
-1. **Signal.** Send SIGTERM. Kubernetes does this after the `preStop` sleep; compose's
-   `stop_grace_period` is 2 minutes.
-2. **The node stops.**
+1. **Signal.** Send SIGTERM: `kubectl rollout restart`, `docker compose stop`, or
+   `systemctl stop`.
+2. **The node stops.** The signal fixes one deadline: `shutdown_grace` plus
+   `shutdown_timeout` (T, 60 s by default) from then. Within it:
    1. Readiness turns false, and the node retires each shard copy that another node can
-      serve. The database checks atomically that another copy still serves, so nodes
-      stopping together never retire a shard's last serving copy.
+      serve, within T/4. The database checks atomically that another copy still serves,
+      so nodes stopping together never retire a shard's last serving copy.
    2. The API keeps serving for `shutdown_grace`, while load balancers take the node
       out.
-   3. The listener stops accepting, and requests in flight finish, within
-      `shutdown_timeout`.
+   3. The listener stops accepting, and requests in flight finish, within T/4.
    4. The node stops its remaining copies, writes their final manifests, marks them
-      `retiring` in the registry and deregisters, within `shutdown_timeout`. Then it
-      closes the database and flushes telemetry.
+      `retiring` in the registry and deregisters. It has until T/10 before the deadline,
+      which is at least 0.4 T.
+   5. In the last T/10, it closes the database and the admin listener, and flushes
+      telemetry.
 3. **Start the new binary** with the same `node_id` and `data_dir`. It reclaims its
    copies, reopens their segments, and replays only the changelog since it stopped. The
    changelog is kept for it for `retiring_retention` (15 min). Past that, it rebuilds its
@@ -351,11 +376,11 @@ Restart or upgrade **one node at a time**:
 
 Notes:
 
-- **Grace period.** Give the process at least the `preStop` delay, plus
-  `shutdown_grace`, plus 3 × `shutdown_timeout`, before a hard kill. Kubernetes:
-  `terminationGracePeriodSeconds`. Docker: `stop_grace_period`, or `docker stop -t`.
-  A node killed mid-shutdown loses nothing acknowledged: it replays more of the
-  changelog when it comes back.
+- **Grace period.** Give the process `shutdown_grace` plus `shutdown_timeout`, plus a
+  few seconds, before a hard kill. That is `terminationGracePeriodSeconds` in Kubernetes
+  (80 in the example), and `stop_grace_period` or `docker stop -t` in Docker (75 s in
+  the compose file). A node killed mid-shutdown loses nothing acknowledged: it replays
+  more of the changelog when it comes back.
 - **Schema migrations** run at start, on the first upgraded node. A binary refuses to
   start against a database a newer one has migrated (`store: database schema is newer
   than this binary: it has migration N, this binary knows up to M`). So an upgrade that
@@ -385,7 +410,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Refresh and merge | `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
 | Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
-| Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (claim, renew_failed, expire, release), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
+| Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
 | Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total` |
 | Runtime | `go_*` and `process_*` |
 
@@ -401,6 +426,7 @@ Counters and histograms with no observations yet do not appear until their first
 | Changelog polls failing | `max(searchlight_replica_poll_failing_ratio) > 0` for 2 m | the database is unreachable from a node |
 | Nodes missing | `max(searchlight_cluster_nodes) < 3` (your node count) for 5 m | a node died or cannot heartbeat |
 | Lease renewals failing | `rate(searchlight_cluster_lease_changes_total{kind="renew_failed"}[5m]) > 0` | a node is about to lose its copies |
+| Leases lost | `rate(searchlight_cluster_lease_changes_total{kind="lost"}[5m]) > 0` | a node lost copies to another node (its renewals failed past `lease_ttl`); they recover elsewhere |
 | Database errors | `rate(searchlight_store_errors_total[5m]) > 0` for 5 m | SQL errors |
 | Server errors | `sum(rate(searchlight_http_request_errors_total{http_response_status_code=~"5.."}[5m])) / sum(rate(searchlight_http_request_duration_seconds_count[5m])) > 0.01` | more than 1% of requests fail |
 | Backpressure | `rate(searchlight_http_request_errors_total{http_response_status_code="429"}[5m]) > 0` for 10 m | clients are being refused; see Sizing |
@@ -456,7 +482,8 @@ A recovering copy is fetching a snapshot from a serving peer, or rebuilding from
 database, and then replaying the changelog.
 
 - **Is it making progress?** `searchlight_replica_recovery_progress_ratio` (by
-  `source`: peer, blob or sql) and `searchlight_replica_recovery_bytes_total` should
+  `source`: `peer` or `sql`; `blob`, recovery from `sl_blobs` bundles, is planned but not
+  built) and `searchlight_replica_recovery_bytes_total` should
   climb.
 - **Can it reach its peers?** Check that `advertise_address` resolves and is reachable
   from the other nodes, and that every node has the **same** `cluster_token` (a missing
@@ -478,6 +505,8 @@ database, and then replaying the changelog.
 
 - `the database has not answered for …`: the node cannot reach the database. Check the
   network and credentials, and `searchlight_store_errors_total`.
+- `the node has not joined the cluster yet`: it is starting, or its registration in the
+  database failed (see the log).
 - `N shard copies have not finished their startup recovery`: see above.
 - `the node is shutting down`: it received SIGTERM.
 
@@ -492,9 +521,9 @@ of the earlier one ages out after 10 s.
 - **`cluster_token is sent in the clear`.** `advertise_address` is not loopback, and
   `tls_cert` is unset. Set `tls_cert`/`tls_key` (and `peer_ca_file`), or accept the risk
   on a private network.
-- **A lease lost** (`ErrLeaseLost` in a log line, or `a lease expired and its slot could
-  not be claimed back`). The node could not renew a lease within `lease_ttl`, and
-  another node may have claimed the slot. The copy stops serving and is dropped or
+- **A lease lost.** It shows as `kind="lost"` on the lease metric, `ErrLeaseLost` in a
+  log line, or `a lease expired and its slot could not be claimed back`. The node could
+  not renew a lease within `lease_ttl`, and another node may have claimed the slot. The copy stops serving and is dropped or
   re-recovered. Look for database latency spikes, or a node paused by its host (GC,
   CPU starvation).
 - **429 `too_many_requests`.** The cause is in `detail`:

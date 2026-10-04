@@ -96,23 +96,32 @@ jobs:
       - name: compose file is valid
         run: docker compose -f deploy/compose.yml config --quiet
       - name: Kubernetes manifests are valid
-        run: docker run --rm -v "$PWD/deploy/k8s:/k8s:ro" ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary /k8s
+        run: >-
+          docker run --rm -v "$PWD/deploy/k8s:/k8s:ro"
+          ghcr.io/yannh/kubeconform:v0.7.0@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
+          -strict -summary /k8s
       - name: build the image (not pushed)
         run: make docker IMAGE=searchlight:dev
-      - name: the image runs as non-root
+      - name: the image runs as non-root, with its healthcheck
         run: |
           docker run --rm searchlight:dev -h > /dev/null
           test "$(docker image inspect -f '{{.Config.User}}' searchlight:dev)" = "65532:65532"
+          docker image inspect -f '{{json .Config.Healthcheck.Test}}' searchlight:dev | grep -q '"healthcheck"'
+          if docker run --rm searchlight:dev healthcheck; then echo "healthcheck passed with no node running"; exit 1; fi
+      - name: start the compose cluster (the command docs/operations.md gives)
+        run: docker compose -f deploy/compose.yml up --build -d
       - name: the compose cluster serves
         run: |
           compose="docker compose -f deploy/compose.yml"
-          $compose up -d --no-build
-          for port in 8781 8783 8785; do
+          for node in 1 2 3; do
             for i in $(seq 1 90); do
-              curl -fsS "http://127.0.0.1:$port/readyz" > /dev/null && break
-              [ "$i" = 90 ] && { echo "node on admin port $port never became ready"; exit 1; }
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "searchlight-searchlight-$node-1")" = healthy ] && break
+              [ "$i" = 90 ] && { echo "node $node never became healthy"; exit 1; }
               sleep 2
             done
+          done
+          for port in 8781 8783 8785; do
+            curl -fsS "http://127.0.0.1:$port/readyz" > /dev/null
           done
           token=$($compose run --rm --no-deps -T secrets sh -c 'grep " write$" /secrets/tokens | cut -d" " -f1')
           auth="Authorization: Bearer $token"
@@ -128,8 +137,10 @@ jobs:
             -d '{"query": {"field": "brand", "op": "eq", "value": "ACME"}}' | jq -er .total.value)
           test "$total" = 1
           curl -fsS -H "$auth" http://127.0.0.1:8780/_cluster/health | jq -e '.nodes == 3'
-          $compose stop -t 120 searchlight-1
+          start=$(date +%s)
+          $compose stop searchlight-1
           test "$(docker inspect -f '{{.State.ExitCode}}' searchlight-searchlight-1-1)" = 0
+          test $(( $(date +%s) - start )) -le 75
       - name: compose logs
         if: always()
         run: docker compose -f deploy/compose.yml logs --no-color --tail 200 || true

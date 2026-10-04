@@ -298,21 +298,24 @@ sequenceDiagram
   participant N as cluster.Node
   participant Api as public listener :8780
   M->>Adm: telemetry, then serve /healthz, /readyz (503 until the API exists), /metrics, pprof
-  M->>St: open, migrate (under a lock)
+  M->>St: open, migrate (under a lock), retried with backoff while unreachable
   M->>N: cluster.New (engine opens the catalogue)
   M->>Api: serve Node.Handler(API) before Start: peers may call at once
   M->>N: Start: register, read registry, SQLite single-node check, allocate, loops
-  Note over M: SIGINT / SIGTERM
-  M->>Api: readiness false; Drain retires covered copies; serve for shutdown_grace
-  M->>Api: stop accepting, finish in-flight requests
-  M->>N: Stop: final manifests, rows retiring, deregister
+  Note over M: SIGINT / SIGTERM fixes deadline D = now + shutdown_grace + T
+  M->>Api: readiness false; Drain retires covered copies (T/4); serve for shutdown_grace
+  M->>Api: stop accepting, finish in-flight requests (T/4)
+  M->>N: Stop: final manifests, rows retiring, deregister (until D - T/10)
   M->>St: close
   M->>Adm: close
   M->>M: telemetry flush, exit 0
 ```
 
-Each shutdown phase is bounded by `shutdown_timeout`. A second signal ends the process at
-once.
+The whole shutdown fits one budget, fixed at the signal: `shutdown_grace` plus
+`shutdown_timeout` (T). The drain and the listener get T/4 each, the node's stop runs
+until T/10 before the deadline (at least 0.4 T), and the store, the admin listener and
+telemetry close in the last T/10. A second signal ends the process at once. A signal
+during startup stops the node cleanly too, with exit code 0.
 
 ## Planned, not built
 

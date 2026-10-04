@@ -316,12 +316,15 @@ with their counts (at most 1,000). scrape-bot's catalogue page calls it.
 
   It is the operator's view (see [operations](operations.md#troubleshooting)).
 - **`GET /healthz`** is liveness: 200 while the process serves.
-- **`GET /readyz`** is readiness: 503 while the node drains for shutdown, while the
-  database has not answered for longer than `max_lag`, or while a shard copy has not
-  finished its startup recovery.
-- **`GET /metrics`** is the Prometheus exposition. It needs a token here. The admin
-  listener (`admin_listen`, `:8781`) serves the same metrics without one, along with
-  `/healthz`, `/readyz` and pprof.
+- **`GET /readyz`** is readiness. It answers 503, with the reason in `detail`:
+  - while the node has not joined the cluster yet;
+  - while a shard copy has not finished its startup recovery;
+  - while the database has not answered for longer than `max_lag`;
+  - while the node drains for shutdown.
+- **`GET /metrics`** is the Prometheus exposition. It needs a token here.
+- **The admin listener** (`admin_listen`: `127.0.0.1:8781` by default, `:8781` in the
+  container image) serves the same metrics without a token, along with `/healthz`,
+  `/readyz` and pprof. Keep it private.
 
 ## Errors
 

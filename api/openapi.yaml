@@ -1074,7 +1074,7 @@ components:
         index: { type: string }
         shard: { type: integer }
         node: { type: string }
-        state: { type: string, enum: [serving, recovering, halted] }
+        state: { type: string, enum: [serving, recovering, halted, retiring] }
         applied_seq: { type: integer }
         refreshed_seq: { type: integer }
         committed_seq: { type: integer }

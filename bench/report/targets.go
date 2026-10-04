@@ -1,0 +1,391 @@
+package report
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
+
+// Target statuses.
+const (
+	Pass        = "PASS"
+	Fail        = "FAIL"
+	NoBaseline  = "NO BASELINE"  // Searchlight measured, Elasticsearch not (a smoke run)
+	NotMeasured = "NOT MEASURED" // the run has no workload for it
+	Invalid     = "INVALID"      // the engines disagree on answers, or a workload errored
+)
+
+// Workload groups: each maps to a spec section 1 target.
+const (
+	GroupIndexing   = "indexing"
+	GroupVisibility = "visibility"
+	GroupFilter     = "filter"
+	GroupSorted     = "sorted"
+	GroupAggs       = "aggs"
+	GroupPercolate  = "percolate"
+	GroupMixed      = "mixed"
+	GroupFootprint  = "footprint"
+	GroupRestart    = "restart"
+)
+
+// Thresholds of the absolute targets.
+const (
+	// PercolateSpeedup is how many times Elasticsearch's percolation throughput
+	// Searchlight must reach.
+	PercolateSpeedup = 10.0
+	// PercolateP99Micros is the per-document p99 bound at 100k saved queries.
+	PercolateP99Micros = 1000.0
+	// VisibleP99Micros bounds write-to-visible at the default 1 s refresh: the
+	// interval plus 100 ms for the poll's granularity and the requests.
+	VisibleP99Micros = 1_100_000.0
+	// RestartSeconds is "seconds, not proportional to index size".
+	RestartSeconds = 10.0
+)
+
+// TargetCheck is one spec section 1 target, evaluated.
+type TargetCheck struct {
+	ID            string   `json:"id"`
+	Area          string   `json:"area"`
+	Target        string   `json:"target"`
+	Workloads     []string `json:"workloads"`
+	Searchlight   string   `json:"searchlight"`
+	Elasticsearch string   `json:"elasticsearch"`
+	Status        string   `json:"status"`
+	Detail        string   `json:"detail"`
+}
+
+// worst orders statuses: FAIL and INVALID dominate, then the unmeasured, then PASS.
+func worst(a, b string) string {
+	rank := map[string]int{Pass: 0, NoBaseline: 1, NotMeasured: 2, Fail: 3, Invalid: 4}
+	if rank[b] > rank[a] {
+		return b
+	}
+	return a
+}
+
+// workloadsIn returns the run's workload names in a group, in first-seen order.
+func (r *Run) workloadsIn(group string) []string {
+	var out []string
+	for i := range r.Results {
+		res := &r.Results[i]
+		if res.Group == group && !slices.Contains(out, res.Workload) {
+			out = append(out, res.Workload)
+		}
+	}
+	return out
+}
+
+// Evaluate checks every spec section 1 target against the run's results.
+func Evaluate(r *Run) []TargetCheck {
+	checks := []TargetCheck{
+		r.higherIsBetter("T1", "Bulk indexing throughput (docs/s per node)", "≥ Elasticsearch, at equal durability (acknowledged = durable)", GroupIndexing, 1),
+		r.latency("T2", "Filter / boolean search latency, p50 and p99", "≤ Elasticsearch", GroupFilter),
+		r.latency("T3", "Sorted and paged search, p50 and p99", "≤ Elasticsearch", GroupSorted),
+		r.latency("T4", "Aggregation latency (terms, range, histogram, stats)", "≤ Elasticsearch", GroupAggs),
+		r.percolation(),
+		r.footprint(),
+		r.visibility(),
+		{
+			ID: "T8", Area: "New replica from zero to serving (10M docs)", Target: "≤ Elasticsearch peer recovery",
+			Status: NotMeasured, Detail: "Needs the cluster (Task 11: peer recovery) and a second node; slbench has no recovery workload until the cluster is merged.",
+		},
+		r.restart(),
+		{
+			ID: "T10", Area: "Replica failure", Target: "no lost acknowledged write, no client-visible error with ≥ 2 replicas",
+			Status: NotMeasured, Detail: "A correctness property under failure: the chaos suite's job (Task 13b), not a performance workload.",
+		},
+		{
+			ID: "T11", Area: "Scale", Target: "larger than RAM per node (memory-mapped segments), many nodes through shards",
+			Status: NotMeasured, Detail: "Needs a dataset larger than the host's RAM (slbench gen --docs 10000000 on a small host) and the cluster for many nodes.",
+		},
+	}
+	if r.CrossCheck.Failed() {
+		for i := range checks {
+			if checks[i].Status == Pass || checks[i].Status == Fail {
+				if checks[i].ID == "T7" || checks[i].ID == "T9" {
+					continue // absolute targets do not compare answers
+				}
+				checks[i].Status = Invalid
+				checks[i].Detail = "The engines returned different answers (see the cross-check); a comparison of different answers is meaningless. " + checks[i].Detail
+			}
+		}
+	}
+	return checks
+}
+
+func (r *Run) higherIsBetter(id, area, target, group string, factor float64) TargetCheck {
+	c := TargetCheck{ID: id, Area: area, Target: target, Workloads: r.workloadsIn(group)}
+	if len(c.Workloads) == 0 {
+		c.Status, c.Detail = NotMeasured, "No "+group+" workload ran."
+		return c
+	}
+	c.Status = Pass
+	var sl, es, notes []string
+	for _, w := range c.Workloads {
+		s, e := r.Find(w, Searchlight), r.Find(w, Elasticsearch)
+		st, note := compareHigher(w, s, e, factor)
+		c.Status = worst(c.Status, st)
+		if note != "" {
+			notes = append(notes, note)
+		}
+		sl = append(sl, rate(s))
+		es = append(es, rate(e))
+	}
+	c.Searchlight, c.Elasticsearch, c.Detail = strings.Join(sl, "; "), strings.Join(es, "; "), strings.Join(notes, " ")
+	return c
+}
+
+// rate is a result's headline rate.
+func rate(res *Result) string {
+	if res == nil {
+		return "—"
+	}
+	if !res.OK() {
+		return "error"
+	}
+	if res.DocsPerSec > 0 && res.Docs != res.Ops {
+		return FormatRate(res.DocsPerSec) + " docs/s"
+	}
+	return FormatRate(res.OpsPerSec) + " ops/s"
+}
+
+func perSec(res *Result) float64 {
+	if res.DocsPerSec > 0 {
+		return res.DocsPerSec
+	}
+	return res.OpsPerSec
+}
+
+func compareHigher(w string, s, e *Result, factor float64) (string, string) {
+	switch {
+	case s == nil:
+		return NotMeasured, w + ": Searchlight not measured."
+	case !s.OK():
+		return Invalid, fmt.Sprintf("%s: Searchlight errored (%d errors %s).", w, s.Errors, s.Error)
+	case e == nil:
+		return NoBaseline, ""
+	case !e.OK():
+		return Invalid, fmt.Sprintf("%s: Elasticsearch errored (%d errors %s).", w, e.Errors, e.Error)
+	}
+	ratio := perSec(s) / perSec(e)
+	if ratio >= factor {
+		return Pass, fmt.Sprintf("%s: %.2f× Elasticsearch.", w, ratio)
+	}
+	return Fail, fmt.Sprintf("%s: %.2f× Elasticsearch (needs %.0f×).", w, ratio, factor)
+}
+
+func (r *Run) latency(id, area, target, group string) TargetCheck {
+	c := TargetCheck{ID: id, Area: area, Target: target, Workloads: r.workloadsIn(group)}
+	if len(c.Workloads) == 0 {
+		c.Status, c.Detail = NotMeasured, "No "+group+" workload ran."
+		return c
+	}
+	c.Status = Pass
+	won, compared := 0, 0
+	var losses []string
+	var slP50, slP99, esP50, esP99 []float64
+	for _, w := range c.Workloads {
+		s, e := r.Find(w, Searchlight), r.Find(w, Elasticsearch)
+		switch {
+		case s == nil:
+			c.Status = worst(c.Status, NotMeasured)
+			continue
+		case !s.OK() || s.Latency == nil:
+			c.Status = worst(c.Status, Invalid)
+			losses = append(losses, w+": Searchlight errored")
+			continue
+		}
+		slP50, slP99 = append(slP50, s.Latency.P50), append(slP99, s.Latency.P99)
+		switch {
+		case e == nil:
+			c.Status = worst(c.Status, NoBaseline)
+			continue
+		case !e.OK() || e.Latency == nil:
+			c.Status = worst(c.Status, Invalid)
+			losses = append(losses, w+": Elasticsearch errored")
+			continue
+		}
+		esP50, esP99 = append(esP50, e.Latency.P50), append(esP99, e.Latency.P99)
+		compared++
+		if s.Latency.P50 <= e.Latency.P50 && s.Latency.P99 <= e.Latency.P99 {
+			won++
+			continue
+		}
+		c.Status = worst(c.Status, Fail)
+		losses = append(losses, fmt.Sprintf("%s (p50 %s vs %s, p99 %s vs %s)", w,
+			FormatMicros(s.Latency.P50), FormatMicros(e.Latency.P50), FormatMicros(s.Latency.P99), FormatMicros(e.Latency.P99)))
+	}
+	c.Searchlight = spread(slP50, slP99)
+	c.Elasticsearch = spread(esP50, esP99)
+	if compared > 0 {
+		c.Detail = fmt.Sprintf("%d of %d workloads at or under Elasticsearch on both p50 and p99.", won, compared)
+	}
+	if len(losses) > 0 {
+		c.Detail += " Behind: " + strings.Join(losses, "; ") + "."
+	}
+	return c
+}
+
+// spread summarizes p50s and p99s across workloads as ranges.
+func spread(p50, p99 []float64) string {
+	if len(p50) == 0 {
+		return "—"
+	}
+	rng := func(v []float64) string {
+		lo, hi := slices.Min(v), slices.Max(v)
+		if lo == hi {
+			return FormatMicros(lo)
+		}
+		return FormatMicros(lo) + "–" + FormatMicros(hi)
+	}
+	return "p50 " + rng(p50) + ", p99 " + rng(p99)
+}
+
+func (r *Run) percolation() TargetCheck {
+	c := TargetCheck{
+		ID: "T5", Area: "Percolation throughput (docs/s against 10k / 100k saved queries)",
+		Target:    fmt.Sprintf("≥ %.0f× Elasticsearch's percolator, with p99 per document < 1 ms at 100k queries", PercolateSpeedup),
+		Workloads: r.workloadsIn(GroupPercolate),
+	}
+	c.Status = Pass
+	var sl, es, notes []string
+	for _, n := range []int{10_000, 100_000} {
+		w := fmt.Sprintf("percolate_batch_%d", n)
+		s, e := r.Find(w, Searchlight), r.Find(w, Elasticsearch)
+		st, note := compareHigher(w, s, e, PercolateSpeedup)
+		if s == nil {
+			note = fmt.Sprintf("%s not run (the run's largest saved-search set is smaller).", w)
+		}
+		c.Status = worst(c.Status, st)
+		if note != "" {
+			notes = append(notes, note)
+		}
+		sl = append(sl, fmt.Sprintf("%s: %s", shortCount(n), rate(s)))
+		es = append(es, fmt.Sprintf("%s: %s", shortCount(n), rate(e)))
+	}
+	single := r.Find("percolate_single_100000", Searchlight)
+	switch {
+	case single == nil:
+		c.Status = worst(c.Status, NotMeasured)
+		notes = append(notes, "percolate_single_100000 not run, so the 1 ms p99 is unchecked.")
+	case !single.OK() || single.Latency == nil:
+		c.Status = worst(c.Status, Invalid)
+	default:
+		sl = append(sl, "p99/doc @100k: "+FormatMicros(single.Latency.P99))
+		if single.Latency.P99 >= PercolateP99Micros {
+			c.Status = worst(c.Status, Fail)
+			notes = append(notes, fmt.Sprintf("p99 per document at 100k is %s (needs < 1 ms).", FormatMicros(single.Latency.P99)))
+		}
+		if e := r.Find("percolate_single_100000", Elasticsearch); e != nil && e.Latency != nil {
+			es = append(es, "p99/doc @100k: "+FormatMicros(e.Latency.P99))
+		}
+	}
+	c.Searchlight, c.Elasticsearch, c.Detail = strings.Join(sl, "; "), strings.Join(es, "; "), strings.Join(notes, " ")
+	return c
+}
+
+func shortCount(n int) string {
+	if n >= 1000 && n%1000 == 0 {
+		return fmt.Sprintf("%dk", n/1000)
+	}
+	return fmt.Sprint(n)
+}
+
+func (r *Run) footprint() TargetCheck {
+	c := TargetCheck{
+		ID: "T6", Area: "Index size on disk and resident memory per million documents", Target: "≤ Elasticsearch",
+		Workloads: []string{"footprint"},
+	}
+	s, e := r.Find("footprint", Searchlight), r.Find("footprint", Elasticsearch)
+	if s == nil {
+		c.Status, c.Detail = NotMeasured, "No footprint measured."
+		return c
+	}
+	desc := func(res *Result) string {
+		if res == nil {
+			return "—"
+		}
+		return fmt.Sprintf("disk %s/M, RSS %s/M", FormatBytes(res.Values["disk_per_million"]), FormatBytes(res.Values["rss_per_million"]))
+	}
+	c.Searchlight, c.Elasticsearch = desc(s), desc(e)
+	if e == nil {
+		c.Status = NoBaseline
+		return c
+	}
+	c.Status = Pass
+	var notes []string
+	for _, k := range []string{"disk_per_million", "rss_per_million"} {
+		sv, ev := s.Values[k], e.Values[k]
+		if sv <= 0 || ev <= 0 {
+			c.Status = worst(c.Status, NotMeasured)
+			notes = append(notes, k+" not measured on both engines.")
+			continue
+		}
+		if sv > ev {
+			c.Status = worst(c.Status, Fail)
+			notes = append(notes, fmt.Sprintf("%s: %.2f× Elasticsearch.", k, sv/ev))
+		} else {
+			notes = append(notes, fmt.Sprintf("%s: %.2f× Elasticsearch.", k, sv/ev))
+		}
+	}
+	c.Detail = strings.Join(notes, " ")
+	return c
+}
+
+func (r *Run) visibility() TargetCheck {
+	c := TargetCheck{
+		ID: "T7", Area: "Write-to-visible latency", Target: "≤ 1 s by default (the refresh interval), and refresh=wait_for like Elasticsearch",
+		Workloads: []string{"refresh_visible", "refresh_wait_for"},
+	}
+	vis, wf := r.Find("refresh_visible", Searchlight), r.Find("refresh_wait_for", Searchlight)
+	if vis == nil || wf == nil {
+		c.Status, c.Detail = NotMeasured, "The visibility workloads did not run."
+		return c
+	}
+	desc := func(v, w *Result) string {
+		if v == nil || v.Latency == nil || w == nil || w.Latency == nil {
+			return "—"
+		}
+		return fmt.Sprintf("visible p50 %s p99 %s; wait_for p50 %s p99 %s",
+			FormatMicros(v.Latency.P50), FormatMicros(v.Latency.P99), FormatMicros(w.Latency.P50), FormatMicros(w.Latency.P99))
+	}
+	c.Searchlight = desc(vis, wf)
+	c.Elasticsearch = desc(r.Find("refresh_visible", Elasticsearch), r.Find("refresh_wait_for", Elasticsearch))
+	switch {
+	case !vis.OK() || !wf.OK() || vis.Latency == nil:
+		c.Status, c.Detail = Invalid, "A visibility workload errored (a wait_for write not visible at once counts as an error)."
+	case vis.Latency.P99 > VisibleP99Micros:
+		c.Status, c.Detail = Fail, fmt.Sprintf("p99 write-to-visible %s exceeds 1 s + 100 ms.", FormatMicros(vis.Latency.P99))
+	default:
+		c.Status, c.Detail = Pass, "Absolute target (p99 ≤ 1.1 s: the 1 s interval plus poll granularity); wait_for writes were visible on return."
+	}
+	return c
+}
+
+func (r *Run) restart() TargetCheck {
+	c := TargetCheck{
+		ID: "T9", Area: "Node restart to serving", Target: "seconds, not proportional to index size (segments are reopened, not rebuilt)",
+		Workloads: []string{"restart"},
+	}
+	s := r.Find("restart", Searchlight)
+	if s == nil {
+		c.Status, c.Detail = NotMeasured, "No restart command was given (slbench run --sl-restart-cmd)."
+		return c
+	}
+	secs := func(res *Result) string {
+		if res == nil || res.Latency == nil {
+			return "—"
+		}
+		return FormatMicros(res.Latency.Max)
+	}
+	c.Searchlight, c.Elasticsearch = secs(s), secs(r.Find("restart", Elasticsearch))
+	switch {
+	case !s.OK() || s.Latency == nil:
+		c.Status, c.Detail = Invalid, "The restart workload errored."
+	case s.Latency.Max/1e6 > RestartSeconds:
+		c.Status, c.Detail = Fail, fmt.Sprintf("Slowest restart %s exceeds %.0f s.", FormatMicros(s.Latency.Max), RestartSeconds)
+	default:
+		c.Status, c.Detail = Pass, fmt.Sprintf("Absolute target: every restart under %.0f s.", RestartSeconds)
+	}
+	return c
+}

@@ -50,8 +50,10 @@ func ReplicaTailers(cfg config.Config, hub *replica.Hub, log *slog.Logger, tr tr
 	if remap == 0 {
 		remap = -1 // the config's 0 is "rebuild at once"; the replica's is "the default"
 	}
-	return func(st store.Store, sh *shard.Shard, id store.ShardID, _ TailerEnv) Tailer {
+	return func(st store.Store, sh *shard.Shard, id store.ShardID, env TailerEnv) Tailer {
 		return replicaTailer{replica.NewTailer(st, sh, id, replica.Options{
+			Copy:            env.Copy,
+			Fetcher:         env.Fetcher,
 			PollInterval:    cfg.ChangelogPollInterval,
 			MaxLag:          cfg.MaxLag,
 			RemapDebounce:   remap,

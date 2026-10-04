@@ -4,6 +4,7 @@ import (
 	"context"
 	"hash/fnv"
 
+	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -52,6 +53,12 @@ type TailerEnv struct {
 	// cannot ask the store for its head (store.HeadSeq) may advance an idle copy to
 	// it: every change at or below it is committed. The replica tailer ignores it.
 	Head func() int64
+	// Copy is the registry copy the tailer reports for (a cluster node): its applied
+	// seq and state, fenced by its epoch. Nil on a single node.
+	Copy *store.Copy
+	// Fetcher, when set, brings the copy's files from a serving peer when it must be
+	// rebuilt, before the store's snapshot is tried.
+	Fetcher replica.Fetcher
 }
 
 // NewTailerFunc makes the tailer of one shard copy: the node's one seam for its

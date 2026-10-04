@@ -86,13 +86,19 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	}
 	n.indexes[name] = idx
 	n.mu.Unlock()
+	if n.cl != nil {
+		// This node claims its copies now, rather than at the allocator's next pass.
+		if err := n.cl.Allocate(ctx, name); err != nil {
+			n.log.WarnContext(ctx, "allocating a new index's copies failed; the allocator retries", slog.String("index", name), slog.Any("error", err))
+		}
+	}
 	// A new copy recovers (from an empty snapshot) before it serves: answer once
 	// it does, so the client's next request finds it serving.
 	if err := n.waitServing(ctx, idx); err != nil {
 		n.log.WarnContext(ctx, "a new index's copies are not serving yet", slog.String("index", name), slog.Any("error", err))
 	}
 	n.log.InfoContext(ctx, "index created", slog.String("index", name), slog.Int("shards", spec.Settings.Shards), slog.String("uid", meta.UID))
-	return n.describe(idx), nil
+	return n.describe(ctx, idx), nil
 }
 
 // waitServing waits, under ctx and at most max_lag, until every copy of idx serves;
@@ -103,7 +109,7 @@ func (n *Single) waitServing(ctx context.Context, idx *index) error {
 	delay := time.Millisecond
 	for {
 		var err error
-		for _, c := range idx.copies {
+		for _, c := range idx.copies() {
 			if err = c.notServing(); err != nil {
 				break
 			}
@@ -111,7 +117,7 @@ func (n *Single) waitServing(ctx context.Context, idx *index) error {
 		if err == nil {
 			return nil
 		}
-		for _, c := range idx.copies {
+		for _, c := range idx.copies() {
 			if c.halted.Load() != nil || haltErr(c) != nil {
 				return err
 			}
@@ -136,7 +142,7 @@ func (n *Single) dropTimeout() time.Duration {
 }
 
 // ListIndexes implements [api.Coordinator].
-func (n *Single) ListIndexes(context.Context) ([]*api.IndexInfo, error) {
+func (n *Single) ListIndexes(ctx context.Context) ([]*api.IndexInfo, error) {
 	n.mu.RLock()
 	list := slices.Collect(maps.Values(n.indexes))
 	n.mu.RUnlock()
@@ -151,22 +157,24 @@ func (n *Single) ListIndexes(context.Context) ([]*api.IndexInfo, error) {
 	})
 	out := make([]*api.IndexInfo, len(list))
 	for i, idx := range list {
-		out[i] = n.describe(idx)
+		out[i] = n.describe(ctx, idx)
 	}
 	return out, nil
 }
 
 // GetIndex implements [api.Coordinator].
-func (n *Single) GetIndex(_ context.Context, name string) (*api.IndexInfo, error) {
-	idx, err := n.lookup(name)
+func (n *Single) GetIndex(ctx context.Context, name string) (*api.IndexInfo, error) {
+	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	return n.describe(idx), nil
+	return n.describe(ctx, idx), nil
 }
 
-// describe builds an index's description, counting what its copies hold searchable.
-func (n *Single) describe(idx *index) *api.IndexInfo {
+// describe builds an index's description, counting what its copies hold searchable:
+// this node's, and on a cluster node a serving copy elsewhere of each shard it does
+// not host (a shard no copy answers for is not counted).
+func (n *Single) describe(ctx context.Context, idx *index) *api.IndexInfo {
 	st := idx.meta.Load()
 	info := &api.IndexInfo{
 		Name:      st.meta.Name,
@@ -176,12 +184,21 @@ func (n *Single) describe(idx *index) *api.IndexInfo {
 		Mapping:   st.mapping,
 		Settings:  st.settings,
 	}
-	for _, c := range idx.copies {
-		if sh := c.shard(); sh != nil {
-			if g := sh.Acquire(); g != nil {
-				info.Docs += g.NumDocs()
-				info.Queries += g.NumQueries()
-				g.Release()
+	for _, sl := range idx.shards {
+		if c := sl.local.Load(); c != nil {
+			if sh := c.shard(); sh != nil {
+				if g := sh.Acquire(); g != nil {
+					info.Docs += g.NumDocs()
+					info.Queries += g.NumQueries()
+					g.Release()
+					continue
+				}
+			}
+		}
+		if n.cl != nil {
+			if docs, queries, err := n.cl.Counts(ctx, sl.id); err == nil {
+				info.Docs += docs
+				info.Queries += queries
 			}
 		}
 	}
@@ -325,6 +342,7 @@ func (n *Single) reloadCatalog(ctx context.Context, idx *index) error {
 		return err
 	}
 	idx.meta.Store(st)
+	n.adoptSettings(idx, st.settings)
 	return nil
 }
 
@@ -335,7 +353,7 @@ func (n *Single) reloadCatalog(ctx context.Context, idx *index) error {
 // seq, so tailed and rebuilt copies agree, and the document becomes searchable on
 // the field.
 func (n *Single) PatchMapping(ctx context.Context, name string, fields map[string]schema.FieldType) (*api.IndexInfo, error) {
-	idx, err := n.lookup(name)
+	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -361,12 +379,12 @@ func (n *Single) PatchMapping(ctx context.Context, name string, fields map[strin
 	if err != nil {
 		return nil, err
 	}
-	return n.describe(idx), nil
+	return n.describe(ctx, idx), nil
 }
 
 // PatchSettings implements [api.Coordinator]. A new refresh interval applies at once.
 func (n *Single) PatchSettings(ctx context.Context, name string, patch api.SettingsPatch) (*api.IndexInfo, error) {
-	idx, err := n.lookup(name)
+	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -386,10 +404,16 @@ func (n *Single) PatchSettings(ctx context.Context, name string, patch api.Setti
 	if err != nil {
 		return nil, err
 	}
-	idx.refresh.Store(int64(n.resolvedRefresh(st.settings)))
-	select {
-	case idx.refreshWake <- struct{}{}:
-	default:
+	n.adoptSettings(idx, st.settings)
+	return n.describe(ctx, idx), nil
+}
+
+// adoptSettings applies an index's settings to this node: its refresh interval.
+func (n *Single) adoptSettings(idx *index, s api.IndexSettings) {
+	if idx.refresh.Swap(int64(n.resolvedRefresh(s))) != int64(n.resolvedRefresh(s)) {
+		select {
+		case idx.refreshWake <- struct{}{}:
+		default:
+		}
 	}
-	return n.describe(idx), nil
 }

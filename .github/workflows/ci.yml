@@ -87,3 +87,49 @@ jobs:
       - name: test
         # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
         run: go test ./...
+
+  docker:
+    name: image, compose and Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: compose file is valid
+        run: docker compose -f deploy/compose.yml config --quiet
+      - name: Kubernetes manifests are valid
+        run: docker run --rm -v "$PWD/deploy/k8s:/k8s:ro" ghcr.io/yannh/kubeconform:v0.7.0 -strict -summary /k8s
+      - name: build the image (not pushed)
+        run: make docker IMAGE=searchlight:dev
+      - name: the image runs as non-root
+        run: |
+          docker run --rm searchlight:dev -h > /dev/null
+          test "$(docker image inspect -f '{{.Config.User}}' searchlight:dev)" = "65532:65532"
+      - name: the compose cluster serves
+        run: |
+          compose="docker compose -f deploy/compose.yml"
+          $compose up -d --no-build
+          for port in 8781 8783 8785; do
+            for i in $(seq 1 90); do
+              curl -fsS "http://127.0.0.1:$port/readyz" > /dev/null && break
+              [ "$i" = 90 ] && { echo "node on admin port $port never became ready"; exit 1; }
+              sleep 2
+            done
+          done
+          token=$($compose run --rm --no-deps -T secrets sh -c 'grep " write$" /secrets/tokens | cut -d" " -f1')
+          auth="Authorization: Bearer $token"
+          curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' http://127.0.0.1:8780/indexes/ci \
+            -d '{"mapping": {"fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 2}}'
+          seq=$(printf '%s\n' '{"upsert": {"id": "a"}}' '{"brand": "acme", "price": 5}' '{"upsert": {"id": "b"}}' '{"brand": "other", "price": 50}' |
+            curl -fsS -X POST -H "$auth" -H 'Content-Type: application/x-ndjson' --data-binary @- http://127.0.0.1:8782/indexes/ci/_bulk |
+            jq -er .seq)
+          total=$(curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' "http://127.0.0.1:8784/indexes/ci/_search?wait_for_seq=$seq" \
+            -d '{"query": {"field": "brand", "op": "eq", "value": "ACME"}}' | jq -er .total.value)
+          test "$total" = 1
+          curl -fsS -H "$auth" http://127.0.0.1:8780/_cluster/health | jq -e '.nodes == 3'
+          $compose stop -t 120 searchlight-1
+          test "$(docker inspect -f '{{.State.ExitCode}}' searchlight-searchlight-1-1)" = 0
+      - name: compose logs
+        if: always()
+        run: docker compose -f deploy/compose.yml logs --no-color --tail 200 || true
+      - name: compose down
+        if: always()
+        run: docker compose -f deploy/compose.yml down -v || true

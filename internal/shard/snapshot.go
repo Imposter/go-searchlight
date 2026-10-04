@@ -154,6 +154,18 @@ func (sn *Snapshot) NumDocs() uint64 { return sn.g.numDocs }
 // Files lists the snapshot's files, the manifest last.
 func (sn *Snapshot) Files() []SnapshotFile { return slices.Clone(sn.files) }
 
+// Path returns where a listed file lives on disk; ok is false for one the snapshot
+// encodes itself (a sidecar, the manifest) or does not list.
+func (sn *Snapshot) Path(name string) (path string, ok bool) {
+	if _, mem := sn.mem[name]; mem {
+		return "", false
+	}
+	if !slices.ContainsFunc(sn.files, func(f SnapshotFile) bool { return f.Name == name }) {
+		return "", false
+	}
+	return filepath.Join(sn.dir, name), true
+}
+
 // SnapshotReader reads one file of a snapshot.
 type SnapshotReader interface {
 	io.ReadSeeker

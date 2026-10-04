@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -224,6 +225,7 @@ type options struct {
 	meter     metric.Meter
 	logger    *slog.Logger
 	blobChunk int
+	gateKey   string // the database a single-writer dialect's write gate is shared by
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -285,11 +287,19 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if d.Name == "sqlite" {
+		if p, err := sqlite.Path(u); err == nil {
+			if abs, err := filepath.Abs(p); err == nil {
+				p = abs
+			}
+			o.gateKey = strings.ToLower(filepath.Clean(p))
+		}
+	}
 	pools, err := d.Open(u)
 	if err != nil {
 		return nil, fmt.Errorf("open %s store: %w", d.Name, err)
 	}
-	s, err := newSQLStore(d, pools, &o)
+	s, err := newSQLStore(d, pools, &o) //nolint:contextcheck // the store outlives Open; its checkpointer stops at Close
 	if err != nil {
 		_ = pools.Close()
 		return nil, err

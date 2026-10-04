@@ -33,6 +33,7 @@ import (
 	"io/fs"
 	"net/url"
 	"strings"
+	"time"
 
 	sqlitedriver "modernc.org/sqlite" // registers the "sqlite" database/sql driver
 	sqlite3 "modernc.org/sqlite/lib"  // SQLITE_BUSY, SQLITE_LOCKED result codes
@@ -42,6 +43,9 @@ import (
 
 //go:embed migrations/*.sql
 var migrations embed.FS
+
+// CheckpointEvery is how often the store checkpoints the WAL.
+const CheckpointEvery = 500 * time.Millisecond
 
 // DefaultBusyTimeoutMS is how long a connection waits for another process's
 // lock before failing with SQLITE_BUSY, unless the URL sets _busy_timeout.
@@ -54,16 +58,20 @@ func Dialect() *dialect.Dialect {
 		panic(err) // the embedded directory always exists
 	}
 	return &dialect.Dialect{
-		Name:        "sqlite",
-		Open:        open,
-		Migrations:  sub,
-		Retryable:   retryable,
-		Changelog:   changelog,
-		Records:     records,
-		Registry:    registry,
-		Blobs:       blobs,
-		Indexes:     indexes,
-		Maintenance: maintenance,
+		Name:       "sqlite",
+		Open:       open,
+		Migrations: sub,
+		Retryable:  retryable,
+		// The writer's automatic checkpoints are off (DSNs): a PASSIVE checkpoint on
+		// a read connection keeps the log short instead, off every commit's path.
+		Checkpoint:      "PRAGMA wal_checkpoint(PASSIVE)",
+		CheckpointEvery: CheckpointEvery,
+		Changelog:       changelog,
+		Records:         records,
+		Registry:        registry,
+		Blobs:           blobs,
+		Indexes:         indexes,
+		Maintenance:     maintenance,
 	}
 }
 
@@ -138,6 +146,10 @@ func DSNs(u *url.URL) (write, read string, err error) {
 	}
 	w := cloneValues(q)
 	w.Set("_txlock", "immediate")
+	// No checkpoint inside a commit: one that copies a large log into the database
+	// holds the one write connection (and so every writer) for a long while. The
+	// store checkpoints on a read connection (Dialect.Checkpoint).
+	w.Add("_pragma", "wal_autocheckpoint(0)")
 	r := cloneValues(q)
 	r.Set("_txlock", "deferred")
 	return path + "?" + w.Encode(), path + "?" + r.Encode(), nil

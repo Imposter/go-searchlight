@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +43,11 @@ type sqlStore struct {
 	// after the changes are written and before COMMIT.
 	beforeCommit func(ctx context.Context, first, last int64)
 
+	gateKey string // the shared gate's key, released at Close
+	// stopBg stops the background checkpointer; bg waits for it.
+	stopBg context.CancelFunc
+	bg     sync.WaitGroup
+
 	reg   *registry
 	blobs *blobStore
 	idx   *indexStore
@@ -62,8 +68,14 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		return nil, fmt.Errorf("store instruments: %w", err)
 	}
 	if pools.Write.Stats().MaxOpenConnections == 1 {
-		// One write connection (SQLite): queue writers in lanes (gate.go).
-		s.w.g = &gate{}
+		// One write connection (SQLite): queue writers in lanes (gate.go), one gate
+		// for every store of this process on the same database file.
+		s.w.g, s.gateKey = acquireGate(o.gateKey), o.gateKey
+	}
+	if d.Checkpoint != "" && d.CheckpointEvery > 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.stopBg = cancel
+		s.bg.Go(func() { s.checkpointLoop(ctx) })
 	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
@@ -159,7 +171,33 @@ func (s *sqlStore) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	if s.stopBg != nil {
+		s.stopBg()
+		s.bg.Wait()
+	}
+	if s.w.g != nil {
+		releaseGate(s.gateKey)
+	}
 	return s.pools.Close()
+}
+
+// checkpointLoop runs the dialect's checkpoint every CheckpointEvery on a read
+// connection until ctx ends. A failure is retried at the next tick.
+func (s *sqlStore) checkpointLoop(ctx context.Context) {
+	t := time.NewTicker(s.d.CheckpointEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		if _, err := s.r.ExecContext(cctx, s.d.Checkpoint); err != nil && ctx.Err() == nil {
+			s.log.DebugContext(ctx, "checkpoint failed; retried at the next tick", slog.Any("error", err))
+		}
+		cancel()
+	}
 }
 
 // rollback ends a transaction that did not commit.

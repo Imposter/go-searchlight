@@ -42,6 +42,51 @@ func laneOf(ctx context.Context) lane {
 	return laneLow
 }
 
+// The gates of this process, by database: every store this process opens on one SQLite
+// file shares its gate, so their writers take turns first come, first served, rather
+// than all waiting in SQLite's busy handler, which favours no one (in-process tests
+// run several nodes over one file).
+var gates = struct {
+	sync.Mutex
+	m map[string]*sharedGate
+}{m: map[string]*sharedGate{}}
+
+type sharedGate struct {
+	g    *gate
+	refs int
+}
+
+// acquireGate returns key's gate (a new one for ""), counting the reference.
+func acquireGate(key string) *gate {
+	if key == "" {
+		return &gate{}
+	}
+	gates.Lock()
+	defer gates.Unlock()
+	sg := gates.m[key]
+	if sg == nil {
+		sg = &sharedGate{g: &gate{}}
+		gates.m[key] = sg
+	}
+	sg.refs++
+	return sg.g
+}
+
+// releaseGate drops a reference to key's gate.
+func releaseGate(key string) {
+	if key == "" {
+		return
+	}
+	gates.Lock()
+	defer gates.Unlock()
+	if sg := gates.m[key]; sg != nil {
+		sg.refs--
+		if sg.refs <= 0 {
+			delete(gates.m, key)
+		}
+	}
+}
+
 // gate is a two-lane FIFO mutex.
 type gate struct {
 	mu    sync.Mutex

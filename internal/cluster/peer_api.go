@@ -393,6 +393,9 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		defer f.Close()
+		// A big file outlasts the listener's write timeout: the stream has none (a
+		// stalled peer is cut by its own side, and the transfer resumes).
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 		if p.n.opts.hooks != nil && p.n.opts.hooks.peerFile != nil {
 			w = p.n.opts.hooks.peerFile(name, w)
 		}

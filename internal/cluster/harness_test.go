@@ -295,6 +295,16 @@ func (c *cluster) config(i int) config.Config {
 // start starts node i (again, when it ran before: same id and data directory).
 func (c *cluster) start(i int) *tnode {
 	c.t.Helper()
+	tn, err := c.tryStart(i)
+	if err != nil {
+		c.t.Fatal(err)
+	}
+	return tn
+}
+
+// tryStart is start returning the error Start gave (the node then is not running).
+func (c *cluster) tryStart(i int) (*tnode, error) {
+	c.t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		c.t.Fatal(err)
@@ -308,7 +318,7 @@ func (c *cluster) start(i int) *tnode {
 	if _, ok := raw.(store.Watcher); ok {
 		tn.st = watchingFaultStore{tn.wrap} // Postgres: the replica Hub runs
 	}
-	o := Options{Store: tn.st, Config: cfg, Version: "test", Logger: quietLogger}
+	o := Options{Store: tn.st, Config: cfg, Version: "test", Logger: quietLogger, AllowSQLiteCluster: true}
 	fastOptions(&o)
 	o.Engine = func(eo *node.Options) {
 		eo.Logger = quietLogger
@@ -330,13 +340,16 @@ func (c *cluster) start(i int) *tnode {
 	tn.srv.Handler = n.Handler(srv)
 	go func() { _ = tn.srv.Serve(ln) }()
 	if err := n.Start(context.Background()); err != nil {
-		c.t.Fatal(err)
+		_ = tn.srv.Close()
+		_ = n.Stop(context.Background())
+		_ = tn.wrap.Close()
+		return nil, err
 	}
 	tn.alive.Store(true)
 	c.mu.Lock()
 	c.nodes[i] = tn
 	c.mu.Unlock()
-	return tn
+	return tn, nil
 }
 
 // node returns node i.
@@ -476,6 +489,31 @@ type faultStore struct {
 	store.Store
 	mu   sync.Mutex
 	down bool
+	// slowest is each store operation's longest call (tests that measure tails).
+	slowest map[string]time.Duration
+}
+
+// timed records an operation's duration: defer f.timed("op")().
+func (f *faultStore) timed(op string) func() {
+	start := time.Now()
+	return func() {
+		d := time.Since(start)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.slowest == nil {
+			f.slowest = map[string]time.Duration{}
+		}
+		f.slowest[op] = max(f.slowest[op], d)
+	}
+}
+
+// tails returns each operation's longest call so far, and resets them.
+func (f *faultStore) tails() map[string]time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.slowest
+	f.slowest = nil
+	return out
 }
 
 func newFaultStore(st store.Store) *faultStore { return &faultStore{Store: st} }
@@ -510,6 +548,7 @@ func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(st
 }
 
 func (f *faultStore) Prune(ctx context.Context, id store.ShardID, below int64) error {
+	defer f.timed("Prune")()
 	if f.isDown() {
 		return errPartitioned
 	}
@@ -557,6 +596,7 @@ func (x *faultIndexes) Drop(ctx context.Context, name string) error {
 }
 
 func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
+	defer f.timed("Apply")()
 	if f.isDown() {
 		return 0, 0, errPartitioned
 	}
@@ -615,6 +655,7 @@ type faultRegistry struct {
 }
 
 func (r *faultRegistry) Heartbeat(ctx context.Context, n store.Node) error {
+	defer r.f.timed("Heartbeat")()
 	if r.f.isDown() {
 		return errPartitioned
 	}
@@ -636,6 +677,7 @@ func (r *faultRegistry) Copies(ctx context.Context, index string) ([]store.Copy,
 }
 
 func (r *faultRegistry) ClaimCopy(ctx context.Context, id store.ShardID, nodeID string, target int, ttl time.Duration) (store.Copy, bool, error) {
+	defer r.f.timed("ClaimCopy")()
 	if r.f.isDown() {
 		return store.Copy{}, false, errPartitioned
 	}
@@ -643,6 +685,7 @@ func (r *faultRegistry) ClaimCopy(ctx context.Context, id store.ShardID, nodeID 
 }
 
 func (r *faultRegistry) RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) ([]store.ShardID, error) {
+	defer r.f.timed("RenewLeases")()
 	if r.f.isDown() {
 		return nil, errPartitioned
 	}
@@ -650,6 +693,7 @@ func (r *faultRegistry) RenewLeases(ctx context.Context, nodeID string, ttl time
 }
 
 func (r *faultRegistry) SetCopyState(ctx context.Context, c store.Copy, state store.CopyState) error {
+	defer r.f.timed("SetCopyState")()
 	if r.f.isDown() {
 		return errPartitioned
 	}
@@ -657,6 +701,7 @@ func (r *faultRegistry) SetCopyState(ctx context.Context, c store.Copy, state st
 }
 
 func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int64) error {
+	defer r.f.timed("ReportApplied")()
 	if r.f.isDown() {
 		return errPartitioned
 	}
@@ -664,6 +709,7 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 }
 
 func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, error) {
+	defer r.f.timed("RetireCopy")()
 	if r.f.isDown() {
 		return false, errPartitioned
 	}
@@ -671,6 +717,7 @@ func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, err
 }
 
 func (r *faultRegistry) RemoveNode(ctx context.Context, id string) error {
+	defer r.f.timed("RemoveNode")()
 	if r.f.isDown() {
 		return errPartitioned
 	}
@@ -678,6 +725,7 @@ func (r *faultRegistry) RemoveNode(ctx context.Context, id string) error {
 }
 
 func (r *faultRegistry) ReleaseCopy(ctx context.Context, c store.Copy) error {
+	defer r.f.timed("ReleaseCopy")()
 	if r.f.isDown() {
 		return errPartitioned
 	}

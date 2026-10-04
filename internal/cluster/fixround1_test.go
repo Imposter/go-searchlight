@@ -329,3 +329,23 @@ func TestStoppedNodeKeepsItsTail(t *testing.T) {
 	})
 	waitCount(t, b.n, "tail", last, 21)
 }
+
+// TestSQLiteServesOneNode (fix round 2): on SQLite a second live node refuses to join
+// (production SQLite is single-node); once the first has stopped and deregistered,
+// another node may take its place. In-process tests opt in to multi-node SQLite with
+// Options.AllowSQLiteCluster.
+func TestSQLiteServesOneNode(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.AllowSQLiteCluster = false })
+	a := c.start(0)
+	createIndex(t, a.n, "one", 1, 0)
+	if _, err := c.tryStart(1); !errors.Is(err, ErrSQLiteCluster) {
+		t.Fatalf("a second node on SQLite: %v, want ErrSQLiteCluster", err)
+	}
+	if nodes, err := a.n.Nodes(tctx(t)); err != nil || len(nodes) != 1 {
+		t.Fatalf("the refused node is still registered: %+v %v", nodes, err)
+	}
+	a.stop()
+	b := c.start(1)
+	last := mustWrite(t, b.n, "one", upsertOp("x", 1))
+	waitCount(t, b.n, "one", last, 1)
+}

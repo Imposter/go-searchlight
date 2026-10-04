@@ -130,7 +130,7 @@ const searchAttempts = 2
 func (n *Single) Search(ctx context.Context, name string, r *search.Request, opts api.ReadOptions) (res *api.SearchResult, err error) {
 	ctx, span := n.readSpan(ctx, "node.search", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +259,7 @@ func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) (
 func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateRequest, opts api.ReadOptions) (res *api.PercolateResponse, err error) {
 	ctx, span := n.readSpan(ctx, "node.percolate", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -335,7 +335,7 @@ func docProblem(err error, loc string) error {
 func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.ReadOptions) (cat *api.FieldCatalog, err error) {
 	ctx, span := n.readSpan(ctx, "node.fields", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +377,7 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 // the database cannot be reached, or when it does not answer within max_lag, it is
 // read from a copy instead, marked stale.
 func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Document, error) {
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +399,7 @@ func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Documen
 // GetQuery implements [api.Coordinator]: read from the store, so realtime; from a
 // copy, marked stale, while the database cannot be reached.
 func (n *Single) GetQuery(ctx context.Context, name, id string) (*api.SavedQuery, error) {
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +503,7 @@ func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKin
 
 // ListQueries implements [api.Coordinator]: read from the store, so realtime.
 func (n *Single) ListQueries(ctx context.Context, name, after string, size int) ([]*api.SavedQuery, error) {
-	if _, err := n.lookup(ctx, name); err != nil {
+	if _, err := n.lookupForRead(ctx, name, 0); err != nil {
 		return nil, err
 	}
 	recs, err := n.records.ListQueries(ctx, name, after, size)

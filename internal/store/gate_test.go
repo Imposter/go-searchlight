@@ -152,6 +152,9 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	if limit := 4*commit + 150*time.Millisecond; p90 > limit {
 		t.Fatalf("a tenth of the renewals took over %s under bulk load (limit %s): they queue behind several commits", p90, limit)
 	}
+	if limit := 10 * commit; truncateHold > limit {
+		t.Fatalf("a truncation of the log held the write connection %s (limit %s, ten bulk commits)", truncateHold, limit)
+	}
 	if limit := 8*commit + 300*time.Millisecond + truncateHold; worst > limit {
 		t.Fatalf("a renewal took %s under bulk load (limit %s, a truncation of the log included): it queued behind several commits", worst, limit)
 	}

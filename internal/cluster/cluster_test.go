@@ -20,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -755,4 +756,37 @@ func (h *warnings) has(prefix string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.ContainsFunc(h.msgs, func(m string) bool { return strings.HasPrefix(m, prefix) })
+}
+
+// TestEnsureIndexAcrossNodes: a client behind a load balancer checks for an index on
+// node B (404), creates it through node A, then writes and reads through B. Plain reads
+// on B may still answer 404 for a moment, but the write, a mapping change and a read
+// that waits for the write all find the index.
+func TestEnsureIndexAcrossNodes(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	a, b := c.start(0), c.start(1)
+	notFound := func(err error) bool {
+		var ae *api.Error
+		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+	}
+	cachedOnce := false
+	for k := 0; k < 10 && !cachedOnce; k++ {
+		name := fmt.Sprintf("ensure%d", k)
+		if _, err := b.n.GetIndex(tctx(t), name); !notFound(err) {
+			t.Fatalf("the check on B before the create: %v, want a 404", err)
+		}
+		createIndex(t, a.n, name, 2, 0)
+		_, err := b.n.GetIndex(tctx(t), name)
+		cachedOnce = notFound(err)
+		seq := mustWrite(t, b.n, name, upsertOp("x", 1))
+		if _, err := b.n.PatchMapping(tctx(t), name, map[string]schema.FieldType{"extra": schema.Keyword}); err != nil {
+			t.Fatalf("a mapping change on B right after the create on A: %v", err)
+		}
+		if got, err := count(tctx(t), b.n, name, seq); err != nil || got != 1 {
+			t.Fatalf("a read on B waiting for the write: %d, %v", got, err)
+		}
+	}
+	if !cachedOnce {
+		t.Skip("every create on A outlasted the 404 B remembered; the sequence was not exercised")
+	}
 }

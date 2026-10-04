@@ -392,11 +392,11 @@ func (n *Single) SyncCatalog(ctx context.Context) error {
 }
 
 // adoptIndex opens index name when the store has it (another node created it): the
-// index, or nil when the store has none. A name the store did not have is not looked
-// up again for absentTTL, unless this node creates it meanwhile.
-func (n *Single) adoptIndex(ctx context.Context, name string) (*index, error) {
+// index, or nil when the store has none. With cachedAbsence, a name the store did not
+// have is not looked up again for absentTTL, unless this node creates it meanwhile.
+func (n *Single) adoptIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {
 	gen, absent := n.absent.check(name)
-	if absent {
+	if absent && cachedAbsence {
 		return nil, nil
 	}
 	m, err := n.st.Indexes().Get(ctx, name)

@@ -165,7 +165,7 @@ func (n *Single) ListIndexes(ctx context.Context) ([]*api.IndexInfo, error) {
 
 // GetIndex implements [api.Coordinator].
 func (n *Single) GetIndex(ctx context.Context, name string) (*api.IndexInfo, error) {
-	idx, err := n.lookup(ctx, name)
+	idx, err := n.lookupForRead(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}

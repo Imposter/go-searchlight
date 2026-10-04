@@ -758,6 +758,17 @@ func (n *Single) noteHead(seq int64) {
 // lookup returns an open index, or a 404. A cluster node that does not know the index
 // yet (another node created it since its last catalogue sync) looks it up in the store.
 func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
+	return n.lookupIndex(ctx, name, false)
+}
+
+// lookupForRead is lookup for a read, which may answer 404 from a recent store lookup
+// (absentTTL) unless it waits for a seq: a read that names one follows a write, and
+// must find the index that write found.
+func (n *Single) lookupForRead(ctx context.Context, name string, waitSeq int64) (*index, error) {
+	return n.lookupIndex(ctx, name, waitSeq <= 0)
+}
+
+func (n *Single) lookupIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {
 	n.mu.RLock()
 	closed, idx := n.closed, n.indexes[name]
 	n.mu.RUnlock()
@@ -768,7 +779,7 @@ func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
 		return idx, nil
 	}
 	if n.cl != nil {
-		if idx, err := n.adoptIndex(ctx, name); err != nil || idx != nil {
+		if idx, err := n.adoptIndex(ctx, name, cachedAbsence); err != nil || idx != nil {
 			return idx, err
 		}
 	}

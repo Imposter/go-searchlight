@@ -416,7 +416,11 @@ func TestRequestDeadline(t *testing.T) {
 }
 
 func TestWaitForSeqTimesOut(t *testing.T) {
-	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 2 * time.Second }})
+	// 8 s, not 2: under go test ./... -count=2's full parallel suite (many heavy
+	// packages sharing this machine's cores), the fake tailer's catch-up after Resume
+	// can be scheduled out past 2 s; a real tailer never takes this long, but the
+	// deadline below still has to actually elapse once, by design.
+	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 8 * time.Second }})
 	e.must(http.StatusCreated, "PUT", "/indexes/w", "")
 	// A seq past the newest committed one is refused at once, before a bulk writes.
 	e.problem(e.do("POST", "/indexes/w/_search?wait_for_seq=999999", `{}`), http.StatusBadRequest, "invalid_request")

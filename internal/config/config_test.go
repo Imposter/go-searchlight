@@ -36,7 +36,7 @@ func TestLoadDefaults(t *testing.T) {
 	want := Config{
 		StoreURL:              sqliteURL,
 		Listen:                ":8780",
-		AdminListen:           ":8781",
+		AdminListen:           "127.0.0.1:8781",
 		AdvertiseAddress:      host + ":8780",
 		NodeID:                host,
 		DataDir:               "data",
@@ -52,7 +52,7 @@ func TestLoadDefaults(t *testing.T) {
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
 		LogLevel:              slog.LevelInfo,
-		ShutdownTimeout:       30 * time.Second,
+		ShutdownTimeout:       time.Minute,
 		InsecureNoAuth:        true,
 		MaxBodyBytes:          16 << 20,
 		MaxDocBytes:           4 << 20,

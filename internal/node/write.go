@@ -341,10 +341,10 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 		if sh == nil {
 			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", s)
 		}
+		if n.cl != nil && c.peerServing() != nil {
+			continue // others apply the write; this copy is not counted on
+		}
 		if err := c.notServing(); err != nil {
-			if n.cl != nil {
-				continue
-			}
 			return err
 		}
 		if err := sh.Admit(); err != nil {
@@ -473,13 +473,15 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 	slices.Sort(shards)
 	for _, s := range shards {
 		sl := idx.shards[s]
-		if c := sl.local.Load(); c != nil && (n.cl == nil || c.notServing() == nil) {
+		localDone := false
+		if c := sl.local.Load(); c != nil && (n.cl == nil || c.peerServing() == nil) {
 			if err := waitLocal(ctx, c, seq, mode); err != nil {
 				return err
 			}
+			localDone = true
 		}
 		if n.cl != nil {
-			if err := n.cl.WaitRefreshed(ctx, sl.id, seq, mode); err != nil {
+			if err := n.cl.WaitRefreshed(ctx, sl.id, seq, mode, localDone); err != nil {
 				return err
 			}
 		}
@@ -518,7 +520,7 @@ func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, 
 	if c == nil {
 		return api.Unavailable(shard.ErrClosed, "this node holds no copy of shard %d of index %q", s, index)
 	}
-	if err := c.notServing(); err != nil {
+	if err := c.peerServing(); err != nil {
 		return err
 	}
 	c.tailer.Wake()

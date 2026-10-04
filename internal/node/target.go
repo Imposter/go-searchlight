@@ -235,7 +235,8 @@ func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq in
 
 // LocalTarget returns a read target on this node's own copy of shard s of index, once
 // it has every change up to waitSeq searchable (under ctx). It fails (503) when this
-// node hosts no serving copy of the shard: the peer API serves remote reads with it.
+// node hosts no serving copy of the shard, or holds its lease not surely (lapsed): the
+// peer API serves remote reads with it.
 func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq int64) (ShardTarget, error) {
 	idx, err := n.lookup(ctx, index)
 	if err != nil {
@@ -248,12 +249,21 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 	if c == nil {
 		return nil, api.Unavailable(shard.ErrClosed, "this node holds no copy of shard %d of index %q", s, index)
 	}
+	if err := c.peerServing(); err != nil {
+		return nil, err
+	}
 	if waitSeq > 0 {
 		if err := n.checkHead(ctx, waitSeq); err != nil {
 			return nil, err
 		}
 	}
-	return n.localTarget(ctx, c, waitSeq, 0)
+	t, err := n.localTarget(ctx, c, waitSeq, 0)
+	if err == nil && c.lapsed() {
+		// The lease lapsed while the read waited: no peer may use the copy now.
+		t.Release()
+		return nil, c.peerServing()
+	}
+	return t, err
 }
 
 // localTarget holds a generation of copy c once it has waitSeq searchable (a 504 at the

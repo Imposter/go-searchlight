@@ -58,9 +58,12 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 	if h := c.halted.Load(); h != nil {
 		info.State, info.Error = api.ShardHalted, (*h).Error()
 	}
+	if c.paused.Load() {
+		info.State = api.ShardServing // this node's own last-resort reads only
+	}
 	if info.State == api.ShardServing {
 		info.Rebuilding = c.rebuilding()
-		info.Stale = info.Rebuilding || c.trailing(n.cfg.MaxLag)
+		info.Stale = info.Rebuilding || c.lapsed() || c.trailing(n.cfg.MaxLag)
 	}
 	return info
 }

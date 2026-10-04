@@ -154,6 +154,27 @@ jobs:
           # (exit code 3), not just a line in the report.
         continue-on-error: true
 
+      # Captured before the services stop (docker compose down drops the
+      # containers, and with them "docker compose logs"), so a failure like the
+      # loader's "context canceled" (slbench: searchlight: loading: context
+      # canceled, every target NOT MEASURED) can be diagnosed from the artifact
+      # and the job log instead of being a dead end: slserver.log has the
+      # request Searchlight actually refused or crashed on, and the ES container
+      # log has the same for Elasticsearch.
+      - name: collect server logs
+        if: always()
+        run: |
+          docker compose -f bench/docker-compose.es.yml logs --no-color --timestamps \
+            > "$SL_DIR/elasticsearch.log" 2>&1 || true
+          if [ "${{ steps.run.outcome }}" = "failure" ]; then
+            echo "::group::slserver.log (tail, run workloads failed)"
+            tail -n 200 "$SL_DIR/slserver.log" 2>/dev/null || echo "(no $SL_DIR/slserver.log)"
+            echo "::endgroup::"
+            echo "::group::elasticsearch.log (tail, run workloads failed)"
+            tail -n 200 "$SL_DIR/elasticsearch.log" 2>/dev/null || echo "(no $SL_DIR/elasticsearch.log)"
+            echo "::endgroup::"
+          fi
+
       - name: stop Searchlight
         if: always()
         run: |
@@ -173,6 +194,8 @@ jobs:
           path: |
             docs/benchmarks.md
             ${{ env.DATA_DIR }}/bench-results.json
+            ${{ env.SL_DIR }}/slserver.log
+            ${{ env.SL_DIR }}/elasticsearch.log
           if-no-files-found: warn
           retention-days: 90
 

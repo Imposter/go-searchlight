@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -35,6 +36,11 @@ type SearchlightOptions struct {
 	Config map[string]string
 	// QueryWriters is how many saved queries are PUT at once (default 32).
 	QueryWriters int
+	// Log receives a line for every 429/503 retry and every request that ultimately
+	// fails (nil discards them; the suite passes its own log so they land next to
+	// "loading ... into searchlight" instead of vanishing behind a bare
+	// "context canceled").
+	Log io.Writer
 }
 
 // Searchlight is the Searchlight engine, over its HTTP API.
@@ -51,7 +57,7 @@ func NewSearchlight(opts SearchlightOptions) *Searchlight {
 	if opts.QueryWriters <= 0 {
 		opts.QueryWriters = 32
 	}
-	return &Searchlight{c: newClient(opts.URL, opts.Token), opts: opts, seq: map[string]int64{}}
+	return &Searchlight{c: newClient(opts.URL, opts.Token, opts.Log), opts: opts, seq: map[string]int64{}}
 }
 
 // Name implements Engine.

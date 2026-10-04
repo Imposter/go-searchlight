@@ -133,6 +133,22 @@ func closedLoop(ctx context.Context, conc, start, n int, d time.Duration, op Op,
 	if m != nil {
 		m.Elapsed = time.Since(t0)
 		m.Errors = errs.Load()
+		floorElapsed(m)
+	}
+}
+
+// floorElapsed guarantees m.Elapsed is positive whenever at least one op ran (ops or
+// errors): time.Since already reads a monotonic clock, but on a coarse-resolution
+// timer (observed on Windows, for a handful of very fast iterations) two readings
+// close together can come back equal, reporting 0 elapsed for real, measured work.
+// Zero throughput for work that happened is not a legitimate answer (Throughput and
+// DocsPerSec already treat Elapsed<=0 as "no data"), so it is floored to the
+// smallest representable positive duration instead of being silently suppressed.
+// Elapsed staying 0 when nothing ran at all (m.Ops and m.Errors both 0) is left
+// alone: that case really is instantaneous.
+func floorElapsed(m *Measurement) {
+	if (m.Ops > 0 || m.Errors > 0) && m.Elapsed <= 0 {
+		m.Elapsed = time.Nanosecond
 	}
 }
 
@@ -194,4 +210,5 @@ func openLoop(ctx context.Context, o RunOptions, op Op, m *Measurement) {
 	wg.Wait()
 	m.Elapsed = time.Since(t0)
 	m.Errors = errs.Load()
+	floorElapsed(m)
 }

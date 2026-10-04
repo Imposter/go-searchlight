@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +61,41 @@ func TestRunClosedLoopCountsOnlyMeasured(t *testing.T) {
 	}
 	if m.Throughput() <= 0 || m.DocsPerSec() != 2*m.Throughput() {
 		t.Fatalf("throughput %v docs/s %v", m.Throughput(), m.DocsPerSec())
+	}
+}
+
+// TestFloorElapsedGuaranteesPositiveWhenOpsRan is the regression test for a flake in
+// TestRunClosedLoopCountsOnlyMeasured: a fast closed loop's two time.Now() readings
+// (both from Go's monotonic clock) landed close enough together that time.Since
+// reported 0 on a coarse Windows timer, even though 100 real ops ran — and
+// Throughput/DocsPerSec treat Elapsed<=0 as "no data", reporting a false 0 rate for
+// work that demonstrably happened. 0 is not a legitimate answer whenever at least
+// one op ran (it is legitimate when none did: nothing happened, instantaneously), so
+// floorElapsed guarantees Elapsed is positive in the former case and leaves it alone
+// in the latter.
+func TestFloorElapsedGuaranteesPositiveWhenOpsRan(t *testing.T) {
+	opsRan := &Measurement{Ops: 5, Elapsed: 0}
+	floorElapsed(opsRan)
+	if opsRan.Elapsed <= 0 {
+		t.Fatalf("Elapsed = %v, want > 0 once ops ran", opsRan.Elapsed)
+	}
+
+	errorsOnly := &Measurement{Errors: 1, Elapsed: 0}
+	floorElapsed(errorsOnly)
+	if errorsOnly.Elapsed <= 0 {
+		t.Fatalf("Elapsed = %v, want > 0 once an op ran, even if it only ever errored", errorsOnly.Elapsed)
+	}
+
+	nothingRan := &Measurement{Elapsed: 0}
+	floorElapsed(nothingRan)
+	if nothingRan.Elapsed != 0 {
+		t.Fatalf("Elapsed = %v, want left at 0: nothing ran, so instantaneous is legitimate", nothingRan.Elapsed)
+	}
+
+	realElapsed := &Measurement{Ops: 3, Elapsed: 5 * time.Millisecond}
+	floorElapsed(realElapsed)
+	if realElapsed.Elapsed != 5*time.Millisecond {
+		t.Fatalf("Elapsed = %v, want the real measured value left untouched", realElapsed.Elapsed)
 	}
 }
 
@@ -325,4 +363,290 @@ func TestSearchSpecsTranslateAndCover(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestRetryDelayClampsRetryAfter checks that a server-given Retry-After is honored
+// up to maxRetryAfter but never beyond it: a misbehaving (or hostile) server must
+// not be able to stretch a single retry's wait, and so the whole request's total
+// retry time across maxRetries of them, without bound.
+func TestRetryDelayClampsRetryAfter(t *testing.T) {
+	if got := retryDelay(0, time.Hour); got != maxRetryAfter {
+		t.Fatalf("retryDelay with a 1h Retry-After = %v, want capped at maxRetryAfter (%v)", got, maxRetryAfter)
+	}
+	if got := retryDelay(0, maxRetryAfter); got != maxRetryAfter {
+		t.Fatalf("retryDelay at exactly maxRetryAfter = %v, want it unchanged (%v)", got, maxRetryAfter)
+	}
+	const under = 10 * time.Second
+	if got := retryDelay(0, under); got != under {
+		t.Fatalf("retryDelay with a %v Retry-After (under the cap) = %v, want it unchanged", under, got)
+	}
+	// No Retry-After: the exponential backoff, itself bounded by retryMaxDelay (well
+	// under maxRetryAfter), applies instead.
+	if got := retryDelay(0, 0); got != retryBaseDelay {
+		t.Fatalf("retryDelay(0, 0) = %v, want the base backoff %v", got, retryBaseDelay)
+	}
+}
+
+// TestClientRetriesBackpressureThenSucceeds checks that a 429 (e.g. the shard write
+// buffer backpressure a bulk load can hit) is retried, honoring Retry-After, instead
+// of failing the request on the first refusal.
+func TestClientRetriesBackpressureThenSucceeds(t *testing.T) {
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.Header().Set("Retry-After", "0") // keep the test fast
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"detail":"the write buffer is full while refreshes catch up; retry"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	var log bytes.Buffer
+	c := newClient(srv.URL, "", &log)
+	b, err := c.do(context.Background(), http.MethodPost, "/x", "", nil)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	_ = b
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3 (2 retried 429s then a 200)", calls.Load())
+	}
+	if !strings.Contains(log.String(), "HTTP 429") {
+		t.Fatalf("log = %q, want it to mention the 429s it retried", log.String())
+	}
+}
+
+// TestClientRetryExhaustedReturnsRealStatusError checks that once retries run out,
+// the caller gets the actual *StatusError (its status and body), never a bare
+// context error that would hide why the request failed.
+func TestClientRetryExhaustedReturnsRealStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("draining"))
+	}))
+	defer srv.Close()
+	var log bytes.Buffer
+	c := newClient(srv.URL, "", &log)
+	_, err := c.do(context.Background(), http.MethodPost, "/x", "", nil)
+	var st *StatusError
+	if !errors.As(err, &st) || st.Status != http.StatusServiceUnavailable {
+		t.Fatalf("err = %v (%T), want a 503 *StatusError", err, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v: a context error masking the real 503", err)
+	}
+}
+
+// fakeBulkEngine is an Engine whose Bulk fails once, on a chosen call, with a
+// caller-given error, and otherwise succeeds after a short delay (so a failure can
+// race ahead of its concurrent siblings, as in the real incident).
+type fakeBulkEngine struct {
+	Engine
+	mu      sync.Mutex
+	calls   int
+	failAt  int
+	failErr error
+}
+
+func (f *fakeBulkEngine) Name() string { return "fake" }
+
+func (f *fakeBulkEngine) Bulk(ctx context.Context, _ string, _ []Doc, _ string) error {
+	f.mu.Lock()
+	i := f.calls
+	f.calls++
+	f.mu.Unlock()
+	if i == f.failAt {
+		return f.failErr
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(20 * time.Millisecond):
+	}
+	return nil
+}
+
+// TestBulkLoadSurfacesRealErrorNotContextCanceled is the regression test for the
+// incident this fixes: one worker's bulk request fails (here with the 429 a
+// backpressured shard answers), bulkLoad cancels the others so they stop early, and
+// the error that reaches the caller must be the real cause, not the "context
+// canceled" their own canceled-context sends turn into.
+func TestBulkLoadSurfacesRealErrorNotContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "products.ndjson")
+	var b strings.Builder
+	for i := range 40 {
+		fmt.Fprintf(&b, `{"id":"p%d","doc":{"x":1}}`+"\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := &StatusError{
+		Method: "POST", URL: "http://x/_bulk", Status: http.StatusTooManyRequests,
+		Body: "the write buffer is full while refreshes catch up; retry",
+	}
+	eng := &fakeBulkEngine{failAt: 1, failErr: boom}
+	s := &suite{
+		engines: []Engine{eng},
+		cfg:     Config{Index: "idx", DataFile: path, BulkBatch: 2, BulkConcurrency: 4, Log: io.Discard},
+		run:     &report.Run{},
+	}
+
+	_, _, err := s.bulkLoad(context.Background(), eng)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("bulkLoad returned %v: context.Canceled is hiding the real cause", err)
+	}
+	var st *StatusError
+	if !errors.As(err, &st) || st.Status != http.StatusTooManyRequests {
+		t.Fatalf("err = %v (%T), want the *StatusError (429) that actually failed the load", err, err)
+	}
+}
+
+// TestWriteJitterDeterministicAndBounded checks writeJitter's contract: uniform on
+// [0, interval), the same (seed, workload, i) always gives the same delay (so a run
+// is reproducible and, at a given i, identical across engines), and different i
+// mostly gives different delays (it is not a constant in disguise).
+func TestWriteJitterDeterministicAndBounded(t *testing.T) {
+	const interval = 150 * time.Millisecond
+	seen := map[time.Duration]bool{}
+	for i := range 50 {
+		d := writeJitter(7, "refresh_visible", i, interval)
+		if d < 0 || d >= interval {
+			t.Fatalf("writeJitter(i=%d) = %v, want [0, %v)", i, d, interval)
+		}
+		if again := writeJitter(7, "refresh_visible", i, interval); again != d {
+			t.Fatalf("writeJitter(i=%d) = %v then %v: not deterministic", i, d, again)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 25 {
+		t.Fatalf("only %d distinct delays across 50 i's, want a spread, not a near-constant", len(seen))
+	}
+	// A different workload name must not collapse to the same sequence (refresh_visible
+	// and refresh_wait_for, run back to back for the same engine, would otherwise apply
+	// identical delays at identical i's for no reason).
+	if writeJitter(7, "refresh_wait_for", 3, interval) == writeJitter(7, "refresh_visible", 3, interval) {
+		t.Fatalf("refresh_visible and refresh_wait_for got the same delay at i=3: want them independent")
+	}
+	// interval 0 (an engine with refresh disabled) never sleeps.
+	if d := writeJitter(7, "refresh_visible", 0, 0); d != 0 {
+		t.Fatalf("writeJitter with interval 0 = %v, want 0", d)
+	}
+}
+
+// fakeVisEngine is an Engine whose Bulk and Search each advance a fake clock by a
+// fixed, known amount and then succeed (Prepare needs no real translation): standing
+// in for a real engine's write-then-poll in
+// TestVisibilityExcludesJitterFromMeasuredLatency. It never really sleeps, so that
+// test is exact and deterministic instead of a wall-clock comparison against a
+// possibly busy, shared CI runner's scheduling noise.
+type fakeVisEngine struct {
+	Engine
+	name    string
+	advance func(time.Duration)
+	work    time.Duration
+}
+
+func (f *fakeVisEngine) Name() string { return f.name }
+
+type fakePrepared struct{}
+
+func (fakePrepared) isPrepared() {}
+
+func (f *fakeVisEngine) Prepare([]byte) (Prepared, error) { return fakePrepared{}, nil }
+
+func (f *fakeVisEngine) Bulk(context.Context, string, []Doc, string) error {
+	f.advance(f.work)
+	return nil
+}
+
+func (f *fakeVisEngine) Search(context.Context, string, Prepared, []any) (SearchResult, error) {
+	f.advance(f.work)
+	return SearchResult{Total: 1, Relation: "eq"}, nil
+}
+
+// TestVisibilityExcludesJitterFromMeasuredLatency is the regression test for the
+// coordinator's requested change: the visibility workloads must sleep a random,
+// seeded, per-iteration delay before a measured write (so writes do not land in
+// lockstep right after the previous refresh), and that delay must not count toward
+// the recorded latency.
+//
+// It injects the fake clock and sleeper suite.now/suite.sleep stand in for, instead
+// of asserting on a wall-clock margin (which flaked under package-wide load: a
+// coarse Windows timer plus scheduling noise from other tests running at once can
+// stretch even a few milliseconds of real work well past a tight threshold). The
+// fake clock only advances when told to: the injected sleeper advances it by exactly
+// the jitter delay without really blocking, and fakeVisEngine's Bulk/Search each
+// advance it by a known, fixed work duration. So the recorded latency is exactly
+// computable: 2*fakeWork if the jitter is excluded, or that plus the jitter delay if
+// it leaked in, nothing in between and nothing left to timing chance.
+func TestVisibilityExcludesJitterFromMeasuredLatency(t *testing.T) {
+	const (
+		interval   = 500 * time.Millisecond
+		fakeWork   = 2 * time.Millisecond
+		iterations = 5
+	)
+	var clock atomic.Int64 // fake nanoseconds since an arbitrary epoch
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	advance := func(d time.Duration) { clock.Add(int64(d)) }
+
+	eng := &fakeVisEngine{name: "fake", advance: advance, work: fakeWork}
+	s := &suite{
+		engines: []Engine{eng},
+		cfg: Config{
+			Index: "idx", Seed: 1, VisibleIterations: iterations,
+			Only: []string{"refresh_visible"}, Log: io.Discard,
+		},
+		run: &report.Run{Engines: []report.EngineInfo{
+			{Name: "fake", Config: map[string]string{"refresh_interval": interval.String()}},
+		}},
+		now:   now,
+		sleep: func(_ context.Context, d time.Duration) error { advance(d); return nil },
+	}
+
+	if err := s.visibility(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every iteration (warmup, min(2, iterations), plus the measured ones) sleeps a
+	// jitter delay and does the fake work: the fake clock's final value must equal
+	// that exactly, proving the delay really was applied at every iteration, not
+	// just the measured ones.
+	total := min(2, iterations) + iterations
+	var wantClock int64
+	for i := range total {
+		wantClock += int64(writeJitter(1, "refresh_visible", i, interval)) + 2*int64(fakeWork)
+	}
+	if got := clock.Load(); got != wantClock {
+		t.Fatalf("fake clock ended at %v, want exactly %v: the jitter delay was not applied at every iteration", time.Duration(got), time.Duration(wantClock))
+	}
+
+	r := findResult(s.run.Results, "refresh_visible", "fake")
+	if r == nil || r.Latency == nil {
+		t.Fatal("no refresh_visible/fake result with latency")
+	}
+	wantMicros := float64(2*fakeWork) / float64(time.Microsecond)
+	// The histogram is HDR-style (0.1% precision), not exact storage, so compare
+	// with a tolerance well above that but minuscule next to the 500 ms interval a
+	// leaked jitter would add.
+	if tol := wantMicros * 0.05; r.Latency.Min < wantMicros-tol || r.Latency.Max > wantMicros+tol {
+		t.Fatalf("recorded latency min %g µs max %g µs, want %g µs ± %g%%: the jitter leaked into the measurement",
+			r.Latency.Min, r.Latency.Max, wantMicros, 5.0)
+	}
+}
+
+// findResult returns the result for workload/engine, or nil.
+func findResult(rs []report.Result, workload, engine string) *report.Result {
+	for i := range rs {
+		if rs[i].Workload == workload && rs[i].Engine == engine {
+			return &rs[i]
+		}
+	}
+	return nil
 }

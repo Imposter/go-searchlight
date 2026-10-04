@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"runtime"
@@ -141,6 +143,29 @@ type suite struct {
 	engines []Engine
 	run     *report.Run
 	loaded  int64
+	// now and sleep stand in for time.Now and sleepJitter in the visibility
+	// workload's measured write (writeJitter's delay, and the write-to-visible
+	// timing around it): nil in production, where they default to the real clock
+	// and a real wait. A test can inject both to make "the delay is excluded from
+	// the recorded latency" an exact, deterministic check instead of a wall-clock
+	// comparison against a noisy, shared CI runner's scheduling.
+	now   func() time.Time
+	sleep func(context.Context, time.Duration) error
+}
+
+// clock and sleeper return s.now and s.sleep, defaulting to the real ones.
+func (s *suite) clock() func() time.Time {
+	if s.now != nil {
+		return s.now
+	}
+	return time.Now
+}
+
+func (s *suite) sleeper() func(context.Context, time.Duration) error {
+	if s.sleep != nil {
+		return s.sleep
+	}
+	return sleepJitter
 }
 
 func (s *suite) logf(format string, args ...any) {
@@ -421,6 +446,11 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 					m.Errors++
 					if m.FirstErr == nil {
 						m.FirstErr = err
+						// Logged as soon as it happens, and not just returned at the end: once
+						// cancel wakes the reader loop below, its own ctx.Err() ("context
+						// canceled") would otherwise be the only error anyone sees, hiding the
+						// real cause (a 429, a 503, a timeout, ...).
+						s.logf("  %s: bulk failed, stopping the load: %v", eng.Name(), err)
 						cancel()
 					}
 				} else {
@@ -464,13 +494,17 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 	close(batches)
 	wg.Wait()
 	m.Elapsed = time.Since(t0)
-	if readErr != nil && !errors.Is(readErr, errStop) {
-		return m, n, readErr
-	}
-	if m.FirstErr != nil {
+	// m.FirstErr (a worker's real failure) wins over readErr: once a worker's error
+	// calls cancel, the reader above gets ctx.Err() ("context canceled") from its own
+	// batches<- select, which would otherwise mask the actual cause.
+	switch {
+	case m.FirstErr != nil:
 		return m, n, m.FirstErr
+	case readErr != nil && !errors.Is(readErr, errStop):
+		return m, n, readErr
+	default:
+		return m, n, nil
 	}
-	return m, n, nil
 }
 
 func (s *suite) waitSearchable(ctx context.Context, eng Engine, want int64) error {
@@ -673,7 +707,63 @@ func idQuery(id string) []byte {
 	return body(q{"query": cond("_id", "eq", id), "size": 0, "track_total": true})
 }
 
+// defaultRefreshInterval is read-to-visible's assumed refresh interval when an
+// engine's reported Config has no "refresh_interval" (Searchlight's own default,
+// config.Default().RefreshInterval, and also Elasticsearch's).
+const defaultRefreshInterval = time.Second
+
+// refreshInterval is eng's refresh interval, from the EngineInfo.Config it reported
+// to RunSuite ("refresh_interval", a time.ParseDuration string), or
+// defaultRefreshInterval when it did not report one or reported one that does not
+// parse to a positive duration.
+func (s *suite) refreshInterval(eng Engine) time.Duration {
+	for _, info := range s.run.Engines {
+		if info.Name != eng.Name() {
+			continue
+		}
+		if v, ok := info.Config["refresh_interval"]; ok {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				return d
+			}
+		}
+	}
+	return defaultRefreshInterval
+}
+
+// writeJitter is the delay a measured visibility write sleeps before it starts,
+// standing in for a real client's write landing at a random point in the refresh
+// cycle rather than, as a closed loop otherwise does, right after the previous
+// write's own refresh. It is uniform on [0, interval), and deterministic in
+// (seed, workload, i): the same call gives every engine the identical delay at the
+// same iteration, so the comparison stays apples to apples, and a run is
+// reproducible.
+func writeJitter(seed uint64, workload string, i int, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	fmt.Fprintf(h, "%s:%d", workload, i)
+	r := rand.New(rand.NewPCG(seed, h.Sum64())) //nolint:gosec // reproducible benchmark jitter, not secrets
+	return time.Duration(r.Int64N(int64(interval)))
+}
+
+// sleepJitter sleeps d, unless ctx ends first.
+func sleepJitter(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // visibility measures write-to-visible latency (refresh_visible) and refresh=wait_for.
+// Each measured write sleeps a random, unmeasured delay first (writeJitter): a real
+// client does not write in lockstep right after the engine's previous refresh, which
+// a closed loop at concurrency 1 would otherwise do every iteration.
 func (s *suite) visibility(ctx context.Context) error {
 	for _, w := range []string{"refresh_visible", "refresh_wait_for"} {
 		if !s.cfg.wants(w, report.GroupVisibility) {
@@ -681,6 +771,8 @@ func (s *suite) visibility(ctx context.Context) error {
 		}
 		for _, eng := range s.engines {
 			o := RunOptions{Warmup: min(2, s.cfg.VisibleIterations), Iterations: s.cfg.VisibleIterations, Concurrency: 1}
+			interval := s.refreshInterval(eng)
+			now, sleep := s.clock(), s.sleeper()
 			op := func(ctx context.Context, i int) (int, time.Duration, error) {
 				id := fmt.Sprintf("v%s-%06d", strings.TrimPrefix(w, "refresh_"), i)
 				p, err := eng.Prepare(idQuery(id))
@@ -688,14 +780,18 @@ func (s *suite) visibility(ctx context.Context) error {
 					return 0, 0, err
 				}
 				doc := Doc{ID: id, Body: datasets.AppendProduct(nil, s.cfg.Seed, s.loaded+1_000_000+int64(i))}
+				if err := sleep(ctx, writeJitter(s.cfg.Seed, w, i, interval)); err != nil {
+					return 0, 0, err
+				}
 				if w == "refresh_wait_for" {
 					// Only the write is timed: refresh=wait_for's latency is the write's
 					// own, and the confirming search is an untimed correctness check
 					// (it fails the iteration if the write was not visible on return,
-					// but its own latency is not part of what T7 measures).
-					t0 := time.Now()
+					// but its own latency is not part of what T7 measures). The jitter
+					// above ran before t0, so it is never part of timed either.
+					t0 := now()
 					bulkErr := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for")
-					timed := time.Since(t0)
+					timed := now().Sub(t0)
 					if bulkErr != nil {
 						return 0, 0, bulkErr
 					}
@@ -708,6 +804,7 @@ func (s *suite) visibility(ctx context.Context) error {
 					}
 					return 1, timed, nil
 				}
+				t0 := now()
 				if err := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, ""); err != nil {
 					return 0, 0, err
 				}
@@ -718,7 +815,7 @@ func (s *suite) visibility(ctx context.Context) error {
 						return 0, 0, err
 					}
 					if res.Total == 1 {
-						return 1, 0, nil
+						return 1, now().Sub(t0), nil
 					}
 					if time.Now().After(deadline) {
 						return 0, 0, fmt.Errorf("%s not visible after 10 s", id)
@@ -726,9 +823,9 @@ func (s *suite) visibility(ctx context.Context) error {
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
-			desc := "write without refresh, poll every 10 ms until searchable (latency from the write's start)"
+			desc := "write without refresh, poll every 10 ms until searchable (latency from the write's start, after a random pre-write delay of up to one refresh interval, unmeasured)"
 			if w == "refresh_wait_for" {
-				desc = "write with refresh=wait_for (the write's latency); visible on return"
+				desc = "write with refresh=wait_for (the write's latency); visible on return (also after the same random pre-write delay, unmeasured)"
 			}
 			s.add(s.result(w, report.GroupVisibility, desc, eng, o, Run(ctx, o, op)))
 		}

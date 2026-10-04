@@ -26,8 +26,9 @@ type Cluster interface {
 	Committed(index string, shards map[int]int64)
 	// WaitRefreshed waits, under ctx, until every serving copy of id on another node
 	// has seq searchable; with api.RefreshTrue the copies refresh at once once they
-	// have applied it.
-	WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode) error
+	// have applied it. localDone says this node's copy has it: when it has not and no
+	// other copy reached seq either, the wait fails.
+	WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error
 	// Allocate claims and hosts this node's copies of index now, so a new index
 	// serves when CreateIndex answers.
 	Allocate(ctx context.Context, index string) error
@@ -74,9 +75,15 @@ type HostSpec struct {
 	// Copy is the registry copy: its slot and fencing epoch, which the tailer names in
 	// every registry write.
 	Copy store.Copy
-	// LeaseValid reports whether the copy's lease still holds by the node's own
-	// monotonic clock; once it is false the copy serves nothing.
-	LeaseValid func() bool
+	// Held reports whether the copy's lease surely holds (by the node's own clocks):
+	// while it does not, the copy serves no peer, takes part in no write's refresh
+	// wait, and its reads on this node are stale (the node's last resort, when no
+	// other copy answers).
+	Held func() bool
+	// Quarantined reports whether the copy may not serve at all yet: a slot taken
+	// over from another node serves nothing until that node's lease has surely run
+	// out by this node's clock.
+	Quarantined func() bool
 	// Fetcher brings the copy's files from a serving peer when it must be rebuilt.
 	Fetcher replica.Fetcher
 	// Startup marks a copy the node took as it started: readiness waits on it.

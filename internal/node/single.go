@@ -208,10 +208,17 @@ type copyState struct {
 	// startup marks a copy readiness waits on: every copy of a single node; on a
 	// cluster node, the copies it took when it started.
 	startup bool
-	// leaseValid, on a cluster node, reports whether the copy's lease still holds by
-	// the node's own monotonic clock; false stops the copy serving at once. Nil: no
-	// lease (a single node).
-	leaseValid func() bool
+	// spec is what the cluster gave the copy (cluster nodes): Held reports whether
+	// its lease surely holds (nil: no lease, a single node), Quarantined whether it
+	// may not serve yet.
+	spec HostSpec
+	// paused is set once the copy's tailer was stopped because its lease lapsed by
+	// the local clock without being confirmed lost: it writes nothing, serves no
+	// peer, and stays open for this node's own last-resort reads, stale.
+	paused atomic.Bool
+	// warm, on a copy resumed from a pause, is the shard it resumed with: while its new
+	// tailer starts up over that very shard (not a rebuild's), the copy serves on.
+	warm *shard.Shard
 	// copy is the registry copy (cluster nodes), nil on a single node.
 	copy *store.Copy
 	// cancel stops the copy's tailer; done is closed once its Run has returned.
@@ -301,7 +308,25 @@ func (n *Single) stale() bool { return n.dbDown.Load() }
 // or the copy trails the changelog by more than max_lag, cannot poll it, or is being
 // rebuilt aside.
 func (n *Single) copyStale(c *copyState) bool {
-	return n.stale() || c.trailing(n.cfg.MaxLag) || c.rebuilding()
+	return n.stale() || c.lapsed() || c.trailing(n.cfg.MaxLag) || c.rebuilding()
+}
+
+// lapsed reports whether the copy's lease is not surely held (a cluster node): it is
+// paused, or past its local deadline.
+func (c *copyState) lapsed() bool {
+	return c.paused.Load() || (c.spec.Held != nil && !c.spec.Held())
+}
+
+// peerServing is why the copy cannot serve another node's read (or a write's refresh
+// wait) now, or nil: it cannot serve at all, or its lease is not surely held.
+func (c *copyState) peerServing() error {
+	if err := c.notServing(); err != nil {
+		return err
+	}
+	if c.lapsed() {
+		return api.Unavailable(store.ErrLeaseLost, "this node's lease on shard %d of index %q has lapsed", c.id.Shard, c.id.Index)
+	}
+	return nil
 }
 
 // rebuilding reports whether the copy is being rebuilt aside: it serves, stale.
@@ -329,8 +354,11 @@ func (c *copyState) trailing(maxLag time.Duration) bool {
 // opened, reopened or rebuilt: the shard a tailer exposes then may be empty or partly
 // loaded, so it is never read).
 func (c *copyState) notServing() error {
-	if c.leaseValid != nil && !c.leaseValid() {
-		return api.Unavailable(store.ErrLeaseLost, "this node's lease on shard %d of index %q may have expired", c.id.Shard, c.id.Index)
+	if c.spec.Quarantined != nil && c.spec.Quarantined() {
+		return api.Unavailable(store.ErrLeaseLost, "shard %d of index %q was taken over from another node and serves nothing yet", c.id.Shard, c.id.Index)
+	}
+	if c.paused.Load() {
+		return nil // it serves this node's last-resort reads, stale (lapsed)
 	}
 	if h := c.halted.Load(); h != nil {
 		return api.Unavailable(*h, "shard %d of index %q has halted", c.id.Shard, c.id.Index)
@@ -348,6 +376,9 @@ func (c *copyState) notServing() error {
 		case StateHalted:
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q has halted", c.id.Shard, c.id.Index)
 		default:
+			if c.warm != nil && c.shard() == c.warm {
+				return nil // resumed: its new tailer starts up over the shard that served
+			}
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q is recovering", c.id.Shard, c.id.Index)
 		}
 	}
@@ -595,24 +626,30 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		env.Copy = &cp
 	}
 	c := &copyState{
-		id:         sl.id,
-		slot:       sl,
-		tailer:     n.opts.NewTailer(n.st, sh, sl.id, env),
-		startup:    spec.Startup,
-		leaseValid: spec.LeaseValid,
-		copy:       env.Copy,
-		done:       make(chan struct{}),
+		id:      sl.id,
+		slot:    sl,
+		tailer:  n.opts.NewTailer(n.st, sh, sl.id, env),
+		startup: spec.Startup,
+		spec:    spec,
+		copy:    env.Copy,
 		perc: percolate.New(percolate.Options{
 			Index: idx.name, Shard: s, Threads: n.cfg.SearchThreads,
 			Logger: n.log, Tracer: n.tr, Meter: n.meter,
 		}),
 	}
+	n.startTailer(idx, c) //nolint:contextcheck // the tailer outlives the call that hosts the copy
+	return nil
+}
+
+// startTailer runs c's tailer and makes c the slot's copy. The slot's host lock is
+// held.
+func (n *Single) startTailer(idx *index, c *copyState) {
 	var runCtx context.Context
 	runCtx, c.cancel = context.WithCancel(idx.runCtx)
-	sl.local.Store(c)
+	c.done = make(chan struct{})
+	c.slot.local.Store(c)
 	idx.wg.Add(1)
-	go n.runTailer(runCtx, idx, c) //nolint:contextcheck // the tailer outlives the call that hosts the copy
-	return nil
+	go n.runTailer(runCtx, idx, c)
 }
 
 // runTailer runs a copy's tailer until the index stops or the copy is unhosted,

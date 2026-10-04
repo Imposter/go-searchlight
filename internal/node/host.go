@@ -62,6 +62,91 @@ func (n *Single) UnhostCopy(ctx context.Context, cp store.Copy, wipe bool) error
 	return n.unhost(ctx, cp, mode)
 }
 
+// PauseCopy stops the tailer of this node's copy cp (at its epoch), whose lease lapsed
+// by the local clock but is not known lost: it writes nothing more and serves no peer,
+// while its shard stays open, serving this node's own last-resort reads, stale.
+// ResumeCopy (the same epoch re-claimed) starts it again; UnhostCopy closes it.
+func (n *Single) PauseCopy(ctx context.Context, cp store.Copy) error {
+	c, idx, unlock := n.lockCopy(cp)
+	if c == nil {
+		return nil
+	}
+	defer unlock()
+	if c.paused.Load() {
+		return nil
+	}
+	c.cancel()
+	<-c.done
+	c.paused.Store(true)
+	n.log.WarnContext(ctx, "shard copy paused: its lease lapsed", slog.String(telemetry.KeyIndex, idx.name), slog.Int(telemetry.KeyShard, cp.Shard.Shard))
+	return nil
+}
+
+// ResumeCopy starts a paused copy again under cp (its lease re-claimed at the same
+// epoch): a new tailer over the open shard catches it up, reporting under cp.
+func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {
+	c, idx, unlock := n.lockCopy(cp)
+	if c == nil {
+		return fmt.Errorf("node: no copy of %s at epoch %d to resume", cp.Shard, cp.Epoch)
+	}
+	defer unlock()
+	if !c.paused.Load() {
+		return nil
+	}
+	sh := c.shard()
+	if sh == nil || sh.Err() != nil {
+		return fmt.Errorf("node: the paused copy of %s cannot resume", cp.Shard)
+	}
+	copyCopy := cp
+	next := &copyState{
+		id:      c.id,
+		slot:    c.slot,
+		tailer:  n.opts.NewTailer(n.st, sh, c.id, TailerEnv{Head: n.head.Load, Fetcher: c.spec.Fetcher, Copy: &copyCopy}),
+		startup: c.startup,
+		spec:    c.spec,
+		copy:    &copyCopy,
+		perc:    c.perc,
+		warm:    sh,
+	}
+	next.started.Store(c.started.Load())
+	next.spec.Copy = cp
+	n.startTailer(idx, next) //nolint:contextcheck // the tailer outlives the call that resumes the copy
+	n.log.InfoContext(ctx, "shard copy resumed: its lease was claimed again", slog.String(telemetry.KeyIndex, idx.name), slog.Int(telemetry.KeyShard, cp.Shard.Shard))
+	return nil
+}
+
+// Paused reports whether this node's copy of id is paused (its lease lapsed).
+func (n *Single) Paused(id store.ShardID) bool {
+	n.mu.RLock()
+	idx := n.indexes[id.Index]
+	n.mu.RUnlock()
+	if idx == nil || id.Shard < 0 || id.Shard >= len(idx.shards) {
+		return false
+	}
+	c := idx.shards[id.Shard].local.Load()
+	return c != nil && c.paused.Load()
+}
+
+// lockCopy finds this node's copy of cp's shard at cp's epoch and takes its slot's
+// host lock: unlock releases it. The copy is nil (and nothing locked) when the node
+// hosts none at that epoch.
+func (n *Single) lockCopy(cp store.Copy) (*copyState, *index, func()) {
+	n.mu.RLock()
+	idx := n.indexes[cp.Shard.Index]
+	n.mu.RUnlock()
+	if idx == nil || cp.Shard.Shard < 0 || cp.Shard.Shard >= len(idx.shards) {
+		return nil, nil, nil
+	}
+	sl := idx.shards[cp.Shard.Shard]
+	sl.host.Lock()
+	c := sl.local.Load()
+	if c == nil || (c.copy != nil && c.copy.Epoch != cp.Epoch) {
+		sl.host.Unlock()
+		return nil, nil, nil
+	}
+	return c, idx, sl.host.Unlock
+}
+
 // AbandonCopy stops this node's copy cp as a crash would: no final commit, the
 // directory kept as it is (tests of node loss).
 func (n *Single) AbandonCopy(ctx context.Context, cp store.Copy) error {
@@ -133,8 +218,12 @@ type LocalCopy struct {
 	Info api.ShardInfo
 	// Copy is its registry copy.
 	Copy store.Copy
-	// Serving reports that it serves reads now (it may still be stale).
+	// Serving reports that it serves reads now, to peers too (it may still be
+	// stale): it serves, and its lease surely holds.
 	Serving bool
+	// Paused reports that its lease lapsed and its tailer is stopped: it serves only
+	// this node's own last-resort reads.
+	Paused bool
 	// StartedUp reports that it has finished its startup recovery.
 	StartedUp bool
 	// Startup marks a copy the node took as it started.
@@ -146,7 +235,7 @@ func (n *Single) LocalCopies() []LocalCopy {
 	var out []LocalCopy
 	for _, idx := range n.sortedIndexes() {
 		for _, c := range idx.copies() {
-			lc := LocalCopy{Info: n.copyInfo(c), Serving: c.notServing() == nil, StartedUp: c.startedUp(), Startup: c.startup}
+			lc := LocalCopy{Info: n.copyInfo(c), Serving: c.peerServing() == nil, Paused: c.paused.Load(), StartedUp: c.startedUp(), Startup: c.startup}
 			if c.copy != nil {
 				lc.Copy = *c.copy
 			}
@@ -171,7 +260,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 		return nil, api.Unavailable(shard.ErrClosed, "this node holds no copy of %s", id)
 	}
 	for range acquireTries {
-		if err := c.notServing(); err != nil {
+		if err := c.peerServing(); err != nil {
 			return nil, err
 		}
 		sh := c.shard()
@@ -182,7 +271,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 		if err != nil {
 			return nil, api.Unavailable(err, "%s cannot be copied now", id)
 		}
-		if c.notServing() == nil && c.shard() == sh {
+		if c.peerServing() == nil && c.shard() == sh {
 			return sn, nil
 		}
 		sn.Release()
@@ -396,4 +485,48 @@ func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, e
 	}
 	n.adoptSettings(idx, st.settings)
 	return true, nil
+}
+
+// CopyDir is a copy directory this node does not host a copy from.
+type CopyDir struct {
+	Shard store.ShardID
+	Path  string
+}
+
+// UnhostedCopyDirs lists the copy directories of open indexes this node holds no copy
+// from: ones an earlier run left (it did not claim the shard back), or a released or
+// lost copy's.
+func (n *Single) UnhostedCopyDirs() []CopyDir {
+	var out []CopyDir
+	for _, idx := range n.sortedIndexes() {
+		for s, sl := range idx.shards {
+			if sl.local.Load() != nil {
+				continue
+			}
+			root := idx.copyRoot(s)
+			if _, err := os.Stat(root); err == nil {
+				out = append(out, CopyDir{Shard: sl.id, Path: root})
+			}
+		}
+	}
+	return out
+}
+
+// RemoveCopyDir removes this node's directory of id, unless it hosts a copy of id
+// (checked under the slot's host lock, so a claim racing it opens an empty one).
+func (n *Single) RemoveCopyDir(ctx context.Context, id store.ShardID) error {
+	n.mu.RLock()
+	idx := n.indexes[id.Index]
+	n.mu.RUnlock()
+	if idx == nil || id.Shard < 0 || id.Shard >= len(idx.shards) {
+		return nil
+	}
+	sl := idx.shards[id.Shard]
+	sl.host.Lock()
+	defer sl.host.Unlock()
+	if sl.local.Load() != nil {
+		return nil
+	}
+	n.log.InfoContext(ctx, "removing an unused copy directory", slog.String(telemetry.KeyIndex, id.Index), slog.Int(telemetry.KeyShard, id.Shard))
+	return os.RemoveAll(idx.copyRoot(id.Shard))
 }

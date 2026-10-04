@@ -1,8 +1,9 @@
 # Searchlight
 
 Searchlight is a search engine written in Go. It runs forward search with aggregations and
-percolation of saved queries. Its source of truth is a SQL database (Postgres, MySQL or
-SQLite). The design is in
+percolation of saved queries. Its source of truth is a SQL database: Postgres, MySQL 8.0.19
+or later (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default) or
+SQLite. The design is in
 [docs/superpowers/specs/2026-10-02-searchlight-design.md](docs/superpowers/specs/2026-10-02-searchlight-design.md)
 and the build plan is in [docs/superpowers/plans/2026-10-02-searchlight.md](docs/superpowers/plans/2026-10-02-searchlight.md).
 

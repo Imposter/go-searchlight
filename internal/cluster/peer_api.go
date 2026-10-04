@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +69,7 @@ func (p *peerAPI) handler() http.Handler {
 	handle("POST /_internal/wait", p.wait)
 	handle("POST /_internal/counts", p.counts)
 	handle("GET /_internal/copies", p.copies)
-	handle("POST /_internal/snapshots", p.snapshot)
+	mux.Handle("POST /_internal/snapshots", p.wrapStream("POST /_internal/snapshots", p.snapshot))
 	handle("DELETE /_internal/snapshots/{id}", p.release)
 	mux.Handle("GET /_internal/snapshots/{id}/files/{name}", p.wrapStream("GET /_internal/snapshots/{id}/files/{name}", p.file))
 	mux.Handle("/", p.wrap("unmatched", func(*http.Request) (any, error) {
@@ -194,6 +195,29 @@ func (p *peerAPI) hint(r *http.Request) (any, error) {
 	return nil, nil
 }
 
+// errStale is a read refused because this node's copy is stale and the caller wants a
+// current one (it has other copies to try).
+func errStale(ref shardRef) error {
+	return &api.Error{
+		Status: http.StatusServiceUnavailable, Code: codeStale,
+		Detail: "this node's copy of shard " + strconv.Itoa(ref.Shard) + " of index " + strconv.Quote(ref.Index) + " is stale",
+	}
+}
+
+// target returns a read target on this node's copy for ref: one that serves peers, and
+// is current unless the caller allows stale.
+func (p *peerAPI) target(r *http.Request, ref shardRef) (node.ShardTarget, error) {
+	t, err := p.n.LocalTarget(r.Context(), ref.Index, ref.Shard, ref.WaitSeq)
+	if err != nil {
+		return nil, err
+	}
+	if !ref.AllowStale && t.Stale() {
+		t.Release()
+		return nil, errStale(ref)
+	}
+	return t, nil
+}
+
 func (p *peerAPI) search(r *http.Request) (any, error) {
 	ctx := r.Context()
 	var msg searchMsg
@@ -207,7 +231,7 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	t, err := p.n.LocalTarget(ctx, msg.Index, msg.Shard, msg.WaitSeq)
+	t, err := p.target(r, msg.shardRef)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +242,7 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	}
 	reply := &searchReply{Result: res, Stale: t.Stale()}
 	if msg.Pin {
-		reply.Pin = p.n.pins.add(t)
+		reply.Pin = p.n.pins.add(store.ShardID{Index: msg.Index, Shard: msg.Shard}, t)
 	} else {
 		t.Release()
 	}
@@ -232,7 +256,7 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		return nil, err
 	}
 	var reply fetchReply
-	ok := p.n.pins.use(msg.Pin, func(t node.ShardTarget) error {
+	err := p.n.pins.use(msg.Pin, p.n.peerValid, func(t node.ShardTarget) error {
 		if err := t.Fetch(ctx, msg.Hits, msg.Fields); err != nil {
 			return err
 		}
@@ -242,11 +266,11 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		}
 		return nil
 	})
-	if errors.Is(ok, errPinGone) {
-		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired"}
+	if errors.Is(err, errPinGone) {
+		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired, or its copy no longer serves"}
 	}
-	if ok != nil {
-		return nil, ok
+	if err != nil {
+		return nil, err
 	}
 	return &reply, nil
 }
@@ -276,7 +300,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 		}
 		docs[i] = doc
 	}
-	t, err := p.n.LocalTarget(ctx, msg.Index, msg.Shard, msg.WaitSeq)
+	t, err := p.target(r, msg.shardRef)
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +323,7 @@ func (p *peerAPI) get(r *http.Request) (any, error) {
 	if err := decode(r, &msg); err != nil {
 		return nil, err
 	}
-	t, err := p.n.LocalTarget(ctx, msg.Index, msg.Shard, msg.WaitSeq)
+	t, err := p.target(r, msg.shardRef)
 	if err != nil {
 		return nil, err
 	}
@@ -343,48 +367,77 @@ func (p *peerAPI) counts(r *http.Request) (any, error) {
 }
 
 func (p *peerAPI) copies(*http.Request) (any, error) {
-	local := p.n.LocalCopies()
-	out := &copiesReply{Copies: make([]api.ShardInfo, 0, len(local))}
-	for i := range local {
-		out.Copies = append(out.Copies, local[i].Info)
-	}
-	return out, nil
+	return &copiesReply{Copies: p.n.localPeerCopies()}, nil
 }
 
-func (p *peerAPI) snapshot(r *http.Request) (any, error) {
+// localPeerCopies describes this node's copies for the peer API: with their epochs and
+// progress counters.
+func (n *Node) localPeerCopies() []peerCopy {
+	local := n.LocalCopies()
+	out := make([]peerCopy, 0, len(local))
+	for i := range local {
+		lc := &local[i]
+		id := store.ShardID{Index: lc.Info.Index, Shard: lc.Info.Shard}
+		out = append(out, peerCopy{
+			ShardInfo: lc.Info, Epoch: lc.Copy.Epoch, Paused: lc.Paused,
+			Progress: lc.Info.AppliedSeq + int64(lc.Info.Docs) + n.fetch.progressOf(id), //nolint:gosec // a document count
+		})
+	}
+	return out
+}
+
+// snapshot takes a snapshot of a copy for a peer's recovery and lists its files with
+// their sums. Hashing a big copy the first time can outlast the listener's write
+// timeout: the write deadline moves on before each file, bounding each file's hashing
+// instead of the whole listing.
+func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	var msg shardRef
 	if err := decode(r, &msg); err != nil {
-		return nil, err
+		return err
 	}
-	sn, err := p.n.Snapshot(ctx, store.ShardID{Index: msg.Index, Shard: msg.Shard})
+	id := store.ShardID{Index: msg.Index, Shard: msg.Shard}
+	sn, err := p.n.Snapshot(ctx, id)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	rc := http.NewResponseController(w)
 	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion()}
 	for _, f := range sn.Files() {
-		sum, err := p.n.sums.sum(sn, f)
+		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound))
+		sum, err := p.n.sums.sum(id, sn, f)
+		if err == nil {
+			err = ctx.Err()
+		}
 		if err != nil {
 			sn.Release()
-			return nil, err
+			return err
 		}
 		reply.Files = append(reply.Files, wireFile{Name: f.Name, Size: f.Size, SHA256: sum})
 	}
-	reply.ID = p.n.snaps.add(sn)
-	p.n.log.InfoContext(ctx, "serving a recovery snapshot", slog.String("shard", store.ShardID{Index: msg.Index, Shard: msg.Shard}.String()),
+	reply.ID = p.n.snaps.add(id, sn)
+	p.n.log.InfoContext(ctx, "serving a recovery snapshot", slog.String("shard", id.String()),
 		slog.Int64("seq", reply.Seq), slog.Int("files", len(reply.Files)))
-	return reply, nil
+	_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound))
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(reply)
 }
+
+// snapshotHashBound bounds hashing one snapshot file (and writing a snapshot file's
+// next chunk).
+const snapshotHashBound = 2 * time.Minute
 
 func (p *peerAPI) release(r *http.Request) (any, error) {
 	p.n.snaps.remove(r.PathValue("id"))
 	return nil, nil
 }
 
-// file streams one snapshot file; a Range header resumes it from an offset.
+// file streams one snapshot file; a Range header resumes it from an offset. The
+// stream is cut once the copy no longer serves peers (its lease lapsed, it was
+// unhosted): the recovering node resumes from another source.
 func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 	name := r.PathValue("name")
-	return p.n.snaps.use(r.PathValue("id"), func(sn *shard.Snapshot) error {
+	return p.n.snaps.use(r.PathValue("id"), p.n.peerValid, func(id store.ShardID, sn *shard.Snapshot) error {
 		f, err := sn.Open(name)
 		if errors.Is(err, shard.ErrNoSuchFile) {
 			return api.NotFound(api.CodeNotFound, "the snapshot has no file %q", name)
@@ -393,9 +446,7 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		defer f.Close()
-		// A big file outlasts the listener's write timeout: the stream has none (a
-		// stalled peer is cut by its own side, and the transfer resumes).
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+		w = &leaseWriter{ResponseWriter: w, rc: http.NewResponseController(w), valid: func() bool { return p.n.peerValid(id) }}
 		if p.n.opts.hooks != nil && p.n.opts.hooks.peerFile != nil {
 			w = p.n.opts.hooks.peerFile(name, w)
 		}
@@ -405,9 +456,36 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 	})
 }
 
+// leaseWriter streams a snapshot file: before each write it moves the write deadline
+// on (a big file outlasts the listener's write timeout, a stalled reader does not
+// outlast the bound), and it aborts the stream once the copy no longer serves peers.
+type leaseWriter struct {
+	http.ResponseWriter
+	rc    *http.ResponseController
+	valid func() bool
+}
+
+func (w *leaseWriter) Write(b []byte) (int, error) {
+	if !w.valid() {
+		panic(http.ErrAbortHandler) // the copy's lease lapsed: drop the connection
+	}
+	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound))
+	return w.ResponseWriter.Write(b)
+}
+
+// peerWriteBound is how long one write of a snapshot stream may block.
+const peerWriteBound = 30 * time.Second
+
+// peerValid reports whether this node's copy of id serves peers now: its lease surely
+// holds, it is not quarantined, and it is not paused.
+func (n *Node) peerValid(id store.ShardID) bool {
+	l := n.leaseFor(id)
+	return l != nil && l.valid() && !l.quarantined() && !n.Paused(id)
+}
+
 // --- pins and snapshots ---------------------------------------------------------------
 
-// errPinGone is a pin that expired or was released.
+// errPinGone is a pin that expired or was released, or whose copy no longer serves.
 var errPinGone = errors.New("cluster: the pin is gone")
 
 // pinTable holds the generations searches pinned on this node for their fetch phase.
@@ -419,6 +497,7 @@ type pinTable struct {
 
 type pinEntry struct {
 	mu      sync.Mutex // held while a fetch uses the target
+	id      store.ShardID
 	t       node.ShardTarget
 	expires time.Time
 	gone    bool
@@ -432,18 +511,19 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (p *pinTable) add(t node.ShardTarget) string {
-	id := newID()
+func (p *pinTable) add(id store.ShardID, t node.ShardTarget) string {
+	pin := newID()
 	p.mu.Lock()
-	p.m[id] = &pinEntry{t: t, expires: time.Now().Add(p.ttl)}
+	p.m[pin] = &pinEntry{id: id, t: t, expires: time.Now().Add(p.ttl)}
 	p.mu.Unlock()
-	return id
+	return pin
 }
 
-// use runs fn on a pinned target, keeping it pinned meanwhile.
-func (p *pinTable) use(id string, fn func(node.ShardTarget) error) error {
+// use runs fn on a pinned target, keeping it pinned meanwhile, while its copy still
+// serves peers (valid).
+func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.ShardTarget) error) error {
 	p.mu.Lock()
-	e := p.m[id]
+	e := p.m[pin]
 	if e != nil {
 		e.expires = time.Now().Add(p.ttl)
 	}
@@ -453,16 +533,16 @@ func (p *pinTable) use(id string, fn func(node.ShardTarget) error) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.gone {
+	if e.gone || !valid(e.id) {
 		return errPinGone
 	}
 	return fn(e.t)
 }
 
-func (p *pinTable) remove(id string) {
+func (p *pinTable) remove(pin string) {
 	p.mu.Lock()
-	e := p.m[id]
-	delete(p.m, id)
+	e := p.m[pin]
+	delete(p.m, pin)
 	p.mu.Unlock()
 	if e != nil {
 		e.drop()
@@ -483,10 +563,10 @@ func (p *pinTable) sweep() {
 	now := time.Now()
 	var expired []*pinEntry
 	p.mu.Lock()
-	for id, e := range p.m {
+	for pin, e := range p.m {
 		if now.After(e.expires) {
 			expired = append(expired, e)
-			delete(p.m, id)
+			delete(p.m, pin)
 		}
 	}
 	p.mu.Unlock()
@@ -498,9 +578,9 @@ func (p *pinTable) sweep() {
 func (p *pinTable) closeAll() {
 	p.mu.Lock()
 	list := make([]*pinEntry, 0, len(p.m))
-	for id, e := range p.m {
+	for pin, e := range p.m {
 		list = append(list, e)
-		delete(p.m, id)
+		delete(p.m, pin)
 	}
 	p.mu.Unlock()
 	for _, e := range list {
@@ -508,39 +588,50 @@ func (p *pinTable) closeAll() {
 	}
 }
 
-// snapTable holds the snapshots peers are recovering from.
+// snapTable holds the snapshots peers are recovering from. An idle snapshot expires
+// after SnapshotTTL, and every snapshot after SnapshotMaxAge however busy (it holds its
+// generation's segments on disk): a recovery resumes on a fresh one.
 type snapTable struct {
-	ttl time.Duration
-	mu  sync.Mutex
-	m   map[string]*snapEntry
+	ttl, maxAge time.Duration
+	mu          sync.Mutex
+	m           map[string]*snapEntry
 }
 
 type snapEntry struct {
+	id      store.ShardID
 	sn      *shard.Snapshot
+	created time.Time
 	expires time.Time
 	users   int
 	gone    bool
 }
 
-func newSnapTable(ttl time.Duration) *snapTable {
-	return &snapTable{ttl: ttl, m: map[string]*snapEntry{}}
+func newSnapTable(ttl, maxAge time.Duration) *snapTable {
+	return &snapTable{ttl: ttl, maxAge: maxAge, m: map[string]*snapEntry{}}
 }
 
-func (s *snapTable) add(sn *shard.Snapshot) string {
-	id := newID()
+func (s *snapTable) add(id store.ShardID, sn *shard.Snapshot) string {
+	key := newID()
+	now := time.Now()
 	s.mu.Lock()
-	s.m[id] = &snapEntry{sn: sn, expires: time.Now().Add(s.ttl)}
+	s.m[key] = &snapEntry{id: id, sn: sn, created: now, expires: now.Add(s.ttl)}
 	s.mu.Unlock()
-	return id
+	return key
 }
 
-// use runs fn on a snapshot, which is kept meanwhile and for SnapshotTTL after.
-func (s *snapTable) use(id string, fn func(*shard.Snapshot) error) error {
+// use runs fn on a snapshot, which is kept meanwhile and for SnapshotTTL after, while
+// it is younger than SnapshotMaxAge (410 after) and its copy still serves peers (503
+// otherwise).
+func (s *snapTable) use(key string, valid func(store.ShardID) bool, fn func(store.ShardID, *shard.Snapshot) error) error {
 	s.mu.Lock()
-	e := s.m[id]
-	if e == nil {
+	e := s.m[key]
+	if e == nil || time.Since(e.created) > s.maxAge {
 		s.mu.Unlock()
-		return &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the snapshot expired"}
+		return &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the snapshot expired; take another"}
+	}
+	if !valid(e.id) {
+		s.mu.Unlock()
+		return api.Unavailable(store.ErrLeaseLost, "this node's copy of %s no longer serves peers", e.id)
 	}
 	e.users++
 	s.mu.Unlock()
@@ -554,13 +645,13 @@ func (s *snapTable) use(id string, fn func(*shard.Snapshot) error) error {
 			e.sn.Release()
 		}
 	}()
-	return fn(e.sn)
+	return fn(e.id, e.sn)
 }
 
-func (s *snapTable) remove(id string) {
+func (s *snapTable) remove(key string) {
 	s.mu.Lock()
-	e := s.m[id]
-	delete(s.m, id)
+	e := s.m[key]
+	delete(s.m, key)
 	release := false
 	if e != nil {
 		e.gone = true
@@ -576,9 +667,9 @@ func (s *snapTable) sweep() {
 	now := time.Now()
 	var release []*shard.Snapshot
 	s.mu.Lock()
-	for id, e := range s.m {
-		if e.users == 0 && now.After(e.expires) {
-			delete(s.m, id)
+	for key, e := range s.m {
+		if e.users == 0 && (now.After(e.expires) || now.Sub(e.created) > s.maxAge) {
+			delete(s.m, key)
 			e.gone = true
 			release = append(release, e.sn)
 		}
@@ -592,8 +683,8 @@ func (s *snapTable) sweep() {
 func (s *snapTable) closeAll() {
 	s.mu.Lock()
 	var release []*shard.Snapshot
-	for id, e := range s.m {
-		delete(s.m, id)
+	for key, e := range s.m {
+		delete(s.m, key)
 		e.gone = true
 		if e.users == 0 {
 			release = append(release, e.sn)
@@ -620,31 +711,45 @@ func (n *Node) janitorLoop(ctx context.Context) {
 	}
 }
 
-// sumCache remembers the SHA-256 of immutable snapshot files: segment, query segment
-// and deletes sidecar files never change once written (their names are unique), so a
-// file is hashed once whatever the number of recoveries. The manifest is hashed each
-// time.
+// sumCache remembers the SHA-256 of snapshot files on disk, keyed by their path, size
+// and modification time: segment and query segment files never change once written
+// (their names are unique), so a file is hashed once whatever the number of
+// recoveries. The files a snapshot encodes itself (sidecars, the manifest) are small
+// and hashed each time. A copy's entries are dropped when it is unhosted.
 type sumCache struct {
 	mu sync.Mutex
-	m  map[string]sumEntry
+	m  map[sumKey]sumEntry
+}
+
+type sumKey struct {
+	path  string
+	size  int64
+	mtime int64
 }
 
 type sumEntry struct {
-	size int64
-	sum  string
+	shard store.ShardID
+	sum   string
 }
 
 // maxSums bounds the cache.
 const maxSums = 1 << 16
 
-func newSumCache() *sumCache { return &sumCache{m: map[string]sumEntry{}} }
+func newSumCache() *sumCache { return &sumCache{m: map[sumKey]sumEntry{}} }
 
-func (c *sumCache) sum(sn *shard.Snapshot, f shard.SnapshotFile) (string, error) {
-	if f.Name != shard.ManifestName {
+func (c *sumCache) sum(id store.ShardID, sn *shard.Snapshot, f shard.SnapshotFile) (string, error) {
+	var key sumKey
+	path, onDisk := sn.Path(f.Name)
+	if onDisk {
+		info, err := os.Stat(path)
+		if err != nil {
+			return "", err
+		}
+		key = sumKey{path: path, size: info.Size(), mtime: info.ModTime().UnixNano()}
 		c.mu.Lock()
-		e, ok := c.m[f.Name]
+		e, ok := c.m[key]
 		c.mu.Unlock()
-		if ok && e.size == f.Size {
+		if ok && key.size == f.Size {
 			return e.sum, nil
 		}
 	}
@@ -658,13 +763,24 @@ func (c *sumCache) sum(sn *shard.Snapshot, f shard.SnapshotFile) (string, error)
 		return "", err
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
-	if f.Name != shard.ManifestName {
+	if onDisk {
 		c.mu.Lock()
 		if len(c.m) >= maxSums {
 			clear(c.m)
 		}
-		c.m[f.Name] = sumEntry{size: f.Size, sum: sum}
+		c.m[key] = sumEntry{shard: id, sum: sum}
 		c.mu.Unlock()
 	}
 	return sum, nil
+}
+
+// drop forgets the sums of a shard's files.
+func (c *sumCache) drop(id store.ShardID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, e := range c.m {
+		if e.shard == id {
+			delete(c.m, k)
+		}
+	}
 }

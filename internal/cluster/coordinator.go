@@ -36,10 +36,13 @@ package cluster
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,14 +64,23 @@ const (
 	DefaultHeartbeatInterval = 2 * time.Second
 	DefaultDeadAfter         = 10 * time.Second
 	DefaultLeaseTTL          = 10 * time.Second
-	DefaultCatalogInterval   = time.Second
-	DefaultPruneInterval     = 30 * time.Second
-	DefaultPruneHaltGrace    = 15 * time.Minute
-	DefaultSweepInterval     = 10 * time.Minute
-	DefaultSweepAge          = time.Hour
-	DefaultPeerTimeout       = 10 * time.Second
-	DefaultPinTTL            = 30 * time.Second
-	DefaultSnapshotTTL       = 2 * time.Minute
+	// DefaultSQLiteLeaseTTL is the lease TTL on SQLite, whose single writer can hold a
+	// renewal behind a long commit (and a checkpoint) for a while.
+	DefaultSQLiteLeaseTTL  = 30 * time.Second
+	DefaultCatalogInterval = time.Second
+	DefaultPruneInterval   = 30 * time.Second
+	DefaultPruneStall      = 15 * time.Minute
+	DefaultRetiringKeep    = 15 * time.Minute
+	DefaultChangelogKeep   = 24 * time.Hour
+	DefaultSnapshotMaxAge  = time.Hour
+	DefaultPeerIdleTimeout = 30 * time.Second
+	DefaultGCInterval      = time.Minute
+	DefaultCopyDirGrace    = 10 * time.Minute
+	DefaultSweepInterval   = 10 * time.Minute
+	DefaultSweepAge        = time.Hour
+	DefaultPeerTimeout     = 10 * time.Second
+	DefaultPinTTL          = 30 * time.Second
+	DefaultSnapshotTTL     = 2 * time.Minute
 )
 
 // Options configures a [Node]. Only Store and Config are required.
@@ -85,18 +97,24 @@ type Options struct {
 
 	// HeartbeatInterval is how often the node heartbeats, renews its leases and
 	// allocates (2 s). DeadAfter is how long a silent node stays live (10 s), and
-	// LeaseTTL how long a lease lasts unrenewed (10 s). LeaseMargin is how long
-	// before its local deadline a copy stops serving (LeaseTTL/10), covering the
-	// clocks' rate difference.
+	// LeaseTTL how long a lease lasts unrenewed (config lease_ttl, else 30 s on SQLite
+	// and 10 s elsewhere). LeaseMargin is how long before its local deadline a copy
+	// stops serving peers (LeaseTTL/10), covering the clocks' rate difference.
 	HeartbeatInterval, DeadAfter, LeaseTTL, LeaseMargin time.Duration
 	// ViewInterval is how often the registry is read for routing (HeartbeatInterval/4).
 	ViewInterval time.Duration
 	// CatalogInterval is how often the index catalogue is synced (1 s).
 	CatalogInterval time.Duration
-	// PruneInterval is how often the leader prunes the changelog (30 s), and
-	// PruneHaltGrace how long a copy whose applied seq does not move while another
-	// copy's does may hold the prune floor back (15 min).
-	PruneInterval, PruneHaltGrace time.Duration
+	// PruneInterval is how often the leader prunes the changelog (30 s).
+	// PruneStallTimeout is how long a copy behind the others may make no progress and
+	// still hold the prune floor (config prune_stall_timeout, 15 min);
+	// RetiringRetention how long a cleanly stopped copy's row holds it
+	// (retiring_retention, 15 min); ChangelogRetention the oldest a change may grow
+	// whatever copy needs it (changelog_retention, 24 h).
+	PruneInterval, PruneStallTimeout, RetiringRetention, ChangelogRetention time.Duration
+	// GCInterval is how often unused copy directories and recovery staging are looked
+	// for (1 min), and CopyDirGrace how long one must have lain unused (10 min).
+	GCInterval, CopyDirGrace time.Duration
 	// SweepInterval is how often the leader sweeps abandoned blob uploads (10 min),
 	// SweepAge how old they must be (1 h).
 	SweepInterval, SweepAge time.Duration
@@ -104,8 +122,12 @@ type Options struct {
 	// retried on another copy.
 	PeerTimeout time.Duration
 	// PinTTL is how long a peer keeps a generation pinned for a search's fetch phase
-	// (30 s); SnapshotTTL how long an idle recovery snapshot is kept (2 min).
-	PinTTL, SnapshotTTL time.Duration
+	// (30 s); SnapshotTTL how long an idle recovery snapshot is kept (2 min), and
+	// SnapshotMaxAge how long any is (1 h: a recovery resumes on a fresh one).
+	PinTTL, SnapshotTTL, SnapshotMaxAge time.Duration
+	// PeerIdleTimeout cuts a snapshot stream that delivers nothing for that long
+	// (30 s): the recovery resumes it.
+	PeerIdleTimeout time.Duration
 
 	// Transport carries the peer API's requests; nil means a pooled default.
 	Transport http.RoundTripper
@@ -146,7 +168,13 @@ func (o *Options) resolve() error {
 		o.DeadAfter = DefaultDeadAfter
 	}
 	if o.LeaseTTL <= 0 {
+		o.LeaseTTL = o.Config.LeaseTTL
+	}
+	if o.LeaseTTL <= 0 {
 		o.LeaseTTL = DefaultLeaseTTL
+		if o.Store.Dialect() == "sqlite" {
+			o.LeaseTTL = DefaultSQLiteLeaseTTL
+		}
 	}
 	if o.LeaseTTL <= o.HeartbeatInterval {
 		return fmt.Errorf("cluster: the lease ttl (%s) must exceed the heartbeat interval (%s)", o.LeaseTTL, o.HeartbeatInterval)
@@ -163,9 +191,13 @@ func (o *Options) resolve() error {
 	if o.PruneInterval <= 0 {
 		o.PruneInterval = DefaultPruneInterval
 	}
-	if o.PruneHaltGrace <= 0 {
-		o.PruneHaltGrace = DefaultPruneHaltGrace
-	}
+	o.PruneStallTimeout = firstPositive(o.PruneStallTimeout, o.Config.PruneStallTimeout, DefaultPruneStall)
+	o.RetiringRetention = firstPositive(o.RetiringRetention, o.Config.RetiringRetention, DefaultRetiringKeep)
+	o.ChangelogRetention = firstPositive(o.ChangelogRetention, o.Config.ChangelogRetention, DefaultChangelogKeep)
+	o.GCInterval = firstPositive(o.GCInterval, DefaultGCInterval)
+	o.CopyDirGrace = firstPositive(o.CopyDirGrace, DefaultCopyDirGrace)
+	o.SnapshotMaxAge = firstPositive(o.SnapshotMaxAge, DefaultSnapshotMaxAge)
+	o.PeerIdleTimeout = firstPositive(o.PeerIdleTimeout, DefaultPeerIdleTimeout)
 	if o.SweepInterval <= 0 {
 		o.SweepInterval = DefaultSweepInterval
 	}
@@ -196,6 +228,16 @@ func (o *Options) resolve() error {
 	return nil
 }
 
+// firstPositive returns the first positive duration of ds.
+func firstPositive(ds ...time.Duration) time.Duration {
+	for _, d := range ds {
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
 // Node is one node of a cluster: the [api.Coordinator] every API request goes to. Build
 // it with [New], start it with [Node.Start] and serve [Node.Handler]; [Node.Stop] (or
 // Close) shuts it down as a rolling restart wants.
@@ -214,13 +256,16 @@ type Node struct {
 
 	client *http.Client
 	scheme string
-	ars    *ars
-	view   atomic.Pointer[view]
+	// clearWarned are the peers warned about getting the cluster token in the clear.
+	clearWarned sync.Map
+	ars         *ars
+	view        atomic.Pointer[view]
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
 	leases  map[store.ShardID]*lease
-	// allocMu serializes claims, renewals and the lease bookkeeping around them.
+	// allocMu serializes allocation passes (claims and releases) and forgetting the
+	// leases of dropped indexes. Renewals do not take it: they wait on nothing.
 	allocMu sync.Mutex
 
 	pins  *pinTable
@@ -285,13 +330,24 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		t := http.DefaultTransport.(*http.Transport).Clone() //nolint:forcetypeassert,errcheck // the default transport is an *http.Transport
 		t.MaxIdleConnsPerHost = 64
 		t.IdleConnTimeout = time.Minute
+		if o.Config.PeerCAFile != "" {
+			pem, err := os.ReadFile(o.Config.PeerCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("cluster: peer_ca_file: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("cluster: peer_ca_file %s holds no PEM certificate", o.Config.PeerCAFile)
+			}
+			t.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		}
 		transport = t
 	}
 	n.client = &http.Client{Transport: transport}
 	n.ars = newARS()
 	n.view.Store(&view{nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}})
 	n.pins = newPinTable(o.PinTTL)
-	n.snaps = newSnapTable(o.SnapshotTTL)
+	n.snaps = newSnapTable(o.SnapshotTTL, o.SnapshotMaxAge)
 	n.sums = newSumCache()
 	n.hints = newHinter(n)
 	n.fetch = &fetcher{n: n}
@@ -367,11 +423,12 @@ func (n *Node) Handler(pub http.Handler) http.Handler {
 }
 
 // Drain begins a rolling shutdown: the node takes no new copy, and each copy it holds
-// that a serving copy elsewhere can stand in for has its tailer stopped and is marked
-// retiring, so reads go to the other copies and the allocator may place a
-// replacement. A copy that is the shard's only serving one keeps serving until Stop.
-// The API calls it when it starts draining (readiness false); Stop calls it too. It is
-// idempotent.
+// that a serving copy elsewhere can stand in for has its tailer stopped, is marked
+// retiring (only while another copy still serves, checked atomically in the store, so
+// nodes draining together never retire a shard's last serving copies) and is closed;
+// reads go to the other copies and the allocator may place a replacement. A copy that
+// is the shard's only serving one keeps serving until Stop. The API calls it when it
+// starts draining (readiness false); Stop calls it too. It is idempotent.
 func (n *Node) Drain(ctx context.Context) {
 	n.drainMu.Lock()
 	defer n.drainMu.Unlock()
@@ -387,30 +444,57 @@ func (n *Node) Drain(ctx context.Context) {
 		if v.servingElsewhere(l.copy.Shard, n.id) == 0 {
 			continue // the only serving copy: it serves until Stop
 		}
-		n.retire(ctx, l)
-		retired++
+		if n.retire(ctx, l) {
+			retired++
+		}
 	}
-	n.log.InfoContext(ctx, "cluster node draining", slog.Int("retired", retired), slog.Int("kept", n.leaseCount()))
+	n.log.InfoContext(ctx, "cluster node draining", slog.Int("retired", retired), slog.Int("kept", n.leaseCount()-retired))
 }
 
-// retire stops a copy's tailer and its serving, then marks it retiring in the registry
-// (in that order: a running tailer could still promote it to serving).
-func (n *Node) retire(ctx context.Context, l *lease) {
-	if err := n.UnhostCopy(ctx, l.copy, false); err != nil {
+// retire stops a copy's tailer (a running tailer could still promote it to serving),
+// then marks it retiring if another copy serves, and closes it; otherwise it resumes
+// the copy, which keeps serving. It reports whether the copy retired.
+func (n *Node) retire(ctx context.Context, l *lease) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lost || l.retired.Load() {
+		return false
+	}
+	if !l.paused {
+		if err := n.PauseCopy(ctx, l.copy); err != nil {
+			n.log.WarnContext(ctx, "stopping a draining copy's tailer failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+			return false
+		}
+	}
+	ok, err := n.reg.RetireCopy(ctx, l.copy)
+	if err != nil || !ok {
+		if err != nil && !errors.Is(err, store.ErrLeaseLost) {
+			n.log.WarnContext(ctx, "marking a copy retiring failed; it keeps serving", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+		}
+		if !l.paused {
+			if rerr := n.ResumeCopy(ctx, l.copy); rerr != nil {
+				n.log.WarnContext(ctx, "resuming a copy that could not retire failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", rerr))
+			}
+		}
+		return false
+	}
+	l.retired.Store(true)
+	l.copy.State = store.CopyRetiring
+	n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
+	if err := n.unhostCopy(ctx, l.copy, false); err != nil {
 		n.log.WarnContext(ctx, "closing a retiring copy failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
 	}
-	if err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); err != nil && !errors.Is(err, store.ErrLeaseLost) {
-		n.log.WarnContext(ctx, "marking a copy retiring failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
-	} else if err == nil {
-		l.retired.Store(true)
-		n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
-	}
+	return true
 }
 
 // Stop leaves the cluster as a rolling restart wants: it drains (if the API has not),
-// stops the loops, stops every copy's tailer and closes its shard (a final manifest),
-// releases the leases, deregisters the node and closes the engine. It does not close
-// the store. It is idempotent; Close is the same.
+// stops the loops, stops every copy's tailer and closes its shard (a final manifest and
+// a final applied seq), marks every copy retiring and deregisters the node, then closes
+// the engine. The copies' leases are not released: their rows stay, retiring, at their
+// final applied seqs, so the changelog the node needs to replay when it comes back is
+// kept for retiring_retention, and the node claims its own slots back at the same
+// epochs. Peers place replacements meanwhile (a retiring copy does not count towards
+// its target). It does not close the store. It is idempotent; Close is the same.
 func (n *Node) Stop(ctx context.Context) error {
 	n.stopOnce.Do(func() {
 		n.stopped.Store(true)
@@ -422,7 +506,7 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.closeBackground()
 		var errs []error
 		for _, l := range n.leaseList() {
-			if err := n.UnhostCopy(ctx, l.copy, false); err != nil {
+			if err := n.unhostCopy(ctx, l.copy, false); err != nil {
 				errs = append(errs, err)
 			}
 			if !l.retired.Load() {
@@ -430,12 +514,7 @@ func (n *Node) Stop(ctx context.Context) error {
 					n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
 				}
 			}
-			if err := n.reg.ReleaseCopy(ctx, l.copy); err != nil && !errors.Is(err, store.ErrLeaseLost) {
-				n.log.WarnContext(ctx, "releasing a copy failed; its lease runs out", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
-			} else {
-				n.inst.lease(ctx, "release")
-			}
-			n.dropLease(l.copy.Shard)
+			n.dropLease(l)
 		}
 		if n.started.Load() {
 			if err := n.reg.RemoveNode(ctx, n.id); err != nil {
@@ -470,7 +549,7 @@ func (n *Node) kill() {
 		ctx := context.Background()
 		for _, l := range n.leaseList() {
 			_ = n.AbandonCopy(ctx, l.copy)
-			n.dropLease(l.copy.Shard)
+			n.dropLease(l)
 		}
 		n.hints.close()
 		n.pins.closeAll()

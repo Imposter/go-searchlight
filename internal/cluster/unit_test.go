@@ -94,64 +94,98 @@ func TestWireRoundTrip(t *testing.T) {
 // just failed after every healthy one, and a copy that answered stale after fresh ones.
 func TestARSOrder(t *testing.T) {
 	a := newARS()
+	id := store.ShardID{Index: "i", Shard: 0}
+	slow, fast, fresh := candidate{node: "slow", shard: id}, candidate{node: "fast", shard: id}, candidate{node: "new", shard: id}
 	for range 5 {
-		done := a.start("slow")
+		done := a.start(slow.node, slow.key())
 		time.Sleep(20 * time.Millisecond)
 		done(false, 0.02, 3)
-		done = a.start("fast")
+		done = a.start(fast.node, fast.key())
 		done(false, 0.001, 0)
 	}
-	cands := []candidate{{node: "slow"}, {node: "fast"}, {node: "new"}}
+	cands := []candidate{slow, fast, fresh}
 	a.order(cands, 3)
 	if cands[2].node != "slow" {
 		t.Fatalf("order %v: the slow peer is not last", cands)
 	}
-	a.start("fast")(true, -1, -1) // fast fails
+	a.start(fast.node, fast.key())(true, -1, -1) // fast's copy fails
 	a.order(cands, 3)
 	if cands[2].node != "fast" {
-		t.Fatalf("order %v: the failed peer is not last", cands)
+		t.Fatalf("order %v: the failed copy is not last", cands)
 	}
-	id := store.ShardID{Index: "i", Shard: 0}
-	stale := candidate{node: "new", shard: id}
-	a.noteStale(stale.key(), true)
-	cands = []candidate{stale, {node: "slow", shard: id}}
+	// Suspicion is the copy's: fast's copy of another shard is still first in line.
+	other := candidate{node: "fast", shard: store.ShardID{Index: "i", Shard: 1}}
+	pair := []candidate{{node: "slow", shard: other.shard}, other}
+	a.order(pair, 3)
+	if pair[0].node != "fast" {
+		t.Fatalf("order %v: a failure of one copy is held against the peer's others", pair)
+	}
+	// Suspicion grows with each failure in a row, and a success clears it.
+	a.start(fast.node, fast.key())(true, -1, -1)
+	a.mu.Lock()
+	until := time.Until(a.copies[fast.key()].suspectUntil)
+	a.mu.Unlock()
+	if until < suspectBase+suspectBase/2 {
+		t.Fatalf("after two failures the copy is suspected for %s only", until)
+	}
+	a.start(fast.node, fast.key())(false, 0.001, 0)
+	a.order(cands, 3)
+	if cands[2].node == "fast" {
+		t.Fatalf("order %v: a success did not clear the suspicion", cands)
+	}
+	a.noteStale(fresh.key(), true)
+	cands = []candidate{fresh, slow}
 	a.order(cands, 3)
 	if cands[0].node != "slow" {
 		t.Fatalf("order %v: the stale copy is first", cands)
 	}
 }
 
-// TestPruneFloor: the floor is the lowest applied seq of the live copies; a copy whose
-// node reports it halted for the whole grace stops counting; expired leases and dead
-// nodes never count; a shard with no live copy is not pruned.
+// TestPruneFloor: the floor is the lowest applied seq of the copies that count: live
+// ones, and a stopped node's retiring rows for RetiringRetention after their leases
+// ran out. A copy behind the others with no progress for the stall timeout stops
+// counting, and counts again once it moves. Expired leases and dead nodes otherwise
+// never count; a shard with no copy that counts is not pruned on its copies' account.
 func TestPruneFloor(t *testing.T) {
-	n := &Node{opts: Options{PruneHaltGrace: 50 * time.Millisecond}}
+	n := &Node{opts: Options{PruneStallTimeout: 50 * time.Millisecond, RetiringRetention: time.Minute}}
 	id := store.ShardID{Index: "p", Shard: 0}
-	v := &view{live: map[string]bool{"a": true, "b": true}}
+	v := &view{live: map[string]bool{"a": true, "b": true, "a2": true}}
 	cp := func(node string, seq int64, left time.Duration) store.Copy {
-		return store.Copy{Shard: id, NodeID: node, AppliedSeq: seq, LeaseLeft: left}
+		return store.Copy{Shard: id, NodeID: node, AppliedSeq: seq, LeaseLeft: left, State: store.CopyServing}
 	}
 	copies := []store.Copy{cp("a", 100, time.Second), cp("b", 40, time.Second), cp("c", 5, time.Second), cp("a2", 1, -time.Second)}
-	v.live["a2"] = true
-	if f, ok := n.pruneFloor(copies, v); !ok || f != 40 {
+	progress := map[copyKey]int64{}
+	now := time.Now()
+	if f, ok := n.pruneFloor(copies, v, progress, now); !ok || f != 40 {
 		t.Fatalf("floor %d %v, want 40", f, ok)
 	}
-	halted := map[haltKey]bool{{shard: id, node: "b"}: true}
-	n.prune.observe(halted, time.Now())
-	if f, _ := n.pruneFloor(copies, v); f != 40 {
-		t.Fatalf("floor %d: a copy halted for less than the grace already stopped counting", f)
+	if f, _ := n.pruneFloor(copies, v, progress, now.Add(30*time.Millisecond)); f != 40 {
+		t.Fatalf("floor %d: a copy stalled for less than the timeout already stopped counting", f)
 	}
-	time.Sleep(60 * time.Millisecond)
-	n.prune.observe(halted, time.Now())
-	if f, ok := n.pruneFloor(copies, v); !ok || f != 100 {
-		t.Fatalf("floor %d %v, want 100 once b was halted for the grace", f, ok)
+	if f, ok := n.pruneFloor(copies, v, progress, now.Add(60*time.Millisecond)); !ok || f != 100 {
+		t.Fatalf("floor %d %v, want 100 once b stalled for the timeout", f, ok)
 	}
-	n.prune.observe(map[haltKey]bool{}, time.Now()) // b recovered
-	if f, _ := n.pruneFloor(copies, v); f != 40 {
-		t.Fatalf("floor %d: a recovered copy does not count again", f)
+	// b makes progress (its node reports work done): it counts again at once.
+	progress[copyKey{shard: id, node: "b"}] = 7
+	if f, _ := n.pruneFloor(copies, v, progress, now.Add(70*time.Millisecond)); f != 40 {
+		t.Fatalf("floor %d: a copy that moved does not count again", f)
 	}
-	if _, ok := n.pruneFloor([]store.Copy{cp("c", 5, time.Second)}, v); ok {
-		t.Fatal("a shard whose only copy is on a dead node is pruned")
+	// The most advanced copy never stalls, even idle.
+	if f, _ := n.pruneFloor(copies[:1], v, progress, now.Add(time.Hour)); f != 100 {
+		t.Fatalf("floor %d: the most advanced copy stopped counting", f)
+	}
+	// A stopped node's retiring row counts within the retention, past its lease.
+	ret := cp("gone", 20, -30*time.Second)
+	ret.State = store.CopyRetiring
+	if f, _ := n.pruneFloor(append([]store.Copy{ret}, copies...), v, progress, now.Add(80*time.Millisecond)); f != 20 {
+		t.Fatalf("floor %d: a recently retired copy does not hold the floor", f)
+	}
+	ret.LeaseLeft = -2 * time.Minute
+	if f, _ := n.pruneFloor(append([]store.Copy{ret}, copies...), v, progress, now.Add(90*time.Millisecond)); f == 20 {
+		t.Fatal("a retiring row past the retention still holds the floor")
+	}
+	if _, ok := n.pruneFloor([]store.Copy{cp("c", 5, time.Second)}, v, progress, now); ok {
+		t.Fatal("a shard whose only copy is on a dead node is pruned on its account")
 	}
 }
 
@@ -263,7 +297,15 @@ func TestSingleNodeCluster(t *testing.T) {
 	if nodes, _ := st.Registry().Nodes(context.Background()); len(nodes) != 0 {
 		t.Fatalf("still registered: %+v", nodes)
 	}
-	if copies, _ := st.Registry().Copies(context.Background(), ""); len(copies) != 0 {
+	// The copies stay, retiring at their final applied seqs, for the changelog to be
+	// kept for a restart; their leases run out.
+	copies, _ := st.Registry().Copies(context.Background(), "")
+	if len(copies) != 2 {
 		t.Fatalf("copies left: %+v", copies)
+	}
+	for _, c := range copies {
+		if c.State != store.CopyRetiring || c.AppliedSeq == 0 {
+			t.Fatalf("a stopped node's copy is %+v, want retiring at its applied seq", c)
+		}
 	}
 }

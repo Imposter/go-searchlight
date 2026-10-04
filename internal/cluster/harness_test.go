@@ -87,9 +87,9 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, d *db)) {
 	})
 }
 
-// forSQLiteAndPostgres runs fn on SQLite and, when it is configured, Postgres (whose
-// notifications drive the replica Hub): the heaviest tests skip MySQL, which shares one
-// database across every package's tests in CI.
+// forSQLiteAndPostgres runs fn on SQLite and, when it is configured and the run is not
+// -short, Postgres (whose notifications drive the replica Hub): the heaviest tests skip
+// MySQL, which shares one database across every package's tests in CI.
 func forSQLiteAndPostgres(t *testing.T, fn func(t *testing.T, d *db)) {
 	t.Helper()
 	t.Run("sqlite", func(t *testing.T) {
@@ -99,6 +99,9 @@ func forSQLiteAndPostgres(t *testing.T, fn func(t *testing.T, d *db)) {
 		base := os.Getenv(envPG)
 		if base == "" {
 			t.Skip(envPG + " is not set")
+		}
+		if testing.Short() {
+			t.Skip("heavy: not in -short")
 		}
 		fn(t, postgresDB(t, base))
 	})
@@ -495,6 +498,64 @@ func (f *faultStore) Registry() store.RegistryStore {
 	return &faultRegistry{RegistryStore: f.Store.Registry(), f: f}
 }
 
+func (f *faultStore) Indexes() store.IndexStore {
+	return &faultIndexes{IndexStore: f.Store.Indexes(), f: f}
+}
+
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+	if f.isDown() {
+		return 0, errPartitioned
+	}
+	return f.Store.ScanShard(ctx, id, fn)
+}
+
+func (f *faultStore) Prune(ctx context.Context, id store.ShardID, below int64) error {
+	if f.isDown() {
+		return errPartitioned
+	}
+	return f.Store.Prune(ctx, id, below)
+}
+
+type faultIndexes struct {
+	store.IndexStore
+	f *faultStore
+}
+
+func (x *faultIndexes) Create(ctx context.Context, m store.IndexMeta) (store.IndexMeta, error) {
+	if x.f.isDown() {
+		return store.IndexMeta{}, errPartitioned
+	}
+	return x.IndexStore.Create(ctx, m)
+}
+
+func (x *faultIndexes) Get(ctx context.Context, name string) (store.IndexMeta, error) {
+	if x.f.isDown() {
+		return store.IndexMeta{}, errPartitioned
+	}
+	return x.IndexStore.Get(ctx, name)
+}
+
+func (x *faultIndexes) List(ctx context.Context) ([]store.IndexMeta, error) {
+	if x.f.isDown() {
+		return nil, errPartitioned
+	}
+	return x.IndexStore.List(ctx)
+}
+
+func (x *faultIndexes) Update(ctx context.Context, m store.IndexMeta) (store.IndexMeta, error) {
+	if x.f.isDown() {
+		return store.IndexMeta{}, errPartitioned
+	}
+	return x.IndexStore.Update(ctx, m)
+}
+
+func (x *faultIndexes) Drop(ctx context.Context, name string) error {
+	if x.f.isDown() {
+		return errPartitioned
+	}
+	return x.IndexStore.Drop(ctx, name)
+}
+
 func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
 	if f.isDown() {
 		return 0, 0, errPartitioned
@@ -600,6 +661,20 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 		return errPartitioned
 	}
 	return r.RegistryStore.ReportApplied(ctx, c, seq)
+}
+
+func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, error) {
+	if r.f.isDown() {
+		return false, errPartitioned
+	}
+	return r.RegistryStore.RetireCopy(ctx, c)
+}
+
+func (r *faultRegistry) RemoveNode(ctx context.Context, id string) error {
+	if r.f.isDown() {
+		return errPartitioned
+	}
+	return r.RegistryStore.RemoveNode(ctx, id)
 }
 
 func (r *faultRegistry) ReleaseCopy(ctx context.Context, c store.Copy) error {

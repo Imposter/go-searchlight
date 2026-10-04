@@ -636,7 +636,7 @@ func waitCopyState(t testing.TB, st store.Store, id ShardID, want store.CopyStat
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, c := range copies {
+		for _, c := range copies { //nolint:gocritic // a short list
 			if c.Shard == id && c.State == want {
 				return c
 			}

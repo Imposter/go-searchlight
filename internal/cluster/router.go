@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -84,64 +86,100 @@ func retryable(err error) bool {
 
 // call sends a peer API request to the peer at addr and decodes its JSON reply into
 // out (when not nil). An error reply comes back as an *api.Error; a transport failure
-// as a *peerError.
+// as a *peerError. It does not feed adaptive replica selection: readCall does.
 func (n *Node) call(ctx context.Context, peer, addr, method, path string, in, out any) error {
+	_, _, err := n.do(ctx, peer, addr, method, path, in, out)
+	return err
+}
+
+// readCall is call for a read of copy c: its outcome feeds adaptive replica selection.
+// A copy that answered stale is remembered as stale, not suspected.
+func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out any) error {
+	done := n.ars.start(c.node, c.key())
+	service, queue, err := n.do(ctx, c.node, c.addr, http.MethodPost, path, in, out)
+	var ae *api.Error
+	switch {
+	case err == nil:
+		done(false, service, queue)
+	case errors.As(err, &ae) && ae.Code == codeStale:
+		done(false, service, queue)
+		n.ars.noteStale(c.key(), true)
+	case errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusTooManyRequests:
+		done(false, service, queue) // the request's own fault, not the copy's
+	default:
+		done(true, -1, -1)
+	}
+	return err
+}
+
+// do runs a peer request and returns what the peer reported of its load.
+func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out any) (service, queue float64, err error) {
+	service, queue = -1, -1
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return service, queue, err
 		}
 		body = bytes.NewReader(b)
 	}
 	// addr is a peer's advertise address from the registry: peers are trusted.
 	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // see above
 	if err != nil {
-		return err
+		return service, queue, err
 	}
 	n.authorize(req)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	done := n.ars.start(peer)
 	start := time.Now()
 	resp, err := n.client.Do(req) //nolint:gosec // a peer's registered address
 	if err != nil {
-		done(true, -1, -1)
 		n.inst.peer(ctx, path, peer, 0, time.Since(start))
-		return &peerError{node: peer, err: err}
+		return service, queue, &peerError{node: peer, err: err}
 	}
 	defer resp.Body.Close()
 	n.inst.peer(ctx, path, peer, resp.StatusCode, time.Since(start))
-	service, queue := reported(resp.Header)
+	service, queue = reported(resp.Header)
 	if resp.StatusCode >= 400 {
-		failed := resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
-		done(failed, service, queue)
-		return decodeError(resp)
+		return service, queue, decodeError(resp)
 	}
 	if out == nil {
-		done(false, service, queue)
 		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
+		return service, queue, nil
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		done(true, -1, -1)
-		return &peerError{node: peer, err: fmt.Errorf("decoding the reply: %w", err)}
+		return service, queue, &peerError{node: peer, err: fmt.Errorf("decoding the reply: %w", err)}
 	}
-	done(false, service, queue)
-	return nil
+	return service, queue, nil
 }
 
 // authorize adds the cluster token and the trace context to a peer request, and the
-// caller's deadline.
+// caller's deadline. A token sent in the clear to a peer off this machine is warned
+// about, once per peer: set tls_cert (and peer_ca_file) on a network you do not trust.
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)
+		if req.URL.Scheme == "http" && !loopback(req.URL.Hostname()) {
+			if _, warned := n.clearWarned.LoadOrStore(req.URL.Host, true); !warned {
+				n.log.WarnContext(req.Context(), "the cluster token goes to a peer over plain HTTP: serve the peer API over TLS (tls_cert, peer_ca_file)",
+					slog.String("peer", req.URL.Host))
+			}
+		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
 		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10))
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+}
+
+// loopback reports whether host names this machine.
+func loopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // reported reads the service time and queue a peer reported (-1 when it did not).
@@ -185,14 +223,21 @@ type remoteTarget struct {
 var _ node.ShardTarget = (*remoteTarget)(nil)
 
 // attempt runs fn on the chosen copy, or on each candidate in turn until one answers.
-func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx context.Context, c candidate) error) error {
+// Every attempt but the last refuses a stale copy (max_lag: the peer answers a
+// retryable 503); the last accepts one, flagged stale, as does the coordinator's own
+// copy after it.
+func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx context.Context, c candidate, ref shardRef) error) error {
 	if t.chosen != nil {
-		return fn(ctx, *t.chosen)
+		ref := t.ref()
+		ref.AllowStale = true
+		return fn(ctx, *t.chosen, ref)
 	}
 	var last error
 	for i, c := range t.cands {
+		ref := t.ref()
+		ref.AllowStale = i == len(t.cands)-1
 		actx, cancel := context.WithTimeout(ctx, t.n.opts.PeerTimeout)
-		err := fn(actx, c)
+		err := fn(actx, c, ref)
 		cancel()
 		if err == nil {
 			t.chosen = &t.cands[i]
@@ -226,11 +271,11 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 	if err != nil {
 		return nil, err
 	}
-	msg := searchMsg{shardRef: t.ref(), Request: wr, Pin: r.NoBodies}
 	var reply searchReply
-	err = t.attempt(ctx, "search", func(ctx context.Context, c candidate) error {
+	err = t.attempt(ctx, "search", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = searchReply{}
-		if err := t.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"search", msg, &reply); err != nil {
+		msg := searchMsg{shardRef: ref, Request: wr, Pin: r.NoBodies}
+		if err := t.n.readCall(ctx, c, peerPrefix+"search", msg, &reply); err != nil {
 			return err
 		}
 		if reply.Result == nil {
@@ -251,7 +296,7 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 		return fmt.Errorf("%w: no pinned generation to fetch from", search.ErrStaleHit)
 	}
 	var reply fetchReply
-	err := t.n.call(ctx, t.chosen.node, t.chosen.addr, http.MethodPost, peerPrefix+"fetch", fetchMsg{Pin: t.pin, Hits: hits, Fields: fields}, &reply)
+	err := t.n.readCall(ctx, *t.chosen, peerPrefix+"fetch", fetchMsg{Pin: t.pin, Hits: hits, Fields: fields}, &reply)
 	if err != nil {
 		var ae *api.Error
 		switch {
@@ -272,14 +317,15 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 }
 
 func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([][]string, error) {
-	msg := percolateMsg{shardRef: t.ref(), Mapping: mapping, Docs: make([]wireDoc, len(docs))}
+	wdocs := make([]wireDoc, len(docs))
 	for i := range docs {
-		msg.Docs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
+		wdocs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
 	}
 	var reply percolateReply
-	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate) error {
+	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = percolateReply{}
-		if err := t.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"percolate", msg, &reply); err != nil {
+		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs}
+		if err := t.n.readCall(ctx, c, peerPrefix+"percolate", msg, &reply); err != nil {
 			return err
 		}
 		t.noteStale(c, reply.Stale)
@@ -296,9 +342,9 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 
 func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getReply, error) {
 	var reply getReply
-	err := t.attempt(ctx, "get", func(ctx context.Context, c candidate) error {
+	err := t.attempt(ctx, "get", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = getReply{}
-		if err := t.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"get", getMsg{shardRef: t.ref(), ID: id, Query: saved}, &reply); err != nil {
+		if err := t.n.readCall(ctx, c, peerPrefix+"get", getMsg{shardRef: ref, ID: id, Query: saved}, &reply); err != nil {
 			return err
 		}
 		t.noteStale(c, reply.Stale)
@@ -391,14 +437,20 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 
 // WaitRefreshed implements node.Cluster: it waits on every serving copy of id on a
 // live peer, together. A copy whose peer cannot be reached, or that does not serve
-// now, is skipped: no read is routed to it either.
-func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode) error {
+// now, is skipped, and suspected, so reads routed by adaptive replica selection avoid
+// it; but when no copy at all (this node's included: localDone) reached seq, the wait
+// fails.
+func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
 	cands := n.candidates(id)
 	if len(cands) == 0 {
-		return nil
+		if localDone {
+			return nil
+		}
+		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q serves to wait on", id.Shard, id.Index)
 	}
 	errs := make([]error, len(cands))
+	var reached atomic.Int32
 	var wg sync.WaitGroup
 	for i, c := range cands {
 		wg.Go(func() {
@@ -407,15 +459,23 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 			var pe *peerError
 			var ae *api.Error
 			switch {
-			case err == nil, errors.As(err, &pe) && ctx.Err() == nil:
-			case errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
+			case err == nil:
+				reached.Add(1)
+			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
+				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
 			default:
 				errs[i] = err
 			}
 		})
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	if reached.Load() == 0 && !localDone {
+		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q reached seq %d", id.Shard, id.Index, seq)
+	}
+	return nil
 }
 
 // Allocate implements node.Cluster: this node claims its copies of a new index now.
@@ -450,8 +510,8 @@ func (h *clusterHooks) Counts(ctx context.Context, id store.ShardID) (uint64, ui
 	}
 	t := &remoteTarget{n: h.n, id: id, cands: cands}
 	var reply countsReply
-	err := t.attempt(ctx, "counts", func(ctx context.Context, c candidate) error {
-		return h.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", shardRef{Index: id.Index, Shard: id.Shard}, &reply)
+	err := t.attempt(ctx, "counts", func(ctx context.Context, c candidate, ref shardRef) error {
+		return h.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", ref, &reply)
 	})
 	return reply.Docs, reply.Queries, err
 }

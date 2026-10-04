@@ -171,7 +171,7 @@ func (sn *Snapshot) Open(name string) (SnapshotReader, error) {
 	if !slices.ContainsFunc(sn.files, func(f SnapshotFile) bool { return f.Name == name }) {
 		return nil, fmt.Errorf("%w: %q", ErrNoSuchFile, name)
 	}
-	f, err := os.Open(filepath.Join(sn.dir, name)) //nolint:gosec // a name the snapshot lists, in the shard's own directory
+	f, err := os.Open(filepath.Join(sn.dir, name))
 	if err != nil {
 		return nil, fmt.Errorf("shard: snapshot: %w", err)
 	}

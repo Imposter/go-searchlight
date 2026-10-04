@@ -36,10 +36,11 @@
   - Postgres and MySQL tests run when `SEARCHLIGHT_TEST_PG_URL` / `SEARCHLIGHT_TEST_MYSQL_URL` are set.
   - Tests bind 127.0.0.1 with ephemeral ports.
 - **Lint:** `go vet` and `golangci-lint` are clean. Add `.golangci.yml` in Task 1.
+- **Comments:** code is self-explanatory. Write doc comments for exported members and comments that explain architecture or infrastructure (protocols, invariants, durability and concurrency contracts, deployment and CI). Do not narrate code with inline comments; prefer clearer names or smaller functions. Reviewers flag gratuitous comments as findings.
 - **Commits:** conventional subjects, by explicit path. End every commit with:
   `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
   `Claude-Session: https://claude.ai/code/session_01H1UyQR6szrER8nN86UGgmS`
-- **No pushing.** The repo stays local until the operator says otherwise.
+- **Pushing:** the repo is on GitHub (`Imposter/go-searchlight`). Push task branches and merge to `main` after review; CI must be green.
 
 ## Review Focus
 

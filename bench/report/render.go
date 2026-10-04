@@ -48,6 +48,34 @@ func FormatRate(v float64) string {
 	}
 }
 
+// minSamples is the fewest recorded values needed to trust quantile q with reasonable
+// confidence, roughly 1/(1-q)×10: p50 needs 20, p90 needs 100, p99 needs 1,000, p999
+// needs 10,000. Below it, the quantile is noise, not a measurement.
+func minSamples(q float64) int64 {
+	if q >= 1 {
+		return math.MaxInt64
+	}
+	// A small epsilon absorbs float64 rounding (1-0.9 is 0.09999999999999998, not
+	// 0.1), so a q meant to land on a whole number does, rather than ceiling up one.
+	return int64(math.Ceil(10/(1-q) - 1e-9))
+}
+
+// sufficient reports whether l has enough samples to trust its p99 — the quantile
+// every spec section 1 target gated on latency compares.
+func sufficient(l *Latency) bool {
+	return l != nil && l.Count >= minSamples(0.99)
+}
+
+// formatQuantile formats a quantile value, or "n/a (n=…)" when count is too few
+// samples to trust it (see minSamples): an under-sampled percentile is never shown as
+// a number, so it cannot be mistaken for one.
+func formatQuantile(value float64, count int64, q float64) string {
+	if count < minSamples(q) {
+		return fmt.Sprintf("n/a (n=%d)", count)
+	}
+	return FormatMicros(value)
+}
+
 // FormatBytes writes a byte count in binary units.
 func FormatBytes(v float64) string {
 	if v <= 0 {
@@ -276,7 +304,7 @@ func renderFootprint(w io.Writer, r *Run) {
 	if len(rows) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "## Disk and memory\n\nMeasured after the load, once every document was searchable.\n\n")
+	fmt.Fprintf(w, "## Disk and memory\n\nThe larger of two measurements: right after the load (once every document was searchable), and again once every workload had run, to catch growth from merges, the percolator index and the mixed workload.\n\n")
 	table(w, []string{"engine", "disk", "disk per 1M docs", "RSS", "RSS per 1M docs", "how"}, rows)
 }
 
@@ -295,7 +323,7 @@ func renderGroup(w io.Writer, r *Run, group, title, about string) {
 			}
 			row := []string{name, res.Engine, conc(res), FormatRate(res.OpsPerSec), docsRate(res)}
 			if l := res.Latency; l != nil {
-				row = append(row, FormatMicros(l.P50), FormatMicros(l.P99), FormatMicros(l.P999), FormatMicros(l.Max))
+				row = append(row, formatQuantile(l.P50, l.Count, 0.50), formatQuantile(l.P99, l.Count, 0.99), formatQuantile(l.P999, l.Count, 0.999), FormatMicros(l.Max))
 			} else {
 				row = append(row, "—", "—", "—", "—")
 			}

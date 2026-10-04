@@ -130,6 +130,63 @@ func TestEvaluateWithoutBaselineOrWithMismatch(t *testing.T) {
 	}
 }
 
+// TestEvaluateInsufficientSamples checks that a target gated on a percentile with too
+// few recorded values never reports PASS or FAIL: it reports INSUFFICIENT SAMPLES
+// instead, and that status is never shown as a win or a loss.
+func TestEvaluateInsufficientSamples(t *testing.T) {
+	// agg_terms is T4's only workload in sampleRun, so an under-sampled p99 there
+	// cannot be outvoted by another, sufficiently-sampled workload failing instead.
+	r := sampleRun()
+	for i := range r.Results {
+		if r.Results[i].Workload == "agg_terms" {
+			r.Results[i].Latency.Count = 300 // below minSamples(0.99) = 1000
+		}
+	}
+	got := byID(Evaluate(r))
+	if got["T4"].Status != InsufficientSamples {
+		t.Errorf("T4 with an under-sampled p99: %s, want %s", got["T4"].Status, InsufficientSamples)
+	}
+	if !strings.Contains(got["T4"].Detail, "agg_terms") || !strings.Contains(got["T4"].Detail, "insufficient samples") {
+		t.Errorf("T4's detail does not explain the shortfall: %s", got["T4"].Detail)
+	}
+
+	r = sampleRun()
+	for i := range r.Results {
+		if r.Results[i].Workload == "refresh_visible" && r.Results[i].Engine == Searchlight {
+			r.Results[i].Latency.Count = 300
+		}
+	}
+	got = byID(Evaluate(r))
+	if got["T7"].Status != InsufficientSamples {
+		t.Errorf("T7 with an under-sampled refresh_visible p99: %s, want %s", got["T7"].Status, InsufficientSamples)
+	}
+
+	r = sampleRun()
+	for i := range r.Results {
+		if r.Results[i].Workload == "percolate_single_100000" && r.Results[i].Engine == Searchlight {
+			r.Results[i].Latency.Count = 300
+			r.Results[i].Latency.P99 = 1500 // would otherwise fail the < 1 ms target
+		}
+	}
+	if s := byID(Evaluate(r))["T5"].Status; s != InsufficientSamples {
+		t.Errorf("T5 with an under-sampled percolate_single_100000 p99: %s, want %s", s, InsufficientSamples)
+	}
+}
+
+func TestMinSamplesAndFormatQuantile(t *testing.T) {
+	for q, want := range map[float64]int64{0.50: 20, 0.90: 100, 0.99: 1000, 0.999: 10000} {
+		if got := minSamples(q); got != want {
+			t.Errorf("minSamples(%v) = %d, want %d", q, got, want)
+		}
+	}
+	if got := formatQuantile(900, 1000, 0.99); got != "900 µs" {
+		t.Errorf("sufficient: %q", got)
+	}
+	if got := formatQuantile(900, 300, 0.99); got != "n/a (n=300)" {
+		t.Errorf("insufficient: %q", got)
+	}
+}
+
 func TestRenderGolden(t *testing.T) {
 	var b bytes.Buffer
 	if err := Render(&b, sampleRun()); err != nil {

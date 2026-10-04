@@ -13,6 +13,9 @@ const (
 	NoBaseline  = "NO BASELINE"  // Searchlight measured, Elasticsearch not (a smoke run)
 	NotMeasured = "NOT MEASURED" // the run has no workload for it
 	Invalid     = "INVALID"      // the engines disagree on answers, or a workload errored
+	// InsufficientSamples marks a target whose only evidence is a percentile with too
+	// few recorded values to trust (see minSamples): it is never reported PASS or FAIL.
+	InsufficientSamples = "INSUFFICIENT SAMPLES"
 )
 
 // Workload groups: each maps to a spec section 1 target.
@@ -54,9 +57,10 @@ type TargetCheck struct {
 	Detail        string   `json:"detail"`
 }
 
-// worst orders statuses: FAIL and INVALID dominate, then the unmeasured, then PASS.
+// worst orders statuses: FAIL and INVALID dominate, then insufficient samples, then
+// the unmeasured, then PASS.
 func worst(a, b string) string {
-	rank := map[string]int{Pass: 0, NoBaseline: 1, NotMeasured: 2, Fail: 3, Invalid: 4}
+	rank := map[string]int{Pass: 0, NoBaseline: 1, NotMeasured: 2, InsufficientSamples: 3, Fail: 4, Invalid: 5}
 	if rank[b] > rank[a] {
 		return b
 	}
@@ -101,7 +105,7 @@ func Evaluate(r *Run) []TargetCheck {
 	}
 	if r.CrossCheck.Failed() {
 		for i := range checks {
-			if checks[i].Status == Pass || checks[i].Status == Fail {
+			if checks[i].Status == Pass || checks[i].Status == Fail || checks[i].Status == InsufficientSamples {
 				if checks[i].ID == "T7" || checks[i].ID == "T9" {
 					continue // absolute targets do not compare answers
 				}
@@ -206,6 +210,12 @@ func (r *Run) latency(id, area, target, group string) TargetCheck {
 			continue
 		}
 		esP50, esP99 = append(esP50, e.Latency.P50), append(esP99, e.Latency.P99)
+		if !sufficient(s.Latency) || !sufficient(e.Latency) {
+			c.Status = worst(c.Status, InsufficientSamples)
+			losses = append(losses, fmt.Sprintf("%s: insufficient samples for p99 (searchlight n=%d, elasticsearch n=%d; need ≥%d)",
+				w, s.Latency.Count, e.Latency.Count, minSamples(0.99)))
+			continue
+		}
 		compared++
 		if s.Latency.P50 <= e.Latency.P50 && s.Latency.P99 <= e.Latency.P99 {
 			won++
@@ -270,6 +280,10 @@ func (r *Run) percolation() TargetCheck {
 		notes = append(notes, "percolate_single_100000 not run, so the 1 ms p99 is unchecked.")
 	case !single.OK() || single.Latency == nil:
 		c.Status = worst(c.Status, Invalid)
+	case !sufficient(single.Latency):
+		c.Status = worst(c.Status, InsufficientSamples)
+		sl = append(sl, fmt.Sprintf("p99/doc @100k: n/a (n=%d)", single.Latency.Count))
+		notes = append(notes, fmt.Sprintf("percolate_single_100000 has %d samples; p99 needs ≥%d to judge the < 1 ms target.", single.Latency.Count, minSamples(0.99)))
 	default:
 		sl = append(sl, "p99/doc @100k: "+FormatMicros(single.Latency.P99))
 		if single.Latency.P99 >= PercolateP99Micros {
@@ -332,9 +346,14 @@ func (r *Run) footprint() TargetCheck {
 	return c
 }
 
+// visibility checks T7: write-to-visible latency and refresh=wait_for. Elasticsearch's
+// wait_for waits for the next scheduled refresh rather than forcing one, so its bound
+// is the same as plain write-to-visible (p99 at or under the 1 s refresh interval,
+// plus slack), not some much smaller number — both halves are gated the same way, and
+// T7 fails if either does.
 func (r *Run) visibility() TargetCheck {
 	c := TargetCheck{
-		ID: "T7", Area: "Write-to-visible latency", Target: "≤ 1 s by default (the refresh interval), and refresh=wait_for like Elasticsearch",
+		ID: "T7", Area: "Write-to-visible latency", Target: "≤ 1 s by default (the refresh interval), for both plain writes and refresh=wait_for",
 		Workloads: []string{"refresh_visible", "refresh_wait_for"},
 	}
 	vis, wf := r.Find("refresh_visible", Searchlight), r.Find("refresh_wait_for", Searchlight)
@@ -347,17 +366,44 @@ func (r *Run) visibility() TargetCheck {
 			return "—"
 		}
 		return fmt.Sprintf("visible p50 %s p99 %s; wait_for p50 %s p99 %s",
-			FormatMicros(v.Latency.P50), FormatMicros(v.Latency.P99), FormatMicros(w.Latency.P50), FormatMicros(w.Latency.P99))
+			FormatMicros(v.Latency.P50), formatQuantile(v.Latency.P99, v.Latency.Count, 0.99),
+			FormatMicros(w.Latency.P50), formatQuantile(w.Latency.P99, w.Latency.Count, 0.99))
 	}
 	c.Searchlight = desc(vis, wf)
 	c.Elasticsearch = desc(r.Find("refresh_visible", Elasticsearch), r.Find("refresh_wait_for", Elasticsearch))
-	switch {
-	case !vis.OK() || !wf.OK() || vis.Latency == nil:
+	if !vis.OK() || !wf.OK() || vis.Latency == nil || wf.Latency == nil {
 		c.Status, c.Detail = Invalid, "A visibility workload errored (a wait_for write not visible at once counts as an error)."
-	case vis.Latency.P99 > VisibleP99Micros:
-		c.Status, c.Detail = Fail, fmt.Sprintf("p99 write-to-visible %s exceeds 1 s + 100 ms.", FormatMicros(vis.Latency.P99))
+		return c
+	}
+	visSuff, wfSuff := sufficient(vis.Latency), sufficient(wf.Latency)
+	if !visSuff || !wfSuff {
+		var short []string
+		if !visSuff {
+			short = append(short, fmt.Sprintf("refresh_visible (n=%d)", vis.Latency.Count))
+		}
+		if !wfSuff {
+			short = append(short, fmt.Sprintf("refresh_wait_for (n=%d)", wf.Latency.Count))
+		}
+		c.Status = InsufficientSamples
+		c.Detail = fmt.Sprintf("p99 needs ≥%d samples: %s.", minSamples(0.99), strings.Join(short, ", "))
+		return c
+	}
+	visFail, wfFail := vis.Latency.P99 > VisibleP99Micros, wf.Latency.P99 > VisibleP99Micros
+	switch {
+	case visFail && wfFail:
+		c.Status = Fail
+		c.Detail = fmt.Sprintf("p99 write-to-visible %s and p99 wait_for %s both exceed 1 s + 100 ms.",
+			FormatMicros(vis.Latency.P99), FormatMicros(wf.Latency.P99))
+	case visFail:
+		c.Status = Fail
+		c.Detail = fmt.Sprintf("p99 write-to-visible %s exceeds 1 s + 100 ms (wait_for p99 %s is within it).",
+			FormatMicros(vis.Latency.P99), FormatMicros(wf.Latency.P99))
+	case wfFail:
+		c.Status = Fail
+		c.Detail = fmt.Sprintf("p99 wait_for %s exceeds 1 s + 100 ms (write-to-visible p99 %s is within it).",
+			FormatMicros(wf.Latency.P99), FormatMicros(vis.Latency.P99))
 	default:
-		c.Status, c.Detail = Pass, "Absolute target (p99 ≤ 1.1 s: the 1 s interval plus poll granularity); wait_for writes were visible on return."
+		c.Status, c.Detail = Pass, "Absolute target (p99 ≤ 1.1 s: the 1 s interval plus poll granularity) for both plain writes and refresh=wait_for."
 	}
 	return c
 }

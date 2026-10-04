@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"io/fs"
 	"net/url"
+	"time"
 )
 
 // Pools are the connection pools a dialect opens. Write runs every
@@ -62,6 +63,13 @@ type Dialect struct {
 	// multi-statement reads.
 	ApplyTx    *sql.TxOptions
 	SnapshotTx *sql.TxOptions
+
+	// Checkpoint, when set, is run on a read connection every CheckpointEvery:
+	// SQLite's WAL checkpoint, taken off the write connection (whose automatic
+	// checkpoints are off), so a commit never stalls every other writer while it
+	// copies the log into the database.
+	Checkpoint      string
+	CheckpointEvery time.Duration
 
 	// Retryable reports a transient error (deadlock, serialization failure,
 	// lock wait timeout) after which the whole transaction, rolled back by the

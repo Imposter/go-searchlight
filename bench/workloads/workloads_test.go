@@ -20,10 +20,10 @@ import (
 func TestRunClosedLoopCountsOnlyMeasured(t *testing.T) {
 	var calls atomic.Int64
 	seen := make([]atomic.Bool, 150)
-	m := Run(context.Background(), RunOptions{Warmup: 50, Iterations: 100, Concurrency: 4}, func(_ context.Context, i int) (int, error) {
+	m := Run(context.Background(), RunOptions{Warmup: 50, Iterations: 100, Concurrency: 4}, func(_ context.Context, i int) (int, time.Duration, error) {
 		calls.Add(1)
 		seen[i].Store(true)
-		return 2, nil
+		return 2, 0, nil
 	})
 	if calls.Load() != 150 || m.Ops != 100 || m.Docs != 200 || m.Hist.Count() != 100 || m.Errors != 0 {
 		t.Fatalf("calls %d ops %d docs %d recorded %d errors %d", calls.Load(), m.Ops, m.Docs, m.Hist.Count(), m.Errors)
@@ -40,11 +40,11 @@ func TestRunClosedLoopCountsOnlyMeasured(t *testing.T) {
 
 func TestRunErrorsAreCountedNotRecorded(t *testing.T) {
 	boom := errors.New("boom")
-	m := Run(context.Background(), RunOptions{Iterations: 20, Concurrency: 2}, func(_ context.Context, i int) (int, error) {
+	m := Run(context.Background(), RunOptions{Iterations: 20, Concurrency: 2}, func(_ context.Context, i int) (int, time.Duration, error) {
 		if i%4 == 0 {
-			return 0, boom
+			return 0, 0, boom
 		}
-		return 1, nil
+		return 1, 0, nil
 	})
 	if m.Errors != 5 || m.Ops != 15 || !errors.Is(m.FirstErr, boom) {
 		t.Fatalf("errors %d ops %d first %v", m.Errors, m.Ops, m.FirstErr)
@@ -54,9 +54,9 @@ func TestRunErrorsAreCountedNotRecorded(t *testing.T) {
 func TestRunOpenLoopChargesQueueing(t *testing.T) {
 	// 200 requests/s, each taking 20 ms, at most 2 in flight: the engine cannot keep up,
 	// so later requests wait and their latency (from the scheduled start) grows.
-	m := Run(context.Background(), RunOptions{Iterations: 20, Concurrency: 2, Rate: 200}, func(context.Context, int) (int, error) {
+	m := Run(context.Background(), RunOptions{Iterations: 20, Concurrency: 2, Rate: 200}, func(context.Context, int) (int, time.Duration, error) {
 		time.Sleep(20 * time.Millisecond)
-		return 1, nil
+		return 1, 0, nil
 	})
 	if m.Ops != 20 {
 		t.Fatalf("ops %d", m.Ops)
@@ -72,12 +72,26 @@ func TestRunOpenLoopChargesQueueing(t *testing.T) {
 
 func TestRunDurationBound(t *testing.T) {
 	start := time.Now()
-	m := Run(context.Background(), RunOptions{Duration: 100 * time.Millisecond, Concurrency: 2}, func(context.Context, int) (int, error) {
+	m := Run(context.Background(), RunOptions{Duration: 100 * time.Millisecond, Concurrency: 2}, func(context.Context, int) (int, time.Duration, error) {
 		time.Sleep(time.Millisecond)
-		return 1, nil
+		return 1, 0, nil
 	})
 	if el := time.Since(start); el > 2*time.Second || m.Ops == 0 {
 		t.Fatalf("ran %v, %d ops", el, m.Ops)
+	}
+}
+
+// TestRunSelfTimedOverridesWallClock checks that an op's own reported latency
+// replaces the call's wall time when it is nonzero (refresh=wait_for's untimed
+// confirming search relies on this: the sleep below stands in for it).
+func TestRunSelfTimedOverridesWallClock(t *testing.T) {
+	m := Run(context.Background(), RunOptions{Iterations: 30, Concurrency: 1}, func(context.Context, int) (int, time.Duration, error) {
+		time.Sleep(5 * time.Millisecond) // unmeasured tail work
+		return 1, 2 * time.Millisecond, nil
+	})
+	s := m.Hist.Summary()
+	if s.Max >= 4000 || s.Min < 1900 { // µs: ~2 ms, not the ~5 ms wall time
+		t.Fatalf("min %v max %v µs: self-timed latency was not used", s.Min, s.Max)
 	}
 }
 

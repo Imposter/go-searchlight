@@ -92,7 +92,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	percIter := fs.Int("percolate-iterations", 50, "measured percolate batches per saved-search set")
 	percSingle := fs.Int("percolate-single", 300, "measured single-document percolations per saved-search set")
 	bulkPercIter := fs.Int("bulk-percolate-iterations", 20, "measured _bulk?percolate requests")
-	visible := fs.Int("visible-iterations", 20, "measured write-to-visible iterations")
+	visible := fs.Int("visible-iterations", 300, "measured write-to-visible iterations (p99 needs >=1000 to be trusted; the report marks it n/a below that)")
 	mixed := fs.Duration("mixed", 30*time.Second, "how long the mixed read/write workload runs")
 	ccVariants := fs.Int("crosscheck-variants", 4, "variants per workload the cross-check compares")
 	only := fs.String("only", "", "comma-separated workloads or groups to run (default all)")
@@ -105,6 +105,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	md := fs.String("md", "", "also render the markdown report here")
 	label := fs.String("label", "", "a label for the report's title")
 	allowMismatch := fs.Bool("allow-mismatch", false, "exit 0 even when the cross-check fails")
+	stopOnMismatch := fs.Bool("stop-on-mismatch", false, "skip every timing workload once the cross-check finds an unresolved mismatch (comparative numbers from engines that disagree are not worth collecting)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -190,7 +191,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		RestartCmds:        map[string]string{report.Searchlight: *slRestart, report.Elasticsearch: *esRestart},
 		RestartIterations:  *restartIter,
 		Only:               splitList(*only), Skip: splitList(*skip),
-		LoadOnly: loadOnly, Log: stdout,
+		LoadOnly: loadOnly, StopOnMismatch: *stopOnMismatch, Log: stdout,
 	}
 	run, runErr := workloads.RunSuite(ctx, cfg, engines)
 	if run == nil {

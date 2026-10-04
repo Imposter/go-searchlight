@@ -8,8 +8,11 @@ import (
 )
 
 // Op is one iteration of a workload: the i-th request. It returns how many documents
-// it handled (for docs/s; 0 counts as 1).
-type Op func(ctx context.Context, i int) (docs int, err error)
+// it handled (for docs/s; 0 counts as 1), and optionally the latency to record in
+// place of the call's own wall time. Most ops return 0 and keep the wall time; an op
+// whose unmeasured tail work (a confirming read after a timed write, say) must not
+// count toward the measured latency returns that latency instead.
+type Op func(ctx context.Context, i int) (docs int, timed time.Duration, err error)
 
 // RunOptions say how a workload runs.
 type RunOptions struct {
@@ -99,8 +102,11 @@ func closedLoop(ctx context.Context, conc, start, n int, d time.Duration, op Op,
 					break
 				}
 				s := nanotime()
-				nd, err := op(ctx, int(i))
+				nd, timed, err := op(ctx, int(i))
 				lat := time.Duration(nanotime() - s)
+				if timed > 0 {
+					lat = timed
+				}
 				if err != nil {
 					if errs.Add(1) == 1 {
 						firstErr = err
@@ -167,8 +173,11 @@ func openLoop(ctx context.Context, o RunOptions, op Op, m *Measurement) {
 		}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			nd, err := op(ctx, o.Warmup+k)
+			nd, timed, err := op(ctx, o.Warmup+k)
 			lat := time.Duration(nanotime() - at)
+			if timed > 0 {
+				lat = timed
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

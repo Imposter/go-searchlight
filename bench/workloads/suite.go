@@ -63,6 +63,10 @@ type Config struct {
 
 	// LoadOnly stops after the load and footprint.
 	LoadOnly bool
+	// StopOnMismatch skips every timing workload once the cross-check (run right
+	// after the load) finds an unresolved mismatch: comparative numbers from engines
+	// that disagree on answers are not worth the time to collect.
+	StopOnMismatch bool
 	// Only and Skip filter workloads by name or group (empty Only: all).
 	Only, Skip []string
 	Log        io.Writer
@@ -88,7 +92,7 @@ func (c *Config) defaults() {
 	set(&c.PercolateIterations, 50)
 	set(&c.PercolateSingle, 300)
 	set(&c.BulkPercolateIterations, 20)
-	set(&c.VisibleIterations, 20)
+	set(&c.VisibleIterations, 300)
 	set(&c.MixedReaders, 4)
 	set(&c.MixedWriters, 1)
 	set(&c.MixedBatch, 500)
@@ -169,11 +173,20 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 	if cfg.LoadOnly {
 		steps = steps[:1]
 	}
-	for _, step := range steps {
+	const crossCheckStep = 1 // s.crossCheckSearches, above
+	for i, step := range steps {
 		if err := step(ctx); err != nil {
 			s.run.FinishedAt = time.Now().UTC()
 			return s.run, err
 		}
+		if i == crossCheckStep && cfg.StopOnMismatch && s.run.CrossCheck.Failed() {
+			s.run.Notes = append(s.run.Notes, "Stopped after the cross-check found an unresolved mismatch (--stop-on-mismatch): "+
+				"further timing workloads would compare answers that are already known to disagree.")
+			break
+		}
+	}
+	if !cfg.LoadOnly {
+		s.peakFootprint(ctx)
 	}
 	s.run.FinishedAt = time.Now().UTC()
 	s.run.Targets = report.Evaluate(s.run)
@@ -250,7 +263,7 @@ func (s *suite) load(ctx context.Context) error {
 		}
 		fp := report.Result{
 			Workload: "footprint", Group: report.GroupFootprint, Engine: eng.Name(), Ops: 1,
-			Description: "disk: " + r.DiskSource + "; RSS: " + r.RSSSource,
+			Description: "disk: " + r.DiskSource + "; RSS: " + r.RSSSource + " (right after the load)",
 			Values: map[string]float64{
 				"disk_bytes": float64(r.DiskBytes), "rss_bytes": float64(r.RSSBytes),
 				"disk_per_million": float64(r.DiskBytes) / float64(n) * 1e6,
@@ -265,6 +278,46 @@ func (s *suite) load(ctx context.Context) error {
 		s.run.Dataset.AvgDocBytes = float64(s.run.Dataset.FileBytes) / float64(s.loaded)
 	}
 	return nil
+}
+
+// peakFootprint re-measures disk and RSS once every workload has run, and keeps the
+// larger of that and the load-time measurement in the "footprint" result: RSS in
+// particular can grow well past its post-load level once merges, the percolator
+// index and the mixed workload have run, and spec section 1's T6 target is about the
+// engine's real footprint over the run, not just right after loading. Best-effort: a
+// measurement error here leaves the load-time numbers in place.
+func (s *suite) peakFootprint(ctx context.Context) {
+	for _, eng := range s.engines {
+		idx := -1
+		for i := range s.run.Results {
+			if s.run.Results[i].Workload == "footprint" && s.run.Results[i].Engine == eng.Name() {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			continue
+		}
+		r, err := eng.Resources(ctx, s.cfg.Index)
+		if err != nil {
+			continue
+		}
+		fp := &s.run.Results[idx]
+		peaked := false
+		if disk := float64(r.DiskBytes); disk > fp.Values["disk_bytes"] {
+			fp.Values["disk_bytes"], fp.Values["disk_per_million"] = disk, disk/float64(s.loaded)*1e6
+			peaked = true
+		}
+		if rss := float64(r.RSSBytes); rss > fp.Values["rss_bytes"] {
+			fp.Values["rss_bytes"], fp.Values["rss_per_million"] = rss, rss/float64(s.loaded)*1e6
+			peaked = true
+		}
+		if peaked {
+			fp.Description = "disk: " + r.DiskSource + "; RSS: " + r.RSSSource + " (peak across the run)"
+		}
+		s.logf("  footprint %s (peak): disk %s, RSS %s", eng.Name(),
+			report.FormatBytes(fp.Values["disk_bytes"]), report.FormatBytes(fp.Values["rss_bytes"]))
+	}
 }
 
 func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, error) {
@@ -510,9 +563,9 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 	}
 	o := s.cfg.Search
 	if spec.PageDepth == 0 {
-		op := func(ctx context.Context, i int) (int, error) {
+		op := func(ctx context.Context, i int) (int, time.Duration, error) {
 			_, err := eng.Search(ctx, s.cfg.Index, prepared[i%len(prepared)], nil)
-			return 1, err
+			return 1, 0, err
 		}
 		return s.result(spec.Name, spec.Group, spec.Description, eng, o, Run(ctx, o, op)), nil
 	}
@@ -521,7 +574,7 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 	perWalk := max(spec.PageDepth/pageSize, 1)
 	var cursor []any
 	walk := -1
-	op := func(ctx context.Context, i int) (int, error) {
+	op := func(ctx context.Context, i int) (int, time.Duration, error) {
 		w, p := i/perWalk, i%perWalk
 		if p == 0 || w != walk || cursor == nil {
 			walk, cursor = w, nil
@@ -529,10 +582,10 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 		res, err := eng.Search(ctx, s.cfg.Index, prepared[w%len(prepared)], cursor)
 		if err != nil {
 			cursor = nil
-			return 0, err
+			return 0, 0, err
 		}
 		cursor = res.Next
-		return 1, nil
+		return 1, 0, nil
 	}
 	po := RunOptions{Warmup: perWalk, Iterations: perWalk * s.cfg.PageWalks, Concurrency: 1}
 	return s.result(spec.Name, spec.Group, spec.Description, eng, po, Run(ctx, po, op)), nil
@@ -551,40 +604,47 @@ func (s *suite) visibility(ctx context.Context) error {
 		}
 		for _, eng := range s.engines {
 			o := RunOptions{Warmup: min(2, s.cfg.VisibleIterations), Iterations: s.cfg.VisibleIterations, Concurrency: 1}
-			op := func(ctx context.Context, i int) (int, error) {
+			op := func(ctx context.Context, i int) (int, time.Duration, error) {
 				id := fmt.Sprintf("v%s-%06d", strings.TrimPrefix(w, "refresh_"), i)
 				p, err := eng.Prepare(idQuery(id))
 				if err != nil {
-					return 0, err
+					return 0, 0, err
 				}
 				doc := Doc{ID: id, Body: datasets.AppendProduct(nil, s.cfg.Seed, s.loaded+1_000_000+int64(i))}
 				if w == "refresh_wait_for" {
-					if err := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for"); err != nil {
-						return 0, err
+					// Only the write is timed: refresh=wait_for's latency is the write's
+					// own, and the confirming search is an untimed correctness check
+					// (it fails the iteration if the write was not visible on return,
+					// but its own latency is not part of what T7 measures).
+					t0 := time.Now()
+					bulkErr := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for")
+					timed := time.Since(t0)
+					if bulkErr != nil {
+						return 0, 0, bulkErr
 					}
 					res, err := eng.Search(ctx, s.cfg.Index, p, nil)
 					if err != nil {
-						return 0, err
+						return 0, 0, err
 					}
 					if res.Total != 1 {
-						return 0, fmt.Errorf("%s: written with refresh=wait_for but not visible on return", id)
+						return 0, 0, fmt.Errorf("%s: written with refresh=wait_for but not visible on return", id)
 					}
-					return 1, nil
+					return 1, timed, nil
 				}
 				if err := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, ""); err != nil {
-					return 0, err
+					return 0, 0, err
 				}
 				deadline := time.Now().Add(10 * time.Second)
 				for {
 					res, err := eng.Search(ctx, s.cfg.Index, p, nil)
 					if err != nil {
-						return 0, err
+						return 0, 0, err
 					}
 					if res.Total == 1 {
-						return 1, nil
+						return 1, 0, nil
 					}
 					if time.Now().After(deadline) {
-						return 0, fmt.Errorf("%s not visible after 10 s", id)
+						return 0, 0, fmt.Errorf("%s not visible after 10 s", id)
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
@@ -625,19 +685,19 @@ func (s *suite) mixed(ctx context.Context) error {
 		var rm, wm *Measurement
 		var wg sync.WaitGroup
 		wg.Go(func() {
-			rm = Run(ctx, ro, func(ctx context.Context, i int) (int, error) {
+			rm = Run(ctx, ro, func(ctx context.Context, i int) (int, time.Duration, error) {
 				_, err := eng.Search(ctx, s.cfg.Index, prepared[i%len(prepared)], nil)
-				return 1, err
+				return 1, 0, err
 			})
 		})
 		wg.Go(func() {
-			wm = Run(ctx, wo, func(ctx context.Context, i int) (int, error) {
+			wm = Run(ctx, wo, func(ctx context.Context, i int) (int, time.Duration, error) {
 				docs := make([]Doc, s.cfg.MixedBatch)
 				for k := range docs {
 					j := (int64(i)*int64(s.cfg.MixedBatch) + int64(k)) % s.loaded
 					docs[k] = Doc{ID: datasets.ProductID(j), Body: datasets.AppendProduct(nil, s.cfg.Seed+1, j)}
 				}
-				return len(docs), eng.Bulk(ctx, s.cfg.Index, docs, "")
+				return len(docs), 0, eng.Bulk(ctx, s.cfg.Index, docs, "")
 			})
 		})
 		wg.Wait()
@@ -722,20 +782,20 @@ func (s *suite) percolation(ctx context.Context) error {
 			name := fmt.Sprintf("percolate_batch_%d", n)
 			if s.cfg.wants(name, report.GroupPercolate) {
 				o := RunOptions{Warmup: max(s.cfg.PercolateIterations/10, 2), Iterations: s.cfg.PercolateIterations, Concurrency: s.cfg.PercolateConcurrency}
-				op := func(ctx context.Context, i int) (int, error) {
+				op := func(ctx context.Context, i int) (int, time.Duration, error) {
 					start := (i * batch) % len(pool)
 					docs := pool[start:min(start+batch, len(pool))]
 					_, err := eng.Percolate(ctx, s.cfg.PercIndex, docs)
-					return len(docs), err
+					return len(docs), 0, err
 				}
 				s.add(s.result(name, report.GroupPercolate, fmt.Sprintf("%d documents per request against %d saved searches", batch, n), eng, o, Run(ctx, o, op)))
 			}
 			name = fmt.Sprintf("percolate_single_%d", n)
 			if s.cfg.wants(name, report.GroupPercolate) {
 				o := RunOptions{Warmup: max(s.cfg.PercolateSingle/10, 5), Iterations: s.cfg.PercolateSingle, Concurrency: 1}
-				op := func(ctx context.Context, i int) (int, error) {
+				op := func(ctx context.Context, i int) (int, time.Duration, error) {
 					_, err := eng.Percolate(ctx, s.cfg.PercIndex, pool[i%len(pool):i%len(pool)+1])
-					return 1, err
+					return 1, 0, err
 				}
 				s.add(s.result(name, report.GroupPercolate, fmt.Sprintf("one document per request against %d saved searches (per-document latency)", n), eng, o, Run(ctx, o, op)))
 			}
@@ -747,14 +807,14 @@ func (s *suite) percolation(ctx context.Context) error {
 	for _, eng := range s.engines {
 		const bp = 500
 		o := RunOptions{Warmup: 2, Iterations: s.cfg.BulkPercolateIterations, Concurrency: 1}
-		op := func(ctx context.Context, i int) (int, error) {
+		op := func(ctx context.Context, i int) (int, time.Duration, error) {
 			docs := make([]Doc, bp)
 			for k := range docs {
 				j := (i*bp + k) % len(pool)
 				docs[k] = Doc{ID: fmt.Sprintf("bp%09d", i*bp+k), Body: pool[j]}
 			}
 			_, err := eng.BulkPercolate(ctx, s.cfg.PercIndex, docs)
-			return bp, err
+			return bp, 0, err
 		}
 		desc := fmt.Sprintf("%d documents written and percolated per request against %d saved searches (Elasticsearch: _bulk then percolate)", bp, largest)
 		s.add(s.result("bulk_percolate", report.GroupPercolate, desc, eng, o, Run(ctx, o, op)))
@@ -804,7 +864,7 @@ func (s *suite) restart(ctx context.Context) error {
 			return err
 		}
 		o := RunOptions{Iterations: s.cfg.RestartIterations, Concurrency: 1}
-		op := func(ctx context.Context, _ int) (int, error) {
+		op := func(ctx context.Context, _ int) (int, time.Duration, error) {
 			var cmd *exec.Cmd
 			if runtime.GOOS == "windows" {
 				cmd = exec.CommandContext(ctx, "cmd", "/C", cmdline)
@@ -813,11 +873,11 @@ func (s *suite) restart(ctx context.Context) error {
 			}
 			cmd.Stdout, cmd.Stderr = s.cfg.Log, s.cfg.Log
 			if err := cmd.Run(); err != nil {
-				return 0, fmt.Errorf("restart command: %w", err)
+				return 0, 0, fmt.Errorf("restart command: %w", err)
 			}
 			rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 			defer cancel()
-			return 1, waitReady(rctx, func(ctx context.Context) error {
+			return 1, 0, waitReady(rctx, func(ctx context.Context) error {
 				n, err := eng.Count(ctx, s.cfg.Index)
 				if err != nil {
 					return err

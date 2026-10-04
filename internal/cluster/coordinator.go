@@ -274,6 +274,14 @@ type Node struct {
 	// leases of dropped indexes. Renewals do not take it: they wait on nothing.
 	allocMu sync.Mutex
 
+	// progressHW are this node's copies' progress high-water marks.
+	progressMu sync.Mutex
+	progressHW map[copyKey]int64
+
+	// startedAt is when the node was built: copy directories and staging an earlier
+	// run left count as unused from then.
+	startedAt time.Time
+
 	pins  *pinTable
 	snaps *snapTable
 	sums  *sumCache
@@ -316,16 +324,17 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		opts:   o,
-		cfg:    o.Config,
-		id:     o.Config.NodeID,
-		st:     o.Store,
-		reg:    o.Store.Registry(),
-		log:    o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
-		tr:     o.Tracer,
-		clock:  o.Clock,
-		leases: map[store.ShardID]*lease{},
-		scheme: "http",
+		opts:      o,
+		cfg:       o.Config,
+		id:        o.Config.NodeID,
+		st:        o.Store,
+		reg:       o.Store.Registry(),
+		log:       o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
+		tr:        o.Tracer,
+		clock:     o.Clock,
+		leases:    map[store.ShardID]*lease{},
+		scheme:    "http",
+		startedAt: time.Now(),
 	}
 	if o.Config.TLSCert != "" {
 		n.scheme = "https"

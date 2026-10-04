@@ -371,19 +371,35 @@ func (p *peerAPI) copies(*http.Request) (any, error) {
 }
 
 // localPeerCopies describes this node's copies for the peer API: with their epochs and
-// progress counters.
+// progress counters. A copy's counter is the high-water mark of its applied seq, its
+// documents and the bytes its current recovery attempt fetched: it moves only when the
+// copy gets further than it ever got, so a recovery that fails and redoes the same work
+// over and over shows no progress.
 func (n *Node) localPeerCopies() []peerCopy {
 	local := n.LocalCopies()
 	out := make([]peerCopy, 0, len(local))
 	for i := range local {
 		lc := &local[i]
 		id := store.ShardID{Index: lc.Info.Index, Shard: lc.Info.Shard}
+		now := lc.Info.AppliedSeq + int64(lc.Info.Docs) + n.fetch.progressOf(id) //nolint:gosec // a document count
 		out = append(out, peerCopy{
 			ShardInfo: lc.Info, Epoch: lc.Copy.Epoch, Paused: lc.Paused,
-			Progress: lc.Info.AppliedSeq + int64(lc.Info.Docs) + n.fetch.progressOf(id), //nolint:gosec // a document count
+			Progress: n.progressMark(copyKey{shard: id, node: n.id, epoch: lc.Copy.Epoch}, now),
 		})
 	}
 	return out
+}
+
+// progressMark raises copy k's progress high-water mark to now and returns it.
+func (n *Node) progressMark(k copyKey, now int64) int64 {
+	n.progressMu.Lock()
+	defer n.progressMu.Unlock()
+	if n.progressHW == nil {
+		n.progressHW = map[copyKey]int64{}
+	}
+	hw := max(n.progressHW[k], now)
+	n.progressHW[k] = hw
+	return hw
 }
 
 // snapshot takes a snapshot of a copy for a peer's recovery and lists its files with

@@ -191,6 +191,9 @@ type shardSlot struct {
 	host sync.Mutex
 	// local is this node's copy, nil when it hosts none.
 	local atomic.Pointer[copyState]
+	// unhostedAt is when this node last stopped hosting a copy of the shard (Unix
+	// nanoseconds; 0: not this run).
+	unhostedAt atomic.Int64
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.

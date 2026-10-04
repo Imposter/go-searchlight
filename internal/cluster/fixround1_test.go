@@ -349,3 +349,53 @@ func TestSQLiteServesOneNode(t *testing.T) {
 	last := mustWrite(t, b.n, "one", upsertOp("x", 1))
 	waitCount(t, b.n, "one", last, 1)
 }
+
+// TestDecommissionedRowsReleased (N2): the retiring rows a cleanly stopped node left
+// are deleted once their leases ran out more than retiring_retention ago, while the
+// node is gone from sl_nodes.
+func TestDecommissionedRowsReleased(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.PruneInterval = 100 * time.Millisecond
+		o.RetiringRetention = 300 * time.Millisecond
+	})
+	a := c.start(0)
+	createIndex(t, a.n, "dec", 1, 0)
+	b := c.start(1)
+	waitCopies(t, a.st, "dec", 1, 2, time.Minute)
+	gone := b.n.id
+	b.stop()
+	id := store.ShardID{Index: "dec", Shard: 0}
+	has := func() bool {
+		list, err := a.st.Registry().Copies(context.Background(), "dec")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range list {
+			if list[i].Shard == id && list[i].NodeID == gone {
+				return true
+			}
+		}
+		return false
+	}
+	if !has() {
+		t.Fatal("the stopped node's row is gone at once: Stop released it")
+	}
+	eventually(t, time.Minute, "the decommissioned node's row is released", func() error {
+		if has() {
+			return errors.New("still there")
+		}
+		return nil
+	})
+}
+
+// TestProgressHighWaterMark (I4): a copy's progress counter moves only when it gets
+// further than it ever got, so a recovery that keeps retrying the same work stalls.
+func TestProgressHighWaterMark(t *testing.T) {
+	n := &Node{}
+	k := copyKey{node: "n", epoch: 1}
+	for _, step := range []struct{ now, want int64 }{{10, 10}, {25, 25}, {3, 25}, {25, 25}, {24, 25}, {26, 26}} {
+		if got := n.progressMark(k, step.now); got != step.want {
+			t.Fatalf("progress %d after %d, want %d", got, step.now, step.want)
+		}
+	}
+}

@@ -227,7 +227,7 @@ type options struct {
 	logger    *slog.Logger
 	blobChunk int
 	gateKey   string // the database a single-writer dialect's write gate is shared by
-	walPath   string // its write-ahead log file
+	dbPath    string
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -295,10 +295,9 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 				p = abs
 			}
 			p = filepath.Clean(p)
-			o.walPath = p + "-wal"
-			o.gateKey = p
+			o.dbPath, o.gateKey = p, p
 			if runtime.GOOS == "windows" {
-				o.gateKey = strings.ToLower(p) // one file, however its path is cased
+				o.gateKey = strings.ToLower(p)
 			}
 		}
 	}

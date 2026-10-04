@@ -64,17 +64,20 @@ type Dialect struct {
 	ApplyTx    *sql.TxOptions
 	SnapshotTx *sql.TxOptions
 
-	// Checkpoint, when set, is run on a read connection every CheckpointEvery:
-	// SQLite's WAL checkpoint, taken off the write connection (whose automatic
-	// checkpoints are off), so a commit never stalls every other writer while it
-	// copies the log into the database.
-	Checkpoint      string
-	CheckpointEvery time.Duration
-	// CheckpointMinLog, when set, skips a checkpoint while the database's write-ahead
-	// log file (its path plus "-wal") is smaller: as SQLite's automatic checkpoint
-	// does (1,000 pages), but off the commit path, and with no extra fsync while the
-	// log is short.
+	// Checkpoint, when set, is SQLite's WAL checkpoint, returning (busy, log frames,
+	// checkpointed frames). The store runs it on a read connection, off the write
+	// connection (whose automatic checkpoints are off), so a commit never stalls every
+	// other writer while it copies the log into the database. Every CheckpointEvery
+	// the store asks PendingLog how many bytes of the log no checkpoint has copied
+	// yet, and checkpoints once that reaches CheckpointMinLog: as SQLite's automatic
+	// checkpoint does (1,000 pages), with no fsync while little is pending.
+	Checkpoint       string
+	CheckpointEvery  time.Duration
 	CheckpointMinLog int64
+	PendingLog       func(dbPath string) (int64, error)
+	// LogWarnBytes is the write-ahead log size past which, when a checkpoint could
+	// not copy every frame (a long reader pins the log), the store warns.
+	LogWarnBytes int64
 
 	// Retryable reports a transient error (deadlock, serialization failure,
 	// lock wait timeout) after which the whole transaction, rolled back by the

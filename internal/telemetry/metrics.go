@@ -162,6 +162,7 @@ const (
 	// Database.
 	MetricStoreOperationDuration = "searchlight.store.operation.duration"
 	MetricStoreErrors            = "searchlight.store.errors"
+	MetricStoreWALSize           = "searchlight.store.wal.size"
 )
 
 // Histogram bucket boundaries.
@@ -229,6 +230,7 @@ var Catalog = []MetricSpec{
 
 	{MetricStoreOperationDuration, KindHistogram, "s", "SQL store latency by operation and dialect.", FastBuckets},
 	{MetricStoreErrors, KindCounter, "{error}", "SQL store errors by operation and dialect.", nil},
+	{MetricStoreWALSize, KindGauge, "By", "SQLite's write-ahead log file size, and the part of it no checkpoint has copied yet (pending=true).", nil},
 }
 
 var catalogIndex = func() map[string]*MetricSpec {

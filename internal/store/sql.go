@@ -44,11 +44,13 @@ type sqlStore struct {
 	// after the changes are written and before COMMIT.
 	beforeCommit func(ctx context.Context, first, last int64)
 
-	gateKey string // the shared gate's key, released at Close
-	walPath string // the write-ahead log file (SQLite)
-	// stopBg stops the background checkpointer; bg waits for it.
-	stopBg context.CancelFunc
-	bg     sync.WaitGroup
+	gateKey     string
+	dbPath      string
+	stopBg      context.CancelFunc
+	bg          sync.WaitGroup
+	walGauge    metric.Float64Gauge
+	checkpoints atomic.Int64
+	logWarn     atomic.Int64
 
 	reg   *registry
 	blobs *blobStore
@@ -59,22 +61,23 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 	in := telemetry.NewInstruments(o.meter)
 	s := &sqlStore{
 		d: d, pools: pools, w: &gatedDB{DB: pools.Write}, r: pools.Read,
-		log:    o.logger.With(slog.String("component", "store"), slog.String("dialect", d.Name)),
-		tracer: o.tracer,
-		dur:    in.Histogram(telemetry.MetricStoreOperationDuration),
-		errs:   in.Counter(telemetry.MetricStoreErrors),
-		attr:   attribute.String("dialect", d.Name),
-		chunk:  o.blobChunk,
+		log:      o.logger.With(slog.String("component", "store"), slog.String("dialect", d.Name)),
+		tracer:   o.tracer,
+		dur:      in.Histogram(telemetry.MetricStoreOperationDuration),
+		errs:     in.Counter(telemetry.MetricStoreErrors),
+		attr:     attribute.String("dialect", d.Name),
+		chunk:    o.blobChunk,
+		dbPath:   o.dbPath,
+		walGauge: in.Gauge(telemetry.MetricStoreWALSize),
 	}
 	if err := in.Err(); err != nil {
 		return nil, fmt.Errorf("store instruments: %w", err)
 	}
 	if pools.Write.Stats().MaxOpenConnections == 1 {
-		// One write connection (SQLite): queue writers in lanes (gate.go), one gate
-		// for every store of this process on the same database file.
-		s.w.g, s.gateKey, s.walPath = acquireGate(o.gateKey), o.gateKey, o.walPath
+		s.w.g, s.gateKey = acquireGate(o.gateKey), o.gateKey
 	}
-	if d.Checkpoint != "" && d.CheckpointEvery > 0 {
+	s.logWarn.Store(d.LogWarnBytes)
+	if d.Checkpoint != "" && d.CheckpointEvery > 0 && d.PendingLog != nil && s.dbPath != "" {
 		ctx, cancel := context.WithCancel(context.Background())
 		s.stopBg = cancel
 		s.bg.Go(func() { s.checkpointLoop(ctx) })
@@ -183,28 +186,58 @@ func (s *sqlStore) Close() error {
 	return s.pools.Close()
 }
 
-// checkpointLoop runs the dialect's checkpoint every CheckpointEvery on a read
-// connection until ctx ends. A failure is retried at the next tick.
+// checkpointLoop checkpoints the write-ahead log off the write path (Dialect
+// Checkpoint) until ctx ends: every CheckpointEvery it reads how much of the log is
+// pending, records the log's size, and checkpoints once CheckpointMinLog is pending,
+// or anything is while the file is larger than that: a burst's log is copied back in
+// full, so SQLite restarts it and cuts the file down to its journal size limit.
+// A checkpoint a long reader keeps from copying every frame, with the log past
+// LogWarnBytes, is warned about at most once a minute.
 func (s *sqlStore) checkpointLoop(ctx context.Context) {
 	t := time.NewTicker(s.d.CheckpointEvery)
 	defer t.Stop()
+	var warned time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		if s.d.CheckpointMinLog > 0 && s.walPath != "" {
-			if info, err := os.Stat(s.walPath); err == nil && info.Size() < s.d.CheckpointMinLog {
-				continue // the log is short: no checkpoint (and no fsync) yet
-			}
+		size := s.walSize()
+		pending, err := s.d.PendingLog(s.dbPath)
+		if err != nil {
+			pending = s.d.CheckpointMinLog
 		}
+		s.walGauge.Record(ctx, float64(size), metric.WithAttributes(s.attr, attribute.Bool("pending", false)))
+		s.walGauge.Record(ctx, float64(pending), metric.WithAttributes(s.attr, attribute.Bool("pending", true)))
+		if pending == 0 || (pending < s.d.CheckpointMinLog && size <= s.d.CheckpointMinLog) {
+			continue
+		}
+		var busy, frames, copied int64
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
-		if _, err := s.r.ExecContext(cctx, s.d.Checkpoint); err != nil && ctx.Err() == nil {
-			s.log.DebugContext(ctx, "checkpoint failed; retried at the next tick", slog.Any("error", err))
-		}
+		err = s.r.QueryRowContext(cctx, s.d.Checkpoint).Scan(&busy, &frames, &copied)
 		cancel()
+		s.checkpoints.Add(1)
+		switch {
+		case err != nil:
+			if ctx.Err() == nil {
+				s.log.DebugContext(ctx, "checkpoint failed; retried at the next tick", slog.Any("error", err))
+			}
+		case copied < frames && size >= s.logWarn.Load() && time.Since(warned) >= time.Minute:
+			warned = time.Now()
+			s.log.WarnContext(ctx, "the write-ahead log keeps growing: a long read pins it, so checkpoints cannot copy it back",
+				slog.Int64("wal_bytes", size), slog.Int64("frames", frames), slog.Int64("checkpointed", copied))
+		}
 	}
+}
+
+// walSize is the write-ahead log file's size, 0 when there is none.
+func (s *sqlStore) walSize() int64 {
+	info, err := os.Stat(s.dbPath + "-wal")
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // rollback ends a transaction that did not commit.

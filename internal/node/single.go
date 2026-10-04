@@ -628,8 +628,8 @@ func (n *Single) runTailer(ctx context.Context, idx *index, c *copyState) {
 			stopped = err
 			n.log.ErrorContext(ctx, "shard copy tailer panicked", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("panic", p))
 		}
-		if stopped != nil && n.cl != nil {
-			n.cl.CopyStopped(c.id, stopped)
+		if stopped != nil && n.cl != nil && c.copy != nil {
+			n.cl.CopyStopped(*c.copy, stopped)
 		}
 	}()
 	err := c.tailer.Run(ctx)

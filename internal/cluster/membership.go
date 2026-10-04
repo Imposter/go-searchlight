@@ -208,7 +208,7 @@ func (n *Node) loseCopy(ctx context.Context, l *lease) {
 		return
 	}
 	n.dropLease(l.copy.Shard)
-	if err := n.UnhostCopy(context.WithoutCancel(ctx), l.copy.Shard, false); err != nil {
+	if err := n.UnhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
 		n.log.WarnContext(ctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
 	}
 }

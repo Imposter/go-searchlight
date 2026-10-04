@@ -49,22 +49,23 @@ func (n *Single) Hosted(id store.ShardID) (store.Copy, bool) {
 	return *c.copy, true
 }
 
-// UnhostCopy stops this node's copy of id: it stops serving at once, then its tailer
-// stops and its shard closes (a final commit), and with wipe its directory is removed
-// (in the background while readers still map its segments). It is a no-op when the
-// node hosts no copy of id.
-func (n *Single) UnhostCopy(ctx context.Context, id store.ShardID, wipe bool) error {
+// UnhostCopy stops this node's copy cp (its shard, at its epoch): it stops serving at
+// once, then its tailer stops and its shard closes (a final commit), and with wipe
+// its directory is removed (in the background while readers still map its segments).
+// It is a no-op when the node hosts no copy of the shard, or one of another epoch (a
+// later claim, or another incarnation of the index).
+func (n *Single) UnhostCopy(ctx context.Context, cp store.Copy, wipe bool) error {
 	mode := unhostClose
 	if wipe {
 		mode = unhostWipe
 	}
-	return n.unhost(ctx, id, mode)
+	return n.unhost(ctx, cp, mode)
 }
 
-// AbandonCopy stops this node's copy of id as a crash would: no final commit, the
+// AbandonCopy stops this node's copy cp as a crash would: no final commit, the
 // directory kept as it is (tests of node loss).
-func (n *Single) AbandonCopy(ctx context.Context, id store.ShardID) error {
-	return n.unhost(ctx, id, unhostAbandon)
+func (n *Single) AbandonCopy(ctx context.Context, cp store.Copy) error {
+	return n.unhost(ctx, cp, unhostAbandon)
 }
 
 type unhostMode int
@@ -75,7 +76,8 @@ const (
 	unhostAbandon
 )
 
-func (n *Single) unhost(ctx context.Context, id store.ShardID, mode unhostMode) error {
+func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) error {
+	id := cp.Shard
 	n.mu.RLock()
 	idx := n.indexes[id.Index]
 	n.mu.RUnlock()
@@ -85,10 +87,11 @@ func (n *Single) unhost(ctx context.Context, id store.ShardID, mode unhostMode) 
 	sl := idx.shards[id.Shard]
 	sl.host.Lock()
 	defer sl.host.Unlock()
-	c := sl.local.Swap(nil)
-	if c == nil {
+	c := sl.local.Load()
+	if c == nil || (c.copy != nil && c.copy.Epoch != cp.Epoch) {
 		return nil
 	}
+	sl.local.Store(nil)
 	c.cancel()
 	<-c.done
 	var err error

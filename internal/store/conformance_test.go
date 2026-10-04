@@ -1047,15 +1047,28 @@ func TestRetireCopy(t *testing.T) {
 		if retired.Load() != 1 {
 			t.Fatalf("%d copies retired, want 1", retired.Load())
 		}
+		// A copy of n1's slot at an epoch no claim ever gave is fenced off: its row
+		// keeps whatever state it had.
+		before, err := st.Registry().Copies(ctx, "ret")
+		if err != nil {
+			t.Fatal(err)
+		}
 		stale := copies[0]
-		stale.Epoch++
-		if _, err := st.Registry().RetireCopy(ctx, stale); err == nil {
-			// A stale epoch either finds no other serving copy or is fenced off.
-			list, _ := st.Registry().Copies(ctx, "ret")
-			for _, c := range list {
-				if c.Epoch == stale.Epoch {
-					t.Fatalf("a stale incarnation was retired: %+v", list)
-				}
+		for _, c := range before {
+			stale.Epoch = max(stale.Epoch, c.Epoch)
+		}
+		stale.Epoch += 1000
+		if ok, err := st.Registry().RetireCopy(ctx, stale); ok || (err != nil && !errors.Is(err, ErrLeaseLost)) {
+			t.Fatalf("a stale incarnation's retire: %v %v", ok, err)
+		}
+		after, err := st.Registry().Copies(ctx, "ret")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range before {
+			b, a := &before[i], &after[i]
+			if a.NodeID != b.NodeID || a.Slot != b.Slot || a.Epoch != b.Epoch || a.State != b.State {
+				t.Fatalf("a stale incarnation's retire changed %+v to %+v", *b, *a)
 			}
 		}
 	})

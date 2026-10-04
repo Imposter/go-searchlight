@@ -413,7 +413,16 @@ const (
 	ShardServing    = "serving"
 	ShardRecovering = "recovering"
 	ShardHalted     = "halted"
+	// ShardRetiring is a cluster node's copy being shut down (a rolling restart):
+	// it serves no reads, and a replacement may be placed meanwhile.
+	ShardRetiring = "retiring"
 )
+
+// Drainer is implemented by a coordinator that prepares for shutdown when the API
+// starts draining (the cluster node retires the copies others can stand in for).
+type Drainer interface {
+	Drain(ctx context.Context)
+}
 
 // ShardInfo describes one shard copy.
 type ShardInfo struct {

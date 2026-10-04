@@ -70,12 +70,20 @@ type Dialect struct {
 	// other writer while it copies the log into the database. Every CheckpointEvery
 	// the store asks PendingLog how many bytes of the log no checkpoint has copied
 	// yet, and checkpoints once that reaches CheckpointMinLog: as SQLite's automatic
-	// checkpoint does (1,000 pages), with no fsync while little is pending. When the
-	// log file has grown past TruncateAbove with little pending (a burst, copied back)
-	// it runs TruncateCheckpoint, which copies the rest and empties the file.
+	// checkpoint does (1,000 pages), with no fsync while little is pending.
+	//
+	// A log copied back in full is restarted by the next write, but under a steady
+	// stream of writes that moment never comes, so once the log file has grown past
+	// TruncateAbove the store empties it with TruncateCheckpoint, which blocks every
+	// writer while it runs. It does so on the write connection: when the writers are
+	// idle and at most TruncateMaxPending is left to copy; or, when they have not been
+	// idle for TruncateAfterTicks checks, next in line after the commit in flight
+	// (whatever that commit left to copy).
 	Checkpoint         string
 	TruncateCheckpoint string
 	TruncateAbove      int64
+	TruncateMaxPending int64
+	TruncateAfterTicks int
 	CheckpointEvery    time.Duration
 	CheckpointMinLog   int64
 	PendingLog         func(dbPath string) (int64, error)

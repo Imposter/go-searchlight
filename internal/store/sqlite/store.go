@@ -71,6 +71,8 @@ func Dialect() *dialect.Dialect {
 		Checkpoint:         "PRAGMA wal_checkpoint(PASSIVE)",
 		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
 		TruncateAbove:      4 * JournalSizeLimit,
+		TruncateMaxPending: 512 << 10,
+		TruncateAfterTicks: 4,
 		CheckpointEvery:    CheckpointEvery,
 		CheckpointMinLog:   JournalSizeLimit,
 		PendingLog:         PendingLog,
@@ -133,16 +135,27 @@ func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 
 
 // DSNs returns the driver DSNs for the writer and reader pools. Parameters in
 // the URL are passed through; journal mode, transaction locking and
-// (unless given) the busy timeout and synchronous level are set here.
+// (unless given) the busy timeout and synchronous level are set here. The store
+// checkpoints the write-ahead log itself, off the write connection, reading its
+// progress from the shared wal-index: the URL may not set the locking mode (an
+// exclusive one has no wal-index), automatic checkpoints or the journal size limit.
 func DSNs(u *url.URL) (write, read string, err error) {
 	path, err := Path(u)
 	if err != nil {
 		return "", "", err
 	}
 	q := u.Query()
-	for _, k := range []string{"_txlock", "_journal_mode", "_journal"} {
+	for _, k := range []string{"_txlock", "_journal_mode", "_journal", "_locking_mode", "_locking"} {
 		if q.Has(k) {
 			return "", "", fmt.Errorf("sqlite store URL may not set %s; the store manages it", k)
+		}
+	}
+	for _, p := range q["_pragma"] {
+		name, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(p)), "(")
+		name, _, _ = strings.Cut(name, "=")
+		switch strings.TrimSpace(name) {
+		case "journal_mode", "locking_mode", "wal_autocheckpoint", "journal_size_limit":
+			return "", "", fmt.Errorf("sqlite store URL may not set the %s pragma; the store manages it", strings.TrimSpace(name))
 		}
 	}
 	q.Set("_journal_mode", "WAL")
@@ -156,7 +169,7 @@ func DSNs(u *url.URL) (write, read string, err error) {
 	q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", JournalSizeLimit))
 	w := cloneValues(q)
 	w.Set("_txlock", "immediate")
-	w.Add("_pragma", "wal_autocheckpoint(0)") // the store checkpoints off the write path
+	w.Add("_pragma", "wal_autocheckpoint(0)")
 	r := cloneValues(q)
 	r.Set("_txlock", "deferred")
 	return path + "?" + w.Encode(), path + "?" + r.Encode(), nil

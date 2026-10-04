@@ -52,7 +52,9 @@ type sqlStore struct {
 	walGauge    metric.Float64Gauge
 	checkpoints atomic.Int64
 	truncates   atomic.Int64
-	logWarn     atomic.Int64
+	// truncateHold is the longest truncate held the write connection, in nanoseconds.
+	truncateHold atomic.Int64
+	logWarn      atomic.Int64
 
 	reg   *registry
 	blobs *blobStore
@@ -188,18 +190,14 @@ func (s *sqlStore) Close() error {
 	return s.pools.Close()
 }
 
-// checkpointLoop checkpoints the write-ahead log off the write path until ctx ends.
-// Every CheckpointEvery it records the log's size and how much of it is pending, and
-// runs Checkpoint once CheckpointMinLog is pending. A log copied back in full is
-// restarted by the next write, and journal_size_limit cuts its file down then; under
-// a steady stream of writes that moment never comes, so once the file has grown past
-// TruncateAbove the loop also empties it (truncate). A checkpoint a long reader keeps
-// from copying every frame, with the log past LogWarnBytes, is warned about at most
-// once a minute.
+// checkpointLoop checkpoints the write-ahead log off the write path until ctx ends,
+// as Dialect.Checkpoint describes. A checkpoint a long reader keeps from copying every
+// frame, with the log past LogWarnBytes, is warned about at most once a minute.
 func (s *sqlStore) checkpointLoop(ctx context.Context) {
 	t := time.NewTicker(s.d.CheckpointEvery)
 	defer t.Stop()
 	var warned time.Time
+	busyTicks := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -214,13 +212,26 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 		s.walGauge.Record(ctx, float64(size), metric.WithAttributes(s.attr, attribute.Bool("pending", false)))
 		s.walGauge.Record(ctx, float64(pending), metric.WithAttributes(s.attr, attribute.Bool("pending", true)))
 		oversized := pending > 0 && s.d.TruncateCheckpoint != "" && size > s.d.TruncateAbove
+		if !oversized {
+			busyTicks = 0
+		}
 		if pending < s.d.CheckpointMinLog && !oversized {
 			continue
 		}
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
 		frames, copied, err := s.checkpoint(cctx)
 		if err == nil && oversized && copied == frames {
-			err = s.truncate(cctx)
+			var truncated bool
+			switch {
+			case s.writersIdle():
+				truncated, err = s.truncate(cctx, s.d.TruncateMaxPending)
+			case busyTicks+1 >= s.d.TruncateAfterTicks:
+				truncated, err = s.truncate(withHighLane(cctx), -1)
+			}
+			busyTicks++
+			if truncated {
+				busyTicks = 0
+			}
 		}
 		cancel()
 		switch {
@@ -245,30 +256,34 @@ func (s *sqlStore) checkpoint(ctx context.Context) (frames, copied int64, err er
 	return frames, copied, err
 }
 
+func (s *sqlStore) writersIdle() bool {
+	return (s.w.g == nil || s.w.g.idle()) && s.w.DB.Stats().InUse == 0
+}
+
 // truncateBusyMS bounds how long truncate waits for readers while it holds the write
 // connection.
 const truncateBusyMS = 50
 
-// truncate empties the log file with TruncateCheckpoint, right after a passive one so
-// that little is left to copy. It blocks every writer while it runs, so it takes the
-// write connection in the high lane, as soon as the commit in flight ends, leaving
-// only that commit's frames to copy (more than CheckpointMinLog: it leaves the log to
-// a later tick), and gives up after truncateBusyMS on readers.
-func (s *sqlStore) truncate(ctx context.Context) error {
-	conn, err := s.w.Conn(withHighLane(ctx))
+// truncate runs TruncateCheckpoint on the write connection, taken in ctx's lane,
+// unless more than maxPending (when not negative) is left to copy by then. It reports
+// whether the checkpoint ran.
+func (s *sqlStore) truncate(ctx context.Context, maxPending int64) (bool, error) {
+	conn, err := s.w.Conn(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer conn.Close()
-	if pending, err := s.d.PendingLog(s.dbPath); err != nil || pending > s.d.CheckpointMinLog {
-		return err
+	held := time.Now()
+	defer func() { s.noteTruncateHold(time.Since(held)) }()
+	if pending, err := s.d.PendingLog(s.dbPath); err != nil || (maxPending >= 0 && pending > maxPending) {
+		return false, err
 	}
 	var was int64
 	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&was); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA busy_timeout = %d", truncateBusyMS)); err != nil {
-		return err
+		return false, err
 	}
 	defer func() {
 		if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf("PRAGMA busy_timeout = %d", was)); err != nil {
@@ -277,7 +292,16 @@ func (s *sqlStore) truncate(ctx context.Context) error {
 	}()
 	s.truncates.Add(1)
 	var busy, frames, copied int64
-	return conn.QueryRowContext(ctx, s.d.TruncateCheckpoint).Scan(&busy, &frames, &copied)
+	return true, conn.QueryRowContext(ctx, s.d.TruncateCheckpoint).Scan(&busy, &frames, &copied)
+}
+
+func (s *sqlStore) noteTruncateHold(d time.Duration) {
+	for {
+		cur := s.truncateHold.Load()
+		if int64(d) <= cur || s.truncateHold.CompareAndSwap(cur, int64(d)) {
+			return
+		}
+	}
 }
 
 // walSize is the write-ahead log file's size, 0 when there is none.

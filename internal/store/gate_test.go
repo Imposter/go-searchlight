@@ -137,20 +137,23 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	commit := elapsed / time.Duration(done)
 	sorted := slices.Clone(renewals)
 	slices.Sort(sorted)
-	median := sorted[len(sorted)/2]
+	median, p90 := sorted[len(sorted)/2], sorted[len(sorted)*9/10]
 	s, ok := st.(*sqlStore)
 	if !ok {
 		t.Fatalf("%T is not the SQL store", st)
 	}
-	t.Logf("renewals: median %s, slowest %s; a bulk commit (2000 changes) holds the connection %s on average (%d commits); log file %d bytes, %d truncations",
-		median, worst, commit, done, s.walSize(), s.truncates.Load())
-	// Typically one commit in flight; now and then the write connection is truncating
-	// the log instead.
+	truncateHold := time.Duration(s.truncateHold.Load())
+	t.Logf("renewals: median %s, p90 %s, slowest %s; a bulk commit (2000 changes) holds the connection %s on average (%d commits); "+
+		"log file %d bytes, %d truncations holding it up to %s",
+		median, p90, worst, commit, done, s.walSize(), s.truncates.Load(), truncateHold)
 	if limit := 2*commit + 50*time.Millisecond; median > limit {
 		t.Fatalf("the median renewal took %s under bulk load, more than about one commit in flight (%s)", median, limit)
 	}
-	if limit := 6*commit + 200*time.Millisecond; worst > limit {
-		t.Fatalf("a renewal took %s under bulk load (limit %s): it queued behind several commits", worst, limit)
+	if limit := 4*commit + 150*time.Millisecond; p90 > limit {
+		t.Fatalf("a tenth of the renewals took over %s under bulk load (limit %s): they queue behind several commits", p90, limit)
+	}
+	if limit := 8*commit + 300*time.Millisecond + truncateHold; worst > limit {
+		t.Fatalf("a renewal took %s under bulk load (limit %s, a truncation of the log included): it queued behind several commits", worst, limit)
 	}
 	if limit := 2 * s.d.TruncateAbove; s.walSize() > limit {
 		t.Fatalf("a steady stream of commits left a %d-byte log (limit %d): it never restarts on its own, and was not truncated", s.walSize(), limit)

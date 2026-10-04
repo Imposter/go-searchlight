@@ -33,7 +33,7 @@ func benchDB(b *testing.B) *db {
 func BenchmarkScatterGatherSearch(b *testing.B) {
 	for _, nodes := range []int{1, 3} {
 		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
-			c := newCluster(b, benchDB(b), nil)
+			c := newCluster(b, benchDB(b), heavyLoad)
 			a := c.start(0)
 			replicas := 0
 			if nodes > 1 {
@@ -46,14 +46,10 @@ func BenchmarkScatterGatherSearch(b *testing.B) {
 			last := bulkLoad(b, a.n, "sg", 0, 30_000, 5000)
 			waitCopies(b, a.st, "sg", 3, 1, time.Minute)
 			if nodes == 1 {
-				if got, err := count(tctx(b), a.n, "sg", last); err != nil || got != 30_000 {
-					b.Fatalf("counts %d (%v)", got, err)
-				}
+				waitCount(b, a.n, "sg", last, int64(30_000))
 			} else {
 				for _, tn := range c.live() {
-					if got, err := count(tctx(b), tn.n, "sg", last); err != nil || got != 30_000 {
-						b.Fatalf("node %d counts %d (%v)", tn.i, got, err)
-					}
+					waitCount(b, tn.n, "sg", last, int64(30_000))
 				}
 			}
 			q, problems := query.Parse([]byte(`{"field":"price","op":"between","value":[100,800]}`))
@@ -82,13 +78,11 @@ func BenchmarkScatterGatherSearch(b *testing.B) {
 // throughput is the copy's bytes over the time from the node's start to its copy
 // serving.
 func BenchmarkPeerRecovery(b *testing.B) {
-	c := newCluster(b, benchDB(b), nil)
+	c := newCluster(b, benchDB(b), heavyLoad)
 	a := c.start(0)
 	createIndex(b, a.n, "pr", 1, 0)
 	last := bulkLoad(b, a.n, "pr", 0, 50_000, 5000)
-	if got, err := count(tctx(b), a.n, "pr", last); err != nil || got != 50_000 {
-		b.Fatalf("counts %d (%v)", got, err)
-	}
+	waitCount(b, a.n, "pr", last, int64(50_000))
 	id := store.ShardID{Index: "pr", Shard: 0}
 	total := snapshotBytes(b, a, id)
 	var spent time.Duration
@@ -123,7 +117,7 @@ func BenchmarkPeerRecovery(b *testing.B) {
 func BenchmarkWriteThroughput(b *testing.B) {
 	for _, nodes := range []int{1, 3} {
 		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
-			c := newCluster(b, benchDB(b), nil)
+			c := newCluster(b, benchDB(b), heavyLoad)
 			a := c.start(0)
 			createIndex(b, a.n, "wt", 3, 0)
 			for i := 1; i < nodes; i++ {

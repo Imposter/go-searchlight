@@ -82,10 +82,7 @@ func TestJoinAllocateAndServe(t *testing.T) {
 			}
 		}
 		for _, tn := range c.live() {
-			got, err := count(tctx(t), tn.n, "items", last)
-			if err != nil || got != 30 {
-				t.Fatalf("node %d counts %d (%v), want 30", tn.i, got, err)
-			}
+			waitCount(t, tn.n, "items", last, int64(30))
 		}
 		nodes, err := a.n.Nodes(tctx(t))
 		if err != nil || len(nodes) != 3 || !nodes[0].Self {
@@ -191,10 +188,7 @@ func TestNodeKillReallocatesAndHealth(t *testing.T) {
 			}
 		}
 		for _, tn := range []*tnode{a, cn} {
-			got, err := count(tctx(t), tn.n, "r2", last)
-			if err != nil || got != 50 {
-				t.Fatalf("node %d counts %d (%v), want 50", tn.i, got, err)
-			}
+			waitCount(t, tn.n, "r2", last, int64(50))
 		}
 	})
 }
@@ -276,9 +270,7 @@ func TestReadsRetryAroundDeadNode(t *testing.T) {
 			last = mustWrite(t, a.n, "rr", upsertOp(fmt.Sprintf("d%d", k), k))
 		}
 		for _, tn := range c.live() {
-			if got, err := count(tctx(t), tn.n, "rr", last); err != nil || got != 40 {
-				t.Fatalf("node %d counts %d (%v)", tn.i, got, err)
-			}
+			waitCount(t, tn.n, "rr", last, int64(40))
 		}
 		victim := c.node(1)
 		survivors := []*tnode{c.node(0), c.node(2)}
@@ -358,16 +350,7 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, tn := range c.live() {
-			got, err := count(tctx(t), tn.n, "roll", head)
-			if err != nil || got != acked.Load() {
-				v := tn.n.view.Load()
-				for id, list := range v.copies {
-					for _, cp := range list {
-						t.Logf("view of node %d: %s %s slot %d %s lease %s live %v", tn.i, id, cp.NodeID, cp.Slot, cp.State, cp.LeaseLeft, v.live[cp.NodeID])
-					}
-				}
-				t.Fatalf("node %d counts %d (%v), want %d", tn.i, got, err, acked.Load())
-			}
+			waitCount(t, tn.n, "roll", head, acked.Load())
 		}
 	})
 }

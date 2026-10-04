@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -60,7 +61,10 @@ const (
 )
 
 // errNoSource is a recovery with no serving peer to fetch from.
-var errNoSource = errors.New("cluster: no serving peer holds a copy of the shard")
+var errNoSource = fmt.Errorf("cluster: no serving peer holds a copy of the shard: %w", replica.ErrNoSource)
+
+// errEmptySource is a peer whose copy holds nothing yet.
+var errEmptySource = fmt.Errorf("cluster: the peer's copy is empty: %w", replica.ErrNoSource)
 
 // fetcher is the replica.Fetcher: peer recovery.
 type fetcher struct {
@@ -97,6 +101,9 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 				return ctx.Err()
 			}
 			errs = append(errs, err)
+			if errors.Is(err, errEmptySource) {
+				break // nothing to fetch from this peer: try the next
+			}
 			n.log.WarnContext(ctx, "a peer recovery attempt failed", slog.String("shard", id.String()), slog.String("peer", c.node),
 				slog.Int("attempt", attempt), slog.Any("error", err))
 			var ae *api.Error
@@ -106,6 +113,9 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 			sleep(ctx, delay)
 			delay *= 2
 		}
+	}
+	if !slices.ContainsFunc(errs, func(err error) bool { return !errors.Is(err, errEmptySource) }) {
+		return errEmptySource // no peer has anything yet
 	}
 	return fmt.Errorf("cluster: peer recovery of %s failed: %w", id, errors.Join(errs...))
 }
@@ -131,7 +141,7 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 	})
 	if snap.Seq <= 0 {
 		// A copy at seq 0 holds nothing the store's snapshot would not give as well.
-		return 0, &api.Error{Status: http.StatusConflict, Code: api.CodeConflict, Detail: "the peer's copy is empty"}
+		return 0, errEmptySource
 	}
 	if len(snap.Files) == 0 || snap.Files[len(snap.Files)-1].Name != shard.ManifestName {
 		return 0, fmt.Errorf("cluster: the peer's snapshot of %s does not end with its manifest", id)

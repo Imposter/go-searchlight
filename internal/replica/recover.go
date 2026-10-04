@@ -31,6 +31,12 @@ type Fetcher interface {
 	Fetch(ctx context.Context, id ShardID, dir string) error
 }
 
+// ErrNoSource is what a Fetcher returns, wrapped, when no peer has a copy worth
+// fetching (none serves the shard, or the one that does holds nothing yet): the tailer
+// rebuilds from the store's snapshot, as it does after any fetch error, but this is no
+// failure.
+var ErrNoSource = errors.New("replica: no peer has a copy to fetch")
+
 // Recovery sources, for metrics and logs.
 const (
 	sourceSQL    = "sql"
@@ -459,7 +465,11 @@ func (t *Tailer) fetchInto(ctx context.Context, reason, dir string) (sh *shard.S
 	if ctx.Err() != nil {
 		return nil, false, ctx.Err()
 	}
-	t.log.WarnContext(ctx, "fetching the shard copy failed; rebuilding it from the store", slog.Any("error", used))
+	if errors.Is(used, ErrNoSource) {
+		t.log.InfoContext(ctx, "no peer has a copy to fetch; rebuilding it from the store", slog.Any("reason", used))
+	} else {
+		t.log.WarnContext(ctx, "fetching the shard copy failed; rebuilding it from the store", slog.Any("error", used))
+	}
 	return nil, false, t.wipe(ctx, dir)
 }
 

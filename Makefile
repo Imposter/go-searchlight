@@ -1,7 +1,8 @@
 # Searchlight developer targets. CI runs `make build test lint`.
 #
 #   make build    compile every package and the binary into bin/
-#   make test     go test -race ./... (RACE= to drop -race where cgo/gcc is missing)
+#   make test     go test -race ./... (RACE= to drop -race where cgo/gcc is missing); the
+#                 cluster suite runs three-node clusters, hence a 30 minute timeout
 #   make lint     go vet and golangci-lint
 #   make bench    every benchmark, with allocations
 #   make parity   regenerate testdata/parity/*.json and internal/analysis/tables.go from
@@ -26,7 +27,7 @@ build:
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/ ./cmd/searchlight
 
 test:
-	$(GO) test $(RACE) ./...
+	$(GO) test $(RACE) -timeout 30m ./...
 
 lint:
 	$(GO) vet ./...

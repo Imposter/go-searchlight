@@ -48,6 +48,7 @@ func bulkLoad(t testing.TB, n *Node, index string, from, count, batch int) int64
 // cutOnce makes the first stream of a file named match stop dead after limit bytes:
 // the connection drops mid-transfer.
 type cutOnce struct {
+	mu    sync.Mutex
 	match func(name string) bool
 	limit int64
 	fired atomic.Bool
@@ -55,14 +56,24 @@ type cutOnce struct {
 	corrupt bool
 }
 
+// arm sets which file is cut, and where.
+func (c *cutOnce) arm(match func(name string) bool, limit int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.match, c.limit = match, limit
+}
+
 func (c *cutOnce) wrap(name string, w http.ResponseWriter) http.ResponseWriter {
-	if !c.match(name) || c.fired.Load() {
+	c.mu.Lock()
+	match, limit := c.match, c.limit
+	c.mu.Unlock()
+	if match == nil || !match(name) || c.fired.Load() {
 		return w
 	}
 	if !c.fired.CompareAndSwap(false, true) {
 		return w
 	}
-	return &cutWriter{ResponseWriter: w, left: c.limit, corrupt: c.corrupt}
+	return &cutWriter{ResponseWriter: w, left: limit, corrupt: c.corrupt}
 }
 
 type cutWriter struct {
@@ -141,8 +152,8 @@ func TestPeerRecovery100k(t *testing.T) {
 		docs = 20_000
 	}
 	d := sqliteDB(t)
-	cut := &cutOnce{limit: 1 << 20}
-	bad := &cutOnce{limit: 100, corrupt: true}
+	cut := &cutOnce{}
+	bad := &cutOnce{corrupt: true}
 	c := newCluster(t, d, func(i int, o *Options) {
 		if i == 0 {
 			o.hooks = &testHooks{peerFile: func(name string, w http.ResponseWriter) http.ResponseWriter {
@@ -163,11 +174,10 @@ func TestPeerRecovery100k(t *testing.T) {
 		t.Fatalf("node-0's copy is %s", err)
 	}
 	name, size := biggestSegment(t, a, id)
-	cut.match = func(n string) bool { return n == name }
-	cut.limit = size / 3
-	bad.match = func(n string) bool { return n != name && n != "manifest" && strings.HasSuffix(n, ".seg") }
+	cut.arm(func(n string) bool { return n == name }, size/3)
+	bad.arm(func(n string) bool { return n != name && n != "manifest" && strings.HasSuffix(n, ".seg") }, 100)
 	total := snapshotBytes(t, a, id)
-	t.Logf("the copy is %d bytes; cutting %s (%d bytes) after %d", total, name, size, cut.limit)
+	t.Logf("the copy is %d bytes; cutting %s (%d bytes) after %d", total, name, size, size/3)
 
 	began = time.Now()
 	b := c.start(1)

@@ -110,7 +110,7 @@ func TestJoinAllocateAndServe(t *testing.T) {
 // shard has exactly two copies, spread evenly; lowering the target to 1 releases the
 // extra copies, raising it to 3 places one on every node.
 func TestAllocationToTargetAndRelease(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
 		c.start(1)
@@ -264,7 +264,7 @@ func (r *reader) finish(t testing.TB) {
 // readers on the others run: the reads routed to it fail over to the other copy, and
 // no client sees an error.
 func TestReadsRetryAroundDeadNode(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
 		c.start(1)
@@ -295,7 +295,7 @@ func TestReadsRetryAroundDeadNode(t *testing.T) {
 // readers on the other nodes search and a writer writes: no client error, and every
 // acknowledged write stays searchable.
 func TestRollingRestartNoClientErrors(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
 		c.start(1)

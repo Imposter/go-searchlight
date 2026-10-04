@@ -21,7 +21,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 		t.Fatalf("placeholders %v", got)
 	}
 	w := &dialect.Write{Counter: 7}
-	st := write(w)
+	st := write(w, limits)
 	if len(st) != 1 || len(st[0].Args) != 28 {
 		t.Fatalf("an empty write: %d statements, %d args", len(st), len(st[0].Args))
 	}
@@ -48,7 +48,7 @@ func TestWriteParts(t *testing.T) {
 	for i := range 3 {
 		w.Documents = append(w.Documents, dialect.DocumentRow{Index: "i", ID: fmt.Sprint("d", i), Body: strings.Repeat("b", 40), Seq: int64(i)})
 	}
-	parts := writeParts(w, 100) // three 40-byte rows a part
+	parts := write(w, dialect.Limits{Bytes: 120}) // three 40-byte rows a part
 	if len(parts) != 4 {
 		t.Fatalf("%d parts, want 4", len(parts))
 	}
@@ -81,7 +81,7 @@ func TestWriteParts(t *testing.T) {
 	if !slices.Equal(docs, []string{"d0", "d1", "d2"}) {
 		t.Errorf("documents %v", docs)
 	}
-	if len(write(w)) != 1 {
+	if len(write(w, limits)) != 1 || len(write(w, dialect.Limits{})) != 1 {
 		t.Error("a small write is not one statement")
 	}
 }

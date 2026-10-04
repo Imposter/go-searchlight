@@ -35,6 +35,7 @@ var changelog = dialect.Changelog{
 	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
 	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
 	Write:         write,
+	Limits:        limits,
 	ChangesAfter:  "SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
 	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2",
 	ScanDocuments: "SELECT id, body, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 ORDER BY id",
@@ -44,9 +45,15 @@ var changelog = dialect.Changelog{
 // writeSQL is the whole of an Apply's (or a mapping change's) write as one
 // statement of fixed text: every table's rows travel as arrays, so a batch of
 // any size is one round trip, parsed and planned once per connection, with no
-// bind-parameter limit to chunk around. Empty arrays write nothing. The parts
-// touch disjoint rows (the store sends at most one entry per key), which data-
-// modifying WITH queries require; the final SELECT announces the commit.
+// bind-parameter limit to chunk around. Empty arrays write nothing. The final
+// SELECT announces the commit.
+//
+// Precondition: the parts touch disjoint rows. The store sends at most one
+// entry per key across a table's upserts and deletes (netState keeps the
+// last change to each key). Postgres does not check this for us: the WITH
+// parts all see the snapshot from before the statement, so an upsert and a
+// delete of the same key would both "succeed" and the upsert would silently
+// win; only two upserts of one key fail ("cannot affect row a second time").
 const writeSQL = `WITH changes AS (
 	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version)
 	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::text[], $9::bigint[])
@@ -69,19 +76,18 @@ const writeSQL = `WITH changes AS (
 )
 SELECT pg_notify('` + notifyChannel + `', payload) FROM unnest($28::text[]) AS payload`
 
-// maxWriteBytes bounds the payload bytes of one write statement, well below
-// the 1 GB a single array value (and a protocol message) may hold. A batch
-// beyond it is written in several statements of the same text.
-const maxWriteBytes = 64 << 20
+// limits is the engine's: one write statement carries at most 64 MB of
+// payload, well below the 1 GB a single array value (and a protocol message)
+// may hold. A batch beyond it is written in several statements of the same
+// text. Bind parameters never limit it: writeSQL always takes 28.
+var limits = dialect.Limits{Bytes: 64 << 20}
 
-// write spells w as writeSQL statements: one, unless its payloads pass
-// maxWriteBytes.
-func write(w *dialect.Write) []dialect.Stmt { return writeParts(w, maxWriteBytes) }
-
-// writeParts spells w in parts of about limit payload bytes. Each part sets
-// the same counter value; the deletes go with the first part and the
-// notifications with the last, so they happen once.
-func writeParts(w *dialect.Write, limit int) []dialect.Stmt {
+// write spells w in parts of about l.Bytes payload bytes: one, unless the
+// batch is that large. Each part sets the same counter value; the deletes go
+// with the first part and the notifications with the last, so they happen
+// once.
+func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
+	limit := l.Bytes
 	changes := split(len(w.Changes), limit, func(i int) int { return len(w.Changes[i].Payload) })
 	docs := split(len(w.Documents), limit, func(i int) int { return len(w.Documents[i].Body) })
 	queries := split(len(w.Queries), limit, func(i int) int { return len(w.Queries[i].Query) + len(w.Queries[i].Meta) })
@@ -111,14 +117,19 @@ func writeParts(w *dialect.Write, limit int) []dialect.Stmt {
 	return out
 }
 
-// split cuts n rows into [start, end) ranges, each closed once its rows'
-// sizes pass limit (so a row larger than limit goes alone).
+// split cuts n rows into [start, end) ranges whose sizes add up to at most
+// limit, closing a range before the row that would pass it (a row larger
+// than limit goes alone). A limit of 0 is no limit.
 func split(n, limit int, size func(int) int) [][2]int {
 	var out [][2]int
 	for start := 0; start < n; {
 		end, bytes := start, 0
-		for end < n && (end == start || bytes < limit) {
-			bytes += size(end)
+		for end < n {
+			sz := size(end)
+			if limit > 0 && end > start && bytes+sz > limit {
+				break
+			}
+			bytes += sz
 			end++
 		}
 		out = append(out, [2]int{start, end})

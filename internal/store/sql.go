@@ -363,7 +363,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 // and the notifications. A statement text that runs several times in a row
 // is prepared once for the run.
 func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) error {
-	stmts := s.d.Changelog.Write(w)
+	stmts := s.d.Changelog.Write(w, s.d.Changelog.Limits)
 	var run *sql.Stmt // prepared for stmts[i].SQL while it repeats
 	defer func() {
 		if run != nil {

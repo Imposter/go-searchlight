@@ -188,8 +188,10 @@ func TestApplyAndRead(t *testing.T) {
 	})
 }
 
-// TestBigBatch covers multi-statement inserts (more rows than one INSERT
-// carries) and in-batch rewrites of the same document.
+// TestBigBatch covers a large batch with in-batch rewrites and deletes of the
+// same documents. At the engines' own limits it fits one statement a table on
+// Postgres and MySQL (SQLite writes a row a statement); TestSplitWrites
+// drives the multi-statement paths with shrunk limits.
 func TestBigBatch(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		st := h.open(t)

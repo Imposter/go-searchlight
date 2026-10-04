@@ -38,12 +38,8 @@ var changelog = dialect.Changelog{
 	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
-// write spells w one row a statement: the store prepares a statement that
-// repeats once and runs it for each row. SQLite has no round trips to save,
-// and compiling a multi-row VALUES list costs more than stepping a prepared
-// statement per row (Apply of 1000 rows: about 1.9x the throughput of
-// 500-row statements, see the store benchmarks).
-func write(w *dialect.Write) []dialect.Stmt {
+// write spells w one row a statement; see the package comment for why.
+func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 	out := make([]dialect.Stmt, 0, len(w.Changes)+len(w.Documents)+len(w.Queries)+len(w.DocumentDeletes)+len(w.QueryDeletes)+1)
 	for i := range w.Changes {
 		r := &w.Changes[i]

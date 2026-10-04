@@ -3,13 +3,18 @@
 //
 // Apply locks the counter row with SELECT ... FOR UPDATE under READ
 // COMMITTED, so sequence numbers are assigned and committed in order, and
-// writes a batch as multi-row INSERTs sized to MySQL's placeholder limit.
+// writes a batch as multi-row INSERTs sized to MySQL's placeholder and packet
+// limits.
 // MySQL DDL is not transactional, so migrations run on one connection holding
 // a GET_LOCK named after an MD5 hash of the database (a name can run to 64
 // bytes, which a long database name alone could exceed), and each file is
 // recorded as it completes. Identifiers and names are VARBINARY: ids compare
 // byte for byte, as on the other dialects, instead of under a
 // case-insensitive collation.
+//
+// It needs MySQL 8.0.19 or later (upserts use the row alias, INSERT ... AS new
+// ON DUPLICATE KEY UPDATE col = new.col) and is tested on 8.4 LTS. The
+// server's max_allowed_packet must be at least 64 MB, the default.
 package mysql
 
 import (
@@ -91,6 +96,9 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.InterpolateParams = true
 	cfg.ClientFoundRows = true
+	// Read max_allowed_packet from the server, so a statement the server
+	// would take is never refused, or interpolated past it, client-side.
+	cfg.MaxAllowedPacket = 0
 	cfg.MultiStatements = false
 	cfg.Loc = time.UTC
 	if cfg.Params == nil {

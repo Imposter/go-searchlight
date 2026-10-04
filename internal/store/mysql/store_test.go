@@ -27,7 +27,7 @@ func TestConfigFromCIURL(t *testing.T) {
 	if cfg.User != "searchlight" || cfg.Passwd != "searchlight" || cfg.Net != "tcp" || cfg.Addr != "127.0.0.1:3306" || cfg.DBName != "searchlight" {
 		t.Fatalf("config %+v", cfg)
 	}
-	if !cfg.InterpolateParams || !cfg.ClientFoundRows || cfg.MultiStatements || cfg.Loc != time.UTC {
+	if !cfg.InterpolateParams || !cfg.ClientFoundRows || cfg.MultiStatements || cfg.Loc != time.UTC || cfg.MaxAllowedPacket != 0 {
 		t.Fatalf("store settings not forced: %+v", cfg)
 	}
 	if cfg.Params["time_zone"] != "'+00:00'" {

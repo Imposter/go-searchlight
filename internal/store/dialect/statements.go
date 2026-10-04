@@ -10,6 +10,15 @@ package dialect
 // A few statements are built from rows (the batch writes); those are
 // functions returning Stmts. A Returning is a write the store reads back.
 
+// Limits bound one batch-write statement. Zero means no bound.
+type Limits struct {
+	// Params is the most bind parameters a statement takes.
+	Params int
+	// Bytes is roughly the most argument bytes a statement carries, as the
+	// engine counts them (MySQL counts the escaped, interpolated form).
+	Bytes int
+}
+
 // Stmt is one statement with its arguments.
 type Stmt struct {
 	// What names the step in errors ("insert changes", "upsert documents").
@@ -99,10 +108,14 @@ type Changelog struct {
 	DocumentSeq string
 	QuerySeq    string
 	// Write returns the statements that store w, in order, inside the
-	// transaction holding the counter lock. The store prepares a statement
-	// text that runs several times in a row once for the run, so one row a
-	// statement costs no parse per row.
-	Write func(w *Write) []Stmt
+	// transaction holding the counter lock, splitting a batch so that no
+	// statement passes l. The store prepares a statement text that runs
+	// several times in a row once for the run, so one row a statement costs
+	// no parse per row.
+	Write func(w *Write, l Limits) []Stmt
+	// Limits are the engine's statement limits Write is called with. Tests
+	// shrink them to drive the split paths on a real server.
+	Limits Limits
 	// ChangesAfter: (index, shard, seq, limit) -> seq, kind, id, payload, at,
 	// index_uid, mapping_version of the shard's changes after seq, by seq.
 	ChangesAfter string

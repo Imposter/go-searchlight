@@ -13,8 +13,16 @@
 // retried like a Postgres serialization failure or a MySQL deadlock: the
 // whole transaction was never committed, so running it again is safe.
 //
-// A batch is written one row a statement, each prepared once per batch,
-// and writes that are read back use RETURNING (SQLite 3.35 and later).
+// A batch is written one row a statement, not as multi-row VALUES lists:
+// the store prepares each statement text once per batch and steps it for
+// every row. SQLite runs in process, so there are no round trips for long
+// VALUES lists to save, while compiling a list of hundreds of rows costs more
+// than stepping a prepared statement per row. Measured with fixed iterations,
+// Apply of 1000 1 KB documents runs about 2.1 times as fast as with VALUES
+// lists sized to the variable limit, and about 1.8 times as fast as main's
+// 500-row lists (BenchmarkApply in package store). The store's limits are
+// therefore unused here. Writes that are read back use RETURNING (SQLite 3.35
+// and later).
 package sqlite
 
 import (

@@ -34,8 +34,6 @@ type candidate struct {
 // key names the copy for adaptive replica selection's staleness memory.
 func (c candidate) key() string { return c.node + "|" + c.shard.String() }
 
-// candidates lists the serving copies of id on live peers, best first (adaptive
-// replica selection).
 // ErrNoServingCopy is the cause of the 503 a request for a shard no node serves a copy
 // of gets: one that the registry, read again, shows no serving copy of either (an index
 // whose copies are still being placed or recovered, or whose nodes are all down).
@@ -70,6 +68,8 @@ func noServingCopy(id store.ShardID) *api.Error {
 	return api.Unavailable(ErrNoServingCopy, "no node serves a copy of shard %d of index %q yet; retry", id.Shard, id.Index)
 }
 
+// candidates lists the serving copies of id on live peers, best first (adaptive
+// replica selection).
 func (n *Node) candidates(id store.ShardID) []candidate {
 	v := n.view.Load()
 	var out []candidate

@@ -235,7 +235,7 @@ func TestConcurrentWritersOnEveryNode(t *testing.T) {
 // through the others. No acknowledged write is lost, and the surviving copies converge
 // to the store.
 func TestNodeLossMidBulk(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, noPrune)
 		a := c.start(0)
 		createIndex(t, a.n, "mb", 2, 2)
@@ -343,7 +343,7 @@ func TestNodeLossMidRecovery(t *testing.T) {
 // many small segments a burst of refreshed writes left. Restarted, it reopens its
 // copies (or rebuilds them) and converges; nothing acknowledged is lost.
 func TestNodeLossMidMerge(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, noPrune)
 		a := c.start(0)
 		createIndex(t, a.n, "mm", 1, 0)
@@ -372,7 +372,7 @@ func TestNodeLossMidMerge(t *testing.T) {
 // internal refs. A search sorted and paged across shards matches one over the store's
 // truth; percolation and stored-document percolation reach the peers' saved queries.
 func TestMultiShardSearchAcrossNodes(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
 		c.start(1)

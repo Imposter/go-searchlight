@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -83,6 +84,23 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, d *db)) {
 			t.Skip(envMySQL + " is not set")
 		}
 		fn(t, mysqlDB(t, base))
+	})
+}
+
+// forSQLiteAndPostgres runs fn on SQLite and, when it is configured, Postgres (whose
+// notifications drive the replica Hub): the heaviest tests skip MySQL, which shares one
+// database across every package's tests in CI.
+func forSQLiteAndPostgres(t *testing.T, fn func(t *testing.T, d *db)) {
+	t.Helper()
+	t.Run("sqlite", func(t *testing.T) {
+		fn(t, sqliteDB(t))
+	})
+	t.Run("postgres", func(t *testing.T) {
+		base := os.Getenv(envPG)
+		if base == "" {
+			t.Skip(envPG + " is not set")
+		}
+		fn(t, postgresDB(t, base))
 	})
 }
 
@@ -230,7 +248,7 @@ type tnode struct {
 	srv   *http.Server
 	addr  string
 	wrap  *faultStore
-	alive bool
+	alive atomic.Bool
 }
 
 func newCluster(t testing.TB, d *db, mod func(i int, o *Options)) *cluster {
@@ -311,7 +329,7 @@ func (c *cluster) start(i int) *tnode {
 	if err := n.Start(context.Background()); err != nil {
 		c.t.Fatal(err)
 	}
-	tn.alive = true
+	tn.alive.Store(true)
 	c.mu.Lock()
 	c.nodes[i] = tn
 	c.mu.Unlock()
@@ -331,7 +349,7 @@ func (c *cluster) live() []*tnode {
 	defer c.mu.Unlock()
 	var out []*tnode
 	for i := range len(c.nodes) + 8 {
-		if tn := c.nodes[i]; tn != nil && tn.alive {
+		if tn := c.nodes[i]; tn != nil && tn.alive.Load() {
 			out = append(out, tn)
 		}
 	}
@@ -349,7 +367,7 @@ func (tn *tnode) stop() {
 	if err := tn.n.Stop(ctx); err != nil {
 		tn.c.t.Errorf("stop node %d: %v", tn.i, err)
 	}
-	tn.alive = false
+	tn.alive.Store(false)
 	_ = tn.wrap.Close()
 }
 
@@ -358,7 +376,7 @@ func (tn *tnode) stop() {
 func (tn *tnode) kill() {
 	_ = tn.srv.Close()
 	tn.n.kill()
-	tn.alive = false
+	tn.alive.Store(false)
 	_ = tn.wrap.Close()
 }
 
@@ -368,7 +386,7 @@ func (c *cluster) close() {
 		_ = tn.srv.Close()
 		_ = tn.n.Stop(ctx)
 		cancel()
-		tn.alive = false
+		tn.alive.Store(false)
 		_ = tn.wrap.Close()
 	}
 }

@@ -966,6 +966,9 @@ func TestRegistryFencing(t *testing.T) {
 		if err != nil || !ok || thief.Slot != first.Slot {
 			t.Fatal(thief, ok, err)
 		}
+		if thief.TakenFrom != "n1" || first.TakenFrom != "" {
+			t.Fatalf("TakenFrom: first %q, thief %q", first.TakenFrom, thief.TakenFrom)
+		}
 		if err := reg.ReleaseCopy(ctx, thief); err != nil {
 			t.Fatal(err)
 		}
@@ -996,6 +999,64 @@ func TestRegistryFencing(t *testing.T) {
 		// Epochs never consume changelog sequence numbers.
 		if got := counterValue(t, st); got != 0 {
 			t.Fatalf("claims moved the seq counter to %d", got)
+		}
+	})
+}
+
+// TestRetireCopy: a copy is marked retiring only while another node's copy serves;
+// of two copies retiring at once, one stays.
+func TestRetireCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "ret")
+		shard := ShardID{Index: "ret"}
+		var copies []Copy
+		for _, n := range []string{"n1", "n2"} {
+			c, ok, err := st.Registry().ClaimCopy(ctx, shard, n, 2, time.Minute)
+			if err != nil || !ok {
+				t.Fatal(ok, err)
+			}
+			copies = append(copies, c)
+		}
+		// Neither serves: nothing stands in for the other.
+		if ok, err := st.Registry().RetireCopy(ctx, copies[0]); err != nil || ok {
+			t.Fatalf("retired with no other serving copy: %v %v", ok, err)
+		}
+		for _, c := range copies {
+			if err := st.Registry().SetCopyState(ctx, c, CopyServing); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Both drain at once, each through its own connection: one retires.
+		var retired atomic.Int32
+		var wg sync.WaitGroup
+		for _, c := range copies {
+			reg := h.open(t).Registry()
+			wg.Go(func() {
+				ok, err := reg.RetireCopy(ctx, c)
+				if err != nil {
+					t.Error(err)
+				}
+				if ok {
+					retired.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+		if retired.Load() != 1 {
+			t.Fatalf("%d copies retired, want 1", retired.Load())
+		}
+		stale := copies[0]
+		stale.Epoch++
+		if _, err := st.Registry().RetireCopy(ctx, stale); err == nil {
+			// A stale epoch either finds no other serving copy or is fenced off.
+			list, _ := st.Registry().Copies(ctx, "ret")
+			for _, c := range list {
+				if c.Epoch == stale.Epoch {
+					t.Fatalf("a stale incarnation was retired: %+v", list)
+				}
+			}
 		}
 	})
 }

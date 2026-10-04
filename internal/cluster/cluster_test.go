@@ -3,7 +3,9 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -621,4 +623,36 @@ func (c *fakeClock) Wall() time.Time    { return time.Unix(0, c.wall.Load()) }
 func (c *fakeClock) set(d time.Duration) {
 	c.wall.Add(int64(d) - c.now.Load())
 	c.now.Store(int64(d))
+}
+
+// TestReadRightAfterCreateOnAnotherNode: an index created on one node is read on
+// another at once, before that node's routing view or catalogue would next sync on
+// their own. The reader finds the index in the store and its copies in the registry,
+// and answers; a shard no node serves gets ErrNoServingCopy's 503, not a closed store.
+func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		c := newCluster(t, d, func(i int, o *Options) {
+			if i == 1 {
+				o.HeartbeatInterval = 1500 * time.Millisecond
+				o.ViewInterval = time.Hour
+				o.CatalogInterval = time.Hour
+				o.PruneInterval = time.Hour
+			}
+		})
+		a, b := c.start(0), c.start(1)
+		for k := range 5 {
+			name := fmt.Sprintf("fresh%d", k)
+			createIndex(t, a.n, name, 2, 0)
+			seq := mustWrite(t, a.n, name, upsertOp("x", 1))
+			got, err := count(tctx(t), b.n, name, seq)
+			if err != nil || got != 1 {
+				t.Fatalf("read of %s on the other node right after it was created: %d, %v", name, got, err)
+			}
+		}
+		_, err := (&clusterHooks{b.n}).Remote(tctx(t), store.ShardID{Index: "nowhere", Shard: 0}, 0)
+		var ae *api.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || !errors.Is(err, ErrNoServingCopy) || errors.Is(err, store.ErrClosed) {
+			t.Fatalf("a shard no node serves: %v, want ErrNoServingCopy's 503", err)
+		}
+	})
 }

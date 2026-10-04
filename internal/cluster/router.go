@@ -36,6 +36,40 @@ func (c candidate) key() string { return c.node + "|" + c.shard.String() }
 
 // candidates lists the serving copies of id on live peers, best first (adaptive
 // replica selection).
+// ErrNoServingCopy is the cause of the 503 a request for a shard no node serves a copy
+// of gets: one that the registry, read again, shows no serving copy of either (an index
+// whose copies are still being placed or recovered, or whose nodes are all down).
+var ErrNoServingCopy = errors.New("cluster: no node serves a copy of the shard")
+
+// routeCandidates is candidates, read again from a fresh view when the routing view
+// has none: the view lags the registry by up to ViewInterval, and a copy claimed
+// since (an index another node just created) is served at once.
+func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidate {
+	if c := n.candidates(id); len(c) > 0 {
+		return c
+	}
+	n.refreshOnMiss(ctx)
+	return n.candidates(id)
+}
+
+// refreshOnMiss re-reads the registry for routing, unless a read that began after the
+// call did meanwhile: concurrent misses share one registry read.
+func (n *Node) refreshOnMiss(ctx context.Context) {
+	asked := n.clock.Now()
+	n.missMu.Lock()
+	defer n.missMu.Unlock()
+	if v := n.view.Load(); v != nil && v.read >= asked {
+		return
+	}
+	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
+		n.log.DebugContext(ctx, "reading the registry for a shard with no copy in view failed", slog.Any("error", err))
+	}
+}
+
+func noServingCopy(id store.ShardID) *api.Error {
+	return api.Unavailable(ErrNoServingCopy, "no node serves a copy of shard %d of index %q yet; retry", id.Shard, id.Index)
+}
+
 func (n *Node) candidates(id store.ShardID) []candidate {
 	v := n.view.Load()
 	var out []candidate
@@ -407,10 +441,10 @@ func (n *Node) closeBackground() {
 // --- the engine's hooks (node.Cluster) ----------------------------------------------
 
 // Remote implements node.Cluster.
-func (h *clusterHooks) Remote(_ context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
-	cands := h.n.candidates(id)
+func (h *clusterHooks) Remote(ctx context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
+	cands := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
-		return nil, api.Unavailable(store.ErrClosed, "no other node holds a serving copy of shard %d of index %q", id.Shard, id.Index)
+		return nil, noServingCopy(id)
 	}
 	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands}, nil
 }
@@ -443,11 +477,14 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
 	cands := n.candidates(id)
+	if len(cands) == 0 && !localDone {
+		cands = n.routeCandidates(ctx, id)
+	}
 	if len(cands) == 0 {
 		if localDone {
 			return nil
 		}
-		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q serves to wait on", id.Shard, id.Index)
+		return noServingCopy(id)
 	}
 	errs := make([]error, len(cands))
 	var reached atomic.Int32
@@ -473,7 +510,7 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 		return err
 	}
 	if reached.Load() == 0 && !localDone {
-		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q reached seq %d", id.Shard, id.Index, seq)
+		return api.Unavailable(ErrNoServingCopy, "no copy of shard %d of index %q reached seq %d", id.Shard, id.Index, seq)
 	}
 	return nil
 }
@@ -504,9 +541,9 @@ func (h *clusterHooks) CopyStopped(c store.Copy, err error) {
 
 // Counts implements node.Cluster.
 func (h *clusterHooks) Counts(ctx context.Context, id store.ShardID) (uint64, uint64, error) {
-	cands := h.n.candidates(id)
+	cands := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
-		return 0, 0, api.Unavailable(store.ErrClosed, "no serving copy of %s", id)
+		return 0, 0, noServingCopy(id)
 	}
 	t := &remoteTarget{n: h.n, id: id, cands: cands}
 	var reply countsReply

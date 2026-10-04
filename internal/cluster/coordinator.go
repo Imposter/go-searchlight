@@ -265,6 +265,7 @@ type Node struct {
 	clearWarned sync.Map
 	ars         *ars
 	view        atomic.Pointer[view]
+	missMu      sync.Mutex
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex

@@ -77,7 +77,20 @@ func run(ctx context.Context, args []string) error {
 	if !given(settings, "log_level") {
 		settings = append(settings, "--log_level=warn")
 	}
-	if *token == "" && !given(settings, "tokens_file") && !given(settings, "insecure_no_auth") {
+	tok := *token
+	if tok == "auto" {
+		tok = slserver.NewToken()
+	}
+	switch {
+	case tok != "" && !given(settings, "tokens_file"):
+		// The config refuses to load without a tokens file unless auth is off, so the
+		// file the server will use is written before loading it.
+		path := filepath.Join(abs, "tokens")
+		if err := os.WriteFile(path, []byte(tok+" write\n"), 0o600); err != nil {
+			return err
+		}
+		settings = append(settings, "--tokens_file="+path)
+	case tok == "" && !given(settings, "tokens_file") && !given(settings, "insecure_no_auth"):
 		settings = append(settings, "--insecure_no_auth")
 	}
 	cfg, err := config.Load(settings, os.Getenv)
@@ -86,10 +99,6 @@ func run(ctx context.Context, args []string) error {
 			config.Usage(os.Stdout)
 		}
 		return err
-	}
-	tok := *token
-	if tok == "auto" {
-		tok = slserver.NewToken()
 	}
 	s, err := slserver.Start(ctx, slserver.Options{Config: cfg, Dir: abs, Addr: *addr, Token: tok, Version: "bench", LogOutput: os.Stderr})
 	if err != nil {

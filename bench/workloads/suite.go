@@ -103,7 +103,7 @@ func (c *Config) defaults() {
 	set(&c.PercolateBatch, 100)
 	set(&c.PercolateConcurrency, 4)
 	set(&c.PercolateIterations, 50)
-	set(&c.PercolateSingle, 300)
+	set(&c.PercolateSingle, 1000)
 	set(&c.BulkPercolateIterations, 20)
 	set(&c.VisibleIterations, 1000)
 	set(&c.MixedReaders, 4)

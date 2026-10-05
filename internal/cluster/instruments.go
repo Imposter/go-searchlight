@@ -16,7 +16,8 @@ import (
 )
 
 // instruments are the cluster's metrics (spec section 11): lease and allocation
-// changes, live nodes, peer requests and retries, and peer recovery bytes.
+// changes, live nodes, peer requests and retries, and the bytes recoveries fetch from
+// peers and bundles.
 type instruments struct {
 	leases      metric.Int64Counter
 	allocations metric.Int64Counter
@@ -65,6 +66,6 @@ func (i *instruments) retry(ctx context.Context, op string) {
 	i.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op)))
 }
 
-func (i *instruments) recoveryBytes(ctx context.Context, n int64) {
-	i.recovered.Add(ctx, n, metric.WithAttributes(attribute.String("source", "peer")))
+func (i *instruments) recoveryBytes(ctx context.Context, source string, n int64) {
+	i.recovered.Add(ctx, n, metric.WithAttributes(attribute.String("source", source)))
 }

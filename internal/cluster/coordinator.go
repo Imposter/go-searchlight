@@ -18,8 +18,10 @@
 //     are released when a target is lowered.
 //   - Peer recovery (recovery.go, peer_api.go): a new copy fetches a serving peer's
 //     snapshot over the internal API, file by file, each checked against its SHA-256,
-//     resumable within a file and across attempts, the manifest written last; it falls
-//     back to the store's snapshot.
+//     resumable within a file and across attempts, the manifest written last. With no
+//     peer to serve it, it restores the newest recovery bundle in the store's blobs
+//     (bundle.go), which serving copies upload every bundle_interval; failing that, it
+//     falls back to the store's snapshot.
 //   - Routing (router.go, ars.go): any node takes any request. Writes commit to SQL
 //     and push hints to the peers holding the written shards. Reads use this node's
 //     copy when it is current, else a serving copy elsewhere chosen by adaptive replica
@@ -28,7 +30,8 @@
 //     can stand in for and marks them retiring; Stop then stops the rest, releases the
 //     leases and deregisters.
 //   - Maintenance (maintenance.go): the live node with the lowest id prunes the
-//     changelog behind the copies and sweeps abandoned blobs.
+//     changelog behind the copies and the retained recovery bundles, and sweeps
+//     abandoned blobs.
 //
 // [Node] is the cluster node: an [api.Coordinator] over the node engine (node.Single)
 // with this package as its node.Cluster.
@@ -83,6 +86,7 @@ const (
 	DefaultPeerTimeout     = 10 * time.Second
 	DefaultPinTTL          = 30 * time.Second
 	DefaultSnapshotTTL     = 2 * time.Minute
+	DefaultBundleRetention = 2
 )
 
 // Options configures a [Node]. Only Store and Config are required.
@@ -130,6 +134,11 @@ type Options struct {
 	// PeerIdleTimeout cuts a snapshot stream that delivers nothing for that long
 	// (30 s): the recovery resumes it.
 	PeerIdleTimeout time.Duration
+	// BundleInterval is how often this node uploads a recovery bundle of each shard it
+	// is the uploader of (config bundle_interval; 0 uploads none), and BundleRetention
+	// how many bundles of each shard are kept (bundle_retention, 2). See bundle.go.
+	BundleInterval  time.Duration
+	BundleRetention int
 
 	// Transport carries the peer API's requests; nil means a pooled default.
 	Transport http.RoundTripper
@@ -204,6 +213,13 @@ func (o *Options) resolve() error {
 	o.CopyDirGrace = firstPositive(o.CopyDirGrace, DefaultCopyDirGrace)
 	o.SnapshotMaxAge = firstPositive(o.SnapshotMaxAge, DefaultSnapshotMaxAge)
 	o.PeerIdleTimeout = firstPositive(o.PeerIdleTimeout, DefaultPeerIdleTimeout)
+	o.BundleInterval = firstPositive(o.BundleInterval, o.Config.BundleInterval)
+	if o.BundleRetention <= 0 {
+		o.BundleRetention = o.Config.BundleRetention
+	}
+	if o.BundleRetention <= 0 {
+		o.BundleRetention = DefaultBundleRetention
+	}
 	if o.SweepInterval <= 0 {
 		o.SweepInterval = DefaultSweepInterval
 	}
@@ -441,6 +457,9 @@ func (n *Node) Start(ctx context.Context) error {
 	n.goLoop(n.leaseWatchdog)
 	n.goLoop(n.maintenanceLoop)
 	n.goLoop(n.janitorLoop)
+	if n.opts.BundleInterval > 0 {
+		n.goLoop(n.bundleLoop)
+	}
 	n.log.InfoContext(ctx, "cluster node started", slog.String("address", n.cfg.AdvertiseAddress), slog.Int("copies", n.leaseCount()))
 	return nil
 }

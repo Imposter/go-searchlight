@@ -936,12 +936,12 @@ type dirFetcher struct {
 	calls int
 }
 
-func (f *dirFetcher) Fetch(_ context.Context, _ ShardID, dir string) error {
+func (f *dirFetcher) Fetch(_ context.Context, _ ShardID, dir string) (string, error) {
 	f.calls++
 	if f.fail {
-		return errors.New("no peer")
+		return "", errors.New("no peer")
 	}
-	return copyDir(f.from, dir)
+	return SourcePeer, copyDir(f.from, dir)
 }
 
 // TestFetcherBeforeSnapshot: a new copy takes a fetched copy and only replays the
@@ -997,15 +997,15 @@ type gatedFetcher struct {
 	calls   atomic.Int32
 }
 
-func (f *gatedFetcher) Fetch(ctx context.Context, _ ShardID, dir string) error {
+func (f *gatedFetcher) Fetch(ctx context.Context, _ ShardID, dir string) (string, error) {
 	f.calls.Add(1)
 	f.once.Do(func() { close(f.entered) })
 	select {
 	case <-f.gate:
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	}
-	return copyDir(f.from, dir)
+	return SourcePeer, copyDir(f.from, dir)
 }
 
 // TestFetcherRebuildsAside: a copy the changelog was pruned past is valid but outdated,

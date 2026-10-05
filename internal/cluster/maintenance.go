@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,8 @@ import (
 //     RetiringRetention (15 min) after its lease ran out, by the database's clock, so
 //     a node restarted within it replays the tail of the changelog rather than
 //     rebuilding (spec section 9).
+//   - every retained recovery bundle of the shard's current incarnation (bundle.go): a
+//     copy restored from one replays the changelog after its seq.
 //
 // Bounded, so no copy holds the floor forever:
 //
@@ -49,10 +52,11 @@ import (
 //     copy that moves again counts again at once; one pruned past rebuilds (its next
 //     read says store.ErrPruned), from a peer or the store, neither of which needs the
 //     pruned changes.
-//   - Age: a change older than ChangelogRetention (24 h) is pruned whatever copy still
-//     needs it; that copy rebuilds.
+//   - Age: a change older than ChangelogRetention (24 h) is pruned whatever copy or
+//     bundle still needs it; that copy rebuilds, and a bundle pruned past is deleted.
 //
-// A shard with no copy that counts is pruned by age alone.
+// A shard with no copy or bundle that counts is pruned by age alone. Bundles of
+// incarnations the catalogue no longer holds are deleted.
 
 // pruneState is the leader's memory of each copy's progress, and of how far it has
 // pruned each shard.
@@ -123,12 +127,20 @@ func (n *Node) pruneAll(ctx context.Context) error {
 	v := n.view.Load()
 	n.releaseDecommissioned(ctx, v)
 	progress := n.copyProgress(ctx, v)
+	bundles, gone, err := n.retainedBundles(ctx)
+	if err != nil {
+		return err
+	}
+	n.deleteBundles(ctx, gone, "its index incarnation is gone")
 	now := n.clock.Now()
 	cutoff := n.clock.Wall().Add(-n.opts.ChangelogRetention)
 	for _, iv := range n.Indexes() {
 		for s := range iv.Shards {
 			id := store.ShardID{Index: iv.Name, Shard: s}
 			floor, ok := n.pruneFloor(v.copies[id], v, progress, now)
+			if b := bundles[id]; len(b) > 0 && (!ok || b[0].seq < floor) {
+				floor, ok = b[0].seq, true
+			}
 			age, err := n.ageFloor(ctx, id, floor, cutoff)
 			if err != nil {
 				return err
@@ -143,10 +155,22 @@ func (n *Node) pruneAll(ctx context.Context) error {
 				return err
 			}
 			n.prune.setBelow(id, floor+1)
+			n.deleteBundles(ctx, slices.DeleteFunc(bundles[id], func(b bundleRef) bool { return b.seq >= floor }), "the changelog was pruned past it")
 		}
 	}
 	n.prune.forget(v)
 	return nil
+}
+
+// deleteBundles deletes bundles no recovery can use any more.
+func (n *Node) deleteBundles(ctx context.Context, list []bundleRef, why string) {
+	for _, b := range list {
+		if err := n.st.Blobs().Delete(ctx, b.name); err != nil {
+			n.log.WarnContext(ctx, "deleting an unusable recovery bundle failed", slog.String("bundle", b.name), slog.Any("error", err))
+			continue
+		}
+		n.log.InfoContext(ctx, "deleted an unusable recovery bundle", slog.String("bundle", b.name), slog.String("reason", why))
+	}
 }
 
 func (p *pruneState) forget(v *view) {

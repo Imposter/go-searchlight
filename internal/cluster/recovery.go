@@ -48,9 +48,10 @@ import (
 //     file, fsynced, renamed, the directory fsynced): it is the copy's commit point, so
 //     a recovery cut short anywhere before it leaves a directory that opens empty.
 //
-// The tailer then opens the copy and replays the changelog from the snapshot's seq. Any
-// failure makes the tailer rebuild the copy from the store's snapshot (ScanShard)
-// instead. A copy that is outdated but valid is rebuilt aside, so it keeps serving
+// The tailer then opens the copy and replays the changelog from the snapshot's seq. When
+// no peer can serve the copy, the newest recovery bundle in the store's blobs is
+// restored instead (bundle.go); any other failure makes the tailer rebuild the copy
+// from the store's snapshot (ScanShard). A copy that is outdated but valid is rebuilt aside, so it keeps serving
 // while its replacement is fetched (replica's aside rebuild).
 
 // Fetch attempts and retries.
@@ -63,7 +64,7 @@ const (
 )
 
 // errNoSource is a recovery with no serving peer to fetch from.
-var errNoSource = fmt.Errorf("cluster: no serving peer holds a copy of the shard: %w", replica.ErrNoSource)
+var errNoSource = fmt.Errorf("cluster: no serving peer holds a copy of the shard, and no recovery bundle: %w", replica.ErrNoSource)
 
 // errEmptySource is a peer whose copy holds nothing yet.
 var errEmptySource = fmt.Errorf("cluster: the peer's copy is empty: %w", replica.ErrNoSource)
@@ -72,8 +73,10 @@ var errEmptySource = fmt.Errorf("cluster: the peer's copy is empty: %w", replica
 type fetcher struct {
 	n *Node
 	// bytes and resumes count what recoveries fetched and how often a file was
-	// resumed (tests, benchmarks).
-	bytes, resumes atomic.Int64
+	// resumed; restored and rejected count the recovery bundles installed and refused
+	// (tests, benchmarks).
+	bytes, resumes     atomic.Int64
+	restored, rejected atomic.Int64
 	// running are the shards recovering now, with the bytes each has fetched (their
 	// progress, for the prune leader's stall detection).
 	mu      sync.Mutex
@@ -132,17 +135,38 @@ func (f *fetcher) progressOf(id store.ShardID) int64 {
 
 var _ replica.Fetcher = (*fetcher)(nil)
 
-// Fetch implements replica.Fetcher: it fills dir with a serving peer's copy of id.
-func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error {
+// Fetch implements replica.Fetcher: it fills dir with a serving peer's copy of id or,
+// when no peer can serve it, with the newest usable recovery bundle of id (bundle.go).
+func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) (string, error) {
+	progress, end := f.begin(id)
+	defer end()
+	ctx = context.WithValue(ctx, progressKey{}, progress)
+	peerErr := f.fetchPeers(ctx, id, dir, progress)
+	if peerErr == nil {
+		return replica.SourcePeer, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	progress.Store(0)
+	restored, err := f.restoreBundle(ctx, id, dir)
+	switch {
+	case restored:
+		return replica.SourceBlob, nil
+	case err != nil:
+		return "", fmt.Errorf("cluster: no recovery bundle of %s could be restored: %w (peers: %s)", id, err, peerErr.Error())
+	}
+	return "", peerErr
+}
+
+// fetchPeers fills dir with a serving peer's copy of id, trying the peers best first.
+func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, progress *atomic.Int64) error {
 	n := f.n
 	cands := n.candidates(id)
 	if len(cands) == 0 {
 		return errNoSource
 	}
 	staging := n.stagingDir(id)
-	progress, end := f.begin(id)
-	defer end()
-	ctx = context.WithValue(ctx, progressKey{}, progress)
 	var errs []error
 	for _, c := range cands {
 		delay := 100 * time.Millisecond
@@ -411,7 +435,7 @@ func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part 
 	ctr, _ := ctx.Value(progressKey{}).(*atomic.Int64)
 	k, cerr := io.Copy(fh, &idleReader{r: resp.Body, timer: timer, idle: n.opts.PeerIdleTimeout, ctr: ctr})
 	f.bytes.Add(k)
-	n.inst.recoveryBytes(ctx, k)
+	n.inst.recoveryBytes(ctx, replica.SourcePeer, k)
 	serr := segment.SyncFile(fh)
 	if err := errors.Join(cerr, serr, fh.Close()); err != nil {
 		return k, &peerError{node: c.node, err: err}

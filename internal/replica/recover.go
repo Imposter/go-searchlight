@@ -21,28 +21,37 @@ import (
 // the cluster provides it). When a copy must be rebuilt, the tailer wipes its
 // directory and calls Fetch, which fills dir (it exists and is empty) with a shard
 // directory, segments and sidecars first and the manifest last, each fsynced (the
-// manifest is the commit point: a Fetch cut short leaves a directory that opens empty).
-// The copy must be of the index's current incarnation. The tailer opens it and replays
-// the changelog from its seq. Any error, or a copy that cannot be used (another
-// incarnation, an older mapping than the rebuild needs, or one the changelog has been
-// pruned past before it moved), makes the tailer wipe dir again and rebuild from the
-// store's ScanShard instead.
+// manifest is the commit point: a Fetch cut short leaves a directory that opens empty),
+// and reports where the copy came from: [SourcePeer] or [SourceBlob]. The copy must be
+// of the index's current incarnation. The tailer opens it and replays the changelog
+// from its seq. Any error, or a copy that cannot be used (another incarnation, an older
+// mapping than the rebuild needs, or one the changelog has been pruned past before it
+// moved), makes the tailer wipe dir again and rebuild from the store's ScanShard
+// instead.
 type Fetcher interface {
-	Fetch(ctx context.Context, id ShardID, dir string) error
+	Fetch(ctx context.Context, id ShardID, dir string) (source string, err error)
 }
 
-// ErrNoSource is what a Fetcher returns, wrapped, when no peer has a copy worth
-// fetching (none serves the shard, or the one that does holds nothing yet): the tailer
-// rebuilds from the store's snapshot, as it does after any fetch error, but this is no
-// failure.
-var ErrNoSource = errors.New("replica: no peer has a copy to fetch")
+// ErrNoSource is what a Fetcher returns, wrapped, when neither a peer nor a bundle has
+// a copy worth fetching (no peer serves the shard, or the one that does holds nothing
+// yet, and no bundle the changelog still reaches exists): the tailer rebuilds from the
+// store's snapshot, as it does after any fetch error, but this is no failure.
+var ErrNoSource = errors.New("replica: no peer or bundle has a copy to fetch")
 
-// Recovery sources, for metrics and logs.
+// Recovery sources, for metrics and logs. A [Fetcher] reports SourcePeer or SourceBlob.
 const (
+	// SourcePeer is a copy streamed from a serving peer.
+	SourcePeer = "peer"
+	// SourceBlob is a copy restored from a bundle in the store's blobs (sl_blobs).
+	SourceBlob   = "blob"
 	sourceSQL    = "sql"
-	sourcePeer   = "peer"
 	sourceReopen = "reopen"
+	// sourceFetch labels a fetch before the Fetcher has said where its copy came from.
+	sourceFetch = "fetch"
 )
+
+// fetchedFrom reports whether source is one a Fetcher reports.
+func fetchedFrom(source string) bool { return source == SourcePeer || source == SourceBlob }
 
 // ErrWipeNeeded is returned by [Recover] for a copy it cannot resume: one whose index
 // was dropped and recreated since, or one a rebuild left half-loaded. Close it, remove
@@ -194,9 +203,10 @@ func (t *Tailer) canBuildAside(reason string) bool {
 
 // useFetcher reports whether a rebuild should try the Fetcher first. A fetched copy
 // that made no progress before it needed rebuilding again (it was pruned past, or
-// halted at the same change) is not fetched again: the peers are no better off.
+// halted at the same change) is not fetched again: the peers and bundles are no better
+// off.
 func (t *Tailer) useFetcher() bool {
-	return t.opts.Fetcher != nil && (t.lastSource != sourcePeer || t.Applied() != t.recoveredAt)
+	return t.opts.Fetcher != nil && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
 }
 
 // rebuildAside rebuilds the copy in a new directory under its root while the current
@@ -239,7 +249,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			return err
 		}
 		if ok {
-			sh, source, asOf = fetched, sourcePeer, fetched.AppliedSeq()
+			sh, source, asOf = fetched, t.lastSource, fetched.AppliedSeq()
 		}
 	}
 	if sh == nil {
@@ -261,8 +271,8 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 		}
 		changes, err := t.st.ChangesAfter(ctx, t.id, sh.AppliedSeq(), t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
-			if source == sourcePeer {
-				t.lastSource, t.recoveredAt = sourcePeer, asOf // fetch no more: the peers are no better off
+			if fetchedFrom(source) {
+				t.lastSource, t.recoveredAt = source, asOf // fetch no more: the peers and bundles are no better off
 			}
 			return &rebuildError{reason: reasonPruned, err: err}
 		}
@@ -449,19 +459,27 @@ func (t *Tailer) fetch(ctx context.Context, reason, dir string) (ok bool, err er
 // 0, with the mapping version the rebuild needs; it is returned open, not yet the
 // tailer's. Otherwise dir is wiped, and the error is nil unless ctx ended.
 func (t *Tailer) fetchInto(ctx context.Context, reason, dir string) (sh *shard.Shard, ok bool, err error) {
-	ctx, span := t.startRecoverySpan(ctx, sourcePeer, reason)
+	ctx, span := t.startRecoverySpan(ctx, sourceFetch, reason)
 	start := t.opts.Clock.Now()
+	source := sourceFetch
 	var used error
-	defer func() { t.endRecovery(ctx, span, sourcePeer, reason, start, used) }()
+	defer func() {
+		span.SetAttributes(attribute.String("source", source))
+		t.endRecovery(ctx, span, source, reason, start, used)
+	}()
 	if used = os.MkdirAll(dir, 0o750); used == nil {
-		used = t.opts.Fetcher.Fetch(ctx, t.id, dir)
+		var from string
+		from, used = t.opts.Fetcher.Fetch(ctx, t.id, dir)
+		if used == nil {
+			source = from
+		}
 	}
 	if used == nil {
 		if sh, used = t.openShard(ctx, dir); used == nil {
 			uid, seq, mv := sh.IndexUID(), sh.AppliedSeq(), sh.MappingVersion()
 			if seq > 0 && uid == t.cat.meta.UID && mv >= t.minMappingVersion {
-				t.lastSource, t.recoveredAt, t.minMappingVersion = sourcePeer, seq, 0
-				t.log.InfoContext(ctx, "shard copy fetched", slog.String("reason", reason), slog.Int64("seq", seq))
+				t.lastSource, t.recoveredAt, t.minMappingVersion = source, seq, 0
+				t.log.InfoContext(ctx, "shard copy fetched", slog.String("reason", reason), slog.String("source", source), slog.Int64("seq", seq))
 				return sh, true, nil
 			}
 			sh.Abandon()
@@ -472,7 +490,7 @@ func (t *Tailer) fetchInto(ctx context.Context, reason, dir string) (sh *shard.S
 		return nil, false, ctx.Err()
 	}
 	if errors.Is(used, ErrNoSource) {
-		t.log.InfoContext(ctx, "no peer has a copy to fetch; rebuilding it from the store", slog.Any("reason", used))
+		t.log.InfoContext(ctx, "no peer or bundle has a copy to fetch; rebuilding it from the store", slog.Any("reason", used))
 	} else {
 		t.log.WarnContext(ctx, "fetching the shard copy failed; rebuilding it from the store", slog.Any("error", used))
 	}

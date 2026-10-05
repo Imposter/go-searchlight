@@ -217,6 +217,8 @@ unless `insecure_no_auth` is set.
 | `prune_stall_timeout` | `15m` | how long a copy behind the others may make no progress and still hold the changelog's prune floor |
 | `retiring_retention` | `15m` | how long the changelog is kept for a cleanly stopped node's copies, so a node restarted within it replays the tail rather than rebuilding |
 | `changelog_retention` | `24h` | the oldest a change may grow before it is pruned, whatever copy still needs it (that copy rebuilds) |
+| `bundle_interval` | `0s` (off) | how often each shard's durable state is uploaded to the database as a recovery bundle (`sl_blobs`), for a copy to recover from when no peer can serve it; at least `1s` when set (see [Recovery bundles](#recovery-bundles)) |
+| `bundle_retention` | `2` | how many recovery bundles of each shard are kept, the newest |
 | `refresh_interval` | `1s` | how often writes become searchable, on a fixed grid (an index's own `refresh_interval` overrides it). A refresh is visibility only: it fsyncs nothing |
 | `flush_interval` | `10s` | how often a shard copy makes what refreshes published durable: it fsyncs the new segments and deletes, writes its manifest, and only then reports that seq as applied (the changelog is pruned by it). A crash replays at most this much of the changelog. A merge, a peer snapshot and a shutdown also flush at once |
 | `max_lag` | `2s` | how far a copy may trail and still serve reads; also how long the database may go unanswered before readiness turns false |
@@ -259,6 +261,36 @@ unless `insecure_no_auth` is set.
   last flush.
 - **Tuning.** Raise `flush_interval` to fsync less often, at the price of a longer
   replay after a crash. A clean shutdown always flushes.
+
+### Recovery bundles
+
+A copy that must be rebuilt (a new node, a lost or corrupt disk, a copy pruned past)
+fetches a serving peer's segments. With **no peer** to serve it (a single node, or every
+node of the shard rebuilt at once), it rebuilds from the database's documents
+(`ScanShard`), re-analyzing every one. Recovery bundles put a faster step in between:
+
+- **Upload.** With `bundle_interval` set, every interval one serving copy of each shard
+  (on the live node with the lowest `node_id`) flushes and uploads its durable segments,
+  as one checksummed blob in `sl_blobs`, written in 1 MiB chunks. A shard with no write
+  since its newest bundle is skipped. Once a new bundle is surely stored, the oldest are
+  deleted down to `bundle_retention`.
+- **Restore.** A copy with no peer to fetch from restores the newest bundle of its
+  shard's current incarnation that the changelog still reaches, then replays the
+  changelog after it. Each file, and the whole bundle, is checked against its SHA-256
+  while it is staged under `data_dir/recovery`; a bundle that fails any check is never
+  installed, and the next older one, then `ScanShard`, is used instead.
+- **Cost.** Bundles take database space: about the size of each shard's segments, times
+  `bundle_retention`. Each retained bundle also keeps the changelog after its seq, so
+  `sl_changes` holds up to `bundle_interval × bundle_retention` of writes (never more
+  than `changelog_retention`; a bundle that pruning by age passes is deleted).
+- **Off.** `bundle_interval=0s`, the default, uploads none. Bundles already stored are
+  still restored and still kept until pruning by age passes them, or their index is
+  dropped.
+
+Turn bundles on where rebuilding a shard from its documents is slow and no peer may be
+there to copy from: a single node with a large index, or a cluster whose nodes may all
+lose their disks together. A cluster that always has a serving peer gains nothing from
+them.
 
 ### Removed settings
 
@@ -361,7 +393,10 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 - **Records.** It holds every document and saved query (`sl_documents`, `sl_queries`).
 - **Changelog.** `sl_changes` holds the changes not yet pruned: at most
   `changelog_retention` (24 h) of writes, usually far less. Pruning follows the slowest
-  live copy, so a stalled copy holds the floor for at most `prune_stall_timeout`.
+  live copy, so a stalled copy holds the floor for at most `prune_stall_timeout`. Each
+  retained recovery bundle holds it too, at its seq.
+- **Recovery bundles** (with `bundle_interval` set) take about each shard's segment size
+  times `bundle_retention` in `sl_blobs`.
 - **Write rate.** Group commit coalesces each node's concurrent writes into one
   transaction every few milliseconds, so the database sees few, larger transactions.
   Use `_bulk` for throughput.
@@ -377,8 +412,8 @@ rebuilt.**
   backup.db"` or a filesystem snapshot (never a plain copy of a live file). Every
   `sl_*` table belongs to Searchlight.
 - **Do not back up `data_dir`.** A node that loses it rebuilds every copy: from a
-  serving peer when one exists, else from the database. Losing a node's disk loses
-  nothing.
+  serving peer when one exists, else from a recovery bundle (when `bundle_interval` is
+  set), else from the database. Losing a node's disk loses nothing.
 - **Restoring the database to an earlier point.** Stop every node, and wipe every
   node's `data_dir` (or replace the volumes) before you start them again. Local
   segments may hold changes the restored database does not, and must not be reused.
@@ -522,18 +557,18 @@ When every copy of a shard halts, the shard has no serving copy and the cluster 
 A recovering copy is fetching a snapshot from a serving peer, or rebuilding from the
 database, and then replaying the changelog.
 
-- **Is it making progress?** `searchlight_replica_recovery_progress_ratio` (by
-  `source`: `peer` or `sql`; `blob`, recovery from `sl_blobs` bundles, is planned but not
-  built) and `searchlight_replica_recovery_bytes_total` should
-  climb.
+- **Is it making progress?** `searchlight_replica_recovery_progress_ratio` and
+  `searchlight_replica_recovery_bytes_total` (by `source`: `peer`, `blob` for a recovery
+  bundle, or `sql`) should climb.
 - **Can it reach its peers?** Check that `advertise_address` resolves and is reachable
   from the other nodes, and that every node has the **same** `cluster_token` (a missing
   one closes the peer API, and a wrong one gets 401s). With TLS, check `peer_ca_file`.
   Failing peer requests show in `searchlight_cluster_peer_request_duration_seconds`
   with status 0, 401 or 5xx.
 - **Is there room?** Staging needs the copy's whole size under `data_dir/recovery`.
-- **Is it retrying?** A recovery that fails falls back to the database (`ScanShard`),
-  then retries with backoff up to `rebuild_retry_cap`. A copy whose changelog was pruned
+- **Is it retrying?** A recovery that fails falls back to a recovery bundle when there
+  is one (`a recovery bundle failed its checks` names one refused), then to the database
+  (`ScanShard`), then retries with backoff up to `rebuild_retry_cap`. A copy whose changelog was pruned
   past (`ErrPruned` in the log) rebuilds rather than replays: that is expected after a
   node was down for longer than `retiring_retention` or `prune_stall_timeout`.
 - **Is it a remap?** A mapping change that newly maps a field already held by documents
@@ -575,5 +610,10 @@ of the earlier one ages out after 10 s.
   Retry after `Retry-After`. If it persists, see [Sizing](#sizing).
 - **`stale: true` on reads.** The database cannot be reached, and the node answers from
   its segments.
+- **`shard copy does not open; wiping it to rebuild`.** A copy's files failed their
+  checks when the node opened them: a segment failing its checksum, a damaged manifest,
+  or a segment format this binary does not read. The copy is never served; it is wiped
+  and rebuilt like a new one (from a peer, a recovery bundle or the database). Repeated
+  on a node, suspect its disk.
 - **Profiling.** Set `pprof=true`, then
   `go tool pprof http://<node>:8781/debug/pprof/profile?seconds=30`.

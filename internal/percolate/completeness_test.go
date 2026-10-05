@@ -36,6 +36,33 @@ var (
 
 func longMode() bool { return *flagLong || os.Getenv("SEARCHLIGHT_LONG") != "" }
 
+// coverage counts what the completeness property's segments hold, so the property
+// fails if a generator change stops exercising a path: posting filters on numbers and
+// bools, proven leaves (an empty program), and inline and stored programs.
+var coverage struct {
+	numberFilters, boolFilters, emptyPrograms, inlinePrograms, storedPrograms int
+}
+
+func (s *Segment) countCoverage() {
+	for r := 0; r < len(s.filtered); r += filteredSize {
+		if u32(s.filtered, r+4)&1 == 1 {
+			coverage.boolFilters++
+		} else {
+			coverage.numberFilters++
+		}
+	}
+	for r := range s.n {
+		switch n := u32(s.verifies, verifySize*int(r)+4); {
+		case n == 0:
+			coverage.emptyPrograms++
+		case n <= inlineProg:
+			coverage.inlinePrograms++
+		default:
+			coverage.storedPrograms++
+		}
+	}
+}
+
 func TestCompletenessProperty(t *testing.T) {
 	seeds := []uint64{1, 2, 3}
 	queries, docs := 400, 250 // 100k pairs per seed and regime
@@ -69,6 +96,13 @@ func TestCompletenessProperty(t *testing.T) {
 			}
 		}
 	}
+	if *flagSeed == 0 {
+		c := coverage
+		if c.numberFilters == 0 || c.boolFilters == 0 || c.emptyPrograms == 0 || c.inlinePrograms == 0 || c.storedPrograms == 0 {
+			t.Fatalf("a path went unexercised: %+v", c)
+		}
+		t.Logf("coverage: %+v", c)
+	}
 }
 
 func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs int, stats shard.TermStats) {
@@ -90,6 +124,7 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	if err != nil {
 		t.Fatal(err)
 	}
+	seg.countCoverage()
 	compiled := make([]*query.Compiled, len(qs))
 	for i := range qs {
 		compiled[i] = query.Compile(qs[i].Query)
@@ -103,11 +138,11 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	}
 	v := &view{seg: seg, n: seg.NumQueries(), deletes: deletes}
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	m := testMapping()
 	isAlways := make(map[uint32]bool)
 	for i := 0; i < len(seg.always); i += 4 {
-		isAlways[u32(seg.always, i)] = true
+		isAlways[seg.ordAt(u32(seg.always, i))] = true
 	}
 	pairs, matches, anchored, candidates := 0, 0, 0, 0
 	for di := range numDocs {
@@ -118,8 +153,8 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 		}
 		seg.collect(&d, sc)
 		cand := make(map[uint32]bool, len(sc.cands))
-		for _, ord := range sc.cands {
-			cand[ord] = true
+		for _, r := range sc.cands {
+			cand[seg.ordAt(r)] = true
 		}
 		candidates += len(cand)
 		var want []string
@@ -143,11 +178,8 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 			}
 		}
 		var st docStats
-		err = verify(v, &d, sc, &st)
-		got := sc.results(true)
-		if err != nil {
-			t.Fatal(err)
-		}
+		verify(v, sc, &st)
+		got := sc.results()
 		sc.reset()
 		slices.Sort(got)
 		if !slices.Equal(got, want) {

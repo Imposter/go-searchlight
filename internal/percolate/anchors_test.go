@@ -63,8 +63,8 @@ func TestExtractRules(t *testing.T) {
 		{`{"field":"title","op":"contains","value":"ab"}`, `text:title=""`},
 		{`{"field":"title","op":"starts_with","value":"x"}`, `text:title=""`},
 		{`{"field":"title","op":"contains_any","value":["ab","cd"]}`, `text:title="" text:title=""`},
-		// Words: each phrase's rarest word (under no statistics, the first of equals).
-		{`{"field":"title","op":"words_any","value":["Hello World","x"]}`, `word:title="hello" word:title="x"`},
+		// Words: each phrase's two rarest words as a pair, or its one word.
+		{`{"field":"title","op":"words_any","value":["Hello World","x"]}`, `word:title="hello"&word:title="world" word:title="x"`},
 		{`{"field":"title","op":"words_all","value":["!!!"]}`, `always`},
 		{`{"field":"title","op":"words_any","value":["!!!"]}`, `always`},
 		// Similar: a positive minimum anchors on trigram keys; a refused one needs a text.

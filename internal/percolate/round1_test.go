@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -57,7 +56,7 @@ func wordsDoc(t testing.TB, words int) schema.Doc {
 func TestPairProbingIsLinear(t *testing.T) {
 	seg := pairHeavySegment(t, 20000)
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	for _, m := range []int{100, 1000, 3000} {
 		d := wordsDoc(t, m)
 		sc.pairOps = 0
@@ -86,7 +85,7 @@ func TestPairFallbackIsSound(t *testing.T) {
 	// And it is still linear: the pair-heavy document adds the members' postings.
 	seg := pairHeavySegment(t, 2000)
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	d := wordsDoc(t, 1000)
 	seg.collect(&d, sc)
 	if want := 2000 + 1000; sc.pairOps > want {
@@ -133,14 +132,14 @@ func TestCraftedFieldCountRefusedCheaply(t *testing.T) {
 	}
 }
 
-// The verifications metric counts Match calls by verdict: a verdict memoized for a
-// class is not a call, and misses never go negative.
+// The verifications metric counts program evaluations by verdict: a verdict memoized
+// for a class is not one, and misses never go negative.
 func TestVerificationsCountMatchCalls(t *testing.T) {
 	raws := []string{
 		`{"field":"brand","op":"eq","value":"acme"}`,
 		`{"field":"brand","op":"eq","value":" ACME "}`, // the same class as the first
 		`{"field":"brand","op":"in","value":["acme","x"]}`,
-		`{"all":[{"field":"brand","op":"eq","value":"acme"},{"field":"price","op":"gt","value":100}]}`,
+		`{"all":[{"field":"brand","op":"eq","value":"acme"},{"not":{"field":"price","op":"lt","value":100}}]}`,
 	}
 	qs := make([]shard.StoredQuery, len(raws))
 	for i, raw := range raws {
@@ -155,70 +154,18 @@ func TestVerificationsCountMatchCalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	d, _, _ := schema.Analyze(testMapping(), "d", []byte(`{"brand":"Acme","price":5}`))
 	seg.collect(&d, sc)
 	var st docStats
-	if err := verify(&view{seg: seg, n: seg.NumQueries()}, &d, sc, &st); err != nil {
-		t.Fatal(err)
-	}
-	got := sc.results(true)
+	verify(&view{seg: seg, n: seg.NumQueries()}, sc, &st)
+	got := sc.results()
 	sc.reset()
 	if want := []string{"q0", "q1", "q2"}; !slices.Equal(got, want) {
 		t.Fatalf("matches %v, want %v", got, want)
 	}
 	if st.verifiedMatch != 2 || st.verifiedMiss != 1 || st.matched != 3 {
 		t.Fatalf("Match calls %d match, %d miss; %d matched; want 2, 1, 3", st.verifiedMatch, st.verifiedMiss, st.matched)
-	}
-}
-
-// Opening a segment compiles every class in the background; Close stops the warm-up
-// and waits for it.
-func TestWarmUpCompilesEveryClass(t *testing.T) {
-	dir := t.TempDir()
-	qs := make([]shard.StoredQuery, 3000)
-	for i := range qs {
-		qs[i] = shard.StoredQuery{ID: fmt.Sprintf("q%05d", i), Query: parseQuery(t, fmt.Sprintf(`{"field":"brand","op":"eq","value":"b%d"}`, i))}
-	}
-	if _, err := (Index{}).Build(context.Background(), dir, "w", qs, nil); err != nil {
-		t.Fatal(err)
-	}
-	opened, err := Index{}.Open(dir, "w")
-	if err != nil {
-		t.Fatal(err)
-	}
-	seg, ok := opened.(*Segment)
-	if !ok {
-		t.Fatalf("Open returned %T", opened)
-	}
-	select {
-	case <-seg.warmed:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the warm-up did not finish")
-	}
-	for ord := range seg.NumQueries() {
-		if seg.compiled[seg.class(ord)].Load() == nil {
-			t.Fatalf("class of query %d not compiled", ord)
-		}
-	}
-	if err := seg.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// Close on a segment still warming returns once the warm-up has stopped.
-	opened, err = Index{}.Open(dir, "w")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := opened.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := opened.Close(); err != nil { // idempotent
-		t.Fatal(err)
-	}
-	if seg, ok := opened.(*Segment); !ok {
-		t.Fatalf("Open returned %T", opened)
-	} else if _, running := <-seg.warmed; running {
-		t.Fatal("warm-up still running after Close")
 	}
 }
 
@@ -241,7 +188,7 @@ func TestAnchorsFromStoredTree(t *testing.T) {
 		t.Fatal("a hand-built query went to always-check")
 	}
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	d, _, _ := schema.Analyze(testMapping(), "d", []byte(`{"brand":"acme","price":3}`))
 	seg.collect(&d, sc)
 	if len(sc.cands) != 1 {

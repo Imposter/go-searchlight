@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 func TestT7RefreshPhases(t *testing.T) {
+	testtier.Heavy(t)
 	if os.Getenv("SEARCHLIGHT_T7DIAG") == "" {
 		t.Skip("set SEARCHLIGHT_T7DIAG=1 to run the T7 harness")
 	}

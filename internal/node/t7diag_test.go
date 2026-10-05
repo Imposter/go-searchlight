@@ -38,6 +38,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 type t7Span struct {
@@ -129,6 +130,7 @@ func t7FsyncLoad(t *testing.T, dir string, worker int, stop *atomic.Bool) {
 }
 
 func TestT7Diag(t *testing.T) {
+	testtier.Heavy(t)
 	if os.Getenv("SEARCHLIGHT_T7DIAG") == "" {
 		t.Skip("set SEARCHLIGHT_T7DIAG=1 to run the T7 harness")
 	}

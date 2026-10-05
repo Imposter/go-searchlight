@@ -18,6 +18,7 @@ import (
 	"github.com/RoaringBitmap/roaring/v2"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 func testMapping() *schema.Mapping {
@@ -928,13 +929,14 @@ func buildBytes(t *testing.T, dir, name string, docs []schema.Doc, threads int) 
 }
 
 // TestBuildThreadsByteIdenticalMatrix extends TestBuildThreadsByteIdentical over
-// identityCorpora and thread counts below, at, and far above the document count.
+// identityCorpora and thread counts below, at, and far above the document count (the
+// short tier: GOMAXPROCS and one count in between).
 func TestBuildThreadsByteIdenticalMatrix(t *testing.T) {
 	for name, docs := range identityCorpora(t) {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			want := buildBytes(t, dir, "t1", docs, 1)
-			for _, threads := range []int{0, 2, 5, 17, 64, 301} {
+			for _, threads := range testtier.Pick([]int{0, 17}, []int{0, 2, 5, 17, 64, 301}) {
 				got := buildBytes(t, dir, fmt.Sprintf("t%d", threads), docs, threads)
 				if !bytes.Equal(got, want) {
 					t.Fatalf("Threads: %d wrote different bytes than Threads: 1 (%d vs %d bytes)", threads, len(got), len(want))
@@ -947,14 +949,15 @@ func TestBuildThreadsByteIdenticalMatrix(t *testing.T) {
 // TestMergeByteIdenticalToRebuild is the merge half of N8: for every corpus, split into
 // several segment counts (one document per segment included), with and without deletes,
 // at several GOMAXPROCS values (Merge's own worker count), the merged file must be
-// byte-for-byte a fresh Build of the live documents in merge order.
+// byte-for-byte a fresh Build of the live documents in merge order. The short tier
+// runs one segment count and one GOMAXPROCS.
 func TestMergeByteIdenticalToRebuild(t *testing.T) {
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
 	for name, docs := range identityCorpora(t) {
 		t.Run(name, func(t *testing.T) {
-			for _, segs := range []int{1, 2, 5, 17} {
+			for _, segs := range testtier.Pick([]int{5}, []int{1, 2, 5, 17}) {
 				for _, withDeletes := range []bool{false, true} {
-					for _, procs := range []int{1, 3, 16} {
+					for _, procs := range testtier.Pick([]int{3}, []int{1, 3, 16}) {
 						runtime.GOMAXPROCS(procs)
 						checkMergeEqualsRebuild(t, docs, segs, withDeletes)
 					}

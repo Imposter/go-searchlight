@@ -12,6 +12,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store/sqlite"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestCheckpointGateAfterBurst (N3): after a burst grows SQLite's write-ahead log far
@@ -19,6 +20,7 @@ import (
 // checkpoint empties the file, and small writes afterwards pass ticks with no
 // checkpoint (and no fsync): the gate counts the frames pending, not the file's size.
 func TestCheckpointGateAfterBurst(t *testing.T) {
+	testtier.Heavy(t)
 	st := durableSQLiteHarness(t).open(t)
 	s, ok := st.(*sqlStore)
 	if !ok {

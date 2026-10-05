@@ -32,6 +32,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
 	"github.com/Imposter/go-searchlight/internal/store/storetest"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // The external databases the suite also runs on; unset, those dialects are skipped.
@@ -100,9 +101,7 @@ func forSQLiteAndPostgres(t *testing.T, fn func(t *testing.T, d *db)) {
 		if base == "" {
 			t.Skip(envPG + " is not set")
 		}
-		if testing.Short() {
-			t.Skip("heavy: not in -short")
-		}
+		testtier.Heavy(t)
 		fn(t, postgresDB(t, base))
 	})
 }

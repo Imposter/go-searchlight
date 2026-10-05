@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestGateLanesAndFIFO: waiters get the gate first come, first served within a lane,
@@ -75,8 +77,10 @@ func TestGateLanesAndFIFO(t *testing.T) {
 
 // TestRenewalLatencyUnderBulkLoad (probe P3): on SQLite, whose writes share one
 // connection, lease renewals made while writers keep committing large batches wait
-// for about one transaction, never behind the queue of bulk commits.
+// for about one transaction, never behind the queue of bulk commits. The fixed
+// margins scale under the race detector, which slows the commit path several-fold.
 func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
+	testtier.Heavy(t)
 	st := durableSQLiteHarness(t).open(t)
 	ctx := context.Background()
 	if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "bulk", Mapping: []byte(`{}`)}); err != nil {
@@ -146,16 +150,16 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	t.Logf("renewals: median %s, p90 %s, slowest %s; a bulk commit (2000 changes) holds the connection %s on average (%d commits); "+
 		"log file %d bytes, %d truncations holding it up to %s",
 		median, p90, worst, commit, done, s.walSize(), s.truncates.Load(), truncateHold)
-	if limit := 2*commit + 50*time.Millisecond; median > limit {
+	if limit := 2*commit + 50*time.Millisecond*testtier.RaceSlowdown; median > limit {
 		t.Fatalf("the median renewal took %s under bulk load, more than about one commit in flight (%s)", median, limit)
 	}
-	if limit := 4*commit + 150*time.Millisecond; p90 > limit {
+	if limit := 4*commit + 150*time.Millisecond*testtier.RaceSlowdown; p90 > limit {
 		t.Fatalf("a tenth of the renewals took over %s under bulk load (limit %s): they queue behind several commits", p90, limit)
 	}
 	if limit := 10 * commit; truncateHold > limit {
 		t.Fatalf("a truncation of the log held the write connection %s (limit %s, ten bulk commits)", truncateHold, limit)
 	}
-	if limit := 8*commit + 300*time.Millisecond + truncateHold; worst > limit {
+	if limit := 8*commit + 300*time.Millisecond*testtier.RaceSlowdown + truncateHold; worst > limit {
 		t.Fatalf("a renewal took %s under bulk load (limit %s, a truncation of the log included): it queued behind several commits", worst, limit)
 	}
 	if limit := 3 * s.d.TruncateAbove; s.truncates.Load() == 0 || s.walSize() > limit {

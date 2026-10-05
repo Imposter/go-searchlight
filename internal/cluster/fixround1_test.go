@@ -20,6 +20,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestDatabaseOutageOneNodeCluster (probe P1, spec section 10): a cluster of one cut
@@ -28,6 +29,7 @@ import (
 // max_lag. Healed, the node claims its slots back at the same epochs and its copies
 // resume without a rebuild.
 func TestDatabaseOutageOneNodeCluster(t *testing.T) {
+	testtier.Heavy(t)
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	createIndex(t, a.n, "out", 2, 0)
@@ -296,6 +298,7 @@ func TestChangelogAgeCap(t *testing.T) {
 // the retiring retention, so the changelog it needs to replay on restart survives the
 // leader's pruning; restarted, it claims its own slots back at the same epochs.
 func TestStoppedNodeKeepsItsTail(t *testing.T) {
+	testtier.Heavy(t)
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.PruneInterval = 100 * time.Millisecond })
 	a := c.start(0)
 	createIndex(t, a.n, "tail", 1, 0)

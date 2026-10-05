@@ -18,6 +18,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestTailerAppliesTheChangelog: documents and saved queries reach the copy, other
@@ -64,7 +65,7 @@ func TestTailerAppliesTheChangelog(t *testing.T) {
 func TestConvergence(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		seeds := 2
-		if testing.Short() || raceEnabled {
+		if testing.Short() || testtier.Race {
 			seeds = 1
 		}
 		for seed := range seeds {

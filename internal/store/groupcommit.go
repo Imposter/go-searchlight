@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -33,6 +34,8 @@ type GroupCommitOptions struct {
 	// Tracer and Meter default to the global providers'.
 	Tracer trace.Tracer
 	Meter  metric.Meter
+	// Clock times the batching window; nil means clock.Real.
+	Clock clock.Clock
 
 	// received, when set (tests only), runs in the committer's goroutine as
 	// each request is taken into a batch.
@@ -63,6 +66,7 @@ type GroupCommitter struct {
 	maxDelay   time.Duration
 	maxChanges int
 	tracer     trace.Tracer
+	clock      clock.Clock
 	batchSize  metric.Float64Histogram
 	received   func()
 
@@ -103,12 +107,16 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 	if o.Meter == nil {
 		o.Meter = otel.Meter(telemetry.ScopeName)
 	}
+	if o.Clock == nil {
+		o.Clock = clock.Real{}
+	}
 	in := telemetry.NewInstruments(o.Meter)
 	g := &GroupCommitter{
 		st:         st,
 		maxDelay:   o.MaxDelay,
 		maxChanges: o.MaxChanges,
 		tracer:     o.Tracer,
+		clock:      o.Clock,
 		batchSize:  in.Histogram(telemetry.MetricGroupCommitBatchSize),
 		reqs:       make(chan *gcRequest),
 		closing:    make(chan struct{}),
@@ -134,7 +142,7 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last
 	if err != nil {
 		return 0, 0, err
 	}
-	r := &gcRequest{ctx: ctx, changes: batch, prep: p, arrived: time.Now(), result: make(chan gcResult, 1)}
+	r := &gcRequest{ctx: ctx, changes: batch, prep: p, arrived: g.clock.Now(), result: make(chan gcResult, 1)}
 	select {
 	case g.reqs <- r:
 	case <-g.closing:
@@ -178,7 +186,7 @@ func (g *GroupCommitter) run() {
 		batch := []*gcRequest{first}
 		n := len(first.changes)
 		deadline := first.arrived.Add(g.maxDelay)
-		var timer *time.Timer
+		var timer clock.Timer
 	collect:
 		for n < g.maxChanges {
 			// Take whoever is already waiting before looking at the clock,
@@ -187,16 +195,16 @@ func (g *GroupCommitter) run() {
 			select {
 			case r = <-g.reqs:
 			default:
-				wait := time.Until(deadline)
+				wait := g.clock.Until(deadline)
 				if wait <= 0 {
 					break collect
 				}
 				if timer == nil {
-					timer = time.NewTimer(wait)
+					timer = g.clock.NewTimer(wait)
 				}
 				select {
 				case r = <-g.reqs:
-				case <-timer.C:
+				case <-timer.C():
 					break collect
 				case <-g.closing:
 					break collect

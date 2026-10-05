@@ -1,0 +1,52 @@
+# searchlight-peers is the StatefulSet's governing headless Service: it gives each pod
+# the stable DNS name its advertise_address uses
+# (searchlight-0.searchlight-peers.<namespace>.svc:8780). It publishes
+# pods that are not ready yet, because a node registers in the database, and peers may
+# call it, before its copies have recovered and it reports ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: searchlight-peers
+  labels:
+    app.kubernetes.io/name: searchlight
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: searchlight
+  ports:
+    - name: http
+      port: 8780
+      targetPort: http
+---
+# searchlight is the clients' Service: any ready node takes any request.
+apiVersion: v1
+kind: Service
+metadata:
+  name: searchlight
+  labels:
+    app.kubernetes.io/name: searchlight
+spec:
+  selector:
+    app.kubernetes.io/name: searchlight
+  ports:
+    - name: http
+      port: 8780
+      targetPort: http
+---
+# searchlight-admin exposes the admin listener (/metrics, /healthz, /readyz, pprof when
+# enabled) to Prometheus inside the cluster. Never expose it publicly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: searchlight-admin
+  labels:
+    app.kubernetes.io/name: searchlight
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: searchlight
+  ports:
+    - name: admin
+      port: 8781
+      targetPort: admin

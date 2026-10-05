@@ -1,0 +1,13 @@
+# One node down at a time, voluntarily: a drain or a rolling restart retires one node's
+# copies while the others serve them.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: searchlight
+  labels:
+    app.kubernetes.io/name: searchlight
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: searchlight

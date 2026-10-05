@@ -1,7 +1,8 @@
-// Package slserver runs a Searchlight node for the benchmark: the SQL store, the
-// single-node coordinator and the HTTP API, wired as the API tests wire them, on a
-// local listener. It stands in for cmd/searchlight (Task 12) until that binary is
-// merged: the harness itself only ever talks to a URL.
+// Package slserver runs a Searchlight node in process for the benchmark: the SQL store,
+// the single-node engine (node.Single, not the cluster.Node cmd/searchlight runs) and
+// the HTTP API, wired as the API tests wire them, on a local listener. The harness
+// itself only ever talks to a URL; benchmarking the real binary instead is plan Task
+// 13b.
 package slserver
 
 import (

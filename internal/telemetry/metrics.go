@@ -226,7 +226,7 @@ var Catalog = []MetricSpec{
 	{MetricReplicaHalted, KindGauge, "1", "1 while a shard copy is halted at a change it cannot apply, else 0, by index and shard.", nil},
 	{MetricReplicaPollFailing, KindGauge, "1", "1 while a shard copy's changelog polls fail (its lag in changes is then the last known one), else 0, by index and shard.", nil},
 	{MetricReplicaWatchReconnects, KindCounter, "{reconnect}", "Changelog notification subscriptions restarted after they failed.", nil},
-	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew_failed, expire, release).", nil},
+	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew, renew_failed, reclaim, lapse, resume, lost, release).", nil},
 	{MetricClusterAllocations, KindCounter, "{change}", "Shard copy state transitions by index and state (recovering, serving, retiring).", nil},
 	{MetricClusterNodes, KindGauge, "{node}", "Live nodes in the cluster, as this node reads the registry.", nil},
 	{MetricClusterPeerDuration, KindHistogram, "s", "Internal peer API request latency by route, peer and status (0: unreachable).", FastBuckets},

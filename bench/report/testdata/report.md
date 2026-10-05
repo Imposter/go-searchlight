@@ -85,7 +85,7 @@ The running maximum of samples taken every 1.5 s across the whole run, so a mid-
 
 The whole dataset loaded through `_bulk` at a fixed concurrency; each batch is acknowledged once durable. Latency is per batch.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | bulk_index | searchlight | c=1 | 50 | 50k | 80 ms | 200 ms | n/a (n=1000) | 400 ms | 0 | 1.67× rate |
 | bulk_index | elasticsearch | c=1 | 30 | 30k | 130 ms | 300 ms | n/a (n=1000) | 600 ms | 0 |  |
@@ -94,7 +94,7 @@ The whole dataset loaded through `_bulk` at a fixed concurrency; each batch is a
 
 Each measured write first sleeps a random, unmeasured delay uniform on [0, refresh interval) — seeded and identical for both engines at the same iteration — so writes land at a random point in the refresh cycle instead of, as a closed loop otherwise would, right after the previous one's own refresh. `refresh_visible`: one document written without refresh, then polled (every 10 ms) until a search finds it; latency runs from the write's start (after its delay). `refresh_wait_for`: the write's own latency with `refresh=wait_for` (also after its delay), then an immediate search must find it.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | refresh_visible | searchlight | c=1 | 1 | — | 600 ms | 1.05 s | n/a (n=1000) | 2.1 s | 0 | p50 1.09× |
 | refresh_visible | elasticsearch | c=1 | 1 | — | 550 ms | 1.02 s | n/a (n=1000) | 2.04 s | 0 |  |
@@ -105,7 +105,7 @@ Each measured write first sleeps a random, unmeasured delay uniform on [0, refre
 
 Each workload cycles through query variants with Zipfian values; size 10, bodies returned.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | filter_term | searchlight | c=1 | 2000 | — | 400 µs | 900 µs | n/a (n=1000) | 1.8 ms | 0 | p50 0.50× |
 | filter_term | elasticsearch | c=1 | 1000 | — | 800 µs | 2 ms | n/a (n=1000) | 4 ms | 0 |  |
@@ -116,7 +116,7 @@ Each workload cycles through query variants with Zipfian values; size 10, bodies
 
 Top-k with a sort, and `search_after` walks to the stated depth (latency per page).
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | sorted_price_top100 | searchlight | c=1 | 500 | — | 1.5 ms | 4 ms | n/a (n=1000) | 8 ms | 0 | p50 0.60× |
 | sorted_price_top100 | elasticsearch | c=1 | 300 | — | 2.5 ms | 6 ms | n/a (n=1000) | 12 ms | 0 |  |
@@ -125,7 +125,7 @@ Top-k with a sort, and `search_after` walks to the stated depth (latency per pag
 
 Size 0; Elasticsearch's request cache is off; filters vary per iteration.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | agg_terms | searchlight | c=1 | 300 | — | 3 ms | 6 ms | n/a (n=1000) | 12 ms | 0 | p50 0.60× |
 | agg_terms | elasticsearch | c=1 | 200 | — | 5 ms | 9 ms | n/a (n=1000) | 18 ms | 0 |  |
@@ -134,7 +134,7 @@ Size 0; Elasticsearch's request cache is off; filters vary per iteration.
 
 Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: batches of documents at a fixed concurrency (docs/s, latency per batch). `percolate_single_N`: one document per request (per-document latency). `bulk_percolate`: Searchlight's `_bulk?percolate=true` against Elasticsearch's `_bulk` then percolate.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | percolate_batch_10000 | searchlight | c=1 | 400 | 40k | 10 ms | 20 ms | n/a (n=1000) | 40 ms | 0 | 20.00× rate |
 | percolate_batch_10000 | elasticsearch | c=1 | 20 | 2000 | 200 ms | 400 ms | n/a (n=1000) | 800 ms | 0 |  |
@@ -149,7 +149,7 @@ Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: bat
 
 Readers cycle through filter, sorted and aggregation searches while writers update existing documents in bulk, for a fixed time.
 
-| workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
+| workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | mixed_read | searchlight | c=1 | 3000 | — | 1 ms | 4 ms | n/a (n=1000) | 8 ms | 0 | p50 0.67× |
 | mixed_read | elasticsearch | c=1 | 2000 | — | 1.5 ms | 6 ms | n/a (n=1000) | 12 ms | 0 |  |

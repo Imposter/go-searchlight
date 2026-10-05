@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"math"
 	"math/rand/v2"
 	"os"
 	"os/exec"
@@ -73,6 +74,18 @@ type Config struct {
 	// (target T8); RecoveryIterations recoveries are timed.
 	Recoverers         map[string]Recoverer
 	RecoveryIterations int
+	// Repeats reruns each latency-gated workload (filter, sorted/paging, aggs, and
+	// percolate_single) this many times, each its own warmup and measured iterations:
+	// the merged histogram carries every repeat's samples (more of them, for T2-T5's
+	// minSamples margin), and the spread of each repeat's own p99 is recorded as
+	// "p99_cv_pct" (the coefficient of variation) so the report shows whether the
+	// number is stable run to run, not just well-sampled once. 1 (the default): no
+	// repeat, the original single-run behavior.
+	Repeats int
+	// Profilers capture pprof evidence (CPU, heap, mutex) from an engine's process,
+	// by name, bracketing each major workload phase (target: tuning PRs carry
+	// evidence). nil: no capture.
+	Profilers map[string]*PprofCapture
 
 	// LoadOnly stops after the load and footprint.
 	LoadOnly bool
@@ -99,11 +112,16 @@ func (c *Config) defaults() {
 	set(&c.Search.Concurrency, 1)
 	set(&c.Variants, 64)
 	set(&c.PageDepth, 10_000)
-	set(&c.PageWalks, 5)
+	// PageWalks 10 at the default PageDepth/pageSize (100) gives 1000 measured pages,
+	// minSamples(0.99): fewer walks left paging_search_after's p99 INSUFFICIENT SAMPLES
+	// (target T3).
+	set(&c.PageWalks, 10)
 	set(&c.PercolateBatch, 100)
 	set(&c.PercolateConcurrency, 4)
 	set(&c.PercolateIterations, 50)
-	set(&c.PercolateSingle, 300)
+	// PercolateSingle 1000 is minSamples(0.99): target T5's p99-per-document-at-100k
+	// bound needs a trusted p99, and fewer samples left it INSUFFICIENT SAMPLES.
+	set(&c.PercolateSingle, 1000)
 	set(&c.BulkPercolateIterations, 20)
 	set(&c.VisibleIterations, 1000)
 	set(&c.MixedReaders, 4)
@@ -112,6 +130,7 @@ func (c *Config) defaults() {
 	set(&c.CrossCheckVariants, 4)
 	set(&c.RestartIterations, 3)
 	set(&c.RecoveryIterations, 3)
+	set(&c.Repeats, 1)
 	if c.MixedDuration <= 0 {
 		c.MixedDuration = 30 * time.Second
 	}
@@ -177,6 +196,18 @@ func (s *suite) logf(format string, args ...any) {
 	fmt.Fprintf(s.cfg.Log, "%s "+format+"\n", append([]any{time.Now().Format("15:04:05")}, args...)...)
 }
 
+// profiled wraps step with Searchlight's pprof capture (s.cfg.Profilers), when one is
+// configured, so every tuning PR for the phase step runs carries CPU, heap and mutex
+// evidence (bracketing phases that span both engines, since Searchlight is the only
+// one with pprof); step runs unchanged when none is.
+func (s *suite) profiled(phase string, step func(context.Context) error) func(context.Context) error {
+	pc := s.cfg.Profilers[report.Searchlight]
+	if pc == nil {
+		return step
+	}
+	return func(ctx context.Context) error { return pc.Around(ctx, phase, step) }
+}
+
 // RunSuite runs every workload (spec section 14) on each engine, one engine at a time,
 // and returns the run's results. Engines are compared only if they answer the
 // cross-check identically.
@@ -189,7 +220,7 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 			Warmup: cfg.Search.Warmup, Iterations: cfg.Search.Iterations, Concurrency: cfg.Search.Concurrency, Rate: cfg.Search.Rate,
 			Variants: cfg.Variants, BulkBatch: cfg.BulkBatch, BulkConcurrency: cfg.BulkConcurrency,
 			PercolateBatch: cfg.PercolateBatch, PercolateConcurrency: cfg.PercolateConcurrency, PageDepth: cfg.PageDepth,
-			MixedSeconds: cfg.MixedDuration.Seconds(),
+			MixedSeconds: cfg.MixedDuration.Seconds(), Repeats: cfg.Repeats,
 		},
 	}}
 	for _, e := range engines {
@@ -211,7 +242,11 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 	if !cfg.LoadOnly {
 		sampler, stopSampler = s.startFootprintSampler(ctx)
 	}
-	steps := []func(context.Context) error{s.load, s.crossCheckSearches, s.searches, s.visibility, s.mixed, s.percolation, s.restart, s.recovery}
+	steps := []func(context.Context) error{
+		s.profiled("load", s.load), s.crossCheckSearches, s.profiled("searches", s.searches),
+		s.profiled("visibility", s.visibility), s.profiled("mixed", s.mixed), s.profiled("percolation", s.percolation),
+		s.restart, s.recovery,
+	}
 	if cfg.LoadOnly {
 		steps = steps[:1]
 	}
@@ -318,6 +353,18 @@ func (s *suite) load(ctx context.Context) error {
 			},
 		}
 		s.logf("  footprint %s: disk %s, RSS %s", eng.Name(), report.FormatBytes(float64(r.DiskBytes)), report.FormatBytes(float64(r.RSSBytes)))
+		if sizer, ok := eng.(SectionSizer); ok {
+			sizes, err := sizer.SectionSizes(ctx, s.cfg.Index)
+			if err != nil {
+				s.logf("  %s: disk section breakdown: %v", eng.Name(), err)
+			}
+			for section, bytes := range sizes {
+				fp.Values["section_"+section+"_bytes"] = float64(bytes)
+			}
+			if len(sizes) > 0 {
+				s.logf("  %s: disk by section: %s", eng.Name(), formatSections(sizes))
+			}
+		}
 		s.run.Results = append(s.run.Results, fp)
 	}
 	s.run.Dataset.Docs = s.loaded
@@ -325,6 +372,29 @@ func (s *suite) load(ctx context.Context) error {
 		s.run.Dataset.AvgDocBytes = float64(s.run.Dataset.FileBytes) / float64(s.loaded)
 	}
 	return nil
+}
+
+// formatSections formats a disk-by-section breakdown for the log, largest first.
+func formatSections(sizes map[string]int64) string {
+	names := make([]string, 0, len(sizes))
+	for k := range sizes {
+		names = append(names, k)
+	}
+	slices.SortFunc(names, func(a, b string) int {
+		switch {
+		case sizes[b] > sizes[a]:
+			return 1
+		case sizes[b] < sizes[a]:
+			return -1
+		default:
+			return 0
+		}
+	})
+	parts := make([]string, len(names))
+	for i, name := range names {
+		parts[i] = fmt.Sprintf("%s %s", name, report.FormatBytes(float64(sizes[name])))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // footprintSampleInterval is how often the sampler re-measures disk and RSS while
@@ -668,6 +738,75 @@ func (s *suite) searches(ctx context.Context) error {
 	return nil
 }
 
+// runRepeated runs op cfg.Repeats times (each its own warmup and measured
+// iterations under o), merging every repeat's histogram into one Measurement (more
+// total samples, for T2-T5's minSamples margin) and returning, alongside it, the
+// coefficient of variation of the repeats' own p99s as a percentage (0 when Repeats
+// is 1 or fewer than two repeats recorded any samples): the spread a stable p99
+// should show as small, and an unstable one as large, run to run.
+func (s *suite) runRepeated(ctx context.Context, o RunOptions, op Op) (*Measurement, float64) {
+	repeats := max(s.cfg.Repeats, 1)
+	m := Run(ctx, o, op)
+	if repeats <= 1 {
+		return m, 0
+	}
+	p99s := []float64{}
+	if m.Hist.Count() > 0 {
+		p99s = append(p99s, m.Hist.Summary().P99)
+	}
+	for range repeats - 1 {
+		next := Run(ctx, o, op)
+		if next.Hist.Count() > 0 {
+			p99s = append(p99s, next.Hist.Summary().P99)
+		}
+		m.Hist.Merge(next.Hist)
+		m.Ops += next.Ops
+		m.Docs += next.Docs
+		m.Errors += next.Errors
+		m.Elapsed += next.Elapsed
+		if m.FirstErr == nil {
+			m.FirstErr = next.FirstErr
+		}
+	}
+	return m, p99CV(p99s)
+}
+
+// p99CV is the coefficient of variation (stddev / mean, as a percentage) of a set of
+// p99s from independent repeats of the same workload; 0 when there are fewer than two
+// to compare or the mean is not positive.
+func p99CV(v []float64) float64 {
+	if len(v) < 2 {
+		return 0
+	}
+	var sum float64
+	for _, x := range v {
+		sum += x
+	}
+	mean := sum / float64(len(v))
+	if mean <= 0 {
+		return 0
+	}
+	var sq float64
+	for _, x := range v {
+		sq += (x - mean) * (x - mean)
+	}
+	stddev := math.Sqrt(sq / float64(len(v)))
+	return stddev / mean * 100
+}
+
+// withCV attaches a repeated run's p99 coefficient of variation to res.Values, when
+// it was computed (cv > 0, meaning Repeats > 1 and at least two repeats had samples).
+func withCV(res report.Result, cv float64) report.Result {
+	if cv <= 0 {
+		return res
+	}
+	if res.Values == nil {
+		res.Values = map[string]float64{}
+	}
+	res.Values["p99_cv_pct"] = cv
+	return res
+}
+
 func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec) (report.Result, error) {
 	prepared := make([]Prepared, len(spec.Bodies))
 	for i, b := range spec.Bodies {
@@ -683,7 +822,8 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 			_, err := eng.Search(ctx, s.cfg.Index, prepared[i%len(prepared)], nil)
 			return 1, 0, err
 		}
-		return s.result(spec.Name, spec.Group, spec.Description, eng, o, Run(ctx, o, op)), nil
+		m, cv := s.runRepeated(ctx, o, op)
+		return withCV(s.result(spec.Name, spec.Group, spec.Description, eng, o, m), cv), nil
 	}
 	// Paging: sequential walks; each iteration is one page.
 	const pageSize = 100
@@ -704,7 +844,8 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 		return 1, 0, nil
 	}
 	po := RunOptions{Warmup: perWalk, Iterations: perWalk * s.cfg.PageWalks, Concurrency: 1}
-	return s.result(spec.Name, spec.Group, spec.Description, eng, po, Run(ctx, po, op)), nil
+	m, cv := s.runRepeated(ctx, po, op)
+	return withCV(s.result(spec.Name, spec.Group, spec.Description, eng, po, m), cv), nil
 }
 
 // idQuery is a search for one document by id.
@@ -976,7 +1117,8 @@ func (s *suite) percolation(ctx context.Context) error {
 					_, err := eng.Percolate(ctx, s.cfg.PercIndex, pool[i%len(pool):i%len(pool)+1])
 					return 1, 0, err
 				}
-				s.add(s.result(name, report.GroupPercolate, fmt.Sprintf("one document per request against %d saved searches (per-document latency)", n), eng, o, Run(ctx, o, op)))
+				m, cv := s.runRepeated(ctx, o, op)
+				s.add(withCV(s.result(name, report.GroupPercolate, fmt.Sprintf("one document per request against %d saved searches (per-document latency)", n), eng, o, m), cv))
 			}
 		}
 	}
@@ -1093,16 +1235,21 @@ func (s *suite) restart(ctx context.Context) error {
 	return nil
 }
 
-// Recoverer runs an engine's new-replica recovery (target T8) on a cluster of its own.
-// The suite loads the dataset into Source, the cluster's first node, then each Recover
-// starts a node holding nothing, returns how long it took from its start until its own
-// copies serve all want documents of index, and removes it again.
+// Recoverer runs an engine's new-replica recovery (target T8). Source, when it is not
+// nil, is a cluster of its own: the suite loads the dataset into it, the cluster's
+// first node, before timing any Recover. A nil Source means the engine instead
+// measures recovery on the index and data [RunSuite]'s load step already put in
+// place (Elasticsearch: a second node, already part of the same cluster, recovers a
+// replica of the index the rest of the suite ran against). Each Recover returns how
+// long it took, from whatever "zero" means for that engine, until want documents of
+// index are served again.
 type Recoverer interface {
 	Source() Engine
 	Recover(ctx context.Context, index string, want int64) (time.Duration, error)
 }
 
-// recovery loads the dataset into each recoverer's source and times new replicas.
+// recovery loads the dataset into each recoverer's own source, when it has one, and
+// times new replicas.
 func (s *suite) recovery(ctx context.Context) error {
 	if !s.cfg.wants("recovery", report.GroupRecovery) {
 		return nil
@@ -1112,17 +1259,20 @@ func (s *suite) recovery(ctx context.Context) error {
 		if rec == nil {
 			continue
 		}
-		src := rec.Source()
-		s.logf("loading %s into %s's recovery source", s.cfg.DataFile, eng.Name())
-		if err := src.CreateIndex(ctx, s.cfg.Index, datasets.Products, s.cfg.Shards); err != nil {
-			return fmt.Errorf("%s: recovery source: creating %s: %w", eng.Name(), s.cfg.Index, err)
-		}
-		_, n, err := s.bulkLoad(ctx, src)
-		if err != nil {
-			return fmt.Errorf("%s: recovery source: loading: %w", eng.Name(), err)
-		}
-		if err := s.waitSearchable(ctx, src, n); err != nil {
-			return err
+		n := s.loaded
+		if src := rec.Source(); src != nil {
+			s.logf("loading %s into %s's recovery source", s.cfg.DataFile, eng.Name())
+			if err := src.CreateIndex(ctx, s.cfg.Index, datasets.Products, s.cfg.Shards); err != nil {
+				return fmt.Errorf("%s: recovery source: creating %s: %w", eng.Name(), s.cfg.Index, err)
+			}
+			_, ln, err := s.bulkLoad(ctx, src)
+			if err != nil {
+				return fmt.Errorf("%s: recovery source: loading: %w", eng.Name(), err)
+			}
+			if err := s.waitSearchable(ctx, src, ln); err != nil {
+				return err
+			}
+			n = ln
 		}
 		o := RunOptions{Iterations: s.cfg.RecoveryIterations, Concurrency: 1}
 		op := func(ctx context.Context, _ int) (int, time.Duration, error) {

@@ -33,9 +33,14 @@ jobs:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     # The default --visible-iterations (1000, minSamples(0.99)) costs roughly 36
     # extra minutes by itself (bench/workloads/suite.go's VisibleIterations comment
-    # has the measured per-iteration cost); 180 still leaves ample room for a
-    # 1M-document run's load, searches, aggregations and percolation beside it.
-    timeout-minutes: 180
+    # has the measured per-iteration cost). On top of that, --repeats (default 3)
+    # reruns every filter/sorted/aggs/percolate-single workload for stable p99s
+    # (target: run-to-run variance), and --es-recovery adds Elasticsearch's own
+    # peer-recovery timing (target T8) to the Searchlight-only recovery workload
+    # that already ran here. 240 leaves room for a 1M-document run's load, searches,
+    # aggregations, percolation and both engines' recovery; narrow it back down
+    # once a real 1M run's wall time is measured.
+    timeout-minutes: 240
     # The recovery workload (target T8: a new replica from zero to serving) needs a
     # second Searchlight node, and so a store two nodes can share: this Postgres, for a
     # cluster of slbench's own beside the SQLite node every other workload runs on.
@@ -92,11 +97,18 @@ jobs:
           # documents, floor 1g; on the default runner, capped at 3g to leave room for
           # Searchlight, Docker and the OS in ~7 GB total. A larger 'runner' lifts the
           # cap along with the document ceiling above.
+          #
+          # bench/docker-compose.es.yml now runs TWO Elasticsearch nodes (target T8's
+          # peer-recovery baseline), both at this same heap, never tuned down for
+          # either one (see that file's comment) -- so the real memory cost on the
+          # default runner is roughly double this HEAP_GB, on top of everything else
+          # already sharing the ~7 GB. If that runs out of memory at 1M documents,
+          # the fix is a larger 'runner' input, not a smaller heap on one node.
           HEAP_GB=$(( (N + 299999) / 300000 ))
           if [ "$HEAP_GB" -lt 1 ]; then HEAP_GB=1; fi
           if [ "$RUNNER_LABEL" = "ubuntu-latest" ] && [ "$HEAP_GB" -gt 3 ]; then HEAP_GB=3; fi
           echo "ES_HEAP=${HEAP_GB}g" >> "$GITHUB_ENV"
-          echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g, runner $RUNNER_LABEL"
+          echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g per node (x2 nodes), runner $RUNNER_LABEL"
 
       # Each recovery-cluster node opens up to 64 connections plus one for LISTEN; two
       # nodes and slbench's own pass the image's default of 100.
@@ -119,16 +131,18 @@ jobs:
       - name: start Elasticsearch
         run: docker compose -f bench/docker-compose.es.yml up -d
 
+      # wait_for_nodes=2 as well as yellow: --es-recovery below needs the second node
+      # (elasticsearch2) actually joined, not just the first one answering.
       - name: wait for Elasticsearch
         run: |
           for i in $(seq 1 60); do
-            if curl -sf "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s" >/dev/null; then
-              echo "elasticsearch is up"
+            if curl -sf "http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&wait_for_nodes=2&timeout=5s" >/dev/null; then
+              echo "elasticsearch is up (2 nodes)"
               exit 0
             fi
             sleep 5
           done
-          echo "elasticsearch did not become healthy" >&2
+          echo "elasticsearch did not become healthy with 2 nodes" >&2
           docker compose -f bench/docker-compose.es.yml logs
           exit 1
 
@@ -148,9 +162,11 @@ jobs:
             --sets "$SEARCHES" \
             --sl-bin bin/searchlight \
             --sl-dir "$SL_DIR" \
+            --pprof-dir "$SL_DIR/pprof" \
             --recovery-store-url "$RECOVERY_STORE_URL" \
             --es-url "http://127.0.0.1:9200" \
             --es-config "heap_max=${ES_HEAP}" \
+            --es-recovery \
             --label "CI (${{ github.sha }})" \
             --out "$DATA_DIR/bench-results.json" \
             --md docs/benchmarks.md \
@@ -196,6 +212,7 @@ jobs:
             ${{ env.SL_DIR }}/searchlight.log
             ${{ env.SL_DIR }}/recovery/*/searchlight.log
             ${{ env.SL_DIR }}/elasticsearch.log
+            ${{ env.SL_DIR }}/pprof/*
           if-no-files-found: warn
           retention-days: 90
 

@@ -446,7 +446,7 @@ func (r *Run) recovery() TargetCheck {
 	case !s.OK() || s.Latency == nil:
 		c.Status, c.Detail = Invalid, "The recovery workload errored."
 	case e == nil:
-		c.Status, c.Detail = NoBaseline, "Elasticsearch's peer recovery was not run: it needs a second Elasticsearch node, which this harness does not start."+scale
+		c.Status, c.Detail = NoBaseline, "Elasticsearch's peer recovery was not run: pass --es-recovery (needs the second node bench/docker-compose.es.yml starts)."+scale
 	case !e.OK() || e.Latency == nil:
 		c.Status, c.Detail = Invalid, "Elasticsearch's recovery workload errored."
 	case s.Latency.Max > e.Latency.Max:

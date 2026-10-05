@@ -75,6 +75,15 @@ type Engine interface {
 	Resources(ctx context.Context, index string) (report.Resources, error)
 }
 
+// SectionSizer is implemented by an engine that can break its on-disk footprint down
+// by section or structure (target T6's per-section disk breakdown: Searchlight's
+// segment sections next to Elasticsearch's _disk_usage API). A nil map and nil error
+// means not available (Searchlight: no --sl-disk paths). index is ignored by an
+// engine (Searchlight) whose breakdown is already node-wide, like Resources.
+type SectionSizer interface {
+	SectionSizes(ctx context.Context, index string) (map[string]int64, error)
+}
+
 // StatusError is an engine answering with an unexpected HTTP status.
 type StatusError struct {
 	Method, URL string

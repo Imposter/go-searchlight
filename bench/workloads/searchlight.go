@@ -405,6 +405,17 @@ func (s *Searchlight) Resources(ctx context.Context, _ string) (report.Resources
 	return r, nil
 }
 
+// SectionSizes implements SectionSizer: bytes per on-disk segment section (spec §6),
+// summed across every .seg file under DiskPaths. Returns (nil, nil) without
+// --sl-disk paths, the same "not available" the caller already treats Resources'
+// missing disk source as.
+func (s *Searchlight) SectionSizes(_ context.Context, _ string) (map[string]int64, error) {
+	if len(s.opts.DiskPaths) == 0 {
+		return nil, nil
+	}
+	return sectionSizes(s.opts.DiskPaths)
+}
+
 // dirSize sums the sizes of the regular files under root (or root itself).
 func dirSize(root string) (int64, error) {
 	var total int64

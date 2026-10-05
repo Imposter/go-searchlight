@@ -122,7 +122,7 @@ var groupOrder = []struct{ group, title, about string }{
 	{GroupPercolate, "Percolation", "Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: batches of documents at a fixed concurrency (docs/s, latency per batch). `percolate_single_N`: one document per request (per-document latency). `bulk_percolate`: Searchlight's `_bulk?percolate=true` against Elasticsearch's `_bulk` then percolate."},
 	{GroupMixed, "Concurrent mixed read/write", "Readers cycle through filter, sorted and aggregation searches while writers update existing documents in bulk, for a fixed time."},
 	{GroupRestart, "Restart to serving", "The engine stopped gracefully and started again (Searchlight: the node slbench runs; Elasticsearch: the operator's restart command), timed until it answers a count with the full total."},
-	{GroupRecovery, "New replica from zero to serving", "A node with an empty data directory joins a cluster of its own that already holds the dataset, timed from its start until its own copies serve every document (peer recovery, then the changelog replayed)."},
+	{GroupRecovery, "New replica from zero to serving", "Searchlight: a node with an empty data directory joins a cluster of its own that already holds the dataset, timed from its start until its own copies serve every document (peer recovery, then the changelog replayed). Elasticsearch: on the same index and data the rest of the run already loaded, the second node's replica is dropped and restored (number_of_replicas 0 then 1), timed until the cluster is green again."},
 }
 
 // Render writes the run as markdown.
@@ -246,6 +246,9 @@ func renderMethod(w io.Writer, r *Run) {
 		loop = fmt.Sprintf("open loop at %.0f requests/s (latency from each request's scheduled start, so queueing is charged)", o.Rate)
 	}
 	fmt.Fprintf(w, "- Each search workload runs %d warmup then %d measured requests, %s, cycling through %d query variants. Latencies are client-side wall time per request, recorded in an HDR-style histogram (0.1%% precision).\n", o.Warmup, o.Iterations, loop, o.Variants)
+	if o.Repeats > 1 {
+		fmt.Fprintf(w, "- Filter, sorted/paging, aggregation and percolate-single workloads each repeat %d times (independent warmup and measured requests every time), merged into one histogram; a table's \"p99 (± run-to-run)\" is the coefficient of variation across the repeats' own p99s, not a confidence interval.\n", o.Repeats)
+	}
 	fmt.Fprintf(w, "- Bulk loads send %d documents per request at concurrency %d. Percolation batches hold %d documents at concurrency %d. Deep paging walks to depth %d.\n", o.BulkBatch, o.BulkConcurrency, o.PercolateBatch, o.PercolateConcurrency, o.PageDepth)
 	if o.MixedSeconds > 0 {
 		fmt.Fprintf(w, "- The mixed workload runs for %.0f s.\n", o.MixedSeconds)
@@ -307,6 +310,72 @@ func renderFootprint(w io.Writer, r *Run) {
 	}
 	fmt.Fprintf(w, "## Disk and memory\n\nThe running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load.\n\n")
 	table(w, []string{"engine", "disk", "disk per 1M docs", "RSS", "RSS per 1M docs", "how"}, rows)
+	renderSectionBreakdown(w, r)
+}
+
+// sectionBreakdownOrder is the section-breakdown column order (largest, typically,
+// to smallest in a real segment): Searchlight's term dictionary and postings
+// together, doc values, points, presence bitmaps, stored fields, the id dictionary
+// and the field directory meta, and anything else either engine reports that this
+// list does not name.
+var sectionBreakdownOrder = []string{"terms", "docvalues", "points", "presence", "stored", "ids", "meta", "other"}
+
+// renderSectionBreakdown renders target T6's per-section disk breakdown (bytes per
+// Searchlight segment section, next to Elasticsearch's _disk_usage API), from the
+// "footprint" result's "section_<name>_bytes" values, measured right after the
+// load (not sampled at the run's peak, unlike the totals table above it).
+func renderSectionBreakdown(w io.Writer, r *Run) {
+	type row struct {
+		engine string
+		sizes  map[string]int64
+	}
+	var byEngine []row
+	names := map[string]bool{}
+	for _, eng := range []string{Searchlight, Elasticsearch} {
+		res := r.Find("footprint", eng)
+		if res == nil {
+			continue
+		}
+		sizes := map[string]int64{}
+		for k, v := range res.Values {
+			if name, ok := strings.CutPrefix(k, "section_"); ok {
+				name = strings.TrimSuffix(name, "_bytes")
+				sizes[name] = int64(v)
+				names[name] = true
+			}
+		}
+		if len(sizes) > 0 {
+			byEngine = append(byEngine, row{eng, sizes})
+		}
+	}
+	if len(byEngine) == 0 {
+		return
+	}
+	cols := make([]string, 0, len(sectionBreakdownOrder))
+	for _, n := range sectionBreakdownOrder {
+		if names[n] {
+			cols = append(cols, n)
+			delete(names, n)
+		}
+	}
+	extra := make([]string, 0, len(names))
+	for n := range names {
+		extra = append(extra, n)
+	}
+	sort.Strings(extra)
+	cols = append(cols, extra...)
+	header := append([]string{"engine"}, cols...)
+	rows := make([][]string, len(byEngine))
+	for i, eng := range byEngine {
+		row := make([]string, len(cols)+1)
+		row[0] = eng.engine
+		for j, c := range cols {
+			row[j+1] = FormatBytes(float64(eng.sizes[c]))
+		}
+		rows[i] = row
+	}
+	fmt.Fprintf(w, "Disk by section, right after the load (not the peak above): Searchlight's segment sections (`internal/segment`, spec section 6), Elasticsearch's `_disk_usage` API aggregated to sit beside them (its norms, term vectors and knn vectors fold into \"other\"; it has no analog of \"ids\" or \"meta\", which live inside its inverted index and stored fields already).\n\n")
+	table(w, header, rows)
 }
 
 func renderGroup(w io.Writer, r *Run, group, title, about string) {
@@ -324,7 +393,11 @@ func renderGroup(w io.Writer, r *Run, group, title, about string) {
 			}
 			row := []string{name, res.Engine, conc(res), FormatRate(res.OpsPerSec), docsRate(res)}
 			if l := res.Latency; l != nil {
-				row = append(row, formatQuantile(l.P50, l.Count, 0.50), formatQuantile(l.P99, l.Count, 0.99), formatQuantile(l.P999, l.Count, 0.999), FormatMicros(l.Max))
+				p99 := formatQuantile(l.P99, l.Count, 0.99)
+				if cv := res.Values["p99_cv_pct"]; cv > 0 {
+					p99 = fmt.Sprintf("%s (±%.1f%%)", p99, cv)
+				}
+				row = append(row, formatQuantile(l.P50, l.Count, 0.50), p99, formatQuantile(l.P999, l.Count, 0.999), FormatMicros(l.Max))
 			} else {
 				row = append(row, "—", "—", "—", "—")
 			}
@@ -336,7 +409,7 @@ func renderGroup(w io.Writer, r *Run, group, title, about string) {
 			rows = append(rows, row)
 		}
 	}
-	table(w, []string{"workload", "engine", "load", "ops/s", "docs/s", "p50", "p99", "p99.9", "max", "errors", "SL vs ES"}, rows)
+	table(w, []string{"workload", "engine", "load", "ops/s", "docs/s", "p50", "p99 (± run-to-run)", "p99.9", "max", "errors", "SL vs ES"}, rows)
 }
 
 func conc(res *Result) string {

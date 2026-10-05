@@ -65,9 +65,11 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	slDisk := fs.String("sl-disk", "", "with --sl-url: comma-separated directories holding the node's data and database, for disk usage")
 	slPID := fs.Int("sl-pid", 0, "with --sl-url: the node's process id on this host (Linux: RSS from /proc; else /metrics)")
 	slConfig := fs.String("sl-config", "", "k=v,... describing Searchlight's configuration for the report")
+	pprofDir := fs.String("pprof-dir", "", "with --sl-bin: capture CPU, heap and mutex pprof profiles from Searchlight (admin pprof) bracketing each workload phase, written here (empty: off)")
 	esURL := fs.String("es-url", "", "Elasticsearch URL")
 	esPID := fs.Int("es-pid", 0, "the Elasticsearch JVM's process id on this host (Linux: RSS from /proc)")
 	esConfig := fs.String("es-config", "", "k=v,... describing Elasticsearch's configuration for the report")
+	esRecovery := fs.Bool("es-recovery", false, "measure Elasticsearch's own peer recovery (target T8) by flipping the index's number_of_replicas 0->1 and timing until green; needs a second node (bench/docker-compose.es.yml starts one)")
 
 	shards := fs.Int("shards", 1, "shards per index on both engines")
 	warmup := fs.Int("warmup", 100, "warmup requests per search workload")
@@ -76,14 +78,15 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	rate := fs.Float64("rate", 0, "open-loop requests per second for search workloads (0: closed loop)")
 	variants := fs.Int("variants", 64, "query variants per search workload")
 	pageDepth := fs.Int("page-depth", 10_000, "deep paging depth in hits")
-	pageWalks := fs.Int("page-walks", 5, "measured deep paging walks")
+	pageWalks := fs.Int("page-walks", 10, "measured deep paging walks (10 at the default page-depth/100 gives 1000 measured pages, minSamples(0.99), the fewest a trusted p99 needs)")
 	bulkBatch := fs.Int("bulk-batch", 1000, "documents per _bulk while loading")
 	bulkConc := fs.Int("bulk-concurrency", 4, "concurrent _bulk requests while loading")
 	percBatch := fs.Int("percolate-batch", 100, "documents per percolate request")
 	percConc := fs.Int("percolate-concurrency", 4, "concurrent percolate batch requests")
 	percIter := fs.Int("percolate-iterations", 50, "measured percolate batches per saved-search set")
-	percSingle := fs.Int("percolate-single", 300, "measured single-document percolations per saved-search set")
+	percSingle := fs.Int("percolate-single", 1000, "measured single-document percolations per saved-search set (1000 is minSamples(0.99), the fewest a trusted p99 needs for target T5's < 1 ms bound)")
 	bulkPercIter := fs.Int("bulk-percolate-iterations", 20, "measured _bulk?percolate requests")
+	repeats := fs.Int("repeats", 3, "times to repeat each latency-gated workload (filter, sorted/paging, aggregations, percolate-single), merged for more samples and to report run-to-run p99 variance (1: no repeat, the original single-run behavior)")
 	visible := fs.Int("visible-iterations", 1000, "measured write-to-visible iterations per direction (visible and wait_for), at concurrency 1 so queueing never shows up as latency; 1000 is minSamples(0.99), the fewest a trusted p99 needs")
 	mixed := fs.Duration("mixed", 30*time.Second, "how long the mixed read/write workload runs")
 	ccVariants := fs.Int("crosscheck-variants", 4, "variants per workload the cross-check compares")
@@ -118,6 +121,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 
 	restarters := map[string]workloads.Restarter{}
 	recoverers := map[string]workloads.Recoverer{}
+	profilers := map[string]*workloads.PprofCapture{}
 	slCfg := keyValues(*slConfig)
 	slPIDFunc := func() int { return *slPID }
 	slDiskPaths := splitList(*slDisk)
@@ -126,6 +130,9 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 			return errors.New("give --sl-bin or --sl-url, not both")
 		}
 		settings := append([]string{"log_level=warn", "shutdown_grace=0s"}, splitList(*slSettings)...)
+		if *pprofDir != "" {
+			settings = append(settings, "pprof=true")
+		}
 		node, stop, err := runNode(ctx, nodeSpec{bin: *slBin, dir: *slDir, nodeID: "bench", settings: settings})
 		if err != nil {
 			return err
@@ -136,6 +143,12 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		restarters[report.Searchlight] = workloads.Restarter{
 			Describe: "the node stopped gracefully and its binary started again",
 			Restart:  func(ctx context.Context) error { return node.Restart(ctx, nodeStopTimeout) },
+		}
+		if *pprofDir != "" {
+			if err := os.MkdirAll(*pprofDir, 0o750); err != nil {
+				return err
+			}
+			profilers[report.Searchlight] = &workloads.PprofCapture{AdminURL: node.AdminURL, Dir: *pprofDir, Engine: report.Searchlight, Log: stdout}
 		}
 		if _, ok := slCfg["store"]; !ok {
 			slCfg["store"] = "SQLite (synchronous=FULL, WAL), its own process"
@@ -170,9 +183,13 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		}))
 	}
 	if *esURL != "" {
-		engines = append(engines, workloads.NewElasticsearch(workloads.ElasticsearchOptions{
+		esEngine := workloads.NewElasticsearch(workloads.ElasticsearchOptions{
 			URL: *esURL, PID: *esPID, Config: keyValues(*esConfig), Fields: datasets.Products, Log: stdout,
-		}))
+		})
+		engines = append(engines, esEngine)
+		if *esRecovery {
+			recoverers[report.Elasticsearch] = workloads.NewElasticsearchRecoverer(esEngine)
+		}
 	}
 	if len(engines) == 0 {
 		return errors.New("no engine: give --sl-bin, --sl-url or --es-url")
@@ -186,10 +203,11 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		Variants: *variants, PageDepth: *pageDepth, PageWalks: *pageWalks,
 		PercolateBatch: *percBatch, PercolateConcurrency: *percConc, PercolateIterations: *percIter, PercolateSingle: *percSingle,
 		BulkPercolateIterations: *bulkPercIter, VisibleIterations: *visible, MixedDuration: *mixed,
-		CrossCheckVariants: *ccVariants,
-		Restarters:         restarters, RestartIterations: *restartIter,
+		CrossCheckVariants: *ccVariants, Repeats: *repeats,
+		Restarters: restarters, RestartIterations: *restartIter,
 		Recoverers: recoverers, RecoveryIterations: *recoveryIter,
-		Only: splitList(*only), Skip: splitList(*skip),
+		Profilers: profilers,
+		Only:      splitList(*only), Skip: splitList(*skip),
 		LoadOnly: loadOnly, StopOnMismatch: *stopOnMismatch, Log: stdout,
 	}
 	run, runErr := workloads.RunSuite(ctx, cfg, engines)

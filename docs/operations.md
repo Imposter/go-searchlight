@@ -43,9 +43,20 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 
 - **Start.** It logs `searchlight starting`, with its configuration and secrets redacted.
   - `/healthz` answers as soon as the admin listener is up.
-  - While the database cannot be reached, the node retries opening and migrating it with
-    backoff (1 s, doubling, up to 30 s), and logs each failure. It refuses to start only
-    on an error that retrying cannot fix, such as a schema newer than the binary.
+  - Opening and migrating the store is retried with backoff (1 s, doubling, up to 30 s),
+    and each failure is logged. What happens next depends on the error:
+    - **Unreachable** (keeps retrying until it opens or the node is signalled): a network
+      error (refused, timed out, DNS), a server not taking connections yet (Postgres
+      class 08, 57P03 or 53300; MySQL 2002, 2003, 2013, 1040 or 1053; a broken
+      connection), or a SQLite file another process holds locked (BUSY, LOCKED).
+    - **Misconfigured** (exits 1 at once, without retrying): credentials refused
+      (Postgres 28P01 or 28000; MySQL 1045 or 1044), a database that does not exist
+      (Postgres 3D000; MySQL 1049), a SQLite file that cannot be opened or written
+      (CANTOPEN, PERM, READONLY, NOTADB, or a missing directory), an invalid
+      `store_url`, or a schema newer than the binary.
+    - **Anything else** is retried for 2 minutes, then the node exits 1.
+
+    Fix the cause and start the node again: `*_FILE` secrets are read only at start.
   - `/readyz` turns 200 once the node has joined the cluster and every shard copy has
     finished its startup recovery.
 - **Stop.** SIGINT or SIGTERM stops it gracefully, within `shutdown_grace` plus
@@ -53,8 +64,8 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
   during startup stops it cleanly too. A second signal kills it at once.
 - **Exit codes.**
   - 0 after a clean stop.
-  - 1, with one line on standard error, when it cannot start (a bad setting, a SQLite
-    store another node uses) or when its shutdown failed.
+  - 1, with one line on standard error, when it cannot start (a bad setting, a
+    misconfigured store, a SQLite store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
 - **`searchlight healthcheck [--live]`** probes the node on this host, for container
   healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
@@ -65,8 +76,10 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 
 [`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
 `-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`. The base images are
-pinned by digest, and Dependabot (`.github/dependabot.yml`) proposes updates for them,
-for the compose images, for the Go modules and for the CI actions.
+pinned by digest. Dependabot (`.github/dependabot.yml`) proposes updates for them, for
+the compose images, for the Go modules and for the CI actions. The one exception is the
+kubeconform image that CI runs inside a `run:` step: Dependabot cannot see it, so it is
+bumped by hand, as the comment beside it says.
 
 ```sh
 make docker                                  # searchlight:dev; IMAGE=... to rename

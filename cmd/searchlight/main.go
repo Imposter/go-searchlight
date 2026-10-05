@@ -6,10 +6,11 @@
 // A node is always a cluster.Node, a cluster of one included. It starts in this order:
 // telemetry and the admin listener (/healthz, /readyz, /metrics and, when enabled,
 // pprof), so probes answer while the rest starts; the SQL store, opened and migrated,
-// retried with backoff while the database cannot be reached; the cluster node and the
-// public API on listen, served before the node joins, since peers may call it as soon
-// as it registers; then the node joins the cluster. A signal during startup stops it
-// cleanly.
+// retried with backoff while the database cannot be reached (a misconfigured store,
+// such as refused credentials or a missing database, fails at once, and any other error
+// after 2 minutes); the cluster node and the public API on listen, served before the
+// node joins, since peers may call it as soon as it registers; then the node joins the
+// cluster. A signal during startup stops it cleanly.
 //
 // On SIGINT or SIGTERM it stops within one budget, fixed at the signal: shutdown_grace
 // plus shutdown_timeout. Readiness turns false and the node retires the copies others
@@ -56,9 +57,10 @@ var version = "dev"
 var _ api.Mounter = (*cluster.Node)(nil)
 
 const (
-	storeRetryFirst = time.Second
-	storeRetryCap   = 30 * time.Second
-	healthTimeout   = 2 * time.Second
+	storeRetryFirst        = time.Second
+	storeRetryCap          = 30 * time.Second
+	storeRetryUnclassified = 2 * time.Minute
+	healthTimeout          = 2 * time.Second
 )
 
 func main() {
@@ -221,26 +223,44 @@ func (b *shutdownBudget) begin(grace bool) *api.Shutdown {
 }
 
 func (b *shutdownBudget) context(parent context.Context) (context.Context, context.CancelFunc) {
-	return context.WithDeadline(context.WithoutCancel(parent), b.begin(false).Deadline)
+	return clock.WithDeadline(context.WithoutCancel(parent), b.clock, b.begin(false).Deadline)
 }
 
 func openStore(ctx context.Context, cfg config.Config, tel *telemetry.T, clk clock.Clock) (store.Store, error) {
-	wait := storeRetryFirst
-	for {
+	return retryStore(ctx, clk, tel.Logger, func(ctx context.Context) (store.Store, error) {
 		st, err := store.Open(ctx, cfg.StoreURL, store.WithLogger(tel.Logger), store.WithTracer(tel.Tracer), store.WithMeter(tel.Meter), store.WithClock(clk))
-		if err == nil {
-			if err = st.Migrate(ctx); err == nil {
-				return st, nil
-			}
+		if err != nil {
+			return nil, fmt.Errorf("store: %w", err)
+		}
+		if err := st.Migrate(ctx); err != nil {
 			_ = st.Close()
-			err = fmt.Errorf("store migrate: %w", err)
-		} else {
-			err = fmt.Errorf("store: %w", err)
+			return nil, fmt.Errorf("store migrate: %w", err)
 		}
-		if ctx.Err() != nil || !store.IsTransient(err) {
+		return st, nil
+	})
+}
+
+func retryStore(ctx context.Context, clk clock.Clock, log *slog.Logger, open func(context.Context) (store.Store, error)) (store.Store, error) {
+	wait := storeRetryFirst
+	var unclassifiedSince time.Time
+	for {
+		st, err := open(ctx)
+		if err == nil {
+			return st, nil
+		}
+		switch {
+		case ctx.Err() != nil:
 			return nil, err
+		case store.Misconfigured(err):
+			return nil, fmt.Errorf("%w (not retried: fix store_url or the database)", err)
+		case store.Unreachable(err):
+			unclassifiedSince = time.Time{}
+		case unclassifiedSince.IsZero():
+			unclassifiedSince = clk.Now()
+		case clk.Since(unclassifiedSince) >= storeRetryUnclassified:
+			return nil, fmt.Errorf("%w (gave up retrying after %s)", err, storeRetryUnclassified)
 		}
-		tel.Logger.WarnContext(ctx, "the store cannot be reached; retrying", slog.Any("error", err), slog.Duration("retry_in", wait))
+		log.WarnContext(ctx, "the store cannot be opened; retrying", slog.Any("error", err), slog.Duration("retry_in", wait))
 		if err := clk.Sleep(ctx, wait); err != nil {
 			return nil, err
 		}

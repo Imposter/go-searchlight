@@ -2,6 +2,7 @@ package clock_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -225,5 +226,74 @@ func TestFakeBlockUntilArmed(t *testing.T) {
 	}
 	if err := f.BlockUntilArmed(waitCtx(t), time.Hour-time.Second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWithTimeoutOnTheFake(t *testing.T) {
+	f := clock.NewFake(epoch)
+	ctx, cancel := clock.WithTimeout(context.Background(), f, time.Second)
+	defer cancel()
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("a fake deadline is reported as the process's")
+	}
+	f.Advance(time.Second - 1)
+	if ctx.Err() != nil {
+		t.Fatalf("ended early: %v", ctx.Err())
+	}
+	f.Advance(1)
+	select {
+	case <-ctx.Done():
+	case <-waitCtx(t).Done():
+		t.Fatal("not ended at its deadline")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		t.Fatalf("Err %v, Cause %v", ctx.Err(), context.Cause(ctx))
+	}
+	child, cancelChild := context.WithCancel(ctx)
+	defer cancelChild()
+	if !errors.Is(child.Err(), context.DeadlineExceeded) {
+		t.Fatalf("a child's Err %v", child.Err())
+	}
+
+	ctx, cancel = clock.WithTimeout(context.Background(), f, time.Second)
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("cancelled: %v", ctx.Err())
+	}
+	if f.Waiters() != 0 {
+		t.Fatalf("a cancelled timeout stays armed: %d", f.Waiters())
+	}
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancel = clock.WithTimeout(parent, f, time.Hour)
+	defer cancel()
+	cancelParent()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("a cancelled parent: %v", ctx.Err())
+	}
+}
+
+func TestWithTimeoutOnRealIsTheContextPackages(t *testing.T) {
+	ctx, cancel := clock.WithTimeout(context.Background(), clock.Real{}, time.Hour)
+	defer cancel()
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) <= 59*time.Minute {
+		t.Fatalf("deadline %v %v", dl, ok)
+	}
+	ctx, cancel = clock.WithTimeout(context.Background(), clock.Real{}, time.Millisecond)
+	defer cancel()
+	<-ctx.Done()
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestAdvanceWakesBlockUntilArmed(t *testing.T) {
+	f := clock.NewFake(epoch)
+	f.NewTimer(2 * time.Second)
+	done := make(chan error, 1)
+	go func() { done <- f.BlockUntilArmed(waitCtx(t), time.Second) }()
+	f.Advance(time.Second)
+	if err := <-done; err != nil {
+		t.Fatalf("a timer that came within d by an advance was missed: %v", err)
 	}
 }

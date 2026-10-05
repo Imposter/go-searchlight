@@ -12,9 +12,19 @@ import (
 // timers deliver into a one-slot buffer, as a receiver that is not ready yet would
 // later find them; AfterFunc callbacks run in their own goroutines, as with [Real].
 //
+// The goroutines a timer wakes run concurrently with Advance, so one that arms a new
+// timer when the last fired (a poll loop, a backoff) arms it from wherever the fake
+// has got to, and sees it fire at most once per Advance. Advance in steps no longer
+// than the shortest period the test relies on, waiting between steps for the effect
+// of each.
+//
 // A test that must not advance before a goroutine is parked on a timer waits for it
 // with [Fake.BlockUntil] (a number of armed timers) or [Fake.BlockUntilArmed] (a timer
 // of a given length). Fake is safe for concurrent use.
+//
+// Everything an engine component times runs on its clock, so on a Fake nothing that
+// waits moves until the test advances it: a node's writes, for one, wait out the
+// group commit window (store.GroupCommitOptions.MaxDelay, 2 ms by default) on it.
 //
 // Its times carry no monotonic reading: the wall clock and the monotonic clock are one
 // unless [Fake.StepWall] moves the wall clock alone.
@@ -96,8 +106,9 @@ func (f *Fake) Sleep(ctx context.Context, d time.Duration) error {
 
 // Advance moves the fake forward by d, firing every timer and ticker that falls due
 // on the way at its own deadline. A ticker whose period is shorter than d fires at
-// each of its deadlines, though its one-slot channel keeps only the first undelivered
-// tick, as a [time.Ticker] drops the ticks a slow receiver misses.
+// each of its deadlines, but its one-slot channel keeps only the first undelivered
+// tick, as a [time.Ticker] drops the ticks a slow receiver misses; a timer its
+// goroutine re-arms on firing fires once.
 func (f *Fake) Advance(d time.Duration) {
 	f.mu.Lock()
 	target := f.now.Add(d)
@@ -111,6 +122,9 @@ func (f *Fake) Advance(d time.Duration) {
 	}
 	if target.After(f.now) {
 		f.now = target
+	}
+	if d != 0 {
+		f.notify()
 	}
 	f.mu.Unlock()
 }

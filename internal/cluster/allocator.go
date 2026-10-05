@@ -153,10 +153,18 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	n.leaseMu.Unlock()
 	n.inst.lease(ctx, "claim")
 	n.inst.allocation(ctx, id, string(c.State))
-	if err := n.HostCopy(ctx, node.HostSpec{Copy: c, Held: l.valid, Quarantined: l.quarantined, Fetcher: n.fetch, Startup: startup}); err != nil {
+	spec := node.HostSpec{Copy: c, Held: l.valid, Quarantined: l.quarantined, Fetcher: n.fetch, Startup: startup}
+	if h := n.opts.hooks; h != nil && h.servedLocal != nil {
+		spec.Served = func() { h.servedLocal(id, l) }
+	}
+	if err := n.HostCopy(ctx, spec); err != nil {
 		n.dropLease(l)
-		if rerr := n.reg.ReleaseCopy(ctx, c); rerr == nil {
-			n.inst.lease(ctx, "release")
+		// A quarantined takeover keeps its row: released, the slot's next claim would
+		// get a fresh epoch with no quarantine while the previous holder may serve.
+		if !l.quarantined() {
+			if rerr := n.reg.ReleaseCopy(ctx, c); rerr == nil {
+				n.inst.lease(ctx, "release")
+			}
 		}
 		return err
 	}
@@ -167,10 +175,11 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 
 // maybeRelease releases this node's copy when the index's target fell below its slot
 // and at least target other copies serve in slots below it (so the copies the target
-// keeps are serving ones, not ones still recovering).
+// keeps are serving ones, not ones still recovering). A quarantined takeover is
+// released once its quarantine ends.
 func (n *Node) maybeRelease(ctx context.Context, v *view, iv node.IndexView, l *lease) error {
 	target := iv.ReplicasPerShard
-	if target == 0 || l.copy.Slot < target || v.servingBelow(l.copy.Shard, n.id, target) < target {
+	if target == 0 || l.copy.Slot < target || l.quarantined() || v.servingBelow(l.copy.Shard, n.id, target) < target {
 		return nil
 	}
 	n.log.InfoContext(ctx, "releasing an extra shard copy: the copy target was lowered", slog.String("shard", l.copy.Shard.String()),

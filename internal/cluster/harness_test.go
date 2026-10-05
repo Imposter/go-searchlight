@@ -252,11 +252,11 @@ type violation struct {
 }
 
 // checkServed checks the split-brain invariant on a read that tn's copy of id served
-// (began is tn's leaseClock reading taken before the copy was checked): the copy's lease
-// held and was not quarantined when the read began, and no other node's copy of the
-// same slot serves peers. A lease claimed after began, or dropped since, cannot be
-// judged.
-func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration) {
+// to a peer (began and wall are tn's leaseClock readings taken before the copy was
+// checked): the copy's lease held, by both clocks, and was not quarantined when the read
+// began, and no other node's copy of the same slot serves peers. A lease claimed after
+// began, or dropped since, cannot be judged.
+func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration, wall time.Time) {
 	l := tn.n.leaseFor(id)
 	if l == nil || l.claimed > began {
 		return
@@ -269,6 +269,10 @@ func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration) 
 		c.violation(fmt.Sprintf("lapsed %d %s %d", tn.i, id, l.copy.Epoch),
 			"node-%d served %s (epoch %d) at %s, its lease lapsed (deadline %s, margin %s)", tn.i, id, l.copy.Epoch, began,
 			time.Duration(l.deadline.Load()), l.margin)
+	case wall.Sub(time.Unix(0, l.wallBefore.Load())) >= l.ttl-l.margin:
+		c.violation(fmt.Sprintf("lapsed by the wall clock %d %s %d", tn.i, id, l.copy.Epoch),
+			"node-%d served %s (epoch %d) at %s by the wall clock, its lease lapsed (granted from %s, ttl %s, margin %s)", tn.i, id,
+			l.copy.Epoch, wall, time.Unix(0, l.wallBefore.Load()), l.ttl, l.margin)
 	}
 	for _, o := range c.live() {
 		if o == tn {
@@ -279,6 +283,16 @@ func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration) 
 				"node-%d served %s slot %d (epoch %d) while node-%d's copy of the slot (epoch %d) serves peers",
 				tn.i, id, l.copy.Slot, l.copy.Epoch, o.i, ol.copy.Epoch)
 		}
+	}
+}
+
+// checkServedLocal checks a read of tn's copy of id held under l, local reads
+// included: a quarantined copy serves nothing. The quarantine only ends, so a copy
+// quarantined now was quarantined when it served.
+func (c *cluster) checkServedLocal(tn *tnode, id store.ShardID, l *lease) {
+	if l.quarantined() {
+		c.violation(fmt.Sprintf("quarantined %d %s %d", tn.i, id, l.copy.Epoch),
+			"node-%d served %s (epoch %d) in its quarantine, which ends at %s", tn.i, id, l.copy.Epoch, l.quarantine)
 	}
 }
 
@@ -377,7 +391,8 @@ func (c *cluster) tryStart(i int) (*tnode, error) {
 	}
 	o := Options{Store: tn.st, Config: cfg, Version: "test", Logger: quietLogger, hooks: &testHooks{
 		allowSQLiteCluster: true,
-		served:             func(id store.ShardID, began time.Duration) { c.checkServed(tn, id, began) },
+		served:             func(id store.ShardID, began time.Duration, wall time.Time) { c.checkServed(tn, id, began, wall) },
+		servedLocal:        func(id store.ShardID, l *lease) { c.checkServedLocal(tn, id, l) },
 	}}
 	fastOptions(&o)
 	o.Engine = func(eo *node.Options) {

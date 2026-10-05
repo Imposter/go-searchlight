@@ -116,7 +116,7 @@ func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time, claime
 	return l
 }
 
-// quarantine is a takeover's quarantine: the slot at epoch serves nothing until until
+// quarantine is a takeover's quarantine: the slot at epoch serves nothing before until
 // (leaseClock.Now).
 type quarantine struct {
 	epoch int64
@@ -129,6 +129,12 @@ type quarantine struct {
 func (n *Node) quarantineFor(c store.Copy, stolenUntil time.Duration) time.Duration {
 	n.leaseMu.Lock()
 	defer n.leaseMu.Unlock()
+	now := n.lc.Now()
+	for id, q := range n.quarantines {
+		if now >= q.until {
+			delete(n.quarantines, id)
+		}
+	}
 	if c.TakenFrom != "" && c.TakenFrom != n.id {
 		n.quarantines[c.Shard] = quarantine{epoch: c.Epoch, until: stolenUntil}
 		return stolenUntil
@@ -137,7 +143,7 @@ func (n *Node) quarantineFor(c store.Copy, stolenUntil time.Duration) time.Durat
 	if !ok {
 		return 0
 	}
-	if q.epoch != c.Epoch || n.lc.Now() >= q.until {
+	if q.epoch != c.Epoch {
 		delete(n.quarantines, c.Shard)
 		return 0
 	}
@@ -283,7 +289,9 @@ func (n *Node) renew(ctx context.Context) {
 
 // reclaim claims a lease the store did not renew. The same slot at the same epoch (no
 // other node took it meanwhile) holds again, and a paused copy resumes; anything else
-// is a confirmed loss. A failure to reach the store leaves the lease as it is.
+// is a confirmed loss, and a slot the claim took over at a new epoch keeps its
+// quarantine for the allocator's claim back. A failure to reach the store leaves the
+// lease as it is.
 func (n *Node) reclaim(ctx context.Context, l *lease) {
 	before, wall := n.lc.Now(), n.lc.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, l.copy.Shard, n.id, n.claimTarget(l.copy.Shard), n.opts.LeaseTTL)
@@ -296,6 +304,8 @@ func (n *Node) reclaim(ctx context.Context, l *lease) {
 		n.inst.lease(ctx, "reclaim")
 		n.resumeIfPaused(ctx, l)
 		return
+	case err == nil && ok:
+		n.quarantineFor(c, before+n.opts.LeaseTTL+n.opts.LeaseMargin)
 	}
 	n.log.WarnContext(ctx, "a lease expired and its slot could not be claimed back at the same epoch; dropping the copy",
 		slog.String("shard", l.copy.Shard.String()), slog.Bool("claimed", ok), slog.Any("error", err))
@@ -562,6 +572,13 @@ func (n *Node) forgetDropped() {
 	for _, l := range n.leaseList() {
 		if !known[l.copy.Shard.Index] {
 			n.dropLease(l)
+		}
+	}
+	n.leaseMu.Lock()
+	defer n.leaseMu.Unlock()
+	for id := range n.quarantines {
+		if !known[id.Index] {
+			delete(n.quarantines, id)
 		}
 	}
 }

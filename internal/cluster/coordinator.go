@@ -159,8 +159,11 @@ type testHooks struct {
 	// peerFile wraps the writer a snapshot file is streamed to.
 	peerFile func(name string, w http.ResponseWriter) http.ResponseWriter
 	// served is told of every read target this node's copy of id gave a peer, with the
-	// leaseClock reading taken before the copy was checked.
-	served func(id store.ShardID, began time.Duration)
+	// leaseClock readings taken before the copy was checked.
+	served func(id store.ShardID, began time.Duration, wall time.Time)
+	// servedLocal is told of every read of this node's copy of id held under l, local
+	// reads included.
+	servedLocal func(id store.ShardID, l *lease)
 }
 
 func (o *Options) resolve() error {

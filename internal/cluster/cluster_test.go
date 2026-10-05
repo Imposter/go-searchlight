@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -438,13 +440,13 @@ func testPartition(t *testing.T, d *db, stepClock bool) {
 	// peerServes reports whether tn's copy serves peers now: what a peer's read of it
 	// gets. A read it serves is held to the serving invariant, as the peer API's are.
 	peerServes := func(tn *tnode) bool {
-		began := tn.n.lc.Now()
+		began, wall := tn.n.lc.Now(), tn.n.lc.Wall()
 		tg, err := tn.n.LocalTarget(context.Background(), "sb", 0, 0)
 		if err != nil {
 			return false
 		}
 		tg.Release()
-		c.checkServed(tn, id, began)
+		c.checkServed(tn, id, began, wall)
 		return true
 	}
 
@@ -523,17 +525,9 @@ func testPartition(t *testing.T, d *db, stepClock bool) {
 // forward step of its clock would.
 func expireLeases(t testing.TB, d *db, index string) {
 	t.Helper()
-	var driver, dsn string
 	switch d.dialect {
 	case "sqlite":
-		u, err := url.Parse(d.url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		driver, dsn = "sqlite", strings.TrimPrefix(u.Path, "/")
-		if _, err := os.Stat(dsn); err != nil {
-			dsn = u.Path
-		}
+		sqliteExec(t, d, "UPDATE sl_shard_copies SET lease_until = 0 WHERE index_name = ?", index)
 	case "postgres":
 		u, err := url.Parse(d.url)
 		if err != nil {
@@ -548,16 +542,28 @@ func expireLeases(t testing.TB, d *db, index string) {
 		if _, err := db.ExecContext(context.Background(), "UPDATE sl_shard_copies SET lease_until = 0 WHERE index_name = $1", index); err != nil {
 			t.Fatal(err)
 		}
-		return
 	default:
 		t.Fatalf("no clock step on %s", d.dialect)
 	}
-	db, err := sql.Open(driver, dsn)
+}
+
+// sqliteExec runs a statement on d, a SQLite database, outside every node's store.
+func sqliteExec(t testing.TB, d *db, q string, args ...any) {
+	t.Helper()
+	u, err := url.Parse(d.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := strings.TrimPrefix(u.Path, "/")
+	if _, err := os.Stat(dsn); err != nil {
+		dsn = u.Path
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, err := db.ExecContext(context.Background(), "UPDATE sl_shard_copies SET lease_until = 0 WHERE index_name = ?", index); err != nil {
+	if _, err := db.ExecContext(context.Background(), q, args...); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -624,8 +630,14 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if q.quarantined() {
 		t.Fatal("still quarantined after TTL plus margin")
 	}
-	if mine := n.newLease(store.Copy{TakenFrom: ""}, clk.Now(), clk.Wall(), clk.Now()); mine.quarantined() {
+	if mine := n.newLease(store.Copy{}, clk.Now(), clk.Wall(), clk.Now()); mine.quarantined() {
 		t.Fatal("a free slot is quarantined")
+	}
+	n.newLease(store.Copy{TakenFrom: "other", Epoch: 2}, clk.Now(), clk.Wall(), clk.Now())
+	set(clk.Now() + 1100*time.Millisecond)
+	n.newLease(store.Copy{Shard: store.ShardID{Index: "elsewhere"}}, clk.Now(), clk.Wall(), clk.Now())
+	if len(n.quarantines) != 0 {
+		t.Fatalf("ended quarantines are kept: %+v", n.quarantines)
 	}
 	q = n.newLease(store.Copy{TakenFrom: "other", Epoch: 3}, clk.Now(), clk.Wall(), clk.Now())
 	if other := n.newLease(store.Copy{Epoch: 4}, clk.Now(), clk.Wall(), clk.Now()); !q.quarantined() || other.quarantined() {
@@ -633,16 +645,11 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	}
 }
 
-// TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack (#19): a node that took a slot
-// over stays quarantined, TTL plus margin after its claim, whatever becomes of its lease
-// meanwhile. A registry view whose read began while the claim was under way, before it
-// committed, still shows the previous holder: it does not count as a takeover of the new
-// copy. And a copy dropped locally and claimed back at the same epoch (the store then
-// names no previous holder) keeps the takeover's quarantine. Before the fix that view
-// dropped the thief's copy and its claim back served at once, beside the cut-off
-// holder's copy. Node-1's clock is fake, so its loops stand still: the test runs its
-// view reads and claims, and the claim hook reads a view while the claim is under way.
-func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
+// takeoverCluster starts node-0, holding the one copy of sb/0, and node-1 on a fake
+// clock, then cuts node-0 off and expires its lease in the database. Node-1's loops
+// stand still: the test runs its view reads and claims.
+func takeoverCluster(t *testing.T) (*db, *clock.Fake, *tnode) {
+	t.Helper()
 	d := sqliteDB(t)
 	clk := clock.NewFake(time.Now())
 	c := newCluster(t, d, func(i int, o *Options) {
@@ -660,14 +667,45 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 	createIndex(t, a.n, "sb", 1, 1)
 	waitCopies(t, a.st, "sb", 1, 1, 30*time.Second)
 	b := c.start(1)
-	id := store.ShardID{Index: "sb", Shard: 0}
-	ctx := tctx(t)
-
 	a.wrap.cut(true)
 	expireLeases(t, d, "sb")
-	if err := b.n.refreshView(ctx); err != nil {
+	return d, clk, b
+}
+
+// allocateNow runs one allocation pass of sb on tn over a fresh view.
+func allocateNow(t *testing.T, tn *tnode) error {
+	t.Helper()
+	ctx := tctx(t)
+	if err := tn.n.refreshView(ctx); err != nil {
 		t.Fatal(err)
 	}
+	return tn.n.allocatePass(ctx, "sb", false, true)
+}
+
+// stealSB has node-1 take sb/0 over from node-0, quarantined.
+func stealSB(t *testing.T, b *tnode) *lease {
+	t.Helper()
+	if err := allocateNow(t, b); err != nil {
+		t.Fatal(err)
+	}
+	l := b.n.leaseFor(store.ShardID{Index: "sb", Shard: 0})
+	if l == nil || l.copy.TakenFrom != "node-0" || !l.quarantined() {
+		t.Fatalf("node-1's claim of node-0's expired slot: %+v", l)
+	}
+	return l
+}
+
+// TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack (#19): a node that took a slot
+// over stays quarantined, TTL plus margin after its claim, whatever becomes of its lease
+// meanwhile. A registry view whose read began while the claim was under way, before it
+// committed, still shows the previous holder: it does not count as a takeover of the new
+// copy. And a copy dropped locally and claimed back at the same epoch (the store then
+// names no previous holder) keeps the takeover's quarantine. The claim hook reads a view
+// while the claim is under way.
+func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
+	_, clk, b := takeoverCluster(t)
+	id := store.ShardID{Index: "sb", Shard: 0}
+	ctx := tctx(t)
 	duringClaim := func() {
 		clk.Advance(time.Millisecond)
 		if err := b.n.refreshView(ctx); err != nil {
@@ -676,14 +714,8 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 		clk.Advance(time.Millisecond)
 	}
 	b.wrap.onClaim.Store(&duringClaim)
-	if err := b.n.allocatePass(ctx, "sb", false, true); err != nil {
-		t.Fatal(err)
-	}
+	stolen := stealSB(t, b)
 	b.wrap.onClaim.Store(nil)
-	stolen := b.n.leaseFor(id)
-	if stolen == nil || stolen.copy.TakenFrom != "node-0" || !stolen.quarantined() {
-		t.Fatalf("node-1's claim of node-0's expired slot: %+v", stolen)
-	}
 	v := b.n.view.Load()
 	if seen := v.copies[id]; len(seen) != 1 || seen[0].NodeID != "node-0" {
 		t.Fatalf("the view read during the claim shows %+v, want node-0's copy", seen)
@@ -698,12 +730,8 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 		t.Fatal("a view read after the claim that shows another holder is not a takeover")
 	}
 
-	// Dropped locally (as a tailer that stops on its own drops it), then claimed back.
 	b.n.loseCopy(ctx, stolen)
-	if err := b.n.refreshView(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.n.allocatePass(ctx, "sb", false, true); err != nil {
+	if err := allocateNow(t, b); err != nil {
 		t.Fatal(err)
 	}
 	back := b.n.leaseFor(id)
@@ -715,6 +743,87 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 	}
 	if _, err := b.n.LocalTarget(ctx, "sb", 0, 0); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("a peer read of the copy claimed back in its quarantine: %v, want the quarantine's refusal", err)
+	}
+}
+
+// TestReclaimTakeoverIsQuarantined: a renewal that finds its lease expired claims the
+// slot again; when another node held it meanwhile (and lapsed), that claim is a takeover
+// at a new epoch. The copy is dropped, and the allocator's claim back of the slot at
+// that epoch (the store names no previous holder) is quarantined all the same.
+func TestReclaimTakeoverIsQuarantined(t *testing.T) {
+	d, _, b := takeoverCluster(t)
+	id := store.ShardID{Index: "sb", Shard: 0}
+	ctx := tctx(t)
+	held := stealSB(t, b)
+	sqliteExec(t, d, "UPDATE sl_shard_copies SET node_id = 'node-2', epoch = epoch + 100, lease_until = 0 WHERE index_name = 'sb'")
+
+	b.n.reclaim(ctx, held)
+	if l := b.n.leaseFor(id); l != nil {
+		t.Fatalf("the lease reclaimed at a new epoch was kept: %+v", l)
+	}
+	if err := allocateNow(t, b); err != nil {
+		t.Fatal(err)
+	}
+	back := b.n.leaseFor(id)
+	if back == nil || back.copy.Epoch == held.copy.Epoch || back.copy.TakenFrom != "" {
+		t.Fatalf("node-1's claim back of the slot it took from node-2: %+v", back)
+	}
+	if !back.quarantined() {
+		t.Fatalf("the slot node-1 took from node-2 serves at once: epoch %d, quarantine %s", back.copy.Epoch, back.quarantine)
+	}
+}
+
+// TestQuarantinedTakeoverKeepsItsRow: a takeover is not released while quarantined, so
+// the slot's next claim cannot get a fresh epoch with no quarantine. A copy that cannot
+// be hosted keeps its row, and the claim back at that epoch stays quarantined; a lowered
+// target does not release a quarantined copy either.
+func TestQuarantinedTakeoverKeepsItsRow(t *testing.T) {
+	_, clk, b := takeoverCluster(t)
+	id := store.ShardID{Index: "sb", Shard: 0}
+	ctx := tctx(t)
+	meta, err := b.st.Indexes().Get(ctx, "sb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(b.cfg.DataDir, "indexes", meta.UID, "0")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	current := filepath.Join(root, "CURRENT")
+	if err := os.WriteFile(current, []byte("bogus"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := allocateNow(t, b); err == nil {
+		t.Fatal("hosting a copy over a broken directory succeeded")
+	}
+	if l := b.n.leaseFor(id); l != nil {
+		t.Fatalf("a copy that could not be hosted kept its lease: %+v", l)
+	}
+	rows, err := b.st.Registry().Copies(ctx, "sb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].NodeID != "node-1" {
+		t.Fatalf("the quarantined takeover's row: %+v, want node-1's", rows)
+	}
+	if err := os.Remove(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := allocateNow(t, b); err != nil {
+		t.Fatal(err)
+	}
+	back := b.n.leaseFor(id)
+	if back == nil || back.copy.Epoch != rows[0].Epoch || !back.quarantined() {
+		t.Fatalf("the claim back of the takeover's row: %+v", back)
+	}
+
+	extra := b.n.newLease(store.Copy{Shard: store.ShardID{Index: "sb", Shard: 7}, Slot: 1, Epoch: 1 << 40, TakenFrom: "node-0"},
+		b.n.lc.Now(), b.n.lc.Wall(), b.n.lc.Now())
+	v := &view{at: clk.Now(), live: map[string]bool{"node-0": true}, copies: map[store.ShardID][]store.Copy{
+		extra.copy.Shard: {{Shard: extra.copy.Shard, Slot: 0, NodeID: "node-0", State: store.CopyServing, LeaseLeft: time.Hour}},
+	}}
+	if err := b.n.maybeRelease(ctx, v, node.IndexView{Name: "sb", ReplicasPerShard: 1}, extra); err != nil || extra.lost {
+		t.Fatalf("a lowered target released a quarantined takeover: lost %v, %v", extra.lost, err)
 	}
 }
 

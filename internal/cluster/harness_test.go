@@ -577,6 +577,9 @@ type faultStore struct {
 	// onClaim, when set, runs at the start of every ClaimCopy, before the claim reaches
 	// the store.
 	onClaim atomic.Pointer[func()]
+	// onRetire, when set, runs at the start of every RetireCopy, before it reaches the
+	// store.
+	onRetire atomic.Pointer[func()]
 }
 
 // timed records an operation's duration: defer f.timed("op")().
@@ -803,6 +806,9 @@ func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, err
 	defer r.f.timed("RetireCopy")()
 	if r.f.isDown() {
 		return false, errPartitioned
+	}
+	if fn := r.f.onRetire.Load(); fn != nil {
+		(*fn)()
 	}
 	return r.RegistryStore.RetireCopy(ctx, c)
 }

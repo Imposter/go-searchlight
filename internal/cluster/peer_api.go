@@ -252,7 +252,10 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	}
 	reply := &searchReply{Result: res, Stale: t.Stale()}
 	if msg.Pin {
-		reply.Pin = p.n.pins.add(store.ShardID{Index: msg.Index, Shard: msg.Shard}, t)
+		reply.Pin = p.n.pins.add(t)
+		if h := p.n.opts.hooks; h != nil && h.pinned != nil {
+			h.pinned(store.ShardID{Index: msg.Index, Shard: msg.Shard}, reply.Pin)
+		}
 	} else {
 		t.Release()
 	}
@@ -266,7 +269,7 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		return nil, err
 	}
 	var reply fetchReply
-	err := p.n.pins.use(msg.Pin, p.n.peerValid, func(t node.ShardTarget) error {
+	err := p.n.pins.use(msg.Pin, func(t node.ShardTarget) error {
 		if err := t.Fetch(ctx, msg.Hits, msg.Fields); err != nil {
 			return err
 		}
@@ -277,7 +280,7 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		return nil
 	})
 	if errors.Is(err, errPinGone) {
-		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired, or its copy no longer serves"}
+		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired or was released"}
 	}
 	if err != nil {
 		return nil, err
@@ -525,10 +528,18 @@ func (n *Node) peerValid(id store.ShardID) bool {
 
 // --- pins and snapshots ---------------------------------------------------------------
 
-// errPinGone is a pin that expired or was released, or whose copy no longer serves.
+// errPinGone is a pin that expired or was released.
 var errPinGone = errors.New("cluster: the pin is gone")
 
 // pinTable holds the generations searches pinned on this node for their fetch phase.
+//
+// A pin outlives its copy's serving: the query phase was admitted while the copy served
+// under its lease, and the fetch reads only the generation that phase searched, which
+// the pin holds open whatever becomes of the copy. So a copy that pauses, retires, is
+// released or closes between a search's phases still answers its fetch. A pin lasts
+// until the search releases it, PinTTL passes unused, or the node stops: a stopping
+// node retires its copies first and keeps serving for shutdown_grace, so the fetches
+// of searches under way drain before Stop drops the pins.
 type pinTable struct {
 	ttl   time.Duration
 	clock clock.Clock
@@ -538,7 +549,6 @@ type pinTable struct {
 
 type pinEntry struct {
 	mu      sync.Mutex // held while a fetch uses the target
-	id      store.ShardID
 	t       node.ShardTarget
 	expires time.Time
 	gone    bool
@@ -554,17 +564,16 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (p *pinTable) add(id store.ShardID, t node.ShardTarget) string {
+func (p *pinTable) add(t node.ShardTarget) string {
 	pin := newID()
 	p.mu.Lock()
-	p.m[pin] = &pinEntry{id: id, t: t, expires: p.clock.Now().Add(p.ttl)}
+	p.m[pin] = &pinEntry{t: t, expires: p.clock.Now().Add(p.ttl)}
 	p.mu.Unlock()
 	return pin
 }
 
-// use runs fn on a pinned target, keeping it pinned meanwhile, while its copy still
-// serves peers (valid).
-func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.ShardTarget) error) error {
+// use runs fn on a pinned target, keeping it pinned meanwhile.
+func (p *pinTable) use(pin string, fn func(node.ShardTarget) error) error {
 	p.mu.Lock()
 	e := p.m[pin]
 	if e != nil {
@@ -576,7 +585,7 @@ func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.gone || !valid(e.id) {
+	if e.gone {
 		return errPinGone
 	}
 	return fn(e.t)

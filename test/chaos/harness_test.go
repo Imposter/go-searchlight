@@ -336,7 +336,11 @@ func (b *balancer) do(ctx context.Context, method, path, body string, deadline t
 			case b.c.refusedOnly && !refused(err):
 				b.violate("%s %s: %s cut a request while it stopped gracefully: %v", method, path, m.NodeID(), err)
 			}
-			b.retried("failover")
+			if refused(err) {
+				b.retried("failover refused")
+			} else {
+				b.retried("failover cut")
+			}
 			last = err.Error()
 			time.Sleep(20 * time.Millisecond)
 			continue
@@ -360,7 +364,8 @@ func refused(err error) bool {
 	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "refused")
 }
 
-// retriedOf is how often the balancer retried for kind ("failover", "write 503", ...).
+// retriedOf is how often the balancer retried for kind ("failover refused", "failover cut",
+// "write 503", ...).
 func (b *balancer) retriedOf(kind string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -381,10 +386,6 @@ func call(ctx context.Context, client *http.Client, method, u, body string) (ans
 		return answer{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiToken)
-	// Every request the suite sends may be sent twice (upserts and deletes by id, and
-	// reads): the key lets the transport resend one it wrote to a kept-alive connection
-	// the server had already closed, as a client library would.
-	req.Header.Set("Idempotency-Key", strconv.FormatUint(idempotency.Add(1), 10))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -677,8 +678,6 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 		time.Sleep(time.Duration(rnd.IntN(20)) * time.Millisecond)
 	}
 }
-
-var idempotency atomic.Uint64
 
 func truncate(b []byte) string {
 	if len(b) > 300 {

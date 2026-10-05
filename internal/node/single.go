@@ -121,20 +121,19 @@ type Options struct {
 // Options.Cluster set it hosts the copies the cluster gives it and reads the rest from
 // peers.
 type Single struct {
-	st      store.Store
-	records store.RecordReader
-	cfg     config.Config
-	opts    Options
-	cl      Cluster // nil: a single node
-	gc      *store.GroupCommitter
-	log     *slog.Logger
-	tr      trace.Tracer
-	meter   metric.Meter
-	clock   clock.Clock
-	budget  *shard.MergeBudget
-	cache   *shard.FilterCache
-	maxLag  int64
-	// openFailed counts copies whose files did not open, by reason.
+	st         store.Store
+	records    store.RecordReader
+	cfg        config.Config
+	opts       Options
+	cl         Cluster // nil: a single node
+	gc         *store.GroupCommitter
+	log        *slog.Logger
+	tr         trace.Tracer
+	meter      metric.Meter
+	clock      clock.Clock
+	budget     *shard.MergeBudget
+	cache      *shard.FilterCache
+	maxLag     int64
 	openFailed metric.Int64Counter
 
 	// head is the newest seq committed or seen applied.
@@ -879,7 +878,6 @@ func storeError(err error, index string) error {
 	return api.Unavailable(err, "the database is unavailable")
 }
 
-// noteOpenFailed counts a copy of index whose files did not open, for reason.
 func (n *Single) noteOpenFailed(ctx context.Context, index, reason string) {
 	if n.openFailed != nil {
 		n.openFailed.Add(ctx, 1, metric.WithAttributes(attribute.String(telemetry.KeyIndex, index), attribute.String("reason", reason)))

@@ -34,7 +34,7 @@ func TestKillMidBulk(t *testing.T) {
 	l.stop()
 	c.settle(m)
 	c.verify(m)
-	if c.lb.retriedOf("failover") == 0 {
+	if c.lb.retriedOf("failover refused")+c.lb.retriedOf("failover cut") == 0 {
 		t.Error("no request failed over: the kill hit no request in flight")
 	}
 }

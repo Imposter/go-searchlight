@@ -180,7 +180,7 @@ A segment is immutable and written once at refresh or merge time. It is one file
 | Part | Contents |
 |---|---|
 | Term dictionary | Per field and kind (value, entry, word, trigram), sorted terms in prefix-compressed blocks with a sparse in-memory index. Lookup is O(log blocks), plus a short scan inside one block. |
-| Postings | Roaring bitmaps in serialized form, used directly from mmap with no copy; word and 3-gram postings Elias-Fano coded where that is smaller (format 4) |
+| Postings | Roaring bitmaps in serialized form, used directly from mmap with no copy |
 | Doc values | Columnar per field: numbers delta- and bit-packed; keywords as ordinals into a per-segment sorted dictionary; multi-valued lists as offsets plus ordinals. Used for sorting, aggregations and residual filters. |
 | Points | Per-field blocks of documents sorted by value, with min/max (a BKD-lite), giving range queries without scanning; a partly covered block reads values from the doc-value column |
 | Stored fields | zstd-compressed blocks of about 8 KB of original JSON, against a per-segment dictionary sampled from the segment's first documents, fetched for hits only |
@@ -298,6 +298,7 @@ The logical schema is the same in every dialect.
   - On shutdown a node marks its copies `retiring`, finishes in-flight requests, writes its manifests and exits.
   - It comes back by reopening its segments and replaying the tail of the changelog.
   - The on-disk format is versioned, and a node refuses segments from a newer major version.
+  - A node reads segments of its own major and the one before it (N−1), so an upgrade across one major reopens its segments; merges rewrite them into the new major, and peer recovery prefers peers already on it.
 - **Changelog pruning** stays behind the lowest `applied_seq` of any live copy, and behind the oldest retained recovery point. A copy's `applied_seq` is its `CommittedSeq`, what its last flush made durable (§6).
 
 ## 10. Failure handling

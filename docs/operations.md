@@ -357,9 +357,10 @@ A node's memory is three budgets, plus the page cache:
    - So a copy taking writes faster than it refreshes holds up to **about 320 MiB**, and
      an idle copy almost nothing. Count the copies that ingest at once, not every copy.
 3. **Merges.** A merge streams its inputs into the merged file and holds only
-   per-document state: a few hundred bytes a document, about 0.6 GiB of heap at peak
-   for a merge of a million of the benchmark's products. `merge_threads` merges can
-   run at once.
+   per-document state, under 1 KiB a document, plus up to 8 MiB for each field it
+   writes at once (one per thread it runs on). A merge of a million of the benchmark's
+   products peaks at about 0.6 GiB of heap on 4 threads and 0.7 GiB on 16.
+   `merge_threads` merges can run at once.
 4. **Caches and the runtime.** The filter cache, the search rank cache (up to
    256 MiB), the generations readers hold, and Go's own overhead.
 5. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
@@ -386,13 +387,17 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 
 - **Segments.** A copy's segments are compressed: stored fields in small zstd blocks
   against a per-segment dictionary, bit-packed doc values and point blocks, roaring
-  postings for keyword values and entries, Elias-Fano postings for words and 3-grams
-  where they are smaller, and zstd term blocks for long values. On the benchmark's
-  product listings (about 870 bytes of JSON each) a fully merged copy takes about
-  0.85 GiB per million documents.
+  postings and prefix-compressed term dictionaries. On the benchmark's product listings
+  (about 870 bytes of JSON each) a fully merged copy takes about 1.2 GiB per million
+  documents; 3-grams of every keyword and text field, which make contains and similar
+  fast, are about a quarter of it.
 - **Headroom.** Leave at least the size of the largest shard copy free. A peer recovery
   stages a whole copy under `data_dir/recovery`, and an aside rebuild holds the old copy
-  and the new one at once.
+  and the new one at once. A merge needs room for its result while its inputs are
+  still on disk, plus, briefly, up to its result's term dictionaries again: fields
+  written while an earlier one is still being written wait in temp files beside the
+  segment (`<segment>.seg.spill*`, removed when the merge ends, or at the next start
+  after a crash). Those writes count against `merge_budget`.
 - **Speed.** Use local SSDs. Refreshes write segments without fsync, into the page
   cache. Each flush, every `flush_interval`, fsyncs what the refreshes since the last one
   wrote.
@@ -485,12 +490,17 @@ Notes:
   - A copy in a **newer** format is refused and left as it is (`shard copy is in a newer
     format than this binary reads`): a binary rolled back never destroys what its
     successor wrote. Roll forward again, or wipe that node's `data_dir` to have it
-    rebuild from its peers or the database. A node still on the old binary cannot use an
-    upgraded peer's copy or a bundle taken after the upgrade either, and rebuilds from
-    the database instead: finish a rolling upgrade before replacing nodes.
+    rebuild from its peers or the database.
+  - A node still on the old binary that must recover a copy during the upgrade cannot
+    use an upgraded peer's segments: the peer refuses the snapshot (409
+    `segments_newer_format`, before taking it), and the old node's bundle reader
+    refuses a bundle an upgraded node wrote. It tries its other peers, then older
+    bundles, and otherwise rebuilds the copy from the database. Finish a rolling upgrade
+    before replacing nodes.
 - **Upgrading to segment format 4** (from 3). Nothing to do: the first start reopens the
-  format-3 segments and serves at once. Disk use falls as merges rewrite them, by about
-  a third on typical documents; deletes sidecars written from then on are format 4 too.
+  format-3 segments and serves at once. Merges rewrite them as they go (about 5% smaller
+  on the benchmark's documents, with stored fields 12% smaller); deletes sidecars
+  written from then on are format 4 too.
   Untyped-value marks (which decide whether a mapping change that maps a new field
   needs a rebuild) carry over from the copy's manifest. A rollback to a format-3
   binary refuses every copy that has written a segment since the upgrade, as above.

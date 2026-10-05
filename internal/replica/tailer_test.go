@@ -516,6 +516,7 @@ func TestApplyErrorHalts(t *testing.T) {
 				var swaps atomic.Int32
 				opts.OnShard = func(*shard.Shard) { swaps.Add(1) }
 				c := newCopy(t, d.open(t), id, opts)
+				clkA := c.withFakeClock(time.Second)
 				c.start()
 				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
 				waitCopyState(t, st, id, store.CopyServing)
@@ -543,13 +544,16 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 
 				// While the bad change is current, the copy tails again and again
-				// but is never wiped: a rebuild would stop at the same row.
-				deadline := time.Now().Add(30 * time.Second)
-				for counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) < 3 {
-					if time.Now().After(deadline) {
-						t.Fatalf("%d halts", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""))
+				// but is never wiped: a rebuild would stop at the same row. Each halt
+				// parks the tailer on its one-second backoff.
+				for {
+					if err := clkA.BlockUntilArmed(tctx(t), time.Second); err != nil {
+						t.Fatalf("no halt backoff after %d halts: %v", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""), err)
 					}
-					time.Sleep(20 * time.Millisecond)
+					if counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) >= 3 {
+						break
+					}
+					clkA.Advance(time.Second)
 				}
 				if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "", ""); n != 1 || swaps.Load() != 0 {
 					t.Fatalf("%d recoveries (want the first one only) and %d swaps while the bad row is current", n, swaps.Load())
@@ -564,18 +568,16 @@ func TestApplyErrorHalts(t *testing.T) {
 				optsB, readerB := meteredOptions()
 				optsB.HaltRetryBase, optsB.HaltRetryCap = 20*time.Millisecond, 50*time.Millisecond
 				b := newCopy(t, d.open(t), id, optsB)
+				b.withFakeClock(optsB.HaltRetryCap)
 				b.start()
-				hb := waitHalt(t, b.tailer)
+				b.until("the load halts", func() bool { return b.current().Halt() != nil })
+				hb := b.current().Halt()
 				if hb.ID != "bad" || hb.Reason != tc.reason {
 					t.Fatalf("load halt %+v", hb)
 				}
-				deadline = time.Now().Add(30 * time.Second)
-				for counterSum(t, readerB, telemetry.MetricReplicaHalts, "", "") < 4 {
-					if time.Now().After(deadline) {
-						t.Fatal("the halted load was not retried")
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
+				b.until("the halted load is retried", func() bool {
+					return counterSum(t, readerB, telemetry.MetricReplicaHalts, "", "") >= 4
+				})
 				if n := counterSum(t, readerB, telemetry.MetricReplicaRecoveries, "", ""); n != 1 {
 					t.Fatalf("%d snapshot loads while the bad row is current; want 1", n)
 				}

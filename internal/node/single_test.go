@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/node/nodetest"
@@ -618,6 +619,8 @@ type flakyStore struct {
 	// hung, when set, makes Ping and record reads wait for their deadline: a
 	// database that hangs rather than fails.
 	hung *atomic.Bool
+	// pinged, when set, receives each Ping's answer.
+	pinged chan error
 }
 
 func (s flakyStore) hang(ctx context.Context) error {
@@ -631,6 +634,17 @@ func (s flakyStore) hang(ctx context.Context) error {
 var errUnreachable = errors.New("dial tcp 10.0.0.1:5432: connect: connection refused")
 
 func (s flakyStore) Ping(ctx context.Context) error {
+	err := s.ping(ctx)
+	if s.pinged != nil {
+		select {
+		case s.pinged <- err:
+		case <-ctx.Done():
+		}
+	}
+	return err
+}
+
+func (s flakyStore) ping(ctx context.Context) error {
 	if err := s.hang(ctx); err != nil {
 		return err
 	}
@@ -718,6 +732,68 @@ func TestDatabaseUnreachable(t *testing.T) {
 	}
 	if sr, _ := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}}, api.ReadOptions{}); sr.Stale {
 		t.Error("still stale with the database back")
+	}
+}
+
+// Readiness and staleness follow the database by the node's clock: unready once the
+// database has not answered for more than max_lag, stale once a ping fails, and both
+// cleared once a ping answers. The clock is fake: each ping is one advance of the ping
+// interval, and the ping loop takes each answer before it sends the next ping.
+func TestReadinessFollowsTheDatabaseByTheClock(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxLag = time.Second
+	const pingEvery = 250 * time.Millisecond // max_lag/4
+	base := openStore(t, cfg)
+	down := &atomic.Bool{}
+	pinged := make(chan error)
+	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down, pinged: pinged} //nolint:forcetypeassert,errcheck // every store reads records
+	clk := clock.NewFake(time.Now())
+	n := open(t, cfg, st, func(o *node.Options) { o.Clock = clk })
+	ping := func(wantUp bool) {
+		t.Helper()
+		if err := clk.BlockUntilArmed(ctx(t), pingEvery); err != nil {
+			t.Fatalf("the ping loop is not waiting for its next ping: %v", err)
+		}
+		clk.Advance(pingEvery)
+		select {
+		case err := <-pinged:
+			if (err == nil) != wantUp {
+				t.Fatalf("a ping answered %v with the database up %v", err, wantUp)
+			}
+		case <-ctx(t).Done():
+			t.Fatal("no ping")
+		}
+	}
+	if err := n.Ready(ctx(t)); err != nil || n.DBStale() {
+		t.Fatalf("a fresh node: ready %v, stale %v", err, n.DBStale())
+	}
+	ping(true)
+	answered := clk.Now()
+
+	down.Store(true)
+	ping(false)
+	for clk.Since(answered)+pingEvery <= cfg.MaxLag {
+		ping(false)
+		if !n.DBStale() {
+			t.Fatal("reads are not stale while the pings fail")
+		}
+		if err := n.Ready(ctx(t)); err != nil {
+			t.Fatalf("unready %s after the database last answered, within max_lag: %v", clk.Since(answered), err)
+		}
+	}
+	ping(false)
+	if err := n.Ready(ctx(t)); err == nil {
+		t.Fatalf("still ready %s after the database last answered", clk.Since(answered))
+	}
+	if n.DBAnsweredWithin(cfg.MaxLag) {
+		t.Fatal("the database counts as answering within max_lag")
+	}
+
+	down.Store(false)
+	ping(true)
+	ping(true)
+	if err := n.Ready(ctx(t)); err != nil || n.DBStale() {
+		t.Fatalf("the database answers again: ready %v, stale %v", err, n.DBStale())
 	}
 }
 

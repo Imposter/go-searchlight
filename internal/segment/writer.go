@@ -60,6 +60,10 @@ type BuildOptions struct {
 	// only once the caller fsyncs it ([SyncFile]) and then the directory. A shard
 	// builds the segments it refreshes this way and fsyncs them when it flushes.
 	NoSync bool
+	// MarksUntyped records that the writer marks every untyped value
+	// ([schema.Value.Untyped]), so a reader can trust [Reader.Untyped] to list exactly
+	// them ([Reader.MarksUntyped]).
+	MarksUntyped bool
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -129,6 +133,10 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	if err != nil {
 		return Meta{}, err
 	}
+	var flags uint32
+	if opts.MarksUntyped {
+		flags |= flagMarksUntyped
+	}
 	ranges := splitRanges(numDocs, opts.Threads)
 	parts := buildPartsParallel(docs, ranges)
 	names := unionFieldNames(parts)
@@ -138,7 +146,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
+	meta, err := writeSegmentParts(path, numDocs, flags, names, parts, storedFromDocs(docs), idsFromSorted(ids), opts.Threads, nil, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -200,6 +208,9 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	if v.GramsTruncated {
 		b.truncated.Add(ord)
 	}
+	if v.Untyped {
+		b.untyped.Add(ord)
+	}
 	switch {
 	case v.Text != nil:
 		b.addValueTerm(ord, *v.Text)
@@ -260,6 +271,20 @@ func partsFor(parts []map[string]*fieldBuilder, name string, empty *fieldBuilder
 
 // storedSource yields every live document's id and body, by ascending ordinal.
 type storedSource func(add func(ord uint32, id string, body []byte) error) error
+
+// idSource yields every document's exact id and ordinal, ascending by id.
+type idSource func(yield func(id []byte, ord uint32) error) error
+
+func idsFromSorted(ids []idOrd) idSource {
+	return func(yield func(id []byte, ord uint32) error) error {
+		for _, e := range ids {
+			if err := yield(stringBytes(e.id), e.ord); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
 
 func storedFromDocs(docs []schema.Doc) storedSource {
 	return func(add func(ord uint32, id string, body []byte) error) error {
@@ -331,14 +356,15 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 }
 
 // writeSegmentParts writes every section, merging parts (by field name, in names's
-// order, which must be sorted) and stored, to a fresh segment file at path. parts may
+// order, which must be sorted), stored and ids, to a fresh segment file at path, with
+// the segment flags flags. parts may
 // have any length: one (a sequential build, or any Merge with one effective worker)
 // or many (one per [BuildOptions.Threads] worker, or one per Merge reader group) -
 // writeFieldDicts and friends treat those identically, which is what makes the file
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
 // writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
 // nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
+func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids idSource, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -419,18 +445,23 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 			if out.truncOff != 0 {
 				out.truncOff += fieldBase
 			}
+			if out.untypedOff != 0 {
+				out.untypedOff += fieldBase
+			}
 		})
 	w.endSection()
 
 	w.beginSection(sectionStored)
-	storedIndexOff, err := writeStoredParallel(w, stored, threads)
+	storedIndexOff, err := writeStored(w, stored, threads)
 	if err != nil {
 		return Meta{}, err
 	}
 	w.endSection()
 
 	w.beginSection(sectionIDs)
-	writeIDs(w, ids)
+	if err := writeIDs(w, ids); err != nil {
+		return Meta{}, err
+	}
 	w.endSection()
 
 	w.beginSection(sectionMeta)
@@ -438,7 +469,7 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	for _, name := range names {
 		outs[name] = scratch[name].out
 	}
-	writeMeta(w, numDocs, storedIndexOff, names, outs)
+	writeMeta(w, numDocs, flags, storedIndexOff, names, outs)
 	w.endSection()
 
 	w.footer()

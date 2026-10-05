@@ -125,8 +125,9 @@ func (w *fileWriter) footer() {
 	w.flush()
 }
 
-// parsedFooter is a verified file's section table.
+// parsedFooter is a verified file's major version and section table.
 type parsedFooter struct {
+	major    uint16
 	sections map[sectionKind]sectionEntry
 	checksum uint32
 }
@@ -152,7 +153,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 	}
 	major := binary.LittleEndian.Uint16(data[8:])
 	minor := binary.LittleEndian.Uint16(data[10:])
-	if major != FormatMajor {
+	if !readsMajor(major) {
 		return parsedFooter{}, &VersionError{Path: path, Major: major, Minor: minor}
 	}
 	tail := data[len(data)-tailSize:]
@@ -166,7 +167,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 	}
 	want := binary.LittleEndian.Uint32(tail[12:])
 	got := crc32c(data[:len(data)-4])
-	footer := parsedFooter{sections: make(map[sectionKind]sectionEntry, count), checksum: want}
+	footer := parsedFooter{major: major, sections: make(map[sectionKind]sectionEntry, count), checksum: want}
 	table := data[tableStart : len(data)-tailSize]
 	for i := range count {
 		e := table[i*sectionEntrySize:]

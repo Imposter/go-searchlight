@@ -11,12 +11,13 @@ import (
 // fieldInfo is one field's parsed structures, offsets resolved into live views over the
 // mapping.
 type fieldInfo struct {
-	presRegion  region
-	truncRegion region // zero (n == 0) when the field has no truncated documents
-	dicts       [numKinds]*termDict
-	keywordCol  *keywordColumn
-	multiCol    *multiColumn
-	numberCol   *numberColumn
+	presRegion    region
+	truncRegion   region // zero (n == 0) when the field has no truncated documents
+	untypedRegion region // zero (n == 0) when the field has no untyped documents
+	dicts         [numKinds]*termDict
+	keywordCol    *keywordColumn
+	multiCol      *multiColumn
+	numberCol     *numberColumn
 }
 
 // Reader is an open, immutable segment, read through mmap. Its methods never allocate
@@ -24,8 +25,8 @@ type fieldInfo struct {
 // including concurrently with [Reader.Close] (see [Reader.Retain]).
 //
 // For performance, several methods ([Reader.Postings], [Reader.Present],
-// [Reader.Truncated]) return roaring.Bitmap values that are zero-copy views straight
-// over the mmap, not fresh copies. Such a result is valid only while this Reader, or a
+// [Reader.Truncated], [Reader.Untyped]) return roaring.Bitmap values that are zero-copy
+// views straight over the mmap, not fresh copies. Such a result is valid only while this Reader, or a
 // handle from [Reader.Retain], stays open: once every handle on the segment is Closed,
 // the mapping is unmapped and any further read of that bitmap is a use-after-free. A
 // caller that needs the bitmap to outlive this Reader - cached across a refresh, handed
@@ -43,6 +44,8 @@ type Reader struct {
 	path      string
 	m         *mapping
 	data      []byte
+	major     uint16
+	flags     uint32
 	numDocs   uint32
 	fields    map[string]*fieldInfo
 	stored    storedIndex
@@ -79,7 +82,7 @@ func openData(path string, data []byte) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Reader{path: path, data: data, fields: map[string]*fieldInfo{}}
+	r := &Reader{path: path, data: data, major: footer.major, fields: map[string]*fieldInfo{}}
 	metaSec := footer.sections[sectionMeta]
 	metaBytes, sliceOK := region{off: metaSec.off, n: metaSec.n}.slice(data)
 	if !sliceOK {
@@ -91,7 +94,7 @@ func openData(path string, data []byte) (*Reader, error) {
 	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
 	}
-	cache, err := newStoredCache()
+	cache, err := newStoredCache(r.stored.dict)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +119,12 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 
 	d := decoder{b: b}
 	r.numDocs = d.u32()
+	if r.major >= 4 {
+		r.flags = d.u32()
+		if r.flags&^flagsKnown != 0 {
+			return corrupt()
+		}
+	}
 	storedIndexOff := d.u64()
 	numFields := d.u32()
 	for range numFields {
@@ -128,9 +137,16 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 		// out, then add the section's own absolute start", in that order.
 		presOff, presLen := d.u64(), d.u64()
 		truncOff, truncLen := d.u64(), d.u64()
+		var untypedOff, untypedLen uint64
+		if r.major >= 4 {
+			untypedOff, untypedLen = d.u64(), d.u64()
+		}
 		fi.presRegion = region{off: presenceBase + presOff - 1, n: presLen}
 		if truncLen > 0 {
 			fi.truncRegion = region{off: presenceBase + truncOff - 1, n: truncLen}
+		}
+		if untypedLen > 0 {
+			fi.untypedRegion = region{off: presenceBase + untypedOff - 1, n: untypedLen}
 		}
 		var dictOffs [numKinds]uint64
 		for k := range numKinds {
@@ -154,18 +170,19 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 		if d.err != nil {
 			return corrupt()
 		}
-		// Present and Truncated hand these out as unchecked zero-copy views on every
-		// call, so they are checked once, here, instead ([checkBitmap]).
-		// The presence bitmap is always written; the truncated one only when a document
-		// was truncated (truncLen 0: none).
-		if !r.validBitmap(fi.presRegion) || (truncLen > 0 && !r.validBitmap(fi.truncRegion)) {
+		// Present, Truncated and Untyped hand these out as unchecked zero-copy views on
+		// every call, so they are checked once, here, instead ([checkBitmap]). The
+		// presence bitmap is always written; the others only when they hold a document
+		// (length 0: none).
+		if !r.validBitmap(fi.presRegion) || (truncLen > 0 && !r.validBitmap(fi.truncRegion)) ||
+			(untypedLen > 0 && !r.validBitmap(fi.untypedRegion)) {
 			return &CorruptError{Path: r.path, Section: "presence", Reason: "malformed bitmap"}
 		}
 		for k := range numKinds {
 			if dictOffs[k] == 0 {
 				continue
 			}
-			dict, err := openDict(r.data, dictOffs[k])
+			dict, err := openDict(r.data, dictOffs[k], r.major)
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "terms", Reason: err.Error()}
 			}
@@ -198,7 +215,7 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			if pointsOff == 0 {
 				return &CorruptError{Path: r.path, Section: "points", Reason: "number column without a point index"}
 			}
-			p, err := openPoints(r.data, pointsOff, nc.enc)
+			p, err := openPoints(r.data, pointsOff, nc, r.major)
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "points", Reason: err.Error()}
 			}
@@ -210,7 +227,7 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	if d.err != nil {
 		return corrupt()
 	}
-	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase, footer.sections[sectionStored].n, r.numDocs)
+	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase, footer.sections[sectionStored].n, r.numDocs, r.major)
 	if err != nil {
 		return &CorruptError{Path: r.path, Section: "stored", Reason: err.Error()}
 	}
@@ -231,6 +248,16 @@ func (r *Reader) validBitmap(rg region) bool {
 
 // NumDocs returns how many document ordinals the segment holds, live and deleted.
 func (r *Reader) NumDocs() uint32 { return r.numDocs }
+
+// FormatMajor returns the major format version the segment was written in: FormatMajor,
+// or ReadsMajor for a segment an older build wrote.
+func (r *Reader) FormatMajor() int { return int(r.major) }
+
+// MarksUntyped reports whether the segment's writer marked every untyped value
+// ([BuildOptions.MarksUntyped]), so that [Reader.Untyped] lists exactly them. False for
+// a format-3 segment, which cannot say: whoever kept that knowledge outside the segment
+// can still read its marks through Untyped.
+func (r *Reader) MarksUntyped() bool { return r.flags&flagMarksUntyped != 0 }
 
 // NumTerms returns how many terms the segment's dictionaries hold: every field and
 // kind, added up (a term in two fields counts twice).
@@ -379,7 +406,59 @@ func (r *Reader) Truncated(field string) *roaring.Bitmap {
 	if fi == nil || fi.truncRegion.n == 0 {
 		return roaring.New()
 	}
+	if r.major < 4 {
+		_, truncated := r.splitV3Marks(fi)
+		return truncated
+	}
 	return viewBitmap(r.data, fi.truncRegion)
+}
+
+// Untyped returns the documents whose value of field its writer marked untyped
+// ([schema.Value.Untyped]): present, in a field the mapping did not map, and of a value
+// dynamic typing would type. Meaningful when the writer marks them
+// ([Reader.MarksUntyped]); empty otherwise.
+//
+// A format-3 segment kept the marks in its truncated bitmap (a marked value is present
+// with no text, where a truncated one always has text): they are its truncated
+// documents with no keyword value, computed on each call into a fresh bitmap, and
+// [Reader.Truncated] leaves them out.
+//
+// Otherwise the result is a zero-copy view over the segment's mmap: valid only while
+// this Reader (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping
+// it any longer than that.
+func (r *Reader) Untyped(field string) *roaring.Bitmap {
+	fi := r.fields[field]
+	if fi == nil {
+		return roaring.New()
+	}
+	if r.major < 4 {
+		marks, _ := r.splitV3Marks(fi)
+		return marks
+	}
+	if fi.untypedRegion.n == 0 {
+		return roaring.New()
+	}
+	return viewBitmap(r.data, fi.untypedRegion)
+}
+
+// splitV3Marks splits a format-3 field's truncated bitmap into the untyped marks (no
+// keyword value) and the truly truncated documents (a keyword value).
+func (r *Reader) splitV3Marks(fi *fieldInfo) (marks, truncated *roaring.Bitmap) {
+	marks, truncated = roaring.New(), roaring.New()
+	if fi.truncRegion.n == 0 {
+		return marks, truncated
+	}
+	kc := KeywordColumn{c: fi.keywordCol}
+	it := viewBitmap(r.data, fi.truncRegion).Iterator()
+	for it.HasNext() {
+		doc := it.Next()
+		if _, ok := kc.Ord(doc); ok {
+			truncated.Add(doc)
+		} else {
+			marks.Add(doc)
+		}
+	}
+	return marks, truncated
 }
 
 // Stored returns document ord's original body.
@@ -424,6 +503,8 @@ func (r *Reader) Retain() *Reader {
 		path:    r.path,
 		m:       r.m,
 		data:    r.data,
+		major:   r.major,
+		flags:   r.flags,
 		numDocs: r.numDocs,
 		fields:  r.fields,
 		stored:  r.stored,
@@ -431,7 +512,7 @@ func (r *Reader) Retain() *Reader {
 
 		numTerms: r.numTerms,
 	}
-	if cache, err := newStoredCache(); err == nil {
+	if cache, err := newStoredCache(r.stored.dict); err == nil {
 		nr.cache = cache
 		nr.ownsCache = true
 	} else {

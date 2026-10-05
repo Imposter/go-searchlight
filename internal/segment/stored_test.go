@@ -27,7 +27,7 @@ func TestCompressBlocksParallelEncoderFailureNoLeak(t *testing.T) {
 	}
 	before := runtime.NumGoroutine()
 	for range 5 {
-		if _, err := compressBlocksParallel(payloads, 4); !errors.Is(err, errBoom) {
+		if _, err := compressBlocksParallel(payloads, 4, blockEncoderSource{get: getBlockEncoder, put: putBlockEncoder}); !errors.Is(err, errBoom) {
 			t.Fatalf("compressBlocksParallel error = %v, want %v", err, errBoom)
 		}
 	}

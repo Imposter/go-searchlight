@@ -24,6 +24,7 @@ import (
 type fieldBuilder struct {
 	presence  *roaring.Bitmap
 	truncated *roaring.Bitmap
+	untyped   *roaring.Bitmap
 
 	valuePairs termPairs // KindValue: text, or "true"/"false"
 	entryPairs termPairs // KindEntry
@@ -48,7 +49,7 @@ type docFloat struct {
 }
 
 func newFieldBuilder() *fieldBuilder {
-	return &fieldBuilder{presence: roaring.New(), truncated: roaring.New()}
+	return &fieldBuilder{presence: roaring.New(), truncated: roaring.New(), untyped: roaring.New()}
 }
 
 func (b *fieldBuilder) addValueTerm(doc uint32, term string) { b.valuePairs.addString(term, doc) }
@@ -78,13 +79,14 @@ func (b *fieldBuilder) sortTermGroups() {
 // alone, still meaning absent), and Reader.parseMeta subtracts the 1 back out, after
 // adding the section's own absolute start, before calling openDict and friends.
 type fieldOutput struct {
-	presOff, presLen   uint64
-	truncOff, truncLen uint64
-	dictOff            [numKinds]uint64
-	keywordColOff      uint64
-	multiColOff        uint64
-	numberColOff       uint64
-	pointsOff          uint64
+	presOff, presLen       uint64
+	truncOff, truncLen     uint64
+	untypedOff, untypedLen uint64
+	dictOff                [numKinds]uint64
+	keywordColOff          uint64
+	multiColOff            uint64
+	numberColOff           uint64
+	pointsOff              uint64
 }
 
 // fieldScratch is one field's working state across the terms, doc-values and points
@@ -178,6 +180,19 @@ func (t *termPairs) add(term []byte, doc uint32) {
 	}
 	g.head, g.tail = t.slab.append(g.head, g.tail, doc)
 	g.lastDoc, g.hasDoc = doc, true
+}
+
+// addRun records term in each of docs (ascending, and after any doc term already has),
+// finding its group once.
+func (t *termPairs) addRun(term []byte, docs []uint32) {
+	g := &t.groups[t.findOrCreate(term)]
+	for _, doc := range docs {
+		if g.hasDoc && g.lastDoc == doc {
+			continue
+		}
+		g.head, g.tail = t.slab.append(g.head, g.tail, doc)
+		g.lastDoc, g.hasDoc = doc, true
+	}
 }
 
 // findOrCreate returns term's group index, interning term into the arena and adding a
@@ -327,9 +342,10 @@ type docOrd struct{ doc, ord uint32 }
 // worker, or one per Merge input reader) - that keeps the combined list ascending with
 // no re-sort, exactly the same list a single part covering every document would have
 // produced. onTerm, when non-nil, is called once per distinct term, in ascending
-// ordinal order, with its combined docs. Returns the dictionary's offset (0 if every
-// part is empty) and how many distinct terms it holds.
-func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
+// ordinal order, with its combined docs. ef lets postings be Elias-Fano coded. Returns
+// the dictionary's offset (0 if every part is empty) and how many distinct terms it
+// holds.
+func writeMergedDict(w *fileWriter, parts []*termPairs, ef bool, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
 	cursor := make([]int, len(parts))
 	anyLeft := func() bool {
 		for p := range parts {
@@ -343,7 +359,7 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, 
 		return 0, 0
 	}
 	enc := newPostingsEncoder()
-	dw := newDictWriter(w, enc)
+	dw := newDictWriter(w, enc, ef)
 	var ord uint32
 	docBuf := make([]uint32, 0, 64)
 	for anyLeft() {
@@ -389,7 +405,8 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, 
 // writeFieldDicts writes one field's four term dictionaries (terms section), merging
 // parts (one fieldBuilder per worker that built any of this field, each already
 // term-sorted) and recording each document's value and entry ordinals into s for
-// writeFieldDocValues.
+// writeFieldDocValues. Word and gram postings may be Elias-Fano coded; value and entry
+// postings, which filters read, stay roaring views.
 func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	sel := func(which func(*fieldBuilder) *termPairs) []*termPairs {
 		out := make([]*termPairs, len(parts))
@@ -400,7 +417,7 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	}
 	var off uint64
 	off, s.numValueTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.valuePairs }),
+		sel(func(p *fieldBuilder) *termPairs { return &p.valuePairs }), false,
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
@@ -410,7 +427,7 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 		s.out.dictOff[KindValue] = off + 1
 	}
 	off, s.numEntryTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.entryPairs }),
+		sel(func(p *fieldBuilder) *termPairs { return &p.entryPairs }), false,
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
@@ -419,10 +436,10 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	if s.numEntryTerms > 0 {
 		s.out.dictOff[KindEntry] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), nil); n > 0 {
+	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), true, nil); n > 0 {
 		s.out.dictOff[KindWord] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), nil); n > 0 {
+	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), true, nil); n > 0 {
 		s.out.dictOff[KindGram] = off + 1
 	}
 }
@@ -512,32 +529,48 @@ func writeFieldPoints(w *fileWriter, numDocs uint32, s *fieldScratch) {
 	s.out.pointsOff = off + 1
 }
 
-// writeFieldPresence writes one field's presence and truncated bitmaps (presence
-// section), as the union of every part's (each part's bitmaps only ever set bits
-// inside that part's own disjoint range, so a union is exactly what one bitmap built
-// from the whole range would hold).
+// writeFieldPresence writes one field's presence, truncated and untyped bitmaps
+// (presence section), as the union of every part's (each part's bitmaps only ever set
+// bits inside that part's own disjoint range, so a union is exactly what one bitmap
+// built from the whole range would hold). The truncated and untyped bitmaps are
+// written only when they hold a document.
 func writeFieldPresence(w *fileWriter, parts []*fieldBuilder, out *fieldOutput) {
 	presence := roaring.New()
 	truncated := roaring.New()
+	untyped := roaring.New()
 	for _, p := range parts {
 		presence.Or(p.presence)
 		truncated.Or(p.truncated)
+		untyped.Or(p.untyped)
 	}
 	blob := serializeBitmap(presence)
 	out.presOff, out.presLen = w.off+1, uint64(len(blob))
 	w.write(blob)
 	if !truncated.IsEmpty() {
-		blob2 := serializeBitmap(truncated)
-		out.truncOff, out.truncLen = w.off+1, uint64(len(blob2))
-		w.write(blob2)
+		blob := serializeBitmap(truncated)
+		out.truncOff, out.truncLen = w.off+1, uint64(len(blob))
+		w.write(blob)
+	}
+	if !untyped.IsEmpty() {
+		blob := serializeBitmap(untyped)
+		out.untypedOff, out.untypedLen = w.off+1, uint64(len(blob))
+		w.write(blob)
 	}
 }
 
-// writeMeta writes the META section: numDocs, the stored index's offset, and each
-// field's directory entry, sorted by name.
-func writeMeta(w *fileWriter, numDocs uint32, storedIndexOff uint64, names []string, outs map[string]*fieldOutput) {
+// Segment flags, in META.
+const (
+	// flagMarksUntyped: the writer marked every untyped value (BuildOptions.MarksUntyped).
+	flagMarksUntyped = 1 << 0
+	flagsKnown       = flagMarksUntyped
+)
+
+// writeMeta writes the META section: numDocs, the segment flags, the stored index's
+// offset, and each field's directory entry, sorted by name.
+func writeMeta(w *fileWriter, numDocs, flags uint32, storedIndexOff uint64, names []string, outs map[string]*fieldOutput) {
 	var h encoder
 	h.u32(numDocs)
+	h.u32(flags)
 	h.u64(storedIndexOff)
 	h.u32(uint32(len(names))) //nolint:gosec // a segment holds far fewer than 4 billion fields
 	w.write(h.b)
@@ -549,6 +582,8 @@ func writeMeta(w *fileWriter, numDocs uint32, storedIndexOff uint64, names []str
 		fh.u64(out.presLen)
 		fh.u64(out.truncOff)
 		fh.u64(out.truncLen)
+		fh.u64(out.untypedOff)
+		fh.u64(out.untypedLen)
 		for k := range numKinds {
 			fh.u64(out.dictOff[k])
 		}

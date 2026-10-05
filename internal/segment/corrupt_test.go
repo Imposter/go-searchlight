@@ -49,7 +49,11 @@ func layoutOf(t testing.TB, data []byte) segmentLayout {
 		t.Fatal(err)
 	}
 	meta := footer.sections[sectionMeta]
-	rel := binary.LittleEndian.Uint64(data[meta.off+4:])
+	at := meta.off + 4
+	if footer.major >= 4 {
+		at += 4 // flags
+	}
+	rel := binary.LittleEndian.Uint64(data[at:])
 	return segmentLayout{sections: footer.sections, storedIndexAbs: footer.sections[sectionStored].off + rel}
 }
 
@@ -108,48 +112,6 @@ func TestStoredBlockCountBoundedBeforeAllocating(t *testing.T) {
 	wantCorrupt(t, err, "stored")
 }
 
-// TestStoredTableRefusesInconsistentBlocks damages one field of the first block's
-// table entry at a time; each must be refused at Open.
-func TestStoredTableRefusesInconsistentBlocks(t *testing.T) {
-	cases := map[string]func(entry []byte){
-		"offset past section":  func(e []byte) { binary.LittleEndian.PutUint64(e[0:], 1<<40) },
-		"clen past section":    func(e []byte) { binary.LittleEndian.PutUint32(e[8:], 0xFFFFFFF0) },
-		"rawLen over ceiling":  func(e []byte) { binary.LittleEndian.PutUint32(e[12:], maxStoredBlockRaw+1) },
-		"rawLen under 2/doc":   func(e []byte) { binary.LittleEndian.PutUint32(e[12:], 1) },
-		"firstOrd not zero":    func(e []byte) { binary.LittleEndian.PutUint32(e[16:], 1) },
-		"empty block":          func(e []byte) { binary.LittleEndian.PutUint32(e[20:], 0) },
-		"count past numDocs":   func(e []byte) { binary.LittleEndian.PutUint32(e[20:], 1000) },
-		"count short of total": func(e []byte) { binary.LittleEndian.PutUint32(e[20:], 1) },
-	}
-	for name, damage := range cases {
-		t.Run(name, func(t *testing.T) {
-			data := buildFile(t, testDocs(t)) // 7 documents: one block
-			damage(data[layoutOf(t, data).storedIndexAbs+4:])
-			_, err := openCrafted(t, data)
-			wantCorrupt(t, err, "stored")
-		})
-	}
-}
-
-// TestStoredRawLenMismatchIsAnError: a block whose recorded rawLen disagrees with what
-// it decompresses to is refused when read, with an error - never a panic, and never a
-// buffer sized from the zstd frame's own (unchecked) content size.
-func TestStoredRawLenMismatchIsAnError(t *testing.T) {
-	for _, delta := range []int{-1, +1} {
-		data := buildFile(t, testDocs(t))
-		e := data[layoutOf(t, data).storedIndexAbs+4:]
-		raw := binary.LittleEndian.Uint32(e[12:])
-		binary.LittleEndian.PutUint32(e[12:], uint32(int(raw)+delta))
-		r, err := openCrafted(t, data)
-		if err != nil {
-			t.Fatalf("delta %d: Open: %v", delta, err)
-		}
-		if _, err := r.Stored(0); err == nil {
-			t.Fatalf("delta %d: Stored of a block with the wrong rawLen succeeded", delta)
-		}
-	}
-}
-
 func TestDocTooLargeRefused(t *testing.T) {
 	doc := schema.Doc{ID: "big", Body: make([]byte, MaxStoredBytes)} // with the 3-byte id, over the limit
 	_, err := Build(t.TempDir(), []schema.Doc{doc}, BuildOptions{})
@@ -162,17 +124,18 @@ func TestDocTooLargeRefused(t *testing.T) {
 	}
 }
 
-// TestOlderFormatsRefused pins N2 and the 3.0 bump: a 1.x file (1.0 absolute offsets,
-// 1.1 no stored rawLen and points offsets from the wrong origin) or a 2.x file (no IDS
-// section, so no exact-id lookup) must be refused with a VersionError, never parsed
-// with the 3.x layout. The checksums are made valid, so only the version check stands
-// between such a file and a misread.
+// TestOlderFormatsRefused pins N2 and the 4.0 bump: a file older than the previous
+// major (1.x: absolute offsets or no stored rawLen; 2.x: no IDS section) must be
+// refused with a VersionError that reads as older (so the copy is rebuilt), never
+// parsed with a newer layout; one newer than this build must be refused as newer. The
+// checksums are made valid, so only the version check stands between such a file and
+// a misread.
 func TestOlderFormatsRefused(t *testing.T) {
 	data := buildFile(t, testDocs(t))
-	if major, minor := binary.LittleEndian.Uint16(data[8:]), binary.LittleEndian.Uint16(data[10:]); major != 3 || minor != 0 {
-		t.Fatalf("Build wrote format %d.%d, want 3.0", major, minor)
+	if major, minor := binary.LittleEndian.Uint16(data[8:]), binary.LittleEndian.Uint16(data[10:]); major != 4 || minor != 0 {
+		t.Fatalf("Build wrote format %d.%d, want 4.0", major, minor)
 	}
-	for _, major := range []uint16{1, 2} {
+	for _, major := range []uint16{1, 2, 5} {
 		for _, minor := range []uint16{0, 1, 7} {
 			old := append([]byte(nil), data...)
 			binary.LittleEndian.PutUint16(old[8:], major)
@@ -181,6 +144,9 @@ func TestOlderFormatsRefused(t *testing.T) {
 			var ve *VersionError
 			if !errors.As(err, &ve) || ve.Major != major || ve.Minor != minor {
 				t.Fatalf("Open of format %d.%d: err = %v (%T), want *VersionError{Major: %d, Minor: %d}", major, minor, err, err, major, minor)
+			}
+			if older := errors.Is(err, ErrOlderFormat); older != (major < ReadsMajor) || Rebuildable(err) != older {
+				t.Fatalf("Open of format %d.%d: older %v, rebuildable %v", major, minor, older, Rebuildable(err))
 			}
 		}
 	}

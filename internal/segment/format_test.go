@@ -17,7 +17,15 @@ func TestPointsRelocatableWithinBuffer(t *testing.T) {
 	for i := range values {
 		values[i] = docFloat{doc: uint32(i), v: float64(i % 300)}
 	}
-	enc, _, _ := chooseEncoding(numDocs, values)
+	enc, st, present := chooseEncoding(numDocs, values)
+	var colBuf bytes.Buffer
+	cw := newFileWriter(&colBuf)
+	colOff := writeNumberColumn(cw, numDocs, enc, st, present, values)
+	cw.flush()
+	col, err := openNumberColumn(colBuf.Bytes(), colOff, numDocs)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pairs := make([]pointPair, len(values))
 	for i, dv := range values {
 		pairs[i] = pointPair{key: enc.key(dv.v), doc: dv.doc}
@@ -30,7 +38,7 @@ func TestPointsRelocatableWithinBuffer(t *testing.T) {
 		w.write(bytes.Repeat([]byte{0xEE}, lead))
 		off := writeSortedPoints(w, numDocs, pairs)
 		w.flush()
-		p, err := openPoints(buf.Bytes(), off, enc)
+		p, err := openPoints(buf.Bytes(), off, col, FormatMajor)
 		if err != nil {
 			t.Fatalf("lead %d: openPoints: %v", lead, err)
 		}

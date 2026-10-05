@@ -46,13 +46,17 @@ func FuzzOpen(f *testing.F) {
 	})
 }
 
-// normalizeFuzzInput copies in and stamps it with the current header and end magic
-// and matching checksums, wherever it is long enough to hold them.
+// normalizeFuzzInput copies in and stamps it with a header and end magic and matching
+// checksums, wherever it is long enough to hold them. The header keeps the input's
+// major when Open reads it (so format-3 seeds exercise the format-3 parsers), and is
+// stamped with FormatMajor otherwise.
 func normalizeFuzzInput(in []byte) []byte {
 	data := append([]byte(nil), in...)
 	if len(data) >= headerSize {
 		copy(data, magic[:])
-		binary.LittleEndian.PutUint16(data[8:], FormatMajor)
+		if !readsMajor(binary.LittleEndian.Uint16(data[8:])) {
+			binary.LittleEndian.PutUint16(data[8:], FormatMajor)
+		}
 		binary.LittleEndian.PutUint16(data[10:], FormatMinor)
 	}
 	if len(data) >= headerSize+tailSize {
@@ -128,7 +132,10 @@ func exerciseReader(r *Reader) {
 
 		consumeBitmap(r.Present(name))
 		consumeBitmap(r.Truncated(name))
+		consumeBitmap(r.Untyped(name))
 	}
+	_, _ = r.MarksUntyped(), r.FormatMajor()
+	_ = r.DiskUsage()
 
 	for _, doc := range docs {
 		_, _ = r.Stored(doc)
@@ -174,9 +181,14 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, emptyTermDocs(tb)),
 		buildFile(tb, numberDocs),
 		buildFile(tb, nil),
+		buildFile(tb, markedDocs(tb, 40)),
+		buildFile(tb, genCorpus(40)),
 	}
 	for _, craft := range craftedCases() {
 		seeds = append(seeds, craft.make(tb))
+	}
+	for _, name := range compatFixtures {
+		seeds = append(seeds, readCompatFixture(tb, name))
 	}
 	return seeds
 }
@@ -206,6 +218,16 @@ func craftedCases() []craftedCase {
 			fixChecksums(data)
 			return data
 		}},
+		{"compressed term block claims a huge raw length", craftTermBlockRawLen},
+		{"compressed term block is not zstd", craftTermBlockGarbage},
+		{"term block flags unknown", craftTermBlockFlags},
+		{"elias-fano postings claim more documents than they hold", craftEFDocFreq},
+		{"elias-fano postings low width past 32", craftEFLowWidth},
+		{"stored table offset past the section", craftStoredOffset},
+		{"stored table first ordinals out of order", craftStoredFirstOrd},
+		{"untyped bitmap malformed", craftUntypedBitmap},
+		{"unknown segment flags", craftMetaFlags},
+		{"format 3 point block outside the file", craftV3PointBlockOffset},
 	}
 }
 
@@ -250,10 +272,10 @@ func craftSharedPrefix(tb testing.TB) []byte {
 	dict := openValid(tb, data).fields["brand"].dicts[KindValue]
 	start := dict.blockOff(0)
 	_, n := binary.Uvarint(data[start:]) // postingsLen
-	if data[start+uint64(n)] != 0 {
-		tb.Fatal("craftSharedPrefix: the first entry's shared prefix is not a one-byte 0")
+	if data[start+uint64(n)] != 0 || data[start+uint64(n)+1] != 0 {
+		tb.Fatal("craftSharedPrefix: the first block is compressed, or its first entry's shared prefix is not a one-byte 0")
 	}
-	data[start+uint64(n)] = 5
+	data[start+uint64(n)+1] = 5
 	fixChecksums(data)
 	return data
 }
@@ -268,7 +290,7 @@ func craftPointBlockOffset(tb testing.TB) []byte {
 	}
 	data := buildFile(tb, docs)
 	p := openValid(tb, data).fields["n"].numberCol.points
-	binary.LittleEndian.PutUint64(data[p.base+pointsHeaderLen+20:], 1<<40)
+	binary.LittleEndian.PutUint64(data[p.base+pointsHeaderLen(FormatMajor)+20:], 1<<40)
 	fixChecksums(data)
 	return data
 }

@@ -29,6 +29,7 @@ const (
 	GroupMixed      = "mixed"
 	GroupFootprint  = "footprint"
 	GroupRestart    = "restart"
+	GroupRecovery   = "recovery"
 )
 
 // Thresholds of the absolute targets.
@@ -89,14 +90,11 @@ func Evaluate(r *Run) []TargetCheck {
 		r.percolation(),
 		r.footprint(),
 		r.visibility(),
-		{
-			ID: "T8", Area: "New replica from zero to serving (10M docs)", Target: "≤ Elasticsearch peer recovery",
-			Status: NotMeasured, Detail: "Needs the cluster (Task 11: peer recovery) and a second node; slbench has no recovery workload until the cluster is merged.",
-		},
+		r.recovery(),
 		r.restart(),
 		{
 			ID: "T10", Area: "Replica failure", Target: "no lost acknowledged write, no client-visible error with ≥ 2 replicas",
-			Status: NotMeasured, Detail: "A correctness property under failure: the chaos suite's job (Task 13b), not a performance workload.",
+			Status: NotMeasured, Detail: "A correctness property under failure, checked by the chaos suite (test/chaos, .github/workflows/chaos.yml), not a performance workload.",
 		},
 		{
 			ID: "T11", Area: "Scale", Target: "larger than RAM per node (memory-mapped segments), many nodes through shards",
@@ -423,6 +421,42 @@ func (r *Run) visibility() TargetCheck {
 	return c
 }
 
+func (r *Run) recovery() TargetCheck {
+	c := TargetCheck{
+		ID: "T8", Area: "New replica from zero to serving (10M docs)", Target: "≤ Elasticsearch peer recovery",
+		Workloads: []string{"recovery"},
+	}
+	s, e := r.Find("recovery", Searchlight), r.Find("recovery", Elasticsearch)
+	if s == nil {
+		c.Status, c.Detail = NotMeasured, "No recovery workload ran: it needs a Postgres or MySQL store for a second Searchlight node (slbench run --sl-bin with --recovery-store-url)."
+		return c
+	}
+	secs := func(res *Result) string {
+		if res == nil || res.Latency == nil {
+			return "—"
+		}
+		return FormatMicros(res.Latency.Max)
+	}
+	c.Searchlight, c.Elasticsearch = secs(s), secs(e)
+	scale := ""
+	if docs := s.Values["docs"]; docs > 0 && docs < 10e6 {
+		scale = fmt.Sprintf(" Measured at %.0f documents, not the target's 10M.", docs)
+	}
+	switch {
+	case !s.OK() || s.Latency == nil:
+		c.Status, c.Detail = Invalid, "The recovery workload errored."
+	case e == nil:
+		c.Status, c.Detail = NoBaseline, "Elasticsearch's peer recovery was not run: it needs a second Elasticsearch node, which this harness does not start."+scale
+	case !e.OK() || e.Latency == nil:
+		c.Status, c.Detail = Invalid, "Elasticsearch's recovery workload errored."
+	case s.Latency.Max > e.Latency.Max:
+		c.Status, c.Detail = Fail, "Searchlight's slowest recovery is slower than Elasticsearch's."+scale
+	default:
+		c.Status, c.Detail = Pass, "Searchlight's slowest recovery is within Elasticsearch's."+scale
+	}
+	return c
+}
+
 func (r *Run) restart() TargetCheck {
 	c := TargetCheck{
 		ID: "T9", Area: "Node restart to serving", Target: "seconds, not proportional to index size (segments are reopened, not rebuilt)",
@@ -430,7 +464,7 @@ func (r *Run) restart() TargetCheck {
 	}
 	s := r.Find("restart", Searchlight)
 	if s == nil {
-		c.Status, c.Detail = NotMeasured, "No restart command was given (slbench run --sl-restart-cmd)."
+		c.Status, c.Detail = NotMeasured, "No restart ran: slbench restarts a node it runs itself (--sl-bin), or one --sl-restart-cmd restarts."
 		return c
 	}
 	secs := func(res *Result) string {

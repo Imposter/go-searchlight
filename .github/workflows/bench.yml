@@ -36,12 +36,30 @@ jobs:
     # has the measured per-iteration cost); 180 still leaves ample room for a
     # 1M-document run's load, searches, aggregations and percolation beside it.
     timeout-minutes: 180
+    # The recovery workload (target T8: a new replica from zero to serving) needs a
+    # second Searchlight node, and so a store two nodes can share: this Postgres, for a
+    # cluster of slbench's own beside the SQLite node every other workload runs on.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: searchlight
+          POSTGRES_PASSWORD: searchlight
+          POSTGRES_DB: searchlight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U searchlight -d searchlight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       DOCS: ${{ inputs.docs || '1m' }}
       SEARCHES: ${{ inputs.searches || '1k,10k,100k' }}
       RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-latest' }}
       DATA_DIR: ${{ github.workspace }}/.bench-data
       SL_DIR: ${{ github.workspace }}/.bench-sl
+      RECOVERY_STORE_URL: postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable
     steps:
       - uses: actions/checkout@v5
 
@@ -80,10 +98,13 @@ jobs:
           echo "ES_HEAP=${HEAP_GB}g" >> "$GITHUB_ENV"
           echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g, runner $RUNNER_LABEL"
 
-      - name: build slbench and slserver
+      # slbench runs the real binary itself, as a child process: on SQLite with a
+      # generated tokens file, restarted for the restart workload (T9), and two more on
+      # Postgres for the recovery workload (T8). It stops them when it is done.
+      - name: build slbench and searchlight
         run: |
           go build -o /tmp/slbench ./bench/cmd/slbench
-          go build -o /tmp/slserver ./bench/cmd/slserver
+          make build
 
       - name: start Elasticsearch
         run: docker compose -f bench/docker-compose.es.yml up -d
@@ -101,34 +122,6 @@ jobs:
           docker compose -f bench/docker-compose.es.yml logs
           exit 1
 
-      - name: start Searchlight
-        run: |
-          mkdir -p "$SL_DIR"
-          nohup /tmp/slserver -dir "$SL_DIR" -addr 127.0.0.1:8780 -token auto -info "$SL_DIR/info.json" \
-            > "$SL_DIR/slserver.log" 2>&1 &
-          echo $! > "$SL_DIR/slserver.pid"
-          for i in $(seq 1 60); do
-            [ -s "$SL_DIR/info.json" ] && break
-            sleep 1
-          done
-          if [ ! -s "$SL_DIR/info.json" ]; then
-            echo "searchlight did not write its info file" >&2
-            cat "$SL_DIR/slserver.log" || true
-            exit 1
-          fi
-          SL_URL=$(jq -r .url "$SL_DIR/info.json")
-          echo "SL_URL=$SL_URL" >> "$GITHUB_ENV"
-          for i in $(seq 1 60); do
-            if curl -sf "$SL_URL/readyz" >/dev/null; then
-              echo "searchlight is ready"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "searchlight did not become ready" >&2
-          cat "$SL_DIR/slserver.log" || true
-          exit 1
-
       - name: generate dataset
         run: |
           mkdir -p "$DATA_DIR"
@@ -143,7 +136,9 @@ jobs:
             --data "$DATA_FILE" \
             --searches "$SEARCH_FILE" \
             --sets "$SEARCHES" \
-            --sl-info "$SL_DIR/info.json" \
+            --sl-bin bin/searchlight \
+            --sl-dir "$SL_DIR" \
+            --recovery-store-url "$RECOVERY_STORE_URL" \
             --es-url "http://127.0.0.1:9200" \
             --es-config "heap_max=${ES_HEAP}" \
             --label "CI (${{ github.sha }})" \
@@ -158,28 +153,22 @@ jobs:
       # containers, and with them "docker compose logs"), so a failure like the
       # loader's "context canceled" (slbench: searchlight: loading: context
       # canceled, every target NOT MEASURED) can be diagnosed from the artifact
-      # and the job log instead of being a dead end: slserver.log has the
-      # request Searchlight actually refused or crashed on, and the ES container
-      # log has the same for Elasticsearch.
+      # and the job log instead of being a dead end: searchlight.log (and, for the
+      # recovery cluster's nodes, recovery/*/searchlight.log) has the request
+      # Searchlight actually refused or crashed on, and the ES container log has the
+      # same for Elasticsearch.
       - name: collect server logs
         if: always()
         run: |
           docker compose -f bench/docker-compose.es.yml logs --no-color --timestamps \
             > "$SL_DIR/elasticsearch.log" 2>&1 || true
           if [ "${{ steps.run.outcome }}" = "failure" ]; then
-            echo "::group::slserver.log (tail, run workloads failed)"
-            tail -n 200 "$SL_DIR/slserver.log" 2>/dev/null || echo "(no $SL_DIR/slserver.log)"
+            echo "::group::searchlight.log (tail, run workloads failed)"
+            tail -n 200 "$SL_DIR/searchlight.log" 2>/dev/null || echo "(no $SL_DIR/searchlight.log)"
             echo "::endgroup::"
             echo "::group::elasticsearch.log (tail, run workloads failed)"
             tail -n 200 "$SL_DIR/elasticsearch.log" 2>/dev/null || echo "(no $SL_DIR/elasticsearch.log)"
             echo "::endgroup::"
-          fi
-
-      - name: stop Searchlight
-        if: always()
-        run: |
-          if [ -f "$SL_DIR/slserver.pid" ]; then
-            kill "$(cat "$SL_DIR/slserver.pid")" 2>/dev/null || true
           fi
 
       - name: stop Elasticsearch
@@ -194,7 +183,8 @@ jobs:
           path: |
             docs/benchmarks.md
             ${{ env.DATA_DIR }}/bench-results.json
-            ${{ env.SL_DIR }}/slserver.log
+            ${{ env.SL_DIR }}/searchlight.log
+            ${{ env.SL_DIR }}/recovery/*/searchlight.log
             ${{ env.SL_DIR }}/elasticsearch.log
           if-no-files-found: warn
           retention-days: 90

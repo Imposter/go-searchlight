@@ -28,9 +28,10 @@ type SearchlightOptions struct {
 	// DiskPaths are the directories holding the node's data (data_dir and, for
 	// SQLite, the database file's directory), summed for the disk footprint.
 	DiskPaths []string
-	// PID, when set on Linux, reads the resident set from /proc; otherwise it is read
-	// from the node's /metrics (process_resident_memory_bytes).
-	PID int
+	// PID, when set, returns the node's process id now (a restart changes it): on
+	// Linux the resident set is read from /proc; otherwise, or when it returns 0, from
+	// the node's /metrics (process_resident_memory_bytes).
+	PID func() int
 	// Config describes the node's configuration for the report (store, durability,
 	// refresh interval, ...).
 	Config map[string]string
@@ -376,9 +377,13 @@ func (s *Searchlight) Resources(ctx context.Context, _ string) (report.Resources
 	} else {
 		r.DiskSource = "not measured (no --sl-disk paths)"
 	}
-	if rss := procRSS(s.opts.PID); rss > 0 {
-		r.RSSBytes, r.RSSSource = rss, fmt.Sprintf("/proc/%d/status VmRSS", s.opts.PID)
-		return r, nil
+	if s.opts.PID != nil {
+		if pid := s.opts.PID(); pid > 0 {
+			if rss := procRSS(pid); rss > 0 {
+				r.RSSBytes, r.RSSSource = rss, "/proc/<pid>/status VmRSS"
+				return r, nil
+			}
+		}
 	}
 	body, err := s.c.do(ctx, http.MethodGet, "/metrics", "", nil)
 	if err != nil {

@@ -34,6 +34,12 @@ linters:
       # the timer-bearing packages only (see the exclusions); a call that must be the
       # process's own time (a net.Conn deadline, a context deadline, waiting out another
       # process's file handle) says why in its //nolint.
+      #
+      # context.WithTimeout and context.WithDeadline are not forbidden: most bound real
+      # I/O (a database call, a peer request) whose deadline must reach the driver or the
+      # peer through ctx.Deadline, which a fake clock's deadline cannot. A bound that
+      # ends a wait polling on the clock uses clock.WithTimeout or clock.WithDeadline
+      # instead, so a test driving the clock drives the bound too.
       analyze-types: true
       forbid:
         - pattern: ^time\.(Now|Since|Until|After|AfterFunc|NewTimer|NewTicker|Tick|Sleep)$

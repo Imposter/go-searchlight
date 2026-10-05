@@ -103,9 +103,10 @@ type Options struct {
 	// shards from peers, and keeps its index catalogue in step with the store
 	// (SyncCatalog). Nil: a single node, hosting every shard's one copy.
 	Cluster Cluster
-	// Clock runs the node's timers (refreshes, database pings, waits) and those of
-	// its shards, tailers, replica Hub and group committer, and judges readiness and
-	// staleness against max_lag. Nil means clock.Real.
+	// Clock runs the node's timers (refreshes, database pings, waits and their
+	// bounds) and those of its shards, tailers, replica Hub and group committer, and
+	// judges readiness and staleness against max_lag. Nil means clock.Real. On a
+	// clock.Fake a write waits out the group commit window until the fake is advanced.
 	Clock clock.Clock
 	// Logger, Tracer and Meter are the node's telemetry; nil means slog.Default() and
 	// the OpenTelemetry globals.

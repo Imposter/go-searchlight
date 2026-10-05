@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -549,7 +550,7 @@ const newIndexServeWait = 5 * time.Second
 // awaitServing waits until the registry shows every copy this node holds of index
 // serving, or newIndexServeWait passes.
 func (n *Node) awaitServing(ctx context.Context, index string) {
-	ctx, cancel := context.WithTimeout(ctx, newIndexServeWait)
+	ctx, cancel := clock.WithTimeout(ctx, n.clock, newIndexServeWait)
 	defer cancel()
 	delay := time.Millisecond
 	for {

@@ -108,7 +108,7 @@ func (p *peerAPI) begin(w http.ResponseWriter, r *http.Request, route string) (*
 		trace.WithAttributes(attribute.String("peer.route", route)))
 	cancel := func() {}
 	if ms, err := strconv.ParseInt(r.Header.Get(headerDeadline), 10, 64); err == nil && ms > 0 {
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(ms)*time.Millisecond)
+		ctx, cancel = clock.WithTimeout(ctx, p.n.clock, time.Duration(ms)*time.Millisecond)
 	}
 	r = r.WithContext(ctx)
 	if e := p.authorized(r); e != nil {

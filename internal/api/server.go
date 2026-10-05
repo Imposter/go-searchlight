@@ -436,7 +436,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 			releaseBudget = sync.OnceFunc(br.releaseAll)
 			defer releaseBudget()
 		}
-		ctx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
+		ctx, cancel := clock.WithTimeout(ctx, s.clock, s.cfg.RequestTimeout)
 		defer cancel()
 		if rt.queued {
 			// The body is read before a slot is taken: a slow client holds none.

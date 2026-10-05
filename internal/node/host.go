@@ -265,7 +265,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 			return nil, err
 		}
 		sh := c.shard()
-		sn, err := sh.Snapshot()
+		sn, err := sh.Snapshot(ctx)
 		if errors.Is(err, shard.ErrClosed) && c.shard() != sh {
 			continue // swapped by a rebuild: snapshot its replacement
 		}

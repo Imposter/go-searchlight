@@ -2,7 +2,6 @@ package shard
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync/atomic"
 
@@ -15,10 +14,11 @@ import (
 // Generations and segment lifetimes.
 //
 // A Generation is an immutable snapshot: the segments and their deletes as of one
-// commit. The shard publishes each through an atomic pointer and holds one reference on
-// the current one; Acquire adds a reference with a compare-and-swap that only succeeds
-// while the count is above zero, so a generation whose count reached zero (retired) can
-// never be revived, and Release drops one. Nothing a reader touches takes a lock.
+// refresh or merge. The shard publishes each through an atomic pointer and holds one
+// reference on the current one; Acquire adds a reference with a compare-and-swap that
+// only succeeds while the count is above zero, so a generation whose count reached zero
+// (retired) can never be revived, and Release drops one. Nothing a reader touches takes
+// a lock.
 //
 // Each segment is a segRef, opened once (one segment.Reader, so one mapping) and
 // reference-counted by the generations that list it: a new generation takes its
@@ -26,8 +26,8 @@ import (
 // therefore mapped for as long as any generation that exposes it is alive, from the
 // first Acquire until the last Release, which is the lifetime its zero-copy bitmaps
 // need. When a segRef's count reaches zero the janitor closes it (the final unmap) and,
-// if a commit has since dropped it from the manifest (merged away), only then removes
-// its files, which Windows refuses while they are mapped.
+// once a flush has dropped it from the manifest (merged away), removes its files,
+// which Windows refuses while they are mapped.
 
 // segKind is a document or a query segment.
 type segKind uint8
@@ -60,9 +60,14 @@ type segRef struct {
 	// merge, which closes it itself if it is never published; the generation that
 	// publishes it takes its first reference.
 	refs atomic.Int32
-	// obsolete is set once a durable manifest no longer lists the segment: its files
-	// are removed after its final close.
+	// obsolete is set once a flush's durable manifest no longer lists the segment, and
+	// closed once the janitor has closed it: its files are removed when both are.
 	obsolete atomic.Bool
+	closed   atomic.Bool
+	// synced is whether the segment's files are fsynced: by its build (a merged
+	// segment), by the flush that first persisted it, or because Open found it in the
+	// manifest. Flushes read and set it holding flushSem.
+	synced bool
 }
 
 // lookup returns the ordinal of the document or query whose id is exactly id, deleted
@@ -86,11 +91,10 @@ func (r *segRef) close() error {
 
 // segState is a segment as one generation sees it: with that generation's deletes.
 type segState struct {
-	ref      *segRef
-	deletes  *roaring.Bitmap // owned and never changed once published; emptyDeletes when none
-	delGen   uint64          // the sidecar holding deletes; 0: none
-	delBytes int64           // that sidecar's size
-	dirty    bool            // deletes changed in the commit being prepared: write a sidecar
+	ref     *segRef
+	deletes *roaring.Bitmap // owned and never changed once published; emptyDeletes when none
+	delGen  uint64          // the generation that last changed deletes, naming its sidecar; 0: none
+	dirty   bool            // deletes changed in the generation being published
 }
 
 // emptyDeletes is the deletes of every segment with none. Read-only, like every deletes
@@ -234,12 +238,11 @@ func (g *Generation) retireAll() {
 	}
 }
 
-// Gen identifies the generation's segment set: the commit that wrote the segments and
-// deletes it exposes. A refresh with nothing to write (a seq-only publish) reuses the
-// current Gen, so it does not grow on every refresh; it grows with each refresh that
-// writes a segment or deletes, each merge, and each lazy persist of a moved seq (which
-// commits the same segments under a new Gen). Two generations with the same Gen expose
-// the same segments and deletes.
+// Gen identifies the generation's segment set: the refresh or merge that published the
+// segments and deletes it exposes. A refresh with nothing to write (a seq-only publish)
+// reuses the current Gen, so it does not grow on every refresh; it grows with each
+// refresh that writes a segment or deletes, and each merge. Two generations with the
+// same Gen expose the same segments and deletes.
 func (g *Generation) Gen() uint64 { return g.gen }
 
 // Seq is the changelog position the generation covers: every change with a seq at or
@@ -379,8 +382,5 @@ func (s *Shard) loadDeletes(st *segState, ms manifestSegment) error {
 		return fmt.Errorf("shard: segment %s: a delete past its %d documents", ms.ID, st.ref.numDocs)
 	}
 	st.deletes, st.delGen = del, ms.DelGen
-	if info, err := os.Stat(filepath.Join(s.dir, deletesName(ms.ID, ms.DelGen))); err == nil {
-		st.delBytes = info.Size()
-	}
 	return nil
 }

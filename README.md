@@ -72,8 +72,8 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `prune_stall_timeout` | `15m` | how long a copy behind the others may make no progress and still hold the changelog's prune floor |
 | `retiring_retention` | `15m` | how long the changelog is kept for a cleanly stopped node's copies to replay on restart |
 | `changelog_retention` | `24h` | the oldest a change may grow before it is pruned whatever copy still needs it |
-| `refresh_interval` | `1s` | how often writes become searchable |
-| `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
+| `refresh_interval` | `1s` | how often writes become searchable (a refresh is visibility only: it fsyncs nothing) |
+| `flush_interval` | `10s` | how often a shard copy makes what refreshes published durable: fsyncs its new segments and deletes, writes its manifest, and only then reports that seq as applied (a crash replays at most this much of the changelog) |
 | `max_lag` | `2s` | how far a copy may trail the changelog and still serve |
 | `changelog_poll_interval` | `500ms` | how often a shard copy polls the changelog when no notification or local write wakes it |
 | `remap_debounce` | `2s` | how long a copy that a mapping change must rebuild waits for more mapping changes (`0s` = rebuild at once) |

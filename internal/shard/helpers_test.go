@@ -34,10 +34,10 @@ func analyze(t testing.TB, id, body string) *schema.Doc {
 	return &d
 }
 
-// testOptions are quiet, manual options: no background refresh or merges, and a
+// testOptions are quiet, manual options: no background refresh, flush or merges, and a
 // filter cache of the test's own (so its Stats are the test's alone).
 func testOptions() Options {
-	return Options{RefreshInterval: -1, DisableMerges: true, Logger: quietLogger, FilterCache: NewFilterCache(1<<20, nil)}
+	return Options{RefreshInterval: -1, FlushInterval: -1, DisableMerges: true, Logger: quietLogger, FilterCache: NewFilterCache(1<<20, nil)}
 }
 
 // harness drives one shard against a model: every applied change is mirrored in
@@ -126,6 +126,20 @@ func (h *harness) refresh() {
 	if err := h.s.Refresh(context.Background()); err != nil {
 		h.t.Fatalf("Refresh: %v", err)
 	}
+}
+
+func (h *harness) flush() {
+	h.t.Helper()
+	if err := h.s.Flush(context.Background()); err != nil {
+		h.t.Fatalf("Flush: %v", err)
+	}
+}
+
+// commit refreshes and flushes: what the shard publishes is durable.
+func (h *harness) commit() {
+	h.t.Helper()
+	h.refresh()
+	h.flush()
 }
 
 func (h *harness) forceMerge(n int) {

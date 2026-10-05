@@ -693,13 +693,17 @@ func (t *Tailer) report(ctx context.Context, force bool) error {
 	return nil
 }
 
-// finalReport makes a last report when Run stops, best effort.
+// finalReport flushes the copy and makes a last report when Run stops, best effort, so
+// the registry holds every seq the copy has published.
 func (t *Tailer) finalReport(ctx context.Context) {
 	if t.copy == nil {
 		return
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
+	if err := t.Shard().Flush(rctx); err != nil {
+		t.log.DebugContext(ctx, "final flush failed", slog.Any("error", err))
+	}
 	if err := t.report(rctx, true); err != nil {
 		t.log.DebugContext(ctx, "final applied-seq report failed", slog.Any("error", err))
 	}

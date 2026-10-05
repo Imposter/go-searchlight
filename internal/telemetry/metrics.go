@@ -126,6 +126,8 @@ const (
 	// Refresh and merge.
 	MetricRefreshDuration = "searchlight.shard.refresh.duration"
 	MetricRefreshFailures = "searchlight.shard.refresh.failures"
+	MetricFlushDuration   = "searchlight.shard.flush.duration"
+	MetricFlushFailures   = "searchlight.shard.flush.failures"
 	MetricMergeFailures   = "searchlight.shard.merge.failures"
 	MetricMergeDuration   = "searchlight.shard.merge.duration"
 	MetricMergeBytes      = "searchlight.shard.merge.bytes"
@@ -197,6 +199,8 @@ var Catalog = []MetricSpec{
 
 	{MetricRefreshDuration, KindHistogram, "s", "Shard refresh time, by index and shard.", SlowBuckets},
 	{MetricRefreshFailures, KindCounter, "{refresh}", "Shard refreshes that failed (the buffer is kept and retried), by index and shard.", nil},
+	{MetricFlushDuration, KindHistogram, "s", "Shard flush time (fsyncs, sidecars, manifest), by index and shard.", SlowBuckets},
+	{MetricFlushFailures, KindCounter, "{flush}", "Shard flushes that failed (retried at the next), by index and shard.", nil},
 	{MetricMergeFailures, KindCounter, "{merge}", "Segment merges that failed or were abandoned, by index and shard.", nil},
 	{MetricMergeDuration, KindHistogram, "s", "Segment merge time, by index and shard.", SlowBuckets},
 	{MetricMergeBytes, KindCounter, "By", "Bytes written by segment merges, by index and shard.", nil},

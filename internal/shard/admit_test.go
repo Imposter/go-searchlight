@@ -15,7 +15,7 @@ import (
 // buffer is over its limit and admits once a refresh drains it.
 func TestAdmit(t *testing.T) {
 	opts := testOptions()
-	opts.FlushBytes = 4 << 10
+	opts.RefreshBytes = 4 << 10
 	opts.MaxBufferFactor = 2
 	h := newHarness(t, opts)
 	if err := h.s.Admit(); err != nil {

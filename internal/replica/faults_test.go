@@ -141,7 +141,7 @@ func TestStoreFaults(t *testing.T) {
 			return nil
 		}
 		c := newCopy(t, fs, id, testOptions())
-		c.sopt.FlushBytes = 1 << 10 // commits mid-load: the cut-short load leaves segments
+		c.sopt.RefreshBytes = 1 << 10 // refreshes mid-load, and flushes persist them: the cut-short load leaves segments
 		c.start()
 		c.waitApplied(mustApply(t, st, upsert("sf", 0, "late", `{}`)))
 		fs.inject("changes", 5)
@@ -202,7 +202,7 @@ func TestCrashPoints(t *testing.T) {
 				return nil
 			}
 			c := newCopy(t, fs, id, testOptions())
-			c.sopt.FlushBytes = 1 << 10 // part of the load is committed, at seq 0
+			c.sopt.RefreshBytes = 1 << 10 // part of the load is refreshed, and flushed at seq 0
 			crashAt(c, reached)
 			fs.onRecord = nil
 			c.start()

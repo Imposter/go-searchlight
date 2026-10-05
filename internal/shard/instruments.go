@@ -16,9 +16,11 @@ import (
 // shard.
 type instruments struct {
 	refresh metric.Float64Histogram
+	flush   metric.Float64Histogram
 	merge   metric.Float64Histogram
 
 	refreshFailures metric.Int64Counter
+	flushFailures   metric.Int64Counter
 	mergeFailures   metric.Int64Counter
 	mergeBytes      metric.Int64Counter
 	backlog         metric.Float64Gauge
@@ -43,9 +45,11 @@ func newInstruments(meter metric.Meter, index string, shard int, log *slog.Logge
 	base := []attribute.KeyValue{attribute.String(telemetry.KeyIndex, index), attribute.Int(telemetry.KeyShard, shard)}
 	i := &instruments{
 		refresh: in.Histogram(telemetry.MetricRefreshDuration),
+		flush:   in.Histogram(telemetry.MetricFlushDuration),
 		merge:   in.Histogram(telemetry.MetricMergeDuration),
 
 		refreshFailures: in.Counter(telemetry.MetricRefreshFailures),
+		flushFailures:   in.Counter(telemetry.MetricFlushFailures),
 		mergeFailures:   in.Counter(telemetry.MetricMergeFailures),
 		mergeBytes:      in.Counter(telemetry.MetricMergeBytes),
 		backlog:         in.Gauge(telemetry.MetricMergeBacklog),
@@ -81,6 +85,10 @@ func (i *instruments) countChanges(ctx context.Context, changes []Change) {
 
 func (i *instruments) recordRefresh(ctx context.Context, d time.Duration) {
 	i.refresh.Record(ctx, d.Seconds(), i.attrs)
+}
+
+func (i *instruments) recordFlush(ctx context.Context, d time.Duration) {
+	i.flush.Record(ctx, d.Seconds(), i.attrs)
 }
 
 func (i *instruments) recordMerge(ctx context.Context, d time.Duration, bytes int64) {
@@ -135,17 +143,17 @@ func (i *instruments) stop() {
 	}
 }
 
-// recordGeneration records a newly published generation's size: its segments, their
-// deletes sidecars and the manifest on disk, and its terms.
+// recordGeneration records a newly published generation's size: its segments, and the
+// manifest and sidecars of the last flush, on disk; and its terms.
 func (s *Shard) recordGeneration(ctx context.Context, g *Generation) {
-	disk := s.manifestBytes.Load()
+	disk := s.manifestBytes.Load() + s.sidecarBytes.Load()
 	var terms uint64
 	for i := range g.docs {
-		disk += g.docs[i].ref.bytes + g.docs[i].delBytes
+		disk += g.docs[i].ref.bytes
 		terms += g.docs[i].ref.reader.NumTerms()
 	}
 	for i := range g.queries {
-		disk += g.queries[i].ref.bytes + g.queries[i].delBytes
+		disk += g.queries[i].ref.bytes
 	}
 	s.inst.segments.Record(ctx, float64(len(g.docs)+len(g.queries)), s.inst.attrs)
 	s.inst.documents.Record(ctx, float64(g.numDocs), s.inst.attrs)

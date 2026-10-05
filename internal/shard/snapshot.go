@@ -2,6 +2,7 @@ package shard
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,14 +15,19 @@ import (
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
-// A Snapshot is a consistent copy of a shard copy's files as of one generation, for
-// peer recovery (spec section 9): another node streams its files into an empty
-// directory, writing the manifest last, and opens a copy identical to this one as of
-// [Snapshot.Seq].
+// A Snapshot is a consistent copy of a shard copy's files as of one flushed
+// generation, for peer recovery (spec section 9): another node streams its files into
+// an empty directory, writing the manifest last, and opens a copy identical to this one
+// as of [Snapshot.Seq].
 //
-// It owns its manifest. The files a commit writes are named for the commit, and a
-// later commit removes the deletes sidecars it supersedes as soon as its own manifest
-// is durable, while the snapshot may still be streaming the older generation. So the
+// It is taken by a flush, of the generation that flush made durable, so it carries
+// only state this copy itself would reopen to after a crash: its seq is never past the
+// copy's CommittedSeq. A flush costs a few fsyncs; the transfer that follows dwarfs
+// them.
+//
+// It owns its manifest. A sidecar is named for the generation that wrote it, and a
+// later flush removes the sidecars it supersedes as soon as its own manifest is
+// durable, while the snapshot may still be streaming the older generation. So the
 // snapshot does not read sidecars or the manifest from the directory: it encodes them
 // from the generation it holds, whose deletes bitmaps never change, and builds the
 // manifest that lists exactly those segments, sidecars, seq and mapping. The segment
@@ -48,15 +54,13 @@ type SnapshotFile struct {
 // one a recovering copy writes last (it is the copy's commit point).
 const ManifestName = manifestName
 
-// Snapshot holds the shard's current generation and describes its files. Release it
-// when the copy is done: until then the generation's segment files stay on disk.
-func (s *Shard) Snapshot() (*Snapshot, error) {
-	if err := s.Err(); err != nil {
+// Snapshot flushes the shard, holds the generation the flush made durable, and
+// describes its files. Release it when the copy is done: until then the generation's
+// segment files stay on disk.
+func (s *Shard) Snapshot(ctx context.Context) (*Snapshot, error) {
+	g, err := s.flush(ctx)
+	if err != nil {
 		return nil, err
-	}
-	g := s.Acquire()
-	if g == nil {
-		return nil, ErrClosed
 	}
 	sn := &Snapshot{g: g, dir: s.dir, mem: map[string][]byte{}}
 	if err := sn.build(s.marksUntyped); err != nil {

@@ -77,9 +77,9 @@ const DefaultMaxApplyLag = 100_000
 type Options struct {
 	// Store is the SQL store, migrated. The node does not close it.
 	Store store.Store
-	// Config is the node's configuration: data_dir, refresh_interval,
-	// seq_persist_interval, merge_threads, merge_budget, search_threads, max_doc_bytes,
-	// node_id, advertise_address and max_lag are used.
+	// Config is the node's configuration: data_dir, refresh_interval, flush_interval,
+	// merge_threads, merge_budget, search_threads, max_doc_bytes, node_id,
+	// advertise_address and max_lag are used.
 	Config config.Config
 	// NewTailer makes each shard copy's tailer. Nil means the replica tailer
 	// (ReplicaTailers), sharing one replica Hub the node runs when the store
@@ -616,17 +616,17 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	}
 	state := idx.meta.Load()
 	opts := shard.Options{
-		Index:              idx.name,
-		Shard:              s,
-		RefreshInterval:    -1, // the node's refresher drives refreshes, so the interval can change
-		SeqPersistInterval: n.cfg.SeqPersistInterval,
-		MergeBudget:        n.budget,
-		FilterCache:        n.cache,
-		QueryIndex:         percolate.Index{},
-		Clock:              n.clock,
-		Logger:             n.log,
-		Tracer:             n.tr,
-		Meter:              n.meter,
+		Index:           idx.name,
+		Shard:           s,
+		RefreshInterval: -1, // the node's refresher drives refreshes, so the interval can change
+		FlushInterval:   n.cfg.FlushInterval,
+		MergeBudget:     n.budget,
+		FilterCache:     n.cache,
+		QueryIndex:      percolate.Index{},
+		Clock:           n.clock,
+		Logger:          n.log,
+		Tracer:          n.tr,
+		Meter:           n.meter,
 	}
 	if n.opts.ShardOptions != nil {
 		n.opts.ShardOptions(&opts)
@@ -699,43 +699,26 @@ func (n *Single) runTailer(ctx context.Context, idx *index, c *copyState) {
 	n.log.ErrorContext(ctx, "shard copy halted", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 }
 
-// refresher refreshes an index's copies every refresh interval (which settings may
-// change at any time).
 func (n *Single) refresher(ctx context.Context, idx *index) {
 	defer idx.wg.Done()
 	warn := time.Time{}
-	for {
-		d := time.Duration(idx.refresh.Load())
-		var tick <-chan time.Time
-		var timer clock.Timer
-		if d > 0 {
-			timer = n.clock.NewTimer(d)
-			tick = timer.C()
-		}
-		select {
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
+	clock.GridLoop{
+		Clock:    n.clock,
+		Period:   func() time.Duration { return time.Duration(idx.refresh.Load()) },
+		Reanchor: idx.refreshWake,
+		Task: func() {
+			for _, c := range idx.copies() {
+				sh := c.shard()
+				if sh == nil || sh.Err() != nil {
+					continue
+				}
+				if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
+					warn = n.clock.Now()
+					n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
+				}
 			}
-			return
-		case <-idx.refreshWake:
-			if timer != nil {
-				timer.Stop()
-			}
-			continue
-		case <-tick:
-		}
-		for _, c := range idx.copies() {
-			sh := c.shard()
-			if sh == nil || sh.Err() != nil {
-				continue
-			}
-			if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
-				warn = n.clock.Now()
-				n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
-			}
-		}
-	}
+		},
+	}.Run(ctx)
 }
 
 // stopIndex stops an index's tailers and refresher and closes its copies.

@@ -40,7 +40,7 @@ func newShardModel(t *testing.T) *shardModel {
 func (m *shardModel) open() {
 	m.t.Helper()
 	s, err := shard.Open(context.Background(), m.dir, testMapping(), shard.Options{
-		QueryIndex: Index{}, RefreshInterval: -1, DisableMerges: true, FlushBytes: -1,
+		QueryIndex: Index{}, RefreshInterval: -1, DisableMerges: true, RefreshBytes: -1,
 	})
 	if err != nil {
 		m.t.Fatal(err)

@@ -244,7 +244,7 @@ func mustApply(t testing.TB, st store.Store, batch ...store.Change) int64 {
 func testShardOptions(id ShardID) shard.Options {
 	return shard.Options{
 		Index: id.Index, Shard: id.Shard,
-		RefreshInterval: 20 * time.Millisecond, SeqPersistInterval: 50 * time.Millisecond,
+		RefreshInterval: 20 * time.Millisecond, FlushInterval: 50 * time.Millisecond,
 		Logger: quietLogger, FilterCache: shard.NewFilterCache(1<<20, nil),
 	}
 }

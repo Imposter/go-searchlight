@@ -94,7 +94,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 	path := filepath.Join(dir, name+FileExt)
 	meta, err := writeSegmentParts(path, total, names, parts, storedFromSlice(func(ord uint32) (string, []byte) {
 		return recs[ord].id, recs[ord].body
-	}, total), ids, threads, opts.Throttle, !opts.NoDirSync)
+	}, total), ids, threads, opts.Throttle, true, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}

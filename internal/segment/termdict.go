@@ -3,12 +3,10 @@ package segment
 import (
 	"bytes"
 	"encoding/binary"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2"
-	"github.com/klauspost/compress/zstd"
 )
 
 // A term dictionary holds one (field, kind)'s terms, sorted by bytes, in blocks of
@@ -18,14 +16,11 @@ import (
 //	[postings of block 0][block 0][postings of block 1][block 1] ... [index]
 //
 //	block  uvarint postingsLen (this block's postings' byte length, so its postings
-//	       start postingsLen bytes before the block itself - see below)
-//	       u8 flags (format 4): 0, the entries follow as they are; blockZstd, uvarint
-//	       rawLen, uvarint compressedLen and the entries zstd-compressed
-//	entries per term: uvarint shared prefix (with the previous term in the block),
+//	       start postingsLen bytes before the block itself - see below), then per
+//	       term: uvarint shared prefix (with the previous term in the block),
 //	       uvarint suffix length, suffix, uvarint docFreq, and either uvarint doc
 //	       (docFreq 1, the postings inline) or uvarint postings length (laid out
-//	       back to back, working backward from the block's own start), which in
-//	       format 4 is shifted left one bit over the postings codec
+//	       back to back, working backward from the block's own start)
 //	index  u32 numTerms, u32 numBlocks, u64 sumDocFreq, u64 blockBack[numBlocks] (each
 //	       block's distance back from the index itself to its own start),
 //	       u32 keyOffset[numBlocks+1], the blocks' keys back to back
@@ -58,61 +53,14 @@ import (
 // blockTerms is how many terms a block holds (the last may hold fewer).
 const blockTerms = 32
 
-// Term block flags (format 4).
-const (
-	blockZstd = 1 << 0
-	// blockFlagsKnown is every flag a reader understands; a block with any other set
-	// reads as empty.
-	blockFlagsKnown = blockZstd
-)
-
-const (
-	// termBlockCompressMin is the smallest block compressed: long values (a
-	// description, say), which prefix sharing does little for. Shorter terms - titles,
-	// urls, ids, grams - stay as they are, so the residual checks that read them never
-	// inflate a block.
-	termBlockCompressMin = 4 << 10
-	// maxTermBlockRaw is the largest block stored compressed, and the most a reader
-	// inflates: a larger one is stored as it is.
-	maxTermBlockRaw = 1 << 20
-	// termBlockSlots is how many inflated blocks a dictionary keeps.
-	termBlockSlots = 8
-)
-
-// termBlockEncoders keeps idle block compressors between dictionaries.
-var termBlockEncoders sync.Pool
-
-func getTermBlockEncoder() *zstd.Encoder {
-	if enc, ok := termBlockEncoders.Get().(*zstd.Encoder); ok {
-		return enc
-	}
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-	if err != nil {
-		panic(err) // only invalid options fail
-	}
-	return enc
-}
-
-// termBlockDecoder inflates compressed term blocks for every dictionary in the process:
-// DecodeAll is safe for concurrent use.
-var termBlockDecoder = sync.OnceValue(func() *zstd.Decoder {
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxTermBlockRaw), zstd.WithDecodeAllCapLimit(true))
-	if err != nil {
-		panic(err) // only invalid options fail
-	}
-	return dec
-})
-
 // dictWriter streams one term dictionary into the TERMS section.
 type dictWriter struct {
 	w          *fileWriter
 	enc        *postingsEncoder
-	efPostings bool // a term's postings may be Elias-Fano coded
 	pending    []pendingTerm
 	termBuf    []byte // the pending terms' bytes
 	postBuf    []byte // the pending terms' serialized postings
 	block      encoder
-	zenc       *zstd.Encoder
 	prev       []byte
 	blockOffs  []uint64
 	keyOffs    []uint32
@@ -126,11 +74,10 @@ type pendingTerm struct {
 	docFreq    uint32
 	single     uint32
 	postLen    int
-	codec      uint8
 }
 
-func newDictWriter(w *fileWriter, enc *postingsEncoder, efPostings bool) *dictWriter {
-	return &dictWriter{w: w, enc: enc, efPostings: efPostings, pending: make([]pendingTerm, 0, blockTerms)}
+func newDictWriter(w *fileWriter, enc *postingsEncoder) *dictWriter {
+	return &dictWriter{w: w, enc: enc, pending: make([]pendingTerm, 0, blockTerms)}
 }
 
 // add appends a term, greater than every term before it, with its documents (sorted,
@@ -142,9 +89,9 @@ func (d *dictWriter) add(term []byte, docs []uint32) {
 	if len(docs) == 1 {
 		p.single = docs[0]
 	} else {
-		blob, codec := d.enc.encode(docs, d.efPostings)
+		blob := d.enc.encode(docs)
 		d.postBuf = append(d.postBuf, blob...)
-		p.postLen, p.codec = len(blob), codec
+		p.postLen = len(blob)
 	}
 	d.pending = append(d.pending, p)
 	d.numTerms++
@@ -178,55 +125,23 @@ func (d *dictWriter) flushBlock() {
 		if p.docFreq == 1 {
 			d.block.uvarint(uint64(p.single))
 		} else {
-			d.block.uvarint(uint64(p.postLen)<<1 | uint64(p.codec)) //nolint:gosec // a serialized postings blob's length, non-negative
+			d.block.uvarint(uint64(p.postLen)) //nolint:gosec // a serialized postings blob's length, non-negative
 		}
 		d.prev = append(d.prev[:0], term...)
 	}
 	var h encoder
-	// postingsLen, not postingsStart itself: a distance back from this block's own
-	// start (blockStart, which the reader already has - it is how it found this
-	// block), not a forward offset from anywhere - see the type comment above.
 	h.uvarint(blockStart - postingsStart)
-	if comp := d.compress(d.block.b); comp != nil {
-		h.u8(blockZstd)
-		h.uvarint(uint64(len(d.block.b)))
-		h.uvarint(uint64(len(comp)))
-		d.w.write(h.b)
-		d.w.write(comp)
-	} else {
-		h.u8(0)
-		d.w.write(h.b)
-		d.w.write(d.block.b)
-	}
+	d.w.write(h.b)
+	d.w.write(d.block.b)
 	d.pending = d.pending[:0]
 	d.termBuf = d.termBuf[:0]
 	d.postBuf = d.postBuf[:0]
-}
-
-// compress returns entries zstd-compressed, or nil when they are not worth it: too
-// short, too long to inflate safely, or saving less than a quarter.
-func (d *dictWriter) compress(entries []byte) []byte {
-	if len(entries) < termBlockCompressMin || len(entries) > maxTermBlockRaw {
-		return nil
-	}
-	if d.zenc == nil {
-		d.zenc = getTermBlockEncoder()
-	}
-	comp := d.zenc.EncodeAll(entries, nil)
-	if len(comp)*4 > len(entries)*3 {
-		return nil
-	}
-	return comp
 }
 
 // finish writes the block index and returns its offset, or false for a dictionary
 // with no terms (which is not written).
 func (d *dictWriter) finish() (uint64, bool) {
 	d.flushBlock()
-	if d.zenc != nil {
-		termBlockEncoders.Put(d.zenc)
-		d.zenc = nil
-	}
 	if d.numTerms == 0 {
 		return 0, false
 	}
@@ -235,8 +150,6 @@ func (d *dictWriter) finish() (uint64, bool) {
 	d.w.u32(uint32(len(d.blockOffs))) //nolint:gosec // blocks fit uint32
 	d.w.u64(d.sumDocFreq)
 	for _, o := range d.blockOffs {
-		// A distance back from the index (off, written here) to that block's own
-		// start (o), not o itself - see the type comment above.
 		d.w.u64(off - o)
 	}
 	for _, o := range d.keyOffs {
@@ -264,7 +177,6 @@ func commonPrefix(a, b []byte) int {
 // adding to one - see the type comment above for why.
 type termDict struct {
 	data       []byte // the whole mapping
-	major      uint16
 	base       uint64 // the index's own absolute position in data
 	numTerms   uint32
 	numBlocks  uint32
@@ -278,29 +190,15 @@ type termDict struct {
 	// concurrent Postings calls need no lock: two racing on the same unchecked term
 	// both check it, then both set the same bit, which is harmless.
 	checked []atomic.Uint64
-
-	// inflated keeps the last compressed blocks read, one per slot.
-	inflated *[termBlockSlots]inflatedBlock
 }
 
-// inflatedBlock is one slot of a dictionary's inflated blocks. raw is never written
-// once set: a slot's next block replaces the slice, so a cursor still reading the old
-// one keeps a valid view.
-type inflatedBlock struct {
-	mu    sync.Mutex
-	valid bool
-	block uint32
-	raw   []byte
-}
-
-// openDict parses the dictionary of a file of the given major whose index starts at
-// the absolute position off.
-func openDict(data []byte, off uint64, major uint16) (*termDict, error) {
+// openDict parses the dictionary whose index starts at the absolute position off.
+func openDict(data []byte, off uint64) (*termDict, error) {
 	if off > uint64(len(data)) {
 		return nil, errShort
 	}
 	d := decoder{b: data, pos: int(off)} //nolint:gosec // bounded by len(data)
-	t := &termDict{data: data, major: major, base: off}
+	t := &termDict{data: data, base: off}
 	t.numTerms = d.u32()
 	t.numBlocks = d.u32()
 	t.sumDocFreq = d.u64()
@@ -326,9 +224,6 @@ func openDict(data []byte, off uint64, major uint16) (*termDict, error) {
 	}
 	// One bit per term: at most an eighth of the bytes the dictionary itself takes.
 	t.checked = make([]atomic.Uint64, (uint64(t.numTerms)+63)/64)
-	if major >= 4 {
-		t.inflated = new([termBlockSlots]inflatedBlock)
-	}
 	return t, nil
 }
 
@@ -351,7 +246,7 @@ func (t *termDict) key(i uint32) []byte {
 // pass over the bitmap. A bitmap that fails is not remembered, and reads as empty
 // every time.
 func (t *termDict) postings(info termInfo, numDocs uint32) *roaring.Bitmap {
-	if info.docFreq <= 1 || info.codec != codecRoaring || info.ord >= t.numTerms {
+	if info.docFreq <= 1 || info.ord >= t.numTerms {
 		return bitmapAt(t.data, info, numDocs)
 	}
 	word, bit := &t.checked[info.ord/64], uint64(1)<<(info.ord%64)
@@ -368,7 +263,7 @@ func (t *termDict) postings(info termInfo, numDocs uint32) *roaring.Bitmap {
 // blockFor returns the last block whose key is at most term, or false when term sorts
 // before every key.
 func (t *termDict) blockFor(term []byte) (uint32, bool) {
-	lo, hi := uint32(0), t.numBlocks // the answer is the last i in [lo, hi) with key(i) <= term
+	lo, hi := uint32(0), t.numBlocks
 	for lo < hi {
 		mid := lo + (hi-lo)/2
 		if bytes.Compare(t.key(mid), term) <= 0 {
@@ -386,7 +281,6 @@ func (t *termDict) blockFor(term []byte) (uint32, bool) {
 // blockCursor decodes one block's entries in order.
 type blockCursor struct {
 	d       decoder
-	major   uint16
 	post    uint64 // the next serialized postings' offset
 	ord     uint32
 	left    uint32
@@ -397,56 +291,13 @@ type blockCursor struct {
 func (t *termDict) cursor(block uint32) blockCursor {
 	blockStart := t.blockOff(block)
 	c := blockCursor{
-		d:     decoder{b: t.data, pos: int(blockStart)}, //nolint:gosec // checked at open
-		major: t.major,
-		ord:   block * blockTerms,
-		left:  min(blockTerms, t.numTerms-block*blockTerms),
+		d:    decoder{b: t.data, pos: int(blockStart)}, //nolint:gosec // checked at open
+		ord:  block * blockTerms,
+		left: min(blockTerms, t.numTerms-block*blockTerms),
 	}
-	// postingsLen is a distance back from this block's own start (blockStart, just
-	// resolved above), not a forward offset from anywhere; postings regions built
-	// from it (blockCursor.next) come out as ordinary absolute mmap positions, so
-	// every other reader of one - bitmapAt, viewBitmap, appendDocs - needs no change.
 	postingsLen := c.d.uvarint()
 	c.post = blockStart - postingsLen
-	if t.major < 4 {
-		return c
-	}
-	flags := c.d.u8()
-	switch {
-	case c.d.err != nil || flags&^blockFlagsKnown != 0:
-		c.left = 0
-	case flags&blockZstd != 0:
-		rawLen := c.d.uvarint()
-		comp := c.d.bytes(c.d.uvarint())
-		raw, ok := t.inflate(block, comp, rawLen)
-		if c.d.err != nil || !ok {
-			c.left = 0
-			return c
-		}
-		c.d = decoder{b: raw}
-	}
 	return c
-}
-
-// inflate returns compressed block's entries, from its slot when they are there. A
-// block that does not inflate to exactly rawLen bytes (at most maxTermBlockRaw) is
-// damage: false.
-func (t *termDict) inflate(block uint32, comp []byte, rawLen uint64) ([]byte, bool) {
-	slot := &t.inflated[block%termBlockSlots]
-	slot.mu.Lock()
-	defer slot.mu.Unlock()
-	if slot.valid && slot.block == block {
-		return slot.raw, true
-	}
-	if rawLen > maxTermBlockRaw {
-		return nil, false
-	}
-	raw, err := termBlockDecoder().DecodeAll(comp, make([]byte, 0, rawLen))
-	if err != nil || uint64(len(raw)) != rawLen {
-		return nil, false
-	}
-	slot.valid, slot.block, slot.raw = true, block, raw
-	return raw, true
 }
 
 // next decodes the next entry: its shared prefix length and suffix. False at the end
@@ -470,10 +321,6 @@ func (c *blockCursor) next() (shared int, suffix []byte, ok bool) {
 		c.entry.single = uint32(c.d.uvarint()) //nolint:gosec // written from a uint32
 	} else {
 		n := c.d.uvarint()
-		if c.major >= 4 {
-			c.entry.codec = uint8(n & 1)
-			n >>= 1
-		}
 		c.entry.post = region{off: c.post, n: n}
 		c.post += n
 	}

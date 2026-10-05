@@ -23,7 +23,6 @@ const pointsBlockSize = 128
 
 const pointsEntryLen = 8 + 8 + 4 + 8
 
-// pointsHeaderLen is the header's size in a file of the given major.
 func pointsHeaderLen(major uint16) uint64 {
 	if major < 4 {
 		return 4 + 4 + 1 + 1
@@ -140,7 +139,6 @@ func openPoints(data []byte, off uint64, col *numberColumn, major uint16) (*poin
 	return p, nil
 }
 
-// blockSize is the bytes a block of count entries takes.
 func (p *points) blockSize(count uint32) uint64 {
 	n := packedSize(uint64(count), p.docWidth)
 	if p.hasKeys {

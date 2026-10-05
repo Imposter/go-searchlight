@@ -7,64 +7,67 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/klauspost/compress/zstd"
 )
 
 // Stored fields are each document's id and original body, packed id-then-body
 // (uvarint length prefixes) into blocks of a contiguous run of document ordinals, each
-// zstd-compressed. Looking one up is a binary search over block start ordinals, then
-// one decompress and a short linear scan. Blocks are compressed in parallel, a bounded
+// compressed. Looking one up is a binary search over block start ordinals, then one
+// decompress and a short linear scan. Blocks are compressed in parallel, a bounded
 // batch at a time, and placed by one sequential pass in ordinal order. Every offset is
 // relative to the STORED section's own start, as every other section's internal
 // offsets are, so relocating the section does not break it.
 //
 // Format 4 (writeStored):
 //
-//	dict    dictLen bytes: the segment's first records, raw, which every block is
-//	        compressed against (none for a small segment)
-//	blocks  compressed bytes, back to back, from dictLen on
+//	dict    dictLen bytes: an s2 dictionary (uvarint repeat offset, then the
+//	        segment's first records, raw) every block is compressed against, or none
+//	        for a small segment
+//	blocks  s2 blocks, back to back, from dictLen on
 //	index   u32 numBlocks, u32 dictLen, u8 ordWidth, u8 offWidth, u8 rawWidth, then
 //	        bit-packed: each block's first ordinal (numBlocks), each block's offset
 //	        and the blocks' end (numBlocks+1), each block's uncompressed length
 //	        (numBlocks)
 //
-// A block is flushed once it holds storedBlockTarget bytes: small, so fetching one hit
-// decompresses little, and the dictionary - the documents' shared shape and their
-// common values - keeps small blocks compressing as well as large ones without it.
+// A block is flushed once it holds storedBlockTarget bytes: small, and s2, so fetching
+// a hit decompresses little, and fast; the dictionary - the documents' shared shape and
+// their common values - keeps small blocks compressing about as well as format 3's
+// larger zstd ones.
 //
 // Format 3:
 //
 //	index   u32 numBlocks, per block: u64 offset, u32 compressedLen, u32 rawLen,
 //	        u32 firstOrd, u32 count
-//	blocks  compressed bytes, back to back, about 16 KB raw each, no dictionary
+//	blocks  zstd frames, back to back, about 16 KB raw each, no dictionary
 //
 // rawLen is a block's uncompressed length. A read decompresses into a buffer of exactly
-// that size and refuses a block whose zstd frame disagrees, instead of trusting the
-// frame header's own content size, which in a crafted file could claim gigabytes.
-// Blocks start at ordinal 0 and run contiguously up to NumDocs, each holding at least
-// one document; openStoredIndex checks all of that, so a damaged table is refused at
-// Open instead of misread later.
+// that size and refuses a block whose own header disagrees, instead of trusting that
+// header, which in a crafted file could claim gigabytes. Blocks start at ordinal 0 and
+// run contiguously up to NumDocs, each holding at least one document; openStoredIndex
+// checks all of that, so a damaged table is refused at Open instead of misread later.
 
 // storedBlockTarget is the uncompressed payload size a block is flushed at.
-const storedBlockTarget = 8 << 10
+const storedBlockTarget = 4 << 10
 
 // storedBlockTargetV3 is the block size format 3 was written with.
 const storedBlockTargetV3 = 16 << 10
 
 const (
-	// storedDictLen is a stored dictionary's length: the segment's first records.
-	storedDictLen = 64 << 10
-	// storedDictSample is the fewest record bytes a segment has a dictionary for. A
-	// smaller one (a refresh's, which merges soon replace) is compressed without: there
-	// a dictionary costs more to load into the encoders than it saves.
-	storedDictSample = 1 << 20
-	// storedDictID names the dictionary in each block's frame header.
-	storedDictID = 1
+	// storedDictLen is how many of the segment's first record bytes its dictionary
+	// holds: s2's largest.
+	storedDictLen = s2.MaxDictSize
 	// storedBatchBlocks is how many blocks each compressing goroutine takes per batch:
 	// what bounds a write's memory, with the dictionary sample, whatever the
 	// segment's size.
 	storedBatchBlocks = 64
 )
+
+// storedDictSample is the fewest record bytes a segment has a dictionary for. A
+// smaller one (a refresh's, which merges soon replace) is compressed without: there
+// a dictionary costs more to load into the encoders than it saves. A variable so a
+// test can give a small segment one.
+var storedDictSample = 1 << 20
 
 // MaxStoredBytes is the largest document Build and Merge store: its id and body
 // together, in bytes. A larger one fails the build with [ErrDocTooLarge]. The limit
@@ -89,77 +92,6 @@ const storedIndexHeaderLen = 4 + 4 + 1 + 1 + 1
 // ErrDocTooLarge is a document whose id and body together exceed [MaxStoredBytes].
 var ErrDocTooLarge = errors.New("segment: document exceeds MaxStoredBytes")
 
-// newBlockEncoder makes one stored-block compressor for a segment without a dictionary.
-// A variable only so a test can make it fail
-// ([TestCompressBlocksParallelEncoderFailureNoLeak]). Each compressing goroutine uses its
-// encoder for one block at a time (EncodeAll), so it needs only one of the encoder's
-// internal block encoders: the default, one per GOMAXPROCS, each with its own match
-// tables, made every Build allocate about 10 MiB per worker for nothing.
-var newBlockEncoder = func() (*zstd.Encoder, error) {
-	return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
-}
-
-// blockEncoders keeps idle stored-block encoders between builds: a shard refreshes
-// every second, and an encoder's tables are worth reusing. A variable so a test can
-// start from an empty pool.
-var blockEncoders = &sync.Pool{}
-
-// getBlockEncoder returns an idle encoder, or a new one.
-func getBlockEncoder() (*zstd.Encoder, error) {
-	if enc, ok := blockEncoders.Get().(*zstd.Encoder); ok {
-		return enc, nil
-	}
-	return newBlockEncoder()
-}
-
-// putBlockEncoder returns enc to the pool. EncodeAll keeps no state between calls, so
-// the next user starts clean.
-func putBlockEncoder(enc *zstd.Encoder) { blockEncoders.Put(enc) }
-
-// blockEncoderSource hands out and takes back one segment's block encoders.
-type blockEncoderSource struct {
-	get func() (*zstd.Encoder, error)
-	put func(*zstd.Encoder)
-}
-
-// encodersFor returns the encoders for blocks compressed against dict, and a func that
-// releases them once the segment is written: the pooled ones for none, otherwise ones
-// made for dict, kept for every batch of the segment (loading a dictionary costs far
-// more than compressing a block).
-func encodersFor(dict []byte) (blockEncoderSource, func()) {
-	if len(dict) == 0 {
-		return blockEncoderSource{get: getBlockEncoder, put: putBlockEncoder}, func() {}
-	}
-	var mu sync.Mutex
-	var idle []*zstd.Encoder
-	src := blockEncoderSource{
-		get: func() (*zstd.Encoder, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			if n := len(idle); n > 0 {
-				enc := idle[n-1]
-				idle = idle[:n-1]
-				return enc, nil
-			}
-			return zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1),
-				zstd.WithEncoderDictRaw(storedDictID, dict))
-		},
-		put: func(enc *zstd.Encoder) {
-			mu.Lock()
-			defer mu.Unlock()
-			idle = append(idle, enc)
-		},
-	}
-	return src, func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, enc := range idle {
-			_ = enc.Close()
-		}
-		idle = nil
-	}
-}
-
 type storedBlockInfo struct {
 	off      uint64
 	clen     uint32
@@ -175,56 +107,35 @@ type storedPayload struct {
 	data     []byte
 }
 
-// compressBlocksParallel zstd-compresses every payload into its own result slot (in
-// payloads' order, whatever order they finish in), using up to threads goroutines,
-// each with its own encoder from encs reused across every block it takes.
-//
-// Workers claim block indices from a shared atomic counter instead of a channel fed
-// by a separate goroutine: a worker that fails to make its encoder simply returns, and
-// once every worker has returned there is nothing left running and nothing left
-// blocked. wg.Wait() is the only synchronization the results need: each slot of
-// compressed is written by exactly one worker, and read only after Wait.
-func compressBlocksParallel(payloads []storedPayload, threads int, encs blockEncoderSource) ([][]byte, error) {
+// compressBlocksParallel compresses every payload with encode into its own result slot
+// (in payloads' order, whatever order they finish in), using up to threads goroutines
+// that claim payloads from a shared counter.
+func compressBlocksParallel(payloads []storedPayload, threads int, encode func(src []byte) []byte) [][]byte {
 	compressed := make([][]byte, len(payloads))
-	if threads < 2 || len(payloads) < 2 {
-		enc, err := encs.get()
-		if err != nil {
-			return nil, err
-		}
-		defer encs.put(enc)
-		for i, p := range payloads {
-			compressed[i] = enc.EncodeAll(p.data, nil)
-		}
-		return compressed, nil
-	}
 	threads = min(threads, len(payloads))
+	if threads < 2 {
+		for i, p := range payloads {
+			compressed[i] = encode(p.data)
+		}
+		return compressed
+	}
 	var next atomic.Int64
-	errs := make([]error, threads)
 	var wg sync.WaitGroup
-	for t := range threads {
+	for range threads {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			enc, err := encs.get()
-			if err != nil {
-				errs[t] = err
-				return
-			}
-			defer encs.put(enc)
 			for {
 				i := int(next.Add(1) - 1)
 				if i >= len(payloads) {
 					return
 				}
-				compressed[i] = enc.EncodeAll(payloads[i].data, nil)
+				compressed[i] = encode(payloads[i].data)
 			}
 		}()
 	}
 	wg.Wait()
-	if err := errors.Join(errs...); err != nil {
-		return nil, err
-	}
-	return compressed, nil
+	return compressed
 }
 
 // storedWriter writes the STORED section from a stream of records: it holds back the
@@ -238,8 +149,7 @@ type storedWriter struct {
 	chosen   bool
 	head     []byte
 	headRecs []headRecord
-	encs     blockEncoderSource
-	release  func()
+	encode   func(src []byte) []byte
 
 	cur      []byte
 	curFirst uint32
@@ -261,8 +171,7 @@ type headRecord struct {
 // writeStored writes src's records as the STORED section and returns the block table's
 // offset, relative to the section's start. w must be at the section's start.
 func writeStored(w *fileWriter, src storedSource, threads int) (uint64, error) {
-	sw := &storedWriter{w: w, sectionStart: w.off, threads: max(threads, 1), release: func() {}}
-	defer func() { sw.release() }()
+	sw := &storedWriter{w: w, sectionStart: w.off, threads: max(threads, 1)}
 	err := src(func(ord uint32, id string, body []byte) error {
 		if size := uint64(len(id)) + uint64(len(body)); size > MaxStoredBytes {
 			return fmt.Errorf("%w: ordinal %d holds %d bytes, over %d", ErrDocTooLarge, ord, size, MaxStoredBytes)
@@ -283,6 +192,9 @@ func appendRecord(dst []byte, id string, body []byte) []byte {
 }
 
 func (sw *storedWriter) add(ord uint32, id string, body []byte) error {
+	if sw.w.err != nil {
+		return sw.w.err
+	}
 	if !sw.chosen {
 		sw.head = appendRecord(sw.head, id, body)
 		sw.headRecs = append(sw.headRecs, headRecord{ord: ord, end: len(sw.head)})
@@ -295,7 +207,6 @@ func (sw *storedWriter) add(ord uint32, id string, body []byte) error {
 	return sw.added(ord)
 }
 
-// added accounts for the record just appended to cur, cutting the block when full.
 func (sw *storedWriter) added(ord uint32) error {
 	if sw.curCount == 0 {
 		sw.curFirst = ord
@@ -312,17 +223,14 @@ func (sw *storedWriter) added(ord uint32) error {
 	return nil
 }
 
-// choose picks the dictionary from the records held back, writes it, and cuts them into
-// blocks.
 func (sw *storedWriter) choose() error {
 	sw.chosen = true
-	dictLen := 0
+	sw.encode = func(src []byte) []byte { return s2.EncodeBetter(nil, src) }
 	if len(sw.head) >= storedDictSample {
-		dictLen = storedDictLen
+		dict := s2.MakeDict(sw.head[:min(storedDictLen, len(sw.head))], nil)
+		sw.w.write(dict.Bytes())
+		sw.encode = func(src []byte) []byte { return dict.EncodeBetter(nil, src) }
 	}
-	dict := sw.head[:dictLen]
-	sw.w.write(dict)
-	sw.encs, sw.release = encodersFor(dict)
 	start := 0
 	for _, r := range sw.headRecs {
 		sw.cur = append(sw.cur, sw.head[start:r.end]...)
@@ -335,15 +243,11 @@ func (sw *storedWriter) choose() error {
 	return nil
 }
 
-// flushBatch compresses the batch's blocks in parallel and writes them in order.
 func (sw *storedWriter) flushBatch() error {
 	if len(sw.batch) == 0 {
 		return nil
 	}
-	compressed, err := compressBlocksParallel(sw.batch, sw.threads, sw.encs)
-	if err != nil {
-		return err
-	}
+	compressed := compressBlocksParallel(sw.batch, sw.threads, sw.encode)
 	for i, p := range sw.batch {
 		sw.firstOrds = append(sw.firstOrds, p.firstOrd)
 		sw.offs = append(sw.offs, sw.w.off-sw.sectionStart)
@@ -354,7 +258,6 @@ func (sw *storedWriter) flushBatch() error {
 	return nil
 }
 
-// finish writes the last block and the block table.
 func (sw *storedWriter) finish() (uint64, error) {
 	if !sw.chosen {
 		if err := sw.choose(); err != nil {
@@ -419,6 +322,7 @@ type storedIndex struct {
 	ordWidth, offWidth, rawWidth uint8
 	firstOrds, offs, raws        []byte
 	dict                         []byte
+	s2dict                       *s2.Dict
 }
 
 // openStoredIndex parses the block table at the absolute position off of a STORED
@@ -452,6 +356,11 @@ func openStoredIndex(data []byte, off, base, sectionLen uint64, numDocs uint32, 
 		return storedIndex{}, errShort
 	}
 	si.dict = data[base : base+dictLen]
+	if dictLen > 0 {
+		if si.s2dict = s2.NewDict(si.dict); si.s2dict == nil {
+			return storedIndex{}, errShort
+		}
+	}
 	if unpack(si.offs, 0, si.offWidth) != dictLen || unpack(si.offs, uint64(si.numBlocks), si.offWidth) != tableRel {
 		return storedIndex{}, errShort
 	}
@@ -562,15 +471,13 @@ const storedCacheShards = 8
 // usually are - within one shard; across shards, unrelated blocks simply don't
 // contend.
 //
-// Its one *zstd.Decoder is shared by every shard with no lock of its own:
-// Decoder.DecodeAll is documented safe for concurrent use (it hands out one of the
-// decoder's own pooled block decoders per call, up to its configured concurrency,
-// instead of mutating shared state), so decompressing two different blocks for two
-// different shards already proceeds in parallel without a sync.Pool of decoders on
-// top - which would only add redundant block-decoder pools fighting over the same
-// cores.
+// A format-4 segment's blocks decode with s2 (against dict, when the segment has one),
+// which needs no state of its own. A format-3 segment's zstd frames decode with one
+// *zstd.Decoder shared by every shard with no lock of its own: DecodeAll is safe for
+// concurrent use.
 type storedCache struct {
-	dec    *zstd.Decoder
+	dict   *s2.Dict
+	zdec   *zstd.Decoder
 	shards [storedCacheShards]storedShard
 }
 
@@ -583,27 +490,60 @@ type storedShard struct {
 	data  []byte
 }
 
-// newStoredCache makes the cache's decoder, holding dict (the segment's stored
-// dictionary, or none), with two caps on what DecodeAll may allocate: a format-wide
-// ceiling (maxStoredBlockRaw, which also bounds the window it will accept), and the cap
-// of the buffer record hands it - exactly the block's recorded rawLen - past which it
-// fails instead of growing the buffer.
-func newStoredCache(dict []byte) (*storedCache, error) {
-	opts := []zstd.DOption{
-		zstd.WithDecoderMaxMemory(maxStoredBlockRaw),
-		zstd.WithDecodeAllCapLimit(true),
+// newStoredCache makes the cache for si's blocks. A format-3 decoder gets two caps on
+// what DecodeAll may allocate: a format-wide ceiling (maxStoredBlockRaw, which also
+// bounds the window it will accept), and the cap of the buffer record hands it -
+// exactly the block's recorded rawLen - past which it fails instead of growing it.
+func newStoredCache(si *storedIndex) (*storedCache, error) {
+	if si.v3 == nil {
+		return &storedCache{dict: si.s2dict}, nil
 	}
-	if len(dict) > 0 {
-		opts = append(opts, zstd.WithDecoderDictRaw(storedDictID, dict))
-	}
-	dec, err := zstd.NewReader(nil, opts...)
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxStoredBlockRaw), zstd.WithDecodeAllCapLimit(true))
 	if err != nil {
 		return nil, err
 	}
-	return &storedCache{dec: dec}, nil
+	return &storedCache{zdec: dec}, nil
 }
 
-func (c *storedCache) close() { c.dec.Close() }
+func (c *storedCache) close() {
+	if c.zdec != nil {
+		c.zdec.Close()
+	}
+}
+
+// inflate decompresses one block into exactly rawLen bytes, refusing one whose own
+// header claims another length before allocating anything.
+func (c *storedCache) inflate(compressed []byte, rawLen uint32) ([]byte, error) {
+	if c.zdec != nil {
+		var h zstd.Header
+		if h.Decode(compressed) != nil || (h.HasFCS && h.FrameContentSize != uint64(rawLen)) {
+			return nil, errShort
+		}
+		payload, err := c.zdec.DecodeAll(compressed, make([]byte, 0, rawLen))
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) != int(rawLen) {
+			return nil, errShort
+		}
+		return payload, nil
+	}
+	if n, err := s2.DecodedLen(compressed); err != nil || n != int(rawLen) {
+		return nil, errShort
+	}
+	dst := make([]byte, rawLen)
+	var out []byte
+	var err error
+	if c.dict != nil {
+		out, err = c.dict.Decode(dst, compressed)
+	} else {
+		out, err = s2.Decode(dst, compressed)
+	}
+	if err != nil || len(out) != int(rawLen) {
+		return nil, errShort
+	}
+	return out, nil
+}
 
 // record decompresses b (reusing its shard's cache when b is already cached) and
 // returns document ord's id and body.
@@ -624,19 +564,9 @@ func (c *storedCache) record(data []byte, b storedBlockInfo, ord uint32) (string
 		if !ok {
 			return "", nil, errShort
 		}
-		// A frame whose header declares a content size other than the table's rawLen
-		// is refused before any buffer is allocated. (EncodeAll omits the size for
-		// small blocks; those still decode into exactly rawLen's capacity, below.)
-		var h zstd.Header
-		if h.Decode(compressed) != nil || (h.HasFCS && h.FrameContentSize != uint64(b.rawLen)) {
-			return "", nil, errShort
-		}
-		payload, err := c.dec.DecodeAll(compressed, make([]byte, 0, b.rawLen))
+		payload, err := c.inflate(compressed, b.rawLen)
 		if err != nil {
 			return "", nil, err
-		}
-		if len(payload) != int(b.rawLen) {
-			return "", nil, errShort
 		}
 		shard.data, shard.block, shard.valid = payload, b.off, true
 	}

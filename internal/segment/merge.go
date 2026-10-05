@@ -19,11 +19,13 @@ type MergeOptions struct {
 	// Threads bounds how many goroutines Merge uses, in both its accumulation and its
 	// writing phase (as [BuildOptions.Threads] does for Build). 0 means GOMAXPROCS.
 	Threads int
-	// Throttle, when set, is called before each chunk (about 64 KiB) of the merged file
-	// is written, with the chunk's size, and with 0 every mergeCheckDocs documents
-	// while the inputs are read, from one goroutine at a time: a shard's I/O budget
-	// sleeps in it, and a cancelled merge returns an error from it, which aborts the
-	// merge (Merge then removes its temp file and returns that error).
+	// Throttle, when set, is called with each chunk's size before it is written to the
+	// merged file or to a temp file holding a field until its turn, and with 0 every
+	// mergeCheckDocs input documents; never from two goroutines at once. A shard's I/O
+	// budget sleeps in it. An error from it (a cancelled merge) stops the merge at its
+	// next check - within mergeCheckDocs documents while reading the inputs, within
+	// failCheckTerms terms of a dictionary, before the next field or the next stored
+	// record while writing - and Merge removes its temp files and returns that error.
 	Throttle func(n int) error
 	// NoDirSync is [BuildOptions.NoDirSync].
 	NoDirSync bool
@@ -108,7 +110,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 	}
 	path := filepath.Join(dir, name+FileExt)
 	meta, err := writeSegmentParts(path, uint32(total), flags, names, parts, readersDicts(inputs, remaps), storedFromReaders(inputs, remaps),
-		idsFromReaders(inputs, remaps), threads, opts.Throttle, true, !opts.NoDirSync)
+		idsFromReaders(inputs, remaps), threads, check, true, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -242,7 +244,7 @@ func bitmapOrEmpty(deletes []*roaring.Bitmap, i int) *roaring.Bitmap {
 func storedFromReaders(inputs []*Reader, remaps [][]int32) storedSource {
 	return func(add func(ord uint32, id string, body []byte) error) error {
 		for i, r := range inputs {
-			cache, err := newStoredCache(r.stored.dict)
+			cache, err := newStoredCache(&r.stored)
 			if err != nil {
 				return err
 			}
@@ -256,10 +258,11 @@ func storedFromReaders(inputs []*Reader, remaps [][]int32) storedSource {
 					return &CorruptError{Path: r.path, Section: "stored", Reason: "no block holds that ordinal"}
 				}
 				id, body, err := cache.record(r.data, b, uint32(oldOrd))
-				if err == nil {
-					err = add(uint32(newOrd), id, body)
-				}
 				if err != nil {
+					cache.close()
+					return &CorruptError{Path: r.path, Section: "stored", Reason: err.Error()}
+				}
+				if err := add(uint32(newOrd), id, body); err != nil {
 					cache.close()
 					return err
 				}
@@ -327,7 +330,7 @@ func fieldViewsFor(r *Reader) map[string]*fieldViews {
 	for name, fi := range r.fields {
 		fv := &fieldViews{fi: fi, presence: viewBitmap(r.data, fi.presRegion)}
 		if r.major < 4 {
-			fv.untyped, fv.truncated = r.splitV3Marks(fi)
+			fv.untyped, fv.truncated = fi.v3Marks, fi.v3Truncated
 		} else {
 			fv.truncated, fv.untyped = r.Truncated(name), r.Untyped(name)
 		}

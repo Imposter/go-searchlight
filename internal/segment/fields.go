@@ -337,18 +337,15 @@ func (s *docSlab) appendDocs(head int32, dst []uint32) []uint32 {
 // docOrd is one document's ordinal into a dictionary it has a term in.
 type docOrd struct{ doc, ord uint32 }
 
-// writeMergedDict k-way merges parts' already-sorted term groups ([termPairs.sortGroups])
-// and writes the result as one dictionary, in ascending term order. A term present in
-// more than one part gets that term's parts' docs concatenated in part order: since
-// every caller gives parts in ascending order of the (disjoint) document-ordinal range
-// each covers - true whether there is one part (a sequential build) or many (one per
-// worker, or one per Merge input reader) - that keeps the combined list ascending with
-// no re-sort, exactly the same list a single part covering every document would have
-// produced. onTerm, when non-nil, is called once per distinct term, in ascending
-// ordinal order, with its combined docs. ef lets postings be Elias-Fano coded. Returns
-// the dictionary's offset (0 if every part is empty) and how many distinct terms it
-// holds.
-func writeMergedDict(w *fileWriter, srcs []termSource, ef bool, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
+// writeMergedDict k-way merges srcs (each sorted, covering disjoint ascending document
+// ranges, in order) and writes the result as one dictionary, in ascending term order.
+// A term in more than one source gets their documents concatenated in source order,
+// which keeps them ascending with no re-sort: exactly the list one source covering
+// every document would have given. onTerm, when non-nil, is called once per distinct
+// term, in ascending ordinal order, with its combined docs. It stops early once w has
+// failed. Returns the dictionary's offset
+// (0 if every source is empty) and how many distinct terms it holds.
+func writeMergedDict(w *fileWriter, srcs []termSource, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
 	live := make([]bool, len(srcs))
 	anyLeft := false
 	for i, src := range srcs {
@@ -359,11 +356,11 @@ func writeMergedDict(w *fileWriter, srcs []termSource, ef bool, onTerm func(ord 
 		return 0, 0
 	}
 	enc := newPostingsEncoder()
-	dw := newDictWriter(w, enc, ef)
+	dw := newDictWriter(w, enc)
 	var ord uint32
 	docBuf := make([]uint32, 0, 64)
 	matched := make([]int, 0, len(srcs))
-	for anyLeft {
+	for anyLeft && (ord%failCheckTerms != 0 || !w.aborted()) {
 		// The smallest current term is tracked by which source holds it (minSrc), never
 		// by whether minTerm is nil: "" is a real term, and a source whose arena holds
 		// nothing but "" hands it back as a nil slice, which a nil-means-unset check
@@ -403,6 +400,10 @@ func writeMergedDict(w *fileWriter, srcs []termSource, ef bool, onTerm func(ord 
 	return off, ord
 }
 
+// failCheckTerms is how many terms writeMergedDict writes between checks that its
+// writer has not failed.
+const failCheckTerms = 1024
+
 // termSource is one sorted run of a dictionary's terms, each with its documents: a
 // part's accumulated groups ([Build]), or an input's dictionary with its postings
 // remapped and its deleted documents dropped ([Merge]). Sources of one dictionary
@@ -420,7 +421,6 @@ type termSource interface {
 // field's parts.
 type dictSources func(name string, parts []*fieldBuilder, kind TermKind) []termSource
 
-// pairsSource is a part's groups, already sorted.
 type pairsSource struct {
 	p *termPairs
 	i int
@@ -430,7 +430,6 @@ func (s *pairsSource) next() bool                       { s.i++; return s.i < le
 func (s *pairsSource) term() []byte                     { return s.p.termBytes(&s.p.groups[s.i]) }
 func (s *pairsSource) appendDocs(dst []uint32) []uint32 { return s.p.appendDocs(&s.p.groups[s.i], dst) }
 
-// partsDicts is [Build]'s dictSources: every part's accumulated groups.
 func partsDicts(_ string, parts []*fieldBuilder, kind TermKind) []termSource {
 	out := make([]termSource, len(parts))
 	for i, p := range parts {
@@ -439,7 +438,6 @@ func partsDicts(_ string, parts []*fieldBuilder, kind TermKind) []termSource {
 	return out
 }
 
-// pairs returns b's accumulator for kind.
 func (b *fieldBuilder) pairs(kind TermKind) *termPairs {
 	switch kind {
 	case KindEntry:
@@ -455,11 +453,10 @@ func (b *fieldBuilder) pairs(kind TermKind) *termPairs {
 // writeFieldDicts writes one field's four term dictionaries (terms section), merging
 // parts (one fieldBuilder per worker that built any of this field, each already
 // term-sorted) and recording each document's value and entry ordinals into s for
-// writeFieldDocValues. Word and gram postings may be Elias-Fano coded; value and entry
-// postings, which filters read, stay roaring views.
+// writeFieldDocValues.
 func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts dictSources, s *fieldScratch) {
 	var off uint64
-	off, s.numValueTerms = writeMergedDict(w, dicts(name, parts, KindValue), false,
+	off, s.numValueTerms = writeMergedDict(w, dicts(name, parts, KindValue),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
@@ -468,7 +465,7 @@ func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts di
 	if s.numValueTerms > 0 {
 		s.out.dictOff[KindValue] = off + 1
 	}
-	off, s.numEntryTerms = writeMergedDict(w, dicts(name, parts, KindEntry), false,
+	off, s.numEntryTerms = writeMergedDict(w, dicts(name, parts, KindEntry),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
@@ -477,10 +474,10 @@ func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts di
 	if s.numEntryTerms > 0 {
 		s.out.dictOff[KindEntry] = off + 1
 	}
-	if off, n := writeMergedDict(w, dicts(name, parts, KindWord), true, nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindWord), nil); n > 0 {
 		s.out.dictOff[KindWord] = off + 1
 	}
-	if off, n := writeMergedDict(w, dicts(name, parts, KindGram), true, nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindGram), nil); n > 0 {
 		s.out.dictOff[KindGram] = off + 1
 	}
 }

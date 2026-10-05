@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
@@ -339,21 +340,24 @@ func runParallel(n, threads int, work func(i int)) {
 // A field whose turn has come when it starts - every field before it already in w -
 // writes straight through to w. Any other is held aside until its turn: in memory up
 // to spillAt bytes, then in a temp file named after spill (a path stem in the
-// segment's directory), so a write holds at most a few small fields in memory however
-// large the segment, never a whole section.
-func writeFieldSectionParallel(w *fileWriter, spill string, names []string, threads int, writeOne func(fw *fileWriter, name string), fixup func(name string, fieldBase uint64)) error {
+// segment's directory), written through throttle like the segment itself. So a write
+// holds at most spillAt bytes for each field running or waiting its turn, and needs up
+// to about one section's size of extra disk while fields wait. Once a write fails, no
+// further field starts and the first error is returned.
+func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int) error, names []string, threads int, writeOne func(fw *fileWriter, name string), fixup func(name string, fieldBase uint64)) error {
 	sectionStart := w.off
 	var mu sync.Mutex
-	next := 0 // the next field to land in w
+	next := 0
 	direct := false
+	failed := false
 	held := make([]*spillBuffer, len(names))
 	errs := make([]error, len(names))
 	// place lands every held field whose turn has come; mu must be held.
 	place := func() {
-		for next < len(names) && held[next] != nil && !direct {
+		for next < len(names) && held[next] != nil && !direct && !failed {
 			fixup(names[next], w.off-sectionStart)
 			if err := held[next].copyTo(w); err != nil {
-				errs[next] = err
+				errs[next], failed = err, true
 			}
 			held[next] = nil
 			next++
@@ -361,52 +365,71 @@ func writeFieldSectionParallel(w *fileWriter, spill string, names []string, thre
 	}
 	runParallel(len(names), threads, func(i int) {
 		mu.Lock()
+		if failed || w.aborted() {
+			failed = true
+			mu.Unlock()
+			return
+		}
 		if i == next && !direct {
 			direct = true
 			base := w.off - sectionStart
 			mu.Unlock()
-			fw := newFileWriter(writerFunc(w.write))
+			fw := newFileWriter(sectionSink{w})
+			fw.abort = w.abort
 			writeOne(fw, names[i])
 			fw.flush()
 			fixup(names[i], base)
 			mu.Lock()
 			direct = false
+			if fw.err != nil {
+				errs[i], failed = fw.err, true
+			}
 			next++
 			place()
 			mu.Unlock()
 			return
 		}
 		mu.Unlock()
-		buf := &spillBuffer{stem: spill}
+		buf := &spillBuffer{stem: spill, throttle: throttle}
 		fw := newFileWriter(buf)
+		fw.abort = w.abort
 		writeOne(fw, names[i])
-		// fileWriter flushes its internal chunk to its target only when the chunk
-		// fills (or a section boundary asks for it): flush the rest.
 		fw.flush()
+		mu.Lock()
+		defer mu.Unlock()
 		if fw.err != nil {
 			buf.discard()
-			errs[i] = fw.err
-			buf = &spillBuffer{}
+			errs[i], failed = fw.err, true
+			return
 		}
-		mu.Lock()
+		if w.abort != nil && w.abort.Load() {
+			buf.discard()
+			failed = true
+			return
+		}
 		held[i] = buf
 		place()
-		mu.Unlock()
 	})
 	for _, b := range held {
 		if b != nil {
 			b.discard()
 		}
 	}
+	if w.err != nil {
+		errs = append(errs, w.err)
+	}
 	return errors.Join(errs...)
 }
 
-// writerFunc writes through a function that cannot fail on its own (a fileWriter
-// keeps its first error itself).
-type writerFunc func(p []byte)
+// sectionSink writes a field straight into the segment's writer, and fails once that
+// writer has.
+type sectionSink struct{ w *fileWriter }
 
-func (f writerFunc) Write(p []byte) (int, error) {
-	f(p)
+func (s sectionSink) Write(p []byte) (int, error) {
+	s.w.write(p)
+	if s.w.err != nil {
+		return 0, s.w.err
+	}
 	return len(p), nil
 }
 
@@ -415,11 +438,12 @@ func (f writerFunc) Write(p []byte) (int, error) {
 var spillAt = 8 << 20
 
 // spillBuffer holds one field's contribution until its turn: in memory, then, past
-// spillAt bytes, in a temp file beside the segment.
+// spillAt bytes, in a temp file beside the segment, written through throttle when set.
 type spillBuffer struct {
-	stem string
-	mem  []byte
-	file *os.File
+	stem     string
+	throttle func(n int) error
+	mem      []byte
+	file     *os.File
 }
 
 func (b *spillBuffer) Write(p []byte) (int, error) {
@@ -433,30 +457,43 @@ func (b *spillBuffer) Write(p []byte) (int, error) {
 			return 0, err
 		}
 		b.file = f
-		if _, err := f.Write(b.mem); err != nil {
+		if err := b.fileWrite(b.mem); err != nil {
 			return 0, err
 		}
 		b.mem = nil
 	}
-	return b.file.Write(p)
+	if err := b.fileWrite(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
-// copyTo writes the held bytes to w and releases them.
+func (b *spillBuffer) fileWrite(p []byte) error {
+	if b.throttle != nil {
+		if err := b.throttle(len(p)); err != nil {
+			return err
+		}
+	}
+	_, err := b.file.Write(p)
+	return err
+}
+
 func (b *spillBuffer) copyTo(w *fileWriter) error {
 	if b.file == nil {
 		w.write(b.mem)
 		b.mem = nil
-		return nil
+		return w.err
 	}
 	defer b.discard()
 	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, err := io.CopyBuffer(writerFunc(w.write), b.file, make([]byte, writeChunk))
-	return err
+	if _, err := io.CopyBuffer(sectionSink{w}, b.file, make([]byte, writeChunk)); err != nil {
+		return err
+	}
+	return w.err
 }
 
-// discard drops the held bytes, removing the temp file if there is one.
 func (b *spillBuffer) discard() {
 	b.mem = nil
 	if b.file != nil {
@@ -495,6 +532,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 		out = throttledWriter{w: f, throttle: throttle}
 	}
 	w := newFileWriter(out)
+	w.abort = new(atomic.Bool)
 	w.header()
 
 	empty := newFieldBuilder()
@@ -504,7 +542,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 
 	w.beginSection(sectionTerms)
-	err = writeFieldSectionParallel(w, path, names, threads,
+	err = writeFieldSectionParallel(w, path, throttle, names, threads,
 		func(fw *fileWriter, name string) {
 			writeFieldDicts(fw, name, partsFor(parts, name, empty), dicts, scratch[name])
 		},
@@ -522,7 +560,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
-	err = writeFieldSectionParallel(w, path, names, threads,
+	err = writeFieldSectionParallel(w, path, throttle, names, threads,
 		func(fw *fileWriter, name string) {
 			writeFieldDocValues(fw, partsFor(parts, name, empty), numDocs, scratch[name])
 		},
@@ -544,7 +582,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionPoints)
-	err = writeFieldSectionParallel(w, path, names, threads,
+	err = writeFieldSectionParallel(w, path, throttle, names, threads,
 		func(fw *fileWriter, name string) { writeFieldPoints(fw, numDocs, scratch[name]) },
 		func(name string, fieldBase uint64) {
 			out := scratch[name].out
@@ -558,7 +596,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionPresence)
-	err = writeFieldSectionParallel(w, path, names, threads,
+	err = writeFieldSectionParallel(w, path, throttle, names, threads,
 		func(fw *fileWriter, name string) {
 			writeFieldPresence(fw, partsFor(parts, name, empty), scratch[name].out)
 		},

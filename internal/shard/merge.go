@@ -20,7 +20,8 @@ import (
 // ids straight into the merged file, holding only per-document state in memory (a few
 // hundred bytes a document: about 0.6 GiB of heap at peak for a million of the
 // benchmark's products). Both its phases check the budget's throttle, and through it
-// the context, so Close cancels a merge wherever it is.
+// the context: a cancelled merge (Close) stops at its next check, within a few thousand
+// documents read or a thousand terms written, and removes its temp files.
 //
 // The merge loop asks the policy for merges after every publish, reserves their inputs
 // (a reserved segment is in no other merge), and runs each in its own goroutine, which

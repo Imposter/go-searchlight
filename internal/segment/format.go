@@ -5,17 +5,15 @@
 //
 //	header   magic (8 bytes), format major (u16), format minor (u16), reserved (u32)
 //	TERMS    per (field, kind) term dictionaries, each one's postings interleaved with
-//	         its prefix-compressed term blocks (zstd-compressed where that pays), then
-//	         its sparse block index
+//	         its prefix-compressed term blocks, then its sparse block index
 //	DOCVALS  per field columns: numbers (frame-of-reference bit-packed), keyword
 //	         ordinals, multi-valued entry ordinals
 //	POINTS   per number field: documents sorted by value into blocks with min/max
 //	         (BKD-lite)
 //	PRESENCE per field roaring bitmaps: present docs, docs whose grams were truncated,
 //	         and docs whose value the writer marked untyped
-//	STORED   a zstd dictionary, then zstd blocks of a fixed number of documents
-//	         (about 8 KB) holding each document's id and JSON body, then a bit-packed
-//	         block table
+//	STORED   a zstd dictionary, then zstd blocks of about 8 KB of documents, each
+//	         one's id and JSON body, then a bit-packed block table
 //	IDS      the primary key: every document's exact id (as given, never normalized)
 //	         to its ordinal, a term dictionary whose terms each hold one ordinal
 //	         inline, then u64 (the dictionary's index offset in the section) + 1, or
@@ -37,19 +35,15 @@
 // rebuilt ([ErrOlderFormat]), a newer one left as it is ([ErrNewerFormat]).
 //
 // 4.0 against 3.0:
-//   - A term block starts with a flags byte; a block of long terms is stored
-//     zstd-compressed when that saves at least a quarter of it.
-//   - A word or gram term's postings are Elias-Fano coded instead of a roaring bitmap
-//     when that is at least a fifth smaller; the low bit of the entry's postings
-//     length names the codec.
+//   - The block index keys each term block by the shortest prefix that separates it
+//     from the block before, not by its whole first term.
 //   - A point block holds only its documents; a partly covered block reads their
 //     values from the number column.
-//   - Stored blocks hold a fixed number of documents each, compressed against a
-//     dictionary sampled from the segment's first documents, behind a bit-packed
-//     block table.
+//   - Stored blocks are about 8 KB, compressed against a dictionary sampled from the
+//     segment's first documents, behind a bit-packed block table.
 //   - META carries segment flags (whether the writer marks untyped values) and a
 //     per-field untyped bitmap. 3.0 overloaded the marks onto the truncated bitmap;
-//     a 3.0 segment's marks are derived on read ([Reader.Untyped]).
+//     a 3.0 segment's marks are split from it at Open ([Reader.Untyped]).
 //
 // 3.0 was 2.0 plus the IDS section, without which [Reader.Ord] cannot answer. A minor
 // bump is reserved for additions an older reader of the same major can safely ignore.
@@ -261,7 +255,6 @@ func (e *VersionError) Unwrap() error {
 	return FormatError(uint64(e.Major), FormatMajor)
 }
 
-// readsMajor reports whether Open reads files of major.
 func readsMajor(major uint16) bool { return major == FormatMajor || major == ReadsMajor }
 
 // errShort is a structure that runs past the end of its bytes.

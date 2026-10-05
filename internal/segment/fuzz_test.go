@@ -184,6 +184,7 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, markedDocs(tb, 40)),
 		buildFile(tb, genCorpus(40)),
 	}
+	seeds = append(seeds, buildWithStoredDict(tb, genCorpus(40)))
 	for _, craft := range craftedCases() {
 		seeds = append(seeds, craft.make(tb))
 	}
@@ -191,6 +192,17 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		seeds = append(seeds, readCompatFixture(tb, name))
 	}
 	return seeds
+}
+
+// buildWithStoredDict builds docs with a stored dictionary however small they are.
+func buildWithStoredDict(tb testing.TB, docs []schema.Doc) []byte {
+	defer func(n int) { storedDictSample = n }(storedDictSample)
+	storedDictSample = 1 << 10
+	data := buildFile(tb, docs)
+	if r := openValid(tb, data); len(r.stored.dict) == 0 {
+		tb.Fatal("buildWithStoredDict: no dictionary")
+	}
+	return data
 }
 
 // craftedCase is one hand-damaged segment: a specific way a checksum-valid file used to
@@ -218,11 +230,6 @@ func craftedCases() []craftedCase {
 			fixChecksums(data)
 			return data
 		}},
-		{"compressed term block claims a huge raw length", craftTermBlockRawLen},
-		{"compressed term block is not zstd", craftTermBlockGarbage},
-		{"term block flags unknown", craftTermBlockFlags},
-		{"elias-fano postings claim more documents than they hold", craftEFDocFreq},
-		{"elias-fano postings low width past 32", craftEFLowWidth},
 		{"stored table offset past the section", craftStoredOffset},
 		{"stored table first ordinals out of order", craftStoredFirstOrd},
 		{"untyped bitmap malformed", craftUntypedBitmap},
@@ -272,10 +279,10 @@ func craftSharedPrefix(tb testing.TB) []byte {
 	dict := openValid(tb, data).fields["brand"].dicts[KindValue]
 	start := dict.blockOff(0)
 	_, n := binary.Uvarint(data[start:]) // postingsLen
-	if data[start+uint64(n)] != 0 || data[start+uint64(n)+1] != 0 {
-		tb.Fatal("craftSharedPrefix: the first block is compressed, or its first entry's shared prefix is not a one-byte 0")
+	if data[start+uint64(n)] != 0 {
+		tb.Fatal("craftSharedPrefix: the first entry's shared prefix is not a one-byte 0")
 	}
-	data[start+uint64(n)+1] = 5
+	data[start+uint64(n)] = 5
 	fixChecksums(data)
 	return data
 }

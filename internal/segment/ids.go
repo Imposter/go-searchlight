@@ -51,11 +51,14 @@ func sortedIDs(numDocs uint32, idAt func(ord uint32) string) ([]idOrd, error) {
 // ids yields twice with a *DuplicateIDError.
 func writeIDs(w *fileWriter, ids idSource) error {
 	sectionStart := w.off
-	dw := newDictWriter(w, newPostingsEncoder(), false)
+	dw := newDictWriter(w, newPostingsEncoder())
 	var one [1]uint32
 	var prev []byte
 	first := true
 	err := ids(func(id []byte, ord uint32) error {
+		if w.err != nil {
+			return w.err
+		}
 		if !first && bytes.Equal(id, prev) {
 			return &DuplicateIDError{ID: string(id)}
 		}
@@ -93,7 +96,7 @@ func (r *Reader) openIDs(sec sectionEntry) error {
 	if rel-1 >= sec.n-8 {
 		return corrupt("dictionary offset outside the section")
 	}
-	dict, err := openDict(r.data, sec.off+rel-1, r.major)
+	dict, err := openDict(r.data, sec.off+rel-1)
 	if err != nil {
 		return corrupt(err.Error())
 	}

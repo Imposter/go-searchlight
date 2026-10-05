@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync/atomic"
 )
 
 // castagnoli is the CRC32C table; the standard library uses the CPU's CRC instructions.
@@ -36,6 +37,9 @@ type fileWriter struct {
 	secStart uint64
 	sections []sectionEntry
 	err      error
+	// abort, when set, is shared by every writer of one segment file: set once any of
+	// them fails, so the others stop early.
+	abort *atomic.Bool
 }
 
 const writeChunk = 256 << 10
@@ -52,8 +56,16 @@ func (w *fileWriter) flush() {
 	w.secCRC = crc32.Update(w.secCRC, castagnoli, w.chunk)
 	if w.err == nil {
 		_, w.err = w.out.Write(w.chunk)
+		if w.err != nil && w.abort != nil {
+			w.abort.Store(true)
+		}
 	}
 	w.chunk = w.chunk[:0]
+}
+
+// aborted reports whether w, or another writer of the same segment, has failed.
+func (w *fileWriter) aborted() bool {
+	return w.err != nil || (w.abort != nil && w.abort.Load())
 }
 
 func (w *fileWriter) writeByte(b byte) {

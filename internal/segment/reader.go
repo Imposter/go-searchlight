@@ -12,12 +12,15 @@ import (
 // mapping.
 type fieldInfo struct {
 	presRegion    region
-	truncRegion   region // zero (n == 0) when the field has no truncated documents
-	untypedRegion region // zero (n == 0) when the field has no untyped documents
+	truncRegion   region
+	untypedRegion region
 	dicts         [numKinds]*termDict
 	keywordCol    *keywordColumn
 	multiCol      *multiColumn
 	numberCol     *numberColumn
+
+	// v3Marks and v3Truncated split a format-3 field's truncated bitmap, at Open.
+	v3Marks, v3Truncated *roaring.Bitmap
 }
 
 // Reader is an open, immutable segment, read through mmap. Its methods never allocate
@@ -94,7 +97,7 @@ func openData(path string, data []byte) (*Reader, error) {
 	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
 	}
-	cache, err := newStoredCache(r.stored.dict)
+	cache, err := newStoredCache(&r.stored)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +185,7 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			if dictOffs[k] == 0 {
 				continue
 			}
-			dict, err := openDict(r.data, dictOffs[k], r.major)
+			dict, err := openDict(r.data, dictOffs[k])
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "terms", Reason: err.Error()}
 			}
@@ -221,6 +224,9 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			}
 			nc.points = p
 			fi.numberCol = nc
+		}
+		if r.major < 4 {
+			fi.v3Marks, fi.v3Truncated = r.splitV3Marks(fi)
 		}
 		r.fields[name] = fi
 	}
@@ -407,8 +413,7 @@ func (r *Reader) Truncated(field string) *roaring.Bitmap {
 		return roaring.New()
 	}
 	if r.major < 4 {
-		_, truncated := r.splitV3Marks(fi)
-		return truncated
+		return fi.v3Truncated.Clone()
 	}
 	return viewBitmap(r.data, fi.truncRegion)
 }
@@ -420,8 +425,8 @@ func (r *Reader) Truncated(field string) *roaring.Bitmap {
 //
 // A format-3 segment kept the marks in its truncated bitmap (a marked value is present
 // with no text, where a truncated one always has text): they are its truncated
-// documents with no keyword value, computed on each call into a fresh bitmap, and
-// [Reader.Truncated] leaves them out.
+// documents with no keyword value, split from them once at Open and copied on each
+// call, and [Reader.Truncated] leaves them out.
 //
 // Otherwise the result is a zero-copy view over the segment's mmap: valid only while
 // this Reader (or a [Reader.Retain] handle on it) stays open. Clone() it before keeping
@@ -432,8 +437,7 @@ func (r *Reader) Untyped(field string) *roaring.Bitmap {
 		return roaring.New()
 	}
 	if r.major < 4 {
-		marks, _ := r.splitV3Marks(fi)
-		return marks
+		return fi.v3Marks.Clone()
 	}
 	if fi.untypedRegion.n == 0 {
 		return roaring.New()
@@ -481,7 +485,11 @@ func (r *Reader) storedRecord(ord uint32) (string, []byte, error) {
 	if !ok {
 		return "", nil, &CorruptError{Path: r.path, Section: "stored", Reason: "no block holds that ordinal"}
 	}
-	return r.cache.record(r.data, b, ord)
+	id, body, err := r.cache.record(r.data, b, ord)
+	if err != nil {
+		return "", nil, &CorruptError{Path: r.path, Section: "stored", Reason: err.Error()}
+	}
+	return id, body, nil
 }
 
 // Retain returns a second handle on the same open segment, so it stays mapped even
@@ -512,7 +520,7 @@ func (r *Reader) Retain() *Reader {
 
 		numTerms: r.numTerms,
 	}
-	if cache, err := newStoredCache(r.stored.dict); err == nil {
+	if cache, err := newStoredCache(&r.stored); err == nil {
 		nr.cache = cache
 		nr.ownsCache = true
 	} else {

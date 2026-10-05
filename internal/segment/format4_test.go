@@ -3,12 +3,13 @@ package segment
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -262,128 +263,11 @@ func TestUntypedMarks(t *testing.T) {
 	}
 }
 
-func TestEliasFanoRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	for range 2000 {
-		numDocs := uint32(2 + rng.IntN(1<<rng.IntN(22)))
-		density := rng.Float64()
-		var docs []uint32
-		for d := range numDocs {
-			if rng.Float64() < density {
-				docs = append(docs, d)
-			}
-		}
-		if len(docs) < 2 {
-			continue
-		}
-		blob := appendEF(nil, docs)
-		if uint64(len(blob)) != efSize(docs) {
-			t.Fatalf("efSize = %d, appendEF wrote %d", efSize(docs), len(blob))
-		}
-		got, ok := appendEFDocs(blob, uint32(len(docs)), numDocs, nil)
-		if !ok || !slices.Equal(got, docs) {
-			t.Fatalf("round trip of %d docs in %d: ok %v", len(docs), numDocs, ok)
-		}
-		if _, ok := appendEFDocs(blob, uint32(len(docs))+1, numDocs, nil); ok {
-			t.Fatal("decoding one document more than the list holds succeeded")
-		}
-		if _, ok := appendEFDocs(blob, uint32(len(docs)), docs[len(docs)-1], nil); ok {
-			t.Fatal("a document at numDocs decoded")
-		}
-		if rb := bitmapOfSorted(docs); !slices.Equal(rb.ToArray(), docs) {
-			t.Fatal("bitmapOfSorted lost documents")
-		}
-	}
-}
-
-func TestBitmapOfSortedContainers(t *testing.T) {
-	var docs []uint32
-	for d := range uint32(3 << 16) {
-		switch {
-		case d < 1<<16 && d%3 == 0: // a bitmap container
-		case d >= 1<<16 && d < 2<<16 && d%40 == 0: // an array container
-		case d == 3<<16-1:
-		default:
-			continue
-		}
-		docs = append(docs, d)
-	}
-	rb := bitmapOfSorted(docs)
-	if !slices.Equal(rb.ToArray(), docs) {
-		t.Fatal("bitmapOfSorted differs")
-	}
-	other := roaring.BitmapOf(docs...)
-	if !rb.Equals(other) || rb.AndCardinality(other) != uint64(len(docs)) {
-		t.Fatal("bitmapOfSorted does not behave as the bitmap it serializes")
-	}
-	rb.Add(1)
-	if !rb.Contains(1) {
-		t.Fatal("bitmapOfSorted's result is not writable")
-	}
-}
-
-// TestPostingsCodecs: gram and word postings take Elias-Fano when it is smaller, value
-// and entry postings never do, and every term reads back exactly.
-func TestPostingsCodecs(t *testing.T) {
-	docs := genCorpus(300)
-	r := mustBuild(t, docs)
-	count := map[TermKind]map[uint8]int{}
-	for _, fi := range r.fields {
-		for kind, d := range fi.dicts {
-			if d == nil {
-				continue
-			}
-			it := d.iter(0)
-			for it.next() {
-				if it.info.docFreq < 2 {
-					continue
-				}
-				if count[TermKind(kind)] == nil {
-					count[TermKind(kind)] = map[uint8]int{}
-				}
-				count[TermKind(kind)][it.info.codec]++
-			}
-		}
-	}
-	if count[KindGram][codecEF] == 0 || count[KindWord][codecEF] == 0 {
-		t.Fatalf("no Elias-Fano word or gram postings: %v", count)
-	}
-	if count[KindValue][codecEF] != 0 || count[KindEntry][codecEF] != 0 {
-		t.Fatalf("value or entry postings coded Elias-Fano: %v", count)
-	}
-	want := map[string]*roaring.Bitmap{}
-	for i, d := range docs {
-		for _, w := range bytes.Fields([]byte(d.Fields["description"].Words)) {
-			if want[string(w)] == nil {
-				want[string(w)] = roaring.New()
-			}
-			want[string(w)].Add(uint32(i))
-		}
-	}
-	for w, bm := range want {
-		if got := r.Postings("description", KindWord, w); !got.Equals(bm) {
-			t.Fatalf("word %q: %d docs, want %d", w, got.GetCardinality(), bm.GetCardinality())
-		}
-	}
-}
-
-// TestCompressedTermBlocks: long values' blocks are compressed and every lookup path
-// still works across them: Lookup, Term, EachTerm, Terms with a prefix.
-func TestCompressedTermBlocks(t *testing.T) {
+// TestSeparatorKeys: the block index's separator keys find every term, and Terms with a
+// prefix starts at the right block, across many blocks of long values.
+func TestSeparatorKeys(t *testing.T) {
 	docs := genCorpus(500)
 	r := mustBuild(t, docs)
-	d := r.fields["description"].dicts[KindValue]
-	compressed := 0
-	for b := range d.numBlocks {
-		start := d.blockOff(b)
-		_, n := binary.Uvarint(r.data[start:])
-		if r.data[start+uint64(n)]&blockZstd != 0 {
-			compressed++
-		}
-	}
-	if compressed == 0 {
-		t.Fatal("no description block is compressed")
-	}
 	kc := r.Keywords("description")
 	for i, doc := range docs {
 		ord, ok := kc.Ord(uint32(i))
@@ -393,9 +277,6 @@ func TestCompressedTermBlocks(t *testing.T) {
 		}
 		if got, ok := kc.Lookup(text); !ok || got != ord {
 			t.Fatalf("doc %d: Lookup = %d, %v, want %d", i, got, ok, ord)
-		}
-		if !r.Postings("description", KindValue, text).Contains(uint32(i)) {
-			t.Fatalf("doc %d: postings miss it", i)
 		}
 		var first []byte
 		r.Terms("description", KindValue, text[:8], func(term string, _ uint32) bool {
@@ -533,91 +414,6 @@ func TestPreviousMajorStoredTableDamage(t *testing.T) {
 	}
 }
 
-// compressedBlock returns the absolute position of a compressed description value
-// block's flags byte in a genCorpus build.
-func compressedBlock(tb testing.TB, data []byte) uint64 {
-	tb.Helper()
-	d := openValid(tb, data).fields["description"].dicts[KindValue]
-	for b := range d.numBlocks {
-		start := d.blockOff(b)
-		_, n := binary.Uvarint(data[start:])
-		if data[start+uint64(n)]&blockZstd != 0 {
-			return start + uint64(n)
-		}
-	}
-	tb.Fatal("no compressed block")
-	return 0
-}
-
-func craftTermBlockRawLen(tb testing.TB) []byte {
-	data := buildFile(tb, genCorpus(40))
-	at := compressedBlock(tb, data) + 1
-	_, n := binary.Uvarint(data[at:])
-	if n != 2 {
-		tb.Fatalf("rawLen is a %d-byte uvarint, want 2", n)
-	}
-	data[at], data[at+1] = 0xff, 0x7f // 16383: no longer the block's length
-	fixChecksums(data)
-	return data
-}
-
-func craftTermBlockGarbage(tb testing.TB) []byte {
-	data := buildFile(tb, genCorpus(40))
-	at := compressedBlock(tb, data) + 1
-	_, n1 := binary.Uvarint(data[at:])
-	_, n2 := binary.Uvarint(data[at+uint64(n1):])
-	frame := at + uint64(n1+n2)
-	for i := range uint64(16) {
-		data[frame+i] ^= 0x5a
-	}
-	fixChecksums(data)
-	return data
-}
-
-func craftTermBlockFlags(tb testing.TB) []byte {
-	data := buildFile(tb, testDocs(tb))
-	d := openValid(tb, data).fields["brand"].dicts[KindValue]
-	start := d.blockOff(0)
-	_, n := binary.Uvarint(data[start:])
-	data[start+uint64(n)] = 0x80
-	fixChecksums(data)
-	return data
-}
-
-// efTerm returns an Elias-Fano coded description word's entry and postings region in a
-// genCorpus build.
-func efTerm(tb testing.TB, data []byte) termInfo {
-	tb.Helper()
-	d := openValid(tb, data).fields["description"].dicts[KindWord]
-	it := d.iter(0)
-	for it.next() {
-		if it.info.docFreq > 2 && it.info.codec == codecEF {
-			return it.info
-		}
-	}
-	tb.Fatal("no Elias-Fano term")
-	return termInfo{}
-}
-
-func craftEFDocFreq(tb testing.TB) []byte {
-	data := buildFile(tb, genCorpus(40))
-	info := efTerm(tb, data)
-	// Clear the high part: no document decodes, whatever docFreq says.
-	l := uint64(data[info.post.off])
-	low := (uint64(info.docFreq)*l + 7) / 8
-	clear(data[info.post.off+1+low : info.post.off+info.post.n])
-	fixChecksums(data)
-	return data
-}
-
-func craftEFLowWidth(tb testing.TB) []byte {
-	data := buildFile(tb, genCorpus(40))
-	info := efTerm(tb, data)
-	data[info.post.off] = 40
-	fixChecksums(data)
-	return data
-}
-
 func craftStoredOffset(tb testing.TB) []byte {
 	data := buildFile(tb, genCorpus(60))
 	st := storedTableOf(tb, data)
@@ -673,11 +469,6 @@ func TestCraftedFailSafelyNamed(t *testing.T) {
 		"stored offset":    {craftStoredOffset, "stored"},
 		"stored first ord": {craftStoredFirstOrd, "stored"},
 		"v3 point block":   {craftV3PointBlockOffset, "points"},
-		"term block raw":   {craftTermBlockRawLen, ""},
-		"term block zstd":  {craftTermBlockGarbage, ""},
-		"term block flags": {craftTermBlockFlags, ""},
-		"ef doc freq":      {craftEFDocFreq, ""},
-		"ef low width":     {craftEFLowWidth, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r, err := openData("crafted", c.make(t))
@@ -715,6 +506,59 @@ func TestHeldFieldsSpill(t *testing.T) {
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) != FileExt {
 			t.Fatalf("left behind %s", e.Name())
+		}
+	}
+}
+
+// TestMergeCancelStopsWriting: a merge whose Throttle fails at its first write returns
+// that error well before a full merge would have finished, and leaves no file behind.
+func TestMergeCancelStopsWriting(t *testing.T) {
+	docs := genCorpus(20000)
+	dir := t.TempDir()
+	var inputs []*Reader
+	for i, part := range [][]schema.Doc{docs[:10000], docs[10000:]} {
+		meta, err := Build(dir, part, BuildOptions{Name: fmt.Sprintf("in%d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := Open(meta.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Close() })
+		inputs = append(inputs, r)
+	}
+	start := time.Now()
+	full, err := Merge(dir, inputs, nil, MergeOptions{Threads: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	whole := time.Since(start)
+	errStop := errors.New("cancelled")
+	var failedAt time.Time
+	throttle := func(n int) error {
+		if n > 0 && failedAt.IsZero() {
+			failedAt = time.Now()
+		}
+		if !failedAt.IsZero() {
+			return errStop
+		}
+		return nil
+	}
+	_, err = Merge(dir, inputs, nil, MergeOptions{Threads: 4, Throttle: throttle})
+	if !errors.Is(err, errStop) {
+		t.Fatalf("Merge = %v, want the throttle's error", err)
+	}
+	if after := time.Since(failedAt); after > whole/3 {
+		t.Fatalf("the merge ran %v after its first refused write; a whole merge takes %v", after, whole)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if name := e.Name(); name != "in0"+FileExt && name != "in1"+FileExt && name != filepath.Base(full.Path) {
+			t.Fatalf("the cancelled merge left %s", name)
 		}
 	}
 }

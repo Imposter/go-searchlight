@@ -262,7 +262,6 @@ func TestWithTimeoutOnTheFake(t *testing.T) {
 		t.Fatalf("a fresh context ended: %v", ctx.Err())
 	}
 	cancel()
-	<-ctx.Done()
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("cancelled: %v", ctx.Err())
 	}
@@ -274,7 +273,6 @@ func TestWithTimeoutOnTheFake(t *testing.T) {
 	ctx, cancel = clock.WithTimeout(parent, f, time.Hour)
 	defer cancel()
 	cancelParent()
-	<-ctx.Done()
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("a cancelled parent: %v", ctx.Err())
 	}
@@ -344,4 +342,30 @@ func TestAdvanceWakesBlockUntilArmed(t *testing.T) {
 			t.Fatal("a timer that came within d by an advance was missed")
 		}
 	})
+}
+
+func TestFakeDeadlineCancelIsSeenAtOnce(t *testing.T) {
+	f := clock.NewFake(epoch)
+	for range 1000 {
+		ctx, cancel := clock.WithTimeout(context.Background(), f, time.Hour)
+		cancel()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("Err right after cancel returned: %v", ctx.Err())
+		}
+		select {
+		case <-ctx.Done():
+		default:
+			t.Fatal("Done is open right after cancel returned")
+		}
+		if f.Waiters() != 0 {
+			t.Fatalf("a cancelled timeout stays armed: %d", f.Waiters())
+		}
+	}
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancel := clock.WithTimeout(parent, f, time.Hour)
+	defer cancel()
+	cancelParent()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("Err right after the parent's cancel returned: %v", ctx.Err())
+	}
 }

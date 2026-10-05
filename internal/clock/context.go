@@ -3,6 +3,7 @@ package clock
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -26,31 +27,42 @@ func WithDeadline(parent context.Context, c Clock, deadline time.Time) (context.
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	t := c.AfterFunc(c.Until(deadline), func() { cancel(context.DeadlineExceeded) })
-	d := &clockDeadline{Context: ctx, done: make(chan struct{})}
-	context.AfterFunc(ctx, func() {
+	done := make(chan struct{})
+	d := &clockDeadline{Context: ctx, done: done, finish: sync.OnceFunc(func() {
 		t.Stop()
-		close(d.done)
-	})
-	return d, func() { cancel(context.Canceled) }
+		close(done)
+	})}
+	context.AfterFunc(ctx, d.finish)
+	return d, func() {
+		cancel(context.Canceled)
+		d.finish()
+	}
 }
 
 // clockDeadline reports context.DeadlineExceeded as its Err once its clock's
 // deadline cancelled it, as a context.WithDeadline context does. It has a Done
 // channel of its own, closed once the inner context ends, so the contexts derived
-// from it take their Err from it rather than from the inner context.
+// from it take their Err from it rather than from the inner context. Done and Err
+// close it themselves when they find the inner context ended, so a cancel is seen at
+// once, as with the context package's contexts.
 type clockDeadline struct {
 	context.Context
-	done chan struct{}
+	done   chan struct{}
+	finish func()
 }
 
-func (c *clockDeadline) Done() <-chan struct{} { return c.done }
+func (c *clockDeadline) Done() <-chan struct{} {
+	if c.Context.Err() != nil {
+		c.finish()
+	}
+	return c.done
+}
 
 func (c *clockDeadline) Err() error {
-	select {
-	case <-c.done:
-	default:
+	if c.Context.Err() == nil {
 		return nil
 	}
+	c.finish()
 	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
 		return context.DeadlineExceeded
 	}

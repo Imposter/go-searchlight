@@ -187,7 +187,6 @@ func TestMergeBudget(t *testing.T) {
 		t.Fatalf("all tokens back: acquire(3) = %d", n)
 	}
 
-	// 10 MiB/s, by the budget's clock: each MiB after the first waits 0.1 s more.
 	clk := clock.NewFake(time.Now())
 	b = NewMergeBudget(1, 10<<20, clk)
 	if err := b.throttle(ctx, 1<<20); err != nil {

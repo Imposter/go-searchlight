@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -655,10 +654,10 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 	})
 }
 
-// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made in a loop
-// from several clients, re-read the registry at most once per missRefreshEvery. The
-// node runs on a fake clock the test moves on a millisecond at a time while they read:
-// however fast or slow the reads run, the registry reads are bounded by that time.
+// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made at once by
+// several clients, re-read the registry at most once per missRefreshEvery, by the
+// node's clock: a burst of them shares one read, and a burst less than an interval
+// after the last read waits out the rest of the interval before reading again.
 func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
 	clk := clock.NewFake(time.Now())
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
@@ -673,31 +672,44 @@ func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
 	a := c.start(0)
 	hooks := &clusterHooks{a.n}
 	id := store.ShardID{Index: "nowhere", Shard: 0}
-	before := a.wrap.nodesReads.Load()
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() {
-			for range 50 {
-				if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
-					t.Errorf("a shard no node serves: %v", err)
-					return
+	burst := func() <-chan struct{} {
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				for range 5 {
+					if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
+						t.Errorf("a shard no node serves: %v", err)
+						return
+					}
 				}
-			}
-		})
+			})
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		return done
 	}
-	var done atomic.Bool
-	go func() { wg.Wait(); done.Store(true) }()
-	began := clk.Now()
-	for !done.Load() {
-		clk.Advance(time.Millisecond)
-		runtime.Gosched()
+	reads := func() int64 { return a.wrap.nodesReads.Load() }
+	before := reads()
+	for k := range int64(3) {
+		clk.Advance(missRefreshEvery)
+		<-burst()
+		if got := reads() - before; got != k+1 {
+			t.Fatalf("%d registry reads after %d bursts an interval apart, want one each", got, k+1)
+		}
 	}
-	wg.Wait()
-	elapsed := clk.Since(began)
-	reads, limit := a.wrap.nodesReads.Load()-before, int64(elapsed/missRefreshEvery)+1
-	t.Logf("%d registry reads in %s", reads, elapsed)
-	if reads == 0 || reads > limit {
-		t.Fatalf("%d registry reads for reads of a shard no node serves in %s (limit %d)", reads, elapsed, limit)
+
+	clk.Advance(missRefreshEvery / 3)
+	done := burst()
+	if err := clk.BlockUntilArmed(tctx(t), missRefreshEvery-missRefreshEvery/3); err != nil {
+		t.Fatalf("a burst within the interval is not waiting out its rest: %v", err)
+	}
+	if got := reads() - before; got != 3 {
+		t.Fatalf("%d registry reads: a burst within the interval read at once", got)
+	}
+	clk.Advance(missRefreshEvery - missRefreshEvery/3)
+	<-done
+	if got := reads() - before; got != 4 {
+		t.Fatalf("%d registry reads once the interval ran out, want 4", got)
 	}
 }
 
@@ -720,18 +732,47 @@ func TestUnknownIndexLookupsAreCached(t *testing.T) {
 	}
 }
 
-// TestCreatedIndexIsSeenAtOnce: an index a request found missing, created here, is
-// read at once, not after the 404 the node remembered runs out.
-func TestCreatedIndexIsSeenAtOnce(t *testing.T) {
-	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+// TestCreateForgetsARememberedAbsence: a node that answered 404 for a name forgets
+// that answer when it creates the index itself, so once it drops the index and
+// another node creates it again, a read finds it although the 404 is younger than
+// absentTTL by the node's clock. That clock is fake: it moves only by the one
+// missRefreshEvery the read needs to see B's copy in a fresh view. Node A is at
+// capacity, so its create and drop host no copy and wait on nothing; B serves.
+func TestCreateForgetsARememberedAbsence(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		o.CatalogInterval = time.Hour
+		if i == 0 {
+			o.Clock = clk
+			o.Capacity = 1
+			o.HeartbeatInterval = time.Hour
+			o.LeaseTTL = 2 * time.Hour
+			o.DeadAfter = 3 * time.Hour
+			o.ViewInterval = time.Hour
+			o.PruneInterval = time.Hour
+		}
+	})
+	b := c.start(1)
+	createIndex(t, b.n, "seed", 1, 2)
 	a := c.start(0)
-	var ae *api.Error
-	if _, err := count(tctx(t), a.n, "ghost", 0); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
+	if a.n.leaseCount() != 1 {
+		t.Fatalf("node A holds %d copies, want its one of seed", a.n.leaseCount())
+	}
+	notFound := func(err error) bool {
+		var ae *api.Error
+		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+	}
+	if _, err := count(tctx(t), a.n, "ghost", 0); !notFound(err) {
 		t.Fatalf("an index no node has: %v, want a 404", err)
 	}
-	createIndex(t, a.n, "ghost", 1, 0)
+	createIndex(t, a.n, "ghost", 1, 1)
+	if err := a.n.DeleteIndex(tctx(t), "ghost"); err != nil {
+		t.Fatal(err)
+	}
+	createIndex(t, b.n, "ghost", 1, 1)
+	clk.Advance(missRefreshEvery)
 	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {
-		t.Fatalf("the index just created here: %d, %v", got, err)
+		t.Fatalf("a read on A of the index B created after A dropped its own: %d, %v", got, err)
 	}
 }
 

@@ -589,7 +589,6 @@ func nextBackoff(cur, base, ceiling time.Duration) time.Duration {
 	return min(2*cur, ceiling)
 }
 
-// pause waits for d to pass or ctx to end.
 func (t *Tailer) pause(ctx context.Context, d time.Duration) {
 	_ = t.opts.Clock.Sleep(ctx, d)
 }

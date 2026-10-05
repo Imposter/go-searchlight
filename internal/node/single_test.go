@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -618,8 +619,7 @@ type flakyStore struct {
 	down *atomic.Bool
 	// hung, when set, makes Ping and record reads wait for their deadline: a
 	// database that hangs rather than fails.
-	hung *atomic.Bool
-	// pinged, when set, receives each Ping's answer.
+	hung   *atomic.Bool
 	pinged chan error
 }
 
@@ -738,7 +738,8 @@ func TestDatabaseUnreachable(t *testing.T) {
 // Readiness and staleness follow the database by the node's clock: unready once the
 // database has not answered for more than max_lag, stale once a ping fails, and both
 // cleared once a ping answers. The clock is fake: each ping is one advance of the ping
-// interval, and the ping loop takes each answer before it sends the next ping.
+// interval, and the test waits for the node to record each answer before it advances
+// again, so the answer is stamped at the time of its ping.
 func TestReadinessFollowsTheDatabaseByTheClock(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.MaxLag = time.Second
@@ -762,6 +763,15 @@ func TestReadinessFollowsTheDatabaseByTheClock(t *testing.T) {
 			}
 		case <-ctx(t).Done():
 			t.Fatal("no ping")
+		}
+		recorded := func() bool { return n.DBStale() }
+		if wantUp {
+			recorded = func() bool { return n.DBAnsweredWithin(0) && !n.DBStale() }
+		}
+		for wait := ctx(t); !recorded(); runtime.Gosched() {
+			if wait.Err() != nil {
+				t.Fatal("the node did not record the ping's answer")
+			}
 		}
 	}
 	if err := n.Ready(ctx(t)); err != nil || n.DBStale() {

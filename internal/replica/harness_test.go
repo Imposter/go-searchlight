@@ -495,14 +495,12 @@ func (c *copyRunner) crashOnly() {
 	c.shard().Abandon()
 }
 
-// tctx is a test's context, bounded so a wait that never ends fails the test.
 func tctx(t testing.TB) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
 	return ctx
 }
 
-// current returns the copy's tailer.
 func (c *copyRunner) current() *Tailer {
 	c.mu.Lock()
 	defer c.mu.Unlock()

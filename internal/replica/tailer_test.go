@@ -527,7 +527,8 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 				badSeq := last - 1
 				c.tailer.Wake()
-				halt := waitHalt(t, c.tailer)
+				c.until("the copy halts", func() bool { return c.current().Halt() != nil })
+				halt := c.current().Halt()
 				if halt.Seq != badSeq || halt.ID != "bad" || halt.Reason != tc.reason || !errors.Is(halt, ErrHalted) {
 					t.Fatalf("halt %+v, want seq %d id bad reason %s", halt, badSeq, tc.reason)
 				}
@@ -544,8 +545,7 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 
 				// While the bad change is current, the copy tails again and again
-				// but is never wiped: a rebuild would stop at the same row. Each halt
-				// parks the tailer on its one-second backoff.
+				// but is never wiped: a rebuild would stop at the same row.
 				for {
 					if err := clkA.BlockUntilArmed(tctx(t), time.Second); err != nil {
 						t.Fatalf("no halt backoff after %d halts: %v", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""), err)
@@ -603,21 +603,6 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 			})
 		})
-	}
-}
-
-// waitHalt waits for the tailer to halt.
-func waitHalt(t testing.TB, tl *Tailer) *HaltError {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if h := tl.Halt(); h != nil {
-			return h
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the copy did not halt")
-		}
-		time.Sleep(2 * time.Millisecond)
 	}
 }
 

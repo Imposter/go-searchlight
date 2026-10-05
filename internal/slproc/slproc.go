@@ -380,6 +380,13 @@ func (n *Node) Kill() error {
 	return err
 }
 
+// UseBinary makes the node's next Start run bin: an upgrade, once the node is stopped.
+func (n *Node) UseBinary(bin string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.opts.Bin = bin
+}
+
 // Restart stops the node gracefully within timeout and starts it again, returning
 // once its admin listener answers.
 func (n *Node) Restart(ctx context.Context, timeout time.Duration) error {
@@ -485,4 +492,19 @@ func (l *Logs) Tail(k int) string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return strings.Join(l.raw[max(0, len(l.raw)-k):], "\n")
+}
+
+// TailExcept returns the last k raw lines whose msg is none of msgs (the access log's
+// "request served", say).
+func (l *Logs) TailExcept(k int, msgs ...string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for i := len(l.raw) - 1; i >= 0 && len(out) < k; i-- {
+		if !slices.ContainsFunc(msgs, func(m string) bool { return strings.Contains(l.raw[i], `"msg":"`+m+`"`) }) {
+			out = append(out, l.raw[i])
+		}
+	}
+	slices.Reverse(out)
+	return strings.Join(out, "\n")
 }

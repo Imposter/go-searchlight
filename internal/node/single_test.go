@@ -632,12 +632,14 @@ func TestDropDoesNotBlockOtherIndexes(t *testing.T) {
 	}
 }
 
-// flakyStore is a store whose database can be taken away: Ping and record reads
-// fail while down.
+// flakyStore is a store whose database can be taken away: Ping and record reads fail
+// while down, and HeadSeq while headDown.
 type flakyStore struct {
 	store.Store
 	rr   store.RecordReader
 	down *atomic.Bool
+	// headDown, when set, fails HeadSeq too.
+	headDown *atomic.Bool
 	// hung, when set, makes Ping and record reads wait for their deadline: a
 	// database that hangs rather than fails.
 	hung   *atomic.Bool
@@ -685,6 +687,13 @@ func (s flakyStore) GetRecord(ctx context.Context, kind store.RecordKind, id sto
 	return s.rr.GetRecord(ctx, kind, id, key)
 }
 
+func (s flakyStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+	if s.headDown != nil && s.headDown.Load() {
+		return 0, time.Time{}, errUnreachable
+	}
+	return s.Store.HeadSeq(ctx)
+}
+
 func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {
 	if s.down.Load() {
 		return nil, errUnreachable
@@ -700,7 +709,8 @@ func TestDatabaseUnreachable(t *testing.T) {
 	cfg.MaxLag = 300 * time.Millisecond
 	base := openStore(t, cfg)
 	down := &atomic.Bool{}
-	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down} //nolint:forcetypeassert,errcheck // every store reads records
+	headDown := &atomic.Bool{}
+	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down, headDown: headDown} //nolint:forcetypeassert,errcheck // every store reads records
 	n := open(t, cfg, st, nil)
 	if _, err := n.CreateIndex(ctx(t), "s", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
 		t.Fatal(err)
@@ -740,6 +750,12 @@ func TestDatabaseUnreachable(t *testing.T) {
 	if _, err := n.GetDocument(ctx(t), "s", "missing"); !errors.As(err, &ae) || ae.Status != 404 || ae.Extra["stale"] != true {
 		t.Errorf("a missing document with the database down: %v", err)
 	}
+	// A seq another node may have committed cannot be checked: retryable, not invalid.
+	headDown.Store(true)
+	if _, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitForSeq: res.Seq + 10}); !errors.As(err, &ae) || ae.Status != 503 {
+		t.Errorf("a wait_for_seq past the node's head with the database down: %v, want a 503", err)
+	}
+	headDown.Store(false)
 	if h, _ := n.Health(ctx(t)); h.Status != api.StatusGreen {
 		t.Errorf("the copies still serve: health %+v", h)
 	}

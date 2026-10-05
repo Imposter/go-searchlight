@@ -699,53 +699,26 @@ func (n *Single) runTailer(ctx context.Context, idx *index, c *copyState) {
 	n.log.ErrorContext(ctx, "shard copy halted", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 }
 
-// refresher refreshes an index's copies on a fixed grid of its refresh interval, which
-// settings may change at any time (re-anchoring the grid).
 func (n *Single) refresher(ctx context.Context, idx *index) {
 	defer idx.wg.Done()
 	warn := time.Time{}
-	interval := func() time.Duration { return time.Duration(idx.refresh.Load()) }
-	runGrid(ctx, n.clock, interval, idx.refreshWake, func() {
-		for _, c := range idx.copies() {
-			sh := c.shard()
-			if sh == nil || sh.Err() != nil {
-				continue
+	clock.GridLoop{
+		Clock:    n.clock,
+		Period:   func() time.Duration { return time.Duration(idx.refresh.Load()) },
+		Reanchor: idx.refreshWake,
+		Task: func() {
+			for _, c := range idx.copies() {
+				sh := c.shard()
+				if sh == nil || sh.Err() != nil {
+					continue
+				}
+				if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
+					warn = n.clock.Now()
+					n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
+				}
 			}
-			if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
-				warn = n.clock.Now()
-				n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
-			}
-		}
-	})
-}
-
-// runGrid calls tick on a fixed grid of interval() ([clock.Grid]), anchored when it
-// starts and again at every wake (the interval changed), until ctx ends. Ticks never
-// overlap: one that overruns skips the grid points it missed rather than running again
-// at once to catch up. While interval() is 0 or less nothing ticks.
-func runGrid(ctx context.Context, clk clock.Clock, interval func() time.Duration, wake <-chan struct{}, tick func()) {
-	grid := clock.NewGrid(clk.Now(), interval())
-	for {
-		var fire <-chan time.Time
-		var timer clock.Timer
-		if next, ok := grid.Next(clk.Now()); ok {
-			timer = clk.NewTimer(clk.Until(next))
-			fire = timer.C()
-		}
-		select {
-		case <-ctx.Done():
-		case <-wake:
-			grid = clock.NewGrid(clk.Now(), interval())
-		case <-fire:
-			tick()
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-		if ctx.Err() != nil {
-			return
-		}
-	}
+		},
+	}.Run(ctx)
 }
 
 // stopIndex stops an index's tailers and refresher and closes its copies.

@@ -189,10 +189,18 @@ A segment is immutable and written once at refresh or merge time. It is one file
 
 ### Shard copy (`internal/shard`)
 
-- **Write buffer.** Applied changes go into an in-memory buffer that is searchable after the next refresh. Every `refresh_interval`, or on `refresh=wait_for`, the buffer is flushed into a new small segment, and a new **generation**, the immutable list of segments, is published through an atomic pointer. Readers hold a generation reference with no locks.
+- **Write buffer.** Applied changes go into an in-memory buffer that is searchable after the next refresh. Every `refresh_interval` the buffer is refreshed into a new small segment, and a new **generation**, the immutable list of segments, is published through an atomic pointer. Readers hold a generation reference with no locks.
+  - Refreshes tick on a fixed grid (`t0 + k·refresh_interval`), so a refresh's own cost never stretches the period. One that overruns skips the ticks it missed rather than running again at once, and refreshes never overlap. Changing `refresh_interval` re-anchors the grid.
+  - `refresh=wait_for` waits for the first published generation that covers the write's seq, like Elasticsearch; it never forces a refresh, and never waits for durability. `refresh=true` forces one.
 - **Deletes and updates** mark live-docs in older segments and are written as sidecar files.
 - **Merges.** A tiered policy, like Lucene's TieredMergePolicy, merges small segments in the background under an I/O and CPU budget. It drops deleted documents and keeps the segment count low.
-- **Durability.** The SQL changelog is the write-ahead log. A shard copy records the `seq` covered by its committed segment set in a local manifest. After a crash it reopens its segments and replays the changelog from the manifest's `seq`, so there is no per-node translog.
+- **Durability: refresh is visibility, flush is durability** (as in Elasticsearch). The SQL changelog is the write-ahead log, so there is no per-node translog, and nothing a copy publishes needs to be durable on the copy first.
+  - **Refresh** writes the buffer's segment without fsync and keeps the deletes it masks in memory, then publishes the generation. It costs CPU and page-cache writes only.
+  - **Flush** makes the published generation durable. It runs every `flush_interval` (10 s), at shutdown, at every merge commit and before a peer snapshot. It fsyncs the segment files no flush has synced, writes and fsyncs the deletes sidecars, swaps the local manifest (temp file, fsync, rename, directory fsync), and only then advances `CommittedSeq` to the manifest's `seq`.
+  - **`CommittedSeq` only ever claims what is durable on disk.** It is the `seq` a copy reports as applied, so the changelog is never pruned past a change some copy could still lose. After a crash a copy reopens the segments of its last flushed manifest and replays the changelog from that manifest's `seq`: at most `flush_interval` of changes.
+  - **Files** are removed only once no durable manifest lists them: a sidecar by the first flush whose manifest drops it, a merged-away segment once that flush has run and the last reader has released it. Open removes whatever a crash left that the manifest does not list.
+  - **A merge** publishes its segment, then flushes. Its manifest therefore lists the merged segment together with every generation published before it, never an unsynced file, and its inputs can go as soon as readers release them.
+  - **A peer snapshot** flushes first, then streams the generation that flush made durable, so a copy never hands out a `seq` it could itself lose.
 - **Caches:**
   - a **filter cache**: an LRU of bitmaps for frequent leaves, per segment, invalidated naturally because segments are immutable;
   - the OS page cache for mmap.
@@ -277,7 +285,7 @@ The logical schema is the same in every dialect.
   - The default target is "every node holds every shard". This is simplest, and any node can serve any read locally.
   - Large indexes set a lower target. The coordinator then scatters to the owners.
 - **Peer recovery.** A new copy:
-  1. asks a serving peer for its current segment files over the internal API (a streamed, checksummed copy, resumable by file);
+  1. asks a serving peer for its current segment files over the internal API (a streamed, checksummed copy, resumable by file); the peer flushes first and streams the generation it made durable;
   2. falls back to `sl_blobs`, or to `ScanShard` from SQL;
   3. then replays the changelog from the segments' `seq` and switches to `serving`.
 
@@ -290,7 +298,7 @@ The logical schema is the same in every dialect.
   - On shutdown a node marks its copies `retiring`, finishes in-flight requests, writes its manifests and exits.
   - It comes back by reopening its segments and replaying the tail of the changelog.
   - The on-disk format is versioned, and a node refuses segments from a newer major version.
-- **Changelog pruning** stays behind the lowest `applied_seq` of any live copy, and behind the oldest retained recovery point.
+- **Changelog pruning** stays behind the lowest `applied_seq` of any live copy, and behind the oldest retained recovery point. A copy's `applied_seq` is its `CommittedSeq`, what its last flush made durable (§6).
 
 ## 10. Failure handling
 
@@ -300,7 +308,7 @@ The logical schema is the same in every dialect.
 | Node crash | Its leases expire after 10 s, and other nodes take its shards up to the target. Clients retried by the coordinator see no error when ≥ 2 copies exist. |
 | Disk lost or corrupt | Segments are checksummed. A bad segment is dropped and the copy re-recovers from a peer or SQL. It never serves a corrupt segment. |
 | Apply error | It halts that shard copy, which goes `recovering`, and re-recovers. It never skips a change. |
-| Merge interrupted | Merges write new files and swap the manifest atomically, so the old segment set is still valid. |
+| Merge interrupted | A merge writes a new file, publishes it, then flushes: until that flush swaps the manifest atomically, the old durable segment set is still valid and none of its files is removed. |
 | Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. Sequence numbers are in the database, so they survive. |
 | Overload | Per-request deadlines, bulk size caps, a merge I/O budget, and a search thread pool with a bounded queue (429 when full, like Elasticsearch). |
 
@@ -336,6 +344,7 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `lease_ttl` | 30 s on SQLite (a single node), 10 s elsewhere |
 | `prune_stall_timeout`, `retiring_retention`, `changelog_retention` | 15 min, 15 min, 24 h: the changelog's prune bounds |
 | `refresh_interval` | 1 s |
+| `flush_interval` | 10 s: how often a copy makes what refreshes published durable, and so how much changelog a crash replays |
 | `max_lag` | 2 s |
 | `merge_budget` | I/O and CPU budget for merges |
 | `search_threads` | defaults to GOMAXPROCS |

@@ -208,6 +208,12 @@ func errStale(ref shardRef) error {
 // target returns a read target on this node's copy for ref: one that serves peers, and
 // is current unless the caller allows stale.
 func (p *peerAPI) target(r *http.Request, ref shardRef) (node.ShardTarget, error) {
+	h := p.n.opts.hooks
+	var began time.Duration
+	var wall time.Time
+	if h != nil && h.served != nil {
+		began, wall = p.n.lc.Now(), p.n.lc.Wall()
+	}
 	t, err := p.n.LocalTarget(r.Context(), ref.Index, ref.Shard, ref.WaitSeq)
 	if err != nil {
 		return nil, err
@@ -215,6 +221,9 @@ func (p *peerAPI) target(r *http.Request, ref shardRef) (node.ShardTarget, error
 	if !ref.AllowStale && t.Stale() {
 		t.Release()
 		return nil, errStale(ref)
+	}
+	if h != nil && h.served != nil {
+		h.served(store.ShardID{Index: ref.Index, Shard: ref.Shard}, began, wall)
 	}
 	return t, nil
 }

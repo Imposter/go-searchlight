@@ -236,10 +236,7 @@ func TestFilesOutliveTheirLastDurableManifest(t *testing.T) {
 		}
 	}
 	reader.Release()
-	h.s.jan.drain()
-	if got, ref := dirFiles(t, h.dir), referencedFiles(t, h.dir); !slices.Equal(got, ref) {
-		t.Fatalf("files after the merge's flush %v, manifest references %v", got, ref)
-	}
+	h.waitNoOrphans()
 	h.check()
 	h.reopen()
 	h.check()

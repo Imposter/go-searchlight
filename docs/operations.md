@@ -385,7 +385,7 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 
 ### Disk
 
-- **Segments.** A copy's segments are compressed: stored fields in small zstd blocks
+- **Segments.** A copy's segments are compressed: stored fields in small s2 blocks
   against a per-segment dictionary, bit-packed doc values and point blocks, roaring
   postings and prefix-compressed term dictionaries. On the benchmark's product listings
   (about 870 bytes of JSON each) a fully merged copy takes about 1.2 GiB per million

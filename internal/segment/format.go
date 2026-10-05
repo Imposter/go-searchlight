@@ -12,8 +12,8 @@
 //	         (BKD-lite)
 //	PRESENCE per field roaring bitmaps: present docs, docs whose grams were truncated,
 //	         and docs whose value the writer marked untyped
-//	STORED   a zstd dictionary, then zstd blocks of about 8 KB of documents, each
-//	         one's id and JSON body, then a bit-packed block table
+//	STORED   an s2 dictionary, then s2 blocks of about 4 KB of documents, each one's
+//	         id and JSON body, then a bit-packed block table
 //	IDS      the primary key: every document's exact id (as given, never normalized)
 //	         to its ordinal, a term dictionary whose terms each hold one ordinal
 //	         inline, then u64 (the dictionary's index offset in the section) + 1, or
@@ -39,8 +39,8 @@
 //     from the block before, not by its whole first term.
 //   - A point block holds only its documents; a partly covered block reads their
 //     values from the number column.
-//   - Stored blocks are about 8 KB, compressed against a dictionary sampled from the
-//     segment's first documents, behind a bit-packed block table.
+//   - Stored blocks are about 4 KB of s2 (format 3: 16 KB of zstd), compressed against
+//     a dictionary of the segment's first documents, behind a bit-packed block table.
 //   - META carries segment flags (whether the writer marks untyped values) and a
 //     per-field untyped bitmap. 3.0 overloaded the marks onto the truncated bitmap;
 //     a 3.0 segment's marks are split from it at Open ([Reader.Untyped]).

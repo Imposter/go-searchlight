@@ -12,6 +12,7 @@ linters:
     - durationcheck
     - errname
     - errorlint
+    - forbidigo
     - gocritic
     - gosec
     - misspell
@@ -27,6 +28,16 @@ linters:
   settings:
     errcheck:
       check-type-assertions: true
+    forbidigo:
+      # Every timer, sleep and elapsed-time reading in the engine goes through an injected
+      # clock.Clock (internal/clock), so tests can drive it with clock.Fake. The rule binds
+      # the timer-bearing packages only (see the exclusions); a call that must be the
+      # process's own time (a net.Conn deadline, a context deadline, waiting out another
+      # process's file handle) says why in its //nolint.
+      analyze-types: true
+      forbid:
+        - pattern: ^time\.(Now|Since|Until|After|AfterFunc|NewTimer|NewTicker|Tick|Sleep)$
+          msg: use the injected clock.Clock (internal/clock), not the time package's clock
     govet:
       enable-all: true
       disable:
@@ -85,6 +96,16 @@ linters:
           - gosec
           - noctx
           - unparam
+      # The clock rule binds the production code of shard, replica, cluster, store, node
+      # and api. Exempt: internal/clock itself (it wraps the time package), tests, the
+      # node's test-support package, bench and cmd (real time is their subject), and
+      # every other package.
+      - path-except: ^internal/(shard|replica|cluster|store|node|api)/
+        linters:
+          - forbidigo
+      - path: (_test\.go|^internal/node/nodetest/)
+        linters:
+          - forbidigo
 
 formatters:
   enable:

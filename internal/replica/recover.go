@@ -50,7 +50,6 @@ const (
 	sourceFetch = "fetch"
 )
 
-// fetchedFrom reports whether source is one a Fetcher reports.
 func fetchedFrom(source string) bool { return source == SourcePeer || source == SourceBlob }
 
 // ErrWipeNeeded is returned by [Recover] for a copy it cannot resume: one whose index

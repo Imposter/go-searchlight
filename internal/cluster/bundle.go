@@ -3,6 +3,7 @@ package cluster
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,6 +34,8 @@ import (
 //     serving copy on the live node with the lowest id takes a snapshot (a flush, then
 //     the generation that flush made durable: shard.Snapshot, as a peer recovery does)
 //     and streams it into one blob through the BlobStore, which chunks it and sums it.
+//     Set bundle_interval alike on every node: a lowest-id node without it uploads
+//     none.
 //     A shard whose newest bundle is already at the snapshot's seq is skipped. Once the
 //     new bundle is surely stored, the oldest are deleted down to BundleRetention
 //     (bundle_retention). An upload whose commit's outcome is unknown
@@ -53,9 +56,10 @@ import (
 //     bundle that fails is skipped for the next older one; with none left the copy is
 //     rebuilt from ScanShard.
 //   - Pruning. Each retained bundle is a recovery point: the leader keeps the changelog
-//     after the oldest retained bundle's seq of each shard (current incarnation), and
-//     deletes bundles that pruning by age (changelog_retention) has passed, or whose
-//     index is gone.
+//     after the oldest retained bundle's seq of each shard (current incarnation). It
+//     deletes, before computing the floor, the bundles pruning by age
+//     (changelog_retention) has passed, which no recovery can replay from, and those
+//     whose index is gone.
 
 // Bundle format.
 const (
@@ -138,12 +142,11 @@ func (n *Node) listBundles(ctx context.Context, prefix string) ([]bundleRef, err
 		if c := cmpShard(a.id, b.id); c != 0 {
 			return c
 		}
-		return int(a.seq - b.seq)
+		return cmp.Compare(a.seq, b.seq)
 	})
 	return out, nil
 }
 
-// indexUIDs maps each index this node knows to its incarnation.
 func (n *Node) indexUIDs() map[string]string {
 	out := map[string]string{}
 	for _, iv := range n.Indexes() {

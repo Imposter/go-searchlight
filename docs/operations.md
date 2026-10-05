@@ -270,7 +270,8 @@ node of the shard rebuilt at once), it rebuilds from the database's documents
 (`ScanShard`), re-analyzing every one. Recovery bundles put a faster step in between:
 
 - **Upload.** With `bundle_interval` set, every interval one serving copy of each shard
-  (on the live node with the lowest `node_id`) flushes and uploads its durable segments,
+  (on the live node with the lowest `node_id`; set `bundle_interval` alike on every node,
+  since a lowest-id node without it uploads none) flushes and uploads its durable segments,
   as one checksummed blob in `sl_blobs`, written in 1 MiB chunks. A shard with no write
   since its newest bundle is skipped. Once a new bundle is surely stored, the oldest are
   deleted down to `bundle_retention`.

@@ -138,7 +138,11 @@ func (n *Node) pruneAll(ctx context.Context) error {
 		for s := range iv.Shards {
 			id := store.ShardID{Index: iv.Name, Shard: s}
 			floor, ok := n.pruneFloor(v.copies[id], v, progress, now)
-			if b := bundles[id]; len(b) > 0 && (!ok || b[0].seq < floor) {
+			below := n.prune.prunedBelow(id)
+			kept := slices.Clone(bundles[id])
+			n.deleteBundles(ctx, slices.DeleteFunc(bundles[id], func(b bundleRef) bool { return b.seq >= below-1 }), "the changelog was pruned past it")
+			kept = slices.DeleteFunc(kept, func(b bundleRef) bool { return b.seq < below-1 })
+			if b := kept; len(b) > 0 && (!ok || b[0].seq < floor) {
 				floor, ok = b[0].seq, true
 			}
 			age, err := n.ageFloor(ctx, id, floor, cutoff)
@@ -155,7 +159,7 @@ func (n *Node) pruneAll(ctx context.Context) error {
 				return err
 			}
 			n.prune.setBelow(id, floor+1)
-			n.deleteBundles(ctx, slices.DeleteFunc(bundles[id], func(b bundleRef) bool { return b.seq >= floor }), "the changelog was pruned past it")
+			n.deleteBundles(ctx, slices.DeleteFunc(kept, func(b bundleRef) bool { return b.seq >= floor }), "the changelog was pruned past it")
 		}
 	}
 	n.prune.forget(v)

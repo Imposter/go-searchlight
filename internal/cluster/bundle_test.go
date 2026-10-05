@@ -200,3 +200,32 @@ func TestPruningKeepsBundlePoints(t *testing.T) {
 		return nil
 	})
 }
+
+// TestCorruptNewestBundleFallsBackToAnOlderOne: of two bundles, a damaged newest one is
+// refused and the older one restored; the changelog after it replays the rest.
+func TestCorruptNewestBundleFallsBackToAnOlderOne(t *testing.T) {
+	d := sqliteDB(t)
+	c := newCluster(t, d, nil)
+	a := c.start(0)
+	createIndex(t, a.n, "two", 1, 0)
+	id := store.ShardID{Index: "two", Shard: 0}
+	first := writeDocs(t, a.n, "two", 0, 30)
+	waitCount(t, a.n, "two", first, 30)
+	publishUntil(t, a, id, first)
+	second := writeDocs(t, a.n, "two", 30, 20)
+	waitCount(t, a.n, "two", second, 50)
+	bundles := publishUntil(t, a, id, second)
+	if len(bundles) != 2 {
+		t.Fatalf("bundles %v, want two", bundles)
+	}
+	last := writeDocs(t, a.n, "two", 50, 5)
+
+	a = wipeAndRestart(t, c, 0, func() { corruptBlob(t, d, bundles[1].name) })
+	waitCount(t, a.n, "two", last, 55)
+	if got := a.n.fetch.rejected.Load(); got != 1 {
+		t.Fatalf("%d bundles rejected, want the newest", got)
+	}
+	if got := a.n.fetch.restored.Load(); got != 1 {
+		t.Fatalf("%d bundles restored, want the older one", got)
+	}
+}

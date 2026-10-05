@@ -24,14 +24,19 @@ func TestKillMidBulk(t *testing.T) {
 	m := newModel()
 	l := c.startLoad(m, 4, 3)
 	l.waitWrites(t, 2000)
+	c.waitDurable(1)
 	waitUntil(t, time.Minute, "a _bulk in flight on chaos-2", func() bool { return c.members[1].bulks.Load() > 0 })
 	c.kill(1)
 	l.waitWrites(t, 3000)
 	c.restart(1)
+	c.assertReopened(1, true)
 	l.waitWrites(t, 1000)
 	l.stop()
 	c.settle(m)
 	c.verify(m)
+	if c.lb.retriedOf("failover") == 0 {
+		t.Error("no request failed over: the kill hit no request in flight")
+	}
 }
 
 // TestKillMidMerge: a node killed while its merges run (a slow merge budget keeps
@@ -42,6 +47,7 @@ func TestKillMidMerge(t *testing.T) {
 	m := newModel()
 	l := c.startLoad(m, 4, 2)
 	l.waitWrites(t, 2000)
+	c.waitDurable(1)
 	var merging float64
 	waitUntil(t, 3*time.Minute, "a merge running on chaos-2", func() bool {
 		merging = c.metric(1, "searchlight_shard_merge_backlog")
@@ -49,11 +55,16 @@ func TestKillMidMerge(t *testing.T) {
 	})
 	c.kill(1)
 	t.Logf("killed chaos-2 with %.0f segments merging", merging)
+	orphans := orphanSegments(t, c.members[1].DataDir())
 	l.waitWrites(t, 2000)
 	c.restart(1)
-	if opened := c.members[1].Logs().All("shard opened"); len(opened) == 0 {
-		t.Error("chaos-2 reopened no shard after the kill")
+	c.assertReopened(1, true)
+	for _, path := range orphans {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("%s, which no durable manifest lists (a merge output the kill cut short), was not collected at the reopen: %v", path, err)
+		}
 	}
+	t.Logf("the reopen collected %d segment files no durable manifest listed", len(orphans))
 	l.waitWrites(t, 1000)
 	l.stop()
 	c.settle(m)
@@ -95,9 +106,13 @@ func TestKillMidRecovery(t *testing.T) {
 		}
 	}
 	t.Logf("killed chaos-3 mid-recovery, once its first copy had been fetched: %d of %d copies fetched, %d serving", recovered, shards, serving)
+	if serving >= shards {
+		t.Fatalf("every copy of chaos-3 served before the kill: it hit no recovery (load more data before it)")
+	}
 	l.waitWrites(t, 1000)
 	start := time.Now()
 	c.restart(2)
+	c.assertReopened(2, false)
 	t.Logf("chaos-3 recovered its copies again and was ready %s after its restart", time.Since(start).Round(time.Millisecond))
 	l.waitWrites(t, 1000)
 	l.stop()
@@ -115,6 +130,7 @@ func TestDatabaseRestart(t *testing.T) {
 		t.Skip(envDBRestart + " is not set: no command to restart the database with")
 	}
 	c := newCluster(t, 3, "")
+	c.write503 = true
 	c.createIndex()
 	m := newModel()
 	l := c.startLoad(m, 4, 3)
@@ -124,6 +140,21 @@ func TestDatabaseRestart(t *testing.T) {
 	l.stop()
 	c.settle(m)
 	c.verify(m)
+	if c.lb.retriedOf("write 503") == 0 && !c.sawDatabaseErrors() {
+		t.Error("no write was refused and no node logged a database error: the restart was not felt")
+	}
+}
+
+// sawDatabaseErrors reports whether a node logged that it could not reach the database.
+func (c *cluster) sawDatabaseErrors() bool {
+	for _, m := range c.members {
+		for _, msg := range []string{"heartbeat failed", "renewing the leases failed; a copy past its deadline pauses (no peer reads it) until a renewal succeeds", "tailer retrying after a failure"} {
+			if m.Logs().Find(msg) != nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // TestCorruptSegment: a segment damaged on disk while its node was down fails its
@@ -170,7 +201,6 @@ func TestCorruptSegment(t *testing.T) {
 	c.verify(m)
 }
 
-// largestSegment is the largest segment file under dataDir.
 func largestSegment(t *testing.T, dataDir string) string {
 	t.Helper()
 	var best string
@@ -201,6 +231,7 @@ func largestSegment(t *testing.T, dataDir string) string {
 func TestRollingUpgrade(t *testing.T) {
 	old, cur := binaries(t)
 	c := newCluster(t, 3, old)
+	c.refusedOnly = true
 	c.createIndex()
 	m := newModel()
 	l := c.startLoad(m, 4, 3)
@@ -213,6 +244,7 @@ func TestRollingUpgrade(t *testing.T) {
 		}
 		mb.UseBinary(cur)
 		c.restart(i)
+		c.assertReopened(i, true)
 		c.waitGreen(3 * time.Minute)
 		t.Logf("upgraded %s in %s", mb.NodeID(), time.Since(start).Round(time.Millisecond))
 		l.waitWrites(t, 1000)
@@ -255,7 +287,7 @@ func TestRestartTimeIsFlat(t *testing.T) {
 	c.settle(m)
 	large := c.timeRestart(0, m)
 	t.Logf("restart to serving: %s at 2,000 documents, %s at 40,000", small.Round(time.Millisecond), large.Round(time.Millisecond))
-	if large > 2*small+3*time.Second {
+	if large > 2*small+500*time.Millisecond {
 		t.Errorf("a restart took %s at 40,000 documents against %s at 2,000: it grows with the index", large, small)
 	}
 	c.verify(m)
@@ -346,7 +378,6 @@ func (c *cluster) timeRestart(i int, m *model) time.Duration {
 	return took
 }
 
-// waitUntil polls cond every 5 ms until it holds, or fails after d.
 func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(d)
@@ -356,4 +387,69 @@ func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// assertReopened checks that node i, just started again after a kill or a stop, found
+// every copy's files whole: none was wiped as unopenable and, with reopen (the node
+// had flushed copies), every copy reopened its segments with documents rather than
+// being rebuilt.
+func (c *cluster) assertReopened(i int, reopen bool) {
+	c.t.Helper()
+	logs := c.members[i].Logs()
+	if wiped := logs.All("shard copy does not open; wiping it to rebuild"); len(wiped) > 0 {
+		c.t.Errorf("%s found a copy it had written unopenable after the restart: %v", c.members[i].NodeID(), wiped)
+	}
+	if !reopen {
+		return
+	}
+	if rebuilt := logs.All("shard copy must be rebuilt"); len(rebuilt) > 0 {
+		c.t.Errorf("%s rebuilt copies on its restart rather than reopening them: %v", c.members[i].NodeID(), rebuilt)
+	}
+	withDocs := 0
+	for _, l := range logs.All("shard opened") {
+		if docs, _ := l["documents"].(float64); docs > 0 {
+			withDocs++
+		}
+	}
+	if withDocs < shards {
+		c.t.Errorf("%s reopened %d copies holding documents, want %d", c.members[i].NodeID(), withDocs, shards)
+	}
+}
+
+func orphanSegments(t *testing.T, dataDir string) []string {
+	t.Helper()
+	manifests, err := filepath.Glob(filepath.Join(dataDir, "indexes", "*", "*", "manifest"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, path := range manifests {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, body, _ := strings.Cut(string(raw), "\n")
+		var man struct {
+			Segments []struct {
+				ID string `json:"id"`
+			} `json:"segments"`
+		}
+		if err := json.Unmarshal([]byte(body), &man); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		listed := map[string]bool{}
+		for _, s := range man.Segments {
+			listed[s.ID+".seg"] = true
+		}
+		segs, err := filepath.Glob(filepath.Join(filepath.Dir(path), "*.seg"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, seg := range segs {
+			if !listed[filepath.Base(seg)] {
+				out = append(out, seg)
+			}
+		}
+	}
+	return out
 }

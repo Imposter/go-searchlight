@@ -9,6 +9,7 @@ import (
 	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -159,6 +161,14 @@ type cluster struct {
 	members []*member
 	lb      *balancer
 	stop    context.CancelFunc
+	// write503 forgives writes answered 503 while the database is down (spec section
+	// 10): only the database restart scenario sets it. A read answered 503 or 429, and a
+	// write answered 429, is a violation in every scenario.
+	write503 bool
+	// refusedOnly forgives a failed request to a disrupted node only when its connection
+	// was refused: set while nodes stop gracefully, which must never cut a request they
+	// accepted.
+	refusedOnly bool
 }
 
 // member is one node of the cluster, as the load balancer sees it.
@@ -243,8 +253,9 @@ func (c *cluster) close() {
 
 // balancer sends each request to a ready node, round robin, as a load balancer in front
 // of the cluster would. A request failing on a node the scenario is disrupting fails
-// over to the next node, and a 429 or 503 is retried after its Retry-After: the
-// documented retryable cases. Anything else that fails, or a request that keeps
+// over to the next node: the one failure a client may see with two or more copies. A
+// 429 or 503 is retried, and is a violation unless the scenario forgives it (a write
+// while the database is down). Anything else that fails, or a request that keeps
 // failing past its deadline, is a client-visible error: a violation.
 type balancer struct {
 	c      *cluster
@@ -302,28 +313,38 @@ type answer struct {
 
 // do sends a request until it gets an answer that is neither a failover nor a
 // retryable status, or until deadline; then it is a violation and do returns an error.
-func (b *balancer) do(ctx context.Context, method, path, body string, deadline time.Duration, bulk bool) (answer, error) {
+func (b *balancer) do(ctx context.Context, method, path, body string, deadline time.Duration, write bool) (answer, error) {
 	end := time.Now().Add(deadline)
+	kind := "read"
+	if write {
+		kind = "write"
+	}
 	var last string
 	for time.Now().Before(end) {
 		if ctx.Err() != nil {
 			return answer{}, ctx.Err()
 		}
 		m := b.pick()
-		a, err := b.send(ctx, m, method, path, body, bulk)
+		a, err := b.send(ctx, m, method, path, body, write)
 		switch {
 		case err != nil && ctx.Err() != nil:
 			return answer{}, ctx.Err()
 		case err != nil:
-			if !m.disrupted.Load() {
+			switch {
+			case !m.disrupted.Load():
 				b.violate("%s %s: %s failed while it was not disrupted: %v", method, path, m.NodeID(), err)
+			case b.c.refusedOnly && !refused(err):
+				b.violate("%s %s: %s cut a request while it stopped gracefully: %v", method, path, m.NodeID(), err)
 			}
 			b.retried("failover")
 			last = err.Error()
 			time.Sleep(20 * time.Millisecond)
 			continue
 		case a.status == http.StatusTooManyRequests || a.status == http.StatusServiceUnavailable:
-			b.retried(strconv.Itoa(a.status))
+			b.retried(fmt.Sprintf("%s %d", kind, a.status))
+			if a.status == http.StatusTooManyRequests || !write || !b.c.write503 {
+				b.violate("%s %s: %s answered HTTP %d %s", method, path, m.NodeID(), a.status, truncate(bytes.TrimSpace(a.body)))
+			}
 			last = fmt.Sprintf("HTTP %d %s", a.status, bytes.TrimSpace(a.body))
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -334,6 +355,18 @@ func (b *balancer) do(ctx context.Context, method, path, body string, deadline t
 	return answer{}, fmt.Errorf("%s %s kept failing: %s", method, path, last)
 }
 
+// refused reports whether err is a connection refused: the node was not listening.
+func refused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(strings.ToLower(err.Error()), "refused")
+}
+
+// retriedOf is how often the balancer retried for kind ("failover", "write 503", ...).
+func (b *balancer) retriedOf(kind string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.retries[kind]
+}
+
 func (b *balancer) send(ctx context.Context, m *member, method, path, body string, bulk bool) (answer, error) {
 	if bulk {
 		m.bulks.Add(1)
@@ -342,13 +375,16 @@ func (b *balancer) send(ctx context.Context, m *member, method, path, body strin
 	return call(ctx, b.client, method, m.URL+path, body)
 }
 
-// call sends one request with the API token.
 func call(ctx context.Context, client *http.Client, method, u, body string) (answer, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u, strings.NewReader(body))
 	if err != nil {
 		return answer{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiToken)
+	// Every request the suite sends may be sent twice (upserts and deletes by id, and
+	// reads): the key lets the transport resend one it wrote to a kept-alive connection
+	// the server had already closed, as a client library would.
+	req.Header.Set("Idempotency-Key", strconv.FormatUint(idempotency.Add(1), 10))
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -611,6 +647,9 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 func (c *cluster) reader(ctx context.Context, l *load, g int) {
 	rnd := rand.New(rand.NewPCG(uint64(g)+100, uint64(time.Now().UnixNano())))
 	for ctx.Err() == nil {
+		l.m.mu.Lock()
+		head := l.m.head
+		l.m.mu.Unlock()
 		var path, body string
 		switch rnd.IntN(3) {
 		case 0:
@@ -619,6 +658,12 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 			path, body = "/indexes/"+index+"/_search", fmt.Sprintf(`{"query": {"field": "k", "op": "lt", "value": %d}, "sort": [{"n": "desc"}], "size": 20}`, rnd.IntN(keysPerWriter))
 		default:
 			path, body = "/indexes/"+index+"/_search", `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand", "size": 10}}}}`
+		}
+		if !c.write503 {
+			// Read-your-writes through the balancer: the newest acknowledged seq, which
+			// any node checks against the database's head. While the database is down a
+			// node cannot, and answers 503: that scenario reads without it.
+			path += fmt.Sprintf("?wait_for_seq=%d", head)
 		}
 		a, err := c.lb.do(ctx, http.MethodPost, path, body, time.Minute, false)
 		if err != nil {
@@ -633,6 +678,8 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 	}
 }
 
+var idempotency atomic.Uint64
+
 func truncate(b []byte) string {
 	if len(b) > 300 {
 		return string(b[:300]) + "…"
@@ -644,12 +691,34 @@ func truncate(b []byte) string {
 
 // shardCopy is one copy as /_cluster/shards reports it.
 type shardCopy struct {
-	Index      string `json:"index"`
-	Shard      int    `json:"shard"`
-	Node       string `json:"node"`
-	State      string `json:"state"`
-	AppliedSeq int64  `json:"applied_seq"`
-	Docs       int64  `json:"docs"`
+	Index        string `json:"index"`
+	Shard        int    `json:"shard"`
+	Node         string `json:"node"`
+	State        string `json:"state"`
+	AppliedSeq   int64  `json:"applied_seq"`
+	CommittedSeq int64  `json:"committed_seq"`
+	Docs         int64  `json:"docs"`
+}
+
+// waitDurable waits until every copy on node i has flushed documents (its committed
+// seq past 0): a crash from then on must find them on disk when the node reopens.
+func (c *cluster) waitDurable(i int) {
+	c.t.Helper()
+	eventually(c.t, 2*time.Minute, c.members[i].NodeID()+"'s copies are durable", func() error {
+		copies, err := c.ownCopies(c.t.Context(), c.members[i])
+		if err != nil {
+			return err
+		}
+		if len(copies) != shards {
+			return fmt.Errorf("%d copies", len(copies))
+		}
+		for _, sc := range copies {
+			if sc.CommittedSeq == 0 || sc.Docs == 0 {
+				return fmt.Errorf("shard %d: committed seq %d, %d documents", sc.Shard, sc.CommittedSeq, sc.Docs)
+			}
+		}
+		return nil
+	})
 }
 
 // ownCopies are the copies of the chaos index that m holds, as m reports them.
@@ -899,7 +968,6 @@ func (c *cluster) metric(i int, name string) float64 {
 	return top
 }
 
-// restartDatabase runs SEARCHLIGHT_CHAOS_DB_RESTART.
 func restartDatabase(t *testing.T, cmdline, logPath string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
@@ -924,7 +992,6 @@ func restartDatabase(t *testing.T, cmdline, logPath string) {
 	t.Logf("the database restarted in %s", time.Since(start).Round(time.Millisecond))
 }
 
-// eventually polls cond until it holds, or fails after d.
 func eventually(t *testing.T, d time.Duration, what string, cond func() error) {
 	t.Helper()
 	deadline := time.Now().Add(d)

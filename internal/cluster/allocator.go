@@ -39,8 +39,16 @@ type allocState struct {
 	clock clock.Clock
 	mu    sync.Mutex
 	// waiting is when a shard was first seen below target while this node was not
-	// among the least loaded eligible nodes.
-	waiting map[store.ShardID]time.Time
+	// among the least loaded eligible nodes (or, unclaimed, was its creator's to
+	// claim). It is keyed by the index's incarnation, so an index dropped and created
+	// again under its name waits afresh.
+	waiting map[allocKey]time.Time
+}
+
+// allocKey is a shard of one incarnation of an index.
+type allocKey struct {
+	uid   string
+	shard int
 }
 
 // everyNode is the claim target for "every node holds every shard": more slots than
@@ -108,16 +116,17 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 			live++
 		}
 	}
+	key := allocKey{uid: iv.UID, shard: id.Shard}
 	if !mine {
 		if target > 0 && live >= target {
-			n.alloc.clear(id)
+			n.alloc.clear(key)
 			return nil
 		}
 		if n.opts.Capacity > 0 && n.leaseCount() >= n.opts.Capacity {
 			return nil
 		}
 		unclaimed := len(v.copies[id]) == 0
-		if !eager && (unclaimed || (target > 0 && !n.firstInLine(v, id))) && !n.alloc.waited(id, 3*n.opts.HeartbeatInterval) {
+		if !eager && (unclaimed || (target > 0 && !n.firstInLine(v, id))) && !n.alloc.waited(key, 3*n.opts.HeartbeatInterval) {
 			return nil
 		}
 	}
@@ -136,7 +145,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	case !ok:
 		return nil // the target was met meanwhile
 	}
-	n.alloc.clear(id)
+	n.alloc.clear(key)
 	if c.State != store.CopyRecovering {
 		// This node's own slot from before a restart (left serving by a crash, or
 		// retiring by a shutdown): it recovers again until its copy, reopened, has
@@ -220,24 +229,35 @@ func (n *Node) firstInLine(v *view, id store.ShardID) bool {
 	return true
 }
 
-// waited reports whether id has been waiting for a claim for at least d, noting when
+// waited reports whether k has been waiting for a claim for at least d, noting when
 // it started waiting.
-func (a *allocState) waited(id store.ShardID, d time.Duration) bool {
+func (a *allocState) waited(k allocKey, d time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.waiting == nil {
-		a.waiting = map[store.ShardID]time.Time{}
+		a.waiting = map[allocKey]time.Time{}
 	}
-	since, ok := a.waiting[id]
+	since, ok := a.waiting[k]
 	if !ok {
-		a.waiting[id] = a.clock.Now()
+		a.waiting[k] = a.clock.Now()
 		return false
 	}
 	return a.clock.Since(since) >= d
 }
 
-func (a *allocState) clear(id store.ShardID) {
+func (a *allocState) clear(k allocKey) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.waiting, id)
+	delete(a.waiting, k)
+}
+
+// forget drops the waits of every incarnation not in live.
+func (a *allocState) forget(live map[string]bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for k := range a.waiting {
+		if !live[k.uid] {
+			delete(a.waiting, k)
+		}
+	}
 }

@@ -58,9 +58,12 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 	if h := c.halted.Load(); h != nil {
 		info.State, info.Error = api.ShardHalted, (*h).Error()
 	}
+	if c.paused.Load() {
+		info.State = api.ShardServing // this node's own last-resort reads only
+	}
 	if info.State == api.ShardServing {
 		info.Rebuilding = c.rebuilding()
-		info.Stale = info.Rebuilding || c.trailing(n.cfg.MaxLag)
+		info.Stale = info.Rebuilding || c.lapsed() || c.trailing(n.cfg.MaxLag)
 	}
 	return info
 }
@@ -69,7 +72,7 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 func (n *Single) Shards(context.Context) ([]api.ShardInfo, error) {
 	var out []api.ShardInfo
 	for _, idx := range n.sortedIndexes() {
-		for _, c := range idx.copies {
+		for _, c := range idx.copies() {
 			out = append(out, n.copyInfo(c))
 		}
 	}
@@ -124,8 +127,8 @@ func (n *Single) Ready(context.Context) error {
 	}
 	var waiting []error
 	for _, idx := range n.sortedIndexes() {
-		for _, c := range idx.copies {
-			if !c.startedUp() {
+		for _, c := range idx.copies() {
+			if c.startup && !c.startedUp() {
 				waiting = append(waiting, fmt.Errorf("%s is still recovering", c.id))
 			}
 		}

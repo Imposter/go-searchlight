@@ -65,6 +65,9 @@ func TestLoadDefaults(t *testing.T) {
 		MaxInflightReadBytes:  256 << 20,
 		InflightAmplification: 10,
 		DropTimeout:           10 * time.Minute,
+		PruneStallTimeout:     15 * time.Minute,
+		RetiringRetention:     15 * time.Minute,
+		ChangelogRetention:    24 * time.Hour,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
 	}
@@ -147,6 +150,9 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		MaxInflightReadBytes:  32 << 20,
 		InflightAmplification: 4,
 		DropTimeout:           time.Minute,
+		PruneStallTimeout:     15 * time.Minute,
+		RetiringRetention:     15 * time.Minute,
+		ChangelogRetention:    24 * time.Hour,
 		MaxIndexFields:        1000,
 	}
 	if c != want {

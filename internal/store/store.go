@@ -21,6 +21,8 @@ import (
 	"io"
 	"log/slog"
 	"net/url"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -115,7 +117,8 @@ type RegistryStore interface {
 	// target live copies: it takes a free slot below target, or steals one
 	// whose lease has expired. A node that already holds a copy keeps it and
 	// has its lease renewed. It reports whether nodeID holds a copy
-	// afterwards, and that copy. A new copy starts recovering at seq 0.
+	// afterwards, and that copy. A new copy starts recovering at seq 0; a
+	// stolen slot's copy names its previous holder in TakenFrom.
 	ClaimCopy(ctx context.Context, shard ShardID, nodeID string, target int, ttl time.Duration) (Copy, bool, error)
 	// RenewLeases extends every unexpired lease nodeID holds to ttl from now
 	// and returns those shards. A lease that has already expired is not
@@ -135,6 +138,10 @@ type RegistryStore interface {
 	// ReportApplied records the seq a copy has applied. It returns
 	// ErrLeaseLost unless the slot still holds this incarnation.
 	ReportApplied(ctx context.Context, c Copy, seq int64) error
+	// RetireCopy marks c retiring, as SetCopyState does, but only while another
+	// node's copy of the shard serves under an unexpired lease, atomically with
+	// that check; it reports whether it did. ErrLeaseLost as SetCopyState.
+	RetireCopy(ctx context.Context, c Copy) (bool, error)
 }
 
 // BlobStore keeps named blobs (segment bundles) in sl_blobs, split into
@@ -219,6 +226,8 @@ type options struct {
 	meter     metric.Meter
 	logger    *slog.Logger
 	blobChunk int
+	gateKey   string // the database a single-writer dialect's write gate is shared by
+	dbPath    string
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -280,11 +289,23 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if d.Name == "sqlite" {
+		if p, err := sqlite.Path(u); err == nil {
+			if abs, err := filepath.Abs(p); err == nil {
+				p = abs
+			}
+			p = filepath.Clean(p)
+			o.dbPath, o.gateKey = p, p
+			if runtime.GOOS == "windows" {
+				o.gateKey = strings.ToLower(p)
+			}
+		}
+	}
 	pools, err := d.Open(u)
 	if err != nil {
 		return nil, fmt.Errorf("open %s store: %w", d.Name, err)
 	}
-	s, err := newSQLStore(d, pools, &o)
+	s, err := newSQLStore(d, pools, &o) //nolint:contextcheck // the store outlives Open; its checkpointer stops at Close
 	if err != nil {
 		_ = pools.Close()
 		return nil, err

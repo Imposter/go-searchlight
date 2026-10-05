@@ -16,7 +16,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
-	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -24,43 +23,6 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
-
-// waitSeq waits, under ctx's deadline, until every copy of idx has every change up
-// to seq searchable. It wakes the tailers first, so a copy with no change of its own
-// up to seq advances to it at once rather than at its next poll.
-func (n *Single) waitSeq(ctx context.Context, idx *index, seq int64) error {
-	if seq <= 0 {
-		return nil
-	}
-	if err := n.checkHead(ctx, seq); err != nil {
-		return err
-	}
-	for _, c := range idx.copies {
-		c.tailer.Wake()
-	}
-	for _, c := range idx.copies {
-		if err := c.notServing(); err != nil {
-			return err
-		}
-		if err := c.waitRefreshed(ctx, seq); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				var at int64
-				if sh := c.shard(); sh != nil {
-					at = sh.RefreshedSeq()
-				}
-				return &api.Error{
-					Status: http.StatusGatewayTimeout, Code: api.CodeTimeout, Err: err,
-					Detail: fmt.Sprintf("seq %d was not searchable on shard %d before the deadline (it is at %d)", seq, c.id.Shard, at),
-				}
-			}
-			if h := c.halted.Load(); h != nil {
-				return api.Unavailable(*h, "shard %d of index %q has halted", c.id.Shard, idx.name)
-			}
-			return err
-		}
-	}
-	return nil
-}
 
 // checkHead refuses (400) a wait_for_seq past the newest committed seq, which no
 // copy would ever reach: the node's head is raised from the store's first.
@@ -75,53 +37,6 @@ func (n *Single) checkHead(ctx context.Context, seq int64) error {
 		return api.InvalidAt("params.wait_for_seq", "wait_for_seq %d is past the newest committed seq, %d", seq, head)
 	}
 	return nil
-}
-
-// waitQueries waits until every saved query committed through this node is
-// searchable on the copy that holds it, so a percolation sees the queries saved just
-// before it. Only copies whose saved queries changed wait, and only until their next
-// refresh; after that it is free.
-func (n *Single) waitQueries(ctx context.Context, idx *index) error {
-	for _, c := range idx.copies {
-		q := c.querySeq.Load()
-		if q == 0 {
-			continue
-		}
-		sh := c.shard()
-		if sh == nil {
-			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", c.id.Shard)
-		}
-		if sh.RefreshedSeq() >= q {
-			continue
-		}
-		c.tailer.Wake()
-		if err := c.waitRefreshed(ctx, q); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// acquire holds the current generation of every copy of idx, by shard, until release.
-func (n *Single) acquire(idx *index) ([]*shard.Generation, func(), error) {
-	gens := make([]*shard.Generation, 0, len(idx.copies))
-	release := func() {
-		for _, g := range gens {
-			g.Release()
-		}
-	}
-	for _, c := range idx.copies {
-		g, err := c.acquire()
-		if err != nil {
-			release()
-			if idx.dropped.Load() {
-				return nil, nil, indexNotFound(idx.name)
-			}
-			return nil, nil, err
-		}
-		gens = append(gens, g)
-	}
-	return gens, release, nil
 }
 
 // acquireTries bounds acquire's retries when the copy's shard is swapped under it.
@@ -190,41 +105,63 @@ func endSpan(span trace.Span, err error) {
 	span.End()
 }
 
+// validQuery checks q against the index's mapping. A cluster node whose mapping lacks a
+// field another node has since added re-reads the catalogue first, so the field is no
+// spurious 400.
+func (n *Single) validQuery(ctx context.Context, idx *index, q query.Node) error {
+	problems := query.Validate(q, idx.meta.Load().mapping)
+	if len(problems) > 0 && n.cl != nil {
+		if changed, _ := n.reloadIfNewer(ctx, idx); changed {
+			problems = query.Validate(q, idx.meta.Load().mapping)
+		}
+	}
+	if len(problems) > 0 {
+		return api.Invalid("the query is invalid", problems...)
+	}
+	return nil
+}
+
+// searchAttempts bounds a search's runs: one more when the copy a fetch needed went
+// away after its query phase.
+const searchAttempts = 2
+
 // Search implements [api.Coordinator]: a query-then-fetch over every shard, each
 // shard's generation held from its query to its fetch.
 func (n *Single) Search(ctx context.Context, name string, r *search.Request, opts api.ReadOptions) (res *api.SearchResult, err error) {
 	ctx, span := n.readSpan(ctx, "node.search", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
-	if problems := query.Validate(r.Query, idx.meta.Load().mapping); len(problems) > 0 {
-		return nil, api.Invalid("the query is invalid", problems...)
-	}
-	if err := n.waitSeq(ctx, idx, opts.WaitForSeq); err != nil {
+	if err := n.validQuery(ctx, idx, r.Query); err != nil {
 		return nil, err
 	}
-	gens, release, err := n.acquire(idx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
 	r.Index = name
-	stale := n.indexStale(idx)
-	resp, err := searchGenerations(ctx, gens, r)
-	if err != nil {
-		return nil, err
+	for attempt := 1; ; attempt++ {
+		ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := searchTargets(ctx, ts, r)
+		stale := ts.stale() || n.stale()
+		ts.release()
+		if err == nil {
+			return &api.SearchResult{Response: resp, Stale: stale}, nil
+		}
+		if attempt == searchAttempts || ctx.Err() != nil || (!errors.Is(err, search.ErrStaleHit) && !errors.Is(err, ErrTargetLost)) {
+			return nil, err
+		}
 	}
-	return &api.SearchResult{Response: resp, Stale: stale}, nil
 }
 
-// searchGenerations searches gens, one per shard: in one pass with bodies when there
-// is one shard; otherwise the query phase per shard (NoBodies), the reduce, then the
-// fetch of the winning hits' bodies from the generations that found them.
-func searchGenerations(ctx context.Context, gens []*shard.Generation, r *search.Request) (*search.Response, error) {
-	if len(gens) == 1 {
-		sr, err := search.ExecuteShard(ctx, gens[0], r)
+// searchTargets searches ts, one per shard: in one pass with bodies when there is one
+// shard; otherwise the query phase per shard (NoBodies), the reduce, then the fetch of
+// the winning hits' bodies from the copies that found them (a hit's shard is the one
+// its id routes to).
+func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.Response, error) {
+	if len(ts) == 1 {
+		sr, err := ts[0].Search(ctx, r)
 		if err != nil {
 			return nil, err
 		}
@@ -232,11 +169,11 @@ func searchGenerations(ctx context.Context, gens []*shard.Generation, r *search.
 	}
 	q := *r
 	q.NoBodies = true
-	results := make([]*search.ShardResult, len(gens))
-	errs := make([]error, len(gens))
+	results := make([]*search.ShardResult, len(ts))
+	errs := make([]error, len(ts))
 	var wg sync.WaitGroup
-	for i, g := range gens {
-		wg.Go(func() { results[i], errs[i] = search.ExecuteShard(ctx, g, &q) })
+	for i, t := range ts {
+		wg.Go(func() { results[i], errs[i] = t.Search(ctx, &q) })
 	}
 	wg.Wait()
 	if err := firstError(errs); err != nil {
@@ -246,27 +183,16 @@ func searchGenerations(ctx context.Context, gens []*shard.Generation, r *search.
 	if len(resp.Hits) == 0 {
 		return resp, nil
 	}
-	// Each segment id names one shard's segment: group the hits by the shard whose
-	// generation holds their segment.
-	owner := map[string]int{}
-	for s, g := range gens {
-		for k := range g.Segments {
-			owner[g.Segments[k].ID] = s
-		}
-	}
 	byShard := map[int][]int{}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
 		if h.Ref == nil {
 			return nil, fmt.Errorf("node: hit %q has no ref to fetch", h.ID)
 		}
-		s, ok := owner[h.Ref.Segment]
-		if !ok {
-			return nil, fmt.Errorf("%w: hit %q", search.ErrStaleHit, h.ID)
-		}
+		s := ShardFor(h.ID, len(ts))
 		byShard[s] = append(byShard[s], i)
 	}
-	ferrs := make([]error, len(gens))
+	ferrs := make([]error, len(ts))
 	for _, s := range slices.Sorted(maps.Keys(byShard)) {
 		wg.Go(func() {
 			pos := byShard[s]
@@ -274,7 +200,7 @@ func searchGenerations(ctx context.Context, gens []*shard.Generation, r *search.
 			for k, i := range pos {
 				hits[k] = resp.Hits[i]
 			}
-			if err := search.FetchShard(ctx, gens[s], hits, r.Fields); err != nil {
+			if err := ts[s].Fetch(ctx, hits, r.Fields); err != nil {
 				ferrs[s] = err
 				return
 			}
@@ -299,57 +225,78 @@ func firstError(errs []error) error {
 	return nil
 }
 
+// analyzeDocs analyzes the given documents of a percolation under the index's mapping.
+// A cluster node re-reads the catalogue once when one does not analyze (a strict
+// index refusing a field another node has since mapped).
+func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) ([]schema.Doc, error) {
+	for attempt := 0; ; attempt++ {
+		m := idx.meta.Load().mapping
+		docs := make([]schema.Doc, 0, len(bodies))
+		var failure error
+		for i, body := range bodies {
+			doc, _, err := schema.Analyze(m, "_percolate_"+strconv.Itoa(i), body)
+			if err != nil {
+				failure = docProblem(err, "docs."+strconv.Itoa(i))
+				break
+			}
+			docs = append(docs, doc)
+		}
+		if failure == nil {
+			return docs, nil
+		}
+		if attempt > 0 || n.cl == nil {
+			return nil, failure
+		}
+		if changed, _ := n.reloadIfNewer(ctx, idx); !changed {
+			return nil, failure
+		}
+	}
+}
+
 // Percolate implements [api.Coordinator]. Given documents are analyzed under the
 // index's mapping (their new fields are not added to it: no saved query can name a
-// field the mapping lacks); stored ones are read from this node's copies.
+// field the mapping lacks); stored ones are read from the copies a search would read.
 func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateRequest, opts api.ReadOptions) (res *api.PercolateResponse, err error) {
 	ctx, span := n.readSpan(ctx, "node.percolate", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
-	m := idx.meta.Load().mapping
-	docs := make([]schema.Doc, 0, len(req.Docs)+len(req.IDs))
+	bodies := make([][]byte, len(req.Docs))
+	for i := range req.Docs {
+		bodies[i] = req.Docs[i]
+	}
+	docs, err := n.analyzeDocs(ctx, idx, bodies)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]api.PercolateResult, 0, len(req.Docs)+len(req.IDs))
-	for i, body := range req.Docs {
-		doc, _, err := schema.Analyze(m, "_percolate_"+strconv.Itoa(i), body)
-		if err != nil {
-			return nil, docProblem(err, "docs."+strconv.Itoa(i))
-		}
-		docs = append(docs, doc)
+	for range req.Docs {
 		out = append(out, api.PercolateResult{Found: true})
 	}
-	if err := n.waitSeq(ctx, idx, opts.WaitForSeq); err != nil {
-		return nil, err
-	}
-	if err := n.waitQueries(ctx, idx); err != nil {
-		return nil, err
-	}
-	stale := n.indexStale(idx)
-	// Stored documents are read from this node's copies (as searches are), not
-	// realtime from the database as GET is: pass wait_for_seq to see a write.
-	gens, release, err := n.acquire(idx)
+	// Stored documents are read from the copies (as searches are), not realtime from
+	// the database as GET is: pass wait_for_seq to see a write.
+	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, true)
 	if err != nil {
 		return nil, err
 	}
+	defer ts.release()
+	m := idx.meta.Load().mapping
 	stored := make([]int, 0, len(req.IDs)) // out positions of found stored docs
 	for i, id := range req.IDs {
 		loc := "ids." + strconv.Itoa(i)
 		if err := schema.ValidateID(id); err != nil {
-			release()
 			return nil, docProblem(err, loc)
 		}
 		res := api.PercolateResult{ID: id}
-		body, ok, err := gens[ShardFor(id, len(gens))].Get(id)
+		body, ok, err := ts[ShardFor(id, len(ts))].Get(ctx, id)
 		if err != nil {
-			release()
 			return nil, err
 		}
 		if ok {
 			doc, _, err := schema.Analyze(m, id, body)
 			if err != nil {
-				release()
 				return nil, docProblem(err, loc)
 			}
 			res.Found = true
@@ -358,8 +305,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 		}
 		out = append(out, res)
 	}
-	release()
-	matches, err := n.percolateDocs(ctx, idx, docs)
+	matches, err := n.percolateDocs(ctx, idx, ts, docs)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +315,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 	for k, p := range stored {
 		out[p].Queries = matches[len(req.Docs)+k]
 	}
-	return &api.PercolateResponse{Results: out, Stale: stale}, nil
+	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil
 }
 
 // docProblem places a document's analysis error at loc.
@@ -389,7 +335,7 @@ func docProblem(err error, loc string) error {
 func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.ReadOptions) (cat *api.FieldCatalog, err error) {
 	ctx, span := n.readSpan(ctx, "node.fields", name)
 	defer func() { endSpan(span, err) }()
-	idx, err := n.lookup(name)
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -405,15 +351,12 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 	if len(aggs) == 0 {
 		return cat, nil
 	}
-	if err := n.waitSeq(ctx, idx, opts.WaitForSeq); err != nil {
-		return nil, err
-	}
-	gens, release, err := n.acquire(idx)
+	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
 	if err != nil {
 		return nil, err
 	}
-	defer release()
-	resp, err := searchGenerations(ctx, gens, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name})
+	defer ts.release()
+	resp, err := searchTargets(ctx, ts, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name})
 	if err != nil {
 		return nil, err
 	}
@@ -432,20 +375,20 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 
 // GetDocument implements [api.Coordinator]: read from the store, so realtime. While
 // the database cannot be reached, or when it does not answer within max_lag, it is
-// read from this node's copy instead, marked stale.
+// read from a copy instead, marked stale.
 func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Document, error) {
-	idx, err := n.lookup(name)
+	idx, err := n.lookupForRead(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}
 	if n.stale() {
-		return n.staleDocument(idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
+		return n.staleDocument(ctx, idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
 	}
 	rctx, cancel := context.WithTimeout(ctx, n.recordTimeout())
 	defer cancel()
 	r, err := n.getRecord(rctx, idx, store.RecordDocument, id)
 	if isUnreachable(err) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return n.staleDocument(idx, id, err)
+		return n.staleDocument(ctx, idx, id, err)
 	}
 	if err != nil {
 		return nil, err
@@ -453,21 +396,21 @@ func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Documen
 	return &api.Document{ID: id, Seq: r.Seq, Body: r.Body}, nil
 }
 
-// GetQuery implements [api.Coordinator]: read from the store, so realtime; from this
-// node's copy, marked stale, while the database cannot be reached.
+// GetQuery implements [api.Coordinator]: read from the store, so realtime; from a
+// copy, marked stale, while the database cannot be reached.
 func (n *Single) GetQuery(ctx context.Context, name, id string) (*api.SavedQuery, error) {
-	idx, err := n.lookup(name)
+	idx, err := n.lookupForRead(ctx, name, 0)
 	if err != nil {
 		return nil, err
 	}
 	if n.stale() {
-		return n.staleQuery(idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
+		return n.staleQuery(ctx, idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
 	}
 	rctx, cancel := context.WithTimeout(ctx, n.recordTimeout())
 	defer cancel()
 	r, err := n.getRecord(rctx, idx, store.RecordQuery, id)
 	if isUnreachable(err) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return n.staleQuery(idx, id, err)
+		return n.staleQuery(ctx, idx, id, err)
 	}
 	if err != nil {
 		return nil, err
@@ -476,7 +419,7 @@ func (n *Single) GetQuery(ctx context.Context, name, id string) (*api.SavedQuery
 }
 
 // recordTimeout bounds a realtime read of one record: past it (a database that hangs
-// rather than fails) the read falls back to this node's copy, marked stale.
+// rather than fails) the read falls back to a copy, marked stale.
 func (n *Single) recordTimeout() time.Duration {
 	if n.cfg.MaxLag > 0 {
 		return n.cfg.MaxLag
@@ -491,14 +434,22 @@ func isUnreachable(err error) bool {
 	return errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable
 }
 
-// staleDocument reads a document from this node's copy.
-func (n *Single) staleDocument(idx *index, id string, cause error) (*api.Document, error) {
-	gens, release, err := n.acquire(idx)
+// staleTarget returns a read target for the shard id routes to, for a stale read.
+func (n *Single) staleTarget(ctx context.Context, idx *index, id string) (ShardTarget, error) {
+	if err := schema.ValidateID(id); err != nil {
+		return nil, docProblem(err, "id")
+	}
+	return n.acquireShard(ctx, idx, ShardFor(id, len(idx.shards)), 0, false)
+}
+
+// staleDocument reads a document from a copy.
+func (n *Single) staleDocument(ctx context.Context, idx *index, id string, cause error) (*api.Document, error) {
+	t, err := n.staleTarget(ctx, idx, id)
 	if err != nil {
 		return nil, cause
 	}
-	defer release()
-	body, ok, err := gens[ShardFor(id, len(gens))].Get(id)
+	defer t.Release()
+	body, ok, err := t.Get(ctx, id)
 	if err != nil {
 		return nil, cause
 	}
@@ -510,36 +461,31 @@ func (n *Single) staleDocument(idx *index, id string, cause error) (*api.Documen
 	return &api.Document{ID: id, Body: body, Stale: true}, nil
 }
 
-// staleQuery reads a saved query from this node's copy.
-func (n *Single) staleQuery(idx *index, id string, cause error) (*api.SavedQuery, error) {
-	gens, release, err := n.acquire(idx)
+// staleQuery reads a saved query from a copy.
+func (n *Single) staleQuery(ctx context.Context, idx *index, id string, cause error) (*api.SavedQuery, error) {
+	t, err := n.staleTarget(ctx, idx, id)
 	if err != nil {
 		return nil, cause
 	}
-	defer release()
-	g := gens[ShardFor(id, len(gens))]
-	seg, ord, ok := g.LookupQuery(id)
+	defer t.Release()
+	q, ok, err := t.GetQuery(ctx, id)
+	if err != nil {
+		return nil, cause
+	}
 	if !ok {
 		e := api.NotFound(api.CodeQueryNotFound, "saved query %q is not in this node's copy of index %q (the database cannot be reached)", id, idx.name)
 		e.Extra = map[string]any{"stale": true}
 		return nil, e
 	}
-	sq, err := g.QuerySegments[seg].Segment.Query(ord)
-	if err != nil {
-		return nil, cause
-	}
-	q, err := percolate.EncodeQuery(sq.Query)
-	if err != nil {
-		return nil, cause
-	}
-	return &api.SavedQuery{ID: id, Seq: sq.Seq, Query: q, Meta: sq.Meta, Stale: true}, nil
+	q.Stale = true
+	return q, nil
 }
 
 func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKind, id string) (store.Record, error) {
 	if err := schema.ValidateID(id); err != nil {
 		return store.Record{}, docProblem(err, "id")
 	}
-	r, err := n.records.GetRecord(ctx, kind, store.ShardID{Index: idx.name, Shard: ShardFor(id, len(idx.copies))}, id)
+	r, err := n.records.GetRecord(ctx, kind, store.ShardID{Index: idx.name, Shard: ShardFor(id, len(idx.shards))}, id)
 	switch {
 	case err == nil, errors.Is(err, store.ErrNotFound):
 		n.noteDB(nil)
@@ -557,7 +503,7 @@ func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKin
 
 // ListQueries implements [api.Coordinator]: read from the store, so realtime.
 func (n *Single) ListQueries(ctx context.Context, name, after string, size int) ([]*api.SavedQuery, error) {
-	if _, err := n.lookup(name); err != nil {
+	if _, err := n.lookupForRead(ctx, name, 0); err != nil {
 		return nil, err
 	}
 	recs, err := n.records.ListQueries(ctx, name, after, size)

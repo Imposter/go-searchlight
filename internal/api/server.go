@@ -234,6 +234,13 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	}
 	s.draining.Store(true)
 	s.log.InfoContext(ctx, "API draining: not ready", slog.Duration("grace", s.cfg.ShutdownGrace))
+	if d, ok := s.c.(Drainer); ok {
+		// A cluster node retires the copies others can stand in for, so peers stop
+		// routing reads here while the listener drains.
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+		d.Drain(dctx)
+		cancel()
+	}
 	if s.cfg.ShutdownGrace > 0 {
 		t := time.NewTimer(s.cfg.ShutdownGrace)
 		select {

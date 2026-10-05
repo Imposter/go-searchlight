@@ -3,7 +3,8 @@
 Searchlight is a search engine written in Go. It runs forward search with aggregations and
 percolation of saved queries. Its source of truth is a SQL database: Postgres, MySQL 8.0.19
 or later (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default) or
-SQLite. The design is in
+SQLite (one node only: a cluster needs Postgres or MySQL; a second node refuses to join a
+SQLite store). The design is in
 [docs/superpowers/specs/2026-10-02-searchlight-design.md](docs/superpowers/specs/2026-10-02-searchlight-design.md)
 and the build plan is in [docs/superpowers/plans/2026-10-02-searchlight.md](docs/superpowers/plans/2026-10-02-searchlight.md).
 
@@ -66,6 +67,11 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db ./bin/searchl
 | `tokens_file` | (none) | API bearer tokens, one per line: `<token>` (read-write) or `<token> read` (read-only); required unless `insecure_no_auth` |
 | `insecure_no_auth` | `false` | serve the API with no auth when `tokens_file` is empty (logged as a warning; never on a reachable node) |
 | `cluster_token` | (none) | auth for the internal peer API |
+| `peer_ca_file` | (system roots) | PEM bundle of the CAs that sign peers' TLS certificates (the peer API runs over TLS when `tls_cert` is set) |
+| `lease_ttl` | `0` (`30s` on SQLite, `10s` elsewhere) | how long a shard copy's lease lasts unrenewed (renewed every 2 s) |
+| `prune_stall_timeout` | `15m` | how long a copy behind the others may make no progress and still hold the changelog's prune floor |
+| `retiring_retention` | `15m` | how long the changelog is kept for a cleanly stopped node's copies to replay on restart |
+| `changelog_retention` | `24h` | the oldest a change may grow before it is pruned whatever copy still needs it |
 | `refresh_interval` | `1s` | how often writes become searchable |
 | `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments |
 | `max_lag` | `2s` | how far a copy may trail the changelog and still serve |

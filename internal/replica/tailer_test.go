@@ -636,7 +636,7 @@ func waitCopyState(t testing.TB, st store.Store, id ShardID, want store.CopyStat
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, c := range copies {
+		for _, c := range copies { //nolint:gocritic // a short list
 			if c.Shard == id && c.State == want {
 				return c
 			}
@@ -945,6 +945,95 @@ func TestFetcherBeforeSnapshot(t *testing.T) {
 			if (!fail && (peer != 1 || sql != 0)) || (fail && sql != 1) {
 				t.Fatalf("fail=%v: %d peer and %d sql recoveries", fail, peer, sql)
 			}
+		}
+	})
+}
+
+// gatedFetcher copies another copy's closed directory once released: a peer recovery
+// the test holds mid-transfer.
+type gatedFetcher struct {
+	from    string
+	entered chan struct{}
+	gate    chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+func (f *gatedFetcher) Fetch(ctx context.Context, _ ShardID, dir string) error {
+	f.calls.Add(1)
+	f.once.Do(func() { close(f.entered) })
+	select {
+	case <-f.gate:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return copyDir(f.from, dir)
+}
+
+// TestFetcherRebuildsAside: a copy the changelog was pruned past is valid but outdated,
+// so its peer-fetched replacement is built aside: the old copy keeps serving (state
+// rebuilding) until the fetched one has caught up and is swapped in.
+func TestFetcherRebuildsAside(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "fa", testMapping)
+		id := ShardID{Index: "fa", Shard: 0}
+		c := newCopy(t, d.open(t), id, testOptions())
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("fa", 0, "a", docBody("a", 1))))
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		head := mustApply(t, st, upsert("fa", 0, "b", docBody("b", 2)), upsert("fa", 0, "c", docBody("c", 3)))
+		if err := st.Prune(ctx, id, head); err != nil { // past the copy: it must rebuild
+			t.Fatal(err)
+		}
+		seed := newCopy(t, d.open(t), id, testOptions())
+		seed.start()
+		seed.waitApplied(head)
+		if err := seed.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		last := mustApply(t, st, upsert("fa", 0, "d", docBody("d", 4)))
+
+		reader := sdkmetric.NewManualReader()
+		f := &gatedFetcher{from: seed.dir, entered: make(chan struct{}), gate: make(chan struct{})}
+		c.opts.Fetcher = f
+		c.opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+		c.start()
+		select {
+		case <-f.entered:
+		case <-time.After(time.Minute):
+			t.Fatal("the fetch never started")
+		}
+		c.mu.Lock()
+		tl := c.tailer
+		c.mu.Unlock()
+		if s := tl.State(); s != StateRebuilding {
+			t.Fatalf("state %s while the replacement is fetched, want rebuilding", s)
+		}
+		g := tl.Shard().Acquire()
+		if g == nil || g.NumDocs() != 1 {
+			t.Fatalf("the old copy does not serve while its replacement is fetched: %v", g)
+		}
+		g.Release()
+		close(f.gate)
+		sh := c.waitApplied(last)
+		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+			t.Fatalf("rebuilt copy differs:\n%s", dd)
+		}
+		if cur, err := CopyDir(c.dir); err != nil || cur == c.dir {
+			t.Fatalf("the current copy is %q (%v), want the one built aside", cur, err)
+		}
+		if peer := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "source", "peer"); peer != 1 || f.calls.Load() != 1 {
+			t.Fatalf("%d peer recoveries, %d fetches", peer, f.calls.Load())
 		}
 	})
 }

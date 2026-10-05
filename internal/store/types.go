@@ -262,6 +262,9 @@ type Copy struct {
 	// LeaseLeft is the lease's remaining time by the database clock;
 	// zero or negative means it has expired and the slot may be taken.
 	LeaseLeft time.Duration
+	// TakenFrom, on a copy ClaimCopy returns, is the node whose expired lease the
+	// claim took the slot from ("" for a free slot or the node's own).
+	TakenFrom string
 }
 
 // Expired reports whether the copy's lease has run out, agreeing with the

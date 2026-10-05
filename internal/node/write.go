@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"sync/atomic"
 	"time"
@@ -42,7 +43,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 		span.End()
 	}()
-	idx, err := n.lookup(name)
+	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -73,11 +74,18 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	span.SetAttributes(attribute.Int64("seq", res.Seq))
 
 	touched := map[int]bool{}
+	written := map[int]int64{}
 	for i := range batch {
 		touched[batch[i].change.Shard] = true
+		written[batch[i].change.Shard] = max(written[batch[i].change.Shard], batch[i].change.Seq)
 	}
 	for s := range touched {
-		idx.copies[s].tailer.Wake()
+		if c := idx.shards[s].local.Load(); c != nil {
+			c.tailer.Wake()
+		}
+	}
+	if n.cl != nil {
+		n.cl.Committed(idx.name, written)
 	}
 	if opts.Refresh != api.RefreshNone {
 		if err := n.waitWritten(ctx, idx, touched, res.Seq, opts.Refresh); err != nil {
@@ -112,8 +120,18 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 // field limit.
 func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, keepDocs bool) ([]prepared, error) {
 	base := idx.meta.Load().mapping
+	reloaded := false
 	for range maxCatalogTries {
 		batch, working := n.analyzeOps(idx, ops, items, base, keepDocs)
+		if n.cl != nil && !reloaded && refused(items) {
+			// Another node may have mapped a field this one does not know yet (a
+			// strict index refuses it): re-read the catalogue once and analyze again.
+			reloaded = true
+			if changed, _ := n.reloadIfNewer(ctx, idx); changed {
+				base = idx.meta.Load().mapping
+				continue
+			}
+		}
 		if working == base {
 			return batch, nil
 		}
@@ -128,6 +146,21 @@ func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp
 		}
 	}
 	return nil, api.Unavailable(store.ErrConflict, "the index's mapping kept changing under the write; retry")
+}
+
+// refused reports whether an op was refused as invalid (a 400).
+func refused(items []api.ItemResult) bool {
+	for i := range items {
+		var ae *api.Error
+		if errors.As(items[i].Err, &ae) && ae.Status == http.StatusBadRequest {
+			return true
+		}
+		var ve *schema.ValidationError
+		if errors.As(items[i].Err, &ve) {
+			return true
+		}
+	}
+	return false
 }
 
 // analyzeOps prepares every op under base, returning the batch and base grown by the
@@ -189,7 +222,7 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 		}
 		return prepared{}, m, api.InvalidAt("id", "%s", msg)
 	}
-	c.Shard = ShardFor(op.ID, len(idx.copies))
+	c.Shard = ShardFor(op.ID, len(idx.shards))
 	var p prepared
 	switch op.Kind {
 	case api.OpUpsert:
@@ -286,6 +319,8 @@ func queryPayload(op *api.WriteOp, m *schema.Mapping) ([]byte, error) {
 // admit refuses a write (429) to a shard copy whose write buffer is full while
 // refreshes catch up, or that trails what the node committed to it by more than
 // MaxApplyLag: the client backs off rather than the changelog outrunning the copies.
+// A single node also refuses (503) a write to a copy that cannot serve; a cluster node
+// checks only the copies it hosts that serve, since others apply the write too.
 func (n *Single) admit(idx *index, batch []prepared) error {
 	seen := map[int]bool{}
 	retry := max(api.DefaultRetryAfter, time.Duration(idx.refresh.Load()))
@@ -295,10 +330,19 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 			continue
 		}
 		seen[s] = true
-		c := idx.copies[s]
+		c := idx.shards[s].local.Load()
+		if c == nil {
+			if n.cl != nil {
+				continue
+			}
+			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", s)
+		}
 		sh := c.shard()
 		if sh == nil {
 			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", s)
+		}
+		if n.cl != nil && c.peerServing() != nil {
+			continue // others apply the write; this copy is not counted on
 		}
 		if err := c.notServing(); err != nil {
 			return err
@@ -353,10 +397,10 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 			}
 			for i := range batch {
 				items[batch[i].pos].Seq = batch[i].change.Seq
-				c := idx.copies[batch[i].change.Shard]
-				raise(&c.written, batch[i].change.Seq)
+				sl := idx.shards[batch[i].change.Shard]
+				raise(&sl.written, batch[i].change.Seq)
 				if k := batch[i].change.Kind; k == store.KindQueryUpsert || k == store.KindQueryDelete {
-					raise(&c.querySeq, batch[i].change.Seq)
+					raise(&sl.querySeq, batch[i].change.Seq)
 				}
 			}
 			n.noteHead(batch[len(batch)-1].change.Seq)
@@ -419,7 +463,8 @@ func raise(v *atomic.Int64, seq int64) {
 
 // waitWritten waits, under ctx's deadline, for the written shards to have seq
 // searchable: by their next refresh (wait_for), or at once (true: once applied, the
-// copies are refreshed).
+// copies are refreshed). That is this node's copy, and on a cluster node every other
+// serving copy of the shard as well.
 func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bool, seq int64, mode api.RefreshMode) error {
 	shards := make([]int, 0, len(touched))
 	for s := range touched {
@@ -427,22 +472,59 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 	}
 	slices.Sort(shards)
 	for _, s := range shards {
-		c := idx.copies[s]
-		if mode == api.RefreshTrue {
-			if err := waitApplied(ctx, c, seq); err != nil {
+		sl := idx.shards[s]
+		localDone := false
+		if c := sl.local.Load(); c != nil && (n.cl == nil || c.peerServing() == nil) {
+			if err := waitLocal(ctx, c, seq, mode); err != nil {
 				return err
 			}
-			if sh := c.shard(); sh != nil && sh.RefreshedSeq() < seq {
-				if err := sh.Refresh(ctx); err != nil {
-					return err
-				}
-			}
+			localDone = true
 		}
-		if err := c.waitRefreshed(ctx, seq); err != nil {
-			return err
+		if n.cl != nil {
+			if err := n.cl.WaitRefreshed(ctx, sl.id, seq, mode, localDone); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// waitLocal waits until copy c has seq searchable: by its next refresh (wait_for), or
+// at once (true: once applied, the copy is refreshed).
+func waitLocal(ctx context.Context, c *copyState, seq int64, mode api.RefreshMode) error {
+	if mode == api.RefreshTrue {
+		if err := waitApplied(ctx, c, seq); err != nil {
+			return err
+		}
+		if sh := c.shard(); sh != nil && sh.RefreshedSeq() < seq {
+			if err := sh.Refresh(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return c.waitRefreshed(ctx, seq)
+}
+
+// WaitLocal waits, under ctx, until this node's copy of shard s of index has seq
+// searchable, as a write's refresh asks (the peer API serves other nodes' waits
+// with it). It fails (503) when the node hosts no serving copy of the shard.
+func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, mode api.RefreshMode) error {
+	idx, err := n.lookup(ctx, index)
+	if err != nil {
+		return err
+	}
+	if s < 0 || s >= len(idx.shards) {
+		return api.NotFound(api.CodeNotFound, "index %q has no shard %d", index, s)
+	}
+	c := idx.shards[s].local.Load()
+	if c == nil {
+		return api.Unavailable(shard.ErrClosed, "this node holds no copy of shard %d of index %q", s, index)
+	}
+	if err := c.peerServing(); err != nil {
+		return err
+	}
+	c.tailer.Wake()
+	return waitLocal(ctx, c, seq, mode)
 }
 
 // waitApplied polls until the copy has applied seq.
@@ -475,8 +557,7 @@ func waitApplied(ctx context.Context, c *copyState, seq int64) error {
 
 // percolateWritten fills each committed upsert's item with the saved queries its
 // document matches, as written: against every saved query committed through this node
-// before the percolation (waitQueries), and every change up to waitFor when it is
-// set.
+// before the percolation, and every change up to waitFor when it is set.
 func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor int64) error {
 	var docs []schema.Doc
 	var pos []int
@@ -490,15 +571,12 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 		res.Percolated = true
 		return nil
 	}
-	if waitFor > 0 {
-		if err := n.waitSeq(ctx, idx, waitFor); err != nil {
-			return err
-		}
-	}
-	if err := n.waitQueries(ctx, idx); err != nil {
+	ts, err := n.acquireTargets(ctx, idx, waitFor, true)
+	if err != nil {
 		return err
 	}
-	matches, err := n.percolateDocs(ctx, idx, docs)
+	defer ts.release()
+	matches, err := n.percolateDocs(ctx, idx, ts, docs)
 	if err != nil {
 		return err
 	}
@@ -511,18 +589,11 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 
 // percolateDocs percolates docs against the saved queries of every shard of idx (a
 // saved query lives on the shard its id hashes to), merging each document's matches.
-func (n *Single) percolateDocs(ctx context.Context, idx *index, docs []schema.Doc) ([][]string, error) {
-	gens, release, err := n.acquire(idx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
+func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc) ([][]string, error) {
+	mapping := idx.meta.Load().meta.Mapping
 	out := make([][]string, len(docs))
-	for s, g := range gens {
-		if g.NumQueries() == 0 {
-			continue
-		}
-		ids, err := idx.copies[s].perc.Percolate(ctx, g, docs)
+	for s, t := range ts {
+		ids, err := t.Percolate(ctx, mapping, docs)
 		if err != nil {
 			return nil, fmt.Errorf("percolate shard %d: %w", s, err)
 		}
@@ -530,7 +601,7 @@ func (n *Single) percolateDocs(ctx context.Context, idx *index, docs []schema.Do
 			out[i] = append(out[i], ids[i]...)
 		}
 	}
-	if len(gens) > 1 {
+	if len(ts) > 1 {
 		for i := range out {
 			slices.Sort(out[i])
 			out[i] = slices.Compact(out[i])

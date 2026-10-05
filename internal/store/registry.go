@@ -30,6 +30,7 @@ func ttlMillis(ttl time.Duration) (int64, error) {
 func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "heartbeat", attribute.String("node_id", n.ID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(n.ID); err != nil {
 		return err
@@ -44,6 +45,7 @@ func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 func (g *registry) RemoveNode(ctx context.Context, nodeID string) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "remove_node", attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(nodeID); err != nil {
 		return err
@@ -90,6 +92,7 @@ func (g *registry) ClaimCopy(ctx context.Context, shard ShardID, nodeID string, 
 	s := g.s
 	ctx, end := s.start(ctx, "claim_copy", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard),
 		attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validShard(shard); err != nil {
 		return c, false, err
@@ -193,6 +196,11 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		case err != nil:
 			return Copy{}, false, fmt.Errorf("claim slot %d: %w", slot, err)
 		case c.NodeID == nodeID:
+			for i := range existing {
+				if prev := &existing[i]; prev.Slot == slot && prev.NodeID != nodeID {
+					c.TakenFrom = prev.NodeID // stolen: its lease had expired
+				}
+			}
 			return c, true, tx.Commit()
 		}
 	}
@@ -217,6 +225,7 @@ func (g *registry) nextEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
 func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) (out []ShardID, err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "renew_leases", attribute.String("node_id", nodeID))
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validNode(nodeID); err != nil {
 		return nil, err
@@ -275,6 +284,7 @@ func copyAttrs(c *Copy) []attribute.KeyValue {
 func (g *registry) ReleaseCopy(ctx context.Context, c Copy) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "release_copy", copyAttrs(&c)...)
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	res, err := s.w.ExecContext(ctx, s.d.Registry.Release, fenceArgs(&c)...)
 	return leaseResult(res, err, &c)
@@ -306,6 +316,7 @@ func (g *registry) Copies(ctx context.Context, index string) (out []Copy, err er
 func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "set_copy_state", append(copyAttrs(&c), attribute.String("state", string(state)))...)
+	ctx = withHighLane(ctx)
 	defer end(&err)
 	if err := validShard(c.Shard); err != nil {
 		return err
@@ -318,6 +329,68 @@ func (g *registry) SetCopyState(ctx context.Context, c Copy, state CopyState) (e
 	}
 	res, err := s.w.ExecContext(ctx, s.d.Registry.SetState, append([]any{string(state)}, fenceArgs(&c)...)...)
 	return leaseResult(res, err, &c)
+}
+
+// RetireCopy marks c retiring only while another copy of its shard serves: it reads
+// the shard's slots and writes the state in one transaction, serialized with every
+// claim and retire by the epoch counter's row lock, so two nodes draining at once
+// never both retire the last serving copies.
+func (g *registry) RetireCopy(ctx context.Context, c Copy) (retired bool, err error) {
+	s := g.s
+	ctx, end := s.start(ctx, "retire_copy", copyAttrs(&c)...)
+	ctx = withHighLane(ctx)
+	defer end(&err)
+	if err := validShard(c.Shard); err != nil {
+		return false, err
+	}
+	if err := validNode(c.NodeID); err != nil {
+		return false, err
+	}
+	for attempt := 1; ; attempt++ {
+		retired, err = g.retireOnce(ctx, c)
+		if err == nil || attempt == applyAttempts || !s.retryable(err) || ctx.Err() != nil {
+			return retired, err
+		}
+	}
+}
+
+func (g *registry) retireOnce(ctx context.Context, c Copy) (bool, error) {
+	s := g.s
+	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
+	if err != nil {
+		return false, err
+	}
+	defer rollback(tx)
+	if _, err := g.nextEpoch(ctx, tx); err != nil { // the lock claims take too
+		return false, err
+	}
+	rows, err := tx.QueryContext(ctx, s.d.Registry.Slots, c.Shard.Index, c.Shard.Shard)
+	if err != nil {
+		return false, err
+	}
+	others := 0
+	for rows.Next() {
+		e, err := g.scanCopy(rows)
+		if err != nil {
+			rows.Close()
+			return false, err
+		}
+		if e.NodeID != c.NodeID && e.State == CopyServing && !e.Expired() && e.LeaseLeft > 0 {
+			others++
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if others == 0 {
+		return false, nil
+	}
+	res, err := tx.ExecContext(ctx, s.d.Registry.SetState, append([]any{string(CopyRetiring)}, fenceArgs(&c)...)...)
+	if err := leaseResult(res, err, &c); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // ReportApplied is monotonic: a late report naming an older seq than one

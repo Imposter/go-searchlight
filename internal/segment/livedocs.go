@@ -3,6 +3,7 @@ package segment
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -20,7 +21,7 @@ const deletesExt = ".del"
 
 // deletesPath returns the sidecar path for segmentID's generation gen.
 func deletesPath(segmentDir, segmentID string, gen uint64) string {
-	return filepath.Join(segmentDir, fmt.Sprintf("%s.%d%s", segmentID, gen, deletesExt))
+	return filepath.Join(segmentDir, DeletesName(segmentID, gen))
 }
 
 // DeletesOptions configures [WriteDeletes].
@@ -39,24 +40,10 @@ func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bit
 	if err != nil {
 		return err
 	}
-	w := newFileWriter(f)
-	w.header()
-	w.beginSection(sectionPresence)
-	var buf bytes.Buffer
-	if deletes == nil {
-		deletes = roaring.New()
-	}
-	if _, err := deletes.WriteTo(&buf); err != nil {
-		_ = f.Close()
-		return err
-	}
-	w.write(buf.Bytes())
-	w.endSection()
-	w.footer()
-	if w.err != nil {
+	if err := EncodeDeletes(f, deletes); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
-		return w.err
+		return err
 	}
 	if err := SyncFile(f); err != nil {
 		_ = f.Close()
@@ -74,6 +61,32 @@ func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bit
 		return nil
 	}
 	return SyncDir(segmentDir)
+}
+
+// DeletesName is the file name of segmentID's generation gen deletes sidecar.
+func DeletesName(segmentID string, gen uint64) string {
+	return fmt.Sprintf("%s.%d%s", segmentID, gen, deletesExt)
+}
+
+// EncodeDeletes writes a deletes sidecar's bytes for deletes (nil: none deleted) to w:
+// exactly what [WriteDeletes] puts in the file, so a copy of a shard can carry a
+// sidecar from memory (a snapshot of a generation whose sidecar a later commit has
+// already replaced on disk).
+func EncodeDeletes(w io.Writer, deletes *roaring.Bitmap) error {
+	fw := newFileWriter(w)
+	fw.header()
+	fw.beginSection(sectionPresence)
+	var buf bytes.Buffer
+	if deletes == nil {
+		deletes = roaring.New()
+	}
+	if _, err := deletes.WriteTo(&buf); err != nil {
+		return err
+	}
+	fw.write(buf.Bytes())
+	fw.endSection()
+	fw.footer()
+	return fw.err
 }
 
 // LoadDeletes reads segmentID's generation gen deletes sidecar, or an empty bitmap when

@@ -155,10 +155,14 @@ const (
 	MetricReplicaWatchReconnects  = "searchlight.replica.watch.reconnects"
 	MetricClusterLeaseChanges     = "searchlight.cluster.lease.changes"
 	MetricClusterAllocations      = "searchlight.cluster.allocation.changes"
+	MetricClusterNodes            = "searchlight.cluster.nodes"
+	MetricClusterPeerDuration     = "searchlight.cluster.peer.request.duration"
+	MetricClusterReadRetries      = "searchlight.cluster.read.retries"
 
 	// Database.
 	MetricStoreOperationDuration = "searchlight.store.operation.duration"
 	MetricStoreErrors            = "searchlight.store.errors"
+	MetricStoreWALSize           = "searchlight.store.wal.size"
 )
 
 // Histogram bucket boundaries.
@@ -220,9 +224,13 @@ var Catalog = []MetricSpec{
 	{MetricReplicaWatchReconnects, KindCounter, "{reconnect}", "Changelog notification subscriptions restarted after they failed.", nil},
 	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew_failed, expire, release).", nil},
 	{MetricClusterAllocations, KindCounter, "{change}", "Shard copy state transitions by index and state (recovering, serving, retiring).", nil},
+	{MetricClusterNodes, KindGauge, "{node}", "Live nodes in the cluster, as this node reads the registry.", nil},
+	{MetricClusterPeerDuration, KindHistogram, "s", "Internal peer API request latency by route, peer and status (0: unreachable).", FastBuckets},
+	{MetricClusterReadRetries, KindCounter, "{retry}", "Shard reads retried on another copy after one failed or timed out, by operation.", nil},
 
 	{MetricStoreOperationDuration, KindHistogram, "s", "SQL store latency by operation and dialect.", FastBuckets},
 	{MetricStoreErrors, KindCounter, "{error}", "SQL store errors by operation and dialect.", nil},
+	{MetricStoreWALSize, KindGauge, "By", "SQLite's write-ahead log file size, and the part of it no checkpoint has copied yet (pending=true).", nil},
 }
 
 var catalogIndex = func() map[string]*MetricSpec {

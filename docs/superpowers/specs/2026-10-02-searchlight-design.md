@@ -270,6 +270,7 @@ The logical schema is the same in every dialect.
 ## 9. Cluster: plug-and-play replicas
 
 - **Membership.** On start a node registers in `sl_nodes` and heartbeats every 2 s. A node whose heartbeat is older than 10 s is dead. Peers are discovered from the same table, so the only setting is `store_url`, plus `advertise_address` when behind NAT.
+- **SQLite serves one node.** Its single writer cannot be shared fairly by several processes, so a cluster needs Postgres or MySQL: a node refuses to join a SQLite store another live node already uses (only in-process tests may opt out).
 - **Shard allocation.** This uses database leases, with no consensus library.
   - Each node runs an allocator loop. For each shard below its target copy count, an eligible node (one not already holding a copy, with spare capacity) claims a copy row with a conditional insert or update. Leases are renewed with heartbeats.
   - When a node dies, its leases expire and other nodes claim those shards.
@@ -331,6 +332,9 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `data_dir` | local segments |
 | `tokens_file` | API tokens |
 | `cluster_token` | auth for the internal peer API |
+| `peer_ca_file` | CAs that sign peers' TLS certificates (system roots by default) |
+| `lease_ttl` | 30 s on SQLite (a single node), 10 s elsewhere |
+| `prune_stall_timeout`, `retiring_retention`, `changelog_retention` | 15 min, 15 min, 24 h: the changelog's prune bounds |
 | `refresh_interval` | 1 s |
 | `max_lag` | 2 s |
 | `merge_budget` | I/O and CPU budget for merges |

@@ -3,9 +3,11 @@ package clock_test
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
@@ -256,7 +258,11 @@ func TestWithTimeoutOnTheFake(t *testing.T) {
 	}
 
 	ctx, cancel = clock.WithTimeout(context.Background(), f, time.Second)
+	if ctx.Err() != nil {
+		t.Fatalf("a fresh context ended: %v", ctx.Err())
+	}
 	cancel()
+	<-ctx.Done()
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("cancelled: %v", ctx.Err())
 	}
@@ -268,8 +274,41 @@ func TestWithTimeoutOnTheFake(t *testing.T) {
 	ctx, cancel = clock.WithTimeout(parent, f, time.Hour)
 	defer cancel()
 	cancelParent()
+	<-ctx.Done()
 	if !errors.Is(ctx.Err(), context.Canceled) {
 		t.Fatalf("a cancelled parent: %v", ctx.Err())
+	}
+	for wait := waitCtx(t); f.Waiters() != 0; runtime.Gosched() {
+		if wait.Err() != nil {
+			t.Fatalf("the parent's cancel left the timeout armed: %d", f.Waiters())
+		}
+	}
+}
+
+func TestChildrenOfAFakeDeadlineSeeItExceeded(t *testing.T) {
+	f := clock.NewFake(epoch)
+	ctx, cancel := clock.WithTimeout(context.Background(), f, time.Second)
+	defer cancel()
+	early, cancelEarly := context.WithCancel(ctx)
+	defer cancelEarly()
+	earlyTimeout, cancelEarlyTimeout := context.WithTimeout(ctx, time.Hour)
+	defer cancelEarlyTimeout()
+	f.Advance(time.Second)
+	<-ctx.Done()
+	late, cancelLate := context.WithCancel(ctx)
+	defer cancelLate()
+	for name, c := range map[string]context.Context{"made before": early, "a timeout made before": earlyTimeout, "made after": late} {
+		select {
+		case <-c.Done():
+		case <-waitCtx(t).Done():
+			t.Fatalf("a child %s the deadline did not end", name)
+		}
+		if !errors.Is(c.Err(), context.DeadlineExceeded) || !errors.Is(context.Cause(c), context.DeadlineExceeded) {
+			t.Fatalf("a child %s the deadline: Err %v, Cause %v", name, c.Err(), context.Cause(c))
+		}
+	}
+	if f.Waiters() != 0 {
+		t.Fatalf("a fired deadline stays armed: %d", f.Waiters())
 	}
 }
 
@@ -288,12 +327,21 @@ func TestWithTimeoutOnRealIsTheContextPackages(t *testing.T) {
 }
 
 func TestAdvanceWakesBlockUntilArmed(t *testing.T) {
-	f := clock.NewFake(epoch)
-	f.NewTimer(2 * time.Second)
-	done := make(chan error, 1)
-	go func() { done <- f.BlockUntilArmed(waitCtx(t), time.Second) }()
-	f.Advance(time.Second)
-	if err := <-done; err != nil {
-		t.Fatalf("a timer that came within d by an advance was missed: %v", err)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		f := clock.NewFake(epoch)
+		f.NewTimer(2 * time.Second)
+		done := make(chan error, 1)
+		go func() { done <- f.BlockUntilArmed(context.Background(), time.Second) }()
+		synctest.Wait()
+		f.Advance(time.Second)
+		synctest.Wait()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatal("a timer that came within d by an advance was missed")
+		}
+	})
 }

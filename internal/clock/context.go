@@ -26,20 +26,33 @@ func WithDeadline(parent context.Context, c Clock, deadline time.Time) (context.
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	t := c.AfterFunc(c.Until(deadline), func() { cancel(context.DeadlineExceeded) })
-	return clockDeadline{ctx}, func() {
+	d := &clockDeadline{Context: ctx, done: make(chan struct{})}
+	context.AfterFunc(ctx, func() {
 		t.Stop()
-		cancel(context.Canceled)
-	}
+		close(d.done)
+	})
+	return d, func() { cancel(context.Canceled) }
 }
 
 // clockDeadline reports context.DeadlineExceeded as its Err once its clock's
-// deadline cancelled it, as a context.WithDeadline context does.
-type clockDeadline struct{ context.Context }
+// deadline cancelled it, as a context.WithDeadline context does. It has a Done
+// channel of its own, closed once the inner context ends, so the contexts derived
+// from it take their Err from it rather than from the inner context.
+type clockDeadline struct {
+	context.Context
+	done chan struct{}
+}
 
-func (c clockDeadline) Err() error {
-	err := c.Context.Err()
-	if err != nil && errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
+func (c *clockDeadline) Done() <-chan struct{} { return c.done }
+
+func (c *clockDeadline) Err() error {
+	select {
+	case <-c.done:
+	default:
+		return nil
+	}
+	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
 		return context.DeadlineExceeded
 	}
-	return err
+	return c.Context.Err()
 }

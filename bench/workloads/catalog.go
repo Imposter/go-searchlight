@@ -99,6 +99,13 @@ func SearchSpecs(seed uint64, variants, pageDepth int) []SearchSpec {
 		{Name: "filter_contains", Group: report.GroupFilter, Description: "title contains (substring)", Bodies: gen(func(int) map[string]any {
 			return q{"query": cond("title", "contains", needle(r)), "size": 10}
 		})},
+		// description is the long text field (about 60 Zipfian words, versus title's
+		// handful); every other contains workload targets title, so a regression
+		// specific to long-text residuals (format 4's trigram prefilter over a much
+		// longer value) went unseen until this one was added.
+		{Name: "filter_contains_description", Group: report.GroupFilter, Description: "description contains (substring, long text)", Bodies: gen(func(int) map[string]any {
+			return q{"query": cond("description", "contains", datasets.Word(200+rank(r, 3000))), "size": 10}
+		})},
 		{Name: "filter_words", Group: report.GroupFilter, Description: "title words_all / description words_any (phrases)", Bodies: gen(func(i int) map[string]any {
 			if i%2 == 0 {
 				return q{"query": cond("title", "words_all", []string{datasets.TitleAdjective(r.IntN(20)) + " " + datasets.TitleNoun(rank(r, 60))}), "size": 10}

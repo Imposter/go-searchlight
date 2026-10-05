@@ -165,6 +165,12 @@ jobs:
         run: |
           DATA_FILE=$(ls "$DATA_DIR"/products-*.ndjson | head -1)
           SEARCH_FILE=$(ls "$DATA_DIR"/searches-*.ndjson | sort -t- -k2 -V | tail -1)
+          # The host-visible PID of es1 (the node slbench talks to), so its RSS is read
+          # the same way as Searchlight's: /proc/<pid>/status VmRSS of the actual
+          # server process, not a container-wide cgroup estimate that counts page
+          # cache differently (T6 ruling, 2026-10-05: measure RSS the same way for
+          # both engines).
+          ES_PID=$(docker inspect -f '{{.State.Pid}}' slbench-elasticsearch)
           /tmp/slbench run \
             --data "$DATA_FILE" \
             --searches "$SEARCH_FILE" \
@@ -174,6 +180,7 @@ jobs:
             --pprof-dir "$SL_DIR/pprof" \
             --recovery-store-url "$RECOVERY_STORE_URL" \
             --es-url "http://127.0.0.1:9200" \
+            --es-pid "$ES_PID" \
             --es-config "heap_max=${ES_HEAP}" \
             --es-recovery \
             --repeats 1 \

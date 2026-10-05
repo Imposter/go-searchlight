@@ -84,6 +84,17 @@ type SectionSizer interface {
 	SectionSizes(ctx context.Context, index string) (map[string]int64, error)
 }
 
+// StoreSizer is implemented by an engine with a separate durable store whose size is
+// not part of its node-local index footprint: target T6 ("index size on disk ...
+// per node") is ruled (2026-10-05) to mean the index's own node-local segments, not
+// Searchlight's SQL store, which is shared by every replica and not a per-node cost
+// (issue #52 tracks shrinking it). A StoreSizer's size is reported informationally,
+// never compared for T6's pass/fail. 0 bytes, "" source, nil error means not
+// available or not applicable (Elasticsearch has no separate store to report).
+type StoreSizer interface {
+	StoreBytes(ctx context.Context) (bytes int64, source string, err error)
+}
+
 // StatusError is an engine answering with an unexpected HTTP status.
 type StatusError struct {
 	Method, URL string

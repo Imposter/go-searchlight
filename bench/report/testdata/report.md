@@ -74,7 +74,7 @@ Fields: title and description (text, about 60 Zipfian words), brand (2,000 value
 
 ## Disk and memory
 
-The running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load.
+The running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load. "Disk" is the node-local index alone (target T6, ruled 2026-10-05); RSS is read the same way for both engines where possible (the source column says how for each row, so the methods can be checked against each other).
 
 | engine | disk | disk per 1M docs | RSS | RSS per 1M docs | how |
 | --- | --- | --- | --- | --- | --- |

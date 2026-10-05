@@ -365,6 +365,17 @@ func (s *suite) load(ctx context.Context) error {
 				s.logf("  %s: disk by section: %s", eng.Name(), formatSections(sizes))
 			}
 		}
+		if storer, ok := eng.(StoreSizer); ok {
+			b, src, err := storer.StoreBytes(ctx)
+			if err != nil {
+				s.logf("  %s: durable store size: %v", eng.Name(), err)
+			} else if b > 0 {
+				fp.Values["store_bytes"] = float64(b)
+				fp.Values["store_per_million"] = float64(b) / float64(n) * 1e6
+				s.logf("  %s: durable store %s (%s; informational, shared by every replica, not part of T6's node-local index size)",
+					eng.Name(), report.FormatBytes(float64(b)), src)
+			}
+		}
 		s.run.Results = append(s.run.Results, fp)
 	}
 	s.run.Dataset.Docs = s.loaded

@@ -25,9 +25,14 @@ import (
 // SearchlightOptions configure a [Searchlight] engine.
 type SearchlightOptions struct {
 	URL, Token string
-	// DiskPaths are the directories holding the node's data (data_dir and, for
-	// SQLite, the database file's directory), summed for the disk footprint.
-	DiskPaths []string
+	// DataPaths are the directories holding the node's index (data_dir), summed for
+	// target T6's node-local disk footprint.
+	DataPaths []string
+	// StorePaths are the directories holding the node's durable store (for SQLite,
+	// the database file's directory), summed and reported informationally (T6
+	// ruling, 2026-10-05): the store is shared by every replica, not a per-node
+	// cost, so it is never part of the disk footprint T6 compares.
+	StorePaths []string
 	// PID, when set, returns the node's process id now (a restart changes it): on
 	// Linux the resident set is read from /proc; otherwise, or when it returns 0, from
 	// the node's /metrics (process_resident_memory_bytes).
@@ -365,15 +370,16 @@ func (s *Searchlight) Percolate(ctx context.Context, index string, docs []json.R
 	return out, nil
 }
 
-// Resources implements Engine.
+// Resources implements Engine. DiskBytes is the node-local index alone (DataPaths,
+// target T6): the durable store (StorePaths) is reported separately, by StoreBytes.
 func (s *Searchlight) Resources(ctx context.Context, _ string) (report.Resources, error) {
 	var r report.Resources
-	if len(s.opts.DiskPaths) > 0 {
-		n, err := pathsSize(s.opts.DiskPaths)
+	if len(s.opts.DataPaths) > 0 {
+		n, err := pathsSize(s.opts.DataPaths)
 		if err != nil {
 			return r, err
 		}
-		r.DiskBytes, r.DiskSource = n, "du "+strings.Join(s.opts.DiskPaths, " + ")
+		r.DiskBytes, r.DiskSource = n, "du "+strings.Join(s.opts.DataPaths, " + ")
 	} else {
 		r.DiskSource = "not measured (no --sl-disk paths)"
 	}
@@ -406,14 +412,27 @@ func (s *Searchlight) Resources(ctx context.Context, _ string) (report.Resources
 }
 
 // SectionSizes implements SectionSizer: bytes per on-disk segment section (spec §6),
-// summed across every .seg file under DiskPaths. Returns (nil, nil) without
+// summed across every .seg file under DataPaths. Returns (nil, nil) without
 // --sl-disk paths, the same "not available" the caller already treats Resources'
 // missing disk source as.
 func (s *Searchlight) SectionSizes(_ context.Context, _ string) (map[string]int64, error) {
-	if len(s.opts.DiskPaths) == 0 {
+	if len(s.opts.DataPaths) == 0 {
 		return nil, nil
 	}
-	return sectionSizes(s.opts.DiskPaths)
+	return sectionSizes(s.opts.DataPaths)
+}
+
+// StoreBytes implements StoreSizer: the durable store's size (StorePaths), reported
+// informationally (T6 ruling, 2026-10-05), never part of Resources' DiskBytes.
+func (s *Searchlight) StoreBytes(context.Context) (int64, string, error) {
+	if len(s.opts.StorePaths) == 0 {
+		return 0, "", nil
+	}
+	n, err := pathsSize(s.opts.StorePaths)
+	if err != nil {
+		return 0, "", err
+	}
+	return n, "du " + strings.Join(s.opts.StorePaths, " + "), nil
 }
 
 // dirSize sums the sizes of the regular files under root (or root itself).

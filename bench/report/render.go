@@ -308,9 +308,30 @@ func renderFootprint(w io.Writer, r *Run) {
 	if len(rows) == 0 {
 		return
 	}
-	fmt.Fprintf(w, "## Disk and memory\n\nThe running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load.\n\n")
+	fmt.Fprintf(w, "## Disk and memory\n\nThe running maximum of samples taken every 1.5 s across the whole run, so a mid-run spike (a merge, the percolator load, the mixed workload) is not missed by measuring only right after the load. "+
+		"\"Disk\" is the node-local index alone (target T6, ruled 2026-10-05); RSS is read the same way for both engines where possible (the source column says how for each row, so the methods can be checked against each other).\n\n")
 	table(w, []string{"engine", "disk", "disk per 1M docs", "RSS", "RSS per 1M docs", "how"}, rows)
+	renderStore(w, r)
 	renderSectionBreakdown(w, r)
+}
+
+// renderStore renders the durable store's size informationally (T6 ruling,
+// 2026-10-05): shared by every replica, not a per-node cost, so never part of the
+// disk column above or of T6's pass/fail.
+func renderStore(w io.Writer, r *Run) {
+	var rows [][]string
+	for _, eng := range []string{Searchlight, Elasticsearch} {
+		res := r.Find("footprint", eng)
+		if res == nil || res.Values["store_bytes"] <= 0 {
+			continue
+		}
+		rows = append(rows, []string{eng, FormatBytes(res.Values["store_bytes"]), FormatBytes(res.Values["store_per_million"])})
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "Durable store, informational only (not part of T6, and not the disk column above): the SQL store every replica shares, not a per-node cost. See issue #52 for shrinking it.\n\n")
+	table(w, []string{"engine", "store", "store per 1M docs"}, rows)
 }
 
 // sectionBreakdownOrder is the section-breakdown column order (largest, typically,

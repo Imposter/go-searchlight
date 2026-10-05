@@ -62,7 +62,8 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	recoveryIter := fs.Int("recovery-iterations", 3, "measured recoveries (new replicas from zero to serving)")
 	slURL := fs.String("sl-url", "", "the API URL of a Searchlight node run elsewhere (instead of --sl-bin)")
 	slToken := fs.String("sl-token", "", "with --sl-url: the bearer token")
-	slDisk := fs.String("sl-disk", "", "with --sl-url: comma-separated directories holding the node's data and database, for disk usage")
+	slDisk := fs.String("sl-disk", "", "with --sl-url: comma-separated directories holding the node's index (data_dir), for target T6's disk usage")
+	slStoreDisk := fs.String("sl-store-disk", "", "with --sl-url: comma-separated directories holding the node's durable store (e.g. the SQLite database), reported informationally, never part of T6's disk usage (2026-10-05 ruling: the store is shared by every replica, not a per-node cost)")
 	slPID := fs.Int("sl-pid", 0, "with --sl-url: the node's process id on this host (Linux: RSS from /proc; else /metrics)")
 	slConfig := fs.String("sl-config", "", "k=v,... describing Searchlight's configuration for the report")
 	pprofDir := fs.String("pprof-dir", "", "with --sl-bin: capture CPU, heap and mutex pprof profiles from Searchlight (admin pprof) bracketing each workload phase, written here (empty: off)")
@@ -124,7 +125,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	profilers := map[string]*workloads.PprofCapture{}
 	slCfg := keyValues(*slConfig)
 	slPIDFunc := func() int { return *slPID }
-	slDiskPaths := splitList(*slDisk)
+	slDataPaths, slStorePaths := splitList(*slDisk), splitList(*slStoreDisk)
 	if *slBin != "" {
 		if *slURL != "" {
 			return errors.New("give --sl-bin or --sl-url, not both")
@@ -139,7 +140,15 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		}
 		defer stop(stderr)
 		*slURL, *slToken = node.URL, node.Token
-		slPIDFunc, slDiskPaths = node.PID, node.DiskPaths()
+		slPIDFunc = node.PID
+		dataDir := node.DataDir()
+		slDataPaths = []string{dataDir}
+		slStorePaths = nil
+		for _, p := range node.DiskPaths() {
+			if p != dataDir {
+				slStorePaths = append(slStorePaths, p)
+			}
+		}
 		restarters[report.Searchlight] = workloads.Restarter{
 			Describe: "the node stopped gracefully and its binary started again",
 			Restart:  func(ctx context.Context) error { return node.Restart(ctx, nodeStopTimeout) },
@@ -179,7 +188,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	var engines []workloads.Engine
 	if *slURL != "" {
 		engines = append(engines, workloads.NewSearchlight(workloads.SearchlightOptions{
-			URL: *slURL, Token: *slToken, DiskPaths: slDiskPaths, PID: slPIDFunc, Config: slCfg, Log: stdout,
+			URL: *slURL, Token: *slToken, DataPaths: slDataPaths, StorePaths: slStorePaths, PID: slPIDFunc, Config: slCfg, Log: stdout,
 		}))
 	}
 	if *esURL != "" {

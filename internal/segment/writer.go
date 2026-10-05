@@ -365,7 +365,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 	}
 	runParallel(len(names), threads, func(i int) {
 		mu.Lock()
-		if failed || w.aborted() {
+		if failed || w.abort.Load() {
 			failed = true
 			mu.Unlock()
 			return
@@ -402,7 +402,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 			errs[i], failed = fw.err, true
 			return
 		}
-		if w.abort != nil && w.abort.Load() {
+		if w.abort.Load() {
 			buf.discard()
 			failed = true
 			return

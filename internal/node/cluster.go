@@ -49,7 +49,8 @@ type ShardTarget interface {
 	Search(ctx context.Context, r *search.Request) (*search.ShardResult, error)
 	// Fetch fills hits' bodies (limited to fields when set) from the generation the
 	// Search ran on. It fails with search.ErrStaleHit or ErrTargetLost when that
-	// generation is gone: the read starts again.
+	// generation is gone: the search runs the shard's query phase again on another
+	// target.
 	Fetch(ctx context.Context, hits []search.Hit, fields []string) error
 	// Percolate matches docs, analyzed under mapping (its catalogue JSON), against the
 	// copy's saved queries: the ids each document matches, in order.
@@ -66,8 +67,8 @@ type ShardTarget interface {
 }
 
 // ErrTargetLost is returned by a ShardTarget's Fetch when the copy its Search ran on
-// can no longer be reached (its node went away between the phases): the read starts
-// again on another copy.
+// can no longer be reached (its node went away between the phases): the search runs
+// the shard's query phase again on another copy.
 var ErrTargetLost = errors.New("node: the copy a read was using went away")
 
 // HostSpec is a shard copy the cluster gives this node.

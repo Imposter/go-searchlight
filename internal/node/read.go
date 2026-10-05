@@ -129,9 +129,9 @@ func (n *Single) validQuery(ctx context.Context, idx *index, q query.Node) error
 	return nil
 }
 
-// searchAttempts bounds a search's runs: one more when the copy a fetch needed went
-// away after its query phase.
-const searchAttempts = 2
+// requeryRounds bounds how many times a search runs the query phase again on the
+// shards whose fetch found their copy's generation gone.
+const requeryRounds = 3
 
 // Search implements [api.Coordinator]: a query-then-fetch over every shard, each
 // shard's generation held from its query to its fetch.
@@ -146,28 +146,36 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 		return nil, err
 	}
 	r.Index = name
-	for attempt := 1; ; attempt++ {
-		ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := searchTargets(ctx, ts, r)
-		stale := ts.stale() || n.stale()
-		ts.release()
-		if err == nil {
-			return &api.SearchResult{Response: resp, Stale: stale}, nil
-		}
-		if attempt == searchAttempts || ctx.Err() != nil || (!errors.Is(err, search.ErrStaleHit) && !errors.Is(err, ErrTargetLost)) {
-			return nil, err
-		}
+	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
+	if err != nil {
+		return nil, err
 	}
+	defer ts.release()
+	resp, err := searchTargets(ctx, ts, r, n.reacquirer(ctx, idx, opts.WaitForSeq))
+	if err != nil {
+		return nil, err
+	}
+	return &api.SearchResult{Response: resp, Stale: ts.stale() || n.stale()}, nil
+}
+
+// reacquirer returns a fresh read target for shard s of idx, for a search whose
+// target's generation went away between its phases: a cluster ranks the copy that lost
+// it after the others.
+func (n *Single) reacquirer(ctx context.Context, idx *index, waitSeq int64) func(s int) (ShardTarget, error) {
+	return func(s int) (ShardTarget, error) { return n.acquireShard(ctx, idx, s, waitSeq, false) }
 }
 
 // searchTargets searches ts, one per shard: in one pass with bodies when there is one
 // shard; otherwise the query phase per shard (NoBodies), the reduce, then the fetch of
 // the winning hits' bodies from the copies that found them (a hit's shard is the one
 // its id routes to).
-func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.Response, error) {
+//
+// A shard whose fetch finds its generation gone (the copy stopped, or the pin expired)
+// has its query phase run again on a target reacquire gives, which replaces it in ts;
+// the shards' results are then reduced again, so the hits, their order, the total and
+// the aggregations are those of the results the bodies come from. That happens at
+// most requeryRounds times, within ctx; past them the search is unavailable (503).
+func searchTargets(ctx context.Context, ts targets, r *search.Request, reacquire func(s int) (ShardTarget, error)) (*search.Response, error) {
 	if len(ts) == 1 {
 		sr, err := ts[0].Search(ctx, r)
 		if err != nil {
@@ -178,18 +186,63 @@ func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.
 	q := *r
 	q.NoBodies = true
 	results := make([]*search.ShardResult, len(ts))
-	errs := make([]error, len(ts))
-	var wg sync.WaitGroup
-	for i, t := range ts {
-		wg.Go(func() { results[i], errs[i] = t.Search(ctx, &q) })
-	}
-	wg.Wait()
-	if err := firstError(errs); err != nil {
+	if err := queryShards(ctx, ts, &q, results, nil); err != nil {
 		return nil, err
 	}
-	resp := search.ReduceContext(ctx, results, &q)
+	for round := 0; ; round++ {
+		resp := search.ReduceContext(ctx, results, &q)
+		lost, err := fetchHits(ctx, ts, resp, r.Fields)
+		if err != nil {
+			return nil, err
+		}
+		if len(lost) == 0 {
+			return resp, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		shards := slices.Sorted(maps.Keys(lost))
+		if round == requeryRounds {
+			return nil, api.Unavailable(lost[shards[0]], "the copies of shard %d of index %q went away during the search; retry", shards[0], r.Index)
+		}
+		for _, s := range shards {
+			t, err := reacquire(s)
+			if err != nil {
+				return nil, err
+			}
+			ts[s].Release()
+			ts[s] = t
+		}
+		if err := queryShards(ctx, ts, &q, results, shards); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// queryShards runs the query phase q on the shards given (every shard when nil),
+// together, into results.
+func queryShards(ctx context.Context, ts targets, q *search.Request, results []*search.ShardResult, shards []int) error {
+	if shards == nil {
+		shards = make([]int, len(ts))
+		for s := range shards {
+			shards[s] = s
+		}
+	}
+	errs := make([]error, len(ts))
+	var wg sync.WaitGroup
+	for _, s := range shards {
+		wg.Go(func() { results[s], errs[s] = ts[s].Search(ctx, q) })
+	}
+	wg.Wait()
+	return firstError(errs)
+}
+
+// fetchHits fills resp's hits' bodies, each shard's from its target, together. It
+// returns the shards whose generation was gone (search.ErrStaleHit, ErrTargetLost),
+// with why, and fails on any other error.
+func fetchHits(ctx context.Context, ts targets, resp *search.Response, fields []string) (map[int]error, error) {
 	if len(resp.Hits) == 0 {
-		return resp, nil
+		return nil, nil
 	}
 	byShard := map[int][]int{}
 	for i := range resp.Hits {
@@ -200,16 +253,16 @@ func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.
 		s := ShardFor(h.ID, len(ts))
 		byShard[s] = append(byShard[s], i)
 	}
-	ferrs := make([]error, len(ts))
-	for _, s := range slices.Sorted(maps.Keys(byShard)) {
+	errs := make([]error, len(ts))
+	var wg sync.WaitGroup
+	for s, pos := range byShard {
 		wg.Go(func() {
-			pos := byShard[s]
 			hits := make([]search.Hit, len(pos))
 			for k, i := range pos {
 				hits[k] = resp.Hits[i]
 			}
-			if err := ts[s].Fetch(ctx, hits, r.Fields); err != nil {
-				ferrs[s] = err
+			if err := ts[s].Fetch(ctx, hits, fields); err != nil {
+				errs[s] = err
 				return
 			}
 			for k, i := range pos {
@@ -218,10 +271,20 @@ func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.
 		})
 	}
 	wg.Wait()
-	if err := firstError(ferrs); err != nil {
-		return nil, err
+	var lost map[int]error
+	for s, err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, search.ErrStaleHit) || errors.Is(err, ErrTargetLost):
+			if lost == nil {
+				lost = map[int]error{}
+			}
+			lost[s] = err
+		default:
+			return nil, err
+		}
 	}
-	return resp, nil
+	return lost, nil
 }
 
 func firstError(errs []error) error {
@@ -364,7 +427,7 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 		return nil, err
 	}
 	defer ts.release()
-	resp, err := searchTargets(ctx, ts, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name})
+	resp, err := searchTargets(ctx, ts, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name}, n.reacquirer(ctx, idx, opts.WaitForSeq))
 	if err != nil {
 		return nil, err
 	}

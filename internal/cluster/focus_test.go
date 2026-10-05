@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
@@ -443,7 +444,8 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 }
 
 // TestFetchAfterPinLostRetries: when a peer loses the generation a search pinned (the
-// pin expires before the fetch), the search runs again and still answers.
+// pin expires before the fetch), the shard's query phase runs again and the search
+// still answers; when every round loses its pins, the client gets a 503 to retry.
 func TestFetchAfterPinLostRetries(t *testing.T) {
 	d := sqliteDB(t)
 	c := newCluster(t, d, func(_ int, o *Options) { o.PinTTL = time.Millisecond })
@@ -476,7 +478,10 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 	for _, tn := range c.live() {
 		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
 		if err != nil {
-			// Every attempt may lose its pins; the error must then be clean.
+			var ae *api.Error
+			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+				t.Fatalf("node %d: a search whose every round lost its pins failed with %v, want a 503", tn.i, err)
+			}
 			t.Logf("node %d: %v", tn.i, err)
 			continue
 		}

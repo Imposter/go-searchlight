@@ -48,11 +48,15 @@ import (
 //     file, fsynced, renamed, the directory fsynced): it is the copy's commit point, so
 //     a recovery cut short anywhere before it leaves a directory that opens empty.
 //
-// A peer whose snapshot holds segments of an older format major than this build writes
-// (an upgraded node that has not merged them away yet, or a node not yet upgraded) is
-// passed over while another peer may serve the copy in the current major, and tried
-// last: this build reads the previous major, so its segments are still usable, but a
-// copy fetched from it starts out in the older format.
+// A snapshot request names the newest segment format major the requester reads
+// (reads_major; a requester that predates the field reads 3) and, at first, the oldest
+// it wants (min_major). The peer checks both against its copy's segments before it
+// takes a snapshot, and refuses with a code the requester reads as "no source here":
+//   - segments newer than the requester reads (a node not yet upgraded, asking an
+//     upgraded peer during a rolling upgrade) would not open there;
+//   - segments older than min_major (a peer not yet upgraded, or one that has not merged
+//     them away) would open, but start the copy out in the older format: such a peer
+//     is tried again, without min_major, once every other peer has been.
 //
 // The tailer then opens the copy and replays the changelog from the snapshot's seq. When
 // no peer can serve the copy, the newest recovery bundle in the store's blobs is
@@ -78,6 +82,9 @@ var errEmptySource = fmt.Errorf("cluster: the peer's copy is empty: %w", replica
 // errOlderMajor is a peer whose snapshot holds segments of an older format major,
 // passed over for now.
 var errOlderMajor = errors.New("cluster: the peer's segments are in an older format major")
+
+// errNewerMajor is a peer whose segments are in a format this build does not read.
+var errNewerMajor = fmt.Errorf("cluster: the peer's segments are in a newer format than this build reads: %w", replica.ErrNoSource)
 
 // fetcher is the replica.Fetcher: peer recovery.
 type fetcher struct {
@@ -209,7 +216,7 @@ func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, 
 				break
 			}
 			errs = append(errs, err)
-			if errors.Is(err, errEmptySource) {
+			if errors.Is(err, errEmptySource) || errors.Is(err, errNewerMajor) {
 				break // nothing to fetch from this peer: try the next
 			}
 			n.log.WarnContext(ctx, "a peer recovery attempt failed", slog.String("shard", id.String()), slog.String("peer", c.node),
@@ -222,8 +229,8 @@ func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, 
 			delay *= 2
 		}
 	}
-	if !slices.ContainsFunc(errs, func(err error) bool { return !errors.Is(err, errEmptySource) }) {
-		return errEmptySource // no peer has anything yet
+	if !slices.ContainsFunc(errs, func(err error) bool { return !errors.Is(err, replica.ErrNoSource) }) {
+		return errEmptySource // no peer has anything this build can use
 	}
 	return fmt.Errorf("cluster: peer recovery of %s failed: %w", id, errors.Join(errs...))
 }
@@ -240,7 +247,18 @@ func (n *Node) stagingDir(id store.ShardID) string {
 func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, dir, staging string, anyMajor bool) (int64, error) {
 	n := f.n
 	var snap snapshotReply
-	if err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"snapshots", shardRef{Index: id.Index, Shard: id.Shard}, &snap); err != nil {
+	req := shardRef{Index: id.Index, Shard: id.Shard, ReadsMajor: segment.FormatMajor}
+	if !anyMajor {
+		req.MinMajor = segment.FormatMajor
+	}
+	if err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"snapshots", req, &snap); err != nil {
+		var ae *api.Error
+		switch {
+		case errors.As(err, &ae) && ae.Code == codeOlderSegments:
+			return 0, errOlderMajor
+		case errors.As(err, &ae) && ae.Code == codeNewerSegments:
+			return 0, errNewerMajor
+		}
 		return 0, err
 	}
 	defer n.background(func(bctx context.Context) {

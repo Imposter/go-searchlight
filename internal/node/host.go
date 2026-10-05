@@ -246,6 +246,33 @@ func (n *Single) LocalCopies() []LocalCopy {
 	return out
 }
 
+// SegmentMajors returns the oldest and newest segment format majors of this node's
+// serving copy of id ([shard.Generation.FormatMajors]): what a peer's recovery would
+// get from a snapshot, without taking one.
+func (n *Single) SegmentMajors(ctx context.Context, id store.ShardID) (oldest, newest int, err error) {
+	idx, err := n.lookup(ctx, id.Index)
+	if err != nil {
+		return 0, 0, err
+	}
+	if id.Shard < 0 || id.Shard >= len(idx.shards) {
+		return 0, 0, api.NotFound(api.CodeNotFound, "index %q has no shard %d", id.Index, id.Shard)
+	}
+	c := idx.shards[id.Shard].local.Load()
+	if c == nil {
+		return 0, 0, api.Unavailable(shard.ErrClosed, "this node holds no copy of %s", id)
+	}
+	if err := c.peerServing(); err != nil {
+		return 0, 0, err
+	}
+	g := c.shard().Acquire()
+	if g == nil {
+		return 0, 0, api.Unavailable(shard.ErrClosed, "%s is being swapped; retry", id)
+	}
+	defer g.Release()
+	oldest, newest = g.FormatMajors()
+	return oldest, newest, nil
+}
+
 // Snapshot takes a snapshot of this node's serving copy of id, for a peer's recovery.
 // Release it when done.
 func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapshot, error) {

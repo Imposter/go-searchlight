@@ -153,16 +153,9 @@ func (sn *Snapshot) MappingVersion() int64 { return sn.g.mp.version }
 // NumDocs is the live documents the snapshot holds.
 func (sn *Snapshot) NumDocs() uint64 { return sn.g.numDocs }
 
-// FormatMajor is the oldest segment format major among the snapshot's segments
-// (segment.FormatMajor when it has none): a copy made from it carries segments that
-// old until merges rewrite them.
-func (sn *Snapshot) FormatMajor() int {
-	major := segment.FormatMajor
-	for i := range sn.g.docs {
-		major = min(major, sn.g.docs[i].ref.reader.FormatMajor())
-	}
-	return major
-}
+// FormatMajors are the oldest and newest segment format majors among the snapshot's
+// segments ([Generation.FormatMajors]).
+func (sn *Snapshot) FormatMajors() (oldest, newest int) { return sn.g.FormatMajors() }
 
 // Files lists the snapshot's files, the manifest last.
 func (sn *Snapshot) Files() []SnapshotFile { return slices.Clone(sn.files) }

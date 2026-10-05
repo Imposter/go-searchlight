@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -310,4 +311,38 @@ func TestRecoveryPrefersCurrentMajor(t *testing.T) {
 	if streamed[1].Load() == 0 {
 		t.Fatal("node-2 fetched nothing from node-1")
 	}
+}
+
+// TestSnapshotRefusesWhatTheRequesterCannotUse: a snapshot request that names no
+// reads_major comes from a node that predates the field and reads format 3 only, so a
+// peer whose segments are newer refuses it before taking a snapshot; one that reads
+// them gets the snapshot; one asking for segments newer than the peer's is refused as
+// older.
+func TestSnapshotRefusesWhatTheRequesterCannotUse(t *testing.T) {
+	d := sqliteDB(t)
+	c := newCluster(t, d, nil)
+	a := c.start(0)
+	createIndex(t, a.n, "rm", 1, 0)
+	last := bulkLoad(t, a.n, "rm", 0, 500, 500)
+	waitCount(t, a.n, "rm", last, 500)
+	ask := func(ref shardRef) (snapshotReply, error) {
+		var snap snapshotReply
+		err := a.n.call(tctx(t), a.n.id, a.addr, http.MethodPost, peerPrefix+"snapshots", ref, &snap)
+		return snap, err
+	}
+	var ae *api.Error
+	if _, err := ask(shardRef{Index: "rm", Shard: 0}); !errors.As(err, &ae) || ae.Code != codeNewerSegments || ae.Status != http.StatusConflict {
+		t.Fatalf("a request without reads_major: %v, want a 409 %s", err, codeNewerSegments)
+	}
+	if _, err := ask(shardRef{Index: "rm", Shard: 0, ReadsMajor: segment.FormatMajor, MinMajor: segment.FormatMajor + 1}); !errors.As(err, &ae) || ae.Code != codeOlderSegments {
+		t.Fatalf("a request for newer segments: %v, want %s", err, codeOlderSegments)
+	}
+	snap, err := ask(shardRef{Index: "rm", Shard: 0, ReadsMajor: segment.FormatMajor, MinMajor: segment.FormatMajor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.FormatMajor != segment.FormatMajor || len(snap.Files) == 0 {
+		t.Fatalf("snapshot: format %d, %d files", snap.FormatMajor, len(snap.Files))
+	}
+	_ = a.n.call(tctx(t), a.n.id, a.addr, http.MethodDelete, peerPrefix+"snapshots/"+snap.ID, nil, nil)
 }

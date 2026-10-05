@@ -292,6 +292,22 @@ func (g *Generation) MappingVersion() int64 { return g.mp.version }
 // Mapping is the index mapping as of the generation's seq.
 func (g *Generation) Mapping() *schema.Mapping { return g.mapping }
 
+// FormatMajors are the oldest and newest segment format majors among the generation's
+// document segments, both segment.FormatMajor when it has none: a copy made from it
+// carries segments as old as oldest until merges rewrite them, and opens only where
+// newest is read.
+func (g *Generation) FormatMajors() (oldest, newest int) {
+	oldest, newest = segment.FormatMajor, 0
+	for i := range g.docs {
+		m := g.docs[i].ref.reader.FormatMajor()
+		oldest, newest = min(oldest, m), max(newest, m)
+	}
+	if newest == 0 {
+		newest = segment.FormatMajor
+	}
+	return oldest, newest
+}
+
 // NumDocs is how many live documents the generation holds.
 func (g *Generation) NumDocs() uint64 { return g.numDocs }
 

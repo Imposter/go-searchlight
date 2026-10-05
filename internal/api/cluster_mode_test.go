@@ -33,8 +33,6 @@ func TestSuitesOnSingleNodeCluster(t *testing.T) {
 		{"WaitForSeqTimesOut", TestWaitForSeqTimesOut, true},
 		{"InvalidUTF8CannotPoisonTheChangelog", TestInvalidUTF8CannotPoisonTheChangelog, false},
 	}
-	clusterMode.Store(true)
-	defer clusterMode.Store(false)
 	for _, s := range suites {
 		t.Run(s.name, func(t *testing.T) {
 			if s.heavy {

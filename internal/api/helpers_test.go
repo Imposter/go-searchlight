@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,16 +32,16 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
 
-// clusterMode makes newEnv serve the API over a one-node cluster.Node.
-var clusterMode atomic.Bool
+// clusterSuite is the test whose subtests newEnv serves over a one-node cluster.Node.
+const clusterSuite = "TestSuitesOnSingleNodeCluster"
 
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.DiscardHandler))
 	os.Exit(m.Run())
 }
 
-// env is an API served over a single node on a fresh SQLite store (or, while
-// clusterMode is set, over a cluster of one: cluster.Node must serve the API exactly as
+// env is an API served over a single node on a fresh SQLite store (or, under
+// clusterSuite, over a cluster of one: cluster.Node must serve the API exactly as
 // node.Single does).
 type env struct {
 	t      testing.TB
@@ -145,7 +144,7 @@ func newEnv(t testing.TB, o envOpts) *env {
 		o.node(&nopts)
 	}
 	var n api.Coordinator
-	if clusterMode.Load() {
+	if strings.HasPrefix(t.Name(), clusterSuite+"/") {
 		cn, err := cluster.New(context.Background(), cluster.Options{
 			Store: st, Config: cfg, Version: "test", Logger: slog.New(slog.DiscardHandler),
 			Engine: func(eo *node.Options) {

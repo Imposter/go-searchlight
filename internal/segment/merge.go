@@ -50,9 +50,10 @@ const mergeCheckDocs = 4096
 // inputs; the groups are then merged with everything else [writeSegmentParts] merges
 // parts with, so Merge is parallel the same way, and for the same reason, [Build] is.
 //
-// Merge holds no document in memory: term postings are read term by term into the
-// builders, and stored records and ids stream from the inputs, in order, as the merged
-// file is written.
+// Merge holds no document and no posting in memory: each field's term dictionaries are
+// a merge of the inputs' (already sorted) dictionaries, and stored records and ids
+// stream from the inputs, in order, as the merged file is written. What it accumulates
+// is per document: presence and marks, numbers, and each value and entry ordinal.
 func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOptions) (Meta, error) {
 	threads := opts.Threads
 	if threads < 1 {
@@ -106,7 +107,7 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 		flags |= flagMarksUntyped
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, uint32(total), flags, names, parts, storedFromReaders(inputs, remaps),
+	meta, err := writeSegmentParts(path, uint32(total), flags, names, parts, readersDicts(inputs, remaps), storedFromReaders(inputs, remaps),
 		idsFromReaders(inputs, remaps), threads, opts.Throttle, true, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
@@ -185,9 +186,9 @@ func mergeGroups(inputs []*Reader, remaps [][]int32, groups []readerRange, parts
 }
 
 // mergeGroup merges readers (a contiguous slice of Merge's inputs) into one
-// fieldBuilder per field they use, and sorts each builder's term dictionaries ready
-// for the merge-and-write pass. check, when set, is called with 0 every
-// mergeCheckDocs documents, and its error aborts the merge.
+// fieldBuilder per field they use: every per-document structure but the terms. check,
+// when set, is called with 0 every mergeCheckDocs documents, and its error aborts the
+// merge.
 func mergeGroup(readers []*Reader, remaps [][]int32, check func(int) error) (map[string]*fieldBuilder, error) {
 	fieldSet := map[string]bool{}
 	for _, r := range readers {
@@ -200,7 +201,6 @@ func mergeGroup(readers []*Reader, remaps [][]int32, check func(int) error) (map
 		builders[name] = newFieldBuilder()
 	}
 
-	var scratch []uint32
 	seen := 0
 	for ri, r := range readers {
 		remap := remaps[ri]
@@ -220,25 +220,11 @@ func mergeGroup(readers []*Reader, remaps [][]int32, check func(int) error) (map
 				mergeDoc(builders[name], fv, oldOrd, uint32(newOrd))
 			}
 		}
-		for name, fi := range r.fields {
-			b := builders[name]
-			var added bool
-			scratch, added = mergeTerms(&b.valuePairs, fi.dicts[KindValue], r.data, remap, scratch)
-			if added && fi.keywordCol != nil {
-				b.hasText = true
-			}
-			scratch, _ = mergeTerms(&b.entryPairs, fi.dicts[KindEntry], r.data, remap, scratch)
-			scratch, _ = mergeTerms(&b.wordPairs, fi.dicts[KindWord], r.data, remap, scratch)
-			scratch, _ = mergeTerms(&b.gramPairs, fi.dicts[KindGram], r.data, remap, scratch)
-		}
 		if check != nil {
 			if err := check(0); err != nil {
 				return nil, err
 			}
 		}
-	}
-	for _, b := range builders {
-		b.sortTermGroups()
 	}
 	return builders, nil
 }
@@ -351,8 +337,9 @@ func fieldViewsFor(r *Reader) map[string]*fieldViews {
 }
 
 // mergeDoc folds one reader's document oldOrd into b under its new ordinal: its
-// presence, truncated and untyped marks, and its number. Terms are merged term by term
-// (mergeTerms).
+// presence, truncated and untyped marks, its number, and whether it has text (a keyword
+// value, which a Build of it would have seen as Value.Text). Terms are merged from the
+// inputs' dictionaries as the file is written (readersDicts).
 func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 	if !fv.presence.Contains(oldOrd) {
 		return
@@ -364,6 +351,9 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 	if fv.untyped.Contains(oldOrd) {
 		b.untyped.Add(newOrd)
 	}
+	if kc := fv.fi.keywordCol; kc != nil && !b.hasText {
+		_, b.hasText = (KeywordColumn{c: kc}).Ord(oldOrd)
+	}
 	if nc := fv.fi.numberCol; nc != nil {
 		if v, ok := (NumericColumn{c: nc}).Value(oldOrd); ok {
 			b.numDocs = append(b.numDocs, docFloat{doc: newOrd, v: v})
@@ -371,34 +361,52 @@ func mergeDoc(b *fieldBuilder, fv *fieldViews, oldOrd, newOrd uint32) {
 	}
 }
 
-// mergeTerms merges one dictionary into pairs term by term, remapping and filtering
-// its postings, and reports whether it added any. Each term's new ordinals are added
-// only while they keep ascending, which [termPairs.add] requires: always so for a file
-// this package wrote (its postings ascend, and remap preserves order), and enforced
-// here so a damaged one cannot break that invariant, only lose documents. Documents at
-// or past the input's own count are never visited (see [appendDocs]). scratch is
-// returned for reuse.
-func mergeTerms(pairs *termPairs, dict *termDict, data []byte, remap []int32, scratch []uint32) ([]uint32, bool) {
-	if dict == nil {
-		return scratch, false
+// readersDicts is [Merge]'s dictSources: each input's dictionary of the field and
+// kind, in input order, remapped.
+func readersDicts(inputs []*Reader, remaps [][]int32) dictSources {
+	return func(name string, _ []*fieldBuilder, kind TermKind) []termSource {
+		var out []termSource
+		for i, r := range inputs {
+			if fi := r.fields[name]; fi != nil && fi.dicts[kind] != nil {
+				out = append(out, &readerSource{data: r.data, it: fi.dicts[kind].iter(0), remap: remaps[i]})
+			}
+		}
+		return out
 	}
-	limit := uint32(len(remap)) //nolint:gosec // remap has one entry per document ordinal, a uint32
-	added := false
-	it := dict.iter(0)
-	for it.next() {
-		scratch = appendDocs(data, it.info, limit, scratch[:0])
-		live := scratch[:0]
+}
+
+// readerSource is one input's dictionary as a termSource: every term with at least one
+// live document, its documents remapped to merged ordinals. A term's new ordinals are
+// kept only while they keep ascending, which a merged dictionary requires: always so
+// for a file this package wrote (its postings ascend, and remap preserves order), and
+// enforced here so a damaged one cannot break that invariant, only lose documents.
+// Documents at or past the input's own count are never visited (see [appendDocs]).
+type readerSource struct {
+	data  []byte
+	it    *termIter
+	remap []int32
+	docs  []uint32
+}
+
+func (s *readerSource) next() bool {
+	limit := uint32(len(s.remap)) //nolint:gosec // remap has one entry per document ordinal, a uint32
+	for s.it.next() {
+		s.docs = appendDocs(s.data, s.it.info, limit, s.docs[:0])
+		live := s.docs[:0]
 		last := int32(-1)
-		for _, old := range scratch {
-			if newOrd := remap[old]; newOrd > last {
+		for _, old := range s.docs {
+			if newOrd := s.remap[old]; newOrd > last {
 				live = append(live, uint32(newOrd)) //nolint:gosec // newOrd > last >= -1
 				last = newOrd
 			}
 		}
+		s.docs = live
 		if len(live) > 0 {
-			pairs.addRun(it.term, live)
-			added = true
+			return true
 		}
 	}
-	return scratch, added
+	return false
 }
+
+func (s *readerSource) term() []byte                     { return s.it.term }
+func (s *readerSource) appendDocs(dst []uint32) []uint32 { return append(dst, s.docs...) }

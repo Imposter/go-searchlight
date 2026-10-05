@@ -693,3 +693,28 @@ func TestCraftedFailSafelyNamed(t *testing.T) {
 		})
 	}
 }
+
+// TestHeldFieldsSpill: with every held field spilled to a temp file, Build and Merge
+// write the same bytes at any thread count, and leave no temp file behind.
+func TestHeldFieldsSpill(t *testing.T) {
+	defer func(n int) { spillAt = n }(spillAt)
+	docs := genCorpus(400)
+	dir := t.TempDir()
+	want := buildBytes(t, dir, "t1", docs, 1)
+	spillAt = 64
+	for _, threads := range []int{2, 7} {
+		if got := buildBytes(t, dir, fmt.Sprintf("t%d", threads), docs, threads); !bytes.Equal(got, want) {
+			t.Fatalf("Threads %d with spilling wrote different bytes", threads)
+		}
+	}
+	checkMergeEqualsRebuild(t, docs, 3, true)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != FileExt {
+			t.Fatalf("left behind %s", e.Name())
+		}
+	}
+}

@@ -172,27 +172,24 @@ func fnv1a(b []byte) uint64 {
 // add records one occurrence of term in doc. Must be called with doc non-decreasing
 // across calls for the same term (true of every call site: [Build] and [Merge] each
 // hand one fieldBuilder a strictly ascending run of document ordinals).
+//
+// A term's first document is kept in its group alone (lastDoc), and moves to the slab
+// with its second: most terms of a value or id field occur once, and a slab block for
+// each would cost slabBlockSize ordinals apiece.
 func (t *termPairs) add(term []byte, doc uint32) {
 	idx := t.findOrCreate(term)
 	g := &t.groups[idx]
-	if g.hasDoc && g.lastDoc == doc {
+	switch {
+	case !g.hasDoc:
+	case g.lastDoc == doc:
 		return // the same term occurring again in the same document: nothing new
-	}
-	g.head, g.tail = t.slab.append(g.head, g.tail, doc)
-	g.lastDoc, g.hasDoc = doc, true
-}
-
-// addRun records term in each of docs (ascending, and after any doc term already has),
-// finding its group once.
-func (t *termPairs) addRun(term []byte, docs []uint32) {
-	g := &t.groups[t.findOrCreate(term)]
-	for _, doc := range docs {
-		if g.hasDoc && g.lastDoc == doc {
-			continue
-		}
+	case g.head < 0:
+		g.head, g.tail = t.slab.append(g.head, g.tail, g.lastDoc)
+		fallthrough
+	default:
 		g.head, g.tail = t.slab.append(g.head, g.tail, doc)
-		g.lastDoc, g.hasDoc = doc, true
 	}
+	g.lastDoc, g.hasDoc = doc, true
 }
 
 // findOrCreate returns term's group index, interning term into the arena and adding a
@@ -245,6 +242,12 @@ func (t *termPairs) growTable() {
 func (t *termPairs) termBytes(g *termGroup) []byte { return t.arena[g.off : g.off+g.length] }
 
 func (t *termPairs) appendDocs(g *termGroup, dst []uint32) []uint32 {
+	if g.head < 0 {
+		if g.hasDoc {
+			dst = append(dst, g.lastDoc)
+		}
+		return dst
+	}
 	return t.slab.appendDocs(g.head, dst)
 }
 
@@ -345,48 +348,38 @@ type docOrd struct{ doc, ord uint32 }
 // ordinal order, with its combined docs. ef lets postings be Elias-Fano coded. Returns
 // the dictionary's offset (0 if every part is empty) and how many distinct terms it
 // holds.
-func writeMergedDict(w *fileWriter, parts []*termPairs, ef bool, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
-	cursor := make([]int, len(parts))
-	anyLeft := func() bool {
-		for p := range parts {
-			if cursor[p] < len(parts[p].groups) {
-				return true
-			}
-		}
-		return false
+func writeMergedDict(w *fileWriter, srcs []termSource, ef bool, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
+	live := make([]bool, len(srcs))
+	anyLeft := false
+	for i, src := range srcs {
+		live[i] = src.next()
+		anyLeft = anyLeft || live[i]
 	}
-	if !anyLeft() {
+	if !anyLeft {
 		return 0, 0
 	}
 	enc := newPostingsEncoder()
 	dw := newDictWriter(w, enc, ef)
 	var ord uint32
 	docBuf := make([]uint32, 0, 64)
-	for anyLeft() {
-		// The smallest current term is tracked by which part holds it (minPart), never
-		// by whether minTerm is nil: "" is a real term, and a part whose arena holds
+	matched := make([]int, 0, len(srcs))
+	for anyLeft {
+		// The smallest current term is tracked by which source holds it (minSrc), never
+		// by whether minTerm is nil: "" is a real term, and a source whose arena holds
 		// nothing but "" hands it back as a nil slice, which a nil-means-unset check
-		// would mistake for "no minimum yet" and let a later part's term beat it.
+		// would mistake for "no minimum yet" and let a later source's term beat it.
 		var minTerm []byte
-		minPart := -1
-		for p := range parts {
-			if cursor[p] >= len(parts[p].groups) {
-				continue
-			}
-			term := parts[p].termBytes(&parts[p].groups[cursor[p]])
-			if minPart < 0 || bytes.Compare(term, minTerm) < 0 {
-				minTerm, minPart = term, p
+		minSrc := -1
+		for i, src := range srcs {
+			if live[i] && (minSrc < 0 || bytes.Compare(src.term(), minTerm) < 0) {
+				minTerm, minSrc = src.term(), i
 			}
 		}
-		docBuf = docBuf[:0]
-		for p := range parts {
-			if cursor[p] >= len(parts[p].groups) {
-				continue
-			}
-			g := &parts[p].groups[cursor[p]]
-			if bytes.Equal(parts[p].termBytes(g), minTerm) {
-				docBuf = parts[p].appendDocs(g, docBuf)
-				cursor[p]++
+		docBuf, matched = docBuf[:0], matched[:0]
+		for i, src := range srcs {
+			if live[i] && bytes.Equal(src.term(), minTerm) {
+				docBuf = src.appendDocs(docBuf)
+				matched = append(matched, i)
 			}
 		}
 		dw.add(minTerm, docBuf)
@@ -394,6 +387,14 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, ef bool, onTerm func(ord
 			onTerm(ord, docBuf)
 		}
 		ord++
+		// Only now: advancing a source may overwrite the term minTerm points into.
+		anyLeft = false
+		for _, i := range matched {
+			live[i] = srcs[i].next()
+		}
+		for i := range srcs {
+			anyLeft = anyLeft || live[i]
+		}
 	}
 	off, ok := dw.finish()
 	if !ok {
@@ -402,22 +403,63 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, ef bool, onTerm func(ord
 	return off, ord
 }
 
+// termSource is one sorted run of a dictionary's terms, each with its documents: a
+// part's accumulated groups ([Build]), or an input's dictionary with its postings
+// remapped and its deleted documents dropped ([Merge]). Sources of one dictionary
+// cover disjoint, ascending document ranges, in order.
+type termSource interface {
+	// next moves to the next term (the first, on the first call); false at the end.
+	next() bool
+	// term is the current term, valid until next.
+	term() []byte
+	// appendDocs appends the current term's documents, ascending.
+	appendDocs(dst []uint32) []uint32
+}
+
+// dictSources returns the term sources of field name's kind dictionary, given the
+// field's parts.
+type dictSources func(name string, parts []*fieldBuilder, kind TermKind) []termSource
+
+// pairsSource is a part's groups, already sorted.
+type pairsSource struct {
+	p *termPairs
+	i int
+}
+
+func (s *pairsSource) next() bool                       { s.i++; return s.i < len(s.p.groups) }
+func (s *pairsSource) term() []byte                     { return s.p.termBytes(&s.p.groups[s.i]) }
+func (s *pairsSource) appendDocs(dst []uint32) []uint32 { return s.p.appendDocs(&s.p.groups[s.i], dst) }
+
+// partsDicts is [Build]'s dictSources: every part's accumulated groups.
+func partsDicts(_ string, parts []*fieldBuilder, kind TermKind) []termSource {
+	out := make([]termSource, len(parts))
+	for i, p := range parts {
+		out[i] = &pairsSource{p: p.pairs(kind), i: -1}
+	}
+	return out
+}
+
+// pairs returns b's accumulator for kind.
+func (b *fieldBuilder) pairs(kind TermKind) *termPairs {
+	switch kind {
+	case KindEntry:
+		return &b.entryPairs
+	case KindWord:
+		return &b.wordPairs
+	case KindGram:
+		return &b.gramPairs
+	}
+	return &b.valuePairs
+}
+
 // writeFieldDicts writes one field's four term dictionaries (terms section), merging
 // parts (one fieldBuilder per worker that built any of this field, each already
 // term-sorted) and recording each document's value and entry ordinals into s for
 // writeFieldDocValues. Word and gram postings may be Elias-Fano coded; value and entry
 // postings, which filters read, stay roaring views.
-func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
-	sel := func(which func(*fieldBuilder) *termPairs) []*termPairs {
-		out := make([]*termPairs, len(parts))
-		for i, p := range parts {
-			out[i] = which(p)
-		}
-		return out
-	}
+func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts dictSources, s *fieldScratch) {
 	var off uint64
-	off, s.numValueTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.valuePairs }), false,
+	off, s.numValueTerms = writeMergedDict(w, dicts(name, parts, KindValue), false,
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
@@ -426,8 +468,7 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	if s.numValueTerms > 0 {
 		s.out.dictOff[KindValue] = off + 1
 	}
-	off, s.numEntryTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.entryPairs }), false,
+	off, s.numEntryTerms = writeMergedDict(w, dicts(name, parts, KindEntry), false,
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
@@ -436,10 +477,10 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	if s.numEntryTerms > 0 {
 		s.out.dictOff[KindEntry] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), true, nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindWord), true, nil); n > 0 {
 		s.out.dictOff[KindWord] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), true, nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindGram), true, nil); n > 0 {
 		s.out.dictOff[KindGram] = off + 1
 	}
 }

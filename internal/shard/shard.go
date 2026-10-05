@@ -176,8 +176,8 @@ type Options struct {
 	Index string
 	Shard int
 	// RefreshInterval is how often the buffer is refreshed in the background
-	// (refresh_interval). 0 means one second; a negative value disables background
-	// refresh (Refresh still works).
+	// (refresh_interval), on a fixed grid from Open. 0 means one second; a negative value
+	// disables background refresh (Refresh still works).
 	RefreshInterval time.Duration
 	// SeqPersistInterval is how often a seq that moved with no new segment (a refresh
 	// of an empty buffer after Advance) is written to the manifest
@@ -954,36 +954,47 @@ func wake(ch chan struct{}) {
 	}
 }
 
+// refreshLoop refreshes on a fixed grid of Options.RefreshInterval from Open, and at
+// once when a full buffer wakes it; it persists a moved seq every SeqPersistInterval.
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
 	warn := rateLimitedWarn{clock: s.opts.Clock, every: time.Minute}
-	var tick, persist <-chan time.Time
-	if s.opts.RefreshInterval > 0 {
-		t := s.opts.Clock.NewTicker(s.opts.RefreshInterval)
-		defer t.Stop()
-		tick = t.C()
-	}
+	var persist <-chan time.Time
 	if s.opts.SeqPersistInterval > 0 {
 		t := s.opts.Clock.NewTicker(s.opts.SeqPersistInterval)
 		defer t.Stop()
 		persist = t.C()
 	}
+	grid := clock.NewGrid(s.opts.Clock.Now(), s.opts.RefreshInterval)
 	for {
+		var tick <-chan time.Time
+		var timer clock.Timer
+		if next, ok := grid.Next(s.opts.Clock.Now()); ok {
+			timer = s.opts.Clock.NewTimer(s.opts.Clock.Until(next))
+			tick = timer.C()
+		}
+		persisting := false
 		select {
 		case <-s.bg.Done():
-			return
 		case <-persist:
-			if s.Err() == nil {
-				if err := s.persistSeq(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
-					s.log.WarnContext(s.bg, "persisting the seq failed", slog.Any("error", err))
-				}
-			}
-			continue
+			persisting = true
 		case <-tick:
 		case <-s.refreshWake:
 		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if s.bg.Err() != nil {
+			return
+		}
 		if s.Err() != nil {
 			continue // a failed shard stays as it is until it is reopened
+		}
+		if persisting {
+			if err := s.persistSeq(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
+				s.log.WarnContext(s.bg, "persisting the seq failed", slog.Any("error", err))
+			}
+			continue
 		}
 		if err := s.Refresh(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
 			if suppressed, ok := warn.allow(); ok {

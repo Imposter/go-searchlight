@@ -699,32 +699,13 @@ func (n *Single) runTailer(ctx context.Context, idx *index, c *copyState) {
 	n.log.ErrorContext(ctx, "shard copy halted", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 }
 
-// refresher refreshes an index's copies every refresh interval (which settings may
-// change at any time).
+// refresher refreshes an index's copies on a fixed grid of its refresh interval, which
+// settings may change at any time (re-anchoring the grid).
 func (n *Single) refresher(ctx context.Context, idx *index) {
 	defer idx.wg.Done()
 	warn := time.Time{}
-	for {
-		d := time.Duration(idx.refresh.Load())
-		var tick <-chan time.Time
-		var timer clock.Timer
-		if d > 0 {
-			timer = n.clock.NewTimer(d)
-			tick = timer.C()
-		}
-		select {
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			return
-		case <-idx.refreshWake:
-			if timer != nil {
-				timer.Stop()
-			}
-			continue
-		case <-tick:
-		}
+	interval := func() time.Duration { return time.Duration(idx.refresh.Load()) }
+	runGrid(ctx, n.clock, interval, idx.refreshWake, func() {
 		for _, c := range idx.copies() {
 			sh := c.shard()
 			if sh == nil || sh.Err() != nil {
@@ -734,6 +715,35 @@ func (n *Single) refresher(ctx context.Context, idx *index) {
 				warn = n.clock.Now()
 				n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 			}
+		}
+	})
+}
+
+// runGrid calls tick on a fixed grid of interval() ([clock.Grid]), anchored when it
+// starts and again at every wake (the interval changed), until ctx ends. Ticks never
+// overlap: one that overruns skips the grid points it missed rather than running again
+// at once to catch up. While interval() is 0 or less nothing ticks.
+func runGrid(ctx context.Context, clk clock.Clock, interval func() time.Duration, wake <-chan struct{}, tick func()) {
+	grid := clock.NewGrid(clk.Now(), interval())
+	for {
+		var fire <-chan time.Time
+		var timer clock.Timer
+		if next, ok := grid.Next(clk.Now()); ok {
+			timer = clk.NewTimer(clk.Until(next))
+			fire = timer.C()
+		}
+		select {
+		case <-ctx.Done():
+		case <-wake:
+			grid = clock.NewGrid(clk.Now(), interval())
+		case <-fire:
+			tick()
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }

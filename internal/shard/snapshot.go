@@ -63,7 +63,7 @@ func (s *Shard) Snapshot(ctx context.Context) (*Snapshot, error) {
 		return nil, err
 	}
 	sn := &Snapshot{g: g, dir: s.dir, mem: map[string][]byte{}}
-	if err := sn.build(s.marksUntyped); err != nil {
+	if err := sn.build(); err != nil {
 		g.Release()
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func (s *Shard) Snapshot(ctx context.Context) (*Snapshot, error) {
 }
 
 // build lists the generation's files and encodes its sidecars and manifest.
-func (sn *Snapshot) build(marksUntyped bool) error {
+func (sn *Snapshot) build() error {
 	g := sn.g
 	entries, err := os.ReadDir(sn.dir)
 	if err != nil {
@@ -130,9 +130,7 @@ func (sn *Snapshot) build(marksUntyped bool) error {
 	if err != nil {
 		return err
 	}
-	if marksUntyped {
-		man.UntypedMarks = untypedMarksFormat
-	}
+	man.UntypedMarks = legacyMarks(g.docs)
 	raw, err := encodeManifest(man)
 	if err != nil {
 		return err
@@ -154,6 +152,17 @@ func (sn *Snapshot) MappingVersion() int64 { return sn.g.mp.version }
 
 // NumDocs is the live documents the snapshot holds.
 func (sn *Snapshot) NumDocs() uint64 { return sn.g.numDocs }
+
+// FormatMajor is the oldest segment format major among the snapshot's segments
+// (segment.FormatMajor when it has none): a copy made from it carries segments that
+// old until merges rewrite them.
+func (sn *Snapshot) FormatMajor() int {
+	major := segment.FormatMajor
+	for i := range sn.g.docs {
+		major = min(major, sn.g.docs[i].ref.reader.FormatMajor())
+	}
+	return major
+}
 
 // Files lists the snapshot's files, the manifest last.
 func (sn *Snapshot) Files() []SnapshotFile { return slices.Clone(sn.files) }

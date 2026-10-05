@@ -16,13 +16,11 @@ import (
 
 // Merges.
 //
-// segment.Merge is in memory: it reads every live input document's stored body into
-// memory before writing the merged file, so a merge needs about its result's stored
-// size in RAM (TieredPolicy.MaxMergedBytes, 1 GiB by default, bounds it), and its
-// accumulation phase cannot be cancelled: only the write phase checks the budget's
-// throttle, and through it the context. Close therefore waits for a merge in its
-// accumulation phase to reach its first write. (A streaming, cancellable merge is
-// parked to Task 14.)
+// segment.Merge accumulates its result's terms in memory, term by term, and streams
+// stored bodies and ids from its inputs as it writes, so a merge needs about its
+// result's postings in RAM (TieredPolicy.MaxMergedBytes, 1 GiB by default, bounds it).
+// Both phases check the budget's throttle, and through it the context, so Close
+// cancels a merge wherever it is.
 //
 // The merge loop asks the policy for merges after every publish, reserves their inputs
 // (a reserved segment is in no other merge), and runs each in its own goroutine, which
@@ -256,15 +254,18 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 	}
 
 	readers := make([]*segment.Reader, len(p.inputs))
+	marks := true
 	for i, ref := range p.inputs {
 		readers[i] = ref.reader
+		marks = marks && ref.marks
 	}
 	var written int64
 	name := newSegmentName()
 	meta, err := segment.Merge(s.dir, readers, snap, segment.MergeOptions{
-		Name:      name,
-		Threads:   threads,
-		NoDirSync: true, // the flush syncs the directory
+		Name:         name,
+		Threads:      threads,
+		NoDirSync:    true, // the flush syncs the directory
+		MarksUntyped: marks,
 		Throttle: func(n int) error {
 			written += int64(n)
 			return s.opts.MergeBudget.throttle(ctx, n)

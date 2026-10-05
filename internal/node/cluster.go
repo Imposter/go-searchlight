@@ -88,6 +88,9 @@ type HostSpec struct {
 	Fetcher replica.Fetcher
 	// Startup marks a copy the node took as it started: readiness waits on it.
 	Startup bool
+	// Served, when set, is called after every read that acquires the copy, local or
+	// a peer's (tests check the cluster's serving invariant with it).
+	Served func()
 }
 
 // IndexView describes an index as the cluster allocates it.

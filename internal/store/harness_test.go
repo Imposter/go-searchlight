@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +38,8 @@ var quiet = WithLogger(slog.New(slog.DiscardHandler))
 type harness struct {
 	dialect string
 	url     string
+	path    string
+	seed    sync.Once
 }
 
 // forEachDialect runs fn on a fresh database of every available dialect.
@@ -59,6 +62,11 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, h *harness)) {
 	})
 }
 
+func forEachDurableDialect(t *testing.T, fn func(t *testing.T, h *harness)) {
+	t.Helper()
+	forEachDialect(t, func(t *testing.T, h *harness) { fn(t, h.durable()) })
+}
+
 func randName(prefix string) string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
@@ -66,6 +74,10 @@ func randName(prefix string) string {
 }
 
 func sqliteURL(path string) string {
+	return durableSQLiteURL(path) + "?_synchronous=OFF"
+}
+
+func durableSQLiteURL(path string) string {
 	path = filepath.ToSlash(path)
 	if strings.HasPrefix(path, "/") {
 		return "sqlite://" + path
@@ -74,7 +86,65 @@ func sqliteURL(path string) string {
 }
 
 func sqliteHarness(t testing.TB) *harness {
-	return &harness{dialect: "sqlite", url: sqliteURL(filepath.Join(t.TempDir(), "searchlight.db"))}
+	path := filepath.Join(t.TempDir(), "searchlight.db")
+	return &harness{dialect: "sqlite", url: sqliteURL(path), path: path}
+}
+
+func durableSQLiteHarness(t testing.TB) *harness {
+	path := filepath.Join(t.TempDir(), "searchlight.db")
+	return &harness{dialect: "sqlite", url: durableSQLiteURL(path), path: path}
+}
+
+func (h *harness) durable() *harness {
+	if h.dialect != "sqlite" {
+		return h
+	}
+	return &harness{dialect: h.dialect, url: durableSQLiteURL(h.path), path: h.path}
+}
+
+var sqliteTemplate = sync.OnceValues(func() (map[string][]byte, error) {
+	dir, err := os.MkdirTemp("", "store-template")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "template.db")
+	ctx := context.Background()
+	st, err := Open(ctx, sqliteURL(path), quiet)
+	if err != nil {
+		return nil, err
+	}
+	if err := errors.Join(st.Migrate(ctx), st.Close()); err != nil {
+		return nil, err
+	}
+	files := map[string][]byte{}
+	for _, suffix := range []string{"", "-wal"} {
+		b, err := os.ReadFile(path + suffix)
+		switch {
+		case errors.Is(err, os.ErrNotExist) && suffix != "":
+		case err != nil:
+			return nil, err
+		default:
+			files[suffix] = b
+		}
+	}
+	return files, nil
+})
+
+func seedSQLite(t testing.TB, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	files, err := sqliteTemplate()
+	if err != nil {
+		t.Fatalf("migrate the template database: %v", err)
+	}
+	for suffix, b := range files {
+		if err := os.WriteFile(path+suffix, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // postgresHarness creates a schema for the test and points search_path at it.
@@ -175,6 +245,9 @@ func mysqlHarness(t testing.TB, base string) *harness {
 // another node's connection to the same database.
 func (h *harness) open(t testing.TB, opts ...Option) Store {
 	t.Helper()
+	if h.path != "" {
+		h.seed.Do(func() { seedSQLite(t, h.path) })
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	st, err := Open(ctx, h.url, append([]Option{quiet}, opts...)...)

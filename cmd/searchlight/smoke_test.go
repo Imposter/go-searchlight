@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 const (
@@ -28,9 +30,7 @@ const (
 // or past the last write's seq, and a restarted node must reopen those shards (not
 // rebuild them) at that seq and serve the data.
 func TestSmokeBinary(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds and runs the binary")
-	}
+	testtier.Heavy(t)
 	if ok, why := canInterrupt(); !ok {
 		t.Skip(why)
 	}

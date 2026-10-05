@@ -5,14 +5,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestNodeLifecycle builds the binary and runs a node on SQLite: it serves on the same
 // URL after a graceful restart and after a kill, and a stop exits cleanly.
 func TestNodeLifecycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds and runs the binary")
-	}
+	testtier.Heavy(t)
 	ctx := t.Context()
 	dir := t.TempDir()
 	bin, err := Build(ctx, dir, "slproc-test")

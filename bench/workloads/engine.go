@@ -117,10 +117,11 @@ const (
 // way a production search client would, and logs each retry and the error a request
 // ultimately fails with to log (nil discards them).
 type client struct {
-	base  string
-	token string
-	http  *http.Client
-	log   io.Writer
+	base    string
+	token   string
+	http    *http.Client
+	log     io.Writer
+	retries int
 }
 
 func newClient(base, token string, log io.Writer) *client {
@@ -135,7 +136,7 @@ func newClient(base, token string, log io.Writer) *client {
 	if log == nil {
 		log = io.Discard
 	}
-	return &client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Transport: tr, Timeout: 10 * time.Minute}, log: log}
+	return &client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{Transport: tr, Timeout: 10 * time.Minute}, log: log, retries: maxRetries}
 }
 
 // retryDelay is how long to wait before retrying attempt (0-based), honoring a
@@ -165,7 +166,7 @@ func (c *client) do(ctx context.Context, method, path, contentType string, body 
 		switch {
 		case err == nil:
 			return b, nil
-		case !errors.As(err, &st) || !retryableStatus(st.Status) || attempt >= maxRetries:
+		case !errors.As(err, &st) || !retryableStatus(st.Status) || attempt >= c.retries:
 			if lastErr != nil {
 				fmt.Fprintf(c.log, "%s %s %s: failed after %d attempt(s), last error: %v\n",
 					time.Now().Format(time.RFC3339), method, path, attempt+1, err)
@@ -175,7 +176,7 @@ func (c *client) do(ctx context.Context, method, path, contentType string, body 
 		lastErr = err
 		wait := retryDelay(attempt, st.RetryAfter)
 		fmt.Fprintf(c.log, "%s %s %s: HTTP %d (attempt %d/%d), retrying in %s: %s\n",
-			time.Now().Format(time.RFC3339), method, path, st.Status, attempt+1, maxRetries+1, wait, st.Body)
+			time.Now().Format(time.RFC3339), method, path, st.Status, attempt+1, c.retries+1, wait, st.Body)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()

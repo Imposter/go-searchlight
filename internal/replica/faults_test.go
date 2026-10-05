@@ -159,7 +159,7 @@ func TestStoreFaults(t *testing.T) {
 // TestCrashPoints kills a copy in the middle of a snapshot load, of a wipe, and of a
 // fetch; started again over the same directory, it converges.
 func TestCrashPoints(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
+	forEachDurableDialect(t, func(t *testing.T, d *db) {
 		st := d.open(t)
 		createIndex(t, st, "cp", testMapping)
 		id := ShardID{Index: "cp", Shard: 0}

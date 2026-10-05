@@ -16,6 +16,7 @@ import (
 	"github.com/Imposter/go-searchlight/bench/report"
 	"github.com/Imposter/go-searchlight/internal/slproc"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 func slbench(t *testing.T, stdin string, args ...string) (int, string) {
@@ -30,9 +31,7 @@ func slbench(t *testing.T, stdin string, args ...string) (int, string) {
 // report: the harness works end to end. With SEARCHLIGHT_TEST_PG_URL set, the recovery
 // workload runs too, on a schema of its own.
 func TestEndToEndBinary(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds the binary and runs every workload")
-	}
+	testtier.Heavy(t)
 	dir := t.TempDir()
 	bin, err := slproc.Build(t.Context(), dir, "bench-test")
 	if err != nil {

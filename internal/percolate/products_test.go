@@ -116,14 +116,17 @@ func BenchmarkPercolateProducts(b *testing.B) {
 }
 
 // BenchmarkPercolateProductsMemory builds and opens a query segment of 1M saved
-// searches, compiles every class, and reports the live heap it holds and its file
-// size. Run it with -benchtime 1x.
+// searches and percolates 200 documents against it one by one, reporting the live heap
+// the open segment holds before and after, its file size, the part of the file
+// percolation reads (hot: all but the stored queries), and the documents' latency. Run
+// it with -benchtime 1x.
 func BenchmarkPercolateProductsMemory(b *testing.B) {
 	const n = 1_000_000
 	qs := make([]shard.StoredQuery, n)
 	for i := range qs {
 		qs[i] = productSearch(b, int64(i))
 	}
+	docs := productDocs(b, productsMapping(b), 200_000, 200)
 	dir := b.TempDir()
 	for b.Loop() {
 		size, err := (Index{}).Build(context.Background(), dir, "m", qs, nil)
@@ -132,18 +135,34 @@ func BenchmarkPercolateProductsMemory(b *testing.B) {
 		}
 		before := liveHeap()
 		start := time.Now()
-		qs2, err := (Index{}).Open(dir, "m")
+		opened, err := (Index{}).Open(dir, "m")
 		if err != nil {
 			b.Fatal(err)
 		}
-		seg, ok := qs2.(*Segment)
+		seg, ok := opened.(*Segment)
 		if !ok {
-			b.Fatalf("Open returned %T", qs2)
+			b.Fatalf("Open returned %T", opened)
 		}
 		b.ReportMetric(time.Since(start).Seconds(), "open-s")
 		b.ReportMetric(float64(liveHeap()-before)/(1<<20), "heap-MiB")
+		sc := new(scratch)
+		sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
+		v := &view{seg: seg, n: seg.NumQueries()}
+		var lat []time.Duration
+		for i := range docs {
+			t0 := clockNow()
+			seg.collect(&docs[i], sc)
+			var st docStats
+			verify(v, sc, &st)
+			sc.results()
+			sc.reset()
+			lat = append(lat, clockSince(t0))
+		}
+		b.ReportMetric(float64(liveHeap()-before)/(1<<20), "heap-after-MiB")
 		b.ReportMetric(float64(size)/(1<<20), "file-MiB")
-		runtime.KeepAlive(seg)
+		b.ReportMetric(float64(size-int64(len(seg.records)+len(seg.offsets)))/(1<<20), "hot-MiB")
+		reportLatency(b, lat)
+		runtime.KeepAlive(sc)
 		_ = seg.Close()
 	}
 	runtime.KeepAlive(qs)

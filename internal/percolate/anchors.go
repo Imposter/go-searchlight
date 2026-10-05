@@ -159,39 +159,40 @@ func Extract(n query.Node, stats TermStats) Anchors {
 	return Anchors{Terms: set.terms, Ranges: set.ranges, Pairs: set.pairs, Cost: set.cost}
 }
 
-// Filter is a cheap condition stored with a query's term postings: a document holding
-// the term is a candidate only if its value of Field passes too. It is a conjunct at
-// the query's root, so every match passes it. Bool filters on Value.Bool (Lo is 1 for
-// true, 0 for false); the others on Value.Number lying in [Lo, Hi].
-type Filter struct {
-	Field  string
-	Bool   bool
-	Lo, Hi float64
+// postFilter is a cheap condition stored with a query's term postings: a document
+// holding the term is a candidate only if its value of field passes too. It is a
+// conjunct at the query's root, so every match passes it. A bool filter is on
+// Value.Bool (lo is 1 for true, 0 for false); the others on Value.Number lying in
+// [lo, hi].
+type postFilter struct {
+	field  string
+	isBool bool
+	lo, hi float64
 }
 
 // postingFilter chooses the filter for a query anchored on terms alone: the first
 // range on a finite number (as a closed range: lt and gt keep their bound, which only
 // admits a candidate the program then refuses), else the first eq on a bool, among
 // the leaves at n's root. False when there is none.
-func postingFilter(n query.Node, set *aset) (Filter, bool) {
+func postingFilter(n query.Node, set *aset) (postFilter, bool) {
 	if !set.ok || len(set.terms) == 0 || len(set.ranges) > 0 || len(set.pairs) > 0 {
-		return Filter{}, false
+		return postFilter{}, false
 	}
-	var flag Filter
+	var flag postFilter
 	found := false
 	for _, l := range rootLeaves(n) {
 		a := l.Decoded()
 		switch l.Op {
 		case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween:
 			if lo, hi, ok := leafRange(l, &a); ok {
-				return Filter{Field: l.Field, Lo: lo, Hi: hi}, true
+				return postFilter{field: l.Field, lo: lo, hi: hi}, true
 			}
 		case query.OpEq:
 			switch {
 			case a.Kind == query.ArgNumber && a.Scalar.Finite:
-				return Filter{Field: l.Field, Lo: a.Scalar.Number, Hi: a.Scalar.Number}, true
+				return postFilter{field: l.Field, lo: a.Scalar.Number, hi: a.Scalar.Number}, true
 			case a.Kind == query.ArgBool && !found:
-				flag, found = Filter{Field: l.Field, Bool: true, Lo: boolNumber(a.Scalar.Bool), Hi: boolNumber(a.Scalar.Bool)}, true
+				flag, found = postFilter{field: l.Field, isBool: true, lo: boolNumber(a.Scalar.Bool), hi: boolNumber(a.Scalar.Bool)}, true
 			}
 		}
 	}
@@ -256,17 +257,17 @@ type fact struct {
 // A leaf at n's root that every route implies holds on every candidate, so the rest is
 // n without it. Pair anchors prove nothing (the pair fallback adds a query on one
 // half), and neither do grams, trigram keys or words.
-func provenRest(n query.Node, set *aset, filter Filter, filtered bool) (query.Node, string) {
+func provenRest(n query.Node, set *aset, filter postFilter, filtered bool) (query.Node, string) {
 	if !set.ok || len(set.pairs) > 0 || len(set.terms)+len(set.ranges) == 0 {
 		return n, ""
 	}
 	routes := make([][]fact, 0, len(set.terms)+len(set.ranges))
 	for _, t := range set.terms {
 		r := []fact{{term: t, isTerm: true}}
-		if filtered && filter.Bool {
-			r = append(r, fact{term: Term{Kind: AtomBool, Field: filter.Field, Term: boolTerm(filter.Lo == 1)}, isTerm: true})
+		if filtered && filter.isBool {
+			r = append(r, fact{term: Term{Kind: AtomBool, Field: filter.field, Term: boolTerm(filter.lo == 1)}, isTerm: true})
 		} else if filtered {
-			r = append(r, fact{field: filter.Field, lo: filter.Lo, hi: filter.Hi})
+			r = append(r, fact{field: filter.field, lo: filter.lo, hi: filter.hi})
 		}
 		routes = append(routes, r)
 	}

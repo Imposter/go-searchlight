@@ -45,7 +45,7 @@ import (
 //	           and count, filtered offset and count
 //	terms      the dictionary terms
 //	postings   u32 ranks, ascending per entry and per pair
-//	filtered   24 bytes per filtered posting (see Filter), ascending per entry: its rank,
+//	filtered   24 bytes per filtered posting (see postFilter in anchors.go), ascending per entry: its rank,
 //	           field<<1|bool, and the range (lo, hi) the field's value must lie in
 //	partners   8 bytes per dictionary entry: the first pair record it owns and how many (a member's only)
 //	pairs      12 bytes per pair: its partner (a member entry), postings offset and count
@@ -372,7 +372,7 @@ func (b *segmentBuilder) add(rank uint32, src []byte) error {
 	for _, t := range set.terms {
 		if filtered {
 			b.postFiltered(t.Kind, b.field(t.Field), t.Term, filteredPost{
-				rank: rank, field: b.field(filter.Field), isBool: filter.Bool, lo: filter.Lo, hi: filter.Hi,
+				rank: rank, field: b.field(filter.field), isBool: filter.isBool, lo: filter.lo, hi: filter.hi,
 			})
 		} else {
 			b.post(t.Kind, b.field(t.Field), t.Term, rank)

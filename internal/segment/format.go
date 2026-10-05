@@ -169,6 +169,41 @@ func (k TermKind) String() string {
 // Valid reports whether k is one of the term kinds.
 func (k TermKind) Valid() bool { return k < numKinds }
 
+// Errors that classify why a shard copy's files do not open. A copy whose data is
+// damaged or of a format this build no longer reads is rebuilt; one written in a newer
+// format is refused and left as it is, never rebuilt over: a binary rolled back must
+// not destroy what its successor wrote.
+var (
+	// ErrCorrupt marks data that fails its checksum, does not parse, or is missing
+	// where a manifest lists it: a [CorruptError] matches it, and the shard and
+	// percolator wrap their own damage in it.
+	ErrCorrupt = errors.New("segment: corrupt")
+	// ErrNewerFormat marks a file written in a format newer than this build reads.
+	ErrNewerFormat = errors.New("segment: written in a newer format than this build reads")
+	// ErrOlderFormat marks a file written in a format older than this build reads.
+	ErrOlderFormat = errors.New("segment: written in an older format than this build reads")
+)
+
+// Rebuildable reports whether err, from opening a shard copy, means its files must be
+// wiped and the copy rebuilt: they are damaged ([ErrCorrupt]) or of a format this
+// build no longer reads ([ErrOlderFormat]). A newer format, and any other error (I/O,
+// permissions, resources), is not.
+func Rebuildable(err error) bool {
+	return errors.Is(err, ErrCorrupt) || errors.Is(err, ErrOlderFormat)
+}
+
+// FormatError classifies a format version found against the one this build reads:
+// [ErrNewerFormat] or [ErrOlderFormat] (nil when they are equal).
+func FormatError(found, reads uint64) error {
+	switch {
+	case found > reads:
+		return ErrNewerFormat
+	case found < reads:
+		return ErrOlderFormat
+	}
+	return nil
+}
+
 // CorruptError is a segment file that fails its checksum or does not parse.
 type CorruptError struct {
 	Path    string
@@ -183,6 +218,9 @@ func (e *CorruptError) Error() string {
 	return fmt.Sprintf("segment %s: corrupt: %s", e.Path, e.Reason)
 }
 
+// Unwrap makes a CorruptError match [ErrCorrupt].
+func (e *CorruptError) Unwrap() error { return ErrCorrupt }
+
 // VersionError is a segment file written by a format major this build does not read.
 type VersionError struct {
 	Path         string
@@ -193,6 +231,9 @@ func (e *VersionError) Error() string {
 	return fmt.Sprintf("segment %s: format %d.%d is not readable by format %d.%d",
 		e.Path, e.Major, e.Minor, FormatMajor, FormatMinor)
 }
+
+// Unwrap makes a VersionError match [ErrNewerFormat] or [ErrOlderFormat].
+func (e *VersionError) Unwrap() error { return FormatError(uint64(e.Major), FormatMajor) }
 
 // errShort is a structure that runs past the end of its bytes.
 var errShort = errors.New("truncated structure")

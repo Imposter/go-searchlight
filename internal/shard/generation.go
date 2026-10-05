@@ -1,8 +1,12 @@
 package shard
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -331,12 +335,12 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 	for _, ms := range man.Segments {
 		r, err := segment.Open(filepath.Join(s.dir, ms.ID+segment.FileExt))
 		if err != nil {
-			return fail(fmt.Errorf("shard: segment %s: %w", ms.ID, err))
+			return fail(fmt.Errorf("shard: segment %s: %w", ms.ID, missingIsCorrupt(err)))
 		}
 		ref := &segRef{id: ms.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: ms.Bytes, reader: r}
 		docs = append(docs, segState{ref: ref, deletes: emptyDeletes})
 		if r.NumDocs() != ms.Docs {
-			return fail(fmt.Errorf("shard: segment %s holds %d documents, the manifest says %d", ms.ID, r.NumDocs(), ms.Docs))
+			return fail(fmt.Errorf("shard: %w: segment %s holds %d documents, the manifest says %d", segment.ErrCorrupt, ms.ID, r.NumDocs(), ms.Docs))
 		}
 		if err := s.loadDeletes(&docs[len(docs)-1], ms); err != nil {
 			return fail(err)
@@ -344,16 +348,17 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 	}
 	for _, ms := range man.QuerySegments {
 		if ms.Format != s.opts.QueryIndex.Format() {
-			return fail(fmt.Errorf("shard: query segment %s is in format %q, the query index builds %q", ms.ID, ms.Format, s.opts.QueryIndex.Format()))
+			return fail(fmt.Errorf("shard: query segment %s is in format %q, the query index builds %q: %w", ms.ID, ms.Format, s.opts.QueryIndex.Format(),
+				queryFormatError(ms.Format, s.opts.QueryIndex.Format())))
 		}
 		qs, err := s.opts.QueryIndex.Open(s.dir, ms.ID)
 		if err != nil {
-			return fail(fmt.Errorf("shard: query segment %s: %w", ms.ID, err))
+			return fail(fmt.Errorf("shard: query segment %s: %w", ms.ID, missingIsCorrupt(err)))
 		}
 		ref := &segRef{id: ms.ID, kind: kindQueries, numDocs: qs.NumQueries(), bytes: ms.Bytes, format: ms.Format, qs: qs}
 		queries = append(queries, segState{ref: ref, deletes: emptyDeletes})
 		if qs.NumQueries() != ms.Docs {
-			return fail(fmt.Errorf("shard: query segment %s holds %d queries, the manifest says %d", ms.ID, qs.NumQueries(), ms.Docs))
+			return fail(fmt.Errorf("shard: %w: query segment %s holds %d queries, the manifest says %d", segment.ErrCorrupt, ms.ID, qs.NumQueries(), ms.Docs))
 		}
 		if err := s.loadDeletes(&queries[len(queries)-1], ms); err != nil {
 			return fail(err)
@@ -367,20 +372,46 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 func (s *Shard) loadDeletes(st *segState, ms manifestSegment) error {
 	if ms.DelGen == 0 {
 		if ms.Deleted != 0 {
-			return fmt.Errorf("shard: segment %s: the manifest counts %d deletes but names no sidecar", ms.ID, ms.Deleted)
+			return fmt.Errorf("shard: %w: segment %s: the manifest counts %d deletes but names no sidecar", segment.ErrCorrupt, ms.ID, ms.Deleted)
 		}
 		return nil
 	}
 	del, err := segment.LoadDeletes(s.dir, ms.ID, ms.DelGen)
 	if err != nil {
-		return fmt.Errorf("shard: segment %s deletes: %w", ms.ID, err)
+		return fmt.Errorf("shard: segment %s deletes: %w", ms.ID, missingIsCorrupt(err))
 	}
 	if del.GetCardinality() != uint64(ms.Deleted) {
-		return fmt.Errorf("shard: segment %s: its deletes sidecar holds %d, the manifest says %d", ms.ID, del.GetCardinality(), ms.Deleted)
+		return fmt.Errorf("shard: %w: segment %s: its deletes sidecar holds %d, the manifest says %d", segment.ErrCorrupt, ms.ID, del.GetCardinality(), ms.Deleted)
 	}
 	if !del.IsEmpty() && del.Maximum() >= st.ref.numDocs {
-		return fmt.Errorf("shard: segment %s: a delete past its %d documents", ms.ID, st.ref.numDocs)
+		return fmt.Errorf("shard: %w: segment %s: a delete past its %d documents", segment.ErrCorrupt, ms.ID, st.ref.numDocs)
 	}
 	st.deletes, st.delGen = del, ms.DelGen
 	return nil
+}
+
+// missingIsCorrupt marks a file the manifest lists but the directory lacks as
+// corruption (segment.ErrCorrupt); any other error is returned as it is.
+func missingIsCorrupt(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: a file the manifest lists is missing: %w", segment.ErrCorrupt, err)
+	}
+	return err
+}
+
+// queryFormatError classifies a query segment's format against the one the query
+// index builds: the same builder in a newer or an older version
+// (segment.ErrNewerFormat, segment.ErrOlderFormat), or another builder's, which this
+// node cannot use and rebuilds (segment.ErrOlderFormat).
+func queryFormatError(found, builds string) error {
+	fName, fVer, fOK := strings.Cut(found, "/")
+	bName, bVer, bOK := strings.Cut(builds, "/")
+	f, ferr := strconv.ParseUint(fVer, 10, 32)
+	b, berr := strconv.ParseUint(bVer, 10, 32)
+	if fOK && bOK && fName == bName && ferr == nil && berr == nil {
+		if err := segment.FormatError(f, b); err != nil {
+			return err
+		}
+	}
+	return segment.ErrOlderFormat
 }

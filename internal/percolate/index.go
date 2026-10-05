@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
@@ -123,6 +124,9 @@ type CorruptError struct {
 func (e *CorruptError) Error() string {
 	return fmt.Sprintf("percolate: query segment %s: corrupt: %s", e.Path, e.Why)
 }
+
+// Unwrap makes a CorruptError match segment.ErrCorrupt.
+func (e *CorruptError) Unwrap() error { return segment.ErrCorrupt }
 
 // Index is the percolator's [shard.QueryIndexBuilder]: set it as the shard's
 // Options.QueryIndex. Its zero value is ready to use.
@@ -691,7 +695,8 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		return nil, corrupt("bad magic")
 	}
 	if v := u32(body, len(fileMagic)); v != formatVersion {
-		return nil, corrupt("format version %d, this build reads %d", v, formatVersion)
+		return nil, fmt.Errorf("percolate: query segment %s: format version %d, this build reads %d: %w",
+			path, v, formatVersion, segment.FormatError(uint64(v), formatVersion))
 	}
 	if c := u32(body, len(fileMagic)+4); c != numSections {
 		return nil, corrupt("%d sections, want %d", c, numSections)

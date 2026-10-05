@@ -158,9 +158,11 @@ data_dir/
 - **Caches.** The filter cache keeps per-segment bitmaps of frequent leaves, and needs no
   invalidation because segments are immutable. The OS page cache holds the mmap'd
   files.
-- **Format versions.** The segment format is versioned (major 3). A node refuses a
-  segment whose major it does not know, and a bad checksum makes the copy recover rather
-  than serve it: a copy whose files do not open is wiped and rebuilt like a new one.
+- **Format versions.** The segment format is versioned (major 3). A copy whose files
+  are damaged (a bad checksum, a damaged manifest, a listed file missing:
+  `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
+  served. A copy of a newer format (`segment.ErrNewerFormat`) is refused and left as it
+  is, and any other open failure (I/O, permissions) is retried, never wiped.
 
 ### Search
 

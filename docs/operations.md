@@ -464,8 +464,11 @@ Notes:
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
   is one migration, the initial schema.
-- **Segment format.** It is versioned. A node refuses segments of a format major it does
-  not know, and rebuilds that copy rather than serving it.
+- **Segment format.** It is versioned. A node rebuilds a copy whose segments are of a
+  format older than it reads. A copy in a **newer** format is refused and left as it is
+  (`shard copy is in a newer format than this binary reads`): a binary rolled back never
+  destroys what its successor wrote. Roll forward again, or wipe that node's `data_dir`
+  to have it rebuild from its peers or the database.
 - **Readiness gates traffic.** A restarted node reports ready only after its copies have
   finished their startup recovery. Until then, the other nodes serve its shards.
 
@@ -483,7 +486,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total` |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
-| Refresh, flush and merge | `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
+| Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
 | Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
 | Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
@@ -612,8 +615,11 @@ of the earlier one ages out after 10 s.
   its segments.
 - **`shard copy does not open; wiping it to rebuild`.** A copy's files failed their
   checks when the node opened them: a segment failing its checksum, a damaged manifest,
-  or a segment format this binary does not read. The copy is never served; it is wiped
-  and rebuilt like a new one (from a peer, a recovery bundle or the database). Repeated
-  on a node, suspect its disk.
+  a file the manifest lists gone missing, or a format older than this binary reads. The
+  copy is never served; it is wiped and rebuilt like a new one (from a peer, a recovery
+  bundle or the database). Repeated on a node, suspect its disk.
+  `searchlight_shard_open_failures_total` counts these by `reason`: `corrupt` (wiped),
+  `newer_format` (refused, see [upgrades](#upgrades-and-rolling-restarts)) and `error`
+  (an I/O, permission or resource failure: nothing is wiped, and the allocator retries).
 - **Profiling.** Set `pprof=true`, then
   `go tool pprof http://<node>:8781/debug/pprof/profile?seconds=30`.

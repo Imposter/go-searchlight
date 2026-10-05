@@ -1,7 +1,9 @@
 package node_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/storetest"
@@ -1063,12 +1066,10 @@ func TestAcquireRechecksTheCopy(t *testing.T) {
 	}
 }
 
-// TestCorruptSegmentIsRebuilt: a copy whose segment fails its checksum when the node
-// opens it is never served: the node wipes it and the copy is rebuilt from the store,
-// whole.
-func TestCorruptSegmentIsRebuilt(t *testing.T) {
-	cfg := testConfig(t)
-	st := openStore(t, cfg)
+// closedCopy writes 40 documents to a one-shard index on a node, closes the node and
+// returns the copy's directory and the last write's seq.
+func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, int64) {
+	t.Helper()
 	n := open(t, cfg, st, nil)
 	if _, err := n.CreateIndex(ctx(t), "c", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
 		t.Fatal(err)
@@ -1084,25 +1085,99 @@ func TestCorruptSegmentIsRebuilt(t *testing.T) {
 	if err := n.Close(ctx(t)); err != nil {
 		t.Fatal(err)
 	}
-	segs, err := filepath.Glob(filepath.Join(cfg.DataDir, "indexes", "*", "0", "*.seg"))
-	if err != nil || len(segs) == 0 {
-		t.Fatalf("no segment to corrupt under %s: %v", cfg.DataDir, err)
+	dirs, err := filepath.Glob(filepath.Join(cfg.DataDir, "indexes", "*", "0"))
+	if err != nil || len(dirs) != 1 {
+		t.Fatalf("the copy's directory under %s: %v %v", cfg.DataDir, dirs, err)
 	}
-	raw, err := os.ReadFile(segs[0])
+	return dirs[0], res.Seq
+}
+
+// segmentsOf lists the segment files in dir.
+func segmentsOf(t *testing.T, dir string) []string {
+	t.Helper()
+	segs, err := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("no segment in %s: %v", dir, err)
+	}
+	return segs
+}
+
+// TestCorruptSegmentIsRebuilt: a copy whose segment fails its checksum when the node
+// opens it is never served: the node wipes it and the copy is rebuilt from the store,
+// whole.
+func TestCorruptSegmentIsRebuilt(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, seq := closedCopy(t, cfg, st)
+	seg := segmentsOf(t, dir)[0]
+	raw, err := os.ReadFile(seg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw[len(raw)/2] ^= 0xff
-	if err := os.WriteFile(segs[0], raw, 0o600); err != nil {
+	if err := os.WriteFile(seg, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	n2 := open(t, cfg, st, nil)
 	waitReady(t, n2)
-	if got := count(t, n2, "c", &query.All{}, res.Seq); got != 40 {
+	if got := count(t, n2, "c", &query.All{}, seq); got != 40 {
 		t.Fatalf("after the corrupt copy was rebuilt count = %d, want 40", got)
 	}
-	if _, err := os.Stat(segs[0]); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the corrupt segment %s is still there: %v", segs[0], err)
+	if _, err := os.Stat(seg); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the corrupt segment %s is still there: %v", seg, err)
+	}
+}
+
+// TestNewerFormatSegmentIsRefused: a copy holding a segment of a newer format than this
+// build reads is refused, and its files are left as they are: a binary rolled back
+// must not destroy its successor's copy.
+func TestNewerFormatSegmentIsRefused(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, _ := closedCopy(t, cfg, st)
+	seg := segmentsOf(t, dir)[0]
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[8:], segment.FormatMajor+1)
+	if err := os.WriteFile(seg, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, Logger: quiet})
+	if !errors.Is(err, segment.ErrNewerFormat) {
+		t.Fatalf("opening a copy of a newer format: %v, want segment.ErrNewerFormat", err)
+	}
+	if got, err := os.ReadFile(seg); err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("the newer-format segment was not left as it was: %v", err)
+	}
+}
+
+// TestUnreadableCopyIsNotWiped: a copy whose files cannot be read for a reason other
+// than their content (here its manifest is a directory: an I/O error, as a permission
+// or a resource error would be) is not wiped: the error is returned, and the files stay.
+func TestUnreadableCopyIsNotWiped(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, _ := closedCopy(t, cfg, st)
+	segs := segmentsOf(t, dir)
+	manifest := filepath.Join(dir, "manifest")
+	if err := os.Rename(manifest, manifest+".aside"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(manifest, "in-the-way"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, Logger: quiet})
+	if err == nil || segment.Rebuildable(err) {
+		t.Fatalf("opening a copy whose manifest cannot be read: %v, want an error that is not corruption", err)
+	}
+	for _, seg := range segs {
+		if _, err := os.Stat(seg); err != nil {
+			t.Errorf("the copy was wiped over an I/O error: %v", err)
+		}
 	}
 }

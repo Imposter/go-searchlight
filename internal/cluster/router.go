@@ -341,7 +341,7 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 
 // Fetch fills hits' bodies from the generation the query phase pinned. When the pin is
 // gone (410) the copy is suspected, so the query phase the engine runs again for the
-// shard goes to another copy first; an unreachable peer is suspected by readCall.
+// shard goes to another copy first.
 func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []string) error {
 	if t.chosen == nil || t.pin == "" {
 		return fmt.Errorf("%w: no pinned generation to fetch from", search.ErrStaleHit)

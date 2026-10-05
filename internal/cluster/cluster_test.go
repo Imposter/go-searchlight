@@ -311,15 +311,15 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		var (
 			c        *cluster
-			stopping atomic.Int32 // 1 + the node about to stop; 0 when none
+			stopping atomic.Pointer[tnode]
 			crossed  atomic.Int64
 			gone     atomic.Int64
 		)
 		c = newCluster(t, d, func(i int, o *Options) {
 			o.Transport = &goneFetches{base: http.DefaultTransport.(*http.Transport).Clone(), gone: &gone} //nolint:forcetypeassert,errcheck // the default transport is an *http.Transport
 			o.hooks.pinned = func(id store.ShardID, _ string) {
-				if stopping.Load() == int32(i+1) {
-					holdPinned(c.node(i).n, id, &crossed)
+				if tn := stopping.Load(); tn != nil && tn.i == i {
+					holdPinned(tn.n, id, &crossed)
 				}
 			}
 		})
@@ -377,10 +377,10 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			})
 			slowRetire := func() { time.Sleep(50 * time.Millisecond) }
 			c.node(i).wrap.onRetire.Store(&slowRetire)
-			stopping.Store(int32(i + 1))
+			stopping.Store(c.node(i))
 			time.Sleep(200 * time.Millisecond)
 			c.node(i).stop()
-			stopping.Store(0)
+			stopping.Store(nil)
 			time.Sleep(500 * time.Millisecond)
 			c.start(i)
 			waitCopies(t, others[0].st, "roll", 3, 2, 60*time.Second)

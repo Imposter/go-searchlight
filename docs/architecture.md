@@ -179,9 +179,10 @@ data_dir/
    bodies are fetched. The copy pins its generation between the two phases (a peer for
    `PinTTL`, 30 s), and a pin outlives its copy's serving: a copy that retires or
    closes between the phases still answers the fetch. A shard whose fetch finds its
-   pin gone anyway (expired, or its node stopped) has its query phase run again on
-   another copy, up to three times within the request's deadline, and the shards'
-   results are reduced again.
+   pin gone anyway (expired, or its node stopped) has its query phase run again,
+   preferring another copy, up to three times within the request's deadline and what
+   is left of its `timeout`, and the shards' results are reduced again; only the
+   shards run again are fetched again.
 
 ### Percolator
 

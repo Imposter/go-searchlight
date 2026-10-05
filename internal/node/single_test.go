@@ -73,6 +73,23 @@ func open(t *testing.T, cfg config.Config, st store.Store, mod func(*node.Option
 	return n
 }
 
+// waitServing waits until every copy of n serves: CreateIndex waits for a new index's
+// copies only up to max_lag, and a busy disk can stretch their first flush past it.
+func waitServing(t *testing.T, n *node.Single) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		h, err := n.Health(ctx(t))
+		if err == nil && h.Unassigned == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the copies never served: %+v %v", h, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // waitReady waits until n is ready: after a restart its copies recover (resume
 // from their segments) before they serve.
 func waitReady(t *testing.T, n *node.Single) {
@@ -685,6 +702,7 @@ func TestDatabaseUnreachable(t *testing.T) {
 	if _, err := n.CreateIndex(ctx(t), "s", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
 		t.Fatal(err)
 	}
+	waitServing(t, n)
 	res := mustWrite(t, n, "s", upsert("a", `{"x": 1}`),
 		api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "x", "op": "eq", "value": 1}`), Meta: json.RawMessage(`{"m": 1}`)})
 	sr, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: res.Seq})
@@ -857,6 +875,7 @@ func TestDatabaseHangs(t *testing.T) {
 	if _, err := n.CreateIndex(ctx(t), "h", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
 		t.Fatal(err)
 	}
+	waitServing(t, n)
 	res := mustWrite(t, n, "h", upsert("a", `{"x": 1}`))
 	if got := count(t, n, "h", &query.All{}, res.Seq); got != 1 {
 		t.Fatalf("count = %d", got)

@@ -41,6 +41,18 @@ func OpenCopy(ctx context.Context, root string, m *schema.Mapping, opts shard.Op
 	return shard.Open(ctx, dir, m, opts)
 }
 
+// WipeCopy removes the shard copy rooted at root, whatever it holds, so the next
+// OpenCopy opens it empty. The current copy's manifest goes first, so a crash part way
+// leaves a copy that opens empty rather than one missing files its manifest lists.
+func WipeCopy(root string) error {
+	if dir, err := CopyDir(root); err == nil {
+		if err := shard.Discard(dir); err != nil {
+			return err
+		}
+	}
+	return os.RemoveAll(root)
+}
+
 // CopyDir returns the directory of root's current copy.
 func CopyDir(root string) (string, error) {
 	raw, err := os.ReadFile(filepath.Join(root, currentFile)) //nolint:gosec // root is the copy's own directory, the node's choice

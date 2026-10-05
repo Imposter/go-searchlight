@@ -632,8 +632,20 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		n.opts.ShardOptions(&opts)
 	}
 	// A copy rebuilt aside lives in a subdirectory its root names: open the
-	// current one (and collect what a crash or a swap left behind).
-	sh, err := replica.OpenCopy(ctx, idx.copyRoot(s), state.mapping, opts)
+	// current one (and collect what a crash or a swap left behind). The directory is a
+	// cache of the store: one that does not open (a segment failing its checksum, a
+	// damaged manifest, a format this build does not read) is wiped, and the copy,
+	// opened empty, is rebuilt from a peer or the store, never served (spec section 10).
+	root := idx.copyRoot(s)
+	sh, err := replica.OpenCopy(ctx, root, state.mapping, opts)
+	if err != nil && ctx.Err() == nil {
+		n.log.WarnContext(ctx, "shard copy does not open; wiping it to rebuild",
+			slog.String(telemetry.KeyIndex, idx.name), slog.Int(telemetry.KeyShard, s), slog.Any("error", err))
+		if werr := replica.WipeCopy(root); werr != nil {
+			return fmt.Errorf("node: open %s: %w (wiping it failed: %w)", sl.id, err, werr)
+		}
+		sh, err = replica.OpenCopy(ctx, root, state.mapping, opts)
+	}
 	if err != nil {
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}

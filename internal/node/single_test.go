@@ -1042,3 +1042,47 @@ func TestAcquireRechecksTheCopy(t *testing.T) {
 		t.Errorf("a read racing the copy going recovering: %v", err)
 	}
 }
+
+// TestCorruptSegmentIsRebuilt: a copy whose segment fails its checksum when the node
+// opens it is never served: the node wipes it and the copy is rebuilt from the store,
+// whole.
+func TestCorruptSegmentIsRebuilt(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	n := open(t, cfg, st, nil)
+	if _, err := n.CreateIndex(ctx(t), "c", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	var ops []api.WriteOp
+	for i := range 40 {
+		ops = append(ops, upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"n": %d, "title": "item %d"}`, i, i)))
+	}
+	res := mustWrite(t, n, "c", ops...)
+	if got := count(t, n, "c", &query.All{}, res.Seq); got != 40 {
+		t.Fatalf("count = %d", got)
+	}
+	if err := n.Close(ctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := filepath.Glob(filepath.Join(cfg.DataDir, "indexes", "*", "0", "*.seg"))
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("no segment to corrupt under %s: %v", cfg.DataDir, err)
+	}
+	raw, err := os.ReadFile(segs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0xff
+	if err := os.WriteFile(segs[0], raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	n2 := open(t, cfg, st, nil)
+	waitReady(t, n2)
+	if got := count(t, n2, "c", &query.All{}, res.Seq); got != 40 {
+		t.Fatalf("after the corrupt copy was rebuilt count = %d, want 40", got)
+	}
+	if _, err := os.Stat(segs[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the corrupt segment %s is still there: %v", segs[0], err)
+	}
+}

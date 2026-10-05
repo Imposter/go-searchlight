@@ -1116,7 +1116,7 @@ func (s *suite) percolation(ctx context.Context) error {
 				op := func(ctx context.Context, i int) (int, time.Duration, error) {
 					start := (i * batch) % len(pool)
 					docs := pool[start:min(start+batch, len(pool))]
-					_, err := eng.Percolate(ctx, s.cfg.PercIndex, docs)
+					_, _, _, err := eng.Percolate(ctx, s.cfg.PercIndex, docs)
 					return len(docs), 0, err
 				}
 				s.add(s.result(name, report.GroupPercolate, fmt.Sprintf("%d documents per request against %d saved searches", batch, n), eng, o, Run(ctx, o, op)))
@@ -1124,12 +1124,33 @@ func (s *suite) percolation(ctx context.Context) error {
 			name = fmt.Sprintf("percolate_single_%d", n)
 			if s.cfg.wants(name, report.GroupPercolate) {
 				o := RunOptions{Warmup: max(s.cfg.PercolateSingle/10, 5), Iterations: s.cfg.PercolateSingle, Concurrency: 1}
+				// serverHist collects the engine's own reported server time (target T5's
+				// p99-per-document clause is judged on this, like Elasticsearch's "took"),
+				// alongside the measured op's end-to-end latency (still the Result's main
+				// Latency, kept for information). i >= o.Warmup excludes warmup calls the
+				// same way Run's own measured-phase histogram does (iteration numbers
+				// continue from the warmup across repeats too: see runRepeated).
+				serverHist := NewHistogram()
+				var serverMu sync.Mutex
 				op := func(ctx context.Context, i int) (int, time.Duration, error) {
-					_, err := eng.Percolate(ctx, s.cfg.PercIndex, pool[i%len(pool):i%len(pool)+1])
+					_, server, serverOK, err := eng.Percolate(ctx, s.cfg.PercIndex, pool[i%len(pool):i%len(pool)+1])
+					if err == nil && serverOK && i >= o.Warmup {
+						serverMu.Lock()
+						serverHist.RecordDuration(server)
+						serverMu.Unlock()
+					}
 					return 1, 0, err
 				}
 				m, cv := s.runRepeated(ctx, o, op)
-				s.add(withCV(s.result(name, report.GroupPercolate, fmt.Sprintf("one document per request against %d saved searches (per-document latency)", n), eng, o, m), cv))
+				res := withCV(s.result(name, report.GroupPercolate, fmt.Sprintf("one document per request against %d saved searches (per-document latency, end-to-end; server time alongside when the engine reports one)", n), eng, o, m), cv)
+				if serverHist.Count() > 0 {
+					sm := serverHist.Summary()
+					if res.Values == nil {
+						res.Values = map[string]float64{}
+					}
+					res.Values["server_p50_us"], res.Values["server_p99_us"], res.Values["server_count"] = sm.P50, sm.P99, float64(serverHist.Count())
+				}
+				s.add(res)
 			}
 		}
 	}
@@ -1160,12 +1181,12 @@ func (s *suite) crossCheckPercolate(ctx context.Context, sl, el Engine, n int, d
 	matched := 0
 	for start := 0; start < len(docs); start += chunk {
 		part := docs[start:min(start+chunk, len(docs))]
-		a, err := sl.Percolate(ctx, s.cfg.PercIndex, part)
+		a, _, _, err := sl.Percolate(ctx, s.cfg.PercIndex, part)
 		if err != nil {
 			problems = append(problems, "searchlight: "+err.Error())
 			break
 		}
-		b, err := el.Percolate(ctx, s.cfg.PercIndex, part)
+		b, _, _, err := el.Percolate(ctx, s.cfg.PercIndex, part)
 		if err != nil {
 			problems = append(problems, "elasticsearch: "+err.Error())
 			break

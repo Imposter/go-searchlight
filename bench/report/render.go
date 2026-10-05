@@ -119,7 +119,7 @@ var groupOrder = []struct{ group, title, about string }{
 	{GroupFilter, "Filter and boolean search", "Each workload cycles through query variants with Zipfian values; size 10, bodies returned."},
 	{GroupSorted, "Sorted and paged search", "Top-k with a sort, and `search_after` walks to the stated depth (latency per page)."},
 	{GroupAggs, "Aggregations", "Size 0; Elasticsearch's request cache is off; filters vary per iteration."},
-	{GroupPercolate, "Percolation", "Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: batches of documents at a fixed concurrency (docs/s, latency per batch). `percolate_single_N`: one document per request (per-document latency). `bulk_percolate`: Searchlight's `_bulk?percolate=true` against Elasticsearch's `_bulk` then percolate."},
+	{GroupPercolate, "Percolation", "Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: batches of documents at a fixed concurrency (docs/s, latency per batch). `percolate_single_N`: one document per request (per-document latency: the p99 cell is \"end-to-end [server p99]\" when the engine reports its own server time -- analyze, match and encode, never the network or the client's decode, like Elasticsearch's own `took` -- and target T5's < 1 ms clause is judged on that server p99, not the end-to-end number; \"(no server timing)\" means an engine has not reported one yet, so end-to-end is all there is to judge). `bulk_percolate`: Searchlight's `_bulk?percolate=true` against Elasticsearch's `_bulk` then percolate."},
 	{GroupMixed, "Concurrent mixed read/write", "Readers cycle through filter, sorted and aggregation searches while writers update existing documents in bulk, for a fixed time."},
 	{GroupRestart, "Restart to serving", "The engine stopped gracefully and started again (Searchlight: the node slbench runs; Elasticsearch: the operator's restart command), timed until it answers a count with the full total."},
 	{GroupRecovery, "New replica from zero to serving", "Searchlight: a node with an empty data directory joins a cluster of its own that already holds the dataset, timed from its start until its own copies serve every document (peer recovery, then the changelog replayed). Elasticsearch: on the same index and data the rest of the run already loaded, the second node's replica is dropped and restored (number_of_replicas 0 then 1), timed until the cluster is green again."},
@@ -417,6 +417,9 @@ func renderGroup(w io.Writer, r *Run, group, title, about string) {
 				p99 := formatQuantile(l.P99, l.Count, 0.99)
 				if cv := res.Values["p99_cv_pct"]; cv > 0 {
 					p99 = fmt.Sprintf("%s (±%.1f%%)", p99, cv)
+				}
+				if sc := res.Values["server_count"]; sc > 0 {
+					p99 = fmt.Sprintf("%s [server %s]", p99, formatQuantile(res.Values["server_p99_us"], int64(sc), 0.99))
 				}
 				row = append(row, formatQuantile(l.P50, l.Count, 0.50), p99, formatQuantile(l.P999, l.Count, 0.999), FormatMicros(l.Max))
 			} else {

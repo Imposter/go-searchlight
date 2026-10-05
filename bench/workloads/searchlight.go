@@ -350,24 +350,41 @@ func (s *Searchlight) PutQueries(ctx context.Context, index string, qs []dataset
 	return s.Refresh(ctx, index)
 }
 
-// Percolate implements Engine.
-func (s *Searchlight) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, error) {
+// Percolate implements Engine. server prefers a Server-Timing response header,
+// then a top-level "took" field (assumed microseconds -- "a µs-precision took", the
+// operator's own description of it -- unlike Elasticsearch's own "took", which is
+// milliseconds; fix this field's unit or name here if the server ships something
+// different), and is (0, false) when the response carries neither yet.
+func (s *Searchlight) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, time.Duration, bool, error) {
+	body, err := json.Marshal(map[string]any{"docs": docs})
+	if err != nil {
+		return nil, 0, false, err
+	}
+	b, headers, err := s.c.doHeaders(ctx, http.MethodPost, ipath(index, "_percolate"), "application/json", body)
+	if err != nil {
+		return nil, 0, false, err
+	}
 	var res struct {
 		Results []struct {
 			Queries []string `json:"queries"`
 		} `json:"results"`
+		TookMicros *int64 `json:"took,omitempty"`
 	}
-	if err := s.c.json(ctx, http.MethodPost, ipath(index, "_percolate"), map[string]any{"docs": docs}, &res); err != nil {
-		return nil, err
+	if err := json.Unmarshal(b, &res); err != nil {
+		return nil, 0, false, fmt.Errorf("searchlight percolate: %w", err)
 	}
 	if len(res.Results) != len(docs) {
-		return nil, fmt.Errorf("searchlight percolate: %d results for %d documents", len(res.Results), len(docs))
+		return nil, 0, false, fmt.Errorf("searchlight percolate: %d results for %d documents", len(res.Results), len(docs))
 	}
 	out := make([][]string, len(docs))
 	for i, r := range res.Results {
 		out[i] = r.Queries
 	}
-	return out, nil
+	server, serverOK := serverTimingDuration(headers)
+	if !serverOK && res.TookMicros != nil {
+		server, serverOK = time.Duration(*res.TookMicros)*time.Microsecond, true
+	}
+	return out, server, serverOK, nil
 }
 
 // Resources implements Engine. DiskBytes is the node-local index alone (DataPaths,

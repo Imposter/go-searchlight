@@ -70,8 +70,13 @@ type Engine interface {
 	Search(ctx context.Context, index string, p Prepared, after []any) (SearchResult, error)
 	// PutQueries stores saved queries; they are percolated once it returns.
 	PutQueries(ctx context.Context, index string, qs []datasets.SavedSearch) error
-	// Percolate returns each document's matching saved-query ids.
-	Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, error)
+	// Percolate returns each document's matching saved-query ids, plus the server's
+	// own processing time for the call (analyze, match and encode; never the network
+	// or the client's decode) when the engine reports one -- like Elasticsearch's
+	// own "took" -- and serverOK, false when it did not (operator decision,
+	// 2026-10-05: target T5's p99-per-document clause is judged on server time, not
+	// the harness's own end-to-end measurement, which keeps reporting alongside it).
+	Percolate(ctx context.Context, index string, docs []json.RawMessage) (matches [][]string, server time.Duration, serverOK bool, err error)
 	Resources(ctx context.Context, index string) (report.Resources, error)
 }
 
@@ -207,13 +212,20 @@ func (c *client) do(ctx context.Context, method, path, contentType string, body 
 
 // doOnce sends one attempt of the request behind do's retry loop.
 func (c *client) doOnce(ctx context.Context, method, path, contentType string, body []byte, ok ...int) ([]byte, error) {
+	b, _, err := c.doOnceFull(ctx, method, path, contentType, body, ok...)
+	return b, err
+}
+
+// doOnceFull is doOnce, also returning the response's header (nil when the request
+// itself failed, before any response).
+func (c *client) doOnceFull(ctx context.Context, method, path, contentType string, body []byte, ok ...int) ([]byte, http.Header, error) {
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, r)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
@@ -223,12 +235,12 @@ func (c *client) doOnce(ctx context.Context, method, path, contentType string, b
 	}
 	res, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, res.Header, err
 	}
 	good := res.StatusCode >= 200 && res.StatusCode < 300
 	if len(ok) > 0 {
@@ -242,9 +254,38 @@ func (c *client) doOnce(ctx context.Context, method, path, contentType string, b
 		if len(msg) > 2000 {
 			msg = msg[:2000] + "..."
 		}
-		return b, &StatusError{Method: method, URL: c.base + path, Status: res.StatusCode, Body: msg, RetryAfter: retryAfterHeader(res.Header.Get("Retry-After"))}
+		return b, res.Header, &StatusError{Method: method, URL: c.base + path, Status: res.StatusCode, Body: msg, RetryAfter: retryAfterHeader(res.Header.Get("Retry-After"))}
 	}
-	return b, nil
+	return b, res.Header, nil
+}
+
+// doHeaders behaves like do, also returning the header of the response that
+// satisfied it (nil if every attempt failed before getting one).
+func (c *client) doHeaders(ctx context.Context, method, path, contentType string, body []byte, ok ...int) ([]byte, http.Header, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		b, h, err := c.doOnceFull(ctx, method, path, contentType, body, ok...)
+		var st *StatusError
+		switch {
+		case err == nil:
+			return b, h, nil
+		case !errors.As(err, &st) || !retryableStatus(st.Status) || attempt >= c.retries:
+			if lastErr != nil {
+				fmt.Fprintf(c.log, "%s %s %s: failed after %d attempt(s), last error: %v\n",
+					time.Now().Format(time.RFC3339), method, path, attempt+1, err)
+			}
+			return b, h, err
+		}
+		lastErr = err
+		wait := retryDelay(attempt, st.RetryAfter)
+		fmt.Fprintf(c.log, "%s %s %s: HTTP %d (attempt %d/%d), retrying in %s: %s\n",
+			time.Now().Format(time.RFC3339), method, path, st.Status, attempt+1, c.retries+1, wait, st.Body)
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }
 
 // retryAfterHeader parses a Retry-After header's seconds form (the only form this
@@ -258,6 +299,30 @@ func retryAfterHeader(v string) time.Duration {
 		return 0
 	}
 	return time.Duration(n) * time.Second
+}
+
+// serverTimingDuration parses a Server-Timing header's first metric's "dur"
+// (https://www.w3.org/TR/server-timing/: "<name>;dur=<value>[;desc=\"...\"], ...",
+// dur in milliseconds), engine-agnostic (either engine's response can carry one).
+// (0, false) when the header is absent or its first metric has no parsable dur.
+func serverTimingDuration(h http.Header) (time.Duration, bool) {
+	v := h.Get("Server-Timing")
+	if v == "" {
+		return 0, false
+	}
+	first, _, _ := strings.Cut(v, ",")
+	for part := range strings.SplitSeq(first, ";") {
+		val, ok := strings.CutPrefix(strings.TrimSpace(part), "dur=")
+		if !ok {
+			continue
+		}
+		ms, err := strconv.ParseFloat(strings.Trim(val, `"`), 64)
+		if err != nil {
+			return 0, false
+		}
+		return time.Duration(ms * float64(time.Millisecond)), true
+	}
+	return 0, false
 }
 
 func (c *client) json(ctx context.Context, method, path string, in, out any) error {

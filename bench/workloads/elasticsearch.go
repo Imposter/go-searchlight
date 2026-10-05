@@ -214,7 +214,8 @@ func (e *Elasticsearch) BulkPercolate(ctx context.Context, index string, docs []
 	for i, d := range docs {
 		bodies[i] = d.Body
 	}
-	return e.Percolate(ctx, index, bodies)
+	matches, _, _, err := e.Percolate(ctx, index, bodies)
+	return matches, err
 }
 
 // Refresh implements Engine.
@@ -348,11 +349,15 @@ func (e *Elasticsearch) PutQueries(ctx context.Context, index string, qs []datas
 const percolatePage = 10_000
 
 // Percolate implements Engine: one percolate query for the batch, paged by query id
-// when more queries match than one page holds.
-func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, error) {
+// when more queries match than one page holds. server sums every page's own "took"
+// (milliseconds, Elasticsearch's standard search-response field): a percolation
+// fitting in one page, as every single-document call does unless it matches more
+// than percolatePage saved searches, is exactly that one page's took.
+func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, time.Duration, bool, error) {
 	out := make([][]string, len(docs))
 	body := es.PercolateBody(docs, percolatePage)
 	var after []any
+	var server time.Duration
 	for {
 		if after != nil {
 			body["sort"] = []any{map[string]any{es.QueryIDField: "asc"}}
@@ -360,14 +365,15 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 		}
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, 0, false, err
 		}
-		b, err := e.c.do(ctx, http.MethodPost, epath(index, "/_search?request_cache=false"), "application/json", raw)
+		b, _, err := e.c.doHeaders(ctx, http.MethodPost, epath(index, "/_search?request_cache=false"), "application/json", raw)
 		if err != nil {
-			return nil, err
+			return nil, 0, false, err
 		}
 		var res struct {
-			Hits struct {
+			TookMillis int64 `json:"took"`
+			Hits       struct {
 				Total struct {
 					Value int64 `json:"value"`
 				} `json:"total"`
@@ -381,8 +387,9 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 			} `json:"hits"`
 		}
 		if err := json.Unmarshal(b, &res); err != nil {
-			return nil, fmt.Errorf("elasticsearch percolate: %w", err)
+			return nil, 0, false, fmt.Errorf("elasticsearch percolate: %w", err)
 		}
+		server += time.Duration(res.TookMillis) * time.Millisecond
 		hits := res.Hits.Hits
 		if after == nil && int64(len(hits)) < res.Hits.Total.Value {
 			// More matches than a page: start over in qid order to page through them.
@@ -402,7 +409,7 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 			}
 		}
 		if after == nil || len(hits) < percolatePage {
-			return out, nil
+			return out, server, true, nil
 		}
 		after = hits[len(hits)-1].Sort
 	}

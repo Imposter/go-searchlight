@@ -291,24 +291,66 @@ func (r *Run) percolation() TargetCheck {
 	case single == nil:
 		c.Status = worst(c.Status, NotMeasured)
 		notes = append(notes, "percolate_single_100000 not run, so the 1 ms p99 is unchecked.")
-	case !single.OK() || single.Latency == nil:
+	case !single.OK():
 		c.Status = worst(c.Status, Invalid)
-	case !sufficient(single.Latency):
-		c.Status = worst(c.Status, InsufficientSamples)
-		sl = append(sl, fmt.Sprintf("p99/doc @100k: n/a (n=%d)", single.Latency.Count))
-		notes = append(notes, fmt.Sprintf("percolate_single_100000 has %d samples; p99 needs ≥%d to judge the < 1 ms target.", single.Latency.Count, minSamples(0.99)))
 	default:
-		sl = append(sl, "p99/doc @100k: "+FormatMicros(single.Latency.P99))
-		if single.Latency.P99 >= PercolateP99Micros {
-			c.Status = worst(c.Status, Fail)
-			notes = append(notes, fmt.Sprintf("p99 per document at 100k is %s (needs < 1 ms).", FormatMicros(single.Latency.P99)))
+		p99, count, isServer, has := percolateP99(single)
+		label := "end-to-end (no server timing)"
+		if isServer {
+			label = "server"
 		}
-		if e := r.Find("percolate_single_100000", Elasticsearch); e != nil && e.Latency != nil {
-			es = append(es, "p99/doc @100k: "+FormatMicros(e.Latency.P99))
+		var endToEnd string
+		if single.Latency != nil {
+			endToEnd = fmt.Sprintf(" (end-to-end p50 %s, p99 %s)", FormatMicros(single.Latency.P50), formatQuantile(single.Latency.P99, single.Latency.Count, 0.99))
+		}
+		switch {
+		case !has:
+			c.Status = worst(c.Status, Invalid)
+		case count < minSamples(0.99):
+			c.Status = worst(c.Status, InsufficientSamples)
+			sl = append(sl, fmt.Sprintf("p99/doc @100k: n/a (n=%d, %s)%s", count, label, endToEnd))
+			notes = append(notes, fmt.Sprintf("percolate_single_100000 has %d %s samples; p99 needs ≥%d to judge the < 1 ms target.", count, label, minSamples(0.99)))
+		default:
+			row := fmt.Sprintf("p99/doc @100k: %s (%s)", FormatMicros(p99), label)
+			if isServer {
+				row += endToEnd
+			}
+			sl = append(sl, row)
+			if p99 >= PercolateP99Micros {
+				c.Status = worst(c.Status, Fail)
+				notes = append(notes, fmt.Sprintf("p99 per document at 100k is %s (%s; needs < 1 ms).", FormatMicros(p99), label))
+			}
+		}
+	}
+	if e := r.Find("percolate_single_100000", Elasticsearch); e != nil {
+		if ep99, _, eIsServer, eHas := percolateP99(e); eHas {
+			elabel := "end-to-end (no server timing)"
+			if eIsServer {
+				elabel = `server, Elasticsearch's own "took"`
+			}
+			es = append(es, fmt.Sprintf("p99/doc @100k: %s (%s)", FormatMicros(ep99), elabel))
 		}
 	}
 	c.Searchlight, c.Elasticsearch, c.Detail = strings.Join(sl, "; "), strings.Join(es, "; "), strings.Join(notes, " ")
 	return c
+}
+
+// percolateP99 returns a percolate_single result's judged p99 (operator decision,
+// 2026-10-05: the engine's own server time -- analyze, match and encode, like
+// Elasticsearch's "took" -- when it reported enough samples of it; the harness's
+// own end-to-end measurement otherwise, clearly distinguished by server), its
+// sample count, and whether a judgment was possible at all (ok).
+func percolateP99(res *Result) (p99 float64, count int64, server, ok bool) {
+	if res == nil {
+		return 0, 0, false, false
+	}
+	if sc := int64(res.Values["server_count"]); sc > 0 {
+		return res.Values["server_p99_us"], sc, true, true
+	}
+	if res.Latency != nil {
+		return res.Latency.P99, res.Latency.Count, false, true
+	}
+	return 0, 0, false, false
 }
 
 func shortCount(n int) string {

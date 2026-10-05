@@ -180,10 +180,10 @@ A segment is immutable and written once at refresh or merge time. It is one file
 | Part | Contents |
 |---|---|
 | Term dictionary | Per field and kind (value, entry, word, trigram), sorted terms in prefix-compressed blocks with a sparse in-memory index. Lookup is O(log blocks), plus a short scan inside one block. |
-| Postings | Roaring bitmaps in serialized form, used directly from mmap with no copy |
+| Postings | Roaring bitmaps in serialized form, used directly from mmap with no copy; word and 3-gram postings Elias-Fano coded where that is smaller (format 4) |
 | Doc values | Columnar per field: numbers delta- and bit-packed; keywords as ordinals into a per-segment sorted dictionary; multi-valued lists as offsets plus ordinals. Used for sorting, aggregations and residual filters. |
-| Points | Per-field sorted value blocks with min/max (a BKD-lite), giving range queries without scanning |
-| Stored fields | zstd-compressed blocks of 16 KB of original JSON, fetched for hits only |
+| Points | Per-field blocks of documents sorted by value, with min/max (a BKD-lite), giving range queries without scanning; a partly covered block reads values from the doc-value column |
+| Stored fields | zstd-compressed blocks of about 8 KB of original JSON, against a per-segment dictionary sampled from the segment's first documents, fetched for hits only |
 | Live docs | A roaring bitmap of deleted documents, with a sidecar file per generation (the segment itself is never rewritten) |
 | Percolator queries | A segment kind of its own holding saved queries' compiled anchors (§7) |
 

@@ -380,8 +380,12 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 
 ### Disk
 
-- **Segments.** A copy's segments are compressed: zstd stored fields, bit-packed doc
-  values, roaring postings.
+- **Segments.** A copy's segments are compressed: stored fields in small zstd blocks
+  against a per-segment dictionary, bit-packed doc values and point blocks, roaring
+  postings for keyword values and entries, Elias-Fano postings for words and 3-grams
+  where they are smaller, and zstd term blocks for long values. On the benchmark's
+  product listings (about 870 bytes of JSON each) a fully merged copy takes about
+  0.85 GiB per million documents.
 - **Headroom.** Leave at least the size of the largest shard copy free. A peer recovery
   stages a whole copy under `data_dir/recovery`, and an aside rebuild holds the old copy
   and the new one at once.
@@ -465,11 +469,27 @@ Notes:
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
   is one migration, the initial schema.
-- **Segment format.** It is versioned. A node rebuilds a copy whose segments are of a
-  format older than it reads. A copy in a **newer** format is refused and left as it is
-  (`shard copy is in a newer format than this binary reads`): a binary rolled back never
-  destroys what its successor wrote. Roll forward again, or wipe that node's `data_dir`
-  to have it rebuild from its peers or the database.
+- **Segment format.** It is versioned by a major number, and each binary reads its own
+  major and the one before it (N−1). An upgrade across one major therefore reopens its
+  segments, as a restart does; merges rewrite them into the new major as they go, and
+  every segment the node writes from then on is in it.
+  - A copy whose segments are older than N−1 (an upgrade that skips a major) is rebuilt:
+    from a peer, a recovery bundle or the database. Upgrade one major at a time to
+    avoid it, or budget for the rebuild.
+  - A recovering copy fetches from a peer already in the current major when one serves
+    it, and from an older-major peer only when none does (its segments still open).
+  - A copy in a **newer** format is refused and left as it is (`shard copy is in a newer
+    format than this binary reads`): a binary rolled back never destroys what its
+    successor wrote. Roll forward again, or wipe that node's `data_dir` to have it
+    rebuild from its peers or the database. A node still on the old binary cannot use an
+    upgraded peer's copy or a bundle taken after the upgrade either, and rebuilds from
+    the database instead: finish a rolling upgrade before replacing nodes.
+- **Upgrading to segment format 4** (from 3). Nothing to do: the first start reopens the
+  format-3 segments and serves at once. Disk use falls as merges rewrite them, by about
+  a third on typical documents; deletes sidecars written from then on are format 4 too.
+  Untyped-value marks (which decide whether a mapping change that maps a new field
+  needs a rebuild) carry over from the copy's manifest. A rollback to a format-3
+  binary refuses every copy that has written a segment since the upgrade, as above.
 - **Readiness gates traffic.** A restarted node reports ready only after its copies have
   finished their startup recovery. Until then, the other nodes serve its shards.
 

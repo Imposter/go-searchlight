@@ -172,7 +172,7 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 		dir := filepath.Join(benchDir(), hex.EncodeToString(sum[:8]))
 		marker := filepath.Join(dir, "complete")
 		opts := shard.Options{
-			RefreshInterval: -1, DisableMerges: true, FlushBytes: -1, Logger: quiet,
+			RefreshInterval: -1, DisableMerges: true, RefreshBytes: -1, Logger: quiet,
 			FilterCache: shard.NewFilterCache(shard.DefaultFilterCacheBytes, nil),
 		}
 		if _, err := os.Stat(marker); err == nil {

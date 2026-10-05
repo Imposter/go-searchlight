@@ -27,8 +27,9 @@ import (
 //	 "segments":[{"id":"9f..","docs":1000,"bytes":81234,"del_gen":7,"deleted":12}],
 //	 "query_segments":[{"id":"4c..","docs":10,"bytes":2048,"format":"default/1"}]}
 //
-// gen numbers every commit (refresh or merge), and names the deletes sidecars that
-// commit wrote (segment.WriteDeletes(dir, id, gen, ...)): a segment's live sidecar is
+// gen is the generation the manifest persists (each refresh that writes something and
+// each merge numbers one), and names the deletes sidecars of the deletes that generation
+// changed (segment.WriteDeletes(dir, id, gen, ...)): a segment's live sidecar is
 // del_gen's, and none when del_gen is 0. seq is the changelog position the segments
 // cover (every change at or below it is in them, gaps included); max_seq is the newest
 // change they hold. Segments are listed in the order their base ordinals follow.
@@ -109,7 +110,7 @@ func (e *ManifestError) Error() string {
 }
 
 // readManifest reads dir's manifest; an empty manifest when there is none. It opens
-// the file sharing it fully (openShared), so the read never stops a commit renaming a
+// the file sharing it fully (openShared), so the read never stops a flush renaming a
 // new manifest over it, and retries briefly while another handle is in the way
 // (retryIO); log takes the retries, at debug.
 func readManifest(dir string, log *slog.Logger) (*manifest, error) {

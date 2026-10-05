@@ -55,6 +55,11 @@ type BuildOptions struct {
 	// caller syncs the directory ([SyncDir]). A shard does that once per commit, for
 	// every file it wrote, instead of once per file.
 	NoDirSync bool
+	// NoSync skips the file's own fsync, and with it the directory's: the file is
+	// renamed into place with its bytes in the page cache, readable at once but durable
+	// only once the caller fsyncs it ([SyncPath]) and then the directory. A shard
+	// builds the segments it refreshes this way and fsyncs them when it flushes.
+	NoSync bool
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -112,8 +117,8 @@ func splitRanges(numDocs uint32, workers int) []docRange {
 // document's position in docs is its ordinal in the segment (0 to len(docs)-1), stable
 // for the segment's life.
 //
-// Build writes to a temp file, fsyncs it, then renames it into place, so a reader never
-// observes a partially written segment.
+// Build writes to a temp file, fsyncs it (unless NoSync), then renames it into place,
+// so a reader never observes a partially written segment.
 func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	if uint64(len(docs)) > math.MaxUint32 {
 		return Meta{}, fmt.Errorf("segment: %d documents exceeds the uint32 ordinal space", len(docs))
@@ -133,7 +138,7 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil, !opts.NoDirSync)
+	meta, err := writeSegmentParts(path, numDocs, names, parts, storedFromDocs(docs), ids, opts.Threads, nil, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -333,8 +338,9 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
 // writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
 // nil, is called before every chunk written to the file ([MergeOptions.Throttle]);
-// syncDir fsyncs the directory after the rename ([BuildOptions.NoDirSync]).
-func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error, syncDir bool) (Meta, error) {
+// syncFile fsyncs the file before the rename ([BuildOptions.NoSync]), and syncDir the
+// directory after it ([BuildOptions.NoDirSync]).
+func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -441,8 +447,10 @@ func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[
 	if w.err != nil {
 		return Meta{}, w.err
 	}
-	if err := SyncFile(f); err != nil {
-		return Meta{}, err
+	if syncFile {
+		if err := SyncFile(f); err != nil {
+			return Meta{}, err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return Meta{}, err

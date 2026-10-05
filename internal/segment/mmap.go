@@ -109,6 +109,21 @@ func SyncFile(f *os.File) error {
 	return f.Sync()
 }
 
+// SyncPath fsyncs the file at path, counting it in [SyncCounts]: the file a [Build]
+// with NoSync wrote, once the caller needs it durable. It opens the file for writing,
+// which Windows requires to flush a file's buffers.
+func SyncPath(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := SyncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // fileSyncs and dirSyncs count every fsync this package (or a caller through SyncFile
 // and SyncDir) asked for, for measuring what a refresh or merge costs in syncs.
 var fileSyncs, dirSyncs atomic.Int64

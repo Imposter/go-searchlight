@@ -3,7 +3,8 @@
 // segments published to readers as a [Generation] through an atomic pointer, deletes
 // and updates kept as per-generation deletes sidecars, background tiered merges under a
 // node-wide [MergeBudget], a [FilterCache] of per-segment leaf bitmaps, and a local
-// manifest that records which segments and which changelog seq are durable on disk.
+// manifest, written by [Shard.Flush], that records which segments and which changelog
+// seq are durable on disk.
 //
 // # Writes
 //
@@ -23,11 +24,14 @@
 //
 // # Durability
 //
-// Every refresh and every merge commits: segment files and deletes sidecars are written
-// and fsynced, then the manifest is swapped atomically (temp file, fsync, rename,
-// directory fsync). [Shard.CommittedSeq] is the manifest's seq: after a crash, [Open]
-// reopens exactly the manifest's segments and the caller replays the changelog from
-// there. Files the manifest does not reference (a crash's leftovers) are removed at Open.
+// A refresh is visibility only: it publishes without an fsync. A flush, every
+// flush_interval, at Close, at every merge commit and before a peer snapshot, is
+// durability: it fsyncs what the published generation added, writes its deletes
+// sidecars, swaps the manifest atomically (temp file, fsync, rename, directory fsync),
+// and only then advances [Shard.CommittedSeq] to the manifest's seq (see flush.go).
+// After a crash, [Open] reopens exactly the manifest's segments and the caller replays
+// the changelog from there. Files the manifest does not reference (a crash's leftovers)
+// are removed at Open.
 package shard
 
 import (
@@ -144,7 +148,7 @@ var (
 	// ErrIndexUID is a change for another incarnation of the index than the shard's.
 	ErrIndexUID = errors.New("shard: change belongs to another incarnation of the index")
 	// ErrBackpressure is an Apply refused because the write buffer is over its limit
-	// (Options.MaxBufferFactor times FlushBytes) while refreshes catch up. Nothing of
+	// (Options.MaxBufferFactor times RefreshBytes) while refreshes catch up. Nothing of
 	// the batch was applied; retry it after a short wait (an HTTP API answers 429).
 	ErrBackpressure = errors.New("shard: the write buffer is full; retry")
 	// ErrInvalidChange is a change that is malformed: an unknown kind, a missing
@@ -179,21 +183,21 @@ type Options struct {
 	// (refresh_interval), on a fixed grid from Open. 0 means one second; a negative value
 	// disables background refresh (Refresh still works).
 	RefreshInterval time.Duration
-	// SeqPersistInterval is how often a seq that moved with no new segment (a refresh
-	// of an empty buffer after Advance) is written to the manifest
-	// (seq_persist_interval). 0 means 30 seconds; negative means only at the next
-	// commit and at Close.
-	SeqPersistInterval time.Duration
+	// FlushInterval is how often the published generation is made durable
+	// (flush_interval, [Shard.Flush]). 0 means DefaultFlushInterval; a negative value
+	// disables background flushes, leaving those at Close, at merge commits, before a
+	// Snapshot and on Flush.
+	FlushInterval time.Duration
 	// RefreshThreads bounds the goroutines a refresh's segment build uses; 0 means
 	// GOMAXPROCS. A refresh is on the write-to-visible path, so it is not budgeted.
 	RefreshThreads int
-	// FlushBytes triggers an early background refresh when the buffer's estimated
+	// RefreshBytes triggers an early background refresh when the buffer's estimated
 	// size passes it, bounding buffer memory. 0 means 64 MiB; negative disables it.
-	FlushBytes int64
-	// MaxBufferFactor bounds the write buffer at this many times FlushBytes: past it
+	RefreshBytes int64
+	// MaxBufferFactor bounds the write buffer at this many times RefreshBytes: past it
 	// Apply refuses with [ErrBackpressure] until a refresh drains the buffer. 0 means
-	// 4; it is off when FlushBytes is negative. A refresh in progress holds one more
-	// buffer, frozen, so memory is bounded at about MaxBufferFactor+1 times FlushBytes.
+	// 4; it is off when RefreshBytes is negative. A refresh in progress holds one more
+	// buffer, frozen, so memory is bounded at about MaxBufferFactor+1 times RefreshBytes.
 	MaxBufferFactor int
 	// MergePolicy chooses background merges. Nil means DefaultTieredPolicy().
 	MergePolicy *TieredPolicy
@@ -213,8 +217,8 @@ type Options struct {
 	// DeleteRetry is how often removing a file that is still in use (Windows) is
 	// retried. 0 means five seconds.
 	DeleteRetry time.Duration
-	// Clock runs the shard's timers (background refresh, seq persistence, the
-	// janitor's retries) and times its operations. Nil means clock.Real.
+	// Clock runs the shard's timers (background refresh and flush, the janitor's
+	// retries) and times its operations. Nil means clock.Real.
 	Clock clock.Clock
 	// Logger, Tracer and Meter are the shard's telemetry; nil means slog.Default(), a
 	// no-op tracer and no metrics.
@@ -229,8 +233,8 @@ type Options struct {
 // Defaults.
 const (
 	DefaultRefreshInterval  = time.Second
-	DefaultSeqPersist       = 30 * time.Second
-	DefaultFlushBytes       = 64 << 20
+	DefaultFlushInterval    = 10 * time.Second
+	DefaultRefreshBytes     = 64 << 20
 	DefaultMaxBufferFactor  = 4
 	DefaultDeleteRetry      = 5 * time.Second
 	DefaultFilterCacheBytes = 64 << 20
@@ -259,14 +263,14 @@ func (o *Options) resolve() {
 	if o.RefreshInterval == 0 {
 		o.RefreshInterval = DefaultRefreshInterval
 	}
-	if o.SeqPersistInterval == 0 {
-		o.SeqPersistInterval = DefaultSeqPersist
+	if o.FlushInterval == 0 {
+		o.FlushInterval = DefaultFlushInterval
 	}
 	if o.RefreshThreads <= 0 {
 		o.RefreshThreads = runtime.GOMAXPROCS(0)
 	}
-	if o.FlushBytes == 0 {
-		o.FlushBytes = DefaultFlushBytes
+	if o.RefreshBytes == 0 {
+		o.RefreshBytes = DefaultRefreshBytes
 	}
 	if o.MaxBufferFactor <= 0 {
 		o.MaxBufferFactor = DefaultMaxBufferFactor
@@ -300,7 +304,8 @@ func (o *Options) resolve() {
 
 // Shard is one shard copy. Its methods are safe for concurrent use. Readers
 // ([Shard.Acquire]) never take a lock; writers (Apply) take a short buffer lock;
-// refresh and merge commits serialize on a commit lock that readers never see.
+// refreshes and merges publish under a commit lock that readers never see; flushes run
+// one at a time, taking the commit lock only briefly.
 type Shard struct {
 	dir  string
 	opts Options
@@ -333,23 +338,35 @@ type Shard struct {
 
 	// refreshMu makes refreshes one at a time.
 	refreshMu sync.Mutex
-	// commitMu serializes refresh and merge commits: the generation counter, the
-	// segment set, the manifest and the merging set.
+	// commitMu serializes refresh and merge publishes: the generation counter, the
+	// segment set, the segments published since the last flush and the merging set.
 	commitMu sync.Mutex
 	gen      uint64
 	merging  map[*segRef]bool
 	inflight int
+	// unflushed are the segments published since the last flush took its generation.
+	unflushed []*segRef
 	// forceEligible is the running ForceMerge's segments (nil when none runs);
 	// forceSem, a one-slot semaphore, runs ForceMerges one at a time.
 	forceEligible map[*segRef]bool
 	forceSem      chan struct{}
 	mergeDone     chan struct{} // closed and replaced when a merge finishes
-	committed     atomic.Int64
-	// manifestBytes is the manifest's size, for the disk-size metric.
+
+	// flushMu makes flushes one at a time, and guards the durable state below: the
+	// manifest's generation, index uid and mapping, the segments and sidecars it lists
+	// (with the sidecars' sizes), and the sidecars flushes wrote that it does not list.
+	flushMu         sync.Mutex
+	committed       atomic.Int64
+	durableGen      uint64
+	committedUID    string
+	committedMap    *mappingState
+	durableSegs     map[*segRef]bool
+	durableSidecars map[string]int64
+	strays          map[string]bool
+	// manifestBytes and sidecarBytes are the manifest's and its sidecars' sizes, for
+	// the disk-size metric.
 	manifestBytes atomic.Int64
-	// committedUID and committedMap are the manifest's index uid and mapping.
-	committedUID string
-	committedMap *mappingState
+	sidecarBytes  atomic.Int64
 
 	waitMu sync.Mutex
 	waitCh chan struct{} // closed and replaced at every publish
@@ -441,6 +458,28 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		return nil, err
 	}
 	s.gen = max(man.Gen, topGen)
+	s.durableGen = man.Gen
+	s.durableSegs = map[*segRef]bool{}
+	s.durableSidecars = map[string]int64{}
+	s.strays = map[string]bool{}
+	var sidecarBytes int64
+	for _, list := range [][]segState{g.docs, g.queries} {
+		for i := range list {
+			st := &list[i]
+			st.ref.synced = true
+			s.durableSegs[st.ref] = true
+			if st.delGen > 0 {
+				path := filepath.Join(dir, deletesName(st.ref.id, st.delGen))
+				var size int64
+				if info, err := os.Stat(path); err == nil {
+					size = info.Size()
+				}
+				s.durableSidecars[path] = size
+				sidecarBytes += size
+			}
+		}
+	}
+	s.sidecarBytes.Store(sidecarBytes)
 	// A shard with no segment yet has nothing unmarked: everything it builds is.
 	s.marksUntyped = man.UntypedMarks == untypedMarksFormat || len(man.Segments) == 0
 	s.applied = man.Seq
@@ -459,6 +498,10 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s.wg.Add(2)
 	go s.refreshLoop()
 	go s.mergeLoop()
+	if opts.FlushInterval > 0 {
+		s.wg.Add(1)
+		go s.flushLoop()
+	}
 	s.wakeMerges()
 	s.log.InfoContext(ctx, "shard opened",
 		slog.String("dir", dir), slog.Int64("seq", man.Seq), slog.Int("segments", len(g.Segments)),
@@ -505,8 +548,9 @@ func (s *Shard) MappingVersion() int64 {
 }
 
 // SetMapping replaces the index mapping, keeping its version; the next refresh
-// publishes (and commits) it. A copy that tails the changelog takes its mappings from
-// Remap changes instead, so the mapping is recorded with the seq it holds from.
+// publishes it, and the flush after persists it. A copy that tails the changelog takes
+// its mappings from Remap changes instead, so the mapping is recorded with the seq it
+// holds from.
 func (s *Shard) SetMapping(m *schema.Mapping) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -515,9 +559,9 @@ func (s *Shard) SetMapping(m *schema.Mapping) {
 }
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change
-// with a seq at or below it is in the committed segments. After a crash, replay the
-// changelog from here. It can trail RefreshedSeq: a refresh that only moved the seq is
-// persisted lazily (Options.SeqPersistInterval).
+// with a seq at or below it is in the flushed segments. After a crash, replay the
+// changelog from here. It trails RefreshedSeq until the next flush
+// (Options.FlushInterval): a refresh publishes without making anything durable.
 func (s *Shard) CommittedSeq() int64 { return s.committed.Load() }
 
 // AppliedSeq returns the highest seq applied (or advanced to), refreshed or not.
@@ -594,7 +638,7 @@ func (s *Shard) Apply(ctx context.Context, changes []Change) error {
 //
 // Load is only for a shard that has applied nothing (AppliedSeq is 0): it refuses any
 // other with [ErrSeqOrder]. Each id must appear once across the load. Until the
-// Advance, a refresh commits the loaded records under seq 0, so a copy whose
+// Advance, a flush persists the loaded records under seq 0, so a copy whose
 // CommittedSeq is 0 but which holds segments was interrupted mid-load: wipe it.
 func (s *Shard) Load(ctx context.Context, changes []Change) error {
 	ctx, span := s.startSpan(ctx, "shard.load", attribute.Int("changes", len(changes)))
@@ -628,7 +672,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 	if err := s.usable(); err != nil {
 		return 0, err
 	}
-	if limit := s.opts.FlushBytes * int64(s.opts.MaxBufferFactor); s.opts.FlushBytes > 0 && s.buf.bytes >= limit {
+	if limit := s.opts.RefreshBytes * int64(s.opts.MaxBufferFactor); s.opts.RefreshBytes > 0 && s.buf.bytes >= limit {
 		wake(s.refreshWake)
 		return 0, fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, s.buf.bytes, limit)
 	}
@@ -687,7 +731,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		s.mapping.Store(mp.m)
 	}
 	s.bufBytes.Store(s.buf.bytes)
-	if s.opts.FlushBytes > 0 && s.buf.bytes >= s.opts.FlushBytes {
+	if s.opts.RefreshBytes > 0 && s.buf.bytes >= s.opts.RefreshBytes {
 		wake(s.refreshWake)
 	}
 	return s.buf.size(), nil
@@ -717,7 +761,7 @@ func (s *Shard) Admit() error {
 		return ErrClosed
 	default:
 	}
-	if limit := s.opts.FlushBytes * int64(s.opts.MaxBufferFactor); s.opts.FlushBytes > 0 {
+	if limit := s.opts.RefreshBytes * int64(s.opts.MaxBufferFactor); s.opts.RefreshBytes > 0 {
 		if n := s.bufBytes.Load(); n >= limit {
 			wake(s.refreshWake)
 			return fmt.Errorf("%w: %d bytes buffered, limit %d", ErrBackpressure, n, limit)
@@ -775,8 +819,8 @@ func (s *Shard) check(c *Change) error {
 
 // Advance records that every change up to seq has been applied, when the changelog
 // holds none for this shard past the last one applied: the next refresh then covers
-// seq, so WaitRefreshed(seq) returns and CommittedSeq moves on without a replay. A seq
-// at or below the applied one is a no-op.
+// seq, so WaitRefreshed(seq) returns, and the flush after it moves CommittedSeq on
+// without a replay. A seq at or below the applied one is a no-op.
 func (s *Shard) Advance(seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -848,11 +892,12 @@ func (s *Shard) notifyPublished() {
 	s.waitMu.Unlock()
 }
 
-// Close refreshes the buffer one last time (so the manifest covers every applied
-// change), stops background refresh and merges (an in-flight merge is abandoned), and
-// releases the shard's own reference on its generation. Generations readers still hold
-// stay valid until released; their segments are unmapped then. Close is idempotent: a
-// second call returns once the first has finished (or ctx ends).
+// Close refreshes the buffer and flushes one last time (so the manifest covers every
+// applied change), stops background refresh, flushes and merges (an in-flight merge is
+// abandoned), and releases the shard's own reference on its generation. Generations
+// readers still hold stay valid until released; their segments are unmapped then.
+// Close is idempotent: a second call returns once the first has finished (or ctx
+// ends).
 func (s *Shard) Close(ctx context.Context) error {
 	ctx, span := s.startSpan(ctx, "shard.close")
 	defer span.End()
@@ -874,13 +919,13 @@ func (s *Shard) Close(ctx context.Context) error {
 	if s.Err() == nil {
 		err = s.Refresh(ctx)
 		if err == nil {
-			err = s.persistSeq(ctx)
+			err = s.Flush(ctx)
 		}
 	}
 	s.shutdown()
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "final refresh failed")
+		span.SetStatus(codes.Error, "final refresh or flush failed")
 		return err
 	}
 	s.log.InfoContext(ctx, "shard closed", slog.Int64("seq", s.CommittedSeq()))
@@ -888,11 +933,11 @@ func (s *Shard) Close(ctx context.Context) error {
 }
 
 // Abandon stops the shard at once, as if its process had died: there is no final
-// refresh, so whatever was applied since the last commit is lost and the directory
-// keeps exactly what CommittedSeq covers. Generations readers hold stay valid until
-// released. It is for a copy about to be wiped or reopened (a failed one, or one whose
-// index was recreated), where a final commit is wasted work or impossible. A Close
-// after it returns at once.
+// refresh or flush, so whatever was applied since the last flush is lost and the
+// directory keeps exactly what CommittedSeq covers. Generations readers hold stay valid
+// until released. It is for a copy about to be wiped or reopened (a failed one, or one
+// whose index was recreated), where a final flush is wasted work or impossible. A
+// Close after it returns at once.
 func (s *Shard) Abandon() { s.shutdown() }
 
 // Options returns the options the shard was opened with, defaults filled in: open the
@@ -900,7 +945,7 @@ func (s *Shard) Abandon() { s.shutdown() }
 func (s *Shard) Options() Options { return s.opts }
 
 // shutdown stops the background goroutines and drops the shard's generation, without
-// any further commit.
+// any further flush.
 func (s *Shard) shutdown() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -908,13 +953,16 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
-		// Taking the locks orders this after any refresh or merge commit in flight.
+		// Taking the locks orders this after any flush, refresh or merge publish in
+		// flight.
+		s.flushMu.Lock()
 		s.refreshMu.Lock()
 		s.commitMu.Lock()
 		g := s.cur.Swap(nil)
 		close(s.closed)
 		s.commitMu.Unlock()
 		s.refreshMu.Unlock()
+		s.flushMu.Unlock()
 		s.notifyPublished()
 		if g != nil {
 			g.Release()
@@ -955,16 +1003,10 @@ func wake(ch chan struct{}) {
 }
 
 // refreshLoop refreshes on a fixed grid of Options.RefreshInterval from Open, and at
-// once when a full buffer wakes it; it persists a moved seq every SeqPersistInterval.
+// once when a full buffer wakes it.
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
 	warn := rateLimitedWarn{clock: s.opts.Clock, every: time.Minute}
-	var persist <-chan time.Time
-	if s.opts.SeqPersistInterval > 0 {
-		t := s.opts.Clock.NewTicker(s.opts.SeqPersistInterval)
-		defer t.Stop()
-		persist = t.C()
-	}
 	grid := clock.NewGrid(s.opts.Clock.Now(), s.opts.RefreshInterval)
 	for {
 		var tick <-chan time.Time
@@ -973,11 +1015,8 @@ func (s *Shard) refreshLoop() {
 			timer = s.opts.Clock.NewTimer(s.opts.Clock.Until(next))
 			tick = timer.C()
 		}
-		persisting := false
 		select {
 		case <-s.bg.Done():
-		case <-persist:
-			persisting = true
 		case <-tick:
 		case <-s.refreshWake:
 		}
@@ -989,12 +1028,6 @@ func (s *Shard) refreshLoop() {
 		}
 		if s.Err() != nil {
 			continue // a failed shard stays as it is until it is reopened
-		}
-		if persisting {
-			if err := s.persistSeq(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
-				s.log.WarnContext(s.bg, "persisting the seq failed", slog.Any("error", err))
-			}
-			continue
 		}
 		if err := s.Refresh(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
 			if suppressed, ok := warn.allow(); ok {

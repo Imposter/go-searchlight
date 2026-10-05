@@ -201,11 +201,14 @@ func (t *Tailer) useFetcher() bool {
 
 // rebuildAside rebuilds the copy in a new directory under its root while the current
 // copy keeps serving: it fetches a peer's copy there (the Fetcher) or loads the store's
-// snapshot, applies the changelog after it until caught up, refreshes, then makes it
-// current (CURRENT, atomically) and swaps it in. Readers holding a generation of the
-// old copy keep it until they release it; the old copy's files are removed once they
-// have (or by the next OpenCopy). A failure, or a crash, leaves the old copy current
-// and serving, and the half-built directory is removed (now, or by the next OpenCopy).
+// snapshot, applies the changelog after it until caught up, refreshes and flushes, then
+// makes it current (CURRENT, atomically) and swaps it in. It is durable before it is
+// current: the copy it replaces may have reported a seq up to the head, and the
+// registry must never hold a seq the current copy could lose. Readers holding a
+// generation of the old copy keep it until they release it; the old copy's files are
+// removed once they have (or by the next OpenCopy). A failure, or a crash, leaves the
+// old copy current and serving, and the half-built directory is removed (now, or by
+// the next OpenCopy).
 func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
@@ -281,6 +284,9 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 		}
 	}
 	if err := sh.Refresh(ctx); err != nil {
+		return err
+	}
+	if err := sh.Flush(ctx); err != nil {
 		return err
 	}
 	if t.opts.hooks != nil && t.opts.hooks.beforeSwap != nil {
@@ -524,13 +530,17 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		return 0, err
 	}
 	t.applied.Store(asOf)
-	// Commit now, so a crash from here on resumes rather than reloads. A refresh
-	// that fails keeps its buffer for the background refresh to retry.
-	if err := sh.Refresh(ctx); err != nil {
+	// Flush now, so a crash from here on resumes rather than reloads. A refresh or
+	// flush that fails is retried in the background (the refresh keeps its buffer).
+	err := sh.Refresh(ctx)
+	if err == nil {
+		err = sh.Flush(ctx)
+	}
+	if err != nil {
 		if errors.Is(err, shard.ErrFailed) || errors.Is(err, shard.ErrClosed) || ctx.Err() != nil {
 			return 0, err
 		}
-		t.log.WarnContext(ctx, "refresh after the snapshot load failed; the background refresh retries it", slog.Any("error", err))
+		t.log.WarnContext(ctx, "persisting the snapshot load failed; the background refresh and flush retry it", slog.Any("error", err))
 	}
 	t.inst.progress.Record(ctx, 1, t.inst.with(attribute.String("source", sourceSQL)))
 	t.log.DebugContext(ctx, "snapshot loaded", slog.Int64("seq", asOf), slog.Int64("records", res.count), slog.Int64("bytes", res.bytes))

@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 
 	"github.com/Imposter/go-searchlight/internal/query"
-	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
@@ -158,7 +157,7 @@ func (Index) Build(ctx context.Context, dir, name string, queries []shard.Stored
 	if err != nil {
 		return 0, err
 	}
-	if err := writeFileSync(filepath.Join(dir, name+FileExt), data); err != nil {
+	if err := writeFile(filepath.Join(dir, name+FileExt), data); err != nil {
 		return 0, err
 	}
 	return int64(len(data)), nil
@@ -1267,20 +1266,15 @@ func writeGroup(buf *bytes.Buffer, key string, children []query.Node) error {
 	return nil
 }
 
-// writeFileSync writes data to path: a temp file, fsynced, renamed into place. The
-// directory is not fsynced: the shard's commit does that once, after the manifest.
-func writeFileSync(path string, data []byte) error {
+// writeFile writes data to path: a temp file renamed into place, unsynced (the shard's
+// flush that persists the segment fsyncs it).
+func writeFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := segment.SyncFile(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

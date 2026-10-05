@@ -4,126 +4,212 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
-// Crash and reopen: a crash at any kill point of a refresh or a merge leaves a
-// directory that reopens to the old or the new commit, whole, with no orphan files,
-// and replaying the changelog from CommittedSeq brings the copy back to the latest
-// state: nothing acknowledged and refreshed is lost.
+// Crash and reopen: a crash before, during or after a flush, during a refresh, or
+// during a merge commit while refreshes have published generations no flush has
+// persisted, leaves a directory that reopens to the last durable manifest, whole, with
+// no orphan and no missing file; replaying the changelog from CommittedSeq then brings
+// the copy back to the latest state. Each case runs with removals that succeed (POSIX,
+// and Windows once nothing maps the file) and with every removal refused while the
+// shard runs (Windows, where a reader or a scanner holds files open), the leftovers
+// being collected at the reopen.
 func TestCrashAtKillPoints(t *testing.T) {
 	type tc struct {
-		op    string // "refresh" or "merge"
-		point string
-		// newCommit is whether the crash leaves the new commit in place.
-		newCommit bool
+		name, point string
+		// run is the operation the crash interrupts; with no point, the crash comes
+		// after it returns.
+		run func(h *harness) error
+		// published is whether the crash leaves everything published durable.
+		published bool
 	}
-	var cases []tc
-	for _, p := range []string{pointRefreshBuilt, pointCommitSidecars, pointManifestWritten} {
-		cases = append(cases, tc{"refresh", p, false})
+	refresh := func(h *harness) error {
+		h.upsert("d04", "late")
+		h.del("d05")
+		h.putQuery("q7")
+		return h.s.Refresh(context.Background())
 	}
-	cases = append(cases, tc{"refresh", pointManifestRenamed, true})
-	for _, p := range []string{pointMergeBuilt, pointCommitSidecars, pointManifestWritten} {
-		cases = append(cases, tc{"merge", p, false})
+	flush := func(h *harness) error { return h.s.Flush(context.Background()) }
+	merge := func(h *harness) error { return h.s.ForceMerge(context.Background(), 1) }
+	nothing := func(*harness) error { return nil }
+	cases := []tc{
+		{"before a flush", "", nothing, false},
+		{"refresh/" + pointRefreshBuilt, pointRefreshBuilt, refresh, false},
+		{"flush/" + pointFlushSynced, pointFlushSynced, flush, false},
+		{"flush/" + pointManifestWritten, pointManifestWritten, flush, false},
+		{"flush/" + pointManifestRenamed, pointManifestRenamed, flush, true},
+		{"after a flush", "", flush, true},
+		{"merge/" + pointMergeBuilt, pointMergeBuilt, merge, false},
+		{"merge/" + pointFlushSynced, pointFlushSynced, merge, false},
+		{"merge/" + pointManifestWritten, pointManifestWritten, merge, false},
+		{"merge/" + pointManifestRenamed, pointManifestRenamed, merge, true},
 	}
-	cases = append(cases, tc{"merge", pointManifestRenamed, true})
-
-	for _, c := range cases {
-		t.Run(c.op+"/"+c.point, func(t *testing.T) {
-			t.Parallel()
-			var armed atomic.Bool
-			opts := testOptions()
-			opts.hooks = &testHooks{at: func(point string) error {
-				if point == c.point && armed.CompareAndSwap(true, false) {
-					return errSimulatedCrash
+	for _, refused := range []bool{false, true} {
+		removals := "removals succeed"
+		if refused {
+			removals = "removals refused"
+		}
+		for _, c := range cases {
+			t.Run(removals+"/"+c.name, func(t *testing.T) {
+				t.Parallel()
+				var armed atomic.Bool
+				opts := testOptions()
+				opts.hooks = &testHooks{
+					at: func(point string) error {
+						if point == c.point && armed.CompareAndSwap(true, false) {
+							return errSimulatedCrash
+						}
+						return nil
+					},
+					remove: func(p string) error {
+						if refused {
+							return errors.New("the file is being used by another process")
+						}
+						return os.Remove(p)
+					},
 				}
-				return nil
-			}}
-			h := newHarness(t, opts)
-			// Three segments, with deletes and updates across them, and saved queries.
-			for i := range 30 {
-				h.upsert(fmt.Sprintf("d%02d", i%17))
-				if i%10 == 9 {
-					h.del(fmt.Sprintf("d%02d", i%7))
-					h.putQuery(fmt.Sprintf("q%d", i%4))
-					h.refresh()
+				h := newHarness(t, opts)
+				// Durable: three segments, with deletes and updates across them, and
+				// saved queries.
+				for i := range 30 {
+					h.upsert(fmt.Sprintf("d%02d", i%17))
+					if i%10 == 9 {
+						h.del(fmt.Sprintf("d%02d", i%7))
+						h.putQuery(fmt.Sprintf("q%d", i%4))
+						h.refresh()
+					}
 				}
-			}
-			durable := h.s.CommittedSeq()
-			if durable != h.seq {
-				t.Fatalf("CommittedSeq %d, want %d", durable, h.seq)
-			}
-
-			var err error
-			want := durable
-			switch c.op {
-			case "refresh":
+				h.flush()
+				durable := h.s.CommittedSeq()
+				if durable != h.seq {
+					t.Fatalf("CommittedSeq %d after a flush, want %d", durable, h.seq)
+				}
+				// Published, not flushed: updates that mask flushed copies (new
+				// deletes on flushed segments), a delete, saved query changes.
 				h.upsert("d01", "new")
 				h.del("d02")
 				h.delQuery("q1")
-				h.putQuery("q9")
-				if c.newCommit {
-					want = h.seq
-				}
-				armed.Store(true)
-				err = h.s.Refresh(context.Background())
-			case "merge":
-				// The merge drops this delete; the commit's other kill points are
-				// reached whatever it writes.
-				h.del("d03")
 				h.refresh()
-				durable, want = h.seq, h.seq
-				armed.Store(true)
-				err = h.s.ForceMerge(context.Background(), 1)
-			}
-			if !errors.Is(err, errSimulatedCrash) {
-				t.Fatalf("%s = %v, want the simulated crash", c.op, err)
-			}
-			if !errors.Is(h.s.Err(), ErrFailed) {
-				t.Fatalf("Err() = %v after a crash", h.s.Err())
-			}
-			if err := h.s.WaitRefreshed(context.Background(), h.seq+1); !errors.Is(err, ErrFailed) {
-				t.Fatalf("WaitRefreshed on a failed shard = %v", err)
-			}
-			h.abandon()
+				h.upsert("d03", "d16")
+				h.putQuery("q9")
+				h.refresh()
+				if got := h.s.CommittedSeq(); got != durable {
+					t.Fatalf("CommittedSeq %d after refreshes, want %d until a flush", got, durable)
+				}
+				published := h.seq
 
-			h.opts.hooks = nil
-			h.open()
-			if got := h.s.CommittedSeq(); got != want {
-				t.Fatalf("reopened at CommittedSeq %d, want %d (durable before: %d)", got, want, durable)
-			}
-			if got, ref := dirFiles(t, h.dir), referencedFiles(t, h.dir); !slices.Equal(got, ref) {
-				t.Fatalf("files after reopen %v, manifest references %v", got, ref)
-			}
-			g := h.s.Acquire()
-			if err := checkGeneration(g, h.snapshots[want]); err != nil {
-				g.Release()
-				t.Fatal(err)
-			}
-			if err := checkQueries(g, h.querySnapshots[want]); err != nil {
-				g.Release()
-				t.Fatal(err)
-			}
-			g.Release()
+				armed.Store(c.point != "")
+				err := c.run(h)
+				if c.point != "" {
+					if !errors.Is(err, errSimulatedCrash) {
+						t.Fatalf("%s = %v, want the simulated crash", c.name, err)
+					}
+					if !errors.Is(h.s.Err(), ErrFailed) {
+						t.Fatalf("Err() = %v after a crash", h.s.Err())
+					}
+					if err := h.s.WaitRefreshed(context.Background(), h.seq+1); !errors.Is(err, ErrFailed) {
+						t.Fatalf("WaitRefreshed on a failed shard = %v", err)
+					}
+				} else if err != nil {
+					t.Fatalf("%s: %v", c.name, err)
+				}
+				h.abandon()
 
-			// The tailer replays the changelog from CommittedSeq.
-			h.replayFrom(want)
-			h.refresh()
-			h.check()
-			h.checkQueries()
-			h.upsert("after")
-			h.refresh()
-			h.forceMerge(1)
-			h.check()
-			h.reopen()
-			h.check()
-			h.checkQueries()
-		})
+				want := durable
+				if c.published {
+					want = published
+				}
+				h.opts.hooks = nil
+				h.open()
+				if got := h.s.CommittedSeq(); got != want {
+					t.Fatalf("reopened at CommittedSeq %d, want %d (durable %d, published %d)", got, want, durable, published)
+				}
+				if got, ref := dirFiles(t, h.dir), referencedFiles(t, h.dir); !slices.Equal(got, ref) {
+					t.Fatalf("files after reopen %v, manifest references %v", got, ref)
+				}
+				g := h.s.Acquire()
+				if err := checkGeneration(g, h.snapshots[want]); err != nil {
+					g.Release()
+					t.Fatal(err)
+				}
+				if err := checkQueries(g, h.querySnapshots[want]); err != nil {
+					g.Release()
+					t.Fatal(err)
+				}
+				g.Release()
+
+				// The tailer replays the changelog from CommittedSeq.
+				h.replayFrom(want)
+				h.refresh()
+				h.check()
+				h.checkQueries()
+				h.upsert("after")
+				h.refresh()
+				h.forceMerge(1)
+				h.check()
+				h.reopen()
+				h.check()
+				h.checkQueries()
+				if got, ref := dirFiles(t, h.dir), referencedFiles(t, h.dir); !slices.Equal(got, ref) {
+					t.Fatalf("files after the replay and a reopen %v, manifest references %v", got, ref)
+				}
+			})
+		}
 	}
+}
+
+// A file outlives every durable manifest that lists it, and no longer: a sidecar a
+// refresh supersedes stays until a flush's manifest stops listing it, and a segment
+// merged away, flushed or only ever published, goes once the merge's flush has dropped
+// it and readers have released it.
+func TestFilesOutliveTheirLastDurableManifest(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.upsert("a", "b", "c")
+	h.commit()
+	h.upsert("a")
+	h.commit()
+	first := referencedFiles(t, h.dir)
+	h.upsert("b")
+	h.refresh()
+	if got := dirFiles(t, h.dir); !isSubset(first, got) {
+		t.Fatalf("a refresh removed files the durable manifest lists: %v, manifest %v", got, first)
+	}
+	h.upsert("d")
+	h.refresh() // a segment only ever published
+	reader := h.s.Acquire()
+	h.forceMerge(1)
+	h.s.jan.drain()
+	for _, name := range first {
+		if _, err := os.Stat(filepath.Join(h.dir, name)); err != nil && name != manifestName && strings.HasSuffix(name, segment.FileExt) {
+			t.Fatalf("segment %s, which a reader holds, was removed: %v", name, err)
+		}
+	}
+	reader.Release()
+	h.s.jan.drain()
+	if got, ref := dirFiles(t, h.dir), referencedFiles(t, h.dir); !slices.Equal(got, ref) {
+		t.Fatalf("files after the merge's flush %v, manifest references %v", got, ref)
+	}
+	h.check()
+	h.reopen()
+	h.check()
+}
+
+func isSubset(sub, of []string) bool {
+	for _, s := range sub {
+		if !slices.Contains(of, s) {
+			return false
+		}
+	}
+	return true
 }
 
 // replayFrom re-applies every logged change after seq, as Task 9's tailer does.

@@ -94,7 +94,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 	copies := []*copyRunner{newCopy(t, d.open(t), id, opts), newCopy(t, d.open(t), id, opts)}
 	for _, c := range copies {
-		c.sopt.FlushBytes = 16 << 10 // small buffers: background refreshes, and backpressure
+		c.sopt.RefreshBytes = 16 << 10 // small buffers: background refreshes, and backpressure
 		c.sopt.MaxBufferFactor = 2
 		c.start()
 	}
@@ -648,7 +648,7 @@ func TestBackpressureIsRetried(t *testing.T) {
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 		c := newCopy(t, d.open(t), id, opts)
 		c.sopt.RefreshInterval = -1 // only the tailer's refreshes drain it
-		c.sopt.FlushBytes = 1       // full after every batch
+		c.sopt.RefreshBytes = 1     // full after every batch
 		c.sopt.MaxBufferFactor = 1
 		c.start()
 		var batch []store.Change
@@ -723,6 +723,57 @@ func TestLeaseLostStopsTheTailer(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		if c.tailer.Applied() != applied {
 			t.Fatal("the tailer applied after losing its lease")
+		}
+	})
+}
+
+// TestReportsOnlyFlushedSeqs: the seq the registry holds for a copy (the changelog is
+// pruned by it) is the copy's CommittedSeq, never more: a change the copy has applied
+// and published, searchable, is reported only once a flush has made it durable.
+func TestReportsOnlyFlushedSeqs(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "f", testMapping)
+		id := ShardID{Index: "f", Shard: 0}
+		cp, ok, err := st.Registry().ClaimCopy(ctx, id, "node-a", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+		opts := testOptions()
+		opts.Copy = &cp
+		c := newCopy(t, d.open(t), id, opts)
+		c.sopt.FlushInterval = -1
+		c.start()
+		reported := func(atLeast int64) int64 {
+			t.Helper()
+			got := waitCopyState(t, st, id, store.CopyServing)
+			for deadline := time.Now().Add(30 * time.Second); got.AppliedSeq < atLeast && time.Now().Before(deadline); {
+				time.Sleep(10 * time.Millisecond)
+				got = waitCopyState(t, st, id, store.CopyServing)
+			}
+			return got.AppliedSeq
+		}
+		first := mustApply(t, st, upsert("f", 0, "a", docBody("a", 1)))
+		sh := c.waitApplied(first)
+		if err := sh.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := reported(first); got < first {
+			t.Fatalf("reported %d after a flush, want %d", got, first)
+		}
+
+		head := mustApply(t, st, upsert("f", 0, "b", docBody("b", 2)))
+		sh = c.waitApplied(head)
+		time.Sleep(10 * opts.ReportInterval)
+		if got := reported(0); got >= head || sh.CommittedSeq() >= head {
+			t.Fatalf("reported %d (CommittedSeq %d) with %d published but not flushed", got, sh.CommittedSeq(), head)
+		}
+		if err := sh.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := reported(head); got < head {
+			t.Fatalf("reported %d after a flush, want %d", got, head)
 		}
 	})
 }

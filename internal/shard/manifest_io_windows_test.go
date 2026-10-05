@@ -34,7 +34,7 @@ func holdExclusive(t *testing.T, path string, d time.Duration) {
 func TestReadManifestWaitsOutASharingViolation(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a")
-	h.refresh()
+	h.commit()
 	holdExclusive(t, filepath.Join(h.dir, manifestName), 60*time.Millisecond)
 	if _, err := readManifest(h.dir, quietLogger); err != nil {
 		t.Fatalf("readManifest while the manifest was held for 60 ms: %v", err)
@@ -46,7 +46,7 @@ func TestReadManifestWaitsOutASharingViolation(t *testing.T) {
 func TestReadManifestRetryIsBounded(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a")
-	h.refresh()
+	h.commit()
 	holdExclusive(t, filepath.Join(h.dir, manifestName), 3*time.Second)
 	start := time.Now()
 	_, err := readManifest(h.dir, quietLogger)

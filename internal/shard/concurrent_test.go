@@ -115,10 +115,13 @@ func TestConcurrentReadersDuringRefreshAndMerge(t *testing.T) {
 	h.waitNoOrphans()
 }
 
-// waitNoOrphans waits for the janitor (which may be mid-drain in its own goroutine) to
-// leave exactly the files the manifest references.
+// waitNoOrphans flushes, then waits for the janitor (which may be mid-drain in its own
+// goroutine) to leave exactly the files the manifest references.
 func (h *harness) waitNoOrphans() {
 	h.t.Helper()
+	if h.s.Err() == nil {
+		h.flush()
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		h.s.jan.drain()
@@ -159,9 +162,10 @@ func readOnce(s *Shard, snaps *sync.Map) error {
 	return nil
 }
 
-// A segment merged away keeps its files, and stays readable, while any generation
-// listing it is held; they are removed after the final Release (when the mapping is
-// gone, which Windows requires), and a removal that fails is retried until it works.
+// A segment merged away keeps its file, and stays readable, while any generation
+// listing it is held; it is removed after the final Release (when the mapping is gone,
+// which Windows requires), and a removal that fails is retried until it works. Its
+// sidecars, which only a durable manifest reads, go with the flush that drops them.
 func TestMergedAwayFilesRemovedAfterLastRelease(t *testing.T) {
 	var mu sync.Mutex
 	failLeft := map[string]int{}
@@ -193,7 +197,7 @@ func TestMergedAwayFilesRemovedAfterLastRelease(t *testing.T) {
 	held := h.s.Acquire()
 	var old []string
 	for _, sv := range held.Segments {
-		old = append(old, segmentFiles(h.dir, sv.ID)...)
+		old = append(old, filepath.Join(h.dir, sv.ID+segment.FileExt))
 	}
 	segPath := filepath.Join(h.dir, held.Segments[0].ID+segment.FileExt)
 	if runtime.GOOS == "windows" {

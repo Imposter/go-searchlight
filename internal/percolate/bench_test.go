@@ -210,7 +210,7 @@ func (env *benchEnv) regenerate() {
 func newBenchEnv(b *testing.B, cfg benchConfig) *benchEnv {
 	b.Helper()
 	ctx := context.Background()
-	s, err := shard.Open(ctx, b.TempDir(), benchMapping, shard.Options{QueryIndex: Index{}, RefreshInterval: -1, FlushBytes: -1, DisableMerges: true})
+	s, err := shard.Open(ctx, b.TempDir(), benchMapping, shard.Options{QueryIndex: Index{}, RefreshInterval: -1, RefreshBytes: -1, DisableMerges: true})
 	if err != nil {
 		b.Fatal(err)
 	}

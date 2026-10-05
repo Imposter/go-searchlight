@@ -3,18 +3,20 @@ package shard
 import "errors"
 
 // Kill points: where a test's hook can simulate a crash (or block, or fail) inside a
-// refresh, a merge or a commit.
+// refresh, a merge or a flush.
 const (
-	// pointRefreshBuilt: the refresh's segment file is written, nothing is committed.
+	// pointRefreshBuilt: the refresh's segment file is written, unsynced, and nothing is
+	// published.
 	pointRefreshBuilt = "refresh.built"
-	// pointMergeBuilt: the merged segment is written, nothing is committed.
+	// pointMergeBuilt: the merged segment is written, and nothing is published.
 	pointMergeBuilt = "merge.built"
-	// pointCommitSidecars: a commit's deletes sidecars are written, its manifest is not.
-	pointCommitSidecars = "commit.sidecars"
+	// pointFlushSynced: a flush's segment files are fsynced and its deletes sidecars
+	// written, and its manifest is not.
+	pointFlushSynced = "flush.synced"
 	// pointManifestWritten: manifest.tmp is written and fsynced, not yet renamed.
 	pointManifestWritten = "manifest.written"
 	// pointManifestRenamed: the new manifest is renamed into place, the directory is
-	// not yet fsynced, and nothing is published.
+	// not yet fsynced, and CommittedSeq has not moved.
 	pointManifestRenamed = "manifest.renamed"
 )
 

@@ -82,15 +82,15 @@ type Config struct {
 	// copy still needs it (that copy rebuilds).
 	ChangelogRetention time.Duration
 	// RefreshInterval is how often each shard's write buffer becomes a
-	// searchable segment.
+	// searchable segment. A refresh is visibility only: it fsyncs nothing.
 	RefreshInterval time.Duration
-	// SeqPersistInterval bounds how long a shard's durable seq (its manifest's) may
-	// trail its refreshed seq when refreshes bring no new segment, only a changelog
-	// position other shards' changes moved. Such a refresh is visible at once but
-	// written to the manifest at most this often (and at the next segment change, and
-	// at shutdown), sparing an fsync per refresh; a restart replays at most this much
-	// more of the changelog.
-	SeqPersistInterval time.Duration
+	// FlushInterval is how often each shard copy makes what refreshes published
+	// durable: it fsyncs the new segments and their deletes, writes its manifest and
+	// only then reports the manifest's seq as applied (the changelog is pruned by it).
+	// The SQL changelog is the write-ahead log, so nothing acknowledged is ever at
+	// risk: a crash replays at most this much more of the changelog. A merge, a peer
+	// snapshot and a shutdown flush at once as well.
+	FlushInterval time.Duration
 	// MaxLag is how far a copy may trail the changelog and still serve reads
 	// and report ready.
 	MaxLag time.Duration
@@ -152,8 +152,8 @@ type Config struct {
 	// its peak: measured at about 4.5 for a bulk and 8 for a bulk with percolate
 	// or a percolation (BenchmarkBulkPeakHeap); the default, 10, leaves headroom.
 	// A node's heap is then about 1.5 times the two budgets, plus each shard
-	// copy's write buffers (flush_bytes times max_buffer_factor: 64 MiB times 4 by
-	// default).
+	// copy's write buffers (the shard's refresh bytes times its max buffer factor:
+	// 64 MiB times 4 by default).
 	InflightAmplification int
 	// DropTimeout bounds dropping an index from the store, which deletes its
 	// documents, queries and changes, apart from the request's own deadline.
@@ -187,7 +187,7 @@ func Default() Config {
 		NodeID:                hostname(),
 		DataDir:               "data",
 		RefreshInterval:       time.Second,
-		SeqPersistInterval:    30 * time.Second,
+		FlushInterval:         10 * time.Second,
 		MaxLag:                2 * time.Second,
 		ChangelogPollInterval: 500 * time.Millisecond,
 		RemapDebounce:         2 * time.Second,
@@ -331,9 +331,9 @@ var settings = []setting{
 		format: func(c *Config) string { return c.RefreshInterval.String() },
 	},
 	{
-		name: "seq_persist_interval", usage: "how often a shard writes a seq that moved without new segments to its manifest",
-		parse:  func(c *Config, v string) error { return positiveDuration(&c.SeqPersistInterval, v) },
-		format: func(c *Config) string { return c.SeqPersistInterval.String() },
+		name: "flush_interval", usage: "how often a shard copy fsyncs what refreshes published and advances its durable seq",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.FlushInterval, v) },
+		format: func(c *Config) string { return c.FlushInterval.String() },
 	},
 	{
 		name: "max_lag", usage: "how far a copy may trail the changelog and still serve and report ready",

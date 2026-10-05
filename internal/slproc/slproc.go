@@ -7,7 +7,9 @@
 // first start and keeps across restarts, so its URL never changes. It is stopped
 // gracefully (SIGTERM; CTRL_BREAK on Windows, which needs a console) or killed outright
 // (SIGKILL; TerminateProcess on Windows), and started again on the same files. Its
-// JSON log lines are kept for the caller to wait on or inspect.
+// JSON log lines are kept for the caller to wait on or inspect. A node never outlives
+// the process that started it: Linux kills it when that process dies (Pdeathsig), and
+// on Windows it belongs to a job object that kills it then.
 package slproc
 
 import (
@@ -239,6 +241,10 @@ func (n *Node) Start(ctx context.Context) error {
 		n.mu.Unlock()
 		close(done)
 	}()
+	if err := adoptChild(cmd); err != nil {
+		_ = n.Kill()
+		return err
+	}
 	if err := n.waitFor(ctx, "/healthz"); err != nil {
 		_ = n.Kill()
 		return err
@@ -396,7 +402,8 @@ func (n *Node) Restart(ctx context.Context, timeout time.Duration) error {
 	return n.Start(ctx)
 }
 
-// Logs collects a process's JSON log lines.
+// Logs collects a process's JSON log lines: every line but the access log's ("request
+// served", which Tail still shows), up to maxLines, the oldest dropped past it.
 type Logs struct {
 	*io.PipeWriter
 	mu    sync.Mutex
@@ -405,8 +412,12 @@ type Logs struct {
 	added chan struct{}
 }
 
-// maxRawLines bounds the raw lines kept for Tail.
-const maxRawLines = 2000
+// maxRawLines bounds the raw lines kept for Tail, and maxLines the parsed ones kept for
+// Find, All and Wait.
+const (
+	maxRawLines = 2000
+	maxLines    = 100_000
+)
 
 func newLogs(tee io.Writer) *Logs {
 	r, w := io.Pipe()
@@ -430,8 +441,11 @@ func (l *Logs) collect(r io.Reader, tee io.Writer) {
 		if len(l.raw) > maxRawLines {
 			l.raw = slices.Delete(l.raw, 0, len(l.raw)-maxRawLines)
 		}
-		if m != nil {
+		if m != nil && m["msg"] != "request served" {
 			l.lines = append(l.lines, m)
+			if len(l.lines) > maxLines {
+				l.lines = slices.Delete(l.lines, 0, len(l.lines)-maxLines)
+			}
 		}
 		close(l.added)
 		l.added = make(chan struct{})

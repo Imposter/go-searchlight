@@ -98,6 +98,16 @@ jobs:
           echo "ES_HEAP=${HEAP_GB}g" >> "$GITHUB_ENV"
           echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g, runner $RUNNER_LABEL"
 
+      # Each recovery-cluster node opens up to 64 connections plus one for LISTEN; two
+      # nodes and slbench's own pass the image's default of 100.
+      - name: raise Postgres's max_connections
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$PG" psql -U searchlight -d searchlight -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart "$PG"
+          until docker exec "$PG" pg_isready -U searchlight -d searchlight; do sleep 1; done
+
       # slbench runs the real binary itself, as a child process: on SQLite with a
       # generated tokens file, restarted for the restart workload (T9), and two more on
       # Postgres for the recovery workload (T8). It stops them when it is done.

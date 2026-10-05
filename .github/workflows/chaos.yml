@@ -5,7 +5,9 @@ name: chaos
 # section 14). It takes several minutes and restarts its database with Docker, so it is
 # a workflow of its own rather than a job of ci.yml:
 #
-#   - it runs weekly, on demand, and on pull requests that touch the code it exercises;
+#   - it runs weekly, on demand, and on pull requests that touch the code it exercises
+#     (the binary, the engine's packages from the API down to the store, and the
+#     modules);
 #   - it is time-boxed (the job at 40 minutes, the tests at 30);
 #   - it is not a required check: a slow or failing run shows on the pull request
 #     without holding up ci.yml's checks, which gate the merge. A failure is still a
@@ -17,10 +19,16 @@ on:
   pull_request:
     paths:
       - "cmd/**"
+      - "internal/api/**"
       - "internal/cluster/**"
+      - "internal/node/**"
       - "internal/replica/**"
+      - "internal/segment/**"
       - "internal/shard/**"
       - "internal/slproc/**"
+      - "internal/store/**"
+      - "go.mod"
+      - "go.sum"
       - "test/chaos/**"
       - ".github/workflows/chaos.yml"
 

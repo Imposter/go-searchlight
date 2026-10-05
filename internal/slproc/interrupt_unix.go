@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
-func prepareInterrupt(*exec.Cmd) {}
+func prepareInterrupt(cmd *exec.Cmd) { cmd.SysProcAttr = orphanGuard() }
+
+func adoptChild(*exec.Cmd) error { return nil }
 
 func interrupt(cmd *exec.Cmd) error { return cmd.Process.Signal(syscall.SIGTERM) }

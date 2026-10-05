@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store/sqlite"
 )
 
@@ -70,10 +72,12 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 }
 
 // TestPinnedLogWarns: a read transaction held open pins the write-ahead log, so a
-// checkpoint cannot copy it back while it grows; past LogWarnBytes the store warns.
+// checkpoint cannot copy it back while it grows; past LogWarnBytes the store warns at
+// the checkpointer's next tick, which the store's fake clock gives it.
 func TestPinnedLogWarns(t *testing.T) {
 	logs := &captureHandler{}
-	st := sqliteHarness(t).open(t, WithLogger(slog.New(logs)))
+	clk := clock.NewFake(time.Now())
+	st := sqliteHarness(t).open(t, WithLogger(slog.New(logs)), WithClock(clk))
 	s, ok := st.(*sqlStore)
 	if !ok {
 		t.Fatalf("%T is not the SQL store", st)
@@ -102,12 +106,16 @@ func TestPinnedLogWarns(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	deadline := time.Now().Add(20 * time.Second)
-	for !logs.has("the write-ahead log keeps growing") {
-		if time.Now().After(deadline) {
-			t.Fatal("no warning about the pinned log")
+	if logs.has("the write-ahead log keeps growing") {
+		t.Fatal("warned before the checkpointer ticked")
+	}
+	clk.Advance(sqlite.CheckpointEvery)
+	wait, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	for ; !logs.has("the write-ahead log keeps growing"); runtime.Gosched() {
+		if wait.Err() != nil {
+			t.Fatal("no warning about the pinned log at the checkpointer's tick")
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 

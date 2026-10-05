@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -35,7 +36,8 @@ import (
 
 // allocState is the allocator's memory between passes.
 type allocState struct {
-	mu sync.Mutex
+	clock clock.Clock
+	mu    sync.Mutex
 	// waiting is when a shard was first seen below target while this node was not
 	// among the least loaded eligible nodes.
 	waiting map[store.ShardID]time.Time
@@ -123,7 +125,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	if target > 0 {
 		claim = target + retiring
 	}
-	before, wall := n.clock.Now(), n.clock.Wall()
+	before, wall := n.lc.Now(), n.lc.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, id, n.id, claim, n.opts.LeaseTTL)
 	n.NoteDB(err)
 	switch {
@@ -228,10 +230,10 @@ func (a *allocState) waited(id store.ShardID, d time.Duration) bool {
 	}
 	since, ok := a.waiting[id]
 	if !ok {
-		a.waiting[id] = time.Now()
+		a.waiting[id] = a.clock.Now()
 		return false
 	}
-	return time.Since(since) >= d
+	return a.clock.Since(since) >= d
 }
 
 func (a *allocState) clear(id store.ShardID) {

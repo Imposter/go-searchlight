@@ -5,6 +5,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
 // Adaptive replica selection, after Elasticsearch's (itself after C3, Suresh et al.,
@@ -46,6 +48,7 @@ const (
 const staleFor = 2 * time.Second
 
 type ars struct {
+	clock clock.Clock
 	mu    sync.Mutex
 	peers map[string]*peerStats
 	// copies are the copies' (node and shard) suspicion and staleness.
@@ -64,8 +67,8 @@ type copyStats struct {
 	staleAt      time.Time
 }
 
-func newARS() *ars {
-	return &ars{peers: map[string]*peerStats{}, copies: map[string]*copyStats{}}
+func newARS(clk clock.Clock) *ars {
+	return &ars{clock: clk, peers: map[string]*peerStats{}, copies: map[string]*copyStats{}}
 }
 
 func (a *ars) peer(id string) *peerStats {
@@ -90,7 +93,7 @@ func (a *ars) copy(key string) *copyStats {
 // outcome: the service time and queue the peer reported (negative when it reported
 // none), or a failure of the copy.
 func (a *ars) start(id, key string) func(failed bool, service float64, queue float64) {
-	began := time.Now()
+	began := a.clock.Now()
 	a.mu.Lock()
 	a.peer(id).outstanding++
 	a.mu.Unlock()
@@ -105,7 +108,7 @@ func (a *ars) start(id, key string) func(failed bool, service float64, queue flo
 		}
 		c := a.copy(key)
 		c.failures, c.suspectUntil = 0, time.Time{}
-		resp := time.Since(began).Seconds()
+		resp := a.clock.Since(began).Seconds()
 		if !p.measured {
 			p.resp, p.measured = resp, true
 			if service >= 0 {
@@ -137,7 +140,7 @@ func (a *ars) suspectLocked(key string) {
 	c := a.copy(key)
 	c.failures++
 	d := suspectBase << min(c.failures-1, 16)
-	c.suspectUntil = time.Now().Add(min(d, suspectCap))
+	c.suspectUntil = a.clock.Now().Add(min(d, suspectCap))
 }
 
 func ewma(avg, sample float64) float64 { return arsAlpha*sample + (1-arsAlpha)*avg }
@@ -147,7 +150,7 @@ func (a *ars) noteStale(key string, stale bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if stale {
-		a.copy(key).staleAt = time.Now()
+		a.copy(key).staleAt = a.clock.Now()
 	} else if c := a.copies[key]; c != nil {
 		c.staleAt = time.Time{}
 	}
@@ -161,7 +164,7 @@ func (a *ars) rank(id, key string, clients int) float64 {
 		r = p.resp - p.service + q*q*q*p.service
 	}
 	if c := a.copies[key]; c != nil {
-		now := time.Now()
+		now := a.clock.Now()
 		if now.Before(c.suspectUntil) {
 			r += failedPenalty
 		}

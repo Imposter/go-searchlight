@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -562,18 +563,19 @@ func expireLeases(t testing.TB, d *db, index string) {
 // wall clock both (a suspended machine's monotonic clock may stand still); a slot taken
 // over from another node is quarantined for TTL plus margin after the claim began.
 func TestLeaseDeadlineByFakeClock(t *testing.T) {
-	clk := &fakeClock{}
-	clk.wall.Store(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC).UnixNano())
+	fake := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	clk := leaseClock{c: fake, epoch: fake.Now()}
+	set := func(d time.Duration) { fake.Advance(d - clk.Now()) }
 	l := &lease{ttl: time.Second, margin: 100 * time.Millisecond, clock: clk}
 	l.extend(0, clk.Wall())
 	if !l.valid() {
 		t.Fatal("a fresh lease is not valid")
 	}
-	clk.set(899 * time.Millisecond)
+	set(899 * time.Millisecond)
 	if !l.valid() {
 		t.Fatal("not valid before the margin")
 	}
-	clk.set(900 * time.Millisecond)
+	set(900 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid within the margin of its deadline")
 	}
@@ -585,47 +587,36 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if time.Duration(l.deadline.Load()) != 1500*time.Millisecond {
 		t.Fatalf("deadline %s", time.Duration(l.deadline.Load()))
 	}
-	clk.set(1400 * time.Millisecond)
+	set(1400 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid past deadline less margin")
 	}
 
 	// Suspend: the wall clock runs on while the monotonic one stands still.
 	l.extend(clk.Now(), clk.Wall())
-	clk.wall.Add(int64(5 * time.Second))
+	fake.StepWall(5 * time.Second)
 	if l.valid() {
 		t.Fatal("valid after the machine slept past the lease, by its monotonic clock alone")
 	}
 
 	// Quarantine: a stolen slot serves nothing for TTL plus margin after its claim.
-	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: clk, id: "me"}
+	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: fake, lc: clk, id: "me"}
 	from := clk.Now()
 	q := n.newLease(store.Copy{TakenFrom: "other"}, from, clk.Wall())
 	if !q.quarantined() || !q.valid() {
 		t.Fatalf("a stolen slot: quarantined %v, valid %v", q.quarantined(), q.valid())
 	}
-	clk.set(from + 1099*time.Millisecond)
+	set(from + 1099*time.Millisecond)
 	if !q.quarantined() {
 		t.Fatal("the quarantine ended before TTL plus margin")
 	}
-	clk.set(from + 1100*time.Millisecond)
+	set(from + 1100*time.Millisecond)
 	if q.quarantined() {
 		t.Fatal("still quarantined after TTL plus margin")
 	}
 	if mine := n.newLease(store.Copy{TakenFrom: ""}, clk.Now(), clk.Wall()); mine.quarantined() {
 		t.Fatal("a free slot is quarantined")
 	}
-}
-
-// fakeClock is a Clock a test moves: a monotonic reading and a wall clock that run
-// together unless a test steps one alone.
-type fakeClock struct{ now, wall atomic.Int64 }
-
-func (c *fakeClock) Now() time.Duration { return time.Duration(c.now.Load()) }
-func (c *fakeClock) Wall() time.Time    { return time.Unix(0, c.wall.Load()) }
-func (c *fakeClock) set(d time.Duration) {
-	c.wall.Add(int64(d) - c.now.Load())
-	c.now.Store(int64(d))
 }
 
 // TestReadRightAfterCreateOnAnotherNode: an index created on one node is read on
@@ -663,13 +654,17 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 	})
 }
 
-// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made in a loop
-// from several clients, re-read the registry at most once per missRefreshEvery.
+// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made at once by
+// several clients, re-read the registry at most once per missRefreshEvery, by the
+// node's clock: a burst of them shares one read, and a burst less than an interval
+// after the last read waits out the rest of the interval before reading again.
 func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
+	clk := clock.NewFake(time.Now())
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
-		o.HeartbeatInterval = 10 * time.Second
-		o.LeaseTTL = 40 * time.Second
-		o.DeadAfter = time.Minute
+		o.Clock = clk
+		o.HeartbeatInterval = time.Hour
+		o.LeaseTTL = 2 * time.Hour
+		o.DeadAfter = 3 * time.Hour
 		o.ViewInterval = time.Hour
 		o.CatalogInterval = time.Hour
 		o.PruneInterval = time.Hour
@@ -677,31 +672,53 @@ func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
 	a := c.start(0)
 	hooks := &clusterHooks{a.n}
 	id := store.ShardID{Index: "nowhere", Shard: 0}
-	before := a.wrap.nodesReads.Load()
-	began := time.Now()
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() {
-			for time.Since(began) < 600*time.Millisecond {
-				if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
-					t.Errorf("a shard no node serves: %v", err)
-					return
+	burst := func() <-chan struct{} {
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				for range 5 {
+					if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
+						t.Errorf("a shard no node serves: %v", err)
+						return
+					}
 				}
-			}
-		})
+			})
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		return done
 	}
-	wg.Wait()
-	reads, limit := a.wrap.nodesReads.Load()-before, int64(time.Since(began)/missRefreshEvery)+3
-	t.Logf("%d registry reads in %s", reads, time.Since(began).Round(time.Millisecond))
-	if reads > limit {
-		t.Fatalf("%d registry reads for reads of a shard no node serves (limit %d)", reads, limit)
+	reads := func() int64 { return a.wrap.nodesReads.Load() }
+	before := reads()
+	for k := range int64(3) {
+		clk.Advance(missRefreshEvery)
+		<-burst()
+		if got := reads() - before; got != k+1 {
+			t.Fatalf("%d registry reads after %d bursts an interval apart, want one each", got, k+1)
+		}
+	}
+
+	clk.Advance(missRefreshEvery / 3)
+	done := burst()
+	if err := clk.BlockUntilArmed(tctx(t), missRefreshEvery-missRefreshEvery/3); err != nil {
+		t.Fatalf("a burst within the interval is not waiting out its rest: %v", err)
+	}
+	if got := reads() - before; got != 3 {
+		t.Fatalf("%d registry reads: a burst within the interval read at once", got)
+	}
+	clk.Advance(missRefreshEvery - missRefreshEvery/3)
+	<-done
+	if got := reads() - before; got != 4 {
+		t.Fatalf("%d registry reads once the interval ran out, want 4", got)
 	}
 }
 
 // TestUnknownIndexLookupsAreCached: requests for an index no node has ask the store
-// about it once per absentTTL, not once each; creating it here is seen at once.
+// about it once per absentTTL, not once each. The node's clock is fake and stands
+// still: every request falls within one absentTTL.
 func TestUnknownIndexLookupsAreCached(t *testing.T) {
-	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.Clock = clk; o.CatalogInterval = time.Hour })
 	a := c.start(0)
 	before := a.wrap.indexGets.Load()
 	for range 50 {
@@ -710,12 +727,52 @@ func TestUnknownIndexLookupsAreCached(t *testing.T) {
 			t.Fatalf("an index no node has: %v, want a 404", err)
 		}
 	}
-	if gets := a.wrap.indexGets.Load() - before; gets > 2 {
-		t.Fatalf("%d store lookups for 50 requests of an unknown index", gets)
+	if gets := a.wrap.indexGets.Load() - before; gets != 1 {
+		t.Fatalf("%d store lookups for 50 requests of an unknown index, want 1", gets)
 	}
-	createIndex(t, a.n, "ghost", 1, 0)
+}
+
+// TestCreateForgetsARememberedAbsence: a node that answered 404 for a name forgets
+// that answer when it creates the index itself, so once it drops the index and
+// another node creates it again, a read finds it although the 404 is younger than
+// absentTTL by the node's clock. That clock is fake: it moves only by the one
+// missRefreshEvery the read needs to see B's copy in a fresh view. Node A is at
+// capacity, so its create and drop host no copy and wait on nothing; B serves.
+func TestCreateForgetsARememberedAbsence(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		o.CatalogInterval = time.Hour
+		if i == 0 {
+			o.Clock = clk
+			o.Capacity = 1
+			o.HeartbeatInterval = time.Hour
+			o.LeaseTTL = 2 * time.Hour
+			o.DeadAfter = 3 * time.Hour
+			o.ViewInterval = time.Hour
+			o.PruneInterval = time.Hour
+		}
+	})
+	b := c.start(1)
+	createIndex(t, b.n, "seed", 1, 2)
+	a := c.start(0)
+	if a.n.leaseCount() != 1 {
+		t.Fatalf("node A holds %d copies, want its one of seed", a.n.leaseCount())
+	}
+	notFound := func(err error) bool {
+		var ae *api.Error
+		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+	}
+	if _, err := count(tctx(t), a.n, "ghost", 0); !notFound(err) {
+		t.Fatalf("an index no node has: %v, want a 404", err)
+	}
+	createIndex(t, a.n, "ghost", 1, 1)
+	if err := a.n.DeleteIndex(tctx(t), "ghost"); err != nil {
+		t.Fatal(err)
+	}
+	createIndex(t, b.n, "ghost", 1, 1)
+	clk.Advance(missRefreshEvery)
 	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {
-		t.Fatalf("the index just created here: %d, %v", got, err)
+		t.Fatalf("a read on A of the index B created after A dropped its own: %d, %v", got, err)
 	}
 }
 

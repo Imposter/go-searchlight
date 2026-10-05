@@ -30,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -225,6 +226,7 @@ type options struct {
 	tracer    trace.Tracer
 	meter     metric.Meter
 	logger    *slog.Logger
+	clock     clock.Clock
 	blobChunk int
 	gateKey   string // the database a single-writer dialect's write gate is shared by
 	dbPath    string
@@ -240,6 +242,10 @@ func WithMeter(m metric.Meter) Option { return func(o *options) { o.meter = m } 
 
 // WithLogger sets the logger (default: slog.Default()).
 func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l } }
+
+// WithClock sets the clock the store's timers and durations run on (default:
+// clock.Real).
+func WithClock(c clock.Clock) Option { return func(o *options) { o.clock = c } }
 
 // WithBlobChunkSize sets the blob chunk size in bytes.
 func WithBlobChunkSize(n int) Option { return func(o *options) { o.blobChunk = n } }
@@ -276,6 +282,9 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	}
 	if o.logger == nil {
 		o.logger = slog.Default()
+	}
+	if o.clock == nil {
+		o.clock = clock.Real{}
 	}
 	if o.blobChunk <= 0 {
 		return nil, invalidf("blob chunk size %d", o.blobChunk)

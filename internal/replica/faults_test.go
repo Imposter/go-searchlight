@@ -450,25 +450,36 @@ func lagAge(tl *Tailer) time.Duration {
 }
 
 // TestRemapDebounce: a burst of mapping changes that each map a field live documents
-// hold costs one rebuild, at the end of the burst, and the copy ends right.
+// hold costs one rebuild, at the end of the burst, and the copy ends right. Each change
+// after the first lands while the copy waits out its debounce window, which the test
+// ends by advancing the tailer's clock.
 func TestRemapDebounce(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		st := d.open(t)
 		createIndex(t, st, "db", `{"dynamic":false,"fields":{"title":"text"}}`)
 		id := ShardID{Index: "db", Shard: 0}
 		opts, reader := meteredOptions()
-		opts.RemapDebounce = 400 * time.Millisecond
+		const debounce = 400 * time.Millisecond
+		opts.RemapDebounce = debounce
 		c := newCopy(t, d.open(t), id, opts)
+		clk := c.withFakeClock(opts.PollInterval)
 		c.start()
 		c.waitApplied(mustApply(t, st, upsert("db", 0, "d1", `{"title":"x","brand":"A","color":"red","size":3,"weight":1}`)))
-		for _, f := range []struct {
+		for i, f := range []struct {
 			name string
 			typ  schema.FieldType
 		}{{"brand", schema.Keyword}, {"color", schema.Keyword}, {"size", schema.Number}, {"weight", schema.Number}} {
 			updateMapping(t, st, "db", func(m *schema.Mapping) { m.Fields[f.name] = f.typ })
-			c.tailer.Wake()
-			time.Sleep(50 * time.Millisecond)
+			if i == 0 {
+				c.current().Wake()
+			} else {
+				clk.Advance(debounce)
+			}
+			if err := clk.BlockUntilArmed(tctx(t), debounce); err != nil {
+				t.Fatalf("mapping change %d: the copy is not waiting out a debounce window: %v", i+1, err)
+			}
 		}
+		clk.Advance(debounce)
 		head := mustApply(t, st, upsert("db", 0, "d2", `{"title":"y","brand":"B"}`))
 		v := viewOf(t, c.waitApplied(head))
 		if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonRemap); n != 1 {

@@ -122,7 +122,7 @@ func (n *Single) Ready(context.Context) error {
 	if closed {
 		return api.Unavailable(store.ErrClosed, "the node is shutting down")
 	}
-	if since := time.Since(time.Unix(0, n.dbOK.Load())); since > n.cfg.MaxLag {
+	if since := n.clock.Since(time.Unix(0, n.dbOK.Load())); since > n.cfg.MaxLag {
 		return api.Unavailable(store.ErrClosed, "the database has not answered for %s (max_lag %s)", since.Round(time.Millisecond), n.cfg.MaxLag)
 	}
 	var waiting []error

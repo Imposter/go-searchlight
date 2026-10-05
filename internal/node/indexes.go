@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -105,7 +106,7 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 // waitServing waits, under ctx and at most max_lag, until every copy of idx serves;
 // a halted copy ends the wait at once.
 func (n *Single) waitServing(ctx context.Context, idx *index) error {
-	ctx, cancel := context.WithTimeout(ctx, max(n.cfg.MaxLag, time.Second))
+	ctx, cancel := clock.WithTimeout(ctx, n.clock, max(n.cfg.MaxLag, time.Second))
 	defer cancel()
 	delay := time.Millisecond
 	for {
@@ -123,12 +124,8 @@ func (n *Single) waitServing(ctx context.Context, idx *index) error {
 				return err
 			}
 		}
-		t := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			t.Stop()
+		if n.clock.Sleep(ctx, delay) != nil {
 			return err
-		case <-t.C:
 		}
 		delay = min(2*delay, 20*time.Millisecond)
 	}

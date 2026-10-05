@@ -48,6 +48,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -199,7 +200,7 @@ type Options struct {
 	// DisableMerges turns background merges off; ForceMerge still merges.
 	DisableMerges bool
 	// MergeBudget bounds merge CPU and I/O. Share one across every shard on a node
-	// (NewMergeBudget(cfg.MergeThreads, cfg.MergeBudget)). Nil means the process-wide
+	// (NewMergeBudget(cfg.MergeThreads, cfg.MergeBudget, clk)). Nil means the process-wide
 	// [DefaultMergeBudget], so shards opened without one still share a budget.
 	MergeBudget *MergeBudget
 	// FilterCache caches leaf bitmaps per segment. Share one across every shard on a
@@ -212,6 +213,9 @@ type Options struct {
 	// DeleteRetry is how often removing a file that is still in use (Windows) is
 	// retried. 0 means five seconds.
 	DeleteRetry time.Duration
+	// Clock runs the shard's timers (background refresh, seq persistence, the
+	// janitor's retries) and times its operations. Nil means clock.Real.
+	Clock clock.Clock
 	// Logger, Tracer and Meter are the shard's telemetry; nil means slog.Default(), a
 	// no-op tracer and no metrics.
 	Logger *slog.Logger
@@ -236,7 +240,7 @@ const (
 // node's shards never each get a private budget or cache by accident.
 var (
 	defaultMergeBudget = sync.OnceValue(func() *MergeBudget {
-		return NewMergeBudget(max(1, runtime.GOMAXPROCS(0)/4), 0)
+		return NewMergeBudget(max(1, runtime.GOMAXPROCS(0)/4), 0, clock.Real{})
 	})
 	defaultFilterCache = sync.OnceValue(func() *FilterCache {
 		return NewFilterCache(DefaultFilterCacheBytes, nil)
@@ -279,6 +283,9 @@ func (o *Options) resolve() {
 	}
 	if o.DeleteRetry <= 0 {
 		o.DeleteRetry = DefaultDeleteRetry
+	}
+	if o.Clock == nil {
+		o.Clock = clock.Real{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -921,6 +928,7 @@ func (s *Shard) shutdown() {
 // rateLimitedWarn lets a recurring failure be logged at most once per every, counting
 // the occurrences it held back.
 type rateLimitedWarn struct {
+	clock      clock.Clock
 	every      time.Duration
 	last       time.Time
 	suppressed int
@@ -929,7 +937,7 @@ type rateLimitedWarn struct {
 // allow reports whether to log this occurrence and, if so, how many were held back
 // since the last one logged.
 func (w *rateLimitedWarn) allow() (suppressed int, ok bool) {
-	if now := time.Now(); now.Sub(w.last) >= w.every {
+	if now := w.clock.Now(); now.Sub(w.last) >= w.every {
 		suppressed = w.suppressed
 		w.last, w.suppressed = now, 0
 		return suppressed, true
@@ -948,17 +956,17 @@ func wake(ch chan struct{}) {
 
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
-	warn := rateLimitedWarn{every: time.Minute}
+	warn := rateLimitedWarn{clock: s.opts.Clock, every: time.Minute}
 	var tick, persist <-chan time.Time
 	if s.opts.RefreshInterval > 0 {
-		t := time.NewTicker(s.opts.RefreshInterval)
+		t := s.opts.Clock.NewTicker(s.opts.RefreshInterval)
 		defer t.Stop()
-		tick = t.C
+		tick = t.C()
 	}
 	if s.opts.SeqPersistInterval > 0 {
-		t := time.NewTicker(s.opts.SeqPersistInterval)
+		t := s.opts.Clock.NewTicker(s.opts.SeqPersistInterval)
 		defer t.Stop()
-		persist = t.C
+		persist = t.C()
 	}
 	for {
 		select {

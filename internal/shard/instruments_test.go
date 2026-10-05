@@ -13,6 +13,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -110,7 +111,8 @@ func gaugeValue(rm metricdata.ResourceMetrics, name string) float64 {
 
 // M5: a persistent background failure is logged once a minute, not every tick.
 func TestRateLimitedWarn(t *testing.T) {
-	w := rateLimitedWarn{every: time.Hour}
+	clk := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	w := rateLimitedWarn{clock: clk, every: time.Hour}
 	logged := 0
 	for range 5 {
 		if _, ok := w.allow(); ok {
@@ -120,8 +122,12 @@ func TestRateLimitedWarn(t *testing.T) {
 	if logged != 1 || w.suppressed != 4 {
 		t.Fatalf("logged %d, suppressed %d; want 1 and 4", logged, w.suppressed)
 	}
-	w.last = time.Now().Add(-2 * time.Hour)
-	if n, ok := w.allow(); !ok || n != 4 {
-		t.Fatalf("after the interval: allow() = %d, %v; want 4, true", n, ok)
+	clk.Advance(time.Hour - time.Nanosecond)
+	if _, ok := w.allow(); ok {
+		t.Fatal("logged again within the interval")
+	}
+	clk.Advance(time.Nanosecond)
+	if n, ok := w.allow(); !ok || n != 5 {
+		t.Fatalf("after the interval: allow() = %d, %v; want 5, true", n, ok)
 	}
 }

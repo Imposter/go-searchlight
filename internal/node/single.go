@@ -58,6 +58,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/replica"
@@ -102,6 +103,11 @@ type Options struct {
 	// shards from peers, and keeps its index catalogue in step with the store
 	// (SyncCatalog). Nil: a single node, hosting every shard's one copy.
 	Cluster Cluster
+	// Clock runs the node's timers (refreshes, database pings, waits and their
+	// bounds) and those of its shards, tailers, replica Hub and group committer, and
+	// judges readiness and staleness against max_lag. Nil means clock.Real. On a
+	// clock.Fake a write waits out the group commit window until the fake is advanced.
+	Clock clock.Clock
 	// Logger, Tracer and Meter are the node's telemetry; nil means slog.Default() and
 	// the OpenTelemetry globals.
 	Logger *slog.Logger
@@ -122,6 +128,7 @@ type Single struct {
 	log     *slog.Logger
 	tr      trace.Tracer
 	meter   metric.Meter
+	clock   clock.Clock
 	budget  *shard.MergeBudget
 	cache   *shard.FilterCache
 	maxLag  int64
@@ -262,13 +269,13 @@ func (n *Single) pingInterval() time.Duration {
 
 // pingLoop checks the database until ctx ends.
 func (n *Single) pingLoop(ctx context.Context) {
-	t := time.NewTicker(n.pingInterval())
+	t := n.clock.NewTicker(n.pingInterval())
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		// A database slower than max_lag/2 to answer a ping is as good as gone
 		// for reads that must not trail by more than max_lag.
@@ -293,7 +300,7 @@ func (n *Single) pingTimeout() time.Duration {
 // noteDB records whether the database just answered.
 func (n *Single) noteDB(err error) {
 	if err == nil {
-		n.dbOK.Store(time.Now().UnixNano())
+		n.dbOK.Store(n.clock.Now().UnixNano())
 		n.dbDown.Store(false)
 		return
 	}
@@ -433,6 +440,12 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.MaxApplyLag <= 0 {
 		o.MaxApplyLag = DefaultMaxApplyLag
 	}
+	if o.Clock == nil {
+		o.Clock = clock.Real{}
+	}
+	if o.GroupCommit.Clock == nil {
+		o.GroupCommit.Clock = o.Clock
+	}
 	if o.GroupCommit.Tracer == nil {
 		o.GroupCommit.Tracer = o.Tracer
 	}
@@ -442,11 +455,11 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.NewTailer == nil {
 		// One Hub per node, shared by every tailer; nil (no notifications, as on
 		// SQLite and MySQL) means the tailers poll and are woken by writes.
-		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter})
+		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter, Clock: o.Clock})
 		if hub != nil {
 			o.Background = append(o.Background, hub.Run)
 		}
-		o.NewTailer = ReplicaTailers(o.Config, hub, o.Logger, o.Tracer, o.Meter)
+		o.NewTailer = ReplicaTailers(o.Config, hub, o.Clock, o.Logger, o.Tracer, o.Meter)
 	}
 	n := &Single{
 		st:       o.Store,
@@ -457,10 +470,12 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		log:      o.Logger,
 		tr:       o.Tracer,
 		meter:    o.Meter,
-		budget:   shard.NewMergeBudget(max(1, o.Config.MergeThreads), o.Config.MergeBudget),
+		clock:    o.Clock,
+		budget:   shard.NewMergeBudget(max(1, o.Config.MergeThreads), o.Config.MergeBudget, o.Clock),
 		cache:    shard.NewFilterCache(shard.DefaultFilterCacheBytes, o.Meter),
 		maxLag:   o.MaxApplyLag,
 		indexes:  map[string]*index{},
+		absent:   absentIndexes{clock: o.Clock},
 		reserved: map[string]bool{},
 	}
 	if o.Config.SearchThreads > 0 {
@@ -608,6 +623,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		MergeBudget:        n.budget,
 		FilterCache:        n.cache,
 		QueryIndex:         percolate.Index{},
+		Clock:              n.clock,
 		Logger:             n.log,
 		Tracer:             n.tr,
 		Meter:              n.meter,
@@ -691,10 +707,10 @@ func (n *Single) refresher(ctx context.Context, idx *index) {
 	for {
 		d := time.Duration(idx.refresh.Load())
 		var tick <-chan time.Time
-		var timer *time.Timer
+		var timer clock.Timer
 		if d > 0 {
-			timer = time.NewTimer(d)
-			tick = timer.C
+			timer = n.clock.NewTimer(d)
+			tick = timer.C()
 		}
 		select {
 		case <-ctx.Done():
@@ -714,8 +730,8 @@ func (n *Single) refresher(ctx context.Context, idx *index) {
 			if sh == nil || sh.Err() != nil {
 				continue
 			}
-			if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && time.Since(warn) > time.Minute {
-				warn = time.Now()
+			if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
+				warn = n.clock.Now()
 				n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 			}
 		}

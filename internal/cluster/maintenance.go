@@ -83,23 +83,23 @@ func (n *Node) leader() bool {
 // maintenanceLoop prunes every PruneInterval and sweeps every SweepInterval while this
 // node leads, and collects unused directories every GCInterval.
 func (n *Node) maintenanceLoop(ctx context.Context) {
-	prune := time.NewTicker(n.opts.PruneInterval)
+	prune := n.clock.NewTicker(n.opts.PruneInterval)
 	defer prune.Stop()
-	sweep := time.NewTicker(n.opts.SweepInterval)
+	sweep := n.clock.NewTicker(n.opts.SweepInterval)
 	defer sweep.Stop()
-	gc := time.NewTicker(n.opts.GCInterval)
+	gc := n.clock.NewTicker(n.opts.GCInterval)
 	defer gc.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-prune.C:
+		case <-prune.C():
 			if n.leader() {
 				if err := n.pruneAll(ctx); err != nil && ctx.Err() == nil {
 					n.log.WarnContext(ctx, "pruning the changelog failed", slog.Any("error", err))
 				}
 			}
-		case <-sweep.C:
+		case <-sweep.C():
 			if n.leader() {
 				removed, err := n.st.Blobs().Sweep(ctx, n.opts.SweepAge)
 				switch {
@@ -109,7 +109,7 @@ func (n *Node) maintenanceLoop(ctx context.Context) {
 					n.log.InfoContext(ctx, "swept abandoned blob uploads", slog.Int("removed", removed))
 				}
 			}
-		case <-gc.C:
+		case <-gc.C():
 			n.collectUnused(ctx)
 		}
 	}
@@ -123,8 +123,8 @@ func (n *Node) pruneAll(ctx context.Context) error {
 	v := n.view.Load()
 	n.releaseDecommissioned(ctx, v)
 	progress := n.copyProgress(ctx, v)
-	now := time.Now()
-	cutoff := now.Add(-n.opts.ChangelogRetention)
+	now := n.clock.Now()
+	cutoff := n.clock.Wall().Add(-n.opts.ChangelogRetention)
 	for _, iv := range n.Indexes() {
 		for s := range iv.Shards {
 			id := store.ShardID{Index: iv.Name, Shard: s}
@@ -381,7 +381,7 @@ func (n *Node) collectUnused(ctx context.Context) {
 		if since.IsZero() {
 			since = n.startedAt
 		}
-		if n.leaseFor(d.Shard) != nil || !settled(d.Shard) || time.Since(since) < n.opts.CopyDirGrace {
+		if n.leaseFor(d.Shard) != nil || !settled(d.Shard) || n.clock.Since(since) < n.opts.CopyDirGrace {
 			continue
 		}
 		if err := n.RemoveCopyDir(ctx, d.Shard); err != nil {
@@ -400,7 +400,7 @@ func (n *Node) collectUnused(ctx context.Context) {
 		if since.IsZero() {
 			since = n.startedAt
 		}
-		if !ok || n.fetch.active(id) || time.Since(since) < n.opts.CopyDirGrace {
+		if !ok || n.fetch.active(id) || n.clock.Since(since) < n.opts.CopyDirGrace {
 			continue
 		}
 		if _, known := targets[id.Index]; known && !settled(id) && !n.peerValid(id) {

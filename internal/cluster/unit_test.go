@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -91,14 +92,16 @@ func TestWireRoundTrip(t *testing.T) {
 }
 
 // TestARSOrder: adaptive replica selection prefers the faster peer, puts a peer that
-// just failed after every healthy one, and a copy that answered stale after fresh ones.
+// just failed after every healthy one until its suspicion decays, and a copy that
+// answered stale after fresh ones for staleFor.
 func TestARSOrder(t *testing.T) {
-	a := newARS()
+	clk := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	a := newARS(clk)
 	id := store.ShardID{Index: "i", Shard: 0}
 	slow, fast, fresh := candidate{node: "slow", shard: id}, candidate{node: "fast", shard: id}, candidate{node: "new", shard: id}
 	for range 5 {
 		done := a.start(slow.node, slow.key())
-		time.Sleep(20 * time.Millisecond)
+		clk.Advance(20 * time.Millisecond)
 		done(false, 0.02, 3)
 		done = a.start(fast.node, fast.key())
 		done(false, 0.001, 0)
@@ -120,14 +123,26 @@ func TestARSOrder(t *testing.T) {
 	if pair[0].node != "fast" {
 		t.Fatalf("order %v: a failure of one copy is held against the peer's others", pair)
 	}
-	// Suspicion grows with each failure in a row, and a success clears it.
+	// Suspicion grows with each failure in a row, decays after its time, and a success
+	// clears it.
 	a.start(fast.node, fast.key())(true, -1, -1)
 	a.mu.Lock()
-	until := time.Until(a.copies[fast.key()].suspectUntil)
+	until := clk.Until(a.copies[fast.key()].suspectUntil)
 	a.mu.Unlock()
-	if until < suspectBase+suspectBase/2 {
-		t.Fatalf("after two failures the copy is suspected for %s only", until)
+	if until != 2*suspectBase {
+		t.Fatalf("after two failures the copy is suspected for %s, want %s", until, 2*suspectBase)
 	}
+	clk.Advance(until - time.Millisecond)
+	a.order(cands, 3)
+	if cands[2].node != "fast" {
+		t.Fatalf("order %v: the suspicion ended early", cands)
+	}
+	clk.Advance(time.Millisecond)
+	a.order(cands, 3)
+	if cands[2].node == "fast" {
+		t.Fatalf("order %v: the suspicion did not decay", cands)
+	}
+	a.start(fast.node, fast.key())(true, -1, -1)
 	a.start(fast.node, fast.key())(false, 0.001, 0)
 	a.order(cands, 3)
 	if cands[2].node == "fast" {
@@ -138,6 +153,11 @@ func TestARSOrder(t *testing.T) {
 	a.order(cands, 3)
 	if cands[0].node != "slow" {
 		t.Fatalf("order %v: the stale copy is first", cands)
+	}
+	clk.Advance(staleFor)
+	a.order(cands, 3)
+	if cands[0].node != "new" {
+		t.Fatalf("order %v: the copy is still held stale after staleFor", cands)
 	}
 }
 
@@ -155,7 +175,8 @@ func TestPruneFloor(t *testing.T) {
 	}
 	copies := []store.Copy{cp("a", 100, time.Second), cp("b", 40, time.Second), cp("c", 5, time.Second), cp("a2", 1, -time.Second)}
 	progress := map[copyKey]int64{}
-	now := time.Now()
+	clk := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	now := clk.Now()
 	if f, ok := n.pruneFloor(copies, v, progress, now); !ok || f != 40 {
 		t.Fatalf("floor %d %v, want 40", f, ok)
 	}

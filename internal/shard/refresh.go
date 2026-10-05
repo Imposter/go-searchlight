@@ -14,7 +14,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
@@ -66,7 +65,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 	ctx, span := s.startSpan(ctx, "shard.refresh",
 		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	defer span.End()
-	start := time.Now()
+	start := s.opts.Clock.Now()
 	published, err := s.refresh(ctx, fb, seq, maxSeq, uid, mp)
 	if err != nil {
 		if !published && !isCrash(err) {
@@ -81,7 +80,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		s.inst.refreshFailures.Add(ctx, 1, s.inst.attrs)
 		return err
 	}
-	d := time.Since(start)
+	d := s.opts.Clock.Since(start)
 	s.inst.recordRefresh(ctx, d)
 	s.mu.Lock()
 	buffered := s.buf.size()

@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
 // MergeBudget bounds the CPU and I/O background merges use (spec section 12's
@@ -21,16 +23,17 @@ import (
 type MergeBudget struct {
 	tokens chan struct{}
 	rate   float64 // bytes per second; 0: unlimited
+	clock  clock.Clock
 
 	mu   sync.Mutex
 	next time.Time // when the next byte may be written
 }
 
 // NewMergeBudget returns a budget of threads concurrent merge goroutines (at least 1)
-// and bytesPerSec merge writes per second (0: unlimited).
-func NewMergeBudget(threads int, bytesPerSec int64) *MergeBudget {
+// and bytesPerSec merge writes per second (0: unlimited), throttled by clk.
+func NewMergeBudget(threads int, bytesPerSec int64, clk clock.Clock) *MergeBudget {
 	threads = max(1, threads)
-	b := &MergeBudget{tokens: make(chan struct{}, threads), rate: float64(max(0, bytesPerSec))}
+	b := &MergeBudget{tokens: make(chan struct{}, threads), rate: float64(max(0, bytesPerSec)), clock: clk}
 	for range threads {
 		b.tokens <- struct{}{}
 	}
@@ -74,7 +77,7 @@ func (b *MergeBudget) throttle(ctx context.Context, n int) error {
 		return nil
 	}
 	b.mu.Lock()
-	now := time.Now()
+	now := b.clock.Now()
 	if b.next.Before(now) {
 		b.next = now
 	}
@@ -84,12 +87,5 @@ func (b *MergeBudget) throttle(ctx context.Context, n int) error {
 	if wait <= 0 {
 		return nil
 	}
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return b.clock.Sleep(ctx, wait)
 }

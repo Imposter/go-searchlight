@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -132,14 +131,14 @@ func (j *janitor) forget(paths ...string) {
 
 func (j *janitor) loop() {
 	defer close(j.done)
-	t := time.NewTicker(j.s.opts.DeleteRetry)
+	t := j.s.opts.Clock.NewTicker(j.s.opts.DeleteRetry)
 	defer t.Stop()
 	for {
 		select {
 		case <-j.stopCh:
 			return
 		case <-j.wake:
-		case <-t.C:
+		case <-t.C():
 		}
 		j.drain()
 	}

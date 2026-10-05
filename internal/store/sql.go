@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -35,6 +36,7 @@ type sqlStore struct {
 	r      *sql.DB
 	log    *slog.Logger
 	tracer trace.Tracer
+	clock  clock.Clock
 	dur    metric.Float64Histogram
 	errs   metric.Int64Counter
 	attr   attribute.KeyValue
@@ -67,6 +69,7 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		d: d, pools: pools, w: &gatedDB{DB: pools.Write}, r: pools.Read,
 		log:      o.logger.With(slog.String("component", "store"), slog.String("dialect", d.Name)),
 		tracer:   o.tracer,
+		clock:    o.clock,
 		dur:      in.Histogram(telemetry.MetricStoreOperationDuration),
 		errs:     in.Counter(telemetry.MetricStoreErrors),
 		attr:     attribute.String("dialect", d.Name),
@@ -129,10 +132,10 @@ func (s *sqlStore) start(ctx context.Context, op string, attrs ...attribute.KeyV
 	ctx, span := s.tracer.Start(ctx, "store."+op,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(append(attrs, attribute.String("db.system.name", s.d.Name))...))
-	t0 := time.Now()
+	t0 := s.clock.Now()
 	return ctx, func(errp *error) {
 		set := metric.WithAttributeSet(attribute.NewSet(attribute.String("operation", op), s.attr))
-		s.dur.Record(ctx, time.Since(t0).Seconds(), set)
+		s.dur.Record(ctx, s.clock.Since(t0).Seconds(), set)
 		if err := *errp; err != nil {
 			span.RecordError(err)
 			if IsTransient(err) {
@@ -194,7 +197,7 @@ func (s *sqlStore) Close() error {
 // as Dialect.Checkpoint describes. A checkpoint a long reader keeps from copying every
 // frame, with the log past LogWarnBytes, is warned about at most once a minute.
 func (s *sqlStore) checkpointLoop(ctx context.Context) {
-	t := time.NewTicker(s.d.CheckpointEvery)
+	t := s.clock.NewTicker(s.d.CheckpointEvery)
 	defer t.Stop()
 	var warned time.Time
 	busyTicks := 0
@@ -202,7 +205,7 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		size := s.walSize()
 		pending, err := s.d.PendingLog(s.dbPath)
@@ -239,8 +242,8 @@ func (s *sqlStore) checkpointLoop(ctx context.Context) {
 			if ctx.Err() == nil {
 				s.log.DebugContext(ctx, "checkpoint failed; retried at the next tick", slog.Any("error", err))
 			}
-		case copied < frames && size >= s.logWarn.Load() && time.Since(warned) >= time.Minute:
-			warned = time.Now()
+		case copied < frames && size >= s.logWarn.Load() && s.clock.Since(warned) >= time.Minute:
+			warned = s.clock.Now()
 			s.log.WarnContext(ctx, "the write-ahead log keeps growing: a long read pins it, so checkpoints cannot copy it back",
 				slog.Int64("wal_bytes", size), slog.Int64("frames", frames), slog.Int64("checkpointed", copied))
 		}
@@ -273,8 +276,8 @@ func (s *sqlStore) truncate(ctx context.Context, maxPending int64) (bool, error)
 		return false, err
 	}
 	defer conn.Close()
-	held := time.Now()
-	defer func() { s.noteTruncateHold(time.Since(held)) }()
+	held := s.clock.Now()
+	defer func() { s.noteTruncateHold(s.clock.Since(held)) }()
 	if pending, err := s.d.PendingLog(s.dbPath); err != nil || (maxPending >= 0 && pending > maxPending) {
 		return false, err
 	}

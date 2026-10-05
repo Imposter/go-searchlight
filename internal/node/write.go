@@ -475,7 +475,7 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 		sl := idx.shards[s]
 		localDone := false
 		if c := sl.local.Load(); c != nil && (n.cl == nil || c.peerServing() == nil) {
-			if err := waitLocal(ctx, c, seq, mode); err != nil {
+			if err := n.waitLocal(ctx, c, seq, mode); err != nil {
 				return err
 			}
 			localDone = true
@@ -491,9 +491,9 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 
 // waitLocal waits until copy c has seq searchable: by its next refresh (wait_for), or
 // at once (true: once applied, the copy is refreshed).
-func waitLocal(ctx context.Context, c *copyState, seq int64, mode api.RefreshMode) error {
+func (n *Single) waitLocal(ctx context.Context, c *copyState, seq int64, mode api.RefreshMode) error {
 	if mode == api.RefreshTrue {
-		if err := waitApplied(ctx, c, seq); err != nil {
+		if err := n.waitApplied(ctx, c, seq); err != nil {
 			return err
 		}
 		if sh := c.shard(); sh != nil && sh.RefreshedSeq() < seq {
@@ -524,11 +524,11 @@ func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, 
 		return err
 	}
 	c.tailer.Wake()
-	return waitLocal(ctx, c, seq, mode)
+	return n.waitLocal(ctx, c, seq, mode)
 }
 
 // waitApplied polls until the copy has applied seq.
-func waitApplied(ctx context.Context, c *copyState, seq int64) error {
+func (n *Single) waitApplied(ctx context.Context, c *copyState, seq int64) error {
 	delay := 200 * time.Microsecond
 	for {
 		sh := c.shard()
@@ -544,12 +544,8 @@ func waitApplied(ctx context.Context, c *copyState, seq int64) error {
 		if err := sh.Err(); err != nil {
 			return err
 		}
-		t := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			t.Stop()
+		if n.clock.Sleep(ctx, delay) != nil {
 			return ctx.Err()
-		case <-t.C:
 		}
 		delay = min(2*delay, 10*time.Millisecond)
 	}

@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -24,6 +25,8 @@ type HubOptions struct {
 	// RetryBase and RetryCap bound the backoff between watch restarts. 0 means
 	// DefaultRetryBase and DefaultRetryCap.
 	RetryBase, RetryCap time.Duration
+	// Clock times the restarts' backoff. Nil means clock.Real.
+	Clock clock.Clock
 }
 
 // Hub turns a store's commit notifications (Postgres LISTEN/NOTIFY) into wake-ups of
@@ -39,6 +42,7 @@ type Hub struct {
 	reconnects metric.Int64Counter
 	retryBase  time.Duration
 	retryCap   time.Duration
+	clock      clock.Clock
 	warn       rateLimitedWarn
 
 	watching atomic.Bool
@@ -65,6 +69,9 @@ func NewHub(st store.Store, opts HubOptions) *Hub {
 	if opts.RetryCap <= 0 {
 		opts.RetryCap = DefaultRetryCap
 	}
+	if opts.Clock == nil {
+		opts.Clock = clock.Real{}
+	}
 	in := telemetry.NewInstruments(opts.Meter)
 	h := &Hub{
 		w:          w,
@@ -72,7 +79,8 @@ func NewHub(st store.Store, opts HubOptions) *Hub {
 		reconnects: in.Counter(telemetry.MetricReplicaWatchReconnects),
 		retryBase:  opts.RetryBase,
 		retryCap:   max(opts.RetryCap, opts.RetryBase),
-		warn:       rateLimitedWarn{every: 30 * time.Second},
+		clock:      opts.Clock,
+		warn:       rateLimitedWarn{clock: opts.Clock, every: 30 * time.Second},
 		subs:       map[ShardID]map[*Tailer]struct{}{},
 	}
 	if err := in.Err(); err != nil {
@@ -89,7 +97,7 @@ func (h *Hub) Watching() bool { return h != nil && h.watching.Load() }
 func (h *Hub) Run(ctx context.Context) error {
 	var retry time.Duration
 	for {
-		started := time.Now()
+		started := h.clock.Now()
 		err := h.w.Watch(ctx, h.ready, h.notify)
 		h.watching.Store(false)
 		select {
@@ -106,7 +114,7 @@ func (h *Hub) Run(ctx context.Context) error {
 		}
 		// Back to polling meanwhile: wake every tailer to take up its poll interval.
 		h.wakeAll()
-		if time.Since(started) > time.Minute {
+		if h.clock.Since(started) > time.Minute {
 			retry = 0 // it was healthy for a while: this is a fresh failure
 		}
 		if retry == 0 {
@@ -114,7 +122,7 @@ func (h *Hub) Run(ctx context.Context) error {
 		} else {
 			retry = min(2*retry, h.retryCap)
 		}
-		sleepCtx(ctx, retry)
+		_ = h.clock.Sleep(ctx, retry)
 	}
 }
 

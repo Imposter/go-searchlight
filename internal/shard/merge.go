@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
@@ -156,7 +155,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 		return nil, err
 	}
 	defer budget.release(tokens)
-	start := time.Now()
+	start := s.opts.Clock.Now()
 
 	g := s.Acquire()
 	if g == nil {
@@ -211,7 +210,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 	if err != nil {
 		return nil, err
 	}
-	d := time.Since(start)
+	d := s.opts.Clock.Since(start)
 	s.inst.recordMerge(ctx, d, written)
 	s.log.DebugContext(ctx, "merged", slog.String("kind", p.kind.String()), slog.Int("segments", len(p.inputs)),
 		slog.Uint64("live", live), slog.Int64("bytes", written), slog.Float64(telemetryDuration, float64(d.Microseconds())/1000))

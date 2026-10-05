@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
 // fakeApplier assigns seqs like the store and records each transaction.
@@ -142,16 +144,31 @@ func TestGroupCommitMaxChanges(t *testing.T) {
 	}
 }
 
+// A lone request waits MaxDelay for company, by the committer's clock, and no longer.
 func TestGroupCommitFlushesAfterDelay(t *testing.T) {
+	clk := clock.NewFake(time.Now())
 	f := &fakeApplier{}
-	g := NewGroupCommitter(f, GroupCommitOptions{})
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Second, Clock: clk})
 	defer g.Close()
-	start := time.Now()
-	if _, _, err := g.Apply(context.Background(), changes("solo", 1)); err != nil {
-		t.Fatal(err)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := g.Apply(context.Background(), changes("solo", 1))
+		done <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := clk.BlockUntilArmed(ctx, time.Second); err != nil {
+		t.Fatalf("the lone request is not waiting MaxDelay: %v", err)
 	}
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("a lone request waited %s", took)
+	clk.Advance(time.Second - time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("the lone request was flushed before MaxDelay: %v", err)
+	default:
+	}
+	clk.Advance(time.Millisecond)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

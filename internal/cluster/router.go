@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -59,26 +60,19 @@ const missRefreshEvery = 75 * time.Millisecond
 // call did meanwhile: concurrent misses share one registry read. Reads it makes are
 // missRefreshEvery apart.
 func (n *Node) refreshOnMiss(ctx context.Context) {
-	asked := n.clock.Now()
+	asked := n.lc.Now()
 	n.missMu.Lock()
 	defer n.missMu.Unlock()
 	fresh := func() bool { v := n.view.Load(); return v != nil && v.readBegan >= asked }
 	if fresh() {
 		return
 	}
-	if wait := missRefreshEvery - time.Since(n.missReadAt); wait > 0 {
-		t := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-		}
-		if fresh() {
+	if wait := missRefreshEvery - n.clock.Since(n.missReadAt); wait > 0 {
+		if n.clock.Sleep(ctx, wait) != nil || fresh() {
 			return
 		}
 	}
-	n.missReadAt = time.Now()
+	n.missReadAt = n.clock.Now()
 	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
 		n.log.DebugContext(ctx, "reading the registry for a shard with no copy in view failed", slog.Any("error", err))
 	}
@@ -186,14 +180,14 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	start := time.Now()
+	start := n.clock.Now()
 	resp, err := n.client.Do(req) //nolint:gosec // a peer's registered address
 	if err != nil {
-		n.inst.peer(ctx, path, peer, 0, time.Since(start))
+		n.inst.peer(ctx, path, peer, 0, n.clock.Since(start))
 		return service, queue, &peerError{node: peer, err: err}
 	}
 	defer resp.Body.Close()
-	n.inst.peer(ctx, path, peer, resp.StatusCode, time.Since(start))
+	n.inst.peer(ctx, path, peer, resp.StatusCode, n.clock.Since(start))
 	service, queue = reported(resp.Header)
 	if resp.StatusCode >= 400 {
 		return service, queue, decodeError(resp)
@@ -222,7 +216,7 @@ func (n *Node) authorize(req *http.Request) {
 		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
-		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10))
+		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10)) //nolint:forbidigo // a context deadline is by the process clock
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 }
@@ -556,7 +550,7 @@ const newIndexServeWait = 5 * time.Second
 // awaitServing waits until the registry shows every copy this node holds of index
 // serving, or newIndexServeWait passes.
 func (n *Node) awaitServing(ctx context.Context, index string) {
-	ctx, cancel := context.WithTimeout(ctx, newIndexServeWait)
+	ctx, cancel := clock.WithTimeout(ctx, n.clock, newIndexServeWait)
 	defer cancel()
 	delay := time.Millisecond
 	for {
@@ -565,14 +559,10 @@ func (n *Node) awaitServing(ctx context.Context, index string) {
 			_ = n.refreshView(ctx)
 			return
 		}
-		t := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			t.Stop()
+		if n.clock.Sleep(ctx, delay) != nil {
 			n.log.WarnContext(ctx, "a new index's copies here are not marked serving yet; other nodes route reads of it once they are",
 				slog.String("index", index))
 			return
-		case <-t.C:
 		}
 		delay = min(2*delay, 20*time.Millisecond)
 	}

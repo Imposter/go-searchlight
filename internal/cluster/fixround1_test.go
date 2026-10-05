@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -201,7 +202,8 @@ func TestUnusedCopyDirectoryCollected(t *testing.T) {
 // TestSnapshotTableBounds (I6): a snapshot older than its maximum age answers 410 (the
 // recovery resumes on a fresh one), one whose copy no longer serves peers 503.
 func TestSnapshotTableBounds(t *testing.T) {
-	st := newSnapTable(time.Minute, 50*time.Millisecond)
+	clk := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	st := newSnapTable(time.Minute, 50*time.Millisecond, clk)
 	id := store.ShardID{Index: "s", Shard: 0}
 	valid := atomic.Bool{}
 	valid.Store(true)
@@ -216,7 +218,11 @@ func TestSnapshotTableBounds(t *testing.T) {
 		t.Fatalf("a snapshot of a copy that no longer serves: %v", err)
 	}
 	valid.Store(true)
-	time.Sleep(60 * time.Millisecond)
+	clk.Advance(50 * time.Millisecond)
+	if err := st.use(key, check, func(store.ShardID, *shard.Snapshot) error { return nil }); err != nil {
+		t.Fatalf("a snapshot at its maximum age: %v", err)
+	}
+	clk.Advance(time.Millisecond)
 	if err := st.use(key, check, func(store.ShardID, *shard.Snapshot) error { return nil }); !errors.As(err, &ae) || ae.Status != http.StatusGone {
 		t.Fatalf("a snapshot past its maximum age: %v", err)
 	}

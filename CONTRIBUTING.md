@@ -13,8 +13,9 @@ The suite has two tiers, sorted by [internal/testtier](internal/testtier/testtie
 
 `TESTFLAGS` adds flags to any of them, such as `TESTFLAGS=-race` or `TESTFLAGS=-count=2`.
 CI runs `make test TESTFLAGS=-race` and `make test-race` as two Linux jobs against SQLite,
-Postgres and MySQL, and the short tier plus the end-to-end benchmark run
-(`TestEndToEndInProcess`) on Windows. The heavy job runs every test, so it alone keeps the
+Postgres and MySQL, and the short tier plus the smoke tests on Windows: the binary built,
+run and restarted (`TestSmokeBinary`), and every benchmark workload against a node in
+process (`TestEndToEndInProcess`). The heavy job runs every test, so it alone keeps the
 suite's coverage; the short job answers first.
 
 The T7 harnesses (`TestT7RefreshPhases`, `TestT7Diag`) are diagnostics, not checks: they run

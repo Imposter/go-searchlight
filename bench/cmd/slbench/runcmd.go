@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,10 +15,8 @@ import (
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/bench/es"
-	"github.com/Imposter/go-searchlight/bench/internal/slserver"
 	"github.com/Imposter/go-searchlight/bench/report"
 	"github.com/Imposter/go-searchlight/bench/workloads"
-	"github.com/Imposter/go-searchlight/internal/config"
 )
 
 // errMismatch is a run whose engines answered differently.
@@ -46,14 +43,6 @@ func splitList(s string) []string {
 	return out
 }
 
-// slInfo is what slserver -info writes.
-type slInfo struct {
-	URL       string   `json:"url"`
-	Token     string   `json:"token"`
-	PID       int      `json:"pid"`
-	DiskPaths []string `json:"disk_paths"`
-}
-
 func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOnly bool) error {
 	name := "run"
 	if loadOnly {
@@ -66,13 +55,16 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	searches := fs.String("searches", "", "saved-search file (the largest set; smaller sets are its prefixes)")
 	sets := fs.String("sets", "1k,10k,100k", "saved-search set sizes to percolate against")
 
-	slURL := fs.String("sl-url", "", "Searchlight API URL")
-	slToken := fs.String("sl-token", "", "Searchlight bearer token")
-	slInfoFile := fs.String("sl-info", "", "read --sl-url, --sl-token, --sl-pid and --sl-disk from slserver's -info file")
-	slDisk := fs.String("sl-disk", "", "comma-separated directories holding Searchlight's data and database, for disk usage")
-	slPID := fs.Int("sl-pid", 0, "Searchlight's process id (Linux: RSS from /proc; else /metrics)")
+	slBin := fs.String("sl-bin", "", "run this searchlight binary for the run, on SQLite with a generated tokens file under --sl-dir (and restart it for the restart workload)")
+	slDir := fs.String("sl-dir", "sl-bench", "with --sl-bin: the node's files (data, database, tokens, searchlight.log)")
+	slSettings := fs.String("sl-settings", "", "with --sl-bin: more node settings, name=value,... (default log_level=warn,shutdown_grace=0s)")
+	recoveryStore := fs.String("recovery-store-url", "", "with --sl-bin: a Postgres or MySQL store_url for the recovery workload (target T8), run on a cluster of its own")
+	recoveryIter := fs.Int("recovery-iterations", 3, "measured recoveries (new replicas from zero to serving)")
+	slURL := fs.String("sl-url", "", "the API URL of a Searchlight node run elsewhere (instead of --sl-bin)")
+	slToken := fs.String("sl-token", "", "with --sl-url: the bearer token")
+	slDisk := fs.String("sl-disk", "", "with --sl-url: comma-separated directories holding the node's data and database, for disk usage")
+	slPID := fs.Int("sl-pid", 0, "with --sl-url: the node's process id on this host (Linux: RSS from /proc; else /metrics)")
 	slConfig := fs.String("sl-config", "", "k=v,... describing Searchlight's configuration for the report")
-	slInProcess := fs.String("sl-inprocess", "", "start a Searchlight node in this process with its files in DIR (local runs)")
 	esURL := fs.String("es-url", "", "Elasticsearch URL")
 	esPID := fs.Int("es-pid", 0, "the Elasticsearch JVM's process id on this host (Linux: RSS from /proc)")
 	esConfig := fs.String("es-config", "", "k=v,... describing Elasticsearch's configuration for the report")
@@ -97,7 +89,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	ccVariants := fs.Int("crosscheck-variants", 4, "variants per workload the cross-check compares")
 	only := fs.String("only", "", "comma-separated workloads or groups to run (default all)")
 	skip := fs.String("skip", "", "comma-separated workloads or groups to skip")
-	slRestart := fs.String("sl-restart-cmd", "", "shell command that restarts Searchlight (enables the restart workload)")
+	slRestart := fs.String("sl-restart-cmd", "", "with --sl-url: a shell command that restarts Searchlight (enables the restart workload)")
 	esRestart := fs.String("es-restart-cmd", "", "shell command that restarts Elasticsearch")
 	restartIter := fs.Int("restart-iterations", 3, "measured restarts per engine")
 
@@ -124,50 +116,57 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		setSizes = nil
 	}
 
-	var notes []string
-	if *slInfoFile != "" {
-		b, err := os.ReadFile(*slInfoFile)
+	restarters := map[string]workloads.Restarter{}
+	recoverers := map[string]workloads.Recoverer{}
+	slCfg := keyValues(*slConfig)
+	slPIDFunc := func() int { return *slPID }
+	slDiskPaths := splitList(*slDisk)
+	if *slBin != "" {
+		if *slURL != "" {
+			return errors.New("give --sl-bin or --sl-url, not both")
+		}
+		settings := append([]string{"log_level=warn", "shutdown_grace=0s"}, splitList(*slSettings)...)
+		node, stop, err := runNode(ctx, nodeSpec{bin: *slBin, dir: *slDir, nodeID: "bench", settings: settings})
 		if err != nil {
 			return err
 		}
-		var si slInfo
-		if err := json.Unmarshal(b, &si); err != nil {
-			return fmt.Errorf("--sl-info: %w", err)
+		defer stop(stderr)
+		*slURL, *slToken = node.URL, node.Token
+		slPIDFunc, slDiskPaths = node.PID, node.DiskPaths()
+		restarters[report.Searchlight] = workloads.Restarter{
+			Describe: "the node stopped gracefully and its binary started again",
+			Restart:  func(ctx context.Context) error { return node.Restart(ctx, nodeStopTimeout) },
 		}
-		*slURL, *slToken, *slPID = si.URL, si.Token, si.PID
-		if *slDisk == "" {
-			*slDisk = strings.Join(si.DiskPaths, ",")
+		if _, ok := slCfg["store"]; !ok {
+			slCfg["store"] = "SQLite (synchronous=FULL, WAL), its own process"
 		}
-	}
-	if *slInProcess != "" {
-		cfg := config.Default()
-		cfg.LogLevel = slog.LevelWarn
-		srv, err := slserver.Start(ctx, slserver.Options{Config: cfg, Dir: *slInProcess, Token: slserver.NewToken(), Version: "bench-inprocess"})
-		if err != nil {
-			return fmt.Errorf("starting the in-process Searchlight: %w", err)
-		}
-		defer func() {
-			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
-			defer cancel()
-			if err := srv.Close(cctx); err != nil {
-				fmt.Fprintln(stderr, "slbench: closing the in-process Searchlight:", err)
+		for _, kv := range settings {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				slCfg[k] = v
 			}
-		}()
-		*slURL, *slToken = srv.URL, srv.Token
-		if *slDisk == "" {
-			*slDisk = strings.Join(srv.DiskPaths, ",")
 		}
-		notes = append(notes, "Searchlight ran in the slbench process (bench/internal/slserver over SQLite), so its RSS includes the harness's own memory and the harness shares its CPUs.")
+		if *recoveryStore != "" {
+			rec, err := newRecoverer(ctx, nodeSpec{bin: *slBin, dir: filepath.Join(*slDir, "recovery"), store: *recoveryStore, settings: settings}, stdout)
+			if err != nil {
+				return err
+			}
+			defer rec.close(stderr)
+			recoverers[report.Searchlight] = rec
+		}
+	} else if *recoveryStore != "" {
+		return errors.New("--recovery-store-url needs --sl-bin: slbench starts the recovery cluster's nodes itself")
+	}
+	if *slRestart != "" {
+		restarters[report.Searchlight] = workloads.CommandRestarter(*slRestart, stdout)
+	}
+	if *esRestart != "" {
+		restarters[report.Elasticsearch] = workloads.CommandRestarter(*esRestart, stdout)
 	}
 
 	var engines []workloads.Engine
 	if *slURL != "" {
-		c := keyValues(*slConfig)
-		if _, ok := c["store"]; !ok && *slInProcess != "" {
-			c["store"] = "SQLite (synchronous=FULL, WAL), in-process"
-		}
 		engines = append(engines, workloads.NewSearchlight(workloads.SearchlightOptions{
-			URL: *slURL, Token: *slToken, DiskPaths: splitList(*slDisk), PID: *slPID, Config: c, Log: stdout,
+			URL: *slURL, Token: *slToken, DiskPaths: slDiskPaths, PID: slPIDFunc, Config: slCfg, Log: stdout,
 		}))
 	}
 	if *esURL != "" {
@@ -176,7 +175,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		}))
 	}
 	if len(engines) == 0 {
-		return errors.New("no engine: give --sl-url, --sl-info, --sl-inprocess or --es-url")
+		return errors.New("no engine: give --sl-bin, --sl-url or --es-url")
 	}
 
 	cfg := workloads.Config{
@@ -188,16 +187,15 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 		PercolateBatch: *percBatch, PercolateConcurrency: *percConc, PercolateIterations: *percIter, PercolateSingle: *percSingle,
 		BulkPercolateIterations: *bulkPercIter, VisibleIterations: *visible, MixedDuration: *mixed,
 		CrossCheckVariants: *ccVariants,
-		RestartCmds:        map[string]string{report.Searchlight: *slRestart, report.Elasticsearch: *esRestart},
-		RestartIterations:  *restartIter,
-		Only:               splitList(*only), Skip: splitList(*skip),
+		Restarters:         restarters, RestartIterations: *restartIter,
+		Recoverers: recoverers, RecoveryIterations: *recoveryIter,
+		Only: splitList(*only), Skip: splitList(*skip),
 		LoadOnly: loadOnly, StopOnMismatch: *stopOnMismatch, Log: stdout,
 	}
 	run, runErr := workloads.RunSuite(ctx, cfg, engines)
 	if run == nil {
 		return runErr
 	}
-	run.Notes = append(run.Notes, notes...)
 	if runErr != nil {
 		run.Notes = append(run.Notes, "The run stopped early: "+runErr.Error())
 	}

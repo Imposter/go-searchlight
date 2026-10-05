@@ -54,6 +54,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
@@ -64,6 +65,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -119,19 +121,20 @@ type Options struct {
 // Options.Cluster set it hosts the copies the cluster gives it and reads the rest from
 // peers.
 type Single struct {
-	st      store.Store
-	records store.RecordReader
-	cfg     config.Config
-	opts    Options
-	cl      Cluster // nil: a single node
-	gc      *store.GroupCommitter
-	log     *slog.Logger
-	tr      trace.Tracer
-	meter   metric.Meter
-	clock   clock.Clock
-	budget  *shard.MergeBudget
-	cache   *shard.FilterCache
-	maxLag  int64
+	st         store.Store
+	records    store.RecordReader
+	cfg        config.Config
+	opts       Options
+	cl         Cluster // nil: a single node
+	gc         *store.GroupCommitter
+	log        *slog.Logger
+	tr         trace.Tracer
+	meter      metric.Meter
+	clock      clock.Clock
+	budget     *shard.MergeBudget
+	cache      *shard.FilterCache
+	maxLag     int64
+	openFailed metric.Int64Counter
 
 	// head is the newest seq committed or seen applied.
 	head atomic.Int64
@@ -478,6 +481,11 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		absent:   absentIndexes{clock: o.Clock},
 		reserved: map[string]bool{},
 	}
+	in := telemetry.NewInstruments(o.Meter)
+	n.openFailed = in.Counter(telemetry.MetricShardOpenFailed)
+	if err := in.Err(); err != nil {
+		n.log.ErrorContext(ctx, "shard open metrics unavailable", slog.Any("error", err))
+	}
 	if o.Config.SearchThreads > 0 {
 		search.SetThreads(o.Config.SearchThreads)
 	}
@@ -632,8 +640,32 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		n.opts.ShardOptions(&opts)
 	}
 	// A copy rebuilt aside lives in a subdirectory its root names: open the
-	// current one (and collect what a crash or a swap left behind).
-	sh, err := replica.OpenCopy(ctx, idx.copyRoot(s), state.mapping, opts)
+	// current one (and collect what a crash or a swap left behind). The directory is a
+	// cache of the store: one whose data is damaged or of a format this build no longer
+	// reads (segment.Rebuildable) is wiped, and the copy, opened empty, is rebuilt from a
+	// peer or the store, never served (spec section 10). One written in a newer format is
+	// refused and left as it is (spec section 9: a binary rolled back must not destroy
+	// its successor's copy), and any other failure (I/O, permissions, resources) is
+	// returned for the allocator to retry.
+	root := idx.copyRoot(s)
+	sh, err := replica.OpenCopy(ctx, root, state.mapping, opts)
+	if err != nil && ctx.Err() == nil {
+		attrs := []any{slog.String(telemetry.KeyIndex, idx.name), slog.Int(telemetry.KeyShard, s), slog.Any("error", err)}
+		switch {
+		case segment.Rebuildable(err):
+			n.noteOpenFailed(ctx, idx.name, "corrupt")
+			n.log.WarnContext(ctx, "shard copy does not open; wiping it to rebuild", attrs...)
+			if werr := replica.WipeCopy(root); werr != nil {
+				return fmt.Errorf("node: open %s: %w (wiping it failed: %w)", sl.id, err, werr)
+			}
+			sh, err = replica.OpenCopy(ctx, root, state.mapping, opts)
+		case errors.Is(err, segment.ErrNewerFormat):
+			n.noteOpenFailed(ctx, idx.name, "newer_format")
+			n.log.ErrorContext(ctx, "shard copy is in a newer format than this binary reads; refusing it, and leaving its files as they are", attrs...)
+		default:
+			n.noteOpenFailed(ctx, idx.name, "error")
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
@@ -844,4 +876,10 @@ func storeError(err error, index string) error {
 		return err
 	}
 	return api.Unavailable(err, "the database is unavailable")
+}
+
+func (n *Single) noteOpenFailed(ctx context.Context, index, reason string) {
+	if n.openFailed != nil {
+		n.openFailed.Add(ctx, 1, metric.WithAttributes(attribute.String(telemetry.KeyIndex, index), attribute.String("reason", reason)))
+	}
 }

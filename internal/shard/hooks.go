@@ -33,16 +33,6 @@ type testHooks struct {
 	remove func(path string) error
 	// sync, when it returns an error, fails a flush's fsync of path with it.
 	sync func(path string) error
-	// synced is told of every file a flush or a merge has fsynced.
-	synced func(path string)
-}
-
-func (s *Shard) noteSynced(paths ...string) {
-	if s.opts.hooks != nil && s.opts.hooks.synced != nil {
-		for _, p := range paths {
-			s.opts.hooks.synced(p)
-		}
-	}
 }
 
 func (s *Shard) hook(point string) error {

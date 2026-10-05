@@ -263,3 +263,35 @@ func TestFormatters(t *testing.T) {
 		t.Errorf("cell = %q", got)
 	}
 }
+
+// TestRecoveryAndRestartTargets: T8 is measured by the recovery workload (against
+// Elasticsearch's when it ran, else without a baseline, saying when the dataset is
+// below the target's 10M documents), and T9 by the restart workload's slowest restart.
+func TestRecoveryAndRestartTargets(t *testing.T) {
+	r := sampleRun()
+	recovery := res("recovery", GroupRecovery, Searchlight, 0.1, 0.1, lat(8e6, 9e6))
+	recovery.Values = map[string]float64{"docs": 1e6}
+	restart := res("restart", GroupRestart, Searchlight, 0.5, 0.5, lat(1e6, 2e6))
+	r.Results = append(r.Results, recovery, restart)
+	got := byID(Evaluate(r))
+	if c := got["T8"]; c.Status != NoBaseline || !strings.Contains(c.Detail, "1000000 documents") {
+		t.Errorf("T8 with Searchlight only: %s (%s)", c.Status, c.Detail)
+	}
+	if c := got["T9"]; c.Status != Pass {
+		t.Errorf("T9: %s (%s)", c.Status, c.Detail)
+	}
+
+	r.Results = append(r.Results, res("recovery", GroupRecovery, Elasticsearch, 0.2, 0.2, lat(4e6, 5e6)))
+	if c := byID(Evaluate(r))["T8"]; c.Status != Fail {
+		t.Errorf("T8 slower than Elasticsearch: %s (%s)", c.Status, c.Detail)
+	}
+	r.Results[len(r.Results)-1].Latency = lat(10e6, 20e6)
+	if c := byID(Evaluate(r))["T8"]; c.Status != Pass {
+		t.Errorf("T8 within Elasticsearch: %s (%s)", c.Status, c.Detail)
+	}
+
+	r.Results[len(r.Results)-2].Latency = lat(6e6, 12e6)
+	if c := byID(Evaluate(r))["T9"]; c.Status != Fail {
+		t.Errorf("T9 with a 24 s restart: %s (%s)", c.Status, c.Detail)
+	}
+}

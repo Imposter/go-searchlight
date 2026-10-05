@@ -158,9 +158,11 @@ data_dir/
 - **Caches.** The filter cache keeps per-segment bitmaps of frequent leaves, and needs no
   invalidation because segments are immutable. The OS page cache holds the mmap'd
   files.
-- **Format versions.** The segment format is versioned (major 3). A node refuses a
-  segment whose major it does not know, and a bad checksum makes the copy recover rather
-  than serve it.
+- **Format versions.** The segment format is versioned (major 3). A copy whose files
+  are damaged (a bad checksum, a damaged manifest, a listed file missing:
+  `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
+  served. A copy of a newer format (`segment.ErrNewerFormat`) is refused and left as it
+  is, and any other open failure (I/O, permissions) is retried, never wiped.
 
 ### Search
 
@@ -254,10 +256,26 @@ A copy that must be built, whether new, wiped, pruned past or corrupt:
 4. **Catch-up.** The tailer opens the copy and replays the changelog from the snapshot's
    seq, and the copy turns `serving`.
 
-When no peer can serve, or any step fails, the copy is rebuilt from the database
-instead: `ScanShard` streams the shard's current rows as of a seq, and the changelog is
-replayed from there. A copy that is outdated but still valid is rebuilt aside, so it
-keeps serving until its replacement catches up.
+When no peer can serve, the newest **recovery bundle** of the shard is restored
+instead, if `bundle_interval` uploads them:
+
+- **Upload.** Every `bundle_interval`, the serving copy of each shard on the live node
+  with the lowest id flushes and streams its durable generation into one blob in
+  `sl_blobs` (`bundles/<index>/<incarnation>/<shard>/<seq>`): a header listing every
+  file's name, size and SHA-256, the manifest last, then the files. The blob store
+  chunks it and sums it. An upload whose commit's outcome is unknown counts only when
+  `Stat` shows the stored sum is the one streamed. The oldest bundles past
+  `bundle_retention` are then deleted.
+- **Restore.** The newest bundle the changelog still reaches is staged under
+  `data_dir/recovery/…/bundle`, every file checked against its sum and fsynced, and the
+  blob's own sum checked at its end. Only then are the files moved into the copy's
+  directory and the manifest written last. A bundle failing any check is never
+  installed; the next older one is tried.
+
+When neither a peer nor a bundle serves, or any step fails, the copy is rebuilt from the
+database instead: `ScanShard` streams the shard's current rows as of a seq, and the
+changelog is replayed from there. A copy that is outdated but still valid is rebuilt
+aside, so it keeps serving until its replacement catches up.
 
 ### Routing
 
@@ -299,19 +317,22 @@ are idempotent. The leader:
   A copy's applied seq is its `CommittedSeq`, what its last flush made durable;
 - sweeps abandoned blob uploads.
 
-The copies that count are:
+The copies and recovery points that count are:
 
-- the live ones, a recovering copy holding its slot at seq 0 included;
+- the live copies, a recovering copy holding its slot at seq 0 included;
 - a cleanly stopped node's retiring copies, for `retiring_retention` after their leases
-  ran out.
+  ran out;
+- every retained recovery bundle of the shard's current incarnation, at its seq.
 
 The floor is bounded, so no copy can hold it forever:
 
 - a copy behind the others that makes no progress for `prune_stall_timeout` stops
   counting;
-- a change older than `changelog_retention` is pruned whatever still needs it.
+- a change older than `changelog_retention` is pruned whatever still needs it, and a
+  bundle it prunes past is deleted.
 
-A copy pruned past rebuilds from a peer or the database. Every node also collects its own
+A copy pruned past rebuilds from a peer or the database. The leader also deletes the
+bundles of dropped indexes. Every node also collects its own
 unused copy directories and stale recovery staging.
 
 ## The binary's lifecycle
@@ -363,11 +384,7 @@ window, the API's request timing and its shutdown grace.
 
 ## Planned, not built
 
-- **Recovery from `sl_blobs` bundles.** The store has the blob table and its protocol,
-  chunked and checksummed, and the leader sweeps abandoned uploads. But no node publishes
-  segment bundles yet, and recovery without a peer goes straight to `ScanShard`. The spec
-  puts blob recovery between peer recovery and the SQL scan.
-- **Tuning against Elasticsearch** (plan Tasks 13 and 14). The benchmark harness is in
-  `bench/`, but the chaos suite, the CI runs against Elasticsearch, and the tuning until
-  every spec §1 target is met are still to come. `docs/benchmarks.md` will hold the
-  results.
+- **Tuning against Elasticsearch** (plan Task 14). The benchmark harness is in `bench/`
+  (it runs the real binary, restarts and recoveries included) and the chaos suite in
+  `test/chaos`, but the tuning until every spec §1 target is met is still to come.
+  `docs/benchmarks.md` will hold the results.

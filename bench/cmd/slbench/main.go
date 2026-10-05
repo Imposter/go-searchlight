@@ -7,9 +7,12 @@
 //	slbench report    render a run's JSON as markdown (docs/benchmarks.md)
 //	slbench translate print the Elasticsearch DSL for a Searchlight query or search
 //
-// Engines are reached by URL only: --sl-url (with --sl-token) and --es-url. For a
-// local run without a Searchlight binary, --sl-inprocess DIR starts a node in this
-// process (bench/internal/slserver). Run "slbench <command> -h" for its flags.
+// Searchlight runs as its real binary: --sl-bin starts it as a child process, on SQLite
+// with a generated tokens file (internal/slproc), and restarts it for the restart
+// workload; with --recovery-store-url (Postgres or MySQL) it also starts a two-node
+// cluster of its own for the recovery workload. A node run elsewhere is reached by
+// --sl-url (with --sl-token), and Elasticsearch by --es-url. Run "slbench <command> -h"
+// for its flags.
 package main
 
 import (

@@ -103,10 +103,22 @@ func retryIO(log *slog.Logger, op, path string, fn func() error) error {
 type ManifestError struct {
 	Path   string
 	Reason string
+	// Format, when set, is the manifest's format: newer or older than this build reads
+	// (segment.ErrNewerFormat, segment.ErrOlderFormat). Otherwise the manifest is
+	// damaged, and the error matches segment.ErrCorrupt.
+	Format error
 }
 
 func (e *ManifestError) Error() string {
 	return fmt.Sprintf("shard manifest %s: %s", e.Path, e.Reason)
+}
+
+// Unwrap makes a ManifestError match segment.ErrCorrupt, or its format's error.
+func (e *ManifestError) Unwrap() error {
+	if e.Format != nil {
+		return e.Format
+	}
+	return segment.ErrCorrupt
 }
 
 // readManifest reads dir's manifest; an empty manifest when there is none. It opens
@@ -148,7 +160,10 @@ func readManifestFile(path string, log *slog.Logger) (*manifest, error) {
 		return nil, bad("bad format")
 	}
 	if format != manifestFormat {
-		return nil, bad(fmt.Sprintf("format %d is not %d", format, manifestFormat))
+		return nil, &ManifestError{
+			Path: path, Reason: fmt.Sprintf("format %d is not %d", format, manifestFormat),
+			Format: segment.FormatError(uint64(max(format, 0)), manifestFormat),
+		}
 	}
 	sum, err := strconv.ParseUint(string(fields[2]), 16, 32)
 	if err != nil {

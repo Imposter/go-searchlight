@@ -151,7 +151,7 @@ func (DefaultQueryIndex) Open(dir, name string) (QuerySegment, error) {
 	if err != nil {
 		return nil, err
 	}
-	corrupt := func(why string) error { return fmt.Errorf("query segment %s: corrupt: %s", path, why) }
+	corrupt := func(why string) error { return fmt.Errorf("query segment %s: %w: %s", path, segment.ErrCorrupt, why) }
 	if len(data) < len(defaultQueryMagic)+8 || !bytes.Equal(data[:8], defaultQueryMagic[:]) {
 		return nil, corrupt("bad magic")
 	}
@@ -160,7 +160,7 @@ func (DefaultQueryIndex) Open(dir, name string) (QuerySegment, error) {
 		return nil, corrupt("checksum mismatch")
 	}
 	if v := binary.LittleEndian.Uint32(body[8:]); v != defaultQueryVersion {
-		return nil, fmt.Errorf("query segment %s: version %d is not %d", path, v, defaultQueryVersion)
+		return nil, fmt.Errorf("query segment %s: version %d is not %d: %w", path, v, defaultQueryVersion, segment.FormatError(uint64(v), defaultQueryVersion))
 	}
 	r := byteReader{b: body[12:]}
 	n := r.uvarint()

@@ -42,7 +42,7 @@ Each section below names the `operationId`s it covers.
 |---|---|
 | The write to be searchable before the answer | `?refresh=wait_for` on the write. It returns once the write is searchable on the node that took it. |
 | The written shards refreshed now | `?refresh=true`. It costs a small segment per call, so don't use it per document under load. |
-| Read-your-writes on any node | Pass the write's `seq` as `?wait_for_seq=N` on the read. The read waits, under its deadline, until every change up to N is searchable on the copies it reads. |
+| Read-your-writes on any node | Pass the write's `seq` as `?wait_for_seq=N` on the read. The read waits, under its deadline, until every change up to N is searchable on the copies it reads. An N past the newest committed seq is a 400 `invalid_request`. While the database cannot be reached, an N past the newest seq the node knows cannot be confirmed: it is a 503 `unavailable` with `Retry-After`. |
 | Nothing special | Writes become searchable everywhere within the index's `refresh_interval` (1 s by default). |
 
 `GET` of one document or one saved query is realtime: it reads the database, not the

@@ -311,10 +311,10 @@ type partialFetcher struct {
 	once    sync.Once
 }
 
-func (f *partialFetcher) Fetch(ctx context.Context, _ ShardID, dir string) error {
+func (f *partialFetcher) Fetch(ctx context.Context, _ ShardID, dir string) (string, error) {
 	entries, err := os.ReadDir(f.from)
 	if err != nil {
-		return err
+		return "", err
 	}
 	for _, e := range entries {
 		if e.IsDir() || e.Name() == "manifest" {
@@ -322,15 +322,15 @@ func (f *partialFetcher) Fetch(ctx context.Context, _ ShardID, dir string) error
 		}
 		data, err := os.ReadFile(filepath.Join(f.from, e.Name()))
 		if err != nil {
-			return err
+			return "", err
 		}
 		if err := os.WriteFile(filepath.Join(dir, e.Name()), data, 0o600); err != nil {
-			return err
+			return "", err
 		}
 	}
 	f.once.Do(func() { close(f.reached) })
 	<-ctx.Done()
-	return ctx.Err()
+	return "", ctx.Err()
 }
 
 // TestPruneDuringLoad: the changelog pruned past a snapshot while it loads makes the

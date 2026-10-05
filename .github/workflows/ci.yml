@@ -99,9 +99,9 @@ jobs:
         run: go test -short ./...
       - name: smoke
         # From the heavy tier: the binary built, run, interrupted and restarted
-        # (TestSmokeBinary), and every benchmark workload driven against a node started
-        # in process (TestEndToEndInProcess).
-        run: go test -run '^(TestSmokeBinary|TestEndToEndInProcess)$' ./cmd/searchlight ./bench/cmd/slbench
+        # (TestSmokeBinary), and every benchmark workload driven against the binary run
+        # as its own process (TestEndToEndBinary).
+        run: go test -run '^(TestSmokeBinary|TestEndToEndBinary)$' ./cmd/searchlight ./bench/cmd/slbench
       - name: heavy tier of the NTFS-sensitive packages
         # WAL checkpointing, merge-and-rename and large-file I/O on a real NTFS volume.
         run: go test -timeout 20m ./internal/store/... ./internal/shard/... ./internal/segment/...

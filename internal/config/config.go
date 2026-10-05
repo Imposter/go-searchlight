@@ -82,6 +82,14 @@ type Config struct {
 	// ChangelogRetention caps how old a change may grow before it is pruned whatever
 	// copy still needs it (that copy rebuilds).
 	ChangelogRetention time.Duration
+	// BundleInterval is how often a bundle of each shard's durable state is uploaded to
+	// the store's blobs (sl_blobs), by one serving copy of the shard, for a copy to
+	// recover from when no peer can serve it; 0 uploads none. Each retained bundle
+	// holds the changelog's prune floor at its seq, so a copy restored from it can
+	// replay the rest.
+	BundleInterval time.Duration
+	// BundleRetention is how many bundles of each shard are kept, the newest.
+	BundleRetention int
 	// RefreshInterval is how often each shard's write buffer becomes a
 	// searchable segment. A refresh is visibility only: it fsyncs nothing.
 	RefreshInterval time.Duration
@@ -215,6 +223,7 @@ func Default() Config {
 		PruneStallTimeout:     15 * time.Minute,
 		RetiringRetention:     15 * time.Minute,
 		ChangelogRetention:    24 * time.Hour,
+		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
 	}
@@ -333,6 +342,23 @@ var settings = []setting{
 		name: "changelog_retention", usage: "the oldest a change may grow before it is pruned whatever copy still needs it",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.ChangelogRetention, v) },
 		format: func(c *Config) string { return c.ChangelogRetention.String() },
+	},
+	{
+		name: "bundle_interval", usage: "how often each shard's durable state is uploaded to sl_blobs for recovery without a peer (0 = never)",
+		parse: func(c *Config, v string) error {
+			d, err := time.ParseDuration(v)
+			if err != nil || d < 0 || (d > 0 && d < time.Second) {
+				return fmt.Errorf("want 0 or a duration of at least 1s, got %q", v)
+			}
+			c.BundleInterval = d
+			return nil
+		},
+		format: func(c *Config) string { return c.BundleInterval.String() },
+	},
+	{
+		name: "bundle_retention", usage: "how many bundles of each shard sl_blobs keeps, the newest",
+		parse:  func(c *Config, v string) error { return positiveInt(&c.BundleRetention, v) },
+		format: func(c *Config) string { return strconv.Itoa(c.BundleRetention) },
 	},
 	{
 		name: "refresh_interval", usage: "how often written documents become searchable",

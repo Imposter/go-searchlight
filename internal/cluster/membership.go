@@ -561,19 +561,20 @@ func (n *Node) catalogLoop(ctx context.Context) {
 
 // forgetDropped drops the leases of copies whose index was dropped (or recreated as a
 // new incarnation) meanwhile: the engine has stopped them, and the store deleted their
-// rows.
+// rows. The allocator's waits on dropped incarnations go with them.
 func (n *Node) forgetDropped() {
 	n.allocMu.Lock()
 	defer n.allocMu.Unlock()
-	known := map[string]bool{}
+	known, uids := map[string]bool{}, map[string]bool{}
 	for _, iv := range n.Indexes() {
-		known[iv.Name] = true
+		known[iv.Name], uids[iv.UID] = true, true
 	}
 	for _, l := range n.leaseList() {
 		if !known[l.copy.Shard.Index] {
 			n.dropLease(l)
 		}
 	}
+	n.alloc.forget(uids)
 	n.leaseMu.Lock()
 	defer n.leaseMu.Unlock()
 	for id := range n.quarantines {

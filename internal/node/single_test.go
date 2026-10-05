@@ -1,7 +1,9 @@
 package node_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +27,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/storetest"
@@ -629,12 +632,14 @@ func TestDropDoesNotBlockOtherIndexes(t *testing.T) {
 	}
 }
 
-// flakyStore is a store whose database can be taken away: Ping and record reads
-// fail while down.
+// flakyStore is a store whose database can be taken away: Ping and record reads fail
+// while down, and HeadSeq while headDown.
 type flakyStore struct {
 	store.Store
 	rr   store.RecordReader
 	down *atomic.Bool
+	// headDown, when set, fails HeadSeq too.
+	headDown *atomic.Bool
 	// hung, when set, makes Ping and record reads wait for their deadline: a
 	// database that hangs rather than fails.
 	hung   *atomic.Bool
@@ -682,6 +687,13 @@ func (s flakyStore) GetRecord(ctx context.Context, kind store.RecordKind, id sto
 	return s.rr.GetRecord(ctx, kind, id, key)
 }
 
+func (s flakyStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+	if s.headDown != nil && s.headDown.Load() {
+		return 0, time.Time{}, errUnreachable
+	}
+	return s.Store.HeadSeq(ctx)
+}
+
 func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {
 	if s.down.Load() {
 		return nil, errUnreachable
@@ -697,7 +709,8 @@ func TestDatabaseUnreachable(t *testing.T) {
 	cfg.MaxLag = 300 * time.Millisecond
 	base := openStore(t, cfg)
 	down := &atomic.Bool{}
-	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down} //nolint:forcetypeassert,errcheck // every store reads records
+	headDown := &atomic.Bool{}
+	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down, headDown: headDown} //nolint:forcetypeassert,errcheck // every store reads records
 	n := open(t, cfg, st, nil)
 	if _, err := n.CreateIndex(ctx(t), "s", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
 		t.Fatal(err)
@@ -737,6 +750,12 @@ func TestDatabaseUnreachable(t *testing.T) {
 	if _, err := n.GetDocument(ctx(t), "s", "missing"); !errors.As(err, &ae) || ae.Status != 404 || ae.Extra["stale"] != true {
 		t.Errorf("a missing document with the database down: %v", err)
 	}
+	// A seq another node may have committed cannot be checked: retryable, not invalid.
+	headDown.Store(true)
+	if _, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitForSeq: res.Seq + 10}); !errors.As(err, &ae) || ae.Status != 503 {
+		t.Errorf("a wait_for_seq past the node's head with the database down: %v, want a 503", err)
+	}
+	headDown.Store(false)
 	if h, _ := n.Health(ctx(t)); h.Status != api.StatusGreen {
 		t.Errorf("the copies still serve: health %+v", h)
 	}
@@ -1060,5 +1079,121 @@ func TestAcquireRechecksTheCopy(t *testing.T) {
 	var ae *api.Error
 	if !errors.As(err, &ae) || ae.Status != 503 {
 		t.Errorf("a read racing the copy going recovering: %v", err)
+	}
+}
+
+// closedCopy writes 40 documents to a one-shard index on a node, closes the node and
+// returns the copy's directory and the last write's seq.
+func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, int64) {
+	t.Helper()
+	n := open(t, cfg, st, nil)
+	if _, err := n.CreateIndex(ctx(t), "c", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	var ops []api.WriteOp
+	for i := range 40 {
+		ops = append(ops, upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"n": %d, "title": "item %d"}`, i, i)))
+	}
+	res := mustWrite(t, n, "c", ops...)
+	if got := count(t, n, "c", &query.All{}, res.Seq); got != 40 {
+		t.Fatalf("count = %d", got)
+	}
+	if err := n.Close(ctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	dirs, err := filepath.Glob(filepath.Join(cfg.DataDir, "indexes", "*", "0"))
+	if err != nil || len(dirs) != 1 {
+		t.Fatalf("the copy's directory under %s: %v %v", cfg.DataDir, dirs, err)
+	}
+	return dirs[0], res.Seq
+}
+
+// segmentsOf lists the segment files in dir.
+func segmentsOf(t *testing.T, dir string) []string {
+	t.Helper()
+	segs, err := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("no segment in %s: %v", dir, err)
+	}
+	return segs
+}
+
+// TestCorruptSegmentIsRebuilt: a copy whose segment fails its checksum when the node
+// opens it is never served: the node wipes it and the copy is rebuilt from the store,
+// whole.
+func TestCorruptSegmentIsRebuilt(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, seq := closedCopy(t, cfg, st)
+	seg := segmentsOf(t, dir)[0]
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0xff
+	if err := os.WriteFile(seg, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	n2 := open(t, cfg, st, nil)
+	waitReady(t, n2)
+	if got := count(t, n2, "c", &query.All{}, seq); got != 40 {
+		t.Fatalf("after the corrupt copy was rebuilt count = %d, want 40", got)
+	}
+	if _, err := os.Stat(seg); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the corrupt segment %s is still there: %v", seg, err)
+	}
+}
+
+// TestNewerFormatSegmentIsRefused: a copy holding a segment of a newer format than this
+// build reads is refused, and its files are left as they are: a binary rolled back
+// must not destroy its successor's copy.
+func TestNewerFormatSegmentIsRefused(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, _ := closedCopy(t, cfg, st)
+	seg := segmentsOf(t, dir)[0]
+	raw, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary.LittleEndian.PutUint16(raw[8:], segment.FormatMajor+1)
+	if err := os.WriteFile(seg, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, Logger: quiet})
+	if !errors.Is(err, segment.ErrNewerFormat) {
+		t.Fatalf("opening a copy of a newer format: %v, want segment.ErrNewerFormat", err)
+	}
+	if got, err := os.ReadFile(seg); err != nil || !bytes.Equal(got, raw) {
+		t.Fatalf("the newer-format segment was not left as it was: %v", err)
+	}
+}
+
+// TestUnreadableCopyIsNotWiped: a copy whose files cannot be read for a reason other
+// than their content (here its manifest is a directory: an I/O error, as a permission
+// or a resource error would be) is not wiped: the error is returned, and the files stay.
+func TestUnreadableCopyIsNotWiped(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	dir, _ := closedCopy(t, cfg, st)
+	segs := segmentsOf(t, dir)
+	manifest := filepath.Join(dir, "manifest")
+	if err := os.Rename(manifest, manifest+".aside"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(manifest, "in-the-way"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := node.NewSingle(context.Background(), node.Options{Store: st, Config: cfg, Logger: quiet})
+	if err == nil || segment.Rebuildable(err) {
+		t.Fatalf("opening a copy whose manifest cannot be read: %v, want an error that is not corruption", err)
+	}
+	for _, seg := range segs {
+		if _, err := os.Stat(seg); err != nil {
+			t.Errorf("the copy was wiped over an I/O error: %v", err)
+		}
 	}
 }

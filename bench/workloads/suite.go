@@ -65,10 +65,14 @@ type Config struct {
 	MixedReaders, MixedWriters, MixedBatch int
 
 	CrossCheckVariants int
-	// RestartCmds restart an engine by name (a shell command); RestartIterations
-	// restarts are timed.
-	RestartCmds       map[string]string
+	// Restarters restart an engine, by name (target T9); RestartIterations restarts are
+	// timed.
+	Restarters        map[string]Restarter
 	RestartIterations int
+	// Recoverers measure a new replica of an engine from zero to serving, by name
+	// (target T8); RecoveryIterations recoveries are timed.
+	Recoverers         map[string]Recoverer
+	RecoveryIterations int
 
 	// LoadOnly stops after the load and footprint.
 	LoadOnly bool
@@ -107,6 +111,7 @@ func (c *Config) defaults() {
 	set(&c.MixedBatch, 500)
 	set(&c.CrossCheckVariants, 4)
 	set(&c.RestartIterations, 3)
+	set(&c.RecoveryIterations, 3)
 	if c.MixedDuration <= 0 {
 		c.MixedDuration = 30 * time.Second
 	}
@@ -206,7 +211,7 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 	if !cfg.LoadOnly {
 		sampler, stopSampler = s.startFootprintSampler(ctx)
 	}
-	steps := []func(context.Context) error{s.load, s.crossCheckSearches, s.searches, s.visibility, s.mixed, s.percolation, s.restart}
+	steps := []func(context.Context) error{s.load, s.crossCheckSearches, s.searches, s.visibility, s.mixed, s.percolation, s.restart, s.recovery}
 	if cfg.LoadOnly {
 		steps = steps[:1]
 	}
@@ -1023,14 +1028,40 @@ func (s *suite) crossCheckPercolate(ctx context.Context, sl, el Engine, n int, d
 	s.recordCheck(fmt.Sprintf("percolate_%d", n), fmt.Sprintf("%d generated documents", len(docs)), problems, false)
 }
 
-// restart times each engine's restart command until it serves the full index again.
+// Restarter restarts an engine (target T9): Restart returns once the engine was
+// stopped and started again, before it necessarily serves; the suite times it until a
+// count of the index is whole again.
+type Restarter struct {
+	// Describe says how, for the report.
+	Describe string
+	Restart  func(ctx context.Context) error
+}
+
+// CommandRestarter restarts an engine with a shell command (sh -c; cmd /C on Windows).
+func CommandRestarter(cmdline string, log io.Writer) Restarter {
+	return Restarter{Describe: "restart command: " + cmdline, Restart: func(ctx context.Context) error {
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			cmd = exec.CommandContext(ctx, "cmd", "/C", cmdline)
+		} else {
+			cmd = exec.CommandContext(ctx, "sh", "-c", cmdline)
+		}
+		cmd.Stdout, cmd.Stderr = log, log
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("restart command: %w", err)
+		}
+		return nil
+	}}
+}
+
+// restart times each engine's restart until it serves the full index again.
 func (s *suite) restart(ctx context.Context) error {
 	if !s.cfg.wants("restart", report.GroupRestart) {
 		return nil
 	}
 	for _, eng := range s.engines {
-		cmdline := s.cfg.RestartCmds[eng.Name()]
-		if cmdline == "" {
+		rs, ok := s.cfg.Restarters[eng.Name()]
+		if !ok || rs.Restart == nil {
 			continue
 		}
 		want, err := eng.Count(ctx, s.cfg.Index)
@@ -1039,15 +1070,8 @@ func (s *suite) restart(ctx context.Context) error {
 		}
 		o := RunOptions{Iterations: s.cfg.RestartIterations, Concurrency: 1}
 		op := func(ctx context.Context, _ int) (int, time.Duration, error) {
-			var cmd *exec.Cmd
-			if runtime.GOOS == "windows" {
-				cmd = exec.CommandContext(ctx, "cmd", "/C", cmdline)
-			} else {
-				cmd = exec.CommandContext(ctx, "sh", "-c", cmdline)
-			}
-			cmd.Stdout, cmd.Stderr = s.cfg.Log, s.cfg.Log
-			if err := cmd.Run(); err != nil {
-				return 0, 0, fmt.Errorf("restart command: %w", err)
+			if err := rs.Restart(ctx); err != nil {
+				return 0, 0, err
 			}
 			rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 			defer cancel()
@@ -1062,7 +1086,53 @@ func (s *suite) restart(ctx context.Context) error {
 				return nil
 			})
 		}
-		s.add(s.result("restart", report.GroupRestart, "restart command until the full count is served: "+cmdline, eng, o, Run(ctx, o, op)))
+		res := s.result("restart", report.GroupRestart, rs.Describe+", until the full count is served", eng, o, Run(ctx, o, op))
+		res.Values = map[string]float64{"docs": float64(want)}
+		s.add(res)
+	}
+	return nil
+}
+
+// Recoverer runs an engine's new-replica recovery (target T8) on a cluster of its own.
+// The suite loads the dataset into Source, the cluster's first node, then each Recover
+// starts a node holding nothing, returns how long it took from its start until its own
+// copies serve all want documents of index, and removes it again.
+type Recoverer interface {
+	Source() Engine
+	Recover(ctx context.Context, index string, want int64) (time.Duration, error)
+}
+
+// recovery loads the dataset into each recoverer's source and times new replicas.
+func (s *suite) recovery(ctx context.Context) error {
+	if !s.cfg.wants("recovery", report.GroupRecovery) {
+		return nil
+	}
+	for _, eng := range s.engines {
+		rec := s.cfg.Recoverers[eng.Name()]
+		if rec == nil {
+			continue
+		}
+		src := rec.Source()
+		s.logf("loading %s into %s's recovery source", s.cfg.DataFile, eng.Name())
+		if err := src.CreateIndex(ctx, s.cfg.Index, datasets.Products, s.cfg.Shards); err != nil {
+			return fmt.Errorf("%s: recovery source: creating %s: %w", eng.Name(), s.cfg.Index, err)
+		}
+		_, n, err := s.bulkLoad(ctx, src)
+		if err != nil {
+			return fmt.Errorf("%s: recovery source: loading: %w", eng.Name(), err)
+		}
+		if err := s.waitSearchable(ctx, src, n); err != nil {
+			return err
+		}
+		o := RunOptions{Iterations: s.cfg.RecoveryIterations, Concurrency: 1}
+		op := func(ctx context.Context, _ int) (int, time.Duration, error) {
+			d, err := rec.Recover(ctx, s.cfg.Index, n)
+			return 1, d, err
+		}
+		desc := fmt.Sprintf("a node with an empty data directory joins a cluster holding %d documents in %d shards, timed from its start until its own copies serve them all", n, s.cfg.Shards)
+		res := s.result("recovery", report.GroupRecovery, desc, eng, o, Run(ctx, o, op))
+		res.Values = map[string]float64{"docs": float64(n)}
+		s.add(res)
 	}
 	return nil
 }

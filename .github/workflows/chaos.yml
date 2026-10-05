@@ -1,0 +1,92 @@
+name: chaos
+
+# The chaos suite (test/chaos) runs the real searchlight binary as a three-node cluster
+# on Postgres and kills, restarts and corrupts it under load (plan Task 13, spec
+# section 14). It takes several minutes and restarts its database with Docker, so it is
+# a workflow of its own rather than a job of ci.yml:
+#
+#   - it runs weekly, on demand, and on pull requests that touch the code it exercises
+#     (the binary, the engine's packages from the API down to the store, and the
+#     modules);
+#   - it is time-boxed (the job at 40 minutes, the tests at 30);
+#   - it is not a required check: a slow or failing run shows on the pull request
+#     without holding up ci.yml's checks, which gate the merge. A failure is still a
+#     bug to fix before merging; the node logs are uploaded with it.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "cmd/**"
+      - "internal/api/**"
+      - "internal/cluster/**"
+      - "internal/node/**"
+      - "internal/replica/**"
+      - "internal/segment/**"
+      - "internal/shard/**"
+      - "internal/slproc/**"
+      - "internal/store/**"
+      - "go.mod"
+      - "go.sum"
+      - "test/chaos/**"
+      - ".github/workflows/chaos.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chaos:
+    name: chaos suite (Linux, Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: searchlight
+          POSTGRES_PASSWORD: searchlight
+          POSTGRES_DB: searchlight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U searchlight -d searchlight"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # Each node opens up to 64 connections plus one for LISTEN; three nodes and the
+      # suite's own pass the image's default of 100.
+      - name: raise Postgres's max_connections
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          docker exec "$PG" psql -U searchlight -d searchlight -c "ALTER SYSTEM SET max_connections = 300"
+          docker restart "$PG"
+          until docker exec "$PG" pg_isready -U searchlight -d searchlight; do sleep 1; done
+      - name: chaos suite
+        env:
+          SEARCHLIGHT_TEST_PG_URL: postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable
+          SEARCHLIGHT_CHAOS_DIR: ${{ runner.temp }}/chaos
+          # The database restart scenario's hook: restart the service container, and
+          # return once it accepts connections again.
+          SEARCHLIGHT_CHAOS_DB_RESTART: >-
+            docker restart ${{ job.services.postgres.id }} &&
+            until docker exec ${{ job.services.postgres.id }} pg_isready -U searchlight -d searchlight; do sleep 0.5; done
+        run: go test -tags chaos -count=1 -v -timeout 30m ./test/chaos
+      - name: upload the nodes' logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-logs
+          path: ${{ runner.temp }}/chaos
+          if-no-files-found: ignore
+          retention-days: 14

@@ -153,16 +153,11 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 			return
 		}
 		if i < len(syncs) {
-			if errs[i] = s.syncPath(syncs[i]); errs[i] == nil {
-				s.noteSynced(syncs[i])
-			}
+			errs[i] = s.syncPath(syncs[i])
 			return
 		}
 		st := writes[i-len(syncs)]
 		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true})
-		if errs[i] == nil {
-			s.noteSynced(filepath.Join(s.dir, deletesName(st.ref.id, st.delGen)))
-		}
 	})
 	for _, st := range writes {
 		s.strays[filepath.Join(s.dir, deletesName(st.ref.id, st.delGen))] = true

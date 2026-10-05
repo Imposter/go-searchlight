@@ -15,12 +15,16 @@ The suite has two tiers, sorted by [internal/testtier](internal/testtier/testtie
 CI runs `make test TESTFLAGS=-race` and `make test-race` as two Linux jobs against SQLite,
 Postgres and MySQL. The heavy job runs every test, so it alone keeps the suite's coverage;
 the short job answers first. On Windows CI runs the short tier, the smoke tests (the binary
-built, run and restarted in `TestSmokeBinary`; every benchmark workload against a node in
-process in `TestEndToEndInProcess`) and the heavy tier of `store`, `shard` and `segment`,
+built, run and restarted in `TestSmokeBinary`; every benchmark workload against the binary
+in `TestEndToEndBinary`) and the heavy tier of `store`, `shard` and `segment`,
 whose WAL checkpoints, merges, renames and large files behave differently on NTFS.
 
 The T7 harnesses (`TestT7RefreshPhases`, `TestT7Diag`) are diagnostics, not checks: they run
 only with `SEARCHLIGHT_T7DIAG=1` and outside `-short`.
+
+The chaos suite (`test/chaos`) is outside both tiers: it builds only with the `chaos` tag,
+needs Postgres (`SEARCHLIGHT_TEST_PG_URL`), and runs in its own workflow,
+`.github/workflows/chaos.yml`.
 
 ### Which tier a test belongs to
 

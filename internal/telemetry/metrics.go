@@ -134,6 +134,7 @@ const (
 	MetricMergeBacklog    = "searchlight.shard.merge.backlog"
 	MetricShardSegments   = "searchlight.shard.segments"
 	MetricShardBufferDocs = "searchlight.shard.buffer.documents"
+	MetricShardOpenFailed = "searchlight.shard.open.failures"
 
 	// Size.
 	MetricShardDocuments    = "searchlight.shard.documents"
@@ -207,6 +208,7 @@ var Catalog = []MetricSpec{
 	{MetricMergeBacklog, KindGauge, "{segment}", "Segments waiting to be merged, by index and shard.", nil},
 	{MetricShardSegments, KindGauge, "{segment}", "Segments in the current generation, by index and shard.", nil},
 	{MetricShardBufferDocs, KindGauge, "{change}", "Documents and saved queries in the write buffer, not yet refreshed, by index and shard.", nil},
+	{MetricShardOpenFailed, KindCounter, "{open}", "Shard copies whose files did not open, by index and reason: corrupt (damaged or of an older format: wiped and rebuilt), newer_format (refused and left as they are) or error (retried).", nil},
 
 	{MetricShardDocuments, KindGauge, "{document}", "Live documents, by index and shard.", nil},
 	{MetricShardTerms, KindGauge, "{term}", "Distinct terms across a shard's segments, by index and shard.", nil},

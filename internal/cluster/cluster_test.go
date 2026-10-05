@@ -789,12 +789,16 @@ func TestQuarantinedTakeoverKeepsItsRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(b.cfg.DataDir, "indexes", meta.UID, "0")
-	if err := os.MkdirAll(root, 0o750); err != nil {
+	// A file where the index's directory belongs: the copy can be neither opened nor
+	// wiped and created afresh.
+	blocker := filepath.Join(b.cfg.DataDir, "indexes", meta.UID)
+	if err := os.RemoveAll(blocker); err != nil {
 		t.Fatal(err)
 	}
-	current := filepath.Join(root, "CURRENT")
-	if err := os.WriteFile(current, []byte("bogus"), 0o600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(blocker), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := allocateNow(t, b); err == nil {
@@ -810,7 +814,7 @@ func TestQuarantinedTakeoverKeepsItsRow(t *testing.T) {
 	if len(rows) != 1 || rows[0].NodeID != "node-1" {
 		t.Fatalf("the quarantined takeover's row: %+v, want node-1's", rows)
 	}
-	if err := os.Remove(current); err != nil {
+	if err := os.Remove(blocker); err != nil {
 		t.Fatal(err)
 	}
 	if err := allocateNow(t, b); err != nil {

@@ -121,7 +121,8 @@ var groupOrder = []struct{ group, title, about string }{
 	{GroupAggs, "Aggregations", "Size 0; Elasticsearch's request cache is off; filters vary per iteration."},
 	{GroupPercolate, "Percolation", "Saved-search sets are prefixes of one generated stream. `percolate_batch_N`: batches of documents at a fixed concurrency (docs/s, latency per batch). `percolate_single_N`: one document per request (per-document latency). `bulk_percolate`: Searchlight's `_bulk?percolate=true` against Elasticsearch's `_bulk` then percolate."},
 	{GroupMixed, "Concurrent mixed read/write", "Readers cycle through filter, sorted and aggregation searches while writers update existing documents in bulk, for a fixed time."},
-	{GroupRestart, "Restart to serving", "The operator's restart command, timed until the engine answers a search with the full count."},
+	{GroupRestart, "Restart to serving", "The engine stopped gracefully and started again (Searchlight: the node slbench runs; Elasticsearch: the operator's restart command), timed until it answers a count with the full total."},
+	{GroupRecovery, "New replica from zero to serving", "A node with an empty data directory joins a cluster of its own that already holds the dataset, timed from its start until its own copies serve every document (peer recovery, then the changelog replayed)."},
 }
 
 // Render writes the run as markdown.
@@ -170,7 +171,7 @@ func Render(w io.Writer, r *Run) error {
 		fmt.Fprintln(w)
 	}
 	fmt.Fprintf(w, "## Reproduce\n\n")
-	fmt.Fprintf(w, "On a Linux host with Docker: `go run ./bench/cmd/slbench gen`, start Elasticsearch with `docker compose -f bench/docker-compose.es.yml up -d` and Searchlight with `go run ./bench/cmd/slserver`, then `slbench run` and `slbench report` (`slbench help` lists every flag). `.github/workflows/bench.yml` runs exactly these steps.\n")
+	fmt.Fprintf(w, "On a Linux host with Docker: `make build`, `go run ./bench/cmd/slbench gen`, start Elasticsearch with `docker compose -f bench/docker-compose.es.yml up -d`, then `slbench run --sl-bin bin/searchlight` (it runs the binary itself; `--recovery-store-url` adds the recovery workload on Postgres) and `slbench report` (`slbench help` lists every flag). `.github/workflows/bench.yml` runs exactly these steps.\n")
 	return nil
 }
 

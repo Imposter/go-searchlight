@@ -3,12 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/Imposter/go-searchlight/bench/report"
+	"github.com/Imposter/go-searchlight/internal/slproc"
+	"github.com/Imposter/go-searchlight/internal/store/postgres"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
@@ -19,22 +26,37 @@ func slbench(t *testing.T, stdin string, args ...string) (int, string) {
 	return code, out.String() + errs.String()
 }
 
-// TestEndToEndInProcess generates a tiny dataset, runs every workload against an
-// in-process Searchlight, and renders the report: the harness works end to end.
-func TestEndToEndInProcess(t *testing.T) {
+// TestEndToEndBinary generates a tiny dataset, builds the searchlight binary, runs
+// every workload against it as its own process (restarts included), and renders the
+// report: the harness works end to end. With SEARCHLIGHT_TEST_PG_URL set, the recovery
+// workload runs too, on a schema of its own.
+func TestEndToEndBinary(t *testing.T) {
 	testtier.Heavy(t)
 	dir := t.TempDir()
+	bin, err := slproc.Build(t.Context(), dir, "bench-test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if code, out := slbench(t, "", "gen", "-out", dir, "-docs", "1500", "-searches", "60,120", "-workers", "2"); code != 0 {
 		t.Fatalf("gen: %d\n%s", code, out)
 	}
 	data := ProductsFile(dir, 1500)
 	results := filepath.Join(dir, "results.json")
 	md := filepath.Join(dir, "report.md")
-	code, out := slbench(t, "", "run", "-data", data, "-searches", SearchesFile(dir, 120), "-sets", "60,120",
-		"-sl-inprocess", filepath.Join(dir, "sl"), "-warmup", "2", "-iterations", "5", "-variants", "3",
+	args := []string{
+		"run", "-data", data, "-searches", SearchesFile(dir, 120), "-sets", "60,120",
+		"-sl-bin", bin, "-sl-dir", filepath.Join(dir, "sl"), "-warmup", "2", "-iterations", "5", "-variants", "3",
 		"-page-depth", "300", "-page-walks", "1", "-bulk-batch", "500", "-percolate-batch", "20", "-percolate-iterations", "2",
 		"-percolate-single", "3", "-bulk-percolate-iterations", "1", "-visible-iterations", "1", "-mixed", "300ms",
-		"-out", results, "-md", md, "-label", "test")
+		"-restart-iterations", "1", "-recovery-iterations", "1", "-shards", "2",
+		"-out", results, "-md", md, "-label", "test",
+	}
+	recovery := false
+	if base := os.Getenv("SEARCHLIGHT_TEST_PG_URL"); base != "" {
+		args = append(args, "-recovery-store-url", pgSchema(t, base))
+		recovery = true
+	}
+	code, out := slbench(t, "", args...)
 	if code != 0 {
 		t.Fatalf("run: %d\n%s", code, out)
 	}
@@ -42,11 +64,15 @@ func TestEndToEndInProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, w := range []string{
+	want := []string{
 		"bulk_index", "footprint", "filter_term", "filter_contains", "sorted_price_top100", "paging_search_after_300",
 		"agg_terms", "agg_cardinality", "refresh_visible", "refresh_wait_for", "mixed_read", "mixed_write",
-		"percolate_batch_60", "percolate_single_120", "bulk_percolate",
-	} {
+		"percolate_batch_60", "percolate_single_120", "bulk_percolate", "restart",
+	}
+	if recovery {
+		want = append(want, "recovery")
+	}
+	for _, w := range want {
 		res := r.Find(w, report.Searchlight)
 		if res == nil {
 			t.Errorf("no %s result", w)
@@ -62,6 +88,12 @@ func TestEndToEndInProcess(t *testing.T) {
 	if fp := r.Find("footprint", report.Searchlight); fp == nil || fp.Values["disk_bytes"] <= 0 {
 		t.Errorf("footprint %+v", fp)
 	}
+	for _, tc := range r.Targets {
+		measured := tc.ID == "T9" || (tc.ID == "T8" && recovery)
+		if measured && (tc.Status == report.NotMeasured || tc.Status == report.Invalid) {
+			t.Errorf("%s: %s (%s)", tc.ID, tc.Status, tc.Detail)
+		}
+	}
 	b, err := os.ReadFile(md)
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +107,33 @@ func TestEndToEndInProcess(t *testing.T) {
 	if code, out := slbench(t, "", "report", "-in", results, "-out", again); code != 0 {
 		t.Fatalf("report: %d\n%s", code, out)
 	}
+}
+
+// pgSchema creates a schema for the test on the Postgres at base and returns a URL
+// whose search_path is it.
+func pgSchema(t *testing.T, base string) string {
+	t.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := postgres.Config(u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := stdlib.OpenDB(*cfg)
+	t.Cleanup(func() { _ = admin.Close() })
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	schema := "sl_bench_" + hex.EncodeToString(b)
+	if _, err := admin.ExecContext(t.Context(), "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = admin.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE") })
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func TestTranslateCommand(t *testing.T) {

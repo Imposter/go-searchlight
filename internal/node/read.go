@@ -25,14 +25,19 @@ import (
 )
 
 // checkHead refuses (400) a wait_for_seq past the newest committed seq, which no
-// copy would ever reach: the node's head is raised from the store's first.
+// copy would ever reach: the node's head is raised from the store's first. While the
+// store cannot be asked, a seq past this node's head may well be committed (by another
+// node): it is unavailable (503, retryable), not invalid.
 func (n *Single) checkHead(ctx context.Context, seq int64) error {
 	if seq <= n.head.Load() {
 		return nil
 	}
-	if h, _, err := n.st.HeadSeq(ctx); err == nil {
-		n.noteHead(h)
+	h, _, err := n.st.HeadSeq(ctx)
+	if err != nil {
+		n.noteDB(err)
+		return api.Unavailable(err, "wait_for_seq %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", seq, n.head.Load())
 	}
+	n.noteHead(h)
 	if head := n.head.Load(); seq > head {
 		return api.InvalidAt("params.wait_for_seq", "wait_for_seq %d is past the newest committed seq, %d", seq, head)
 	}

@@ -69,6 +69,7 @@ func TestLoadDefaults(t *testing.T) {
 		PruneStallTimeout:     15 * time.Minute,
 		RetiringRetention:     15 * time.Minute,
 		ChangelogRetention:    24 * time.Hour,
+		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
 	}
@@ -112,6 +113,8 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		"SEARCHLIGHT_INFLIGHT_AMPLIFICATION":   "4",
 		"SEARCHLIGHT_DROP_TIMEOUT":             "1m",
 		"SEARCHLIGHT_SHUTDOWN_GRACE":           "0s",
+		"SEARCHLIGHT_BUNDLE_INTERVAL":          "30m",
+		"SEARCHLIGHT_BUNDLE_RETENTION":         "3",
 	}
 	c, err := Load(nil, envOf(env))
 	if err != nil {
@@ -154,6 +157,8 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		PruneStallTimeout:     15 * time.Minute,
 		RetiringRetention:     15 * time.Minute,
 		ChangelogRetention:    24 * time.Hour,
+		BundleInterval:        30 * time.Minute,
+		BundleRetention:       3,
 		MaxIndexFields:        1000,
 	}
 	if c != want {
@@ -251,6 +256,9 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"drop_timeout", map[string]string{"SEARCHLIGHT_DROP_TIMEOUT": "0s"}, nil},
 		{"max_index_fields", map[string]string{"SEARCHLIGHT_MAX_INDEX_FIELDS": "0"}, nil},
 		{"shutdown_grace", map[string]string{"SEARCHLIGHT_SHUTDOWN_GRACE": "-1s"}, nil},
+		{"bundle_interval", map[string]string{"SEARCHLIGHT_BUNDLE_INTERVAL": "500ms"}, nil},
+		{"bundle_interval", map[string]string{"SEARCHLIGHT_BUNDLE_INTERVAL": "-1m"}, nil},
+		{"bundle_retention", map[string]string{"SEARCHLIGHT_BUNDLE_RETENTION": "0"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_KEY": "key.pem"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_CERT": filepath.Join(t.TempDir(), "nope.pem"), "SEARCHLIGHT_TLS_KEY": filepath.Join(t.TempDir(), "nope.key")}, nil},
 		{"search_threads", nil, []string{"--search_threads=-2"}},

@@ -64,6 +64,9 @@ func (c *copyState) acquire() (*shard.Generation, error) {
 			return nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is closed", c.id.Shard, c.id.Index)
 		}
 		if c.notServing() == nil && c.shard() == sh {
+			if c.spec.Served != nil {
+				c.spec.Served()
+			}
 			return g, nil
 		}
 		g.Release()

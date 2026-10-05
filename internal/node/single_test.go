@@ -27,6 +27,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
 
 var quiet = slog.New(slog.DiscardHandler)
@@ -35,7 +36,7 @@ func testConfig(t *testing.T) config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
-	cfg.StoreURL = "sqlite:///" + filepath.ToSlash(filepath.Join(dir, "sl.db"))
+	cfg.StoreURL = storetest.SQLiteURL(storetest.Migrated(t, filepath.Join(dir, "sl.db")))
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.RefreshInterval = 20 * time.Millisecond
 	cfg.ChangelogPollInterval = 20 * time.Millisecond

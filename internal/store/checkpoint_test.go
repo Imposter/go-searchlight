@@ -19,7 +19,7 @@ import (
 // checkpoint empties the file, and small writes afterwards pass ticks with no
 // checkpoint (and no fsync): the gate counts the frames pending, not the file's size.
 func TestCheckpointGateAfterBurst(t *testing.T) {
-	st := sqliteHarness(t).open(t)
+	st := durableSQLiteHarness(t).open(t)
 	s, ok := st.(*sqlStore)
 	if !ok {
 		t.Fatalf("%T is not the SQL store", st)
@@ -77,7 +77,7 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 func TestPinnedLogWarns(t *testing.T) {
 	logs := &captureHandler{}
 	clk := clock.NewFake(time.Now())
-	st := sqliteHarness(t).open(t, WithLogger(slog.New(logs)), WithClock(clk))
+	st := durableSQLiteHarness(t).open(t, WithLogger(slog.New(logs)), WithClock(clk))
 	s, ok := st.(*sqlStore)
 	if !ok {
 		t.Fatalf("%T is not the SQL store", st)

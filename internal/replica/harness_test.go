@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +26,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
 
 // The external databases the suite also runs on; unset, those dialects are skipped.
@@ -47,8 +47,20 @@ type db struct {
 // forEachDialect runs fn on a fresh database of every available dialect.
 func forEachDialect(t *testing.T, fn func(t *testing.T, d *db)) {
 	t.Helper()
+	forDialects(t, storetest.SQLiteURL, fn)
+}
+
+// forEachDurableDialect is forEachDialect with SQLite's synchronous=FULL, for tests
+// of durability, crashes and fsyncs.
+func forEachDurableDialect(t *testing.T, fn func(t *testing.T, d *db)) {
+	t.Helper()
+	forDialects(t, storetest.DurableSQLiteURL, fn)
+}
+
+func forDialects(t *testing.T, sqliteURL func(path string) string, fn func(t *testing.T, d *db)) {
+	t.Helper()
 	t.Run("sqlite", func(t *testing.T) {
-		fn(t, &db{dialect: "sqlite", url: sqliteURL(filepath.Join(t.TempDir(), "searchlight.db"))})
+		fn(t, &db{dialect: "sqlite", url: sqliteURL(storetest.Migrated(t, filepath.Join(t.TempDir(), "searchlight.db")))})
 	})
 	t.Run("postgres", func(t *testing.T) {
 		base := os.Getenv(envPG)
@@ -70,14 +82,6 @@ func randName(prefix string) string {
 	var b [6]byte
 	_, _ = rand.Read(b[:])
 	return prefix + hex.EncodeToString(b[:])
-}
-
-func sqliteURL(path string) string {
-	path = filepath.ToSlash(path)
-	if strings.HasPrefix(path, "/") {
-		return "sqlite://" + path
-	}
-	return "sqlite:///" + path
 }
 
 // postgresDB creates a schema for the test and points search_path at it.

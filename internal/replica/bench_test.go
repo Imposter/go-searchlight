@@ -10,13 +10,14 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
 
 // benchStore is a SQLite store holding n documents in shard 0 of index "b", after
 // one change of shard 1 (seq 1) that a benchmark's copy starts past.
 func benchStore(b *testing.B, n int) (store.Store, int64) {
 	b.Helper()
-	st := (&db{dialect: "sqlite", url: sqliteURL(filepath.Join(b.TempDir(), "bench.db"))}).open(b)
+	st := (&db{dialect: "sqlite", url: storetest.DurableSQLiteURL(filepath.Join(b.TempDir(), "bench.db"))}).open(b)
 	createIndex(b, st, "b", testMapping)
 	mustApply(b, st, upsert("b", 1, "other", `{}`))
 	var head int64

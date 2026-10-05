@@ -30,6 +30,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/node/nodetest"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
 
 // clusterMode makes newEnv serve the API over a one-node cluster.Node.
@@ -86,7 +87,7 @@ func testConfig(t testing.TB) config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Default()
-	cfg.StoreURL = "sqlite:///" + filepath.ToSlash(filepath.Join(dir, "searchlight.db"))
+	cfg.StoreURL = storetest.SQLiteURL(storetest.Migrated(t, filepath.Join(dir, "searchlight.db")))
 	cfg.DataDir = filepath.Join(dir, "data")
 	cfg.InsecureNoAuth = true
 	cfg.RefreshInterval = 20 * time.Millisecond

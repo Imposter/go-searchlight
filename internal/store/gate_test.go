@@ -77,7 +77,7 @@ func TestGateLanesAndFIFO(t *testing.T) {
 // connection, lease renewals made while writers keep committing large batches wait
 // for about one transaction, never behind the queue of bulk commits.
 func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
-	st := sqliteHarness(t).open(t)
+	st := durableSQLiteHarness(t).open(t)
 	ctx := context.Background()
 	if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "bulk", Mapping: []byte(`{}`)}); err != nil {
 		t.Fatal(err)

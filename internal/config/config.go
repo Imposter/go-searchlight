@@ -218,6 +218,13 @@ func Default() Config {
 	}
 }
 
+// removedSettings are settings Searchlight no longer has, each with what replaced it:
+// Load refuses one given as a flag or an environment variable by name, rather than
+// letting the flag parser fail generically or the variable be ignored.
+var removedSettings = []struct{ name, instead string }{
+	{"seq_persist_interval", "flush_interval (default 10s) now persists the seq"},
+}
+
 // setting describes one configuration setting.
 type setting struct {
 	name    string // snake_case; flag --name, env SEARCHLIGHT_NAME
@@ -524,6 +531,15 @@ func Load(args []string, env func(string) string) (Config, error) {
 	}
 	c := Default()
 	var errs []error
+	for _, r := range removedSettings {
+		source := EnvPrefix + strings.ToUpper(r.name)
+		if _, ok := fromFlags[r.name]; ok {
+			source = "--" + r.name
+		} else if env(source) == "" {
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s was removed; %s (set by %s)", r.name, r.instead, source))
+	}
 	for i := range settings {
 		s := &settings[i]
 		v, source, err := lookup(s, fromFlags, env)
@@ -558,6 +574,9 @@ func parseFlags(args []string) (map[string]string, error) {
 		} else {
 			fs.Func(s.name, s.usage, record)
 		}
+	}
+	for _, r := range removedSettings {
+		fs.Func(r.name, "removed", func(v string) error { given[r.name] = v; return nil })
 	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

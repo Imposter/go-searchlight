@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -283,6 +284,24 @@ func TestLoadRefusesNoAuthUnlessInsecure(t *testing.T) {
 	c, err := Load([]string{"--insecure_no_auth"}, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}))
 	if err != nil || !c.InsecureNoAuth {
 		t.Errorf("--insecure_no_auth: %+v, %v", c, err)
+	}
+}
+
+// A removed setting is refused by name, as a flag or an environment variable, with what
+// replaced it.
+func TestLoadRefusesRemovedSettings(t *testing.T) {
+	const want = "seq_persist_interval was removed; flush_interval (default 10s) now persists the seq"
+	base := map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}
+	if _, err := Load([]string{"--seq_persist_interval=30s"}, envOf(base)); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "--seq_persist_interval") {
+		t.Errorf("the flag: err = %v, want %q naming the flag", err, want)
+	}
+	env := maps.Clone(base)
+	env["SEARCHLIGHT_SEQ_PERSIST_INTERVAL"] = "30s"
+	if _, err := Load(nil, envOf(env)); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "SEARCHLIGHT_SEQ_PERSIST_INTERVAL") {
+		t.Errorf("the environment variable: err = %v, want %q naming the variable", err, want)
+	}
+	if _, err := Load(nil, envOf(base)); err != nil {
+		t.Errorf("without it: %v", err)
 	}
 }
 

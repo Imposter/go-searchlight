@@ -176,12 +176,24 @@ jobs:
             --es-url "http://127.0.0.1:9200" \
             --es-config "heap_max=${ES_HEAP}" \
             --es-recovery \
+            --repeats 1 \
             --label "CI (${{ github.sha }})" \
             --out "$DATA_DIR/bench-results.json" \
             --md docs/benchmarks.md \
             --stop-on-mismatch
           # No --allow-mismatch: an untolerated engine disagreement must fail this job
           # (exit code 3), not just a line in the report.
+          #
+          # --repeats 1 (not the CLI's own default of 3): two back-to-back dispatches
+          # at 1M documents (identical otherwise) each got cut off by what looks like
+          # an execution ceiling well under this job's own 240-minute timeout-minutes
+          # (109 min and 120 min; main's own unmodified baseline run finished cleanly
+          # in 106 min, so the margin here is tight) -- right as Elasticsearch's own
+          # recovery measurement (the heaviest addition besides repeats) was about to
+          # start, both times. Until that ceiling is understood (it is not this
+          # workflow's own setting) or the run is otherwise trimmed, 1M-document CI
+          # dispatches drop the repeat multiplier to fit; --repeats 2 or 3 is still
+          # the better choice for a smaller or more leisurely run.
         continue-on-error: true
 
       # Captured before the services stop (docker compose down drops the

@@ -838,7 +838,8 @@
     }
   ],
   "notes": [
-    "Searchlight ran in the slbench process (bench/internal/slserver over SQLite), so its RSS includes the harness's own memory and the harness shares its CPUs."
+    "Searchlight ran in the slbench process (bench/internal/slserver over SQLite), so its RSS includes the harness's own memory and the harness shares its CPUs.",
+    "Historical, from before slbench ran the real binary: bench/internal/slserver no longer exists, and slbench run --sl-bin now runs the built searchlight as its own process. Kept for the per-iteration timings the bench sizing cites."
   ],
   "targets": [
     {

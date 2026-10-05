@@ -252,7 +252,7 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	base := context.WithoutCancel(ctx)
 	select {
 	case err := <-errc:
-		cctx, cancel := context.WithDeadline(base, s.closeBy(NewShutdown(s.cfg, s.clock)))
+		cctx, cancel := clock.WithDeadline(base, s.clock, s.closeBy(NewShutdown(s.cfg, s.clock)))
 		defer cancel()
 		return errors.Join(fmt.Errorf("api listener: %w", err), s.c.Close(cctx))
 	case <-ctx.Done():
@@ -269,7 +269,7 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	if d, ok := s.c.(Drainer); ok {
 		// A cluster node retires the copies others can stand in for, so peers stop
 		// routing reads here while the listener drains.
-		dctx, cancel := context.WithDeadline(base, sd.within(s.clock.Now(), quarter))
+		dctx, cancel := clock.WithDeadline(base, s.clock, sd.within(s.clock.Now(), quarter))
 		d.Drain(dctx)
 		cancel()
 	}
@@ -282,7 +282,7 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 			errc <- err
 		}
 	}
-	sctx, cancel := context.WithDeadline(base, sd.within(s.clock.Now(), quarter))
+	sctx, cancel := clock.WithDeadline(base, s.clock, sd.within(s.clock.Now(), quarter))
 	defer cancel()
 	var errs []error
 	if err := srv.Shutdown(sctx); err != nil {
@@ -292,7 +292,7 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		errs = append(errs, fmt.Errorf("api listener: %w", err))
 	}
-	cctx, ccancel := context.WithDeadline(base, s.closeBy(sd))
+	cctx, ccancel := clock.WithDeadline(base, s.clock, s.closeBy(sd))
 	defer ccancel()
 	if err := s.c.Close(cctx); err != nil {
 		errs = append(errs, fmt.Errorf("coordinator close: %w", err))

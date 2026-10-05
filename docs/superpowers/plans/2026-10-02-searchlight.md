@@ -316,6 +316,18 @@ Run `slbench` in CI, or on a Linux host with Docker, against Elasticsearch. Prof
 
 The refresh/flush split, once parked here, was promoted to Task 15c and is done ([#12](https://github.com/Imposter/go-searchlight/issues/12)): a refresh publishes without fsync, and a flush (`flush_interval`, 10 s) makes it durable.
 
+Split into parts under epic [#43](https://github.com/Imposter/go-searchlight/issues/43); each issue carries its scope, carries and done-when criteria.
+
+| Part | Issue | Depends on | Area |
+|---|---|---|---|
+| 14a | [#38](https://github.com/Imposter/go-searchlight/issues/38) | — | Bench: every §14 measurement at 1M docs, pprof capture, per-section disk breakdown |
+| 14b | [#39](https://github.com/Imposter/go-searchlight/issues/39) | — | Disk footprint ≤ Elasticsearch; segment format freeze items ([#37](https://github.com/Imposter/go-searchlight/issues/37)) |
+| 14c | [#40](https://github.com/Imposter/go-searchlight/issues/40) | 14b | Filter, sort and aggregation latency ≤ Elasticsearch |
+| 14d | [#41](https://github.com/Imposter/go-searchlight/issues/41) | — | Percolator at 100k saved queries, p99 < 1 ms |
+| 14e | [#42](https://github.com/Imposter/go-searchlight/issues/42) | — | Build and merge throughput; Postgres and MySQL bulk |
+
+Waves: 14a, 14b and 14d in parallel (disjoint packages); then 14c and 14e; then a final 1M run and `docs/benchmarks.md`.
+
 ## Task 15: Timers (epic [#9](https://github.com/Imposter/go-searchlight/issues/9))
 
 Added 2026-10-04 after the T7 write-to-visible diagnosis and the slow, flaky test runs in Tasks 9–11. Each part is its own GitHub issue, with full scope and done-when criteria there.

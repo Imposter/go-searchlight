@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: bench
+  group: bench-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Imposter/go-searchlight/bench/report"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 func slbench(t *testing.T, stdin string, args ...string) (int, string) {
@@ -21,9 +22,7 @@ func slbench(t *testing.T, stdin string, args ...string) (int, string) {
 // TestEndToEndInProcess generates a tiny dataset, runs every workload against an
 // in-process Searchlight, and renders the report: the harness works end to end.
 func TestEndToEndInProcess(t *testing.T) {
-	if testing.Short() {
-		t.Skip("starts a Searchlight node and runs every workload")
-	}
+	testtier.Heavy(t)
 	dir := t.TempDir()
 	if code, out := slbench(t, "", "gen", "-out", dir, "-docs", "1500", "-searches", "60,120", "-workers", "2"); code != 0 {
 		t.Fatalf("gen: %d\n%s", code, out)

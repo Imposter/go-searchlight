@@ -28,16 +28,27 @@ You need Go 1.25 or newer. The code is pure Go with no cgo, and it builds on Lin
 Windows.
 
 ```sh
-make build    # go build ./... and bin/searchlight (bin/searchlight.exe on Windows)
-make test     # go test -race ./...
-make lint     # go vet ./... and golangci-lint run (golangci-lint v2)
-make bench    # all benchmarks; narrow them with BENCH=<regexp>
-make docker   # the container image (deploy/Dockerfile), searchlight:dev
-make parity   # regenerate testdata/parity/*.json from scrape-bot (see below)
+make build       # go build ./... and bin/searchlight (bin/searchlight.exe on Windows)
+make test        # the short tier: go test -short ./..., under two minutes
+make test-heavy  # every test: the short tier and the heavy one (go test ./...)
+make test-all    # test-heavy with the property tests' long modes
+make test-race   # test-heavy under -race, as CI runs it
+make lint        # go vet ./... and golangci-lint run (golangci-lint v2)
+make bench       # all benchmarks; narrow them with BENCH=<regexp>
+make docker      # the container image (deploy/Dockerfile), searchlight:dev
+make parity      # regenerate testdata/parity/*.json from scrape-bot (see below)
 ```
 
-- **`-race` needs cgo.** If no C compiler is installed (common on Windows), run
-  `make test RACE=` instead. CI runs `-race` on Linux.
+- **Two test tiers.** `make test` runs the short tier: every package, with the tests that
+  wait on real time (cluster failover, rolling restarts, lease and latency bounds), the
+  100,000-document recovery, the full byte-identity matrices, the binary's smoke test and
+  the end-to-end benchmark run left to the heavy tier, which runs only without `-short`. CI
+  runs the short tier and the full suite as two jobs, both under `-race` on Linux with
+  SQLite, Postgres and MySQL, and on Windows the short tier, the two smoke tests and the
+  heavy tier of `store`, `shard` and `segment`. [CONTRIBUTING.md](CONTRIBUTING.md)
+  says which tier a new test belongs to.
+- **`-race` needs cgo.** `TESTFLAGS` adds flags to every test target (`make test
+  TESTFLAGS=-race`); without a C compiler (common on Windows), leave `-race` to CI.
 - **Postgres and MySQL tests** run only when `SEARCHLIGHT_TEST_PG_URL` or
   `SEARCHLIGHT_TEST_MYSQL_URL` is set, for example:
   - `postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable`

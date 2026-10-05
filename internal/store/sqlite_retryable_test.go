@@ -52,7 +52,7 @@ func holdSQLiteWriteLock(t *testing.T, path string) (wait func()) {
 // driver's own result code, not leave it nil as before.
 func TestSQLiteRetryable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "busy.db")
-	st, err := Open(context.Background(), sqliteURL(path)+"?_busy_timeout=200", quiet)
+	st, err := Open(context.Background(), sqliteURL(path)+"&_busy_timeout=200", quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestSQLiteRetryable(t *testing.T) {
 // ever succeed.
 func TestGroupCommitSurvivesSQLiteBusy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "busy-gc.db")
-	st, err := Open(context.Background(), sqliteURL(path)+"?_busy_timeout=200", quiet)
+	st, err := Open(context.Background(), sqliteURL(path)+"&_busy_timeout=200", quiet)
 	if err != nil {
 		t.Fatal(err)
 	}

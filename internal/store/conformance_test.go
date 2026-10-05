@@ -1643,7 +1643,7 @@ func blobChunkCount(t *testing.T, st Store) int {
 // be swept out from under it by Put's own cleanup, which only ever owned
 // its failed, pre-commit attempt.
 func TestBlobPutSurvivesPostCommitFailure(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, h *harness) {
+	forEachDurableDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
 		bs := st.Blobs()
@@ -1681,7 +1681,7 @@ func TestBlobPutSurvivesPostCommitFailure(t *testing.T) {
 // ErrAmbiguousCommit without touching the now-live upload, the blob stays
 // intact, and a later Sweep leaves it alone too.
 func TestBlobPutAmbiguousCommit(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, h *harness) {
+	forEachDurableDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
 		bs := st.Blobs()
@@ -1731,7 +1731,7 @@ func TestBlobPutAmbiguousCommit(t *testing.T) {
 // one that dies after switching the pointer but before removing the old
 // upload, and the interplay of Sweep with Puts still writing.
 func TestBlobSweep(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, h *harness) {
+	forEachDurableDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		const chunk = 1024
 		st := h.open(t, WithBlobChunkSize(chunk))

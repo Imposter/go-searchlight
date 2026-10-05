@@ -20,6 +20,7 @@ import (
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/bench/report"
 	"github.com/Imposter/go-searchlight/internal/search"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // fakeFootprintEngine answers Resources with a fixed sequence (repeating its last
@@ -419,7 +420,8 @@ func TestClientRetriesBackpressureThenSucceeds(t *testing.T) {
 
 // TestClientRetryExhaustedReturnsRealStatusError checks that once retries run out,
 // the caller gets the actual *StatusError (its status and body), never a bare
-// context error that would hide why the request failed.
+// context error that would hide why the request failed. The short tier retries
+// twice, the heavy one maxRetries times through the whole backoff.
 func TestClientRetryExhaustedReturnsRealStatusError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "0")
@@ -429,6 +431,7 @@ func TestClientRetryExhaustedReturnsRealStatusError(t *testing.T) {
 	defer srv.Close()
 	var log bytes.Buffer
 	c := newClient(srv.URL, "", &log)
+	c.retries = testtier.Pick(2, maxRetries)
 	_, err := c.do(context.Background(), http.MethodPost, "/x", "", nil)
 	var st *StatusError
 	if !errors.As(err, &st) || st.Status != http.StatusServiceUnavailable {

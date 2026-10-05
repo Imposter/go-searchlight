@@ -19,6 +19,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // truth reads a shard's documents from the store: id to body.
@@ -250,6 +251,7 @@ func TestConcurrentWritersOnEveryNode(t *testing.T) {
 // through the others. No acknowledged write is lost, and the surviving copies converge
 // to the store.
 func TestNodeLossMidBulk(t *testing.T) {
+	testtier.Heavy(t)
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, noPrune)
 		a := c.start(0)
@@ -354,6 +356,7 @@ func TestNodeLossMidRecovery(t *testing.T) {
 // many small segments a burst of refreshed writes left. Restarted, it reopens its
 // copies (or rebuilds them) and converges; nothing acknowledged is lost.
 func TestNodeLossMidMerge(t *testing.T) {
+	testtier.Heavy(t)
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, noPrune)
 		a := c.start(0)

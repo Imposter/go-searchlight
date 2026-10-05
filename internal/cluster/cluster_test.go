@@ -28,6 +28,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // liveCopies returns the copies of id held under a live lease, as st reads the
@@ -273,6 +274,7 @@ func (r *reader) finish(t testing.TB) {
 // readers on the others run: the reads routed to it fail over to the other copy, and
 // no client sees an error.
 func TestReadsRetryAroundDeadNode(t *testing.T) {
+	testtier.Heavy(t)
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
@@ -302,6 +304,7 @@ func TestReadsRetryAroundDeadNode(t *testing.T) {
 // readers on the other nodes search and a writer writes: no client error, and every
 // acknowledged write stays searchable.
 func TestRollingRestartNoClientErrors(t *testing.T) {
+	testtier.Heavy(t)
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, nil)
 		a := c.start(0)
@@ -406,6 +409,7 @@ func roundAll(m map[string]time.Duration) map[string]time.Duration {
 // local deadline is still ahead. The thief's quarantine (TTL plus margin after its
 // claim, by its own clock) keeps the two from serving at once all the same.
 func TestPartitionedNodeStopsServingBeforeSteal(t *testing.T) {
+	testtier.Heavy(t)
 	for _, stepClock := range []bool{false, true} {
 		name := "partition"
 		if stepClock {

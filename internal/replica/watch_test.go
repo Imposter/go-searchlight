@@ -12,6 +12,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -146,7 +147,7 @@ func (w *fakeWatcher) Watch(ctx context.Context, ready func(), fn func(store.Not
 // wakes the tailers of its shard only, ready and a failed subscription wake every
 // tailer, and the subscription is restarted.
 func TestHub(t *testing.T) {
-	sqlite := &db{dialect: "sqlite", url: sqliteURL(t.TempDir() + "/hub.db")}
+	sqlite := &db{dialect: "sqlite", url: storetest.SQLiteURL(t.TempDir() + "/hub.db")}
 	w := &fakeWatcher{Store: sqlite.open(t), sessions: make(chan *fakeSession, 1)}
 	reader := sdkmetric.NewManualReader()
 	h := NewHub(w, HubOptions{Logger: quietLogger, RetryBase: time.Millisecond, Meter: sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("t")})

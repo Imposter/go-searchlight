@@ -31,8 +31,18 @@ jobs:
           version: v2.13.2
 
   test:
-    name: test -race (SQLite, Postgres, MySQL)
+    # The short tier answers in minutes; the heavy job runs every test, the short
+    # tier's included, so it alone keeps the suite's full coverage.
+    name: test ${{ matrix.tier }} -race (SQLite, Postgres, MySQL)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tier: short
+            target: test TESTFLAGS=-race
+          - tier: heavy
+            target: test-race
     services:
       postgres:
         image: postgres:17
@@ -72,10 +82,10 @@ jobs:
       - name: build
         run: make build
       - name: test
-        run: make test
+        run: make ${{ matrix.target }}
 
   windows:
-    name: build and test (Windows, SQLite)
+    name: build, test -short, smoke and NTFS heavy (Windows, SQLite)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -86,7 +96,15 @@ jobs:
         run: go build ./...
       - name: test
         # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
-        run: go test ./...
+        run: go test -short ./...
+      - name: smoke
+        # From the heavy tier: the binary built, run, interrupted and restarted
+        # (TestSmokeBinary), and every benchmark workload driven against a node started
+        # in process (TestEndToEndInProcess).
+        run: go test -run '^(TestSmokeBinary|TestEndToEndInProcess)$' ./cmd/searchlight ./bench/cmd/slbench
+      - name: heavy tier of the NTFS-sensitive packages
+        # WAL checkpointing, merge-and-rename and large-file I/O on a real NTFS volume.
+        run: go test -timeout 20m ./internal/store/... ./internal/shard/... ./internal/segment/...
 
   docker:
     name: image, compose and Kubernetes manifests

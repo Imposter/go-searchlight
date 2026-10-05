@@ -15,6 +15,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 func mustParse(t testing.TB, raw string) query.Node {
@@ -83,9 +84,7 @@ func TestSimilarPrefilterSpellings(t *testing.T) {
 
 // lowerTable stops at lowerTableMax: nothing past it changes case.
 func TestLowerTableCoversEveryCase(t *testing.T) {
-	if testing.Short() {
-		t.Skip("walks every code point")
-	}
+	testtier.Heavy(t)
 	for r := rune(lowerTableMax + 1); r <= 0x10FFFF; r++ {
 		s := string(r)
 		if f := analysis.Normalize(s); f != s {

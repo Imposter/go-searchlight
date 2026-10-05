@@ -24,7 +24,7 @@ func forEachDialectB(b *testing.B, fn func(b *testing.B, fresh func(testing.TB) 
 	b.Helper()
 	b.Run("sqlite", func(b *testing.B) {
 		fn(b, func(tb testing.TB) *harness {
-			h := sqliteHarness(tb)
+			h := durableSQLiteHarness(tb)
 			if sync := os.Getenv("SEARCHLIGHT_BENCH_SQLITE_SYNC"); sync != "" {
 				h.url += "?_synchronous=" + sync
 			}

@@ -108,6 +108,7 @@ func TestEmptyListTypingNeedsNoRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitServing(t, n)
 	seq := bulkLoad(t, n, "e", 10_000, func(i int) string { return fmt.Sprintf(`{"title": "item %d", "images": [], "meta": {}}`, i) })
 	if got := count(t, n, "e", &query.All{}, seq); got != 10_000 {
 		t.Fatalf("count = %d", got)

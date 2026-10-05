@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,6 +31,8 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
+	"github.com/Imposter/go-searchlight/internal/store/storetest"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // The external databases the suite also runs on; unset, those dialects are skipped.
@@ -100,21 +101,13 @@ func forSQLiteAndPostgres(t *testing.T, fn func(t *testing.T, d *db)) {
 		if base == "" {
 			t.Skip(envPG + " is not set")
 		}
-		if testing.Short() {
-			t.Skip("heavy: not in -short")
-		}
+		testtier.Heavy(t)
 		fn(t, postgresDB(t, base))
 	})
 }
 
 func sqliteDB(t testing.TB) *db {
-	// WAL with synchronous NORMAL: several nodes share the file, and each commit's
-	// fsync would serialize them all (durability across power loss is not tested).
-	path := filepath.ToSlash(filepath.Join(t.TempDir(), "searchlight.db"))
-	if strings.HasPrefix(path, "/") {
-		return &db{dialect: "sqlite", url: "sqlite://" + path + "?_synchronous=NORMAL"}
-	}
-	return &db{dialect: "sqlite", url: "sqlite:///" + path + "?_synchronous=NORMAL"}
+	return &db{dialect: "sqlite", url: storetest.SQLiteURL(storetest.Migrated(t, filepath.Join(t.TempDir(), "searchlight.db")))}
 }
 
 func randName(prefix string) string {

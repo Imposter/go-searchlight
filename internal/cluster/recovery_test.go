@@ -15,6 +15,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // bulkLoad writes n documents to index through node in batches, returning the last
@@ -170,9 +171,7 @@ func snapshotBytes(t testing.TB, tn *tnode, id store.ShardID) int64 {
 // arrives corrupted once and is fetched again after it fails its checksum. The
 // recovered copy holds every document and then tails the changelog.
 func TestPeerRecovery100k(t *testing.T) {
-	if testing.Short() {
-		t.Skip("a 100,000-document recovery: not in -short")
-	}
+	testtier.Heavy(t)
 	docs := 100_000
 	d := sqliteDB(t)
 	cut := &cutOnce{}

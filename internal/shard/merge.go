@@ -280,7 +280,6 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 		return nil, 0, err
 	}
 	out.synced = true
-	s.noteSynced(meta.Path)
 	return out, written, nil
 }
 

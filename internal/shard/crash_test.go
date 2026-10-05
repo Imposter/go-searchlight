@@ -66,17 +66,17 @@ func TestCrashAtKillPoints(t *testing.T) {
 				var armed atomic.Bool
 				var syncedMu sync.Mutex
 				synced := map[string]bool{}
+				t.Cleanup(segment.ObserveSyncs(func(name string) {
+					syncedMu.Lock()
+					synced[filepath.Clean(strings.TrimSuffix(name, ".tmp"))] = true
+					syncedMu.Unlock()
+				}))
 				opts := testOptions()
 				opts.hooks = &testHooks{
-					synced: func(p string) {
-						syncedMu.Lock()
-						synced[filepath.Base(p)] = true
-						syncedMu.Unlock()
-					},
 					at: func(point string) error {
 						if point == pointManifestWritten {
 							syncedMu.Lock()
-							checkManifestSynced(t, filepath.Join(h.dir, manifestName+".tmp"), synced)
+							checkManifestSynced(t, h.dir, synced)
 							syncedMu.Unlock()
 						}
 						if point == c.point && armed.CompareAndSwap(true, false) {
@@ -181,10 +181,12 @@ func TestCrashAtKillPoints(t *testing.T) {
 	}
 }
 
-// checkManifestSynced fails t unless every file the manifest at path names is in synced.
-func checkManifestSynced(t *testing.T, path string, synced map[string]bool) {
+// checkManifestSynced fails t unless every file the manifest being written in dir
+// (manifest.tmp) names is in synced: fsynced by segment.SyncFile, under its own path or
+// as the temp file renamed to it.
+func checkManifestSynced(t *testing.T, dir string, synced map[string]bool) {
 	t.Helper()
-	man, err := readManifestFile(path, quietLogger)
+	man, err := readManifestFile(filepath.Join(dir, manifestName+".tmp"), quietLogger)
 	if err != nil {
 		t.Errorf("reading the manifest being written: %v", err)
 		return
@@ -203,7 +205,7 @@ func checkManifestSynced(t *testing.T, path string, synced map[string]bool) {
 		}
 	}
 	for _, name := range names {
-		if !synced[name] {
+		if !synced[filepath.Join(dir, name)] {
 			t.Errorf("a manifest names %s, which no flush or merge fsynced", name)
 		}
 	}

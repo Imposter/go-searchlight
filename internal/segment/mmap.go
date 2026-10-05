@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 	"sync/atomic"
 )
 
@@ -110,14 +112,58 @@ func SyncDir(dir string) error {
 // lost pages never written, so a caller must treat the file as lost.
 var ErrSync = errors.New("segment: fsync failed")
 
-// SyncFile fsyncs f's contents, counting it in [SyncCounts]. A failure wraps [ErrSync].
+// SyncFile fsyncs f's contents, counting it in [SyncCounts] and telling every
+// [ObserveSyncs] observer f's name once the fsync succeeded. A failure wraps [ErrSync].
 func SyncFile(f *os.File) error {
 	fileSyncs.Add(1)
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("%w: %w", ErrSync, err)
 	}
+	if obs := syncObservers.Load(); obs != nil {
+		for _, o := range *obs {
+			o.fn(f.Name())
+		}
+	}
 	return nil
 }
+
+// ObserveSyncs calls fn with the name of every file [SyncFile] fsyncs from now on, as
+// the file was opened (a temp file renamed afterwards is reported under its temp name),
+// until the returned stop is called. fn runs on the syncing goroutine, concurrently
+// with other syncs, and must not block. It is the ground truth for checks that a
+// durable manifest names only fsynced files (the shard's crash tests).
+func ObserveSyncs(fn func(name string)) (stop func()) {
+	o := &syncObserver{fn: fn}
+	syncObserversMu.Lock()
+	defer syncObserversMu.Unlock()
+	var list []*syncObserver
+	if cur := syncObservers.Load(); cur != nil {
+		list = append(list, *cur...)
+	}
+	list = append(list, o)
+	syncObservers.Store(&list)
+	return func() {
+		syncObserversMu.Lock()
+		defer syncObserversMu.Unlock()
+		cur := syncObservers.Load()
+		if cur == nil {
+			return
+		}
+		rest := slices.DeleteFunc(slices.Clone(*cur), func(x *syncObserver) bool { return x == o })
+		if len(rest) == 0 {
+			syncObservers.Store(nil)
+			return
+		}
+		syncObservers.Store(&rest)
+	}
+}
+
+type syncObserver struct{ fn func(string) }
+
+var (
+	syncObserversMu sync.Mutex
+	syncObservers   atomic.Pointer[[]*syncObserver]
+)
 
 // fileSyncs and dirSyncs count every fsync this package (or a caller through SyncFile
 // and SyncDir) asked for, for measuring what a refresh or merge costs in syncs.

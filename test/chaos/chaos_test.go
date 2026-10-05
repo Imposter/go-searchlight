@@ -209,6 +209,13 @@ func largestSegment(t *testing.T, dataDir string) string {
 		if err != nil || d.IsDir() || filepath.Ext(path) != ".seg" {
 			return err
 		}
+		man, err := os.ReadFile(filepath.Join(filepath.Dir(path), "manifest"))
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(man), `"id":"`+strings.TrimSuffix(d.Name(), ".seg")+`"`) {
+			return nil // left by a refresh or merge the stop cut short: the next open removes it
+		}
 		info, err := d.Info()
 		if err != nil {
 			return err

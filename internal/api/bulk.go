@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 	"unicode/utf8"
 )
 
@@ -60,7 +59,7 @@ type bulkResponse struct {
 // malformed action line, a line over max_doc_bytes or more than max_bulk_ops ops
 // refuse the whole request before anything is written.
 func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
-	start := time.Now()
+	start := s.clock.Now()
 	refresh, e := p.refresh()
 	if e != nil {
 		return e
@@ -105,7 +104,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 		}
 		out.Items[i] = item
 	}
-	out.TookMS = time.Since(start).Milliseconds()
+	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)
 }
 

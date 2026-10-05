@@ -3,6 +3,8 @@ package node
 import (
 	"sync"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
 // absentTTL is how long a cluster node answers a read (one with no wait_for_seq) 404 for
@@ -17,6 +19,7 @@ const absentMax = 4096
 // absentIndexes are the index names the store recently did not have. gen counts the
 // names forgotten, so a lookup that raced a create does not record its stale answer.
 type absentIndexes struct {
+	clock clock.Clock
 	mu    sync.Mutex
 	names map[string]time.Time
 	gen   uint64
@@ -26,7 +29,7 @@ func (a *absentIndexes) check(name string) (gen uint64, absent bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	at, ok := a.names[name]
-	return a.gen, ok && time.Since(at) < absentTTL
+	return a.gen, ok && a.clock.Since(at) < absentTTL
 }
 
 func (a *absentIndexes) note(name string, gen uint64) {
@@ -40,7 +43,7 @@ func (a *absentIndexes) note(name string, gen uint64) {
 	}
 	if len(a.names) >= absentMax {
 		for k, at := range a.names {
-			if time.Since(at) >= absentTTL {
+			if a.clock.Since(at) >= absentTTL {
 				delete(a.names, k)
 			}
 		}
@@ -48,7 +51,7 @@ func (a *absentIndexes) note(name string, gen uint64) {
 			return
 		}
 	}
-	a.names[name] = time.Now()
+	a.names[name] = a.clock.Now()
 }
 
 func (a *absentIndexes) forget(name string) {

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
+
+	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
 func segs(n int, bytes int64) []MergeCandidate {
@@ -164,7 +166,7 @@ func TestTieredPolicy(t *testing.T) {
 }
 
 func TestMergeBudget(t *testing.T) {
-	b := NewMergeBudget(3, 0)
+	b := NewMergeBudget(3, 0, clock.Real{})
 	ctx := context.Background()
 	n, err := b.acquire(ctx, 2)
 	if err != nil || n != 2 {
@@ -185,23 +187,37 @@ func TestMergeBudget(t *testing.T) {
 		t.Fatalf("all tokens back: acquire(3) = %d", n)
 	}
 
-	// 10 MiB/s: 3 MiB after the first chunk takes about 0.3 s.
-	b = NewMergeBudget(1, 10<<20)
-	start := time.Now()
-	for range 4 {
-		if err := b.throttle(ctx, 1<<20); err != nil {
-			t.Fatal(err)
-		}
+	// 10 MiB/s, by the budget's clock: each MiB after the first waits 0.1 s more.
+	clk := clock.NewFake(time.Now())
+	b = NewMergeBudget(1, 10<<20, clk)
+	if err := b.throttle(ctx, 1<<20); err != nil {
+		t.Fatalf("the first MiB waited: %v", err)
 	}
-	if d := time.Since(start); d < 250*time.Millisecond {
-		t.Fatalf("4 MiB at 10 MiB/s took %v", d)
+	throttled := make(chan error, 1)
+	go func() {
+		for range 3 {
+			if err := b.throttle(ctx, 1<<20); err != nil {
+				throttled <- err
+				return
+			}
+		}
+		throttled <- nil
+	}()
+	for range 3 {
+		if err := clk.BlockUntilArmed(ctx, 100*time.Millisecond); err != nil {
+			t.Fatalf("a MiB at 10 MiB/s does not wait 0.1 s: %v", err)
+		}
+		clk.Advance(100 * time.Millisecond)
+	}
+	if err := <-throttled; err != nil {
+		t.Fatal(err)
 	}
 	cancelled, cancel2 := context.WithCancel(ctx)
 	cancel2()
 	if err := b.throttle(cancelled, 1); !errors.Is(err, context.Canceled) {
 		t.Fatalf("throttle after cancel = %v", err)
 	}
-	if NewMergeBudget(0, -5).Threads() != 1 {
+	if NewMergeBudget(0, -5, clock.Real{}).Threads() != 1 {
 		t.Fatal("a budget has at least one thread")
 	}
 }

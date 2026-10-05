@@ -177,7 +177,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 		return nil
 	}
 	sl.local.Store(nil)
-	sl.unhostedAtNano.Store(time.Now().UnixNano())
+	sl.unhostedAtNano.Store(n.clock.Now().UnixNano())
 	c.cancel()
 	<-c.done
 	var err error
@@ -204,7 +204,7 @@ func (n *Single) removeLater(ctx context.Context, dir string) {
 	go func() {
 		delay := 100 * time.Millisecond
 		for range 30 {
-			time.Sleep(delay)
+			time.Sleep(delay) //nolint:forbidigo // waits out other processes' handles on the files: real time is the subject
 			if os.RemoveAll(dir) == nil {
 				return
 			}
@@ -321,7 +321,7 @@ func (n *Single) DBStale() bool { return n.stale() }
 
 // DBAnsweredWithin reports whether the database answered within d.
 func (n *Single) DBAnsweredWithin(d time.Duration) bool {
-	return time.Since(time.Unix(0, n.dbOK.Load())) <= d
+	return n.clock.Since(time.Unix(0, n.dbOK.Load())) <= d
 }
 
 // Indexes describes the indexes this node knows, by name.

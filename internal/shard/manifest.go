@@ -93,7 +93,7 @@ func retryIO(log *slog.Logger, op, path string, fn func() error) error {
 		}
 		log.Debug("manifest file busy; retrying", slog.String("op", op), slog.String("file", path),
 			slog.Int("attempt", attempt+1), slog.Any("error", err))
-		time.Sleep(retryDelays[attempt])
+		time.Sleep(retryDelays[attempt]) //nolint:forbidigo // waits out another process's handle on the file: real time is the subject
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -50,7 +49,7 @@ type hit struct {
 // track_total, aggs, fields, timeout}. Past the search's timeout, or the request's
 // deadline, the response holds what the shards found by then, with timed_out set.
 func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error {
-	start := time.Now()
+	start := s.clock.Now()
 	wait, e := p.waitForSeq()
 	if e != nil {
 		return e
@@ -88,7 +87,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 		h := &resp.Hits[i]
 		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body}
 	}
-	out.TookMS = time.Since(start).Milliseconds()
+	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)
 }
 

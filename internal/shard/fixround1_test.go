@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -172,7 +173,7 @@ func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 // refused.
 func TestCloseCancelsAndWaitsForForceMerge(t *testing.T) {
 	opts := testOptions()
-	opts.MergeBudget = NewMergeBudget(1, 1) // one byte per second: the merge stalls
+	opts.MergeBudget = NewMergeBudget(1, 1, clock.Real{}) // one byte per second: the merge stalls
 	h := newHarness(t, opts)
 	for i := range 3 {
 		h.upsert(fmt.Sprintf("d%d", i))
@@ -412,7 +413,7 @@ func TestDefaultBudgetAndCacheAreShared(t *testing.T) {
 	if a.s.opts.FilterCache != b.s.opts.FilterCache || a.s.opts.FilterCache != DefaultFilterCache() {
 		t.Fatal("two shards with no FilterCache do not share the default one")
 	}
-	own := NewMergeBudget(1, 0)
+	own := NewMergeBudget(1, 0, clock.Real{})
 	opts.MergeBudget = own
 	if c := newHarness(t, opts); c.s.opts.MergeBudget != own {
 		t.Fatal("an explicit MergeBudget was replaced")

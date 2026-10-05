@@ -123,12 +123,8 @@ func (n *Single) waitServing(ctx context.Context, idx *index) error {
 				return err
 			}
 		}
-		t := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			t.Stop()
+		if n.clock.Sleep(ctx, delay) != nil {
 			return err
-		case <-t.C:
 		}
 		delay = min(2*delay, 20*time.Millisecond)
 	}

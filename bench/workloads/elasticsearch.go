@@ -408,25 +408,30 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 	}
 }
 
-// Resources implements Engine.
+// Resources implements Engine. Both disk and RSS are the single node Searchlight's
+// own equivalent footprint is: primaries only (never replicas' bytes, so a transient
+// replica -- bench/docker-compose.es.yml's second node, --es-recovery -- never
+// inflates T6's numbers), and _local (this connected node, es1, not the whole
+// cluster: with a second node, /_nodes/stats answers for both, and picking one of a
+// map's entries would be an arbitrary, non-deterministic choice of which).
 func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Resources, error) {
 	var r report.Resources
 	var stats struct {
 		Indices map[string]struct {
-			Total struct {
+			Primaries struct {
 				Store struct {
 					Size int64 `json:"size_in_bytes"`
 				} `json:"store"`
-			} `json:"total"`
+			} `json:"primaries"`
 		} `json:"indices"`
 	}
 	if err := e.c.json(ctx, http.MethodGet, epath(index, "/_stats/store"), nil, &stats); err != nil {
 		return r, err
 	}
 	for _, s := range stats.Indices {
-		r.DiskBytes += s.Total.Store.Size
+		r.DiskBytes += s.Primaries.Store.Size
 	}
-	r.DiskSource = "_stats/store total.store.size_in_bytes (index files, translog excluded)"
+	r.DiskSource = "_stats/store primaries.store.size_in_bytes (this node's own copy; index files, translog excluded)"
 	if rss := procRSS(e.opts.PID); rss > 0 {
 		r.RSSBytes, r.RSSSource = rss, fmt.Sprintf("/proc/%d/status VmRSS (the JVM)", e.opts.PID)
 		return r, nil
@@ -448,17 +453,17 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 			} `json:"jvm"`
 		} `json:"nodes"`
 	}
-	if err := e.c.json(ctx, http.MethodGet, "/_nodes/stats/os,jvm", nil, &ns); err != nil {
+	if err := e.c.json(ctx, http.MethodGet, "/_nodes/_local/stats/os,jvm", nil, &ns); err != nil {
 		r.RSSSource = "not measured: " + err.Error()
 		return r, nil //nolint:nilerr // best-effort footprint: the failure is recorded in RSSSource, not fatal
 	}
 	for _, n := range ns.Nodes {
 		if v, err := strconv.ParseInt(n.OS.Cgroup.Memory.Usage, 10, 64); err == nil && v > 0 {
-			r.RSSBytes, r.RSSSource = v, "_nodes/stats os.cgroup.memory.usage_in_bytes (container, includes page cache)"
+			r.RSSBytes, r.RSSSource = v, "_nodes/_local/stats os.cgroup.memory.usage_in_bytes (this node's container, includes page cache)"
 			continue
 		}
 		r.RSSBytes = n.JVM.Mem.HeapCommitted + n.JVM.Mem.NonHeapCommitted
-		r.RSSSource = "_nodes/stats JVM heap + non-heap committed (a lower bound of the RSS)"
+		r.RSSSource = "_nodes/_local/stats JVM heap + non-heap committed (a lower bound of this node's RSS)"
 	}
 	return r, nil
 }
@@ -474,29 +479,22 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 // Elasticsearch's _id lives inside its inverted index and stored fields already
 // counted above.
 func (e *Elasticsearch) SectionSizes(ctx context.Context, index string) (map[string]int64, error) {
+	// Only "inverted_index" nests (total_in_bytes inside it); stored_fields,
+	// doc_values, points, norms, term_vectors and knn_vectors are each a flat
+	// "<name>_in_bytes" sibling of a human-readable "<name>" string, not an object
+	// of their own. Confirmed against a real Elasticsearch 8.15.3 response (a
+	// first guess at "stored_fields" nesting the same way failed to decode it).
 	var res map[string]struct {
 		AllFields struct {
 			InvertedIndex struct {
-				SizeInBytes int64 `json:"inverted_index_size_in_bytes"`
+				TotalInBytes int64 `json:"total_in_bytes"`
 			} `json:"inverted_index"`
-			StoredFields struct {
-				SizeInBytes int64 `json:"stored_fields_size_in_bytes"`
-			} `json:"stored_fields"`
-			DocValues struct {
-				SizeInBytes int64 `json:"doc_values_size_in_bytes"`
-			} `json:"doc_values"`
-			Points struct {
-				SizeInBytes int64 `json:"points_size_in_bytes"`
-			} `json:"points"`
-			Norms struct {
-				SizeInBytes int64 `json:"norms_size_in_bytes"`
-			} `json:"norms"`
-			TermVectors struct {
-				SizeInBytes int64 `json:"term_vectors_size_in_bytes"`
-			} `json:"term_vectors"`
-			KnnVectors struct {
-				SizeInBytes int64 `json:"knn_vectors_size_in_bytes"`
-			} `json:"knn_vectors"`
+			StoredFieldsInBytes int64 `json:"stored_fields_in_bytes"`
+			DocValuesInBytes    int64 `json:"doc_values_in_bytes"`
+			PointsInBytes       int64 `json:"points_in_bytes"`
+			NormsInBytes        int64 `json:"norms_in_bytes"`
+			TermVectorsInBytes  int64 `json:"term_vectors_in_bytes"`
+			KnnVectorsInBytes   int64 `json:"knn_vectors_in_bytes"`
 		} `json:"all_fields"`
 	}
 	if err := e.c.json(ctx, http.MethodPost, epath(index, "/_disk_usage")+"?run_expensive_tasks=true", nil, &res); err != nil {
@@ -508,11 +506,11 @@ func (e *Elasticsearch) SectionSizes(ctx context.Context, index string) (map[str
 	}
 	af := idx.AllFields
 	return map[string]int64{
-		"terms":     af.InvertedIndex.SizeInBytes,
-		"stored":    af.StoredFields.SizeInBytes,
-		"docvalues": af.DocValues.SizeInBytes,
-		"points":    af.Points.SizeInBytes,
-		"other":     af.Norms.SizeInBytes + af.TermVectors.SizeInBytes + af.KnnVectors.SizeInBytes,
+		"terms":     af.InvertedIndex.TotalInBytes,
+		"stored":    af.StoredFieldsInBytes,
+		"docvalues": af.DocValuesInBytes,
+		"points":    af.PointsInBytes,
+		"other":     af.NormsInBytes + af.TermVectorsInBytes + af.KnnVectorsInBytes,
 	}, nil
 }
 

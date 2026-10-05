@@ -114,7 +114,10 @@ func (e *ManifestError) Error() string {
 // new manifest over it, and retries briefly while another handle is in the way
 // (retryIO); log takes the retries, at debug.
 func readManifest(dir string, log *slog.Logger) (*manifest, error) {
-	path := filepath.Join(dir, manifestName)
+	return readManifestFile(filepath.Join(dir, manifestName), log)
+}
+
+func readManifestFile(path string, log *slog.Logger) (*manifest, error) {
 	var data []byte
 	err := retryIO(log, "open", path, func() error {
 		f, err := openShared(path)

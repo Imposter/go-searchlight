@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -33,9 +35,15 @@ import (
 //
 // A flush runs every Options.FlushInterval, at Close, at every merge commit (the merge
 // is durable when it returns, and its inputs can go), and before a peer [Snapshot]; a
-// flush with nothing new is a no-op. Flushes run one at a time (flushMu), and a flush
+// flush with nothing new is a no-op. Flushes run one at a time (flushSem), and a flush
 // holds the commit lock only to take its generation and to record what it made
 // durable: its fsyncs never hold up a refresh.
+//
+// A failed fsync fails the shard: after a write-back error a retried fsync may succeed
+// over pages that were never written (segment.ErrSync), so the copy is reopened from its
+// durable manifest and replays the changelog instead. Any other failure, and a flush
+// whose context ends (it stops waiting for its turn and between files), leaves the
+// generation for the next flush.
 //
 // A file is removed only once no durable manifest references it. A segment a merge
 // dropped, or one published and merged away before any flush, is marked obsolete by
@@ -45,7 +53,8 @@ import (
 // flush that never renamed its manifest) is collected at the next Open.
 
 // Flush makes the published generation durable and advances [Shard.CommittedSeq] to
-// its seq. A flush with nothing new is a no-op.
+// its seq. A flush with nothing new is a no-op. It gives up, with ctx's error, while it
+// waits for another flush and between the files it syncs.
 func (s *Shard) Flush(ctx context.Context) error {
 	g, err := s.flush(ctx)
 	if g != nil {
@@ -54,11 +63,13 @@ func (s *Shard) Flush(ctx context.Context) error {
 	return err
 }
 
-// flush makes the current generation durable and returns it acquired, for the caller to
-// release.
 func (s *Shard) flush(ctx context.Context) (*Generation, error) {
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
+	select {
+	case s.flushSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-s.flushSem }()
 	if err := s.Err(); err != nil {
 		return nil, err
 	}
@@ -81,6 +92,10 @@ func (s *Shard) flush(ctx context.Context) (*Generation, error) {
 	start := s.opts.Clock.Now()
 	sidecars, err := s.persist(ctx, g)
 	if err != nil {
+		if errors.Is(err, segment.ErrSync) {
+			s.fail(err)
+			s.log.ErrorContext(ctx, "an fsync failed; the copy must be reopened and replay the changelog", slog.Any("error", err))
+		}
 		if !isCrash(err) {
 			s.commitMu.Lock()
 			s.unflushed = append(pending, s.unflushed...)
@@ -134,12 +149,20 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 	}
 	errs := make([]error, len(syncs)+len(writes))
 	parallel(len(errs), syncWorkers, func(i int) {
+		if errs[i] = ctx.Err(); errs[i] != nil {
+			return
+		}
 		if i < len(syncs) {
-			errs[i] = segment.SyncPath(syncs[i])
+			if errs[i] = s.syncPath(syncs[i]); errs[i] == nil {
+				s.noteSynced(syncs[i])
+			}
 			return
 		}
 		st := writes[i-len(syncs)]
 		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true})
+		if errs[i] == nil {
+			s.noteSynced(filepath.Join(s.dir, deletesName(st.ref.id, st.delGen)))
+		}
 	})
 	for _, st := range writes {
 		s.strays[filepath.Join(s.dir, deletesName(st.ref.id, st.delGen))] = true
@@ -164,6 +187,9 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 		ref.synced = true
 	}
 	if err := s.hook(pointFlushSynced); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	man, err := buildManifest(g.gen, g.seq, g.maxSeq, g.uid, g.mp, g.docs, g.queries)
@@ -194,7 +220,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 // to its seq, segments no longer in it (merged away, whether a manifest listed them or
 // only a generation published since the last flush did) become obsolete, and sidecars
 // it does not list are removed. pending are the segments published since the previous
-// flush. The caller holds flushMu.
+// flush. The caller holds flushSem.
 func (s *Shard) retireDurable(g *Generation, pending []*segRef, sidecars map[string]int64) {
 	keep := make(map[*segRef]bool, len(g.docs)+len(g.queries))
 	for _, list := range [][]segState{g.docs, g.queries} {
@@ -239,8 +265,6 @@ func (s *Shard) retireDurable(g *Generation, pending []*segRef, sidecars map[str
 	s.jan.removeLater(obsolete...)
 }
 
-// markObsolete records that no durable manifest lists ref any more: its files are
-// removed once it is closed, now if it already is.
 func (s *Shard) markObsolete(ref *segRef) {
 	ref.obsolete.Store(true)
 	if ref.closed.Load() {
@@ -248,8 +272,27 @@ func (s *Shard) markObsolete(ref *segRef) {
 	}
 }
 
-// dataFiles lists ref's own files: its segment file, or its query segment's files;
-// never its sidecars or a temp file.
+func (s *Shard) syncPath(path string) error {
+	if s.opts.hooks != nil && s.opts.hooks.sync != nil {
+		if err := s.opts.hooks.sync(path); err != nil {
+			return err
+		}
+	}
+	var f *os.File
+	if err := retryIO(s.log, "open", path, func() error {
+		var err error
+		f, err = os.OpenFile(path, os.O_RDWR, 0)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err := segment.SyncFile(f); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 func (s *Shard) dataFiles(ref *segRef) ([]string, error) {
 	if ref.kind == kindDocs {
 		return []string{filepath.Join(s.dir, ref.id+segment.FileExt)}, nil
@@ -271,25 +314,22 @@ func (s *Shard) dataFiles(ref *segRef) ([]string, error) {
 	return out, nil
 }
 
-// flushLoop flushes every Options.FlushInterval until the shard closes.
 func (s *Shard) flushLoop() {
 	defer s.wg.Done()
-	t := s.opts.Clock.NewTicker(s.opts.FlushInterval)
-	defer t.Stop()
 	warn := rateLimitedWarn{clock: s.opts.Clock, every: time.Minute}
-	for {
-		select {
-		case <-s.bg.Done():
-			return
-		case <-t.C():
-		}
-		if s.Err() != nil {
-			continue
-		}
-		if err := s.Flush(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
-			if suppressed, ok := warn.allow(); ok {
-				s.log.WarnContext(s.bg, "background flush failed", slog.Any("error", err), slog.Int("suppressed", suppressed))
+	clock.GridLoop{
+		Clock:  s.opts.Clock,
+		Period: func() time.Duration { return s.opts.FlushInterval },
+		Phase:  rand.N(s.opts.FlushInterval), //nolint:gosec // spreads shards' flushes; nothing secret
+		Task: func() {
+			if s.Err() != nil {
+				return
 			}
-		}
-	}
+			if err := s.Flush(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
+				if suppressed, ok := warn.allow(); ok {
+					s.log.WarnContext(s.bg, "background flush failed", slog.Any("error", err), slog.Int("suppressed", suppressed))
+				}
+			}
+		},
+	}.Run(s.bg)
 }

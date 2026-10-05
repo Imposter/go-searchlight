@@ -1266,8 +1266,6 @@ func writeGroup(buf *bytes.Buffer, key string, children []query.Node) error {
 	return nil
 }
 
-// writeFile writes data to path: a temp file renamed into place, unsynced (the shard's
-// flush that persists the segment fsyncs it).
 func writeFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)

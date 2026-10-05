@@ -66,7 +66,7 @@ type segRef struct {
 	closed   atomic.Bool
 	// synced is whether the segment's files are fsynced: by its build (a merged
 	// segment), by the flush that first persisted it, or because Open found it in the
-	// manifest. Flushes read and set it under flushMu.
+	// manifest. Flushes read and set it holding flushSem.
 	synced bool
 }
 

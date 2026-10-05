@@ -57,7 +57,7 @@ type BuildOptions struct {
 	NoDirSync bool
 	// NoSync skips the file's own fsync, and with it the directory's: the file is
 	// renamed into place with its bytes in the page cache, readable at once but durable
-	// only once the caller fsyncs it ([SyncPath]) and then the directory. A shard
+	// only once the caller fsyncs it ([SyncFile]) and then the directory. A shard
 	// builds the segments it refreshes this way and fsyncs them when it flushes.
 	NoSync bool
 }
@@ -337,9 +337,7 @@ func writeFieldSectionParallel(w *fileWriter, names []string, threads int, write
 // writeFieldDicts and friends treat those identically, which is what makes the file
 // byte-for-byte the same either way; so does threads, the degree of parallelism the
 // writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
-// nil, is called before every chunk written to the file ([MergeOptions.Throttle]);
-// syncFile fsyncs the file before the rename ([BuildOptions.NoSync]), and syncDir the
-// directory after it ([BuildOptions.NoDirSync]).
+// nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
 func writeSegmentParts(path string, numDocs uint32, names []string, parts []map[string]*fieldBuilder, stored storedSource, ids []idOrd, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)

@@ -159,7 +159,14 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 	if err != nil {
 		return nil, err
 	}
-	defer budget.release(tokens)
+	held := true
+	releaseTokens := func() {
+		if held {
+			held = false
+			budget.release(tokens)
+		}
+	}
+	defer releaseTokens()
 	start := s.opts.Clock.Now()
 
 	g := s.Acquire()
@@ -212,6 +219,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 		}
 		return nil, err
 	}
+	releaseTokens()
 	if err := s.Flush(ctx); err != nil {
 		return nil, err
 	}
@@ -272,6 +280,7 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 		return nil, 0, err
 	}
 	out.synced = true
+	s.noteSynced(meta.Path)
 	return out, written, nil
 }
 

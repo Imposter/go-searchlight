@@ -1,6 +1,8 @@
 package segment
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"sync/atomic"
 )
@@ -103,25 +105,18 @@ func SyncDir(dir string) error {
 	return fsyncDir(dir)
 }
 
-// SyncFile fsyncs f's contents, counting it in [SyncCounts].
+// ErrSync marks an fsync that failed. Retrying it proves nothing: once a write-back
+// error has been reported (Linux), a later fsync of the same file may succeed with the
+// lost pages never written, so a caller must treat the file as lost.
+var ErrSync = errors.New("segment: fsync failed")
+
+// SyncFile fsyncs f's contents, counting it in [SyncCounts]. A failure wraps [ErrSync].
 func SyncFile(f *os.File) error {
 	fileSyncs.Add(1)
-	return f.Sync()
-}
-
-// SyncPath fsyncs the file at path, counting it in [SyncCounts]: the file a [Build]
-// with NoSync wrote, once the caller needs it durable. It opens the file for writing,
-// which Windows requires to flush a file's buffers.
-func SyncPath(path string) error {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return err
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("%w: %w", ErrSync, err)
 	}
-	if err := SyncFile(f); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return nil
 }
 
 // fileSyncs and dirSyncs count every fsync this package (or a caller through SyncFile

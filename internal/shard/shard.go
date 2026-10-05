@@ -352,10 +352,11 @@ type Shard struct {
 	forceSem      chan struct{}
 	mergeDone     chan struct{} // closed and replaced when a merge finishes
 
-	// flushMu makes flushes one at a time, and guards the durable state below: the
-	// manifest's generation, index uid and mapping, the segments and sidecars it lists
-	// (with the sidecars' sizes), and the sidecars flushes wrote that it does not list.
-	flushMu         sync.Mutex
+	// flushSem, a one-slot semaphore, makes flushes one at a time, and guards the
+	// durable state below: the manifest's generation, index uid and mapping, the
+	// segments and sidecars it lists (with the sidecars' sizes), and the sidecars
+	// flushes wrote that it does not list.
+	flushSem        chan struct{}
 	committed       atomic.Int64
 	durableGen      uint64
 	committedUID    string
@@ -420,6 +421,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		merging:     map[*segRef]bool{},
 		mergeDone:   make(chan struct{}),
 		forceSem:    make(chan struct{}, 1),
+		flushSem:    make(chan struct{}, 1),
 		waitCh:      make(chan struct{}),
 		refreshWake: make(chan struct{}, 1),
 		mergeWake:   make(chan struct{}, 1),
@@ -955,14 +957,14 @@ func (s *Shard) shutdown() {
 		s.wg.Wait()
 		// Taking the locks orders this after any flush, refresh or merge publish in
 		// flight.
-		s.flushMu.Lock()
+		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()
 		g := s.cur.Swap(nil)
 		close(s.closed)
 		s.commitMu.Unlock()
 		s.refreshMu.Unlock()
-		s.flushMu.Unlock()
+		<-s.flushSem
 		s.notifyPublished()
 		if g != nil {
 			g.Release()
@@ -1002,37 +1004,22 @@ func wake(ch chan struct{}) {
 	}
 }
 
-// refreshLoop refreshes on a fixed grid of Options.RefreshInterval from Open, and at
-// once when a full buffer wakes it.
 func (s *Shard) refreshLoop() {
 	defer s.wg.Done()
 	warn := rateLimitedWarn{clock: s.opts.Clock, every: time.Minute}
-	grid := clock.NewGrid(s.opts.Clock.Now(), s.opts.RefreshInterval)
-	for {
-		var tick <-chan time.Time
-		var timer clock.Timer
-		if next, ok := grid.Next(s.opts.Clock.Now()); ok {
-			timer = s.opts.Clock.NewTimer(s.opts.Clock.Until(next))
-			tick = timer.C()
-		}
-		select {
-		case <-s.bg.Done():
-		case <-tick:
-		case <-s.refreshWake:
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-		if s.bg.Err() != nil {
-			return
-		}
-		if s.Err() != nil {
-			continue // a failed shard stays as it is until it is reopened
-		}
-		if err := s.Refresh(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
-			if suppressed, ok := warn.allow(); ok {
-				s.log.WarnContext(s.bg, "background refresh failed", slog.Any("error", err), slog.Int("suppressed", suppressed))
+	clock.GridLoop{
+		Clock:  s.opts.Clock,
+		Period: func() time.Duration { return s.opts.RefreshInterval },
+		Now:    s.refreshWake,
+		Task: func() {
+			if s.Err() != nil {
+				return
 			}
-		}
-	}
+			if err := s.Refresh(s.bg); err != nil && s.bg.Err() == nil && !errors.Is(err, ErrClosed) {
+				if suppressed, ok := warn.allow(); ok {
+					s.log.WarnContext(s.bg, "background refresh failed", slog.Any("error", err), slog.Int("suppressed", suppressed))
+				}
+			}
+		},
+	}.Run(s.bg)
 }

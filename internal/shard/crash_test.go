@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -61,10 +62,23 @@ func TestCrashAtKillPoints(t *testing.T) {
 		for _, c := range cases {
 			t.Run(removals+"/"+c.name, func(t *testing.T) {
 				t.Parallel()
+				var h *harness
 				var armed atomic.Bool
+				var syncedMu sync.Mutex
+				synced := map[string]bool{}
 				opts := testOptions()
 				opts.hooks = &testHooks{
+					synced: func(p string) {
+						syncedMu.Lock()
+						synced[filepath.Base(p)] = true
+						syncedMu.Unlock()
+					},
 					at: func(point string) error {
+						if point == pointManifestWritten {
+							syncedMu.Lock()
+							checkManifestSynced(t, filepath.Join(h.dir, manifestName+".tmp"), synced)
+							syncedMu.Unlock()
+						}
 						if point == c.point && armed.CompareAndSwap(true, false) {
 							return errSimulatedCrash
 						}
@@ -77,7 +91,7 @@ func TestCrashAtKillPoints(t *testing.T) {
 						return os.Remove(p)
 					},
 				}
-				h := newHarness(t, opts)
+				h = newHarness(t, opts)
 				// Durable: three segments, with deletes and updates across them, and
 				// saved queries.
 				for i := range 30 {
@@ -163,6 +177,34 @@ func TestCrashAtKillPoints(t *testing.T) {
 					t.Fatalf("files after the replay and a reopen %v, manifest references %v", got, ref)
 				}
 			})
+		}
+	}
+}
+
+// checkManifestSynced fails t unless every file the manifest at path names is in synced.
+func checkManifestSynced(t *testing.T, path string, synced map[string]bool) {
+	t.Helper()
+	man, err := readManifestFile(path, quietLogger)
+	if err != nil {
+		t.Errorf("reading the manifest being written: %v", err)
+		return
+	}
+	var names []string
+	for _, ms := range man.Segments {
+		names = append(names, ms.ID+segment.FileExt)
+		if ms.DelGen > 0 {
+			names = append(names, deletesName(ms.ID, ms.DelGen))
+		}
+	}
+	for _, ms := range man.QuerySegments {
+		names = append(names, ms.ID+defaultQueryExt)
+		if ms.DelGen > 0 {
+			names = append(names, deletesName(ms.ID, ms.DelGen))
+		}
+	}
+	for _, name := range names {
+		if !synced[name] {
+			t.Errorf("a manifest names %s, which no flush or merge fsynced", name)
 		}
 	}
 }

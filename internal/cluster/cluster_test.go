@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -562,18 +564,19 @@ func expireLeases(t testing.TB, d *db, index string) {
 // wall clock both (a suspended machine's monotonic clock may stand still); a slot taken
 // over from another node is quarantined for TTL plus margin after the claim began.
 func TestLeaseDeadlineByFakeClock(t *testing.T) {
-	clk := &fakeClock{}
-	clk.wall.Store(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC).UnixNano())
+	fake := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	clk := leaseClock{c: fake, epoch: fake.Now()}
+	set := func(d time.Duration) { fake.Advance(d - clk.Now()) }
 	l := &lease{ttl: time.Second, margin: 100 * time.Millisecond, clock: clk}
 	l.extend(0, clk.Wall())
 	if !l.valid() {
 		t.Fatal("a fresh lease is not valid")
 	}
-	clk.set(899 * time.Millisecond)
+	set(899 * time.Millisecond)
 	if !l.valid() {
 		t.Fatal("not valid before the margin")
 	}
-	clk.set(900 * time.Millisecond)
+	set(900 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid within the margin of its deadline")
 	}
@@ -585,47 +588,36 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if time.Duration(l.deadline.Load()) != 1500*time.Millisecond {
 		t.Fatalf("deadline %s", time.Duration(l.deadline.Load()))
 	}
-	clk.set(1400 * time.Millisecond)
+	set(1400 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid past deadline less margin")
 	}
 
 	// Suspend: the wall clock runs on while the monotonic one stands still.
 	l.extend(clk.Now(), clk.Wall())
-	clk.wall.Add(int64(5 * time.Second))
+	fake.StepWall(5 * time.Second)
 	if l.valid() {
 		t.Fatal("valid after the machine slept past the lease, by its monotonic clock alone")
 	}
 
 	// Quarantine: a stolen slot serves nothing for TTL plus margin after its claim.
-	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: clk, id: "me"}
+	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: fake, lc: clk, id: "me"}
 	from := clk.Now()
 	q := n.newLease(store.Copy{TakenFrom: "other"}, from, clk.Wall())
 	if !q.quarantined() || !q.valid() {
 		t.Fatalf("a stolen slot: quarantined %v, valid %v", q.quarantined(), q.valid())
 	}
-	clk.set(from + 1099*time.Millisecond)
+	set(from + 1099*time.Millisecond)
 	if !q.quarantined() {
 		t.Fatal("the quarantine ended before TTL plus margin")
 	}
-	clk.set(from + 1100*time.Millisecond)
+	set(from + 1100*time.Millisecond)
 	if q.quarantined() {
 		t.Fatal("still quarantined after TTL plus margin")
 	}
 	if mine := n.newLease(store.Copy{TakenFrom: ""}, clk.Now(), clk.Wall()); mine.quarantined() {
 		t.Fatal("a free slot is quarantined")
 	}
-}
-
-// fakeClock is a Clock a test moves: a monotonic reading and a wall clock that run
-// together unless a test steps one alone.
-type fakeClock struct{ now, wall atomic.Int64 }
-
-func (c *fakeClock) Now() time.Duration { return time.Duration(c.now.Load()) }
-func (c *fakeClock) Wall() time.Time    { return time.Unix(0, c.wall.Load()) }
-func (c *fakeClock) set(d time.Duration) {
-	c.wall.Add(int64(d) - c.now.Load())
-	c.now.Store(int64(d))
 }
 
 // TestReadRightAfterCreateOnAnotherNode: an index created on one node is read on
@@ -664,12 +656,16 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 }
 
 // TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made in a loop
-// from several clients, re-read the registry at most once per missRefreshEvery.
+// from several clients, re-read the registry at most once per missRefreshEvery. The
+// node runs on a fake clock the test moves on a millisecond at a time while they read:
+// however fast or slow the reads run, the registry reads are bounded by that time.
 func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
+	clk := clock.NewFake(time.Now())
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
-		o.HeartbeatInterval = 10 * time.Second
-		o.LeaseTTL = 40 * time.Second
-		o.DeadAfter = time.Minute
+		o.Clock = clk
+		o.HeartbeatInterval = time.Hour
+		o.LeaseTTL = 2 * time.Hour
+		o.DeadAfter = 3 * time.Hour
 		o.ViewInterval = time.Hour
 		o.CatalogInterval = time.Hour
 		o.PruneInterval = time.Hour
@@ -678,11 +674,10 @@ func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
 	hooks := &clusterHooks{a.n}
 	id := store.ShardID{Index: "nowhere", Shard: 0}
 	before := a.wrap.nodesReads.Load()
-	began := time.Now()
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			for time.Since(began) < 600*time.Millisecond {
+			for range 50 {
 				if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
 					t.Errorf("a shard no node serves: %v", err)
 					return
@@ -690,18 +685,28 @@ func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
 			}
 		})
 	}
+	var done atomic.Bool
+	go func() { wg.Wait(); done.Store(true) }()
+	began := clk.Now()
+	for !done.Load() {
+		clk.Advance(time.Millisecond)
+		runtime.Gosched()
+	}
 	wg.Wait()
-	reads, limit := a.wrap.nodesReads.Load()-before, int64(time.Since(began)/missRefreshEvery)+3
-	t.Logf("%d registry reads in %s", reads, time.Since(began).Round(time.Millisecond))
-	if reads > limit {
-		t.Fatalf("%d registry reads for reads of a shard no node serves (limit %d)", reads, limit)
+	elapsed := clk.Since(began)
+	reads, limit := a.wrap.nodesReads.Load()-before, int64(elapsed/missRefreshEvery)+1
+	t.Logf("%d registry reads in %s", reads, elapsed)
+	if reads == 0 || reads > limit {
+		t.Fatalf("%d registry reads for reads of a shard no node serves in %s (limit %d)", reads, elapsed, limit)
 	}
 }
 
 // TestUnknownIndexLookupsAreCached: requests for an index no node has ask the store
-// about it once per absentTTL, not once each; creating it here is seen at once.
+// about it once per absentTTL, not once each. The node's clock is fake and stands
+// still: every request falls within one absentTTL.
 func TestUnknownIndexLookupsAreCached(t *testing.T) {
-	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.Clock = clk; o.CatalogInterval = time.Hour })
 	a := c.start(0)
 	before := a.wrap.indexGets.Load()
 	for range 50 {
@@ -710,8 +715,19 @@ func TestUnknownIndexLookupsAreCached(t *testing.T) {
 			t.Fatalf("an index no node has: %v, want a 404", err)
 		}
 	}
-	if gets := a.wrap.indexGets.Load() - before; gets > 2 {
-		t.Fatalf("%d store lookups for 50 requests of an unknown index", gets)
+	if gets := a.wrap.indexGets.Load() - before; gets != 1 {
+		t.Fatalf("%d store lookups for 50 requests of an unknown index, want 1", gets)
+	}
+}
+
+// TestCreatedIndexIsSeenAtOnce: an index a request found missing, created here, is
+// read at once, not after the 404 the node remembered runs out.
+func TestCreatedIndexIsSeenAtOnce(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	a := c.start(0)
+	var ae *api.Error
+	if _, err := count(tctx(t), a.n, "ghost", 0); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
+		t.Fatalf("an index no node has: %v, want a 404", err)
 	}
 	createIndex(t, a.n, "ghost", 1, 0)
 	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {

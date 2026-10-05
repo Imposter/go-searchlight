@@ -54,6 +54,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -132,9 +133,11 @@ type Options struct {
 
 	// Transport carries the peer API's requests; nil means a pooled default.
 	Transport http.RoundTripper
-	// Clock is the monotonic clock lease deadlines are kept by; nil means the
-	// process's.
-	Clock Clock
+	// Clock runs the node's timers (heartbeats, lease renewals and the watchdog,
+	// maintenance, routing, recovery) and those of its engine, and keeps its lease
+	// deadlines: by the monotonic reading (Since) and, against a suspended machine,
+	// the wall clock (Wall). Nil means clock.Real.
+	Clock clock.Clock
 	// Engine, when set, adjusts the engine's options (tests: fake tailers, small
 	// shards).
 	Engine func(*node.Options)
@@ -217,7 +220,7 @@ func (o *Options) resolve() error {
 		o.SnapshotTTL = DefaultSnapshotTTL
 	}
 	if o.Clock == nil {
-		o.Clock = NewClock()
+		o.Clock = clock.Real{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -254,7 +257,8 @@ type Node struct {
 	reg   store.RegistryStore
 	log   *slog.Logger
 	tr    trace.Tracer
-	clock Clock
+	clock clock.Clock
+	lc    leaseClock
 	inst  *instruments
 
 	client *http.Client
@@ -328,10 +332,12 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		log:       o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
 		tr:        o.Tracer,
 		clock:     o.Clock,
+		lc:        leaseClock{c: o.Clock, epoch: o.Clock.Now()},
 		leases:    map[store.ShardID]*lease{},
 		scheme:    "http",
-		startedAt: time.Now(),
+		startedAt: o.Clock.Now(),
 	}
+	n.alloc.clock = o.Clock
 	if o.Config.TLSCert != "" {
 		n.scheme = "https"
 	}
@@ -363,15 +369,15 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		transport = t
 	}
 	n.client = &http.Client{Transport: transport}
-	n.ars = newARS()
+	n.ars = newARS(o.Clock)
 	n.view.Store(&view{nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}})
-	n.pins = newPinTable(o.PinTTL)
-	n.snaps = newSnapTable(o.SnapshotTTL, o.SnapshotMaxAge)
+	n.pins = newPinTable(o.PinTTL, o.Clock)
+	n.snaps = newSnapTable(o.SnapshotTTL, o.SnapshotMaxAge, o.Clock)
 	n.sums = newSumCache()
 	n.hints = newHinter(n)
 	n.fetch = &fetcher{n: n}
 	n.peer = &peerAPI{n: n}
-	eo := node.Options{Store: o.Store, Config: o.Config, Version: o.Version, Cluster: &clusterHooks{n}, Logger: o.Logger, Tracer: o.Tracer, Meter: o.Meter}
+	eo := node.Options{Store: o.Store, Config: o.Config, Version: o.Version, Cluster: &clusterHooks{n}, Clock: o.Clock, Logger: o.Logger, Tracer: o.Tracer, Meter: o.Meter}
 	if o.Engine != nil {
 		o.Engine(&eo)
 	}

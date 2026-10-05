@@ -16,11 +16,11 @@ import (
 
 // Merges.
 //
-// segment.Merge accumulates its result's terms in memory, term by term, and streams
-// stored bodies and ids from its inputs as it writes, so a merge needs about its
-// result's postings in RAM (TieredPolicy.MaxMergedBytes, 1 GiB by default, bounds it).
-// Both phases check the budget's throttle, and through it the context, so Close
-// cancels a merge wherever it is.
+// segment.Merge streams: it merges its inputs' term dictionaries, stored bodies and
+// ids straight into the merged file, holding only per-document state in memory (a few
+// hundred bytes a document: about 0.6 GiB of heap at peak for a million of the
+// benchmark's products). Both its phases check the budget's throttle, and through it
+// the context, so Close cancels a merge wherever it is.
 //
 // The merge loop asks the policy for merges after every publish, reserves their inputs
 // (a reserved segment is in no other merge), and runs each in its own goroutine, which

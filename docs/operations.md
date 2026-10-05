@@ -356,9 +356,13 @@ A node's memory is three budgets, plus the page cache:
      A refresh in progress holds one more, frozen.
    - So a copy taking writes faster than it refreshes holds up to **about 320 MiB**, and
      an idle copy almost nothing. Count the copies that ingest at once, not every copy.
-3. **Caches and the runtime.** The filter cache, the generations readers hold, and Go's
-   own overhead: a few hundred MiB.
-4. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
+3. **Merges.** A merge streams its inputs into the merged file and holds only
+   per-document state: a few hundred bytes a document, about 0.6 GiB of heap at peak
+   for a merge of a million of the benchmark's products. `merge_threads` merges can
+   run at once.
+4. **Caches and the runtime.** The filter cache, the search rank cache (up to
+   256 MiB), the generations readers hold, and Go's own overhead.
+5. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
    container they count against the memory limit but are reclaimed under pressure.
    Searches stay fast while the hot segments fit in memory. The
    `searchlight_shard_mmap_resident_bytes` and `searchlight_shard_disk_size_bytes`

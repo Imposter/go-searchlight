@@ -46,16 +46,25 @@ func localDocs(n *Node, id store.ShardID, seq int64) (map[string]string, error) 
 		return nil, fmt.Errorf("node %s, %s: %w", n.id, id, err)
 	}
 	defer tg.Release()
-	res, err := tg.Search(ctx, &search.Request{Query: &query.All{}, Size: search.MaxSize, TrackTotal: search.TrackTotalAll, Index: id.Index})
-	if err != nil {
-		return nil, err
-	}
 	out := map[string]string{}
-	for _, h := range res.Hits {
-		out[h.ID] = string(h.Body)
+	var total int64
+	var after []any
+	for {
+		res, err := tg.Search(ctx, &search.Request{Query: &query.All{}, Size: search.MaxSize, TrackTotal: search.TrackTotalAll, Index: id.Index, SearchAfter: after})
+		if err != nil {
+			return nil, err
+		}
+		total = res.Total
+		for _, h := range res.Hits {
+			out[h.ID] = string(h.Body)
+		}
+		if len(res.Hits) < search.MaxSize {
+			break
+		}
+		after = res.Hits[len(res.Hits)-1].Sort
 	}
-	if int64(len(out)) != res.Total {
-		return nil, fmt.Errorf("node %s, %s: %d hits of %d", n.id, id, len(out), res.Total)
+	if int64(len(out)) != total {
+		return nil, fmt.Errorf("node %s, %s: %d hits of %d", n.id, id, len(out), total)
 	}
 	return out, nil
 }
@@ -307,12 +316,12 @@ func TestNodeLossMidRecovery(t *testing.T) {
 	var entered atomic.Bool
 	c := newCluster(t, d, func(i int, o *Options) {
 		if i == 0 {
-			o.hooks = &testHooks{peerFile: func(_ string, w httpResponseWriter) httpResponseWriter {
+			o.hooks.peerFile = func(_ string, w httpResponseWriter) httpResponseWriter {
 				if entered.CompareAndSwap(false, true) {
-					<-slow // hold the first file until the node is killed
+					<-slow
 				}
 				return w
-			}}
+			}
 		}
 	})
 	a := c.start(0)

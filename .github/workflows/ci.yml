@@ -130,9 +130,7 @@ jobs:
           seq=$(printf '%s\n' '{"upsert": {"id": "a"}}' '{"brand": "acme", "price": 5}' '{"upsert": {"id": "b"}}' '{"brand": "other", "price": 50}' |
             curl -fsS -X POST -H "$auth" -H 'Content-Type: application/x-ndjson' --data-binary @- http://127.0.0.1:8782/indexes/ci/_bulk |
             jq -er .seq)
-          # Another node answers a retryable 503 until its routing view, refreshed every
-          # 500 ms, shows the new index's copies; retry as a client honouring Retry-After.
-          total=$(curl -fsS --retry 20 --retry-delay 1 -X POST -H "$auth" -H 'Content-Type: application/json' \
+          total=$(curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
             "http://127.0.0.1:8784/indexes/ci/_search?wait_for_seq=$seq" \
             -d '{"query": {"field": "brand", "op": "eq", "value": "ACME"}}' | jq -er .total.value)
           test "$total" = 1

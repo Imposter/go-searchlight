@@ -204,8 +204,8 @@ unless `insecure_no_auth` is set.
 | `prune_stall_timeout` | `15m` | how long a copy behind the others may make no progress and still hold the changelog's prune floor |
 | `retiring_retention` | `15m` | how long the changelog is kept for a cleanly stopped node's copies, so a node restarted within it replays the tail rather than rebuilding |
 | `changelog_retention` | `24h` | the oldest a change may grow before it is pruned, whatever copy still needs it (that copy rebuilds) |
-| `refresh_interval` | `1s` | how often writes become searchable (an index's own `refresh_interval` overrides it) |
-| `seq_persist_interval` | `30s` | how often a shard persists a changelog position that moved without new segments (a restart replays at most this much more) |
+| `refresh_interval` | `1s` | how often writes become searchable, on a fixed grid (an index's own `refresh_interval` overrides it). A refresh is visibility only: it fsyncs nothing |
+| `flush_interval` | `10s` | how often a shard copy makes what refreshes published durable: it fsyncs the new segments and deletes, writes its manifest, and only then reports that seq as applied (the changelog is pruned by it). A crash replays at most this much of the changelog. A merge, a peer snapshot and a shutdown also flush at once |
 | `max_lag` | `2s` | how far a copy may trail and still serve reads; also how long the database may go unanswered before readiness turns false |
 | `changelog_poll_interval` | `500ms` | how often a copy polls the changelog when no local write, peer hint or Postgres notification wakes it |
 | `remap_debounce` | `2s` | how long a copy that a mapping change must rebuild waits for more mapping changes (`0s` rebuilds at once) |
@@ -229,6 +229,32 @@ unless `insecure_no_auth` is set.
 | `shutdown_timeout` | `60s` | the whole budget of a graceful shutdown after `shutdown_grace`, split as in [rolling restarts](#upgrades-and-rolling-restarts) |
 | `log_level` | `info` | `debug`, `info`, `warn` or `error` |
 | `pprof` | `false` | serve `/debug/pprof/*` on the admin listener |
+
+### Refresh and flush
+
+- **A refresh is visibility.** Every `refresh_interval`, on a fixed grid, each shard
+  copy turns its write buffer into a segment and publishes it to searches. It writes the
+  segment without fsync, so it costs CPU and page-cache writes only.
+- **A flush is durability.** It runs every `flush_interval`, at shutdown, at every merge
+  and before a peer snapshot. It fsyncs what the refreshes wrote, swaps the copy's
+  manifest atomically, and only then advances `CommittedSeq`, the seq the copy reports
+  as applied.
+- **What a crash costs.** Acknowledged writes are never at risk: they are in the
+  database. A crashed node reopens each copy at its last flushed manifest, and replays
+  the changelog from there, which is at most `flush_interval` of changes.
+- **Failed fsyncs.** A failed fsync is never retried. The copy fails and reopens from its
+  last flush.
+- **Tuning.** Raise `flush_interval` to fsync less often, at the price of a longer
+  replay after a crash. A clean shutdown always flushes.
+
+### Removed settings
+
+A removed setting is refused by name at start, whether it is given as a flag or as a
+`SEARCHLIGHT_*` variable, and the error names its replacement:
+
+| Setting | Removed | Instead |
+|---|---|---|
+| `seq_persist_interval` | with the refresh/flush split (#12) | `flush_interval` (default 10s) now persists the seq |
 
 ### Telemetry settings
 
@@ -313,7 +339,9 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 - **Headroom.** Leave at least the size of the largest shard copy free. A peer recovery
   stages a whole copy under `data_dir/recovery`, and an aside rebuild holds the old copy
   and the new one at once.
-- **Speed.** Use local SSDs. Every refresh that writes a segment fsyncs it.
+- **Speed.** Use local SSDs. Refreshes write segments without fsync, into the page
+  cache. Each flush, every `flush_interval`, fsyncs what the refreshes since the last one
+  wrote.
 
 ### The database
 
@@ -407,11 +435,11 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total` |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
-| Refresh and merge | `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
+| Refresh, flush and merge | `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
 | Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
 | Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
-| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total` |
+| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`) |
 | Runtime | `go_*` and `process_*` |
 
 Counters and histograms with no observations yet do not appear until their first one.
@@ -430,7 +458,7 @@ Counters and histograms with no observations yet do not appear until their first
 | Database errors | `rate(searchlight_store_errors_total[5m]) > 0` for 5 m | SQL errors |
 | Server errors | `sum(rate(searchlight_http_request_errors_total{http_response_status_code=~"5.."}[5m])) / sum(rate(searchlight_http_request_duration_seconds_count[5m])) > 0.01` | more than 1% of requests fail |
 | Backpressure | `rate(searchlight_http_request_errors_total{http_response_status_code="429"}[5m]) > 0` for 10 m | clients are being refused; see Sizing |
-| Refresh or merge failing | `rate(searchlight_shard_refresh_failures_total[5m]) > 0`, `rate(searchlight_shard_merge_failures_total[5m]) > 0` | usually a full or failing disk |
+| Refresh, flush or merge failing | `rate(searchlight_shard_refresh_failures_total[5m]) > 0`, `rate(searchlight_shard_flush_failures_total[5m]) > 0`, `rate(searchlight_shard_merge_failures_total[5m]) > 0` | usually a full or failing disk |
 | Merge backlog | `max(searchlight_shard_merge_backlog) > 50` for 30 m | merges cannot keep up: raise `merge_budget` or `merge_threads` |
 | Not ready | the readiness probe failing for 10 m | stuck recovery, or the database unreachable |
 

@@ -6,6 +6,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -44,8 +45,9 @@ type PollReporter interface {
 
 // ReplicaTailers is the production [NewTailerFunc]: a replica tailer per copy, with
 // the node's settings (changelog_poll_interval, max_lag, remap_debounce and the
-// retry bounds) and its shared Hub (nil: the tailers poll and are woken by writes).
-func ReplicaTailers(cfg config.Config, hub *replica.Hub, log *slog.Logger, tr trace.Tracer, meter metric.Meter) NewTailerFunc {
+// retry bounds), its shared Hub (nil: the tailers poll and are woken by writes) and
+// its clock.
+func ReplicaTailers(cfg config.Config, hub *replica.Hub, clk clock.Clock, log *slog.Logger, tr trace.Tracer, meter metric.Meter) NewTailerFunc {
 	remap := cfg.RemapDebounce
 	if remap == 0 {
 		remap = -1 // the config's 0 is "rebuild at once"; the replica's is "the default"
@@ -61,6 +63,7 @@ func ReplicaTailers(cfg config.Config, hub *replica.Hub, log *slog.Logger, tr tr
 			HaltRetryCap:    cfg.HaltRetryCap,
 			RebuildRetryCap: cfg.RebuildRetryCap,
 			Hub:             hub,
+			Clock:           clk,
 			Logger:          log,
 			Tracer:          tr,
 			Meter:           meter,

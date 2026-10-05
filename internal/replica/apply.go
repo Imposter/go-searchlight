@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -119,9 +120,10 @@ func (e *rebuildError) Unwrap() error { return e.err }
 // copy's mapping comes from (that is the changelog's); it tells whether the index,
 // and the tailer's shard of it, still exist, and which incarnation is current.
 type catalog struct {
-	idx  store.IndexStore
-	name string
-	meta store.IndexMeta
+	idx   store.IndexStore
+	name  string
+	clock clock.Clock
+	meta  store.IndexMeta
 	// missingSince is when the catalogue was first seen without the index (or the
 	// shard) since it was last seen with it.
 	missingSince time.Time
@@ -151,7 +153,7 @@ func (c *catalog) load(ctx context.Context, shardNum int) error {
 // missing records that the catalogue lacks the index (or shard) now.
 func (c *catalog) missing(err error) error {
 	if c.missingSince.IsZero() {
-		c.missingSince = time.Now()
+		c.missingSince = c.clock.Now()
 	}
 	return err
 }
@@ -427,7 +429,7 @@ func (t *Tailer) applyChanges(ctx context.Context, sh *shard.Shard, changes []st
 		}
 		span.End()
 	}()
-	start := time.Now()
+	start := t.opts.Clock.Now()
 	uid := sh.IndexUID()
 	items := make([]item, len(changes))
 	for i := range changes {
@@ -441,7 +443,7 @@ func (t *Tailer) applyChanges(ctx context.Context, sh *shard.Shard, changes []st
 		return err
 	}
 	t.inst.batchSize.Record(ctx, float64(len(changes)), t.inst.attrs)
-	t.inst.applyDur.Record(ctx, time.Since(start).Seconds(), t.inst.attrs)
+	t.inst.applyDur.Record(ctx, t.opts.Clock.Since(start).Seconds(), t.inst.attrs)
 	return nil
 }
 
@@ -569,7 +571,7 @@ func (t *Tailer) guard(ctx context.Context, sh *shard.Shard, it *item, reason st
 	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
 	}
-	t.lastCatalog = time.Now()
+	t.lastCatalog = t.opts.Clock.Now()
 	if uid := sh.IndexUID(); uid != "" && uid != t.cat.meta.UID {
 		return &rebuildError{reason: reasonIncarnation, err: fmt.Errorf("the index became incarnation %s", t.cat.meta.UID)}
 	}
@@ -649,7 +651,7 @@ func (t *Tailer) drain(ctx context.Context, sh *shard.Shard, wait *time.Duration
 		}
 		t.log.DebugContext(ctx, "refresh under backpressure failed; retrying", slog.Any("error", err))
 		*wait = min(max(2**wait, time.Millisecond), t.opts.RetryCap)
-		sleepCtx(ctx, *wait)
+		t.pause(ctx, *wait)
 		return ctx.Err()
 	}
 	if err := sh.WaitRefreshed(ctx, sh.AppliedSeq()); err != nil {
@@ -706,7 +708,7 @@ func (t *Tailer) onHalt(ctx context.Context, h *HaltError) error {
 	t.haltWait = nextBackoff(t.haltWait, t.opts.HaltRetryBase, t.opts.HaltRetryCap)
 	t.log.InfoContext(ctx, "halted copy retries after a backoff", slog.Duration("backoff", t.haltWait),
 		slog.Bool("rebuild", t.needRebuild != ""))
-	sleepCtx(ctx, t.haltWait)
+	t.pause(ctx, t.haltWait)
 	return nil
 }
 

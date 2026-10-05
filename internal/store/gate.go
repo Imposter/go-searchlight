@@ -125,6 +125,12 @@ func (g *gate) acquire(ctx context.Context) error {
 	}
 }
 
+func (g *gate) idle() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.busy && len(g.lanes[laneLow]) == 0 && len(g.lanes[laneHigh]) == 0
+}
+
 // release hands the gate to the first high-lane waiter, else the first low-lane one.
 func (g *gate) release() {
 	g.mu.Lock()

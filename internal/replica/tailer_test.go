@@ -94,7 +94,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 	copies := []*copyRunner{newCopy(t, d.open(t), id, opts), newCopy(t, d.open(t), id, opts)}
 	for _, c := range copies {
-		c.sopt.FlushBytes = 16 << 10 // small buffers: background refreshes, and backpressure
+		c.sopt.RefreshBytes = 16 << 10 // small buffers: background refreshes, and backpressure
 		c.sopt.MaxBufferFactor = 2
 		c.start()
 	}
@@ -516,6 +516,7 @@ func TestApplyErrorHalts(t *testing.T) {
 				var swaps atomic.Int32
 				opts.OnShard = func(*shard.Shard) { swaps.Add(1) }
 				c := newCopy(t, d.open(t), id, opts)
+				clkA := c.withFakeClock(time.Second)
 				c.start()
 				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
 				waitCopyState(t, st, id, store.CopyServing)
@@ -526,7 +527,8 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 				badSeq := last - 1
 				c.tailer.Wake()
-				halt := waitHalt(t, c.tailer)
+				c.until("the copy halts", func() bool { return c.current().Halt() != nil })
+				halt := c.current().Halt()
 				if halt.Seq != badSeq || halt.ID != "bad" || halt.Reason != tc.reason || !errors.Is(halt, ErrHalted) {
 					t.Fatalf("halt %+v, want seq %d id bad reason %s", halt, badSeq, tc.reason)
 				}
@@ -544,12 +546,14 @@ func TestApplyErrorHalts(t *testing.T) {
 
 				// While the bad change is current, the copy tails again and again
 				// but is never wiped: a rebuild would stop at the same row.
-				deadline := time.Now().Add(30 * time.Second)
-				for counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) < 3 {
-					if time.Now().After(deadline) {
-						t.Fatalf("%d halts", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""))
+				for {
+					if err := clkA.BlockUntilArmed(tctx(t), time.Second); err != nil {
+						t.Fatalf("no halt backoff after %d halts: %v", counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""), err)
 					}
-					time.Sleep(20 * time.Millisecond)
+					if counterSum(t, reader, telemetry.MetricReplicaHalts, "reason", tc.reason) >= 3 {
+						break
+					}
+					clkA.Advance(time.Second)
 				}
 				if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "", ""); n != 1 || swaps.Load() != 0 {
 					t.Fatalf("%d recoveries (want the first one only) and %d swaps while the bad row is current", n, swaps.Load())
@@ -564,18 +568,16 @@ func TestApplyErrorHalts(t *testing.T) {
 				optsB, readerB := meteredOptions()
 				optsB.HaltRetryBase, optsB.HaltRetryCap = 20*time.Millisecond, 50*time.Millisecond
 				b := newCopy(t, d.open(t), id, optsB)
+				b.withFakeClock(optsB.HaltRetryCap)
 				b.start()
-				hb := waitHalt(t, b.tailer)
+				b.until("the load halts", func() bool { return b.current().Halt() != nil })
+				hb := b.current().Halt()
 				if hb.ID != "bad" || hb.Reason != tc.reason {
 					t.Fatalf("load halt %+v", hb)
 				}
-				deadline = time.Now().Add(30 * time.Second)
-				for counterSum(t, readerB, telemetry.MetricReplicaHalts, "", "") < 4 {
-					if time.Now().After(deadline) {
-						t.Fatal("the halted load was not retried")
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
+				b.until("the halted load is retried", func() bool {
+					return counterSum(t, readerB, telemetry.MetricReplicaHalts, "", "") >= 4
+				})
 				if n := counterSum(t, readerB, telemetry.MetricReplicaRecoveries, "", ""); n != 1 {
 					t.Fatalf("%d snapshot loads while the bad row is current; want 1", n)
 				}
@@ -601,21 +603,6 @@ func TestApplyErrorHalts(t *testing.T) {
 				}
 			})
 		})
-	}
-}
-
-// waitHalt waits for the tailer to halt.
-func waitHalt(t testing.TB, tl *Tailer) *HaltError {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if h := tl.Halt(); h != nil {
-			return h
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the copy did not halt")
-		}
-		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -661,7 +648,7 @@ func TestBackpressureIsRetried(t *testing.T) {
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 		c := newCopy(t, d.open(t), id, opts)
 		c.sopt.RefreshInterval = -1 // only the tailer's refreshes drain it
-		c.sopt.FlushBytes = 1       // full after every batch
+		c.sopt.RefreshBytes = 1     // full after every batch
 		c.sopt.MaxBufferFactor = 1
 		c.start()
 		var batch []store.Change
@@ -736,6 +723,57 @@ func TestLeaseLostStopsTheTailer(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		if c.tailer.Applied() != applied {
 			t.Fatal("the tailer applied after losing its lease")
+		}
+	})
+}
+
+// TestReportsOnlyFlushedSeqs: the seq the registry holds for a copy (the changelog is
+// pruned by it) is the copy's CommittedSeq, never more: a change the copy has applied
+// and published, searchable, is reported only once a flush has made it durable.
+func TestReportsOnlyFlushedSeqs(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "f", testMapping)
+		id := ShardID{Index: "f", Shard: 0}
+		cp, ok, err := st.Registry().ClaimCopy(ctx, id, "node-a", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+		opts := testOptions()
+		opts.Copy = &cp
+		c := newCopy(t, d.open(t), id, opts)
+		c.sopt.FlushInterval = -1
+		c.start()
+		reported := func(atLeast int64) int64 {
+			t.Helper()
+			got := waitCopyState(t, st, id, store.CopyServing)
+			for deadline := time.Now().Add(30 * time.Second); got.AppliedSeq < atLeast && time.Now().Before(deadline); {
+				time.Sleep(10 * time.Millisecond)
+				got = waitCopyState(t, st, id, store.CopyServing)
+			}
+			return got.AppliedSeq
+		}
+		first := mustApply(t, st, upsert("f", 0, "a", docBody("a", 1)))
+		sh := c.waitApplied(first)
+		if err := sh.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := reported(first); got < first {
+			t.Fatalf("reported %d after a flush, want %d", got, first)
+		}
+
+		head := mustApply(t, st, upsert("f", 0, "b", docBody("b", 2)))
+		sh = c.waitApplied(head)
+		time.Sleep(10 * opts.ReportInterval)
+		if got := reported(0); got >= head || sh.CommittedSeq() >= head {
+			t.Fatalf("reported %d (CommittedSeq %d) with %d published but not flushed", got, sh.CommittedSeq(), head)
+		}
+		if err := sh.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if got := reported(head); got < head {
+			t.Fatalf("reported %d after a flush, want %d", got, head)
 		}
 	})
 }

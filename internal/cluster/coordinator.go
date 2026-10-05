@@ -54,6 +54,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -132,14 +133,11 @@ type Options struct {
 
 	// Transport carries the peer API's requests; nil means a pooled default.
 	Transport http.RoundTripper
-	// Clock is the monotonic clock lease deadlines are kept by; nil means the
-	// process's.
-	Clock Clock
-	// AllowSQLiteCluster lets several live nodes share a SQLite store. Tests only:
-	// in-process clusters over one file. In production SQLite serves one node, and
-	// Start refuses a second (ErrSQLiteCluster); there is no flag for it.
-	AllowSQLiteCluster bool
-
+	// Clock runs the node's timers (heartbeats, lease renewals and the watchdog,
+	// maintenance, routing, recovery) and those of its engine, and keeps its lease
+	// deadlines: by the monotonic reading (Since) and, against a suspended machine,
+	// the wall clock (Wall). Nil means clock.Real.
+	Clock clock.Clock
 	// Engine, when set, adjusts the engine's options (tests: fake tailers, small
 	// shards).
 	Engine func(*node.Options)
@@ -156,6 +154,8 @@ type Options struct {
 
 // testHooks are test seams.
 type testHooks struct {
+	allowSQLiteCluster bool
+
 	// peerFile wraps the writer a snapshot file is streamed to.
 	peerFile func(name string, w http.ResponseWriter) http.ResponseWriter
 }
@@ -220,7 +220,7 @@ func (o *Options) resolve() error {
 		o.SnapshotTTL = DefaultSnapshotTTL
 	}
 	if o.Clock == nil {
-		o.Clock = NewClock()
+		o.Clock = clock.Real{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -257,7 +257,8 @@ type Node struct {
 	reg   store.RegistryStore
 	log   *slog.Logger
 	tr    trace.Tracer
-	clock Clock
+	clock clock.Clock
+	lc    leaseClock
 	inst  *instruments
 
 	client *http.Client
@@ -266,6 +267,8 @@ type Node struct {
 	clearWarned sync.Map
 	ars         *ars
 	view        atomic.Pointer[view]
+	missMu      sync.Mutex
+	missReadAt  time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
@@ -274,12 +277,9 @@ type Node struct {
 	// leases of dropped indexes. Renewals do not take it: they wait on nothing.
 	allocMu sync.Mutex
 
-	// progressHW are this node's copies' progress high-water marks.
 	progressMu sync.Mutex
 	progressHW map[copyKey]int64
 
-	// startedAt is when the node was built: copy directories and staging an earlier
-	// run left count as unused from then.
 	startedAt time.Time
 
 	pins  *pinTable
@@ -332,16 +332,22 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		log:       o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
 		tr:        o.Tracer,
 		clock:     o.Clock,
+		lc:        leaseClock{c: o.Clock, epoch: o.Clock.Now()},
 		leases:    map[store.ShardID]*lease{},
 		scheme:    "http",
-		startedAt: time.Now(),
+		startedAt: o.Clock.Now(),
 	}
+	n.alloc.clock = o.Clock
 	if o.Config.TLSCert != "" {
 		n.scheme = "https"
 	}
 	if n.scheme == "http" && o.Config.ClusterToken != "" && !loopbackAddress(o.Config.AdvertiseAddress) {
 		n.log.WarnContext(ctx, "cluster_token is sent in the clear: advertise_address is not loopback and tls_cert is unset",
 			slog.String("address", o.Config.AdvertiseAddress))
+	}
+	if o.Config.ShutdownGrace < o.ViewInterval {
+		n.log.WarnContext(ctx, "shutdown_grace is shorter than the routing view interval: while this node stops, peers still route reads to it after its listener closes, and those reads fail",
+			slog.Duration("shutdown_grace", o.Config.ShutdownGrace), slog.Duration("view_interval", o.ViewInterval))
 	}
 	n.inst = newInstruments(o.Meter, n.log)
 	transport := o.Transport
@@ -363,15 +369,15 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		transport = t
 	}
 	n.client = &http.Client{Transport: transport}
-	n.ars = newARS()
+	n.ars = newARS(o.Clock)
 	n.view.Store(&view{nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}})
-	n.pins = newPinTable(o.PinTTL)
-	n.snaps = newSnapTable(o.SnapshotTTL, o.SnapshotMaxAge)
+	n.pins = newPinTable(o.PinTTL, o.Clock)
+	n.snaps = newSnapTable(o.SnapshotTTL, o.SnapshotMaxAge, o.Clock)
 	n.sums = newSumCache()
 	n.hints = newHinter(n)
 	n.fetch = &fetcher{n: n}
 	n.peer = &peerAPI{n: n}
-	eo := node.Options{Store: o.Store, Config: o.Config, Version: o.Version, Cluster: &clusterHooks{n}, Logger: o.Logger, Tracer: o.Tracer, Meter: o.Meter}
+	eo := node.Options{Store: o.Store, Config: o.Config, Version: o.Version, Cluster: &clusterHooks{n}, Clock: o.Clock, Logger: o.Logger, Tracer: o.Tracer, Meter: o.Meter}
 	if o.Engine != nil {
 		o.Engine(&eo)
 	}
@@ -445,11 +451,11 @@ func (n *Node) Start(ctx context.Context) error {
 var ErrSQLiteCluster = errors.New("cluster: a SQLite store serves a single node; use Postgres or MySQL for a cluster")
 
 // singleSQLite refuses to join when the store is SQLite and another live node is
-// registered (unless Options.AllowSQLiteCluster, for in-process tests). The node checks
+// registered (in-process tests aside). The node checks
 // after registering, so of two nodes starting at once at least one sees the other; it
 // deregisters before it fails.
 func (n *Node) singleSQLite(ctx context.Context) error {
-	if n.st.Dialect() != "sqlite" || n.opts.AllowSQLiteCluster {
+	if n.st.Dialect() != "sqlite" || (n.opts.hooks != nil && n.opts.hooks.allowSQLiteCluster) {
 		return nil
 	}
 	v := n.view.Load()

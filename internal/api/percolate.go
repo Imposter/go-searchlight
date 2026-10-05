@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"time"
 )
 
 // MaxPercolateDocs bounds the documents (given and stored) of one _percolate request.
@@ -18,7 +17,7 @@ type percolateBody struct {
 // percolate serves POST /indexes/{index}/_percolate: {"docs": [{...}], "ids": [...]}
 // in; for each document, given ones first, the ids of the saved queries it matches.
 func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) error {
-	start := time.Now()
+	start := s.clock.Now()
 	wait, e := p.waitForSeq()
 	if e != nil {
 		return e
@@ -51,7 +50,7 @@ func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) err
 			res.Results[i].Queries = []string{}
 		}
 	}
-	out := map[string]any{"took_ms": time.Since(start).Milliseconds(), "results": res.Results}
+	out := map[string]any{"took_ms": s.clock.Since(start).Milliseconds(), "results": res.Results}
 	if res.Stale {
 		out["stale"] = true
 	}

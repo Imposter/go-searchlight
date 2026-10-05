@@ -9,12 +9,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,17 +22,17 @@ import (
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
-// Refresh makes every change applied so far searchable and durable: it writes the
-// buffer's documents as a new segment and its saved queries as a new query segment,
-// masks every older copy of the ids the buffer touched, commits the manifest, and
-// publishes the new generation. Apply keeps going into a fresh buffer meanwhile, and
-// readers keep the old generation until they release it. A refresh with nothing new
-// is a no-op. When it fails before its commit, the buffer is put back, so the next
-// refresh retries it.
+// Refresh makes every change applied so far searchable: it writes the buffer's
+// documents as a new segment and its saved queries as a new query segment, masks every
+// older copy of the ids the buffer touched, and publishes the new generation. It
+// fsyncs nothing: the segment files are written unsynced and the deletes stay in
+// memory until a flush makes them durable ([Shard.Flush]). Apply keeps going into a
+// fresh buffer meanwhile, and readers keep the old generation until they release it. A
+// refresh with nothing new is a no-op. When it fails before it publishes, the buffer
+// is put back, so the next refresh retries it.
 //
 // A refresh whose buffer is empty, when only the changelog position moved ([Advance]),
-// publishes the new seq at once but does not write the manifest: CommittedSeq catches
-// up at the next commit, at most every Options.SeqPersistInterval, and at Close.
+// publishes the new seq at once and writes nothing.
 func (s *Shard) Refresh(ctx context.Context) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -66,10 +64,9 @@ func (s *Shard) Refresh(ctx context.Context) error {
 	ctx, span := s.startSpan(ctx, "shard.refresh",
 		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	defer span.End()
-	start := time.Now()
-	published, err := s.refresh(ctx, fb, seq, maxSeq, uid, mp)
-	if err != nil {
-		if !published && !isCrash(err) {
+	start := s.opts.Clock.Now()
+	if err := s.refresh(ctx, fb, seq, maxSeq, uid, mp); err != nil {
+		if !isCrash(err) {
 			s.mu.Lock()
 			fb.absorb(s.buf)
 			s.buf = fb
@@ -81,7 +78,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		s.inst.refreshFailures.Add(ctx, 1, s.inst.attrs)
 		return err
 	}
-	d := time.Since(start)
+	d := s.opts.Clock.Since(start)
 	s.inst.recordRefresh(ctx, d)
 	s.mu.Lock()
 	buffered := s.buf.size()
@@ -96,24 +93,24 @@ func (s *Shard) Refresh(ctx context.Context) error {
 // telemetryDuration is telemetry.KeyDuration, the log key of a duration in ms.
 const telemetryDuration = "duration_ms"
 
-// refresh writes and commits a frozen buffer. published reports whether a generation
-// was published (even if the shard then failed): if not, nothing of fb is visible.
-func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState) (published bool, err error) {
+// refresh writes a frozen buffer's segments and publishes them. When it fails, nothing
+// of fb is visible.
+func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState) error {
 	var built []*segRef
-	discard := func(err error) (bool, error) {
+	discard := func(err error) error {
 		for _, ref := range built {
 			_ = ref.close()
 			if !isCrash(err) {
 				s.jan.removeLater(segmentFiles(s.dir, ref.id)...)
 			}
 		}
-		return false, err
+		return err
 	}
 
 	if docs := fb.liveDocs(); len(docs) > 0 {
 		ref, err := s.buildDocSegment(ctx, docs)
 		if err != nil {
-			return false, err
+			return err
 		}
 		built = append(built, ref)
 	}
@@ -149,11 +146,8 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 			queries = append(queries, st)
 		}
 	}
-	published, err = s.commit(ctx, docs, queries, nil, seq, maxSeq, uid, mp)
-	if !published {
-		return discard(err)
-	}
-	return true, err
+	s.publish(ctx, docs, queries, built, seq, maxSeq, uid, mp)
+	return nil
 }
 
 // buildDocSegment writes docs as a new segment and opens it.
@@ -164,9 +158,7 @@ func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef
 	// Each Build worker keeps its own per-term structures for its range of documents,
 	// so a small refresh split many ways mostly multiplies that overhead.
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
-	// No directory fsync here: the commit syncs the directory once, after the manifest
-	// rename, for every file it wrote (see commit).
-	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoDirSync: true})
+	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true})
 	if err != nil {
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, fmt.Errorf("shard: building a segment: %w", err)
@@ -267,119 +259,30 @@ func (s *Shard) mask(states []segState, ids []string) []segState {
 	return out
 }
 
-// commit makes docs and queries (with removed no longer among them) the shard's
-// durable and visible state: it writes the dirty segments' deletes sidecars and the
-// manifest, then publishes the generation. The caller holds commitMu. published
-// reports whether the generation was published: a failure after the manifest was
-// renamed into place (its directory fsync) publishes anyway, since the manifest may
-// well be durable, and fails the shard.
-//
-// Syncs: every file a commit relies on (the segments and query segments built for it,
-// its sidecars, the manifest) is fsynced on its own when written, but renamed into
-// place with no directory fsync; the one directory fsync, after the manifest rename,
-// makes all of their names durable together. A journaling file system (ext4, XFS,
-// ZFS, NTFS) applies directory operations in order, so a manifest rename that
-// survives a crash comes with the renames before it. On one that does not, the worst
-// a crash at that moment leaves is a manifest naming a missing file, which Open
-// refuses (the copy recovers from a peer or the changelog), never a silent misread.
-func (s *Shard) commit(ctx context.Context, docs, queries []segState, removed []*segRef, seq, maxSeq int64, uid string, mp *mappingState) (published bool, err error) {
+// publish makes docs and queries, built among them, the shard's visible state as a new
+// generation, and numbers the deletes it changed (dirty) for it: the flush that
+// persists it writes them as sidecars of that number. It writes nothing. The caller
+// holds commitMu.
+func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*segRef, seq, maxSeq int64, uid string, mp *mappingState) {
 	s.gen++
-	gen := s.gen // never reused, even if this commit fails
-	var written, obsolete []string
-	fail := func(err error) (bool, error) {
-		if isCrash(err) {
-			s.fail(err)
-		} else {
-			s.jan.removeLater(written...)
-		}
-		return false, err
-	}
-	var dirty []*segState
 	for _, list := range [][]segState{docs, queries} {
 		for i := range list {
 			if list[i].dirty {
-				dirty = append(dirty, &list[i])
+				list[i].delGen = s.gen
 			}
 		}
 	}
-	for _, st := range dirty {
-		s.jan.forget(filepath.Join(s.dir, deletesName(st.ref.id, gen)))
-	}
-	// Each sidecar is fsynced on its own; writing them in parallel overlaps the syncs.
-	sidecarErrs := make([]error, len(dirty))
-	parallel(len(dirty), sidecarWriters, func(i int) {
-		st := dirty[i]
-		sidecarErrs[i] = segment.WriteDeletes(s.dir, st.ref.id, gen, st.deletes, segment.DeletesOptions{NoDirSync: true})
-	})
-	for i, st := range dirty {
-		path := filepath.Join(s.dir, deletesName(st.ref.id, gen))
-		written = append(written, path)
-		if info, err := os.Stat(path); err == nil {
-			st.delBytes = info.Size()
-		}
-		if st.delGen > 0 {
-			obsolete = append(obsolete, filepath.Join(s.dir, deletesName(st.ref.id, st.delGen)))
-		}
-		st.delGen = gen
-		if err := sidecarErrs[i]; err != nil {
-			return fail(fmt.Errorf("shard: writing deletes of %s: %w", st.ref.id, err))
-		}
-	}
-	if err := s.hook(pointCommitSidecars); err != nil {
-		return fail(err)
-	}
-	man, err := buildManifest(gen, seq, maxSeq, uid, mp, docs, queries)
-	if err == nil && s.marksUntyped {
-		man.UntypedMarks = untypedMarksFormat
-	}
-	if err != nil {
-		return fail(err)
-	}
-	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
-	if err != nil {
-		if !renamed {
-			return fail(fmt.Errorf("shard: writing the manifest: %w", err))
-		}
-		if isCrash(err) {
-			// The process "died" right after the rename: nothing more happens in it.
-			s.fail(err)
-			return false, err
-		}
-		err = fmt.Errorf("shard: the manifest swap may not be durable: %w", err)
-		s.fail(err)
-	}
-	// uncertain: the new manifest is in place but may not survive a crash, so the old
-	// one may come back: its files (merged-away segments, superseded sidecars) stay,
-	// and CommittedSeq stays what is known to be durable. The next Open collects
-	// whatever the surviving manifest does not reference.
-	uncertain := err != nil
-
-	g := newGeneration(s, gen, seq, maxSeq, uid, mp, docs, queries)
-	if !uncertain {
-		for _, ref := range removed {
-			ref.obsolete.Store(true)
-		}
-	}
-	old := s.cur.Swap(g)
-	s.manifestBytes.Store(manBytes)
-	if !uncertain {
-		s.committed.Store(seq)
-		s.committedUID = uid
-		s.committedMap = mp
-	}
-	if old != nil {
+	g := newGeneration(s, s.gen, seq, maxSeq, uid, mp, docs, queries)
+	s.unflushed = append(s.unflushed, built...)
+	if old := s.cur.Swap(g); old != nil {
 		old.Release()
-	}
-	if !uncertain {
-		s.jan.removeLater(obsolete...)
 	}
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
-	return true, err
 }
 
 // publishSeq publishes the current segments as covering seq: a refresh with nothing
-// to write. Nothing is written, so CommittedSeq stays where it was ([persistSeq]).
+// to write.
 func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -392,25 +295,6 @@ func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, m
 	cur.Release()
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
-}
-
-// persistSeq commits the current generation when its seq (or index uid) is ahead of
-// the manifest's: the lazy half of a seq-only refresh.
-func (s *Shard) persistSeq(ctx context.Context) error {
-	s.commitMu.Lock()
-	defer s.commitMu.Unlock()
-	cur := s.cur.Load()
-	if cur == nil {
-		return ErrClosed
-	}
-	if err := s.Err(); err != nil {
-		return err
-	}
-	if cur.seq == s.committed.Load() && cur.uid == s.committedUID && cur.mp == s.committedMap {
-		return nil
-	}
-	_, err := s.commit(ctx, slices.Clone(cur.docs), slices.Clone(cur.queries), nil, cur.seq, cur.maxSeq, cur.uid, cur.mp)
-	return err
 }
 
 func buildManifest(gen uint64, seq, maxSeq int64, uid string, mp *mappingState, docs, queries []segState) (*manifest, error) {
@@ -456,8 +340,8 @@ func newSegmentName() string {
 // isCrash reports whether err is a test's simulated crash.
 func isCrash(err error) bool { return errors.Is(err, errSimulatedCrash) }
 
-// sidecarWriters bounds the deletes sidecars a commit writes at once.
-const sidecarWriters = 8
+// syncWorkers bounds the files a flush fsyncs or writes at once.
+const syncWorkers = 8
 
 // parallel calls work(i) for every i in [0, n) on up to workers goroutines.
 func parallel(n, workers int, work func(i int)) {

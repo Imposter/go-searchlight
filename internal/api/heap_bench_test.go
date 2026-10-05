@@ -77,7 +77,7 @@ func BenchmarkBulkPeakHeap(b *testing.B) {
 			e.must(http.StatusCreated, "PUT", "/indexes/heap", `{"settings": {"shards": 2}}`)
 			// With applying=false the tailers are paused, so the heap measured is
 			// the request's alone (the copies' write buffers are bounded on their
-			// own, by the shard's flush_bytes times max_buffer_factor).
+			// own, by the shard's refresh bytes times its max buffer factor).
 			if !c.applying {
 				for s := range 2 {
 					e.tailer("heap", s).Pause()

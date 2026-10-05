@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -36,6 +37,7 @@ import (
 type Server struct {
 	c       Coordinator
 	cfg     config.Config
+	clock   clock.Clock
 	log     *slog.Logger
 	tracer  trace.Tracer
 	prop    propagation.TextMapPropagator
@@ -81,15 +83,23 @@ type Route struct {
 	Auth         bool
 }
 
+// ServerOption adjusts NewServer.
+type ServerOption func(*Server)
+
+// WithClock sets the clock the server times requests and its shutdown grace by
+// (default: clock.Real).
+func WithClock(c clock.Clock) ServerOption { return func(s *Server) { s.clock = c } }
+
 // NewServer builds the API over c. t supplies the logger, tracer, meter and the
 // /metrics handler; nil uses slog's default logger and the OpenTelemetry globals. It
 // reads cfg.TokensFile, failing when the file is unreadable or holds no valid token;
 // with no tokens file it requires cfg.InsecureNoAuth and logs a warning, since every
 // request is then served unauthenticated.
-func NewServer(c Coordinator, t *telemetry.T, cfg config.Config) (*Server, error) {
+func NewServer(c Coordinator, t *telemetry.T, cfg config.Config, opts ...ServerOption) (*Server, error) {
 	s := &Server{
 		c:     c,
 		cfg:   cfg,
+		clock: clock.Real{},
 		log:   slog.Default(),
 		prop:  otel.GetTextMapPropagator(),
 		queue: make(queue, max(1, cfg.SearchQueue)),
@@ -99,6 +109,9 @@ func NewServer(c Coordinator, t *telemetry.T, cfg config.Config) (*Server, error
 		mux:        http.NewServeMux(),
 		paths:      http.NewServeMux(),
 		tracer:     otel.Tracer(telemetry.ScopeName),
+	}
+	for _, o := range opts {
+		o(s)
 	}
 	meter := otel.Meter(telemetry.ScopeName)
 	if t != nil {
@@ -239,12 +252,12 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	base := context.WithoutCancel(ctx)
 	select {
 	case err := <-errc:
-		cctx, cancel := context.WithDeadline(base, s.closeBy(NewShutdown(s.cfg)))
+		cctx, cancel := context.WithDeadline(base, s.closeBy(NewShutdown(s.cfg, s.clock)))
 		defer cancel()
 		return errors.Join(fmt.Errorf("api listener: %w", err), s.c.Close(cctx))
 	case <-ctx.Done():
 	}
-	sd := NewShutdown(s.cfg)
+	sd := NewShutdown(s.cfg, s.clock)
 	var given *Shutdown
 	if errors.As(context.Cause(ctx), &given) {
 		sd = given
@@ -256,20 +269,20 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	if d, ok := s.c.(Drainer); ok {
 		// A cluster node retires the copies others can stand in for, so peers stop
 		// routing reads here while the listener drains.
-		dctx, cancel := context.WithDeadline(base, sd.within(quarter))
+		dctx, cancel := context.WithDeadline(base, sd.within(s.clock.Now(), quarter))
 		d.Drain(dctx)
 		cancel()
 	}
 	if sd.Grace > 0 {
-		t := time.NewTimer(min(sd.Grace, time.Until(sd.Deadline)))
+		t := s.clock.NewTimer(min(sd.Grace, s.clock.Until(sd.Deadline)))
 		select {
-		case <-t.C:
+		case <-t.C():
 		case err := <-errc:
 			t.Stop()
 			errc <- err
 		}
 	}
-	sctx, cancel := context.WithDeadline(base, sd.within(quarter))
+	sctx, cancel := context.WithDeadline(base, sd.within(s.clock.Now(), quarter))
 	defer cancel()
 	var errs []error
 	if err := srv.Shutdown(sctx); err != nil {
@@ -301,16 +314,16 @@ type Shutdown struct { //nolint:errname // a cancellation cause carrying the bud
 	Grace time.Duration
 }
 
-// NewShutdown returns the budget of a shutdown beginning now: shutdown_grace, then
+// NewShutdown returns the budget of a shutdown beginning now by c: shutdown_grace, then
 // shutdown_timeout.
-func NewShutdown(cfg config.Config) *Shutdown {
-	return &Shutdown{Deadline: time.Now().Add(cfg.ShutdownGrace + cfg.ShutdownTimeout), Grace: cfg.ShutdownGrace}
+func NewShutdown(cfg config.Config, c clock.Clock) *Shutdown {
+	return &Shutdown{Deadline: c.Now().Add(cfg.ShutdownGrace + cfg.ShutdownTimeout), Grace: cfg.ShutdownGrace}
 }
 
 func (*Shutdown) Error() string { return "graceful shutdown" }
 
-func (sd *Shutdown) within(d time.Duration) time.Time {
-	if end := time.Now().Add(d); end.Before(sd.Deadline) {
+func (sd *Shutdown) within(now time.Time, d time.Duration) time.Time {
+	if end := now.Add(d); end.Before(sd.Deadline) {
 		return end
 	}
 	return sd.Deadline
@@ -376,7 +389,7 @@ func requestID(r *http.Request) string {
 // limit. A handler's error is answered as problem JSON.
 func (s *Server) wrap(rt *route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
+		start := s.clock.Now()
 		id := requestID(r)
 		ctx := s.prop.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 		name := rt.method + " " + rt.path
@@ -468,7 +481,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 			releaseBudget = sync.OnceFunc(br.releaseAll)
 			defer releaseBudget()
 		}
-		ctx, cancel := context.WithTimeout(ctx, s.cfg.RequestTimeout)
+		ctx, cancel := clock.WithTimeout(ctx, s.clock, s.cfg.RequestTimeout)
 		defer cancel()
 		if rt.queued {
 			// The body is read before a slot is taken: a slow client holds none.
@@ -496,7 +509,7 @@ func (s *Server) finish(ctx context.Context, rt *route, r *http.Request, sw *sta
 	if status == 0 {
 		status = http.StatusOK
 	}
-	elapsed := time.Since(start)
+	elapsed := s.clock.Since(start)
 	set := metric.WithAttributeSet(attribute.NewSet(append(rt.attrs.ToSlice(), attribute.Int("http.response.status_code", status))...))
 	s.dur.Record(ctx, elapsed.Seconds(), set)
 	if status >= 400 {
@@ -614,7 +627,7 @@ func (s *Server) drain(w http.ResponseWriter, r *http.Request, body *trackedBody
 		return 0
 	}
 	rc := http.NewResponseController(w)
-	if err := rc.SetReadDeadline(time.Now().Add(drainTimeout)); err != nil {
+	if err := rc.SetReadDeadline(time.Now().Add(drainTimeout)); err != nil { //nolint:forbidigo // a connection deadline is by the OS clock
 		return 0 // unbounded in time: close instead
 	}
 	_ = rc.Flush()

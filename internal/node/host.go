@@ -177,7 +177,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 		return nil
 	}
 	sl.local.Store(nil)
-	sl.unhostedAt.Store(time.Now().UnixNano())
+	sl.unhostedAtNano.Store(n.clock.Now().UnixNano())
 	c.cancel()
 	<-c.done
 	var err error
@@ -204,7 +204,7 @@ func (n *Single) removeLater(ctx context.Context, dir string) {
 	go func() {
 		delay := 100 * time.Millisecond
 		for range 30 {
-			time.Sleep(delay)
+			time.Sleep(delay) //nolint:forbidigo // waits out other processes' handles on the files: real time is the subject
 			if os.RemoveAll(dir) == nil {
 				return
 			}
@@ -265,7 +265,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 			return nil, err
 		}
 		sh := c.shard()
-		sn, err := sh.Snapshot()
+		sn, err := sh.Snapshot(ctx)
 		if errors.Is(err, shard.ErrClosed) && c.shard() != sh {
 			continue // swapped by a rebuild: snapshot its replacement
 		}
@@ -321,7 +321,7 @@ func (n *Single) DBStale() bool { return n.stale() }
 
 // DBAnsweredWithin reports whether the database answered within d.
 func (n *Single) DBAnsweredWithin(d time.Duration) bool {
-	return time.Since(time.Unix(0, n.dbOK.Load())) <= d
+	return n.clock.Since(time.Unix(0, n.dbOK.Load())) <= d
 }
 
 // Indexes describes the indexes this node knows, by name.
@@ -392,10 +392,16 @@ func (n *Single) SyncCatalog(ctx context.Context) error {
 }
 
 // adoptIndex opens index name when the store has it (another node created it): the
-// index, or nil when the store has none.
-func (n *Single) adoptIndex(ctx context.Context, name string) (*index, error) {
+// index, or nil when the store has none. With cachedAbsence, a name the store did not
+// have is not looked up again for absentTTL, unless this node creates it meanwhile.
+func (n *Single) adoptIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {
+	gen, absent := n.absent.check(name)
+	if absent && cachedAbsence {
+		return nil, nil
+	}
 	m, err := n.st.Indexes().Get(ctx, name)
 	if errors.Is(err, store.ErrNotFound) {
+		n.absent.note(name, gen)
 		return nil, nil
 	}
 	if err != nil {
@@ -510,7 +516,7 @@ func (n *Single) UnhostedCopyDirs() []CopyDir {
 			root := idx.copyRoot(s)
 			if _, err := os.Stat(root); err == nil {
 				d := CopyDir{Shard: sl.id, Path: root}
-				if at := sl.unhostedAt.Load(); at > 0 {
+				if at := sl.unhostedAtNano.Load(); at > 0 {
 					d.UnhostedAt = time.Unix(0, at)
 				}
 				out = append(out, d)

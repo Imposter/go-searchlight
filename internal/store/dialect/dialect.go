@@ -64,17 +64,33 @@ type Dialect struct {
 	ApplyTx    *sql.TxOptions
 	SnapshotTx *sql.TxOptions
 
-	// Checkpoint, when set, is run on a read connection every CheckpointEvery:
-	// SQLite's WAL checkpoint, taken off the write connection (whose automatic
-	// checkpoints are off), so a commit never stalls every other writer while it
-	// copies the log into the database.
-	Checkpoint      string
-	CheckpointEvery time.Duration
-	// CheckpointMinLog, when set, skips a checkpoint while the database's write-ahead
-	// log file (its path plus "-wal") is smaller: as SQLite's automatic checkpoint
-	// does (1,000 pages), but off the commit path, and with no extra fsync while the
-	// log is short.
-	CheckpointMinLog int64
+	// Checkpoint, when set, is SQLite's WAL checkpoint, returning (busy, log frames,
+	// checkpointed frames). The store runs it on a read connection, off the write
+	// connection (whose automatic checkpoints are off), so a commit never stalls every
+	// other writer while it copies the log into the database. Every CheckpointEvery
+	// the store asks PendingLog how many bytes of the log no checkpoint has copied
+	// yet, and checkpoints once that reaches CheckpointMinLog: as SQLite's automatic
+	// checkpoint does (1,000 pages), with no fsync while little is pending.
+	//
+	// A log copied back in full is restarted by the next write, but under a steady
+	// stream of writes that moment never comes, so once the log file has grown past
+	// TruncateAbove the store empties it with TruncateCheckpoint, which blocks every
+	// writer while it runs. It does so on the write connection: when the writers are
+	// idle and at most TruncateMaxPending is left to copy; or, when they have not been
+	// idle for TruncateAfterTicks checks or the file has grown past twice
+	// TruncateAbove, next in line after the commit in flight (whatever the commits
+	// since the last checkpoint left to copy).
+	Checkpoint         string
+	TruncateCheckpoint string
+	TruncateAbove      int64
+	TruncateMaxPending int64
+	TruncateAfterTicks int
+	CheckpointEvery    time.Duration
+	CheckpointMinLog   int64
+	PendingLog         func(dbPath string) (int64, error)
+	// LogWarnBytes is the write-ahead log size past which, when a checkpoint could
+	// not copy every frame (a long reader pins the log), the store warns.
+	LogWarnBytes int64
 
 	// Retryable reports a transient error (deadlock, serialization failure,
 	// lock wait timeout) after which the whole transaction, rolled back by the

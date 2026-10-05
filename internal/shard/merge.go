@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 	"go.opentelemetry.io/otel/attribute"
@@ -25,18 +24,23 @@ import (
 // accumulation phase to reach its first write. (A streaming, cancellable merge is
 // parked to Task 14.)
 //
-// The merge loop asks the policy for merges after every commit, reserves their inputs
+// The merge loop asks the policy for merges after every publish, reserves their inputs
 // (a reserved segment is in no other merge), and runs each in its own goroutine, which
 // first waits for MergeBudget tokens. A merge works from a generation it acquires: its
 // inputs stay mapped, and their deletes as of that generation are its snapshot. It
 // writes the merged segment with no lock held, so refreshes and readers carry on.
 //
-// Then it commits, under the commit lock: the merged segment replaces its inputs, at the
-// first input's place. Deletes that refreshes added to the inputs since the snapshot are
-// carried over: a document the snapshot had live is in the merged segment at ordinal
-// base + ord - (snapshot deletes up to ord), where base is the live count of the inputs
-// before it, which is exactly the order segment.Merge assigns. A merge whose inputs are
-// wholly deleted writes nothing and only drops them.
+// Then it publishes, under the commit lock: the merged segment replaces its inputs, at
+// the first input's place. Deletes that refreshes added to the inputs since the snapshot
+// are carried over: a document the snapshot had live is in the merged segment at
+// ordinal base + ord - (snapshot deletes up to ord), where base is the live count of
+// the inputs before it, which is exactly the order segment.Merge assigns. A merge whose
+// inputs are wholly deleted writes nothing and only drops them.
+//
+// Last it flushes (flush.go), so a merge commit is durable when runMerge returns: its
+// manifest lists the merged segment (fsynced as it was written) together with every
+// generation refreshes published before it, never an unsynced file, and its inputs'
+// files can go as soon as readers release them instead of a flush interval later.
 
 // mergePlan is one merge: its inputs, all of one kind.
 type mergePlan struct {
@@ -155,8 +159,15 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 	if err != nil {
 		return nil, err
 	}
-	defer budget.release(tokens)
-	start := time.Now()
+	held := true
+	releaseTokens := func() {
+		if held {
+			held = false
+			budget.release(tokens)
+		}
+	}
+	defer releaseTokens()
+	start := s.opts.Clock.Now()
 
 	g := s.Acquire()
 	if g == nil {
@@ -201,17 +212,18 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 		return nil, err
 	}
 
-	published, err := s.commitMerge(ctx, p, out, snap, bases)
-	if !published && out != nil {
-		_ = out.close()
-		if !isCrash(err) {
+	if err := s.publishMerge(ctx, p, out, snap, bases); err != nil {
+		if out != nil {
+			_ = out.close()
 			s.jan.removeLater(segmentFiles(s.dir, out.id)...)
 		}
-	}
-	if err != nil {
 		return nil, err
 	}
-	d := time.Since(start)
+	releaseTokens()
+	if err := s.Flush(ctx); err != nil {
+		return nil, err
+	}
+	d := s.opts.Clock.Since(start)
 	s.inst.recordMerge(ctx, d, written)
 	s.log.DebugContext(ctx, "merged", slog.String("kind", p.kind.String()), slog.Int("segments", len(p.inputs)),
 		slog.Uint64("live", live), slog.Int64("bytes", written), slog.Float64(telemetryDuration, float64(d.Microseconds())/1000))
@@ -252,7 +264,7 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 	meta, err := segment.Merge(s.dir, readers, snap, segment.MergeOptions{
 		Name:      name,
 		Threads:   threads,
-		NoDirSync: true, // the commit syncs the directory (see commit)
+		NoDirSync: true, // the flush syncs the directory
 		Throttle: func(n int) error {
 			written += int64(n)
 			return s.opts.MergeBudget.throttle(ctx, n)
@@ -267,20 +279,22 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, 0, err
 	}
+	out.synced = true
+	s.noteSynced(meta.Path)
 	return out, written, nil
 }
 
-// commitMerge replaces p's inputs with out (nil: they were wholly deleted), carrying
-// over the deletes made since snap.
-func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap []*roaring.Bitmap, bases []uint64) (bool, error) {
+// publishMerge replaces p's inputs with out (nil: they were wholly deleted), carrying
+// over the deletes made since snap. When it fails, nothing is published.
+func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap []*roaring.Bitmap, bases []uint64) error {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	cur := s.cur.Load()
 	if cur == nil {
-		return false, ErrClosed
+		return ErrClosed
 	}
 	if err := s.usable(); err != nil {
-		return false, err
+		return err
 	}
 	list := cur.docs
 	if p.kind == kindQueries {
@@ -314,7 +328,7 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 		}
 	}
 	if place < 0 {
-		return false, errors.New("shard: merge inputs vanished from the current generation")
+		return errors.New("shard: merge inputs vanished from the current generation")
 	}
 	if out != nil {
 		st := segState{ref: out, deletes: emptyDeletes}
@@ -327,8 +341,12 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 	if p.kind == kindQueries {
 		docs, queries = slices.Clone(cur.docs), next
 	}
-	published, err := s.commit(ctx, docs, queries, p.inputs, cur.seq, cur.maxSeq, cur.uid, cur.mp)
-	if published && out != nil && s.forceEligible != nil {
+	var built []*segRef
+	if out != nil {
+		built = []*segRef{out}
+	}
+	s.publish(ctx, docs, queries, built, cur.seq, cur.maxSeq, cur.uid, cur.mp)
+	if out != nil && s.forceEligible != nil {
 		// A merge of only segments a ForceMerge is responsible for (a background merge
 		// in flight when it started, whose inputs all existed then, or its own) makes a
 		// segment it is responsible for. One that also took a segment refreshed since
@@ -344,7 +362,7 @@ func (s *Shard) commitMerge(ctx context.Context, p mergePlan, out *segRef, snap 
 			s.forceEligible[out] = true
 		}
 	}
-	return published, err
+	return nil
 }
 
 // ForceMerge merges the segments the shard holds when it is called down to at most

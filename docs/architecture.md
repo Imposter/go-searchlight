@@ -46,13 +46,14 @@ flowchart LR
 | `internal/cluster` | `cluster.Node`, the only coordinator, a cluster of one included. It covers membership, leases and fencing, the allocator, peer recovery, routing with adaptive replica selection and retries, push hints, maintenance (pruning), cluster health and the rolling shutdown |
 | `internal/node` | The engine under the cluster node: the index catalogue, the write path (analysis, mapping updates, group commit), one hosted copy and tailer per shard, reads with read-your-writes, scatter-gather and reduce |
 | `internal/replica` | The tailer: keeps one shard copy in step with the changelog (recovering, tailing, halted) |
-| `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, deletes sidecars, tiered merges under a node-wide budget, filter cache, manifest |
+| `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
 | `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
 | `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort and `search_after`, aggregations, cross-shard reduce |
 | `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, exact verification |
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
 | `internal/telemetry` | slog JSON logs with trace ids, OpenTelemetry traces and metrics, Prometheus, pprof |
+| `internal/clock` | The engine's source of time: every timer, ticker, sleep and elapsed-time reading goes through an injected `clock.Clock`, `clock.Real` in production and `clock.Fake` in tests |
 
 Packages depend one way: `cmd → api, cluster → node → replica → shard → segment`, with
 `search`, `percolate`, `query`, `schema` and `analysis` below them, and `store` beside
@@ -77,7 +78,8 @@ sequenceDiagram
   P->>T: wake their tailers
   T->>DB: ChangesAfter(shard, applied seq)
   T->>T: analyze, apply to the write buffer
-  T->>T: refresh: buffer to segment, new generation, manifest
+  T->>T: refresh (every refresh_interval): buffer to segment, publish a generation
+  T->>T: flush (every flush_interval): fsync, swap the manifest, advance CommittedSeq
 ```
 
 1. **Validation.** The coordinating node, which is any node, analyzes and validates the
@@ -100,17 +102,33 @@ sequenceDiagram
    changes and applies them to the shard's write buffer. Seqs are global, so a shard
    sees gaps. A short page proves that nothing below the head is missing, and the copy
    advances past the gap.
-5. **Refresh.** Every `refresh_interval`, or at once for `refresh=true` and
-   `refresh=wait_for`, the buffer becomes an immutable segment.
+5. **Refresh is visibility.** Refreshes tick on a fixed grid, every `refresh_interval`
+   from the copy's open, so a refresh's own cost never stretches the period. One that
+   overruns skips the ticks it missed. `refresh=true` forces one at once, and a full
+   buffer (64 MiB) starts one early.
+   - The buffer becomes an immutable segment, written without fsync. The deletes it
+     masks stay in memory.
    - The new generation (the list of segments) is published through an
      `atomic.Pointer`, and readers never lock.
-   - Segment files are fsynced, and the manifest, the copy's commit point, is swapped
-     atomically.
-   - The manifest records the changelog seq the segments cover (`CommittedSeq`), and
-     the copy reports it to the registry as its applied seq.
+   - `refresh=wait_for` waits for the first published generation that covers the write;
+     it never forces a refresh, and never waits for durability.
+6. **Flush is durability.** A flush runs every `flush_interval` (10 s), at shutdown, at
+   every merge commit and before a peer snapshot.
+   - It fsyncs the segment files no flush has synced, and writes and fsyncs the deletes
+     sidecars.
+   - It swaps the manifest, the copy's commit point, atomically: temp file, fsync,
+     rename, directory fsync.
+   - Only then does it advance `CommittedSeq` to the manifest's seq. The copy reports
+     that as its applied seq, and the changelog is never pruned past it. So
+     `CommittedSeq` only ever claims what is on disk.
+   - A failed fsync is never retried: after a write-back error a later fsync can
+     succeed over lost pages. It fails the copy, which reopens from its last flushed
+     manifest.
 
-There is no per-node translog. After a crash, a copy reopens the segments its manifest
-lists and replays the changelog from the manifest's seq.
+There is no per-node translog: the SQL changelog is the write-ahead log, so nothing a
+copy publishes needs to be durable on the copy first. After a crash, a copy reopens the
+segments of its last flushed manifest and replays the changelog from that manifest's
+seq, which is at most `flush_interval` of changes.
 
 ### Shards and segments
 
@@ -128,10 +146,15 @@ data_dir/
 - **Updates and deletes** mark older segments' documents dead in a per-generation
   sidecar. An id the buffer touched masks every older version of it at the same refresh
   that publishes the new one, so no reader ever sees two live versions of an id.
-- **Merges** follow a tiered policy, like Lucene's. They write new files and swap the
-  manifest, run in the background, and share a node-wide budget: `merge_threads` for
-  CPU and `merge_budget` bytes per second for I/O. Deleted documents are dropped as
-  segments merge.
+- **Merges** follow a tiered policy, like Lucene's. A merge writes a new segment,
+  publishes it, then flushes, so its manifest never lists an unsynced file. Merges run in
+  the background and share a node-wide budget: `merge_threads` for CPU and
+  `merge_budget` bytes per second for I/O. Deleted documents are dropped as segments
+  merge.
+- **Files are removed** only once no durable manifest lists them. A sidecar goes at the
+  first flush whose manifest drops it. A merged-away segment goes once that flush has
+  run and the last reader has released it. Open removes whatever a crash left that the
+  manifest does not list.
 - **Caches.** The filter cache keeps per-segment bitmaps of frequent leaves, and needs no
   invalidation because segments are immutable. The OS page cache holds the mmap'd
   files.
@@ -215,8 +238,10 @@ stateDiagram-v2
 A copy that must be built, whether new, wiped, pruned past or corrupt:
 
 1. **Snapshot.** The tailer asks a serving peer for a snapshot. It picks the best peer
-   first, by adaptive replica selection. The peer pins one generation and lists its
-   files with their sizes and SHA-256 sums: segments, deletes sidecars and a manifest.
+   first, by adaptive replica selection. The peer flushes first, then pins the
+   generation that flush made durable, so it never hands out a seq it could itself lose.
+   It lists that generation's files with their sizes and SHA-256 sums: segments,
+   deletes sidecars and a manifest.
 2. **Staging.** Each file is streamed into `data_dir/recovery/…` as `name.part` and
    checked against its sum, then renamed and fsynced.
    - An interrupted transfer resumes with an HTTP Range request.
@@ -270,7 +295,8 @@ replays only the tail. Restart time does not grow with index size.
 The live node with the lowest id is the leader. No election is needed, because its jobs
 are idempotent. The leader:
 
-- prunes each shard's changelog below the lowest applied seq of the copies that count;
+- prunes each shard's changelog below the lowest applied seq of the copies that count.
+  A copy's applied seq is its `CommittedSeq`, what its last flush made durable;
 - sweeps abandoned blob uploads.
 
 The copies that count are:
@@ -317,20 +343,26 @@ until T/10 before the deadline (at least 0.4 T), and the store, the admin listen
 telemetry close in the last T/10. A second signal ends the process at once. A signal
 during startup stops the node cleanly too, with exit code 0.
 
+## Time: the injectable clock
+
+Every timer, ticker, sleep and elapsed-time reading in the engine goes through an
+injected `clock.Clock` (`internal/clock`). That covers shard refreshes and flushes,
+replica polling and backoff, cluster heartbeats, leases and maintenance, the group-commit
+window, the API's request timing and its shutdown grace.
+
+- **Production.** `clock.Real` runs everything. `cmd/searchlight` passes it to the store,
+  the cluster node (which hands it to the engine) and the API.
+- **Tests.** They drive a `clock.Fake`, advancing it instead of waiting.
+- **Monotonic and wall time.** Durations use the monotonic reading, so a stepped wall
+  clock never stretches a measured interval. Lease validity also checks the wall clock,
+  which keeps running while a machine is suspended.
+- **Enforcement.** A forbidigo rule in `.golangci.yml` forbids direct `time.Now`,
+  `time.After`, timers and sleeps in the engine's production packages: `shard`,
+  `replica`, `cluster`, `store`, `node` and `api`.
+- **Refresh scheduling.** Refreshes run on a fixed grid of this clock (`clock.GridLoop`).
+
 ## Planned, not built
 
-- **Refresh/flush split**
-  ([#12](https://github.com/Imposter/go-searchlight/issues/12), plan Task 15c).
-  - Today every refresh that writes a segment also fsyncs it and commits the manifest.
-    A refresh that only moves the changelog position is persisted at most every
-    `seq_persist_interval`.
-  - The split would publish refreshes without an fsync, and flush (fsync, manifest,
-    `CommittedSeq`) on a cadence of its own.
-- **Fixed-grid refresh and a fake clock**
-  ([#10](https://github.com/Imposter/go-searchlight/issues/10),
-  [#11](https://github.com/Imposter/go-searchlight/issues/11), plan Tasks 15a and 15b).
-  The refresh timer re-arms after each refresh ends, so the period is the interval plus
-  the refresh time.
 - **Recovery from `sl_blobs` bundles.** The store has the blob table and its protocol,
   chunked and checksummed, and the leader sweeps abandoned uploads. But no node publishes
   segment bundles yet, and recovery without a peer goes straight to `ScanShard`. The spec

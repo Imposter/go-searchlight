@@ -60,13 +60,13 @@ func TestSnapshotOutlivesSupersededSidecars(t *testing.T) {
 	wantQueries := maps.Clone(h.queries())
 	wantSeq := h.seq
 
-	sn, err := h.s.Snapshot()
+	sn, err := h.s.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sn.Release()
-	if sn.Seq() != wantSeq {
-		t.Fatalf("Seq %d, want %d", sn.Seq(), wantSeq)
+	if sn.Seq() != wantSeq || h.s.CommittedSeq() != wantSeq {
+		t.Fatalf("Seq %d, CommittedSeq %d: want %d, a snapshot of a flushed generation", sn.Seq(), h.s.CommittedSeq(), wantSeq)
 	}
 	var sidecars []string
 	for _, f := range sn.Files() {
@@ -78,11 +78,11 @@ func TestSnapshotOutlivesSupersededSidecars(t *testing.T) {
 		t.Fatal("the snapshot lists no deletes sidecar")
 	}
 
-	// A later commit replaces the sidecars on disk.
+	// A later flush replaces the sidecars on disk.
 	h.del("d06", "d07", "d10", "d11")
 	h.delQuery("q2")
 	h.upsert("d08")
-	h.refresh()
+	h.commit()
 	h.s.jan.drain()
 	for _, name := range sidecars {
 		if _, err := os.Stat(filepath.Join(h.dir, name)); !errors.Is(err, os.ErrNotExist) {
@@ -125,7 +125,7 @@ func TestSnapshotHoldsSegmentFiles(t *testing.T) {
 	h.refresh()
 	h.upsert("c")
 	h.refresh()
-	sn, err := h.s.Snapshot()
+	sn, err := h.s.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

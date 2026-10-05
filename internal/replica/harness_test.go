@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"go.opentelemetry.io/otel/attribute"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -243,7 +244,7 @@ func mustApply(t testing.TB, st store.Store, batch ...store.Change) int64 {
 func testShardOptions(id ShardID) shard.Options {
 	return shard.Options{
 		Index: id.Index, Shard: id.Shard,
-		RefreshInterval: 20 * time.Millisecond, SeqPersistInterval: 50 * time.Millisecond,
+		RefreshInterval: 20 * time.Millisecond, FlushInterval: 50 * time.Millisecond,
 		Logger: quietLogger, FilterCache: shard.NewFilterCache(1<<20, nil),
 	}
 }
@@ -396,6 +397,10 @@ type copyRunner struct {
 	dir  string
 	opts Options
 	sopt shard.Options
+	// clk, when set, is the tailer's clock (opts.Clock): the waits advance it by step
+	// whenever the tailer is parked on a timer.
+	clk  *clock.Fake
+	step time.Duration
 
 	mu     sync.Mutex
 	tailer *Tailer
@@ -490,9 +495,49 @@ func (c *copyRunner) crashOnly() {
 	c.shard().Abandon()
 }
 
+func tctx(t testing.TB) context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func (c *copyRunner) current() *Tailer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tailer
+}
+
+// withFakeClock runs the copy's tailer on a fake clock, which its waits advance by
+// step whenever the tailer is parked on a timer.
+func (c *copyRunner) withFakeClock(step time.Duration) *clock.Fake {
+	c.clk, c.step = clock.NewFake(time.Now()), step
+	c.opts.Clock = c.clk
+	return c.clk
+}
+
+// until advances the fake clock by step each time the tailer parks on a timer, until
+// cond holds when it parks: the tailer is idle then, so what it did is done.
+func (c *copyRunner) until(what string, cond func() bool) {
+	c.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for {
+		if err := c.clk.BlockUntil(ctx, 1); err != nil {
+			c.t.Fatalf("%s: the tailer never parked: %v", what, err)
+		}
+		if cond() {
+			return
+		}
+		c.clk.Advance(c.step)
+	}
+}
+
 // waitApplied waits until the copy has applied, and made searchable, seq.
 func (c *copyRunner) waitApplied(seq int64) *shard.Shard {
 	c.t.Helper()
+	if c.clk != nil {
+		return c.waitAppliedByClock(seq)
+	}
 	deadline := time.Now().Add(time.Minute)
 	for {
 		c.mu.Lock()
@@ -532,6 +577,21 @@ func (c *copyRunner) waitApplied(seq int64) *shard.Shard {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func (c *copyRunner) waitAppliedByClock(seq int64) *shard.Shard {
+	c.t.Helper()
+	c.until(fmt.Sprintf("apply %d", seq), func() bool {
+		tl := c.current()
+		return tl.Applied() >= seq && tl.State() == StateTailing
+	})
+	sh := c.shard()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := sh.WaitRefreshed(ctx, seq); err != nil {
+		c.t.Fatalf("WaitRefreshed(%d): %v", seq, err)
+	}
+	return sh
 }
 
 func attrKey(k string) attribute.Key { return attribute.Key(k) }

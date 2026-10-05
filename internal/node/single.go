@@ -58,6 +58,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/replica"
@@ -76,9 +77,9 @@ const DefaultMaxApplyLag = 100_000
 type Options struct {
 	// Store is the SQL store, migrated. The node does not close it.
 	Store store.Store
-	// Config is the node's configuration: data_dir, refresh_interval,
-	// seq_persist_interval, merge_threads, merge_budget, search_threads, max_doc_bytes,
-	// node_id, advertise_address and max_lag are used.
+	// Config is the node's configuration: data_dir, refresh_interval, flush_interval,
+	// merge_threads, merge_budget, search_threads, max_doc_bytes, node_id,
+	// advertise_address and max_lag are used.
 	Config config.Config
 	// NewTailer makes each shard copy's tailer. Nil means the replica tailer
 	// (ReplicaTailers), sharing one replica Hub the node runs when the store
@@ -102,6 +103,11 @@ type Options struct {
 	// shards from peers, and keeps its index catalogue in step with the store
 	// (SyncCatalog). Nil: a single node, hosting every shard's one copy.
 	Cluster Cluster
+	// Clock runs the node's timers (refreshes, database pings, waits and their
+	// bounds) and those of its shards, tailers, replica Hub and group committer, and
+	// judges readiness and staleness against max_lag. Nil means clock.Real. On a
+	// clock.Fake a write waits out the group commit window until the fake is advanced.
+	Clock clock.Clock
 	// Logger, Tracer and Meter are the node's telemetry; nil means slog.Default() and
 	// the OpenTelemetry globals.
 	Logger *slog.Logger
@@ -122,6 +128,7 @@ type Single struct {
 	log     *slog.Logger
 	tr      trace.Tracer
 	meter   metric.Meter
+	clock   clock.Clock
 	budget  *shard.MergeBudget
 	cache   *shard.FilterCache
 	maxLag  int64
@@ -139,6 +146,8 @@ type Single struct {
 	// reserved are names being created or dropped: no other create takes them.
 	reserved map[string]bool
 	closed   bool
+
+	absent absentIndexes
 
 	// bgCancel stops the Background loops; bg waits for them.
 	bgCancel context.CancelFunc
@@ -188,12 +197,9 @@ type shardSlot struct {
 	written  atomic.Int64
 	querySeq atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
-	host sync.Mutex
-	// local is this node's copy, nil when it hosts none.
-	local atomic.Pointer[copyState]
-	// unhostedAt is when this node last stopped hosting a copy of the shard (Unix
-	// nanoseconds; 0: not this run).
-	unhostedAt atomic.Int64
+	host           sync.Mutex
+	local          atomic.Pointer[copyState]
+	unhostedAtNano atomic.Int64
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.
@@ -263,13 +269,13 @@ func (n *Single) pingInterval() time.Duration {
 
 // pingLoop checks the database until ctx ends.
 func (n *Single) pingLoop(ctx context.Context) {
-	t := time.NewTicker(n.pingInterval())
+	t := n.clock.NewTicker(n.pingInterval())
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		// A database slower than max_lag/2 to answer a ping is as good as gone
 		// for reads that must not trail by more than max_lag.
@@ -294,7 +300,7 @@ func (n *Single) pingTimeout() time.Duration {
 // noteDB records whether the database just answered.
 func (n *Single) noteDB(err error) {
 	if err == nil {
-		n.dbOK.Store(time.Now().UnixNano())
+		n.dbOK.Store(n.clock.Now().UnixNano())
 		n.dbDown.Store(false)
 		return
 	}
@@ -434,6 +440,12 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.MaxApplyLag <= 0 {
 		o.MaxApplyLag = DefaultMaxApplyLag
 	}
+	if o.Clock == nil {
+		o.Clock = clock.Real{}
+	}
+	if o.GroupCommit.Clock == nil {
+		o.GroupCommit.Clock = o.Clock
+	}
 	if o.GroupCommit.Tracer == nil {
 		o.GroupCommit.Tracer = o.Tracer
 	}
@@ -443,11 +455,11 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.NewTailer == nil {
 		// One Hub per node, shared by every tailer; nil (no notifications, as on
 		// SQLite and MySQL) means the tailers poll and are woken by writes.
-		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter})
+		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter, Clock: o.Clock})
 		if hub != nil {
 			o.Background = append(o.Background, hub.Run)
 		}
-		o.NewTailer = ReplicaTailers(o.Config, hub, o.Logger, o.Tracer, o.Meter)
+		o.NewTailer = ReplicaTailers(o.Config, hub, o.Clock, o.Logger, o.Tracer, o.Meter)
 	}
 	n := &Single{
 		st:       o.Store,
@@ -458,10 +470,12 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		log:      o.Logger,
 		tr:       o.Tracer,
 		meter:    o.Meter,
-		budget:   shard.NewMergeBudget(max(1, o.Config.MergeThreads), o.Config.MergeBudget),
+		clock:    o.Clock,
+		budget:   shard.NewMergeBudget(max(1, o.Config.MergeThreads), o.Config.MergeBudget, o.Clock),
 		cache:    shard.NewFilterCache(shard.DefaultFilterCacheBytes, o.Meter),
 		maxLag:   o.MaxApplyLag,
 		indexes:  map[string]*index{},
+		absent:   absentIndexes{clock: o.Clock},
 		reserved: map[string]bool{},
 	}
 	if o.Config.SearchThreads > 0 {
@@ -602,16 +616,17 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	}
 	state := idx.meta.Load()
 	opts := shard.Options{
-		Index:              idx.name,
-		Shard:              s,
-		RefreshInterval:    -1, // the node's refresher drives refreshes, so the interval can change
-		SeqPersistInterval: n.cfg.SeqPersistInterval,
-		MergeBudget:        n.budget,
-		FilterCache:        n.cache,
-		QueryIndex:         percolate.Index{},
-		Logger:             n.log,
-		Tracer:             n.tr,
-		Meter:              n.meter,
+		Index:           idx.name,
+		Shard:           s,
+		RefreshInterval: -1, // the node's refresher drives refreshes, so the interval can change
+		FlushInterval:   n.cfg.FlushInterval,
+		MergeBudget:     n.budget,
+		FilterCache:     n.cache,
+		QueryIndex:      percolate.Index{},
+		Clock:           n.clock,
+		Logger:          n.log,
+		Tracer:          n.tr,
+		Meter:           n.meter,
 	}
 	if n.opts.ShardOptions != nil {
 		n.opts.ShardOptions(&opts)
@@ -684,43 +699,26 @@ func (n *Single) runTailer(ctx context.Context, idx *index, c *copyState) {
 	n.log.ErrorContext(ctx, "shard copy halted", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
 }
 
-// refresher refreshes an index's copies every refresh interval (which settings may
-// change at any time).
 func (n *Single) refresher(ctx context.Context, idx *index) {
 	defer idx.wg.Done()
 	warn := time.Time{}
-	for {
-		d := time.Duration(idx.refresh.Load())
-		var tick <-chan time.Time
-		var timer *time.Timer
-		if d > 0 {
-			timer = time.NewTimer(d)
-			tick = timer.C
-		}
-		select {
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
+	clock.GridLoop{
+		Clock:    n.clock,
+		Period:   func() time.Duration { return time.Duration(idx.refresh.Load()) },
+		Reanchor: idx.refreshWake,
+		Task: func() {
+			for _, c := range idx.copies() {
+				sh := c.shard()
+				if sh == nil || sh.Err() != nil {
+					continue
+				}
+				if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && n.clock.Since(warn) > time.Minute {
+					warn = n.clock.Now()
+					n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
+				}
 			}
-			return
-		case <-idx.refreshWake:
-			if timer != nil {
-				timer.Stop()
-			}
-			continue
-		case <-tick:
-		}
-		for _, c := range idx.copies() {
-			sh := c.shard()
-			if sh == nil || sh.Err() != nil {
-				continue
-			}
-			if err := sh.Refresh(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, shard.ErrClosed) && time.Since(warn) > time.Minute {
-				warn = time.Now()
-				n.log.WarnContext(ctx, "refresh failed", slog.String(telemetry.KeyIndex, c.id.Index), slog.Int(telemetry.KeyShard, c.id.Shard), slog.Any("error", err))
-			}
-		}
-	}
+		},
+	}.Run(ctx)
 }
 
 // stopIndex stops an index's tailers and refresher and closes its copies.
@@ -759,6 +757,17 @@ func (n *Single) noteHead(seq int64) {
 // lookup returns an open index, or a 404. A cluster node that does not know the index
 // yet (another node created it since its last catalogue sync) looks it up in the store.
 func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
+	return n.lookupIndex(ctx, name, false)
+}
+
+// lookupForRead is lookup for a read, which may answer 404 from a recent store lookup
+// (absentTTL) unless it waits for a seq: a read that names one follows a write, and
+// must find the index that write found.
+func (n *Single) lookupForRead(ctx context.Context, name string, waitSeq int64) (*index, error) {
+	return n.lookupIndex(ctx, name, waitSeq <= 0)
+}
+
+func (n *Single) lookupIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {
 	n.mu.RLock()
 	closed, idx := n.closed, n.indexes[name]
 	n.mu.RUnlock()
@@ -769,7 +778,7 @@ func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
 		return idx, nil
 	}
 	if n.cl != nil {
-		if idx, err := n.adoptIndex(ctx, name); err != nil || idx != nil {
+		if idx, err := n.adoptIndex(ctx, name, cachedAbsence); err != nil || idx != nil {
 			return idx, err
 		}
 	}

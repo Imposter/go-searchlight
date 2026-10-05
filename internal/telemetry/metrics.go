@@ -126,6 +126,8 @@ const (
 	// Refresh and merge.
 	MetricRefreshDuration = "searchlight.shard.refresh.duration"
 	MetricRefreshFailures = "searchlight.shard.refresh.failures"
+	MetricFlushDuration   = "searchlight.shard.flush.duration"
+	MetricFlushFailures   = "searchlight.shard.flush.failures"
 	MetricMergeFailures   = "searchlight.shard.merge.failures"
 	MetricMergeDuration   = "searchlight.shard.merge.duration"
 	MetricMergeBytes      = "searchlight.shard.merge.bytes"
@@ -162,6 +164,7 @@ const (
 	// Database.
 	MetricStoreOperationDuration = "searchlight.store.operation.duration"
 	MetricStoreErrors            = "searchlight.store.errors"
+	MetricStoreWALSize           = "searchlight.store.wal.size"
 )
 
 // Histogram bucket boundaries.
@@ -196,6 +199,8 @@ var Catalog = []MetricSpec{
 
 	{MetricRefreshDuration, KindHistogram, "s", "Shard refresh time, by index and shard.", SlowBuckets},
 	{MetricRefreshFailures, KindCounter, "{refresh}", "Shard refreshes that failed (the buffer is kept and retried), by index and shard.", nil},
+	{MetricFlushDuration, KindHistogram, "s", "Shard flush time (fsyncs, sidecars, manifest), by index and shard.", SlowBuckets},
+	{MetricFlushFailures, KindCounter, "{flush}", "Shard flushes that failed (retried at the next), by index and shard.", nil},
 	{MetricMergeFailures, KindCounter, "{merge}", "Segment merges that failed or were abandoned, by index and shard.", nil},
 	{MetricMergeDuration, KindHistogram, "s", "Segment merge time, by index and shard.", SlowBuckets},
 	{MetricMergeBytes, KindCounter, "By", "Bytes written by segment merges, by index and shard.", nil},
@@ -229,6 +234,7 @@ var Catalog = []MetricSpec{
 
 	{MetricStoreOperationDuration, KindHistogram, "s", "SQL store latency by operation and dialect.", FastBuckets},
 	{MetricStoreErrors, KindCounter, "{error}", "SQL store errors by operation and dialect.", nil},
+	{MetricStoreWALSize, KindGauge, "By", "SQLite's write-ahead log file size, and the part of it no checkpoint has copied yet (pending=true).", nil},
 }
 
 var catalogIndex = func() map[string]*MetricSpec {

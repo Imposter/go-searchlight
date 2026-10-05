@@ -350,7 +350,3 @@ Every error is RFC 9457 problem JSON (`application/problem+json`):
 - **Retries.** 429 and 503 carry `Retry-After`. Both are safe to retry. A write that got
   a 5xx may or may not have committed, so retry it with `if_seq` or `op_type=create`
   when that matters.
-- **Just after `createIndex`.** For about a second after an index is created on one
-  node, another node may answer reads of it with a 503 `unavailable` (`no other node
-  holds a serving copy of shard …`). The cause is that its routing view does not show
-  the new copies yet. Retry it like any 503.

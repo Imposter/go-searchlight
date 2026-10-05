@@ -65,6 +65,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -120,6 +121,9 @@ type Options struct {
 	// HaltRetryBase and HaltRetryCap bound the backoff of a halted copy's retries.
 	// 0 means DefaultHaltRetryBase and DefaultHaltRetryCap.
 	HaltRetryBase, HaltRetryCap time.Duration
+	// Clock runs the tailer's polls, backoffs and debounces and ages its lag. Nil
+	// means clock.Real.
+	Clock clock.Clock
 	// RemapDebounce is how long a copy that a mapping change must rebuild waits,
 	// applying nothing, for more mapping changes to come, so that a burst of them
 	// costs one rebuild (at the latest seq) rather than one each. The wait restarts
@@ -198,6 +202,9 @@ func (o *Options) resolve() {
 	o.HaltRetryCap = max(o.HaltRetryCap, o.HaltRetryBase)
 	if o.RemapDebounce == 0 {
 		o.RemapDebounce = DefaultRemapDebounce
+	}
+	if o.Clock == nil {
+		o.Clock = clock.Real{}
 	}
 	if o.Logger == nil {
 		o.Logger = slog.Default()
@@ -333,11 +340,11 @@ func NewTailer(st store.Store, sh *shard.Shard, id ShardID, opts Options) *Taile
 		tr:        opts.Tracer,
 		wake:      make(chan struct{}, 1),
 		shardOpts: sh.Options(),
-		cat:       catalog{idx: st.Indexes(), name: id.Index},
-		warn:      rateLimitedWarn{every: 30 * time.Second},
+		cat:       catalog{idx: st.Indexes(), name: id.Index, clock: opts.Clock},
+		warn:      rateLimitedWarn{clock: opts.Clock, every: 30 * time.Second},
 	}
 	t.inst = newInstruments(opts.Meter, id, t.log)
-	t.lag.lastOK = time.Now()
+	t.lag.lastOK = t.opts.Clock.Now()
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
 	if opts.Copy != nil {
@@ -368,10 +375,10 @@ func (t *Tailer) Lag() (seq int64, age time.Duration) {
 	t.lag.mu.Lock()
 	defer t.lag.mu.Unlock()
 	if t.lag.behind {
-		age = t.lag.age + time.Since(t.lag.obs)
+		age = t.lag.age + t.opts.Clock.Since(t.lag.obs)
 	}
 	if t.lag.failing {
-		age = max(age, time.Since(t.lag.lastOK))
+		age = max(age, t.opts.Clock.Since(t.lag.lastOK))
 	}
 	return t.lag.seq, age
 }
@@ -393,7 +400,7 @@ func (t *Tailer) pollFailed() {
 func (t *Tailer) pollOK() {
 	t.lag.mu.Lock()
 	defer t.lag.mu.Unlock()
-	t.lag.failing, t.lag.lastOK = false, time.Now()
+	t.lag.failing, t.lag.lastOK = false, t.opts.Clock.Now()
 }
 
 // observeLag records a poll's view: head and applied seqs, and the age of the oldest
@@ -404,7 +411,7 @@ func (t *Tailer) observeLag(head, applied int64, behind bool, age time.Duration)
 	t.lag.seq = max(0, head-applied)
 	t.lag.behind = behind
 	t.lag.age = max(0, age)
-	t.lag.obs = time.Now()
+	t.lag.obs = t.opts.Clock.Now()
 }
 
 // State returns the tailer's state.
@@ -538,7 +545,7 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		// CatalogInterval stops the copy.
 		// The catalogue is read again at every retry (RetryBase to RetryCap
 		// apart), so any moment it holds the index ends the grace.
-		if !t.cat.missingSince.IsZero() && time.Since(t.cat.missingSince) >= t.opts.CatalogInterval {
+		if !t.cat.missingSince.IsZero() && t.opts.Clock.Since(t.cat.missingSince) >= t.opts.CatalogInterval {
 			return err
 		}
 		t.log.DebugContext(ctx, "index missing; checking the catalogue again", slog.Any("error", err))
@@ -565,14 +572,14 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 // backoff waits out the next retry delay, or until ctx ends.
 func (t *Tailer) backoff(ctx context.Context) {
 	t.retry = nextBackoff(t.retry, t.opts.RetryBase, t.opts.RetryCap)
-	sleepCtx(ctx, t.retry)
+	t.pause(ctx, t.retry)
 }
 
 // backoffRebuild waits out the next delay between rebuild attempts: longer than
 // tailing retries, since each one wipes and reloads the copy.
 func (t *Tailer) backoffRebuild(ctx context.Context) {
 	t.rebuildWait = nextBackoff(t.rebuildWait, t.opts.RetryBase, t.opts.RebuildRetryCap)
-	sleepCtx(ctx, t.rebuildWait)
+	t.pause(ctx, t.rebuildWait)
 }
 
 func nextBackoff(cur, base, ceiling time.Duration) time.Duration {
@@ -582,13 +589,8 @@ func nextBackoff(cur, base, ceiling time.Duration) time.Duration {
 	return min(2*cur, ceiling)
 }
 
-func sleepCtx(ctx context.Context, d time.Duration) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
+func (t *Tailer) pause(ctx context.Context, d time.Duration) {
+	_ = t.opts.Clock.Sleep(ctx, d)
 }
 
 // sleep waits for a wake-up, the poll interval, or the next report.
@@ -598,14 +600,14 @@ func (t *Tailer) sleep(ctx context.Context, hub *Hub) {
 		d = t.opts.WatchedPollInterval
 	}
 	if t.copy != nil && t.Shard().CommittedSeq() > t.reported {
-		d = min(d, max(time.Millisecond, t.opts.ReportInterval-time.Since(t.lastReport)))
+		d = min(d, max(time.Millisecond, t.opts.ReportInterval-t.opts.Clock.Since(t.lastReport)))
 	}
-	timer := time.NewTimer(d)
+	timer := t.opts.Clock.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 	case <-t.wake:
-	case <-timer.C:
+	case <-timer.C():
 	}
 }
 
@@ -666,7 +668,7 @@ func (t *Tailer) housekeeping(ctx context.Context, caughtUp bool) error {
 			return err
 		}
 	}
-	if time.Since(t.lastCatalog) >= t.opts.CatalogInterval {
+	if t.opts.Clock.Since(t.lastCatalog) >= t.opts.CatalogInterval {
 		if err := t.refreshCatalog(ctx); err != nil {
 			return err
 		}
@@ -681,23 +683,27 @@ func (t *Tailer) report(ctx context.Context, force bool) error {
 		return nil
 	}
 	seq := t.Shard().CommittedSeq()
-	if seq <= t.reported || (!force && time.Since(t.lastReport) < t.opts.ReportInterval) {
+	if seq <= t.reported || (!force && t.opts.Clock.Since(t.lastReport) < t.opts.ReportInterval) {
 		return nil
 	}
 	if err := t.st.Registry().ReportApplied(ctx, *t.copy, seq); err != nil {
 		return fmt.Errorf("report applied seq %d: %w", seq, err)
 	}
-	t.reported, t.lastReport = seq, time.Now()
+	t.reported, t.lastReport = seq, t.opts.Clock.Now()
 	return nil
 }
 
-// finalReport makes a last report when Run stops, best effort.
+// finalReport flushes the copy and makes a last report when Run stops, best effort, so
+// the registry holds every seq the copy has published.
 func (t *Tailer) finalReport(ctx context.Context) {
 	if t.copy == nil {
 		return
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
+	if err := t.Shard().Flush(rctx); err != nil {
+		t.log.DebugContext(ctx, "final flush failed", slog.Any("error", err))
+	}
 	if err := t.report(rctx, true); err != nil {
 		t.log.DebugContext(ctx, "final applied-seq report failed", slog.Any("error", err))
 	}
@@ -728,13 +734,14 @@ func (t *Tailer) markServing(ctx context.Context) error {
 
 // rateLimitedWarn lets a recurring failure be logged at most once per every.
 type rateLimitedWarn struct {
+	clock      clock.Clock
 	every      time.Duration
 	last       time.Time
 	suppressed int
 }
 
 func (w *rateLimitedWarn) allow() (suppressed int, ok bool) {
-	if now := time.Now(); now.Sub(w.last) >= w.every {
+	if now := w.clock.Now(); now.Sub(w.last) >= w.every {
 		suppressed = w.suppressed
 		w.last, w.suppressed = now, 0
 		return suppressed, true

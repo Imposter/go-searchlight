@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -78,8 +79,7 @@ type fetcher struct {
 	mu      sync.Mutex
 	running map[store.ShardID]*atomic.Int64
 	fetched map[store.ShardID]*atomic.Int64
-	// ended is when each shard's last recovery here ended (staging collection).
-	ended map[store.ShardID]time.Time
+	ended   map[store.ShardID]time.Time
 }
 
 // begin marks id recovering; the returned func ends it.
@@ -102,7 +102,7 @@ func (f *fetcher) begin(id store.ShardID) (*atomic.Int64, func()) {
 		if f.ended == nil {
 			f.ended = map[store.ShardID]time.Time{}
 		}
-		f.ended[id] = time.Now()
+		f.ended[id] = f.n.clock.Now()
 	}
 }
 
@@ -147,12 +147,12 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 	for _, c := range cands {
 		delay := 100 * time.Millisecond
 		for attempt := 1; attempt <= fetchAttempts; attempt++ {
-			start := time.Now()
-			progress.Store(0) // per attempt: a retry that redoes the work is no progress
+			start := n.clock.Now()
+			progress.Store(0)
 			bytes, err := f.fetchFrom(ctx, c, id, dir, staging)
 			if err == nil {
 				_ = os.RemoveAll(staging)
-				secs := time.Since(start).Seconds()
+				secs := n.clock.Since(start).Seconds()
 				n.log.InfoContext(ctx, "shard copy recovered from a peer", slog.String("shard", id.String()), slog.String("peer", c.node),
 					slog.Int64("bytes", bytes), slog.Float64("seconds", secs), slog.Float64("mb_per_s", float64(bytes)/(1<<20)/max(secs, 1e-9)))
 				return nil
@@ -170,7 +170,7 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) error
 			if errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusGone && ae.Status != http.StatusTooManyRequests {
 				break // the peer cannot serve this: try the next
 			}
-			sleep(ctx, delay)
+			_ = n.clock.Sleep(ctx, delay)
 			delay *= 2
 		}
 	}
@@ -351,7 +351,7 @@ type progressKey struct{}
 // idleReader cuts a stream (cancels its request) that delivers nothing for idle.
 type idleReader struct {
 	r     io.Reader
-	timer *time.Timer
+	timer clock.Timer
 	idle  time.Duration
 	ctr   *atomic.Int64
 }
@@ -374,7 +374,7 @@ func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part 
 	n := f.n
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	timer := time.AfterFunc(n.opts.PeerIdleTimeout, cancel)
+	timer := n.clock.AfterFunc(n.opts.PeerIdleTimeout, cancel)
 	defer timer.Stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.fileURL(c, snapID, name), http.NoBody)
 	if err != nil {
@@ -460,14 +460,4 @@ func writeSynced(dir, name string, data []byte) error {
 		return err
 	}
 	return segment.SyncDir(dir)
-}
-
-// sleep waits d or until ctx ends.
-func sleep(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-	case <-t.C:
-	}
 }

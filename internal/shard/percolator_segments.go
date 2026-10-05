@@ -72,11 +72,11 @@ type QueryIndexBuilder interface {
 	// query can never fail a refresh. Build must not fail on a query Check accepted
 	// (I/O errors aside).
 	Check(q *StoredQuery) error
-	// Build writes queries as the query segment name in dir, each file fsynced (and
-	// renamed into place if it renames), and returns the bytes it wrote. It need not
-	// fsync the directory: the shard's commit does, once, after its manifest rename.
-	// stats are the shard's document statistics, valid for the call only. A failed or
-	// cancelled Build may leave files behind: the shard removes them.
+	// Build writes queries as the query segment name in dir (renamed into place if it
+	// renames), and returns the bytes it wrote. It fsyncs nothing: the flush that first
+	// persists the segment fsyncs its files, then the directory. stats are the shard's
+	// document statistics, valid for the call only. A failed or cancelled Build may
+	// leave files behind: the shard removes them.
 	Build(ctx context.Context, dir, name string, queries []StoredQuery, stats TermStats) (int64, error)
 	// Open opens the query segment name in dir.
 	Open(dir, name string) (QuerySegment, error)
@@ -138,7 +138,7 @@ func (DefaultQueryIndex) Build(ctx context.Context, dir, name string, queries []
 	}
 	buf = binary.LittleEndian.AppendUint32(buf, crc32.Checksum(buf, castagnoli))
 	path := filepath.Join(dir, name+defaultQueryExt)
-	if err := writeFileSync(path, buf); err != nil {
+	if err := writeFile(path, buf); err != nil {
 		return 0, err
 	}
 	return int64(len(buf)), nil
@@ -328,20 +328,13 @@ func writeGroup(buf *bytes.Buffer, key string, children []query.Node) error {
 	return nil
 }
 
-// writeFileSync writes data to path: a temp file, fsynced, renamed into place. The
-// directory is not fsynced: the shard's commit does that once, after the manifest.
-func writeFileSync(path string, data []byte) error {
+func writeFile(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := segment.SyncFile(f); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err

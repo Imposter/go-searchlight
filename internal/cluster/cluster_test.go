@@ -3,7 +3,11 @@ package cluster
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -16,7 +20,9 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -557,18 +563,19 @@ func expireLeases(t testing.TB, d *db, index string) {
 // wall clock both (a suspended machine's monotonic clock may stand still); a slot taken
 // over from another node is quarantined for TTL plus margin after the claim began.
 func TestLeaseDeadlineByFakeClock(t *testing.T) {
-	clk := &fakeClock{}
-	clk.wall.Store(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC).UnixNano())
+	fake := clock.NewFake(time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC))
+	clk := leaseClock{c: fake, epoch: fake.Now()}
+	set := func(d time.Duration) { fake.Advance(d - clk.Now()) }
 	l := &lease{ttl: time.Second, margin: 100 * time.Millisecond, clock: clk}
 	l.extend(0, clk.Wall())
 	if !l.valid() {
 		t.Fatal("a fresh lease is not valid")
 	}
-	clk.set(899 * time.Millisecond)
+	set(899 * time.Millisecond)
 	if !l.valid() {
 		t.Fatal("not valid before the margin")
 	}
-	clk.set(900 * time.Millisecond)
+	set(900 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid within the margin of its deadline")
 	}
@@ -580,30 +587,30 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	if time.Duration(l.deadline.Load()) != 1500*time.Millisecond {
 		t.Fatalf("deadline %s", time.Duration(l.deadline.Load()))
 	}
-	clk.set(1400 * time.Millisecond)
+	set(1400 * time.Millisecond)
 	if l.valid() {
 		t.Fatal("valid past deadline less margin")
 	}
 
 	// Suspend: the wall clock runs on while the monotonic one stands still.
 	l.extend(clk.Now(), clk.Wall())
-	clk.wall.Add(int64(5 * time.Second))
+	fake.StepWall(5 * time.Second)
 	if l.valid() {
 		t.Fatal("valid after the machine slept past the lease, by its monotonic clock alone")
 	}
 
 	// Quarantine: a stolen slot serves nothing for TTL plus margin after its claim.
-	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: clk, id: "me"}
+	n := &Node{opts: Options{LeaseTTL: time.Second, LeaseMargin: 100 * time.Millisecond}, clock: fake, lc: clk, id: "me"}
 	from := clk.Now()
 	q := n.newLease(store.Copy{TakenFrom: "other"}, from, clk.Wall())
 	if !q.quarantined() || !q.valid() {
 		t.Fatalf("a stolen slot: quarantined %v, valid %v", q.quarantined(), q.valid())
 	}
-	clk.set(from + 1099*time.Millisecond)
+	set(from + 1099*time.Millisecond)
 	if !q.quarantined() {
 		t.Fatal("the quarantine ended before TTL plus margin")
 	}
-	clk.set(from + 1100*time.Millisecond)
+	set(from + 1100*time.Millisecond)
 	if q.quarantined() {
 		t.Fatal("still quarantined after TTL plus margin")
 	}
@@ -612,13 +619,263 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 	}
 }
 
-// fakeClock is a Clock a test moves: a monotonic reading and a wall clock that run
-// together unless a test steps one alone.
-type fakeClock struct{ now, wall atomic.Int64 }
+// TestReadRightAfterCreateOnAnotherNode: an index created on one node is read on
+// another at once, before that node's routing view or catalogue would next sync on
+// their own. The reader finds the index in the store and its copies in the registry,
+// and answers; a shard no node serves gets ErrNoServingCopy's 503, not a closed store.
+func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		c := newCluster(t, d, func(i int, o *Options) {
+			if i == 1 {
+				o.HeartbeatInterval = 1500 * time.Millisecond
+				o.ViewInterval = time.Hour
+				o.CatalogInterval = time.Hour
+				o.PruneInterval = time.Hour
+			}
+		})
+		a, b := c.start(0), c.start(1)
+		for k := range 5 {
+			name := fmt.Sprintf("fresh%d", k)
+			createIndex(t, a.n, name, 2, 0)
+			if got, err := count(tctx(t), b.n, name, 0); err != nil || got != 0 {
+				t.Fatalf("read of %s on the other node right after it was created: %d, %v", name, got, err)
+			}
+			seq := mustWrite(t, a.n, name, upsertOp("x", 1))
+			got, err := count(tctx(t), b.n, name, seq)
+			if err != nil || got != 1 {
+				t.Fatalf("read of %s on the other node right after a write: %d, %v", name, got, err)
+			}
+		}
+		_, err := (&clusterHooks{b.n}).Remote(tctx(t), store.ShardID{Index: "nowhere", Shard: 0}, 0)
+		var ae *api.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || !errors.Is(err, ErrNoServingCopy) || errors.Is(err, store.ErrClosed) {
+			t.Fatalf("a shard no node serves: %v, want ErrNoServingCopy's 503", err)
+		}
+	})
+}
 
-func (c *fakeClock) Now() time.Duration { return time.Duration(c.now.Load()) }
-func (c *fakeClock) Wall() time.Time    { return time.Unix(0, c.wall.Load()) }
-func (c *fakeClock) set(d time.Duration) {
-	c.wall.Add(int64(d) - c.now.Load())
-	c.now.Store(int64(d))
+// TestNoCopyReadsBoundRegistryReads: reads of a shard no node serves, made at once by
+// several clients, re-read the registry at most once per missRefreshEvery, by the
+// node's clock: a burst of them shares one read, and a burst less than an interval
+// after the last read waits out the rest of the interval before reading again.
+func TestNoCopyReadsBoundRegistryReads(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.Clock = clk
+		o.HeartbeatInterval = time.Hour
+		o.LeaseTTL = 2 * time.Hour
+		o.DeadAfter = 3 * time.Hour
+		o.ViewInterval = time.Hour
+		o.CatalogInterval = time.Hour
+		o.PruneInterval = time.Hour
+	})
+	a := c.start(0)
+	hooks := &clusterHooks{a.n}
+	id := store.ShardID{Index: "nowhere", Shard: 0}
+	burst := func() <-chan struct{} {
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Go(func() {
+				for range 5 {
+					if _, err := hooks.Remote(tctx(t), id, 0); !errors.Is(err, ErrNoServingCopy) {
+						t.Errorf("a shard no node serves: %v", err)
+						return
+					}
+				}
+			})
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		return done
+	}
+	reads := func() int64 { return a.wrap.nodesReads.Load() }
+	before := reads()
+	for k := range int64(3) {
+		clk.Advance(missRefreshEvery)
+		<-burst()
+		if got := reads() - before; got != k+1 {
+			t.Fatalf("%d registry reads after %d bursts an interval apart, want one each", got, k+1)
+		}
+	}
+
+	clk.Advance(missRefreshEvery / 3)
+	done := burst()
+	if err := clk.BlockUntilArmed(tctx(t), missRefreshEvery-missRefreshEvery/3); err != nil {
+		t.Fatalf("a burst within the interval is not waiting out its rest: %v", err)
+	}
+	if got := reads() - before; got != 3 {
+		t.Fatalf("%d registry reads: a burst within the interval read at once", got)
+	}
+	clk.Advance(missRefreshEvery - missRefreshEvery/3)
+	<-done
+	if got := reads() - before; got != 4 {
+		t.Fatalf("%d registry reads once the interval ran out, want 4", got)
+	}
+}
+
+// TestUnknownIndexLookupsAreCached: requests for an index no node has ask the store
+// about it once per absentTTL, not once each. The node's clock is fake and stands
+// still: every request falls within one absentTTL.
+func TestUnknownIndexLookupsAreCached(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.Clock = clk; o.CatalogInterval = time.Hour })
+	a := c.start(0)
+	before := a.wrap.indexGets.Load()
+	for range 50 {
+		var ae *api.Error
+		if _, err := count(tctx(t), a.n, "ghost", 0); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
+			t.Fatalf("an index no node has: %v, want a 404", err)
+		}
+	}
+	if gets := a.wrap.indexGets.Load() - before; gets != 1 {
+		t.Fatalf("%d store lookups for 50 requests of an unknown index, want 1", gets)
+	}
+}
+
+// TestCreateForgetsARememberedAbsence: a node that answered 404 for a name forgets
+// that answer when it creates the index itself, so once it drops the index and
+// another node creates it again, a read finds it although the 404 is younger than
+// absentTTL by the node's clock. That clock is fake: it moves only by the one
+// missRefreshEvery the read needs to see B's copy in a fresh view. Node A is at
+// capacity, so its create and drop host no copy and wait on nothing; B serves.
+func TestCreateForgetsARememberedAbsence(t *testing.T) {
+	clk := clock.NewFake(time.Now())
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		o.CatalogInterval = time.Hour
+		if i == 0 {
+			o.Clock = clk
+			o.Capacity = 1
+			o.HeartbeatInterval = time.Hour
+			o.LeaseTTL = 2 * time.Hour
+			o.DeadAfter = 3 * time.Hour
+			o.ViewInterval = time.Hour
+			o.PruneInterval = time.Hour
+		}
+	})
+	b := c.start(1)
+	createIndex(t, b.n, "seed", 1, 2)
+	a := c.start(0)
+	if a.n.leaseCount() != 1 {
+		t.Fatalf("node A holds %d copies, want its one of seed", a.n.leaseCount())
+	}
+	notFound := func(err error) bool {
+		var ae *api.Error
+		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+	}
+	if _, err := count(tctx(t), a.n, "ghost", 0); !notFound(err) {
+		t.Fatalf("an index no node has: %v, want a 404", err)
+	}
+	createIndex(t, a.n, "ghost", 1, 1)
+	if err := a.n.DeleteIndex(tctx(t), "ghost"); err != nil {
+		t.Fatal(err)
+	}
+	createIndex(t, b.n, "ghost", 1, 1)
+	clk.Advance(missRefreshEvery)
+	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {
+		t.Fatalf("a read on A of the index B created after A dropped its own: %d, %v", got, err)
+	}
+}
+
+// TestShortShutdownGraceWarns: a cluster node whose shutdown_grace is shorter than its
+// routing view interval warns at startup.
+func TestShortShutdownGraceWarns(t *testing.T) {
+	for _, grace := range []time.Duration{0, time.Second} {
+		logs := &warnings{}
+		c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+			o.Config.ShutdownGrace = grace
+			o.ViewInterval = 500 * time.Millisecond
+			o.Logger = slog.New(logs)
+		})
+		c.start(0)
+		if got, want := logs.has("shutdown_grace is shorter than the routing view interval"), grace == 0; got != want {
+			t.Fatalf("shutdown_grace %s: warned %v, want %v", grace, got, want)
+		}
+	}
+}
+
+type warnings struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (h *warnings) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelWarn }
+
+func (h *warnings) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+
+func (h *warnings) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *warnings) WithGroup(string) slog.Handler      { return h }
+
+func (h *warnings) has(prefix string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.ContainsFunc(h.msgs, func(m string) bool { return strings.HasPrefix(m, prefix) })
+}
+
+// TestEnsureIndexAcrossNodes: a client behind a load balancer checks for an index on
+// node B (404), creates it through node A, then writes and reads through B. Plain reads
+// on B may still answer 404 for a moment, but the write, a mapping change and a read
+// that waits for the write all find the index.
+func TestEnsureIndexAcrossNodes(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.CatalogInterval = time.Hour })
+	a, b := c.start(0), c.start(1)
+	notFound := func(err error) bool {
+		var ae *api.Error
+		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+	}
+	cachedOnce := false
+	for k := 0; k < 10 && !cachedOnce; k++ {
+		name := fmt.Sprintf("ensure%d", k)
+		if _, err := b.n.GetIndex(tctx(t), name); !notFound(err) {
+			t.Fatalf("the check on B before the create: %v, want a 404", err)
+		}
+		createIndex(t, a.n, name, 2, 0)
+		_, err := b.n.GetIndex(tctx(t), name)
+		cachedOnce = notFound(err)
+		seq := mustWrite(t, b.n, name, upsertOp("x", 1))
+		if _, err := b.n.PatchMapping(tctx(t), name, map[string]schema.FieldType{"extra": schema.Keyword}); err != nil {
+			t.Fatalf("a mapping change on B right after the create on A: %v", err)
+		}
+		if got, err := count(tctx(t), b.n, name, seq); err != nil || got != 1 {
+			t.Fatalf("a read on B waiting for the write: %d, %v", got, err)
+		}
+	}
+	if !cachedOnce {
+		t.Skip("every create on A outlasted the 404 B remembered; the sequence was not exercised")
+	}
+}
+
+// TestUnclaimedShardIsLeftToItsCreator: a shard no node has claimed (an index the
+// creating node has not allocated yet) is left alone by the other nodes for three
+// heartbeats, so the creator's eager claim wins it; after that another node takes it.
+func TestUnclaimedShardIsLeftToItsCreator(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	c.start(1)
+	settings, err := json.Marshal(api.IndexSettings{Shards: 1, ReplicasPerShard: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.st.Indexes().Create(tctx(t), store.IndexMeta{Name: "orphan", Mapping: []byte(`{}`), Settings: settings}); err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now()
+	id := store.ShardID{Index: "orphan", Shard: 0}
+	heartbeat := 200 * time.Millisecond
+	for time.Since(created) < 2*heartbeat {
+		if copies, err := a.st.Registry().Copies(tctx(t), "orphan"); err != nil || len(copies) > 0 {
+			t.Fatalf("a shard no node created was claimed %s after the index appeared: %+v, %v", time.Since(created), copies, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	eventually(t, 30*time.Second, "another node claims the shard", func() error {
+		if n, nodes := serving(t, a.st, id); n != 1 {
+			return fmt.Errorf("%d serving on %v", n, nodes)
+		}
+		return nil
+	})
 }

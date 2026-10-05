@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,7 +42,7 @@ func TestLoadDefaults(t *testing.T) {
 		NodeID:                host,
 		DataDir:               "data",
 		RefreshInterval:       time.Second,
-		SeqPersistInterval:    30 * time.Second,
+		FlushInterval:         10 * time.Second,
 		MaxLag:                2 * time.Second,
 		ChangelogPollInterval: 500 * time.Millisecond,
 		RemapDebounce:         2 * time.Second,
@@ -91,7 +92,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		"SEARCHLIGHT_TOKENS_FILE":              tokens,
 		"SEARCHLIGHT_CLUSTER_TOKEN":            "s3cret",
 		"SEARCHLIGHT_REFRESH_INTERVAL":         "250ms",
-		"SEARCHLIGHT_SEQ_PERSIST_INTERVAL":     "10s",
+		"SEARCHLIGHT_FLUSH_INTERVAL":           "5s",
 		"SEARCHLIGHT_MAX_LAG":                  "5s",
 		"SEARCHLIGHT_CHANGELOG_POLL_INTERVAL":  "2s",
 		"SEARCHLIGHT_MERGE_BUDGET":             "128MB",
@@ -126,7 +127,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		TokensFile:            tokens,
 		ClusterToken:          "s3cret",
 		RefreshInterval:       250 * time.Millisecond,
-		SeqPersistInterval:    10 * time.Second,
+		FlushInterval:         5 * time.Second,
 		MaxLag:                5 * time.Second,
 		ChangelogPollInterval: 2 * time.Second,
 		RemapDebounce:         2 * time.Second,
@@ -223,7 +224,7 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"tokens_file", map[string]string{"SEARCHLIGHT_TOKENS_FILE": filepath.Join(t.TempDir(), "missing")}, nil},
 		{"refresh_interval", map[string]string{"SEARCHLIGHT_REFRESH_INTERVAL": "soon"}, nil},
 		{"refresh_interval", map[string]string{"SEARCHLIGHT_REFRESH_INTERVAL": "0s"}, nil},
-		{"seq_persist_interval", map[string]string{"SEARCHLIGHT_SEQ_PERSIST_INTERVAL": "0s"}, nil},
+		{"flush_interval", map[string]string{"SEARCHLIGHT_FLUSH_INTERVAL": "0s"}, nil},
 		{"max_lag", map[string]string{"SEARCHLIGHT_MAX_LAG": "-1s"}, nil},
 		{"changelog_poll_interval", map[string]string{"SEARCHLIGHT_CHANGELOG_POLL_INTERVAL": "0s"}, nil},
 		{"merge_budget", map[string]string{"SEARCHLIGHT_MERGE_BUDGET": "lots"}, nil},
@@ -283,6 +284,24 @@ func TestLoadRefusesNoAuthUnlessInsecure(t *testing.T) {
 	c, err := Load([]string{"--insecure_no_auth"}, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL}))
 	if err != nil || !c.InsecureNoAuth {
 		t.Errorf("--insecure_no_auth: %+v, %v", c, err)
+	}
+}
+
+// A removed setting is refused by name, as a flag or an environment variable, with what
+// replaced it.
+func TestLoadRefusesRemovedSettings(t *testing.T) {
+	const want = "seq_persist_interval was removed; flush_interval (default 10s) now persists the seq"
+	base := map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}
+	if _, err := Load([]string{"--seq_persist_interval=30s"}, envOf(base)); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "--seq_persist_interval") {
+		t.Errorf("the flag: err = %v, want %q naming the flag", err, want)
+	}
+	env := maps.Clone(base)
+	env["SEARCHLIGHT_SEQ_PERSIST_INTERVAL"] = "30s"
+	if _, err := Load(nil, envOf(env)); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "SEARCHLIGHT_SEQ_PERSIST_INTERVAL") {
+		t.Errorf("the environment variable: err = %v, want %q naming the variable", err, want)
+	}
+	if _, err := Load(nil, envOf(base)); err != nil {
+		t.Errorf("without it: %v", err)
 	}
 }
 

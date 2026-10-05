@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/cluster"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -95,7 +96,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 		return fmt.Errorf("telemetry: %w", err)
 	}
 	log := tel.Logger
-	budget := &shutdownBudget{cfg: cfg}
+	clk := clock.Real{}
+	budget := &shutdownBudget{cfg: cfg, clock: clk}
 	defer func() {
 		sctx, cancel := budget.context(ctx)
 		defer cancel()
@@ -134,7 +136,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 		<-adminDone
 	}()
 
-	st, err := openStore(ctx, cfg, tel)
+	st, err := openStore(ctx, cfg, tel, clk)
 	if err != nil {
 		return interrupted(err)
 	}
@@ -159,14 +161,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 	}
 	cfg.AdvertiseAddress = boundAdvertise(cfg.AdvertiseAddress, ln.Addr())
 	n, err := cluster.New(ctx, cluster.Options{
-		Store: st, Config: cfg, Version: version,
+		Store: st, Config: cfg, Version: version, Clock: clk,
 		Logger: log, Tracer: tel.Tracer, Meter: tel.Meter,
 	})
 	if err != nil {
 		_ = ln.Close()
 		return interrupted(err)
 	}
-	srv, err := api.NewServer(n, tel, cfg)
+	srv, err := api.NewServer(n, tel, cfg, api.WithClock(clk))
 	if err != nil {
 		_ = ln.Close()
 		sctx, cancel := budget.context(ctx)
@@ -203,13 +205,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 }
 
 type shutdownBudget struct {
-	cfg config.Config
-	sd  *api.Shutdown
+	cfg   config.Config
+	clock clock.Clock
+	sd    *api.Shutdown
 }
 
 func (b *shutdownBudget) begin(grace bool) *api.Shutdown {
 	if b.sd == nil {
-		b.sd = api.NewShutdown(b.cfg)
+		b.sd = api.NewShutdown(b.cfg, b.clock)
 		if !grace {
 			b.sd.Grace = 0
 		}
@@ -221,10 +224,10 @@ func (b *shutdownBudget) context(parent context.Context) (context.Context, conte
 	return context.WithDeadline(context.WithoutCancel(parent), b.begin(false).Deadline)
 }
 
-func openStore(ctx context.Context, cfg config.Config, tel *telemetry.T) (store.Store, error) {
+func openStore(ctx context.Context, cfg config.Config, tel *telemetry.T, clk clock.Clock) (store.Store, error) {
 	wait := storeRetryFirst
 	for {
-		st, err := store.Open(ctx, cfg.StoreURL, store.WithLogger(tel.Logger), store.WithTracer(tel.Tracer), store.WithMeter(tel.Meter))
+		st, err := store.Open(ctx, cfg.StoreURL, store.WithLogger(tel.Logger), store.WithTracer(tel.Tracer), store.WithMeter(tel.Meter), store.WithClock(clk))
 		if err == nil {
 			if err = st.Migrate(ctx); err == nil {
 				return st, nil
@@ -238,12 +241,8 @@ func openStore(ctx context.Context, cfg config.Config, tel *telemetry.T) (store.
 			return nil, err
 		}
 		tel.Logger.WarnContext(ctx, "the store cannot be reached; retrying", slog.Any("error", err), slog.Duration("retry_in", wait))
-		t := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return nil, ctx.Err()
-		case <-t.C:
+		if err := clk.Sleep(ctx, wait); err != nil {
+			return nil, err
 		}
 		wait = min(2*wait, storeRetryCap)
 	}

@@ -12,11 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 // I1: a sidecar a crash left behind, which garbage collection could not remove at
-// Open, must never be removed later once a new commit has written (and the manifest
+// Open, must never be removed later once a new flush has written (and the manifest
 // references) a sidecar of the same name.
 func TestGCRetryNeverRemovesARecommittedSidecar(t *testing.T) {
 	var crash atomic.Bool
@@ -29,11 +30,12 @@ func TestGCRetryNeverRemovesARecommittedSidecar(t *testing.T) {
 	}}
 	h := newHarness(t, opts)
 	h.upsert("a", "b", "c")
-	h.refresh()
+	h.commit()
 	h.del("a")
+	h.refresh()
 	crash.Store(true)
-	if err := h.s.Refresh(context.Background()); !errors.Is(err, errSimulatedCrash) {
-		t.Fatalf("Refresh = %v, want the simulated crash", err)
+	if err := h.s.Flush(context.Background()); !errors.Is(err, errSimulatedCrash) {
+		t.Fatalf("Flush = %v, want the simulated crash", err)
 	}
 	h.abandon() // leaves <segment>.<gen>.del, written for a manifest that never landed
 
@@ -49,7 +51,7 @@ func TestGCRetryNeverRemovesARecommittedSidecar(t *testing.T) {
 	}}
 	h.open()
 	h.replayFrom(h.s.CommittedSeq())
-	h.refresh() // writes a sidecar for the same segment, maybe of the same name
+	h.commit() // writes a sidecar for the same segment, maybe of the same name
 	inUse.Store(false)
 	h.s.jan.drain()
 	h.check()
@@ -58,12 +60,12 @@ func TestGCRetryNeverRemovesARecommittedSidecar(t *testing.T) {
 }
 
 // I1: a manifest.tmp garbage collection could not remove at Open stays pending; a
-// retry that runs while a commit has written its own manifest.tmp, before the rename,
+// retry that runs while a flush has written its own manifest.tmp, before the rename,
 // must not remove it.
 func TestGCRetryNeverRemovesTheManifestBeingWritten(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a")
-	h.refresh()
+	h.commit()
 	h.abandon()
 	if err := os.WriteFile(filepath.Join(h.dir, manifestName+".tmp"), []byte("left by a crash"), 0o600); err != nil {
 		t.Fatal(err)
@@ -92,14 +94,14 @@ func TestGCRetryNeverRemovesTheManifestBeingWritten(t *testing.T) {
 		t.Fatalf("pending after Open: %v, want manifest.tmp", p)
 	}
 	h.upsert("b")
-	h.refresh()
+	h.commit()
 	h.check()
 	h.reopen()
 	h.check()
 }
 
 // I2: when the directory fsync after the manifest rename fails, the swap may not be
-// durable: the new generation is published, but nothing the old manifest needs is
+// durable: the generation stays published, but nothing the old manifest needs is
 // removed and CommittedSeq stays what is known to be durable. The next Open settles it.
 func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 	dirSyncFailed := errors.New("fsync directory: input/output error")
@@ -113,11 +115,11 @@ func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 	}}
 	h := newHarness(t, opts)
 	h.upsert("a", "b")
-	h.refresh()
+	h.commit()
 	h.del("a")
-	h.refresh() // a sidecar of the first commit's segment
+	h.commit() // a sidecar of the first flush's segment
 	h.upsert("c")
-	h.refresh()
+	h.commit()
 	before := dirFiles(t, h.dir)
 	committed := h.s.CommittedSeq()
 
@@ -147,14 +149,15 @@ func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 		t.Fatalf("CommittedSeq %d, want %d", h.s.CommittedSeq(), committed)
 	}
 
-	// A refresh's uncertain swap leaves CommittedSeq where it was.
+	// A flush's uncertain swap leaves CommittedSeq where it was.
 	h.abandon()
 	armed.Store(true)
 	h.open()
 	h.upsert("d")
 	committed = h.s.CommittedSeq()
-	if err := h.s.Refresh(context.Background()); !errors.Is(err, dirSyncFailed) {
-		t.Fatalf("Refresh = %v", err)
+	h.refresh()
+	if err := h.s.Flush(context.Background()); !errors.Is(err, dirSyncFailed) {
+		t.Fatalf("Flush = %v", err)
 	}
 	if h.s.RefreshedSeq() != h.seq || h.s.CommittedSeq() != committed {
 		t.Fatalf("RefreshedSeq %d CommittedSeq %d, want %d and %d", h.s.RefreshedSeq(), h.s.CommittedSeq(), h.seq, committed)
@@ -172,7 +175,7 @@ func TestUncertainManifestSwapKeepsTheOldManifestsFiles(t *testing.T) {
 // refused.
 func TestCloseCancelsAndWaitsForForceMerge(t *testing.T) {
 	opts := testOptions()
-	opts.MergeBudget = NewMergeBudget(1, 1) // one byte per second: the merge stalls
+	opts.MergeBudget = NewMergeBudget(1, 1, clock.Real{}) // one byte per second: the merge stalls
 	h := newHarness(t, opts)
 	for i := range 3 {
 		h.upsert(fmt.Sprintf("d%d", i))
@@ -262,19 +265,39 @@ func syncsDuring(f func()) segment.SyncStats {
 	return segment.SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
 }
 
-// I4: a refresh that only moves the seq publishes it with no fsync at all; the
-// manifest catches up at the next commit, every SeqPersistInterval, and at Close. A
-// refresh that writes a segment syncs each file it wrote and the directory once.
-func TestSeqOnlyRefresh(t *testing.T) {
+// A refresh fsyncs nothing, a seq-only one included, and publishes at once:
+// WaitRefreshed returns on it while CommittedSeq stays. A flush syncs the segments and
+// sidecars the published generation added, then the manifest, and the directory once;
+// a flush after a seq-only refresh writes only the manifest; a flush with nothing new
+// writes nothing. Close flushes.
+func TestRefreshSyncsNothingFlushPersists(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a")
-	h.refresh()
+	h.commit()
+	committed := h.s.CommittedSeq()
 	h.del("a") // a sidecar on the first segment, as well as the second segment
 	h.upsert("b")
-	if got := syncsDuring(h.refresh); got.Files != 3 || got.Dirs != 1 {
-		t.Fatalf("a refresh with a segment and a sidecar: %+v syncs, want 3 files (segment, sidecar, manifest) and 1 directory", got)
+	if got := syncsDuring(h.refresh); got.Files != 0 || got.Dirs != 0 {
+		t.Fatalf("a refresh with a segment and a sidecar: %+v syncs, want none", got)
 	}
-	committed := h.s.CommittedSeq()
+	if err := h.s.WaitRefreshed(context.Background(), h.seq); err != nil {
+		t.Fatal(err)
+	}
+	if h.s.CommittedSeq() != committed {
+		t.Fatalf("CommittedSeq %d after a refresh, want %d until a flush", h.s.CommittedSeq(), committed)
+	}
+	h.check()
+	if got := syncsDuring(h.flush); got.Files != 3 || got.Dirs != 1 {
+		t.Fatalf("a flush of a segment and a sidecar: %+v syncs, want 3 files (segment, sidecar, manifest) and 1 directory", got)
+	}
+	if h.s.CommittedSeq() != h.seq {
+		t.Fatalf("CommittedSeq %d after a flush, want %d", h.s.CommittedSeq(), h.seq)
+	}
+	if got := syncsDuring(h.flush); got.Files != 0 || got.Dirs != 0 {
+		t.Fatalf("a flush with nothing new: %+v syncs, want none", got)
+	}
+
+	committed = h.seq
 	h.seq += 10
 	if err := h.s.Advance(h.seq); err != nil {
 		t.Fatal(err)
@@ -286,21 +309,17 @@ func TestSeqOnlyRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	if h.s.CommittedSeq() != committed {
-		t.Fatalf("CommittedSeq %d, want %d until the seq is persisted", h.s.CommittedSeq(), committed)
+		t.Fatalf("CommittedSeq %d, want %d until a flush", h.s.CommittedSeq(), committed)
 	}
 	h.snapshots[h.seq] = h.snapshots[committed]
-	h.check()
-	// The next commit persists it.
-	h.upsert("c")
-	h.refresh()
+	if got := syncsDuring(h.flush); got.Files != 1 || got.Dirs != 1 {
+		t.Fatalf("a flush of a moved seq: %+v syncs, want the manifest and 1 directory", got)
+	}
 	if h.s.CommittedSeq() != h.seq {
-		t.Fatalf("CommittedSeq %d after a commit, want %d", h.s.CommittedSeq(), h.seq)
+		t.Fatalf("CommittedSeq %d after a flush, want %d", h.s.CommittedSeq(), h.seq)
 	}
-	// So does Close.
-	h.seq += 5
-	if err := h.s.Advance(h.seq); err != nil {
-		t.Fatal(err)
-	}
+
+	h.upsert("c")
 	h.refresh()
 	h.reopen()
 	if h.s.CommittedSeq() != h.seq {
@@ -309,11 +328,11 @@ func TestSeqOnlyRefresh(t *testing.T) {
 	h.check()
 }
 
-// I4: in the background, a seq-only move is persisted within SeqPersistInterval.
-func TestSeqPersistedInTheBackground(t *testing.T) {
+// In the background, what refreshes publish is flushed within FlushInterval.
+func TestFlushInTheBackground(t *testing.T) {
 	opts := testOptions()
 	opts.RefreshInterval = 5 * time.Millisecond
-	opts.SeqPersistInterval = 20 * time.Millisecond
+	opts.FlushInterval = 20 * time.Millisecond
 	h := newHarness(t, opts)
 	h.upsert("a")
 	if err := h.s.Advance(100); err != nil {
@@ -322,7 +341,7 @@ func TestSeqPersistedInTheBackground(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for h.s.CommittedSeq() != 100 {
 		if time.Now().After(deadline) {
-			t.Fatalf("CommittedSeq %d, want 100 within the persist interval", h.s.CommittedSeq())
+			t.Fatalf("CommittedSeq %d, want 100 within the flush interval", h.s.CommittedSeq())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -412,7 +431,7 @@ func TestDefaultBudgetAndCacheAreShared(t *testing.T) {
 	if a.s.opts.FilterCache != b.s.opts.FilterCache || a.s.opts.FilterCache != DefaultFilterCache() {
 		t.Fatal("two shards with no FilterCache do not share the default one")
 	}
-	own := NewMergeBudget(1, 0)
+	own := NewMergeBudget(1, 0, clock.Real{})
 	opts.MergeBudget = own
 	if c := newHarness(t, opts); c.s.opts.MergeBudget != own {
 		t.Fatal("an explicit MergeBudget was replaced")
@@ -420,10 +439,10 @@ func TestDefaultBudgetAndCacheAreShared(t *testing.T) {
 }
 
 // M7: a writer faster than refreshes is refused with ErrBackpressure once the buffer
-// passes MaxBufferFactor times FlushBytes; after a retry everything is applied.
+// passes MaxBufferFactor times RefreshBytes; after a retry everything is applied.
 func TestApplyBackpressure(t *testing.T) {
 	opts := testOptions()
-	opts.FlushBytes = 4 << 10
+	opts.RefreshBytes = 4 << 10
 	opts.MaxBufferFactor = 2
 	h := newHarness(t, opts)
 	refused := 0

@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -19,14 +18,15 @@ import (
 // readers' path (Release only hands it work).
 //
 // Removal is deferred and retried: a merged-away segment's files are removed only after
-// its final close (the last generation listing it was released, so it is unmapped), and
-// a removal that fails anyway (Windows refuses to delete a file another process, an
-// antivirus scanner say, has open) stays pending and is retried every
-// Options.DeleteRetry, then once more at Close. What is still left then is collected at
-// the next Open, which removes every shard file the manifest does not reference.
+// its final close (the last generation listing it was released, so it is unmapped) and
+// the flush that dropped it from the manifest (see flush.go), and a removal that fails
+// anyway (Windows refuses to delete a file another process, an antivirus scanner say,
+// has open) stays pending and is retried every Options.DeleteRetry, then once more at
+// Close. What is still left then is collected at the next Open, which removes every
+// shard file the manifest does not reference.
 //
 // A pending name may be written again: a deletes sidecar is named by its segment and
-// commit generation, and manifest.tmp by nothing at all. So a commit forgets a name
+// generation, and manifest.tmp by nothing at all. So a flush forgets a name
 // before writing it ([janitor.forget]), and forget waits out a removal of that name in
 // progress (removeMu), so a retry can never remove the new file. Once the shard is
 // closed the janitor forgets every pending name: another Shard may reopen the
@@ -132,14 +132,14 @@ func (j *janitor) forget(paths ...string) {
 
 func (j *janitor) loop() {
 	defer close(j.done)
-	t := time.NewTicker(j.s.opts.DeleteRetry)
+	t := j.s.opts.Clock.NewTicker(j.s.opts.DeleteRetry)
 	defer t.Stop()
 	for {
 		select {
 		case <-j.stopCh:
 			return
 		case <-j.wake:
-		case <-t.C:
+		case <-t.C():
 		}
 		j.drain()
 	}
@@ -157,6 +157,7 @@ func (j *janitor) drain() {
 			j.s.log.Warn("closing a retired segment failed", slog.String("segment", ref.id), slog.Any("error", err))
 		}
 		j.s.opts.FilterCache.DropSegment(ref.id)
+		ref.closed.Store(true)
 		if ref.obsolete.Load() {
 			// A segment's own name is unique for the directory's life (and no
 			// manifest lists an obsolete one again), so its files are safe to remove
@@ -230,9 +231,9 @@ func segmentFiles(dir, id string) []string {
 	return out
 }
 
-// maxSidecarGen returns the highest commit generation any deletes sidecar (or its temp
+// maxSidecarGen returns the highest generation any deletes sidecar (or its temp
 // file) in dir is named for, 0 when there is none. A crash can leave a sidecar of a
-// generation the manifest never reached; the next commit must not reuse its name.
+// generation the manifest never reached; the next generation must not reuse its name.
 func maxSidecarGen(dir string) (uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -259,7 +260,7 @@ func sidecarGen(name string) (uint64, bool) {
 
 // collectGarbage removes every shard file in the directory that man does not
 // reference: segments, query segments and sidecars a crash left before (or after) the
-// commit that would have listed (or dropped) them, and their temp files. A shard file
+// flush that would have listed (or dropped) them, and their temp files. A shard file
 // is one named as the shard names its files (a segment name, 32 hex digits, then a
 // dot; or manifest.tmp): anything else, and every directory, is left alone and
 // reported, so a data directory pointed somewhere wrong loses nothing. A file that

@@ -17,6 +17,7 @@ import (
 
 	"github.com/RoaringBitmap/roaring/v2"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -31,7 +32,7 @@ func TestConcurrentReadersDuringRefreshAndMerge(t *testing.T) {
 	opts := testOptions()
 	opts.DisableMerges = false
 	opts.MergePolicy = &TieredPolicy{SegmentsPerTier: 2, MaxMergeAtOnce: 3, FloorSegmentBytes: 1}
-	opts.MergeBudget = NewMergeBudget(2, 0)
+	opts.MergeBudget = NewMergeBudget(2, 0, clock.Real{})
 	opts.FilterCache = NewFilterCache(1<<20, nil)
 	h := newHarness(t, opts)
 
@@ -114,10 +115,13 @@ func TestConcurrentReadersDuringRefreshAndMerge(t *testing.T) {
 	h.waitNoOrphans()
 }
 
-// waitNoOrphans waits for the janitor (which may be mid-drain in its own goroutine) to
-// leave exactly the files the manifest references.
+// waitNoOrphans flushes, then waits for the janitor (which may be mid-drain in its own
+// goroutine) to leave exactly the files the manifest references.
 func (h *harness) waitNoOrphans() {
 	h.t.Helper()
+	if h.s.Err() == nil {
+		h.flush()
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		h.s.jan.drain()
@@ -158,9 +162,10 @@ func readOnce(s *Shard, snaps *sync.Map) error {
 	return nil
 }
 
-// A segment merged away keeps its files, and stays readable, while any generation
-// listing it is held; they are removed after the final Release (when the mapping is
-// gone, which Windows requires), and a removal that fails is retried until it works.
+// A segment merged away keeps its file, and stays readable, while any generation
+// listing it is held; it is removed after the final Release (when the mapping is gone,
+// which Windows requires), and a removal that fails is retried until it works. Its
+// sidecars, which only a durable manifest reads, go with the flush that drops them.
 func TestMergedAwayFilesRemovedAfterLastRelease(t *testing.T) {
 	var mu sync.Mutex
 	failLeft := map[string]int{}
@@ -192,7 +197,7 @@ func TestMergedAwayFilesRemovedAfterLastRelease(t *testing.T) {
 	held := h.s.Acquire()
 	var old []string
 	for _, sv := range held.Segments {
-		old = append(old, segmentFiles(h.dir, sv.ID)...)
+		old = append(old, filepath.Join(h.dir, sv.ID+segment.FileExt))
 	}
 	segPath := filepath.Join(h.dir, held.Segments[0].ID+segment.FileExt)
 	if runtime.GOOS == "windows" {
@@ -295,7 +300,7 @@ func TestBackgroundMergesBoundSegments(t *testing.T) {
 // leaves nothing behind.
 func TestMergeCancelledByBudget(t *testing.T) {
 	opts := testOptions()
-	opts.MergeBudget = NewMergeBudget(1, 1) // one byte per second
+	opts.MergeBudget = NewMergeBudget(1, 1, clock.Real{}) // one byte per second
 	h := newHarness(t, opts)
 	for i := range 3 {
 		h.upsert(fmt.Sprintf("d%d", i))

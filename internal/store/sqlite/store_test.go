@@ -59,7 +59,11 @@ func TestDSNs(t *testing.T) {
 	if err != nil || !strings.Contains(w, "_busy_timeout=5&") || !strings.Contains(w, "_synchronous=NORMAL") {
 		t.Fatalf("overrides: %q %v", w, err)
 	}
-	for _, raw := range []string{"sqlite:///x.db?_txlock=deferred", "sqlite:///x.db?_journal_mode=DELETE"} {
+	for _, raw := range []string{
+		"sqlite:///x.db?_txlock=deferred", "sqlite:///x.db?_journal_mode=DELETE", "sqlite:///x.db?_locking_mode=EXCLUSIVE",
+		"sqlite:///x.db?_pragma=locking_mode(EXCLUSIVE)", "sqlite:///x.db?_pragma=LOCKING_MODE%3Dexclusive",
+		"sqlite:///x.db?_pragma=journal_mode(DELETE)", "sqlite:///x.db?_pragma=wal_autocheckpoint(1000)",
+	} {
 		if _, _, err := DSNs(mustParse(t, raw)); err == nil {
 			t.Fatalf("%s accepted", raw)
 		}

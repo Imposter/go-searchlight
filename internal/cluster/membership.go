@@ -9,25 +9,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
 
-// Clock is what lease deadlines are kept by. Now is the time elapsed since a fixed
-// point of the clock's choosing, by a monotonic clock: it never goes back. Wall is the
-// wall clock, which keeps running while the machine sleeps (a monotonic clock may
-// not: Linux's stops during suspend).
-type Clock interface {
-	Now() time.Duration
-	Wall() time.Time
+// leaseClock is how lease deadlines are kept, on the node's clock.Clock. Now is the
+// time elapsed since the node's epoch by the monotonic clock: it never goes back. Wall
+// is the wall clock, which keeps running while the machine sleeps (a monotonic clock
+// may not: Linux's stops during suspend).
+type leaseClock struct {
+	c     clock.Clock
+	epoch time.Time
 }
 
-// NewClock returns the process's clocks.
-func NewClock() Clock { return processClock{start: time.Now()} }
-
-type processClock struct{ start time.Time }
-
-func (c processClock) Now() time.Duration { return time.Since(c.start) }
-func (c processClock) Wall() time.Time    { return time.Now().Round(0) } // no monotonic reading
+func (c leaseClock) Now() time.Duration { return c.c.Since(c.epoch) }
+func (c leaseClock) Wall() time.Time    { return c.c.Wall() }
 
 // lease is a copy this node holds, and what the node knows of its lease.
 //
@@ -56,15 +52,15 @@ func (c processClock) Wall() time.Time    { return time.Now().Round(0) } // no m
 // stepped forward cannot make it serve while the previous holder's copy still does.
 type lease struct {
 	copy       store.Copy
-	deadline   atomic.Int64 // Clock.Now nanoseconds
-	wallBefore atomic.Int64 // Clock.Wall Unix nanoseconds of the last grant's start
+	deadline   atomic.Int64 // leaseClock.Now nanoseconds
+	wallBefore atomic.Int64 // leaseClock.Wall Unix nanoseconds of the last grant's start
 	ttl        time.Duration
 	margin     time.Duration
-	clock      Clock
-	quarantine time.Duration // Clock.Now until which the copy serves nothing; 0: none
-	// claimed is when the claim that granted the lease began (wall clock): a view of
+	clock      leaseClock
+	quarantine time.Duration // leaseClock.Now until which the copy serves nothing; 0: none
+	// claimed is when the claim that granted the lease began, by leaseClock.Now: a view of
 	// the registry read before it cannot judge it.
-	claimed time.Time
+	claimed time.Duration
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
 
@@ -109,7 +105,7 @@ func (l *lease) extend(from time.Duration, wall time.Time) {
 }
 
 func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time) *lease {
-	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.clock, claimed: wall}
+	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.lc, claimed: from}
 	l.deadline.Store(int64(from + l.ttl))
 	l.wallBefore.Store(wall.UnixNano())
 	if c.TakenFrom != "" && c.TakenFrom != n.id {
@@ -160,32 +156,32 @@ func (n *Node) heartbeat(ctx context.Context) error {
 // leaseLoop renews the leases every HeartbeatInterval. It waits on nothing else (the
 // heartbeat has a loop of its own): a lease's safety depends on it alone.
 func (n *Node) leaseLoop(ctx context.Context) {
-	t := time.NewTicker(n.opts.HeartbeatInterval)
+	t := n.clock.NewTicker(n.opts.HeartbeatInterval)
 	defer t.Stop()
-	last := time.Now()
+	last := n.clock.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
-		if gap := time.Since(last); gap > 3*n.opts.HeartbeatInterval {
+		if gap := n.clock.Since(last); gap > 3*n.opts.HeartbeatInterval {
 			n.log.WarnContext(ctx, "the lease loop fell behind", slog.Duration("gap", gap))
 		}
-		last = time.Now()
+		last = n.clock.Now()
 		n.renew(ctx)
 	}
 }
 
 // heartbeatLoop heartbeats every HeartbeatInterval.
 func (n *Node) heartbeatLoop(ctx context.Context) {
-	t := time.NewTicker(n.opts.HeartbeatInterval)
+	t := n.clock.NewTicker(n.opts.HeartbeatInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		if err := n.heartbeat(ctx); err != nil && ctx.Err() == nil {
 			n.log.WarnContext(ctx, "heartbeat failed", slog.Any("error", err))
@@ -195,13 +191,13 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 
 // allocLoop runs the allocator every HeartbeatInterval.
 func (n *Node) allocLoop(ctx context.Context) {
-	t := time.NewTicker(n.opts.HeartbeatInterval)
+	t := n.clock.NewTicker(n.opts.HeartbeatInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		if n.draining.Load() {
 			continue
@@ -226,7 +222,7 @@ func (n *Node) renew(ctx context.Context) {
 	if len(leases) == 0 {
 		return
 	}
-	before, wall := n.clock.Now(), n.clock.Wall()
+	before, wall := n.lc.Now(), n.lc.Wall()
 	renewed, err := n.reg.RenewLeases(ctx, n.id, n.opts.LeaseTTL)
 	n.NoteDB(err)
 	if err != nil {
@@ -236,7 +232,7 @@ func (n *Node) renew(ctx context.Context) {
 		}
 		return
 	}
-	if took := n.clock.Now() - before; took > n.opts.LeaseTTL/4 {
+	if took := n.lc.Now() - before; took > n.opts.LeaseTTL/4 {
 		n.log.WarnContext(ctx, "renewing the leases was slow: the database is overloaded or far", slog.Duration("took", took),
 			slog.Duration("lease_ttl", n.opts.LeaseTTL))
 	}
@@ -259,7 +255,7 @@ func (n *Node) renew(ctx context.Context) {
 // other node took it meanwhile) holds again, and a paused copy resumes; anything else
 // is a confirmed loss. A failure to reach the store leaves the lease as it is.
 func (n *Node) reclaim(ctx context.Context, l *lease) {
-	before, wall := n.clock.Now(), n.clock.Wall()
+	before, wall := n.lc.Now(), n.lc.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, l.copy.Shard, n.id, n.claimTarget(l.copy.Shard), n.opts.LeaseTTL)
 	n.NoteDB(err)
 	switch {
@@ -361,13 +357,13 @@ func (n *Node) unhostCopy(ctx context.Context, cp store.Copy, wipe bool) error {
 // shows another holder of.
 func (n *Node) leaseWatchdog(ctx context.Context) {
 	period := min(50*time.Millisecond, max(time.Millisecond, n.opts.LeaseMargin/2))
-	t := time.NewTicker(period)
+	t := n.clock.NewTicker(period)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		v := n.view.Load()
 		for _, l := range n.leaseList() {
@@ -386,10 +382,11 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 
 // view is the registry as last read: the nodes and every shard's copies.
 type view struct {
-	at     time.Time
-	nodes  map[string]store.Node
-	live   map[string]bool
-	copies map[store.ShardID][]store.Copy
+	at        time.Time
+	readBegan time.Duration
+	nodes     map[string]store.Node
+	live      map[string]bool
+	copies    map[store.ShardID][]store.Copy
 }
 
 // liveNodes lists the live nodes' ids, sorted.
@@ -428,7 +425,7 @@ func (v *view) servingBelow(id store.ShardID, self string, slot int) int {
 // takenOver reports whether the registry, read after l's claim, shows its slot held by
 // another node, or by another incarnation.
 func (v *view) takenOver(l *lease) bool {
-	if v.at.IsZero() || !v.at.After(l.claimed) {
+	if v.at.IsZero() || v.readBegan <= l.claimed {
 		return false
 	}
 	c := &l.copy
@@ -441,9 +438,11 @@ func (v *view) takenOver(l *lease) bool {
 	return false
 }
 
-// refreshView reads the registry.
+// refreshView reads the registry and publishes the view, unless a read that began
+// later has published one already (reads run concurrently: the view loop, the
+// allocator, routing misses).
 func (n *Node) refreshView(ctx context.Context) error {
-	readAt := n.clock.Wall()
+	readAt := n.lc.Now()
 	nodes, err := n.reg.Nodes(ctx)
 	if err != nil {
 		n.NoteDB(err)
@@ -454,7 +453,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v := &view{at: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
+	v := &view{at: n.clock.Now(), readBegan: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
 	for _, nd := range nodes {
 		v.nodes[nd.ID] = nd
 		if nd.HeartbeatAge < n.opts.DeadAfter {
@@ -473,20 +472,28 @@ func (n *Node) refreshView(ctx context.Context) error {
 			n.loseCopy(ctx, l)
 		}
 	}
-	n.view.Store(v)
+	for {
+		cur := n.view.Load()
+		if cur != nil && cur.readBegan > v.readBegan {
+			return nil
+		}
+		if n.view.CompareAndSwap(cur, v) {
+			break
+		}
+	}
 	n.inst.nodes.Store(int64(len(v.live)))
 	return nil
 }
 
 // viewLoop re-reads the registry every ViewInterval, for routing.
 func (n *Node) viewLoop(ctx context.Context) {
-	t := time.NewTicker(n.opts.ViewInterval)
+	t := n.clock.NewTicker(n.opts.ViewInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		if err := n.refreshView(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			n.log.DebugContext(ctx, "reading the registry failed", slog.Any("error", err))
@@ -497,13 +504,13 @@ func (n *Node) viewLoop(ctx context.Context) {
 // catalogLoop syncs the index catalogue every CatalogInterval, and forgets the leases
 // of indexes dropped meanwhile (the engine has stopped their copies).
 func (n *Node) catalogLoop(ctx context.Context) {
-	t := time.NewTicker(n.opts.CatalogInterval)
+	t := n.clock.NewTicker(n.opts.CatalogInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		if err := n.SyncCatalog(ctx); err != nil && ctx.Err() == nil {
 			n.log.DebugContext(ctx, "syncing the catalogue failed", slog.Any("error", err))

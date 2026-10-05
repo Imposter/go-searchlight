@@ -19,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -33,6 +34,53 @@ type candidate struct {
 
 // key names the copy for adaptive replica selection's staleness memory.
 func (c candidate) key() string { return c.node + "|" + c.shard.String() }
+
+// ErrNoServingCopy is the cause of the 503 a request for a shard no node serves a copy
+// of gets: one that the registry, read again, shows no serving copy of either (an index
+// whose copies are still being placed or recovered, or whose nodes are all down).
+var ErrNoServingCopy = errors.New("cluster: no node serves a copy of the shard")
+
+// routeCandidates is candidates, read again from a fresh view when the routing view
+// has none: the view lags the registry by up to ViewInterval, and a copy claimed
+// since (an index another node just created) is served at once.
+func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidate {
+	if c := n.candidates(id); len(c) > 0 {
+		return c
+	}
+	n.refreshOnMiss(ctx)
+	return n.candidates(id)
+}
+
+// missRefreshEvery is the least time between two registry reads routing misses make:
+// a shard no node serves, read in a loop, costs the registry at most one read per
+// interval, and each miss waits at most that long for a fresh view.
+const missRefreshEvery = 75 * time.Millisecond
+
+// refreshOnMiss re-reads the registry for routing, unless a read that began after the
+// call did meanwhile: concurrent misses share one registry read. Reads it makes are
+// missRefreshEvery apart.
+func (n *Node) refreshOnMiss(ctx context.Context) {
+	asked := n.lc.Now()
+	n.missMu.Lock()
+	defer n.missMu.Unlock()
+	fresh := func() bool { v := n.view.Load(); return v != nil && v.readBegan >= asked }
+	if fresh() {
+		return
+	}
+	if wait := missRefreshEvery - n.clock.Since(n.missReadAt); wait > 0 {
+		if n.clock.Sleep(ctx, wait) != nil || fresh() {
+			return
+		}
+	}
+	n.missReadAt = n.clock.Now()
+	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
+		n.log.DebugContext(ctx, "reading the registry for a shard with no copy in view failed", slog.Any("error", err))
+	}
+}
+
+func noServingCopy(id store.ShardID) *api.Error {
+	return api.Unavailable(ErrNoServingCopy, "no node serves a copy of shard %d of index %q yet; retry", id.Shard, id.Index)
+}
 
 // candidates lists the serving copies of id on live peers, best first (adaptive
 // replica selection).
@@ -132,14 +180,14 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	start := time.Now()
+	start := n.clock.Now()
 	resp, err := n.client.Do(req) //nolint:gosec // a peer's registered address
 	if err != nil {
-		n.inst.peer(ctx, path, peer, 0, time.Since(start))
+		n.inst.peer(ctx, path, peer, 0, n.clock.Since(start))
 		return service, queue, &peerError{node: peer, err: err}
 	}
 	defer resp.Body.Close()
-	n.inst.peer(ctx, path, peer, resp.StatusCode, time.Since(start))
+	n.inst.peer(ctx, path, peer, resp.StatusCode, n.clock.Since(start))
 	service, queue = reported(resp.Header)
 	if resp.StatusCode >= 400 {
 		return service, queue, decodeError(resp)
@@ -168,7 +216,7 @@ func (n *Node) authorize(req *http.Request) {
 		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
-		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10))
+		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10)) //nolint:forbidigo // a context deadline is by the process clock
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 }
@@ -407,10 +455,10 @@ func (n *Node) closeBackground() {
 // --- the engine's hooks (node.Cluster) ----------------------------------------------
 
 // Remote implements node.Cluster.
-func (h *clusterHooks) Remote(_ context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
-	cands := h.n.candidates(id)
+func (h *clusterHooks) Remote(ctx context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
+	cands := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
-		return nil, api.Unavailable(store.ErrClosed, "no other node holds a serving copy of shard %d of index %q", id.Shard, id.Index)
+		return nil, noServingCopy(id)
 	}
 	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands}, nil
 }
@@ -443,11 +491,14 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
 	cands := n.candidates(id)
+	if len(cands) == 0 && !localDone {
+		cands = n.routeCandidates(ctx, id)
+	}
 	if len(cands) == 0 {
 		if localDone {
 			return nil
 		}
-		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q serves to wait on", id.Shard, id.Index)
+		return noServingCopy(id)
 	}
 	errs := make([]error, len(cands))
 	var reached atomic.Int32
@@ -473,17 +524,57 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 		return err
 	}
 	if reached.Load() == 0 && !localDone {
-		return api.Unavailable(store.ErrClosed, "no copy of shard %d of index %q reached seq %d", id.Shard, id.Index, seq)
+		return api.Unavailable(ErrNoServingCopy, "no copy of shard %d of index %q reached seq %d", id.Shard, id.Index, seq)
 	}
 	return nil
 }
 
-// Allocate implements node.Cluster: this node claims its copies of a new index now.
+// Allocate implements node.Cluster: this node claims its copies of a new index now,
+// and answers once the registry shows them serving (up to newIndexServeWait), so
+// that every node routes reads of the index to them at once.
 func (h *clusterHooks) Allocate(ctx context.Context, index string) error {
 	if err := h.n.refreshView(ctx); err != nil {
 		return err
 	}
-	return h.n.allocatePass(ctx, index, false, true)
+	if err := h.n.allocatePass(ctx, index, false, true); err != nil {
+		return err
+	}
+	h.n.awaitServing(ctx, index)
+	return nil
+}
+
+// newIndexServeWait bounds how long creating an index waits for its copies here to be
+// marked serving: a copy is recovering until its tailer first catches up.
+const newIndexServeWait = 5 * time.Second
+
+// awaitServing waits until the registry shows every copy this node holds of index
+// serving, or newIndexServeWait passes.
+func (n *Node) awaitServing(ctx context.Context, index string) {
+	ctx, cancel := clock.WithTimeout(ctx, n.clock, newIndexServeWait)
+	defer cancel()
+	delay := time.Millisecond
+	for {
+		copies, err := n.reg.Copies(ctx, index)
+		if err == nil && n.allServing(copies) {
+			_ = n.refreshView(ctx)
+			return
+		}
+		if n.clock.Sleep(ctx, delay) != nil {
+			n.log.WarnContext(ctx, "a new index's copies here are not marked serving yet; other nodes route reads of it once they are",
+				slog.String("index", index))
+			return
+		}
+		delay = min(2*delay, 20*time.Millisecond)
+	}
+}
+
+func (n *Node) allServing(copies []store.Copy) bool {
+	for i := range copies {
+		if copies[i].NodeID == n.id && copies[i].State != store.CopyServing {
+			return false
+		}
+	}
+	return true
 }
 
 // CopyStopped implements node.Cluster: a copy whose tailer stopped on its own (its
@@ -504,9 +595,9 @@ func (h *clusterHooks) CopyStopped(c store.Copy, err error) {
 
 // Counts implements node.Cluster.
 func (h *clusterHooks) Counts(ctx context.Context, id store.ShardID) (uint64, uint64, error) {
-	cands := h.n.candidates(id)
+	cands := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
-		return 0, 0, api.Unavailable(store.ErrClosed, "no serving copy of %s", id)
+		return 0, 0, noServingCopy(id)
 	}
 	t := &remoteTarget{n: h.n, id: id, cands: cands}
 	var reply countsReply

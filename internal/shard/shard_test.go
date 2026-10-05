@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -357,9 +358,10 @@ func TestWaitRefreshedWithGaps(t *testing.T) {
 	if err := h.s.WaitRefreshed(ctx, 30); err != nil {
 		t.Fatal(err)
 	}
-	// A seq-only refresh is visible at once and persisted lazily (TestSeqOnlyRefresh).
-	if h.s.CommittedSeq() != 20 || h.s.RefreshedSeq() != 30 {
-		t.Fatalf("CommittedSeq %d RefreshedSeq %d after Advance(30) and a refresh, want 20 and 30", h.s.CommittedSeq(), h.s.RefreshedSeq())
+	// A refresh is visible at once and durable at the next flush
+	// (TestRefreshSyncsNothingFlushPersists).
+	if h.s.CommittedSeq() != 0 || h.s.RefreshedSeq() != 30 {
+		t.Fatalf("CommittedSeq %d RefreshedSeq %d after Advance(30) and a refresh, want 0 and 30", h.s.CommittedSeq(), h.s.RefreshedSeq())
 	}
 	g := h.s.Acquire()
 	if g.Seq() != 30 || g.MaxSeq() != 20 {
@@ -384,24 +386,38 @@ func TestWaitRefreshedWithGaps(t *testing.T) {
 	h.s = nil
 }
 
+// The buffer is refreshed in the background every RefreshInterval, by the shard's
+// clock: not before the interval passes, and again at the next one.
 func TestBackgroundRefresh(t *testing.T) {
+	clk := clock.NewFake(time.Now())
 	opts := testOptions()
-	opts.RefreshInterval = 5 * time.Millisecond
+	opts.RefreshInterval = time.Second
+	opts.Clock = clk
 	h := newHarness(t, opts)
-	h.upsert("a", "b")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := h.s.WaitRefreshed(ctx, h.seq); err != nil {
-		t.Fatal(err)
+	for _, ids := range [][]string{{"a", "b"}, {"c"}} {
+		if err := clk.BlockUntilArmed(ctx, time.Second); err != nil {
+			t.Fatalf("no refresh timer of the interval: %v", err)
+		}
+		h.upsert(ids...)
+		clk.Advance(time.Second - time.Millisecond)
+		if got := h.s.RefreshedSeq(); got >= h.seq {
+			t.Fatalf("refreshed to %d before the interval passed", got)
+		}
+		clk.Advance(time.Millisecond)
+		if err := h.s.WaitRefreshed(ctx, h.seq); err != nil {
+			t.Fatal(err)
+		}
+		h.check()
 	}
-	h.check()
 }
 
-// A buffer over FlushBytes refreshes early, without waiting for the interval.
-func TestFlushBytesTriggersRefresh(t *testing.T) {
+// A buffer over RefreshBytes refreshes early, without waiting for the interval.
+func TestRefreshBytesTriggersRefresh(t *testing.T) {
 	opts := testOptions()
 	opts.RefreshInterval = time.Hour
-	opts.FlushBytes = 1
+	opts.RefreshBytes = 1
 	h := newHarness(t, opts)
 	h.upsert("a")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -466,7 +482,7 @@ func TestRefreshFailureKeepsTheBuffer(t *testing.T) {
 	opts.hooks = &testHooks{at: func(point string) error {
 		mu.Lock()
 		defer mu.Unlock()
-		if armed && point == pointCommitSidecars {
+		if armed && point == pointRefreshBuilt {
 			return fail
 		}
 		return nil
@@ -499,7 +515,7 @@ func TestRefreshFailureKeepsTheBuffer(t *testing.T) {
 func TestManifestDamageRefused(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a")
-	h.refresh()
+	h.commit()
 	h.abandon()
 	path := filepath.Join(h.dir, manifestName)
 	data, err := os.ReadFile(path)
@@ -521,7 +537,7 @@ func TestManifestDamageRefused(t *testing.T) {
 func TestDamagedSegmentRefused(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a", "b")
-	h.refresh()
+	h.commit()
 	g := h.s.Acquire()
 	id := g.Segments[0].ID
 	g.Release()
@@ -544,9 +560,9 @@ func TestDamagedSegmentRefused(t *testing.T) {
 func TestOpenRemovesOrphans(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a", "b")
-	h.refresh()
+	h.commit()
 	h.del("a")
-	h.refresh()
+	h.commit()
 	h.abandon()
 	for _, name := range []string{
 		"0123456789abcdef0123456789abcdef.seg",

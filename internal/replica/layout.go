@@ -75,9 +75,9 @@ func copyRoot(dir string) string {
 	return dir
 }
 
-// newCopyDir names a fresh copy directory under root.
-func newCopyDir(root string) string {
-	n := time.Now().UnixNano()
+// newCopyDir names a fresh copy directory under root, after now.
+func newCopyDir(root string, now time.Time) string {
+	n := now.UnixNano()
 	for {
 		dir := filepath.Join(root, copyPrefix+strconv.FormatInt(n, 10))
 		if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
@@ -157,7 +157,7 @@ func removeCopy(root, dir string) {
 	go func() {
 		delay := 100 * time.Millisecond
 		for range 20 {
-			time.Sleep(delay)
+			time.Sleep(delay) //nolint:forbidigo // waits out other processes' handles on the files: real time is the subject
 			if try() {
 				return
 			}

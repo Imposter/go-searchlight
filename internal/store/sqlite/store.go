@@ -44,8 +44,12 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// CheckpointEvery is how often the store checkpoints the WAL.
+// CheckpointEvery is how often the store checks whether the WAL needs a checkpoint.
 const CheckpointEvery = 500 * time.Millisecond
+
+// JournalSizeLimit is the size the WAL file is cut back to when SQLite restarts it,
+// and the log a checkpoint waits for.
+const JournalSizeLimit = 4 << 20
 
 // DefaultBusyTimeoutMS is how long a connection waits for another process's
 // lock before failing with SQLITE_BUSY, unless the URL sets _busy_timeout.
@@ -64,15 +68,21 @@ func Dialect() *dialect.Dialect {
 		Retryable:  retryable,
 		// The writer's automatic checkpoints are off (DSNs): a PASSIVE checkpoint on
 		// a read connection keeps the log short instead, off every commit's path.
-		Checkpoint:       "PRAGMA wal_checkpoint(PASSIVE)",
-		CheckpointEvery:  CheckpointEvery,
-		CheckpointMinLog: 4 << 20,
-		Changelog:        changelog,
-		Records:          records,
-		Registry:         registry,
-		Blobs:            blobs,
-		Indexes:          indexes,
-		Maintenance:      maintenance,
+		Checkpoint:         "PRAGMA wal_checkpoint(PASSIVE)",
+		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
+		TruncateAbove:      4 * JournalSizeLimit,
+		TruncateMaxPending: 512 << 10,
+		TruncateAfterTicks: 2,
+		CheckpointEvery:    CheckpointEvery,
+		CheckpointMinLog:   JournalSizeLimit,
+		PendingLog:         PendingLog,
+		LogWarnBytes:       64 << 20,
+		Changelog:          changelog,
+		Records:            records,
+		Registry:           registry,
+		Blobs:              blobs,
+		Indexes:            indexes,
+		Maintenance:        maintenance,
 	}
 }
 
@@ -125,16 +135,27 @@ func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 
 
 // DSNs returns the driver DSNs for the writer and reader pools. Parameters in
 // the URL are passed through; journal mode, transaction locking and
-// (unless given) the busy timeout and synchronous level are set here.
+// (unless given) the busy timeout and synchronous level are set here. The store
+// checkpoints the write-ahead log itself, off the write connection, reading its
+// progress from the shared wal-index: the URL may not set the locking mode (an
+// exclusive one has no wal-index), automatic checkpoints or the journal size limit.
 func DSNs(u *url.URL) (write, read string, err error) {
 	path, err := Path(u)
 	if err != nil {
 		return "", "", err
 	}
 	q := u.Query()
-	for _, k := range []string{"_txlock", "_journal_mode", "_journal"} {
+	for _, k := range []string{"_txlock", "_journal_mode", "_journal", "_locking_mode", "_locking"} {
 		if q.Has(k) {
 			return "", "", fmt.Errorf("sqlite store URL may not set %s; the store manages it", k)
+		}
+	}
+	for _, p := range q["_pragma"] {
+		name, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(p)), "(")
+		name, _, _ = strings.Cut(name, "=")
+		switch strings.TrimSpace(name) {
+		case "journal_mode", "locking_mode", "wal_autocheckpoint", "journal_size_limit":
+			return "", "", fmt.Errorf("sqlite store URL may not set the %s pragma; the store manages it", strings.TrimSpace(name))
 		}
 	}
 	q.Set("_journal_mode", "WAL")
@@ -145,11 +166,9 @@ func DSNs(u *url.URL) (write, read string, err error) {
 		// FULL: a write is acknowledged only once it is durable (spec §8).
 		q.Set("_synchronous", "FULL")
 	}
+	q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", JournalSizeLimit))
 	w := cloneValues(q)
 	w.Set("_txlock", "immediate")
-	// No checkpoint inside a commit: one that copies a large log into the database
-	// holds the one write connection (and so every writer) for a long while. The
-	// store checkpoints on a read connection (Dialect.Checkpoint).
 	w.Add("_pragma", "wal_autocheckpoint(0)")
 	r := cloneValues(q)
 	r.Set("_txlock", "deferred")

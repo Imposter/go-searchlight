@@ -50,6 +50,9 @@ func TestLoad(t *testing.T) {
 	if err := s.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if s.CommittedSeq() != 50 {
 		t.Fatalf("CommittedSeq %d after the load's Advance, want 50", s.CommittedSeq())
 	}
@@ -98,14 +101,17 @@ func TestLoadRefusals(t *testing.T) {
 	}
 }
 
-// TestAbandonLosesOnlyTheUncommitted: Abandon is a crash: the reopened shard has what
-// the last commit covered, and a Close after Abandon returns at once.
-func TestAbandonLosesOnlyTheUncommitted(t *testing.T) {
+// TestAbandonLosesOnlyTheUnflushed: Abandon is a crash: the reopened shard has what
+// the last flush covered, not what refreshes published since, and a Close after
+// Abandon returns at once.
+func TestAbandonLosesOnlyTheUnflushed(t *testing.T) {
 	h := newHarness(t, testOptions())
 	h.upsert("a", "b")
-	h.refresh()
+	h.commit()
 	committed := maps.Clone(h.model)
 	h.upsert("c")
+	h.refresh()
+	h.upsert("d")
 	h.s.Abandon()
 	if h.s.Acquire() != nil {
 		t.Fatal("Acquire after Abandon")

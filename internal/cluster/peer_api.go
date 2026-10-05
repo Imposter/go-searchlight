@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -107,7 +108,7 @@ func (p *peerAPI) begin(w http.ResponseWriter, r *http.Request, route string) (*
 		trace.WithAttributes(attribute.String("peer.route", route)))
 	cancel := func() {}
 	if ms, err := strconv.ParseInt(r.Header.Get(headerDeadline), 10, 64); err == nil && ms > 0 {
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(ms)*time.Millisecond)
+		ctx, cancel = clock.WithTimeout(ctx, p.n.clock, time.Duration(ms)*time.Millisecond)
 	}
 	r = r.WithContext(ctx)
 	if e := p.authorized(r); e != nil {
@@ -125,7 +126,7 @@ func (p *peerAPI) begin(w http.ResponseWriter, r *http.Request, route string) (*
 
 func (p *peerAPI) wrap(route string, fn func(r *http.Request) (any, error)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
+		start := p.n.clock.Now()
 		r, span, done, e := p.begin(w, r, route)
 		defer span.End()
 		defer done()
@@ -135,7 +136,7 @@ func (p *peerAPI) wrap(route string, fn func(r *http.Request) (any, error)) http
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxPeerBody)
 		out, err := fn(r)
-		w.Header().Set(headerServiceTime, strconv.FormatFloat(time.Since(start).Seconds(), 'f', -1, 64))
+		w.Header().Set(headerServiceTime, strconv.FormatFloat(p.n.clock.Since(start).Seconds(), 'f', -1, 64))
 		if err != nil {
 			e := api.ProblemFor(err)
 			if e.Status >= 500 {
@@ -378,16 +379,30 @@ func (p *peerAPI) copies(*http.Request) (any, error) {
 func (n *Node) localPeerCopies() []peerCopy {
 	local := n.LocalCopies()
 	out := make([]peerCopy, 0, len(local))
+	held := make(map[copyKey]bool, len(local))
+	defer n.forgetProgress(held)
 	for i := range local {
 		lc := &local[i]
 		id := store.ShardID{Index: lc.Info.Index, Shard: lc.Info.Shard}
 		now := lc.Info.AppliedSeq + int64(lc.Info.Docs) + n.fetch.progressOf(id) //nolint:gosec // a document count
+		k := copyKey{shard: id, node: n.id, epoch: lc.Copy.Epoch}
+		held[k] = true
 		out = append(out, peerCopy{
 			ShardInfo: lc.Info, Epoch: lc.Copy.Epoch, Paused: lc.Paused,
-			Progress: n.progressMark(copyKey{shard: id, node: n.id, epoch: lc.Copy.Epoch}, now),
+			Progress: n.progressMark(k, now),
 		})
 	}
 	return out
+}
+
+func (n *Node) forgetProgress(held map[copyKey]bool) {
+	n.progressMu.Lock()
+	defer n.progressMu.Unlock()
+	for k := range n.progressHW {
+		if !held[k] {
+			delete(n.progressHW, k)
+		}
+	}
 }
 
 // progressMark raises copy k's progress high-water mark to now and returns it.
@@ -420,7 +435,7 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 	rc := http.NewResponseController(w)
 	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion()}
 	for _, f := range sn.Files() {
-		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound))
+		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 		sum, err := p.n.sums.sum(id, sn, f)
 		if err == nil {
 			err = ctx.Err()
@@ -434,7 +449,7 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 	reply.ID = p.n.snaps.add(id, sn)
 	p.n.log.InfoContext(ctx, "serving a recovery snapshot", slog.String("shard", id.String()),
 		slog.Int64("seq", reply.Seq), slog.Int("files", len(reply.Files)))
-	_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound))
+	_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(reply)
 }
@@ -485,7 +500,7 @@ func (w *leaseWriter) Write(b []byte) (int, error) {
 	if !w.valid() {
 		panic(http.ErrAbortHandler) // the copy's lease lapsed: drop the connection
 	}
-	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound))
+	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	return w.ResponseWriter.Write(b)
 }
 
@@ -506,9 +521,10 @@ var errPinGone = errors.New("cluster: the pin is gone")
 
 // pinTable holds the generations searches pinned on this node for their fetch phase.
 type pinTable struct {
-	ttl time.Duration
-	mu  sync.Mutex
-	m   map[string]*pinEntry
+	ttl   time.Duration
+	clock clock.Clock
+	mu    sync.Mutex
+	m     map[string]*pinEntry
 }
 
 type pinEntry struct {
@@ -519,7 +535,9 @@ type pinEntry struct {
 	gone    bool
 }
 
-func newPinTable(ttl time.Duration) *pinTable { return &pinTable{ttl: ttl, m: map[string]*pinEntry{}} }
+func newPinTable(ttl time.Duration, clk clock.Clock) *pinTable {
+	return &pinTable{ttl: ttl, clock: clk, m: map[string]*pinEntry{}}
+}
 
 func newID() string {
 	var b [16]byte
@@ -530,7 +548,7 @@ func newID() string {
 func (p *pinTable) add(id store.ShardID, t node.ShardTarget) string {
 	pin := newID()
 	p.mu.Lock()
-	p.m[pin] = &pinEntry{id: id, t: t, expires: time.Now().Add(p.ttl)}
+	p.m[pin] = &pinEntry{id: id, t: t, expires: p.clock.Now().Add(p.ttl)}
 	p.mu.Unlock()
 	return pin
 }
@@ -541,7 +559,7 @@ func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.
 	p.mu.Lock()
 	e := p.m[pin]
 	if e != nil {
-		e.expires = time.Now().Add(p.ttl)
+		e.expires = p.clock.Now().Add(p.ttl)
 	}
 	p.mu.Unlock()
 	if e == nil {
@@ -576,7 +594,7 @@ func (e *pinEntry) drop() {
 
 // sweep releases the pins whose time is up.
 func (p *pinTable) sweep() {
-	now := time.Now()
+	now := p.clock.Now()
 	var expired []*pinEntry
 	p.mu.Lock()
 	for pin, e := range p.m {
@@ -609,6 +627,7 @@ func (p *pinTable) closeAll() {
 // generation's segments on disk): a recovery resumes on a fresh one.
 type snapTable struct {
 	ttl, maxAge time.Duration
+	clock       clock.Clock
 	mu          sync.Mutex
 	m           map[string]*snapEntry
 }
@@ -622,13 +641,13 @@ type snapEntry struct {
 	gone    bool
 }
 
-func newSnapTable(ttl, maxAge time.Duration) *snapTable {
-	return &snapTable{ttl: ttl, maxAge: maxAge, m: map[string]*snapEntry{}}
+func newSnapTable(ttl, maxAge time.Duration, clk clock.Clock) *snapTable {
+	return &snapTable{ttl: ttl, maxAge: maxAge, clock: clk, m: map[string]*snapEntry{}}
 }
 
 func (s *snapTable) add(id store.ShardID, sn *shard.Snapshot) string {
 	key := newID()
-	now := time.Now()
+	now := s.clock.Now()
 	s.mu.Lock()
 	s.m[key] = &snapEntry{id: id, sn: sn, created: now, expires: now.Add(s.ttl)}
 	s.mu.Unlock()
@@ -641,7 +660,7 @@ func (s *snapTable) add(id store.ShardID, sn *shard.Snapshot) string {
 func (s *snapTable) use(key string, valid func(store.ShardID) bool, fn func(store.ShardID, *shard.Snapshot) error) error {
 	s.mu.Lock()
 	e := s.m[key]
-	if e == nil || time.Since(e.created) > s.maxAge {
+	if e == nil || s.clock.Since(e.created) > s.maxAge {
 		s.mu.Unlock()
 		return &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the snapshot expired; take another"}
 	}
@@ -654,7 +673,7 @@ func (s *snapTable) use(key string, valid func(store.ShardID) bool, fn func(stor
 	defer func() {
 		s.mu.Lock()
 		e.users--
-		e.expires = time.Now().Add(s.ttl)
+		e.expires = s.clock.Now().Add(s.ttl)
 		release := e.gone && e.users == 0
 		s.mu.Unlock()
 		if release {
@@ -680,7 +699,7 @@ func (s *snapTable) remove(key string) {
 }
 
 func (s *snapTable) sweep() {
-	now := time.Now()
+	now := s.clock.Now()
 	var release []*shard.Snapshot
 	s.mu.Lock()
 	for key, e := range s.m {
@@ -714,13 +733,13 @@ func (s *snapTable) closeAll() {
 
 // janitorLoop expires pins and snapshots.
 func (n *Node) janitorLoop(ctx context.Context) {
-	t := time.NewTicker(time.Second)
+	t := n.clock.NewTicker(time.Second)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-t.C():
 		}
 		n.pins.sweep()
 		n.snaps.sweep()

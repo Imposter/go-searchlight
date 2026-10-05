@@ -23,8 +23,17 @@ on:
 permissions:
   contents: read
 
+# Scoped per ref, not a single repo-wide "bench": GitHub Actions concurrency holds at
+# most one running and one pending run per group, so a shared group is not a FIFO
+# queue -- a second dispatch while one is already pending CANCELS the first pending
+# run rather than queuing behind it, repo-wide, across every branch. Observed directly
+# while landing this change: two sibling Task 14 branches' own dispatches of this same
+# workflow (on their own refs) each cancelled the other's still-pending run before it
+# ever started a job. Per-ref groups still serialize two dispatches on the SAME
+# branch (the original intent: one bench run per ref at a time), without one
+# branch's dispatch starving another's.
 concurrency:
-  group: bench
+  group: bench-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

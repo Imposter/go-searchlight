@@ -127,6 +127,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	}
 	before, wall := n.lc.Now(), n.lc.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, id, n.id, claim, n.opts.LeaseTTL)
+	claimed := n.lc.Now()
 	n.NoteDB(err)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -146,7 +147,7 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 		}
 		c.State = store.CopyRecovering
 	}
-	l := n.newLease(c, before, wall)
+	l := n.newLease(c, before, wall, claimed)
 	n.leaseMu.Lock()
 	n.leases[id] = l
 	n.leaseMu.Unlock()

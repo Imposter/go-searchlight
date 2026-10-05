@@ -158,6 +158,9 @@ type testHooks struct {
 
 	// peerFile wraps the writer a snapshot file is streamed to.
 	peerFile func(name string, w http.ResponseWriter) http.ResponseWriter
+	// served is told of every read target this node's copy of id gave a peer, with the
+	// leaseClock reading taken before the copy was checked.
+	served func(id store.ShardID, began time.Duration)
 }
 
 func (o *Options) resolve() error {
@@ -273,6 +276,9 @@ type Node struct {
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
 	leases  map[store.ShardID]*lease
+	// quarantines are the quarantines of the slots this node took over, by shard: they
+	// outlive the lease, so a claim of the same slot at the same epoch keeps them.
+	quarantines map[store.ShardID]quarantine
 	// allocMu serializes allocation passes (claims and releases) and forgetting the
 	// leases of dropped indexes. Renewals do not take it: they wait on nothing.
 	allocMu sync.Mutex
@@ -324,18 +330,19 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		opts:      o,
-		cfg:       o.Config,
-		id:        o.Config.NodeID,
-		st:        o.Store,
-		reg:       o.Store.Registry(),
-		log:       o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
-		tr:        o.Tracer,
-		clock:     o.Clock,
-		lc:        leaseClock{c: o.Clock, epoch: o.Clock.Now()},
-		leases:    map[store.ShardID]*lease{},
-		scheme:    "http",
-		startedAt: o.Clock.Now(),
+		opts:        o,
+		cfg:         o.Config,
+		id:          o.Config.NodeID,
+		st:          o.Store,
+		reg:         o.Store.Registry(),
+		log:         o.Logger.With(slog.String(telemetry.KeyNodeID, o.Config.NodeID)),
+		tr:          o.Tracer,
+		clock:       o.Clock,
+		lc:          leaseClock{c: o.Clock, epoch: o.Clock.Now()},
+		leases:      map[store.ShardID]*lease{},
+		quarantines: map[store.ShardID]quarantine{},
+		scheme:      "http",
+		startedAt:   o.Clock.Now(),
 	}
 	n.alloc.clock = o.Clock
 	if o.Config.TLSCert != "" {

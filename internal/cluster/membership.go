@@ -50,6 +50,9 @@ func (c leaseClock) Wall() time.Time    { return c.c.Wall() }
 // database's clock) is also quarantined: it serves nothing until TTL plus margin have
 // passed since the claim by this node's own clock, so even a database clock that
 // stepped forward cannot make it serve while the previous holder's copy still does.
+// The quarantine belongs to the slot at that epoch, not to the lease: a copy dropped
+// locally and claimed back at the same epoch (the store then names no previous holder)
+// stays quarantined until the takeover's quarantine ends.
 type lease struct {
 	copy       store.Copy
 	deadline   atomic.Int64 // leaseClock.Now nanoseconds
@@ -58,8 +61,9 @@ type lease struct {
 	margin     time.Duration
 	clock      leaseClock
 	quarantine time.Duration // leaseClock.Now until which the copy serves nothing; 0: none
-	// claimed is when the claim that granted the lease began, by leaseClock.Now: a view of
-	// the registry read before it cannot judge it.
+	// claimed is when the claim that granted the lease had returned, committed, by
+	// leaseClock.Now: a view of the registry whose read began before then may predate the
+	// claim, so it cannot judge it.
 	claimed time.Duration
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
@@ -104,14 +108,40 @@ func (l *lease) extend(from time.Duration, wall time.Time) {
 	}
 }
 
-func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time) *lease {
-	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.lc, claimed: from}
+func (n *Node) newLease(c store.Copy, from time.Duration, wall time.Time, claimed time.Duration) *lease {
+	l := &lease{copy: c, ttl: n.opts.LeaseTTL, margin: n.opts.LeaseMargin, clock: n.lc, claimed: claimed}
 	l.deadline.Store(int64(from + l.ttl))
 	l.wallBefore.Store(wall.UnixNano())
-	if c.TakenFrom != "" && c.TakenFrom != n.id {
-		l.quarantine = from + l.ttl + l.margin
-	}
+	l.quarantine = n.quarantineFor(c, from+l.ttl+l.margin)
 	return l
+}
+
+// quarantine is a takeover's quarantine: the slot at epoch serves nothing until until
+// (leaseClock.Now).
+type quarantine struct {
+	epoch int64
+	until time.Duration
+}
+
+// quarantineFor is the leaseClock.Now until which a claim of c may not serve (0: none):
+// stolenUntil for a slot taken over from another node, else what is left of the
+// quarantine of the takeover that gave this node the slot at c's epoch.
+func (n *Node) quarantineFor(c store.Copy, stolenUntil time.Duration) time.Duration {
+	n.leaseMu.Lock()
+	defer n.leaseMu.Unlock()
+	if c.TakenFrom != "" && c.TakenFrom != n.id {
+		n.quarantines[c.Shard] = quarantine{epoch: c.Epoch, until: stolenUntil}
+		return stolenUntil
+	}
+	q, ok := n.quarantines[c.Shard]
+	if !ok {
+		return 0
+	}
+	if q.epoch != c.Epoch || n.lc.Now() >= q.until {
+		delete(n.quarantines, c.Shard)
+		return 0
+	}
+	return q.until
 }
 
 // leaseList returns the copies this node holds, by shard.

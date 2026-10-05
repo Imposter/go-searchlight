@@ -44,7 +44,8 @@ make parity      # regenerate testdata/parity/*.json from scrape-bot (see below)
   100,000-document recovery, the full byte-identity matrices, the binary's smoke test and
   the end-to-end benchmark run left to the heavy tier, which runs only without `-short`. CI
   runs the short tier and the full suite as two jobs, both under `-race` on Linux with
-  SQLite, Postgres and MySQL, and the short tier and the two smoke tests on Windows. [CONTRIBUTING.md](CONTRIBUTING.md)
+  SQLite, Postgres and MySQL, and on Windows the short tier, the two smoke tests and the
+  heavy tier of `store`, `shard` and `segment`. [CONTRIBUTING.md](CONTRIBUTING.md)
   says which tier a new test belongs to.
 - **`-race` needs cgo.** `TESTFLAGS` adds flags to every test target (`make test
   TESTFLAGS=-race`); without a C compiler (common on Windows), leave `-race` to CI.

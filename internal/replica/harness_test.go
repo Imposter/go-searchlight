@@ -50,8 +50,6 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, d *db)) {
 	forDialects(t, storetest.SQLiteURL, fn)
 }
 
-// forEachDurableDialect is forEachDialect with SQLite's synchronous=FULL, for tests
-// of durability, crashes and fsyncs.
 func forEachDurableDialect(t *testing.T, fn func(t *testing.T, d *db)) {
 	t.Helper()
 	forDialects(t, storetest.DurableSQLiteURL, fn)

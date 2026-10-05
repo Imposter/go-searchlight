@@ -13,10 +13,11 @@ The suite has two tiers, sorted by [internal/testtier](internal/testtier/testtie
 
 `TESTFLAGS` adds flags to any of them, such as `TESTFLAGS=-race` or `TESTFLAGS=-count=2`.
 CI runs `make test TESTFLAGS=-race` and `make test-race` as two Linux jobs against SQLite,
-Postgres and MySQL, and the short tier plus the smoke tests on Windows: the binary built,
-run and restarted (`TestSmokeBinary`), and every benchmark workload against a node in
-process (`TestEndToEndInProcess`). The heavy job runs every test, so it alone keeps the
-suite's coverage; the short job answers first.
+Postgres and MySQL. The heavy job runs every test, so it alone keeps the suite's coverage;
+the short job answers first. On Windows CI runs the short tier, the smoke tests (the binary
+built, run and restarted in `TestSmokeBinary`; every benchmark workload against a node in
+process in `TestEndToEndInProcess`) and the heavy tier of `store`, `shard` and `segment`,
+whose WAL checkpoints, merges, renames and large files behave differently on NTFS.
 
 The T7 harnesses (`TestT7RefreshPhases`, `TestT7Diag`) are diagnostics, not checks: they run
 only with `SEARCHLIGHT_T7DIAG=1` and outside `-short`.
@@ -42,6 +43,9 @@ holds its writes, and start as a copy of a template migrated once per test binar
 
 Tests of durability, crashes or fsyncs keep the store's `synchronous=FULL`:
 `storetest.DurableSQLiteURL`, `durableSQLiteHarness`, or `forEachDurableDialect`.
+
+Package `store` keeps its own copy of the template migration, since its tests cannot import
+`storetest` (which imports `store`) without an import cycle.
 
 ### Parallel tests
 

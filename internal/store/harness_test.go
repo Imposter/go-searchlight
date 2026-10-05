@@ -38,10 +38,8 @@ var quiet = WithLogger(slog.New(slog.DiscardHandler))
 type harness struct {
 	dialect string
 	url     string
-	// path is a SQLite database's file, seeded from the migrated template on the
-	// harness's first open unless a test created it before.
-	path string
-	seed sync.Once
+	path    string
+	seed    sync.Once
 }
 
 // forEachDialect runs fn on a fresh database of every available dialect.
@@ -64,8 +62,6 @@ func forEachDialect(t *testing.T, fn func(t *testing.T, h *harness)) {
 	})
 }
 
-// forEachDurableDialect is forEachDialect with SQLite's synchronous=FULL, for tests
-// of durability, crashes and fsyncs.
 func forEachDurableDialect(t *testing.T, fn func(t *testing.T, h *harness)) {
 	t.Helper()
 	forEachDialect(t, func(t *testing.T, h *harness) { fn(t, h.durable()) })
@@ -77,14 +73,10 @@ func randName(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
-// sqliteURL is a test database's URL, with synchronous=OFF: a test never outlives
-// the operating system that holds its writes.
 func sqliteURL(path string) string {
 	return durableSQLiteURL(path) + "?_synchronous=OFF"
 }
 
-// durableSQLiteURL keeps the store's synchronous=FULL, for tests of durability,
-// crashes and fsyncs.
 func durableSQLiteURL(path string) string {
 	path = filepath.ToSlash(path)
 	if strings.HasPrefix(path, "/") {
@@ -103,8 +95,6 @@ func durableSQLiteHarness(t testing.TB) *harness {
 	return &harness{dialect: "sqlite", url: durableSQLiteURL(path), path: path}
 }
 
-// durable is h with SQLite's synchronous=FULL, for tests of durability, crashes and
-// fsyncs.
 func (h *harness) durable() *harness {
 	if h.dialect != "sqlite" {
 		return h
@@ -112,8 +102,6 @@ func (h *harness) durable() *harness {
 	return &harness{dialect: h.dialect, url: durableSQLiteURL(h.path), path: h.path}
 }
 
-// sqliteTemplate is a database migrated once per process: copying it costs a
-// fraction of migrating each test's database afresh.
 var sqliteTemplate = sync.OnceValues(func() (map[string][]byte, error) {
 	dir, err := os.MkdirTemp("", "store-template")
 	if err != nil {

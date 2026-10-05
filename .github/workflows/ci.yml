@@ -85,7 +85,7 @@ jobs:
         run: make ${{ matrix.target }}
 
   windows:
-    name: build, test -short and smoke (Windows, SQLite)
+    name: build, test -short, smoke and NTFS heavy (Windows, SQLite)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -102,6 +102,9 @@ jobs:
         # (TestSmokeBinary), and every benchmark workload driven against a node started
         # in process (TestEndToEndInProcess).
         run: go test -run '^(TestSmokeBinary|TestEndToEndInProcess)$' ./cmd/searchlight ./bench/cmd/slbench
+      - name: heavy tier of the NTFS-sensitive packages
+        # WAL checkpointing, merge-and-rename and large-file I/O on a real NTFS volume.
+        run: go test -timeout 20m ./internal/store/... ./internal/shard/... ./internal/segment/...
 
   docker:
     name: image, compose and Kubernetes manifests

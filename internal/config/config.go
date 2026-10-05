@@ -42,8 +42,9 @@ type Config struct {
 	StoreURL string
 	// Listen is the public API address.
 	Listen string
-	// AdminListen serves /healthz, /metrics and, when Pprof is set,
-	// /debug/pprof/*.
+	// AdminListen serves /healthz, /readyz, /metrics and, when Pprof is set,
+	// /debug/pprof/*. It is loopback by default; a container sets :8781 so probes and
+	// Prometheus reach it.
 	AdminListen string
 	// AdvertiseAddress is the host:port peers use to reach this node. When
 	// unset it is derived from Listen, with this host's name when Listen has
@@ -120,7 +121,8 @@ type Config struct {
 	LogLevel slog.Level
 	// Pprof serves /debug/pprof/* on the admin listener.
 	Pprof bool
-	// ShutdownTimeout bounds the graceful shutdown.
+	// ShutdownTimeout is a graceful shutdown's whole budget after ShutdownGrace: drain,
+	// listener and node stop (final manifests), then the store and telemetry closing.
 	ShutdownTimeout time.Duration
 
 	// MaxBodyBytes caps a public API request body. It stays below MaxBodyLimit,
@@ -183,7 +185,7 @@ const MaxBodyLimit = 32<<20 - 1<<10
 func Default() Config {
 	return Config{
 		Listen:                ":8780",
-		AdminListen:           ":8781",
+		AdminListen:           "127.0.0.1:8781",
 		NodeID:                hostname(),
 		DataDir:               "data",
 		RefreshInterval:       time.Second,
@@ -198,7 +200,7 @@ func Default() Config {
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
 		LogLevel:              slog.LevelInfo,
-		ShutdownTimeout:       30 * time.Second,
+		ShutdownTimeout:       time.Minute,
 		MaxBodyBytes:          16 << 20,
 		MaxDocBytes:           4 << 20,
 		MaxBulkOps:            10_000,
@@ -258,7 +260,7 @@ var settings = []setting{
 		format: func(c *Config) string { return c.Listen },
 	},
 	{
-		name: "admin_listen", usage: "admin address for /healthz, /metrics and pprof (host:port)",
+		name: "admin_listen", usage: "admin address for /healthz, /readyz, /metrics and pprof (host:port; loopback by default)",
 		parse:  func(c *Config, v string) error { c.AdminListen = v; return nil },
 		format: func(c *Config) string { return c.AdminListen },
 	},
@@ -421,7 +423,7 @@ var settings = []setting{
 		format: func(c *Config) string { return strconv.FormatBool(c.Pprof) },
 	},
 	{
-		name: "shutdown_timeout", usage: "how long a graceful shutdown may take",
+		name: "shutdown_timeout", usage: "how long a graceful shutdown may take in all, after shutdown_grace",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.ShutdownTimeout, v) },
 		format: func(c *Config) string { return c.ShutdownTimeout.String() },
 	},

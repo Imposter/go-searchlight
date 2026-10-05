@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -422,6 +423,13 @@ const (
 // starts draining (the cluster node retires the copies others can stand in for).
 type Drainer interface {
 	Drain(ctx context.Context)
+}
+
+// Mounter is implemented by a coordinator that serves more than the API on its node's
+// listener: Run serves Handler(s) instead of s (the cluster node adds its internal
+// peer API).
+type Mounter interface {
+	Handler(api http.Handler) http.Handler
 }
 
 // ShardInfo describes one shard copy.

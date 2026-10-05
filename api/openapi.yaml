@@ -61,7 +61,7 @@ paths:
       tags: [probes]
       operationId: readyz
       summary: Readiness.
-      description: 503 while the node drains for shutdown, the database does not answer, or a shard copy is recovering or halted.
+      description: 503 while the node has not joined the cluster yet, drains for shutdown, the database does not answer, or a shard copy has not finished its startup recovery.
       security: []
       responses:
         "200":

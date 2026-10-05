@@ -220,14 +220,25 @@ func (s *Server) HTTPServer() *http.Server {
 }
 
 // Run serves s on ln until ctx ends, over TLS when tls_cert and tls_key are set
-// (otherwise put a TLS-terminating proxy in front), then shuts down gracefully:
-// readiness turns false and the API keeps serving for shutdown_grace, so load
-// balancers stop sending it traffic; then the listener stops accepting and requests in
-// flight finish within shutdown_timeout (those still running then are cut off);
-// finally the coordinator is closed, flushing every shard copy, within a
-// shutdown_timeout of its own. It owns ln.
+// (otherwise put a TLS-terminating proxy in front). A coordinator that is a [Mounter]
+// serves s inside its own handler. It owns ln.
+//
+// When ctx ends it shuts down gracefully within one budget, a [Shutdown]: ctx's cause
+// when it is one (context.WithCancelCause), else [NewShutdown] from that moment. With
+// T the shutdown_timeout:
+//
+//   - readiness turns false and a [Drainer] coordinator drains, within T/4;
+//   - the API keeps serving for the grace, so load balancers stop sending it traffic;
+//   - the listener stops accepting and requests in flight finish, within T/4 (those
+//     still running then are cut off);
+//   - the coordinator is closed, flushing every shard copy, by the deadline less T/10,
+//     which leaves it at least 0.4 T; the last T/10 is the caller's, to close what it
+//     opened.
 func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	srv := s.HTTPServer()
+	if m, ok := s.c.(Mounter); ok {
+		srv.Handler = m.Handler(s)
+	}
 	srv.BaseContext = func(net.Listener) context.Context { return context.WithoutCancel(ctx) }
 	errc := make(chan error, 1)
 	go func() {
@@ -238,24 +249,32 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 		errc <- srv.Serve(ln)
 	}()
 	s.log.InfoContext(ctx, "API listener serving", slog.String("address", ln.Addr().String()))
+	base := context.WithoutCancel(ctx)
 	select {
 	case err := <-errc:
-		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+		cctx, cancel := clock.WithDeadline(base, s.clock, s.closeBy(NewShutdown(s.cfg, s.clock)))
 		defer cancel()
 		return errors.Join(fmt.Errorf("api listener: %w", err), s.c.Close(cctx))
 	case <-ctx.Done():
 	}
+	sd := NewShutdown(s.cfg, s.clock)
+	var given *Shutdown
+	if errors.As(context.Cause(ctx), &given) {
+		sd = given
+	}
+	quarter := s.cfg.ShutdownTimeout / 4
+
 	s.draining.Store(true)
-	s.log.InfoContext(ctx, "API draining: not ready", slog.Duration("grace", s.cfg.ShutdownGrace))
+	s.log.InfoContext(ctx, "API draining: not ready", slog.Duration("grace", sd.Grace), slog.Time("deadline", sd.Deadline))
 	if d, ok := s.c.(Drainer); ok {
 		// A cluster node retires the copies others can stand in for, so peers stop
 		// routing reads here while the listener drains.
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+		dctx, cancel := clock.WithDeadline(base, s.clock, sd.within(s.clock.Now(), quarter))
 		d.Drain(dctx)
 		cancel()
 	}
-	if s.cfg.ShutdownGrace > 0 {
-		t := s.clock.NewTimer(s.cfg.ShutdownGrace)
+	if sd.Grace > 0 {
+		t := s.clock.NewTimer(min(sd.Grace, s.clock.Until(sd.Deadline)))
 		select {
 		case <-t.C():
 		case err := <-errc:
@@ -263,7 +282,7 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 			errc <- err
 		}
 	}
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+	sctx, cancel := clock.WithDeadline(base, s.clock, sd.within(s.clock.Now(), quarter))
 	defer cancel()
 	var errs []error
 	if err := srv.Shutdown(sctx); err != nil {
@@ -273,15 +292,41 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	if err := <-errc; !errors.Is(err, http.ErrServerClosed) {
 		errs = append(errs, fmt.Errorf("api listener: %w", err))
 	}
-	// Closing the coordinator gets a budget of its own: a drain that used all of
-	// shutdown_timeout must not leave the copies unflushed.
-	cctx, ccancel := context.WithTimeout(context.WithoutCancel(ctx), s.cfg.ShutdownTimeout)
+	cctx, ccancel := clock.WithDeadline(base, s.clock, s.closeBy(sd))
 	defer ccancel()
 	if err := s.c.Close(cctx); err != nil {
 		errs = append(errs, fmt.Errorf("coordinator close: %w", err))
 	}
 	s.log.InfoContext(cctx, "API stopped")
 	return errors.Join(errs...)
+}
+
+func (s *Server) closeBy(sd *Shutdown) time.Time {
+	return sd.Deadline.Add(-s.cfg.ShutdownTimeout / 10)
+}
+
+// Shutdown is a graceful shutdown's budget, fixed when it begins. Cancel Run's context
+// with one as its cause to set it; the caller then closes what it opened by Deadline.
+type Shutdown struct { //nolint:errname // a cancellation cause carrying the budget, not a failure
+	// Deadline is when the whole shutdown, the caller's closing included, must be done.
+	Deadline time.Time
+	// Grace is how long the API keeps serving after readiness turns false.
+	Grace time.Duration
+}
+
+// NewShutdown returns the budget of a shutdown beginning now by c: shutdown_grace, then
+// shutdown_timeout.
+func NewShutdown(cfg config.Config, c clock.Clock) *Shutdown {
+	return &Shutdown{Deadline: c.Now().Add(cfg.ShutdownGrace + cfg.ShutdownTimeout), Grace: cfg.ShutdownGrace}
+}
+
+func (*Shutdown) Error() string { return "graceful shutdown" }
+
+func (sd *Shutdown) within(now time.Time, d time.Duration) time.Time {
+	if end := now.Add(d); end.Before(sd.Deadline) {
+		return end
+	}
+	return sd.Deadline
 }
 
 // reqInfo is what the middleware hands a handler through its context.

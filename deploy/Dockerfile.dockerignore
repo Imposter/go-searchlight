@@ -1,0 +1,14 @@
+.git
+.github
+.superpowers
+.pgtmp
+bin
+dist
+data
+snapshots
+testdata
+docs
+deploy
+tools
+**/*.test
+**/*.out

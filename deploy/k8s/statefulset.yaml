@@ -1,0 +1,162 @@
+# Three Searchlight nodes. Create the Secret first, from files holding the Postgres or
+# MySQL store_url, a cluster_token and a tokens_file (one "<token> write" or
+# "<token> read" per line):
+#
+#   kubectl create secret generic searchlight \
+#     --from-file=store_url=./store_url \
+#     --from-file=cluster_token=./cluster_token \
+#     --from-file=tokens=./tokens
+#   kubectl apply -f deploy/k8s/
+#
+# A node needs nothing else: it registers in the database, finds its peers there, and
+# recovers its shard copies from them. Scale with kubectl scale; every node holds every
+# shard unless an index sets replicas_per_shard. SQLite serves one node only: use
+# Postgres or MySQL 8.0.19+ here.
+#
+# For production, spread the nodes over hosts and zones as a rule rather than a
+# preference: make the podAntiAffinity below requiredDuringScheduling..., or add
+# topologySpreadConstraints on topology.kubernetes.io/zone, so one host or zone failure
+# never takes every copy of a shard.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: searchlight
+  labels:
+    app.kubernetes.io/name: searchlight
+spec:
+  replicas: 3
+  serviceName: searchlight-peers
+  # Nodes are plug and play: they need no ordered start, and a rolling update replaces
+  # one at a time (the PodDisruptionBudget and readiness gate it).
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: searchlight
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: searchlight
+    spec:
+      # shutdown_grace (10 s) plus shutdown_timeout (60 s), the node's whole shutdown
+      # budget (ConfigMap), plus 10 s of slack before the kubelet kills it.
+      terminationGracePeriodSeconds: 80
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: searchlight
+      containers:
+        - name: searchlight
+          # Build and push it with `make docker` (deploy/Dockerfile), then point this
+          # at your registry.
+          image: searchlight:dev
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: searchlight
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SEARCHLIGHT_NODE_ID
+              value: $(POD_NAME)
+            - name: SEARCHLIGHT_ADVERTISE_ADDRESS
+              value: $(POD_NAME).searchlight-peers.$(POD_NAMESPACE).svc:8780
+            - name: SEARCHLIGHT_STORE_URL_FILE
+              value: /etc/searchlight/secrets/store_url
+            - name: SEARCHLIGHT_CLUSTER_TOKEN_FILE
+              value: /etc/searchlight/secrets/cluster_token
+            - name: SEARCHLIGHT_TOKENS_FILE
+              value: /etc/searchlight/secrets/tokens
+            # The Go heap's soft limit, below the container's memory limit so the
+            # kernel can keep mmap'd segment pages in the page cache.
+            - name: GOMEMLIMIT
+              value: 3GiB
+          ports:
+            - name: http
+              containerPort: 8780
+            - name: admin
+              containerPort: 8781
+          # Memory, against the ConfigMap's budgets (docs/operations.md, "Sizing"):
+          #   in-flight requests: about 1.5 x (max_inflight_write_bytes +
+          #     max_inflight_read_bytes) = 1.5 x (512 MiB + 256 MiB) = 1.1 GiB at most,
+          #     each request charged its body bytes x inflight_amplification (10);
+          #   shard write buffers: up to (4 + 1) x 64 MiB = 320 MiB per shard copy
+          #     taking writes faster than it refreshes, near nothing at rest;
+          #   segments are mmap'd: their resident pages are page cache, counted against
+          #     the limit but reclaimed under pressure, so the headroom above GOMEMLIMIT
+          #     is what keeps hot segments cached.
+          # The limit below fits the in-flight budgets, a few busy shard copies and
+          # about 1 GiB of page cache; the request equals it, so the node is never
+          # evicted for memory it was promised. GOMAXPROCS follows the CPU limit, and with
+          # it search_threads and merge_threads.
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          # /healthz answers as soon as the admin listener is up, before the store is
+          # opened, so liveness never kills a node that is retrying the database or
+          # migrating; /readyz gates traffic until its copies have recovered.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/searchlight
+            - name: secrets
+              mountPath: /etc/searchlight/secrets
+              readOnly: true
+      volumes:
+        - name: secrets
+          secret:
+            secretName: searchlight
+            defaultMode: 0440
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: searchlight
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi

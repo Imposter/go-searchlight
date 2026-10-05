@@ -98,6 +98,68 @@ jobs:
         # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
         run: go test -short ./...
       - name: smoke
-        # The heavy tier's end-to-end run: a node started in process, every workload
-        # driven against it over HTTP, and the report rendered.
-        run: go test -run '^TestEndToEndInProcess$' ./bench/cmd/slbench
+        # From the heavy tier: the binary built, run, interrupted and restarted
+        # (TestSmokeBinary), and every benchmark workload driven against a node started
+        # in process (TestEndToEndInProcess).
+        run: go test -run '^(TestSmokeBinary|TestEndToEndInProcess)$' ./cmd/searchlight ./bench/cmd/slbench
+
+  docker:
+    name: image, compose and Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: compose file is valid
+        run: docker compose -f deploy/compose.yml config --quiet
+      # Dependabot does not track an image pinned inside a run step: bump this one by hand
+      # from https://github.com/yannh/kubeconform/releases, digest included
+      # (docker buildx imagetools inspect ghcr.io/yannh/kubeconform:<tag>).
+      - name: Kubernetes manifests are valid
+        run: >-
+          docker run --rm -v "$PWD/deploy/k8s:/k8s:ro"
+          ghcr.io/yannh/kubeconform:v0.7.0@sha256:85dbef6b4b312b99133decc9c6fc9495e9fc5f92293d4ff3b7e1b30f5611823c
+          -strict -summary /k8s
+      - name: build the image (not pushed)
+        run: make docker IMAGE=searchlight:dev
+      - name: the image runs as non-root, with its healthcheck
+        run: |
+          docker run --rm searchlight:dev -h > /dev/null
+          test "$(docker image inspect -f '{{.Config.User}}' searchlight:dev)" = "65532:65532"
+          docker image inspect -f '{{json .Config.Healthcheck.Test}}' searchlight:dev | grep -q '"healthcheck"'
+          if docker run --rm searchlight:dev healthcheck; then echo "healthcheck passed with no node running"; exit 1; fi
+      - name: start the compose cluster (the command docs/operations.md gives)
+        run: docker compose -f deploy/compose.yml up --build -d
+      - name: the compose cluster serves
+        run: |
+          compose="docker compose -f deploy/compose.yml"
+          for node in 1 2 3; do
+            for i in $(seq 1 90); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "searchlight-searchlight-$node-1")" = healthy ] && break
+              [ "$i" = 90 ] && { echo "node $node never became healthy"; exit 1; }
+              sleep 2
+            done
+          done
+          for port in 8781 8783 8785; do
+            curl -fsS "http://127.0.0.1:$port/readyz" > /dev/null
+          done
+          token=$($compose run --rm --no-deps -T secrets sh -c 'grep " write$" /secrets/tokens | cut -d" " -f1')
+          auth="Authorization: Bearer $token"
+          curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' http://127.0.0.1:8780/indexes/ci \
+            -d '{"mapping": {"fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 2}}'
+          seq=$(printf '%s\n' '{"upsert": {"id": "a"}}' '{"brand": "acme", "price": 5}' '{"upsert": {"id": "b"}}' '{"brand": "other", "price": 50}' |
+            curl -fsS -X POST -H "$auth" -H 'Content-Type: application/x-ndjson' --data-binary @- http://127.0.0.1:8782/indexes/ci/_bulk |
+            jq -er .seq)
+          total=$(curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
+            "http://127.0.0.1:8784/indexes/ci/_search?wait_for_seq=$seq" \
+            -d '{"query": {"field": "brand", "op": "eq", "value": "ACME"}}' | jq -er .total.value)
+          test "$total" = 1
+          curl -fsS -H "$auth" http://127.0.0.1:8780/_cluster/health | jq -e '.nodes == 3'
+          start=$(date +%s)
+          $compose stop searchlight-1
+          test "$(docker inspect -f '{{.State.ExitCode}}' searchlight-searchlight-1-1)" = 0
+          test $(( $(date +%s) - start )) -le 75
+      - name: compose logs
+        if: always()
+        run: docker compose -f deploy/compose.yml logs --no-color --tail 200 || true
+      - name: compose down
+        if: always()
+        run: docker compose -f deploy/compose.yml down -v || true

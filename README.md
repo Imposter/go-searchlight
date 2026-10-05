@@ -9,9 +9,10 @@ SQLite store). The design is in
 and the build plan is in [docs/superpowers/plans/2026-10-02-searchlight.md](docs/superpowers/plans/2026-10-02-searchlight.md).
 
 > **Status:** the engine, the HTTP API and the cluster are built, and the binary runs
-> them. The benchmark against Elasticsearch, the chaos suite and the tuning to the spec's
-> targets are still to come; [docs/architecture.md](docs/architecture.md#planned-not-built)
-> lists what is planned but not built.
+> them. The benchmark harness against Elasticsearch (`bench/`) and the chaos suite
+> (`test/chaos`) are in place; the tuning to the spec's targets is still to come.
+> [docs/architecture.md](docs/architecture.md#planned-not-built) lists what is planned but
+> not built.
 
 ## Documentation
 
@@ -44,6 +45,11 @@ make parity   # regenerate testdata/parity/*.json from scrape-bot (see below)
   - `mysql://searchlight:searchlight@127.0.0.1:3306/searchlight`
 
   The SQLite tests always run and need no services.
+- **The chaos suite** (`test/chaos`, behind the `chaos` build tag) runs the binary as a
+  three-node cluster on Postgres and kills, restarts and corrupts it under load:
+  `SEARCHLIGHT_TEST_PG_URL=... go test -tags chaos ./test/chaos`. Its database restart
+  scenario also needs `SEARCHLIGHT_CHAOS_DB_RESTART`, a shell command that restarts that
+  Postgres. CI runs it in `.github/workflows/chaos.yml`.
 - **`make parity`** runs `uv run --project $(SCRAPE_BOT) python tools/parity/gen.py`.
   `SCRAPE_BOT` defaults to `E:/code/scrape_bot`; point it at your scrape-bot checkout.
 

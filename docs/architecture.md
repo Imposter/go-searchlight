@@ -382,7 +382,7 @@ window, the API's request timing and its shutdown grace.
 
 ## Planned, not built
 
-- **Tuning against Elasticsearch** (plan Tasks 13 and 14). The benchmark harness is in
-  `bench/`, but the chaos suite, the CI runs against Elasticsearch, and the tuning until
-  every spec §1 target is met are still to come. `docs/benchmarks.md` will hold the
-  results.
+- **Tuning against Elasticsearch** (plan Task 14). The benchmark harness is in `bench/`
+  (it runs the real binary, restarts and recoveries included) and the chaos suite in
+  `test/chaos`, but the tuning until every spec §1 target is met is still to come.
+  `docs/benchmarks.md` will hold the results.

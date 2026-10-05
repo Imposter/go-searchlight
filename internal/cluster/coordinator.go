@@ -173,6 +173,9 @@ type testHooks struct {
 	// servedLocal is told of every read of this node's copy of id held under l, local
 	// reads included.
 	servedLocal func(id store.ShardID, l *lease)
+	// pinned is told of every generation of this node's copy of id a peer's query phase
+	// pinned, before the reply goes back.
+	pinned func(id store.ShardID, pin string)
 }
 
 func (o *Options) resolve() error {

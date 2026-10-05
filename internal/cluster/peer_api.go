@@ -442,7 +442,10 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	rc := http.NewResponseController(w)
-	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion()}
+	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion(), FormatMajor: sn.FormatMajor()}
+	if h := p.n.opts.hooks; h != nil && h.snapshotMajor != nil {
+		reply.FormatMajor = h.snapshotMajor(reply.FormatMajor)
+	}
 	for _, f := range sn.Files() {
 		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 		sum, err := p.n.sums.sum(id, sn, f)

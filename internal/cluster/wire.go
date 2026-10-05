@@ -163,6 +163,9 @@ type snapshotReply struct {
 	IndexUID       string     `json:"index_uid"`
 	MappingVersion int64      `json:"mapping_version"`
 	Files          []wireFile `json:"files"`
+	// FormatMajor is the oldest segment format major among the snapshot's segments;
+	// 0 from a peer too old to say.
+	FormatMajor int `json:"format_major,omitempty"`
 }
 
 type wireFile struct {

@@ -48,6 +48,12 @@ import (
 //     file, fsynced, renamed, the directory fsynced): it is the copy's commit point, so
 //     a recovery cut short anywhere before it leaves a directory that opens empty.
 //
+// A peer whose snapshot holds segments of an older format major than this build writes
+// (an upgraded node that has not merged them away yet, or a node not yet upgraded) is
+// passed over while another peer may serve the copy in the current major, and tried
+// last: this build reads the previous major, so its segments are still usable, but a
+// copy fetched from it starts out in the older format.
+//
 // The tailer then opens the copy and replays the changelog from the snapshot's seq. When
 // no peer can serve the copy, the newest recovery bundle in the store's blobs is
 // restored instead (bundle.go); any other failure makes the tailer rebuild the copy
@@ -68,6 +74,10 @@ var errNoSource = fmt.Errorf("cluster: no serving peer holds a copy of the shard
 
 // errEmptySource is a peer whose copy holds nothing yet.
 var errEmptySource = fmt.Errorf("cluster: the peer's copy is empty: %w", replica.ErrNoSource)
+
+// errOlderMajor is a peer whose snapshot holds segments of an older format major,
+// passed over for now.
+var errOlderMajor = errors.New("cluster: the peer's segments are in an older format major")
 
 // fetcher is the replica.Fetcher: peer recovery.
 type fetcher struct {
@@ -159,7 +169,8 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) (stri
 	return "", peerErr
 }
 
-// fetchPeers fills dir with a serving peer's copy of id, trying the peers best first.
+// fetchPeers fills dir with a serving peer's copy of id, trying the peers best first,
+// and those whose segments are in an older format major after every other.
 func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, progress *atomic.Int64) error {
 	n := f.n
 	cands := n.candidates(id)
@@ -167,13 +178,22 @@ func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, 
 		return errNoSource
 	}
 	staging := n.stagingDir(id)
+	type source struct {
+		c        candidate
+		anyMajor bool
+	}
+	queue := make([]source, len(cands))
+	for i, c := range cands {
+		queue[i] = source{c: c}
+	}
 	var errs []error
-	for _, c := range cands {
+	for i := 0; i < len(queue); i++ {
+		c, anyMajor := queue[i].c, queue[i].anyMajor
 		delay := 100 * time.Millisecond
 		for attempt := 1; attempt <= fetchAttempts; attempt++ {
 			start := n.clock.Now()
 			progress.Store(0)
-			bytes, err := f.fetchFrom(ctx, c, id, dir, staging)
+			bytes, err := f.fetchFrom(ctx, c, id, dir, staging, anyMajor)
 			if err == nil {
 				_ = os.RemoveAll(staging)
 				secs := n.clock.Since(start).Seconds()
@@ -183,6 +203,10 @@ func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, 
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if errors.Is(err, errOlderMajor) {
+				queue = append(queue, source{c: c, anyMajor: true})
+				break
 			}
 			errs = append(errs, err)
 			if errors.Is(err, errEmptySource) {
@@ -211,8 +235,9 @@ func (n *Node) stagingDir(id store.ShardID) string {
 }
 
 // fetchFrom recovers id from one peer into dir, through staging. It returns the bytes
-// it fetched.
-func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, dir, staging string) (int64, error) {
+// it fetched. Unless anyMajor, a snapshot whose segments are in an older format major
+// is refused with errOlderMajor before anything is fetched.
+func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, dir, staging string, anyMajor bool) (int64, error) {
 	n := f.n
 	var snap snapshotReply
 	if err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"snapshots", shardRef{Index: id.Index, Shard: id.Shard}, &snap); err != nil {
@@ -226,6 +251,9 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 	if snap.Seq <= 0 {
 		// A copy at seq 0 holds nothing the store's snapshot would not give as well.
 		return 0, errEmptySource
+	}
+	if !anyMajor && snap.FormatMajor < segment.FormatMajor {
+		return 0, errOlderMajor
 	}
 	if len(snap.Files) == 0 || snap.Files[len(snap.Files)-1].Name != shard.ManifestName {
 		return 0, fmt.Errorf("cluster: the peer's snapshot of %s does not end with its manifest", id)

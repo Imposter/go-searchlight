@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
@@ -270,5 +271,43 @@ func TestRecoveryResumesAcrossAttempts(t *testing.T) {
 	// Every file but the manifest was staged by the first attempt and kept.
 	if fetched := b.n.fetch.bytes.Load(); fetched < total || fetched > total+total/2 {
 		t.Fatalf("fetched %d bytes for a %d-byte copy: the staged files were fetched again", fetched, total)
+	}
+}
+
+// TestRecoveryPrefersCurrentMajor: a peer whose segments are in an older format major
+// serves a recovery only when no other peer can. node-0 reports the previous major;
+// node-1, recovering with node-0 its only peer, fetches from it all the same; node-2,
+// with node-1 serving in the current major, fetches nothing from node-0.
+func TestRecoveryPrefersCurrentMajor(t *testing.T) {
+	d := sqliteDB(t)
+	var streamed [3]atomic.Int64
+	c := newCluster(t, d, func(i int, o *Options) {
+		if i == 0 {
+			o.hooks.snapshotMajor = func(int) int { return segment.ReadsMajor }
+		}
+		o.hooks.peerFile = func(_ string, w http.ResponseWriter) http.ResponseWriter {
+			streamed[i].Add(1)
+			return w
+		}
+	})
+	a := c.start(0)
+	createIndex(t, a.n, "maj", 1, 0)
+	last := bulkLoad(t, a.n, "maj", 0, 2000, 1000)
+	waitCount(t, a.n, "maj", last, 2000)
+	b := c.start(1)
+	waitCopies(t, a.st, "maj", 1, 2, time.Minute)
+	waitCount(t, b.n, "maj", last, 2000)
+	if streamed[0].Load() == 0 {
+		t.Fatal("node-1 did not recover from node-0, its only peer")
+	}
+	before := streamed[0].Load()
+	n2 := c.start(2)
+	waitCopies(t, a.st, "maj", 1, 3, time.Minute)
+	waitCount(t, n2.n, "maj", last, 2000)
+	if got := streamed[0].Load() - before; got != 0 {
+		t.Fatalf("node-2 fetched %d files from node-0, whose segments are older, with node-1 serving", got)
+	}
+	if streamed[1].Load() == 0 {
+		t.Fatal("node-2 fetched nothing from node-1")
 	}
 }

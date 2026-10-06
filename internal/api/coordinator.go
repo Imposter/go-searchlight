@@ -294,8 +294,8 @@ type ItemResult struct {
 	// Err is why the op was refused (an *Error), nil when it committed.
 	Err error
 	// Queries are the ids of the saved queries the upserted document matches, with
-	// WriteOptions.Percolate.
-	Queries []string
+	// WriteOptions.Percolate: a JSON array of strings, sorted (nil for none).
+	Queries json.RawMessage
 }
 
 // ReadOptions are a read's parameters.
@@ -355,8 +355,10 @@ type PercolateResult struct {
 	// ID is the stored document's id (empty for a given document).
 	ID string `json:"id,omitempty"`
 	// Found is false for a stored id with no live document.
-	Found   bool     `json:"found"`
-	Queries []string `json:"queries"`
+	Found bool `json:"found"`
+	// Queries are the ids of the saved queries the document matches: a JSON array of
+	// strings, sorted (nil for none), written into the response as it is.
+	Queries json.RawMessage `json:"queries"`
 }
 
 // FieldCatalog describes an index's fields.

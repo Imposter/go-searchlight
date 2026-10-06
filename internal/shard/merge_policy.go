@@ -46,6 +46,16 @@ func DefaultTieredPolicy() TieredPolicy {
 	}
 }
 
+// DefaultQueryTieredPolicy returns the policy for query segments: two segments per
+// tier. Percolating a document probes every query segment with all of its atoms, so
+// each one costs every document a full probe, while saved queries change rarely and a
+// query segment is cheap to rebuild: few, larger query segments are worth the merges.
+func DefaultQueryTieredPolicy() TieredPolicy {
+	p := DefaultTieredPolicy()
+	p.SegmentsPerTier = 2
+	return p
+}
+
 func (p TieredPolicy) normalized() TieredPolicy {
 	d := DefaultTieredPolicy()
 	if p.SegmentsPerTier < 2 {

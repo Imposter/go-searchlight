@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('\x03')
+uint32(250)
+[]byte("0.00000")

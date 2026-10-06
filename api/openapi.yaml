@@ -615,14 +615,19 @@ paths:
       responses:
         "200":
           description: Each document's matching saved queries.
+          headers:
+            Server-Timing:
+              description: The server's time for the request, as took_us, in milliseconds with microseconds (total;dur=1.288).
+              schema: { type: string }
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties: false
-                required: [took_ms, results]
+                required: [took_ms, took_us, results]
                 properties:
-                  took_ms: { type: integer }
+                  took_ms: { type: integer, description: "The server's time for the request, from its admission to the last byte of its answer encoded, in whole milliseconds." }
+                  took_us: { type: integer, description: "The same time in whole microseconds: like Elasticsearch's took, it leaves out the network and the client's decoding." }
                   stale: { type: boolean }
                   results:
                     type: array

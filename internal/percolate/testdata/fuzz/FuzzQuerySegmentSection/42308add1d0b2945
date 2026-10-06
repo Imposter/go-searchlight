@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('®')
+uint32(188)
+[]byte("\x85\xa0\xf5\x850\xf9\x93\x8500")

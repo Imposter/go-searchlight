@@ -92,8 +92,11 @@ type Options struct {
 	BulkConcurrency      int     `json:"bulk_concurrency"`
 	PercolateBatch       int     `json:"percolate_batch"`
 	PercolateConcurrency int     `json:"percolate_concurrency"`
-	PageDepth            int     `json:"page_depth"`
-	MixedSeconds         float64 `json:"mixed_seconds"`
+	// PercolateSingle is the measured single-document percolations per saved-search
+	// set (0 in runs from before it was recorded).
+	PercolateSingle int     `json:"percolate_single,omitempty"`
+	PageDepth       int     `json:"page_depth"`
+	MixedSeconds    float64 `json:"mixed_seconds"`
 }
 
 // Latency is a latency distribution in microseconds.

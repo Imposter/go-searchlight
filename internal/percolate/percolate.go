@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -101,7 +100,7 @@ var defaultPercolator = sync.OnceValue(func() *Percolator { return New(Options{}
 
 // Percolate is [Percolator.Percolate] on a process-wide Percolator with default
 // options.
-func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([][]string, error) {
+func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	return defaultPercolator().Percolate(ctx, g, docs)
 }
 
@@ -113,12 +112,21 @@ type view struct {
 	n       uint32
 }
 
-// docStats are one document's counts, for metrics: candidates gathered, Match calls
-// by verdict (a memoized verdict is not a call), ids returned, and the time spent
+// docStats are one document's counts, for metrics: candidates gathered, programs run
+// by verdict (a memoized verdict is not a run), ids returned, and the time spent
 // probing and verifying.
 type docStats struct {
 	candidates, verifiedMatch, verifiedMiss, matched int
 	probe, verify                                    time.Duration
+}
+
+// count counts one program evaluation by its verdict.
+func (s *docStats) count(hit bool) {
+	if hit {
+		s.verifiedMatch++
+	} else {
+		s.verifiedMiss++
+	}
 }
 
 // add sums o into s.
@@ -132,20 +140,21 @@ func (s *docStats) add(o *docStats) {
 }
 
 // Percolate returns, for each document, the ids of the live saved queries in g that
-// match it, sorted (nil when none). A document whose Fields is nil is analyzed from
-// its ID and Body with g's mapping (an unmapped field under a strict mapping is an
-// error); one whose Fields is set is taken as already analyzed under the index's
-// mapping, as a bulk write analyzes it. Documents are percolated in parallel, at most
-// Options.Threads at a time. g must stay acquired for the call; the ids returned are
-// copies, valid after it.
+// match it, sorted, as a JSON array (nil when none). A document whose Fields is nil is
+// analyzed from its ID and Body with g's mapping (an unmapped field under a strict
+// mapping is an error); one whose Fields is set is taken as already analyzed under the
+// index's mapping, as a bulk write or [schema.AnalyzeForMatch] analyzes it. Documents
+// are percolated in parallel, at most Options.Threads at a time. g must stay acquired
+// for the call; the arrays returned are copies, valid after it.
 //
-// The span records the call's candidates, Match calls and matches, and probe_ms and
+// The span records the call's candidates, programs run and matches, and probe_ms and
 // verify_ms: per-document probe and verify time summed over every worker (busy time,
 // which exceeds the wall time when documents run in parallel).
 //
 // The result is exactly the brute force one, every live query checked with
-// [query.Match]: the query index only skips queries that cannot match.
-func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([][]string, error) {
+// [query.Match]: the query index only skips queries that cannot match, and each
+// candidate's program decides as the matcher does.
+func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	if g == nil {
 		return nil, errors.New("percolate: no generation")
 	}
@@ -156,13 +165,14 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 
 	views := make([]view, len(g.QuerySegments))
 	var maxN, maxEntries uint32
-	always := 0
+	maxFields, always := 0, 0
 	for i := range g.QuerySegments {
 		qs := &g.QuerySegments[i]
 		v := view{n: qs.NumQueries}
 		if seg, ok := qs.Segment.(*Segment); ok {
 			v.seg = seg
 			maxEntries = max(maxEntries, seg.NumEntries())
+			maxFields = max(maxFields, len(seg.fields))
 			always += seg.NumAlways()
 		} else {
 			v.other = qs.Segment
@@ -175,7 +185,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	}
 	p.alwaysCheck.Record(ctx, float64(always), p.set)
 
-	out := make([][]string, len(docs))
+	out := make([]IDs, len(docs))
 	var total docStats
 	var mu sync.Mutex
 	var firstErr error
@@ -185,7 +195,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		if sc == nil {
 			sc = new(scratch)
 		}
-		sc.fit(maxN, maxEntries)
+		sc.fit(maxN, maxEntries, maxFields)
 		var local docStats
 		for {
 			i := int(next.Add(1) - 1)
@@ -256,16 +266,15 @@ func cmpErr(have, got error) error {
 }
 
 // one percolates one document across every query segment.
-func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, sc *scratch) ([]string, docStats, error) {
+func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, sc *scratch) (IDs, docStats, error) {
 	var st docStats
 	if d.Fields == nil {
-		analyzed, _, err := schema.Analyze(g.Mapping(), d.ID, d.Body)
+		analyzed, _, err := schema.AnalyzeForMatch(g.Mapping(), d.ID, d.Body)
 		if err != nil {
 			return nil, st, err
 		}
 		d = &analyzed
 	}
-	runs := 0 // segments that matched: each appends a run sorted by id
 	for i := range views {
 		v := &views[i]
 		before := len(sc.hits)
@@ -274,72 +283,59 @@ func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view,
 				sc.clearHits()
 				return nil, st, err
 			}
-			runs += 2 // not sorted
+			sc.unsorted = true
 			continue
 		}
 		t0 := time.Now()
 		v.seg.collect(d, sc)
 		t1 := time.Now()
 		st.candidates += len(sc.cands)
-		err := verify(v, d, sc, &st)
+		verify(v, sc, &st)
 		sc.reset()
 		st.probe += t1.Sub(t0)
 		st.verify += time.Since(t1)
-		if err != nil {
-			sc.clearHits()
-			return nil, st, err
-		}
-		if len(sc.hits) > before {
-			runs++
-		}
+		sc.run(before)
 	}
-	ids := sc.results(runs <= 1)
+	ids := sc.results()
 	p.duration.Record(ctx, st.probe.Seconds(), p.probeSet)
 	p.duration.Record(ctx, st.verify.Seconds(), p.verifySet)
 	p.candidates.Record(ctx, float64(st.candidates), p.set)
 	return ids, st, nil
 }
 
-// verify checks every candidate in sc with the exact matcher, appending the ids of the
-// live ones that match to sc.hits, sorted by id.
-func verify(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
+// verify evaluates every candidate's program (see prog.go) on the document whose values
+// collect left in sc, appending the ids of the live ones that match to sc.hits, sorted
+// by id (the candidates are ranks: taken in order, so are their ids).
+func verify(v *view, sc *scratch, st *docStats) {
 	seg := v.seg
-	sc.matched = sc.matched[:0]
-	for _, ord := range sc.cands {
-		if v.deletes != nil && v.deletes.Contains(ord) {
+	sc.inOrder(int(seg.n+63) / 64)
+	matched := 0
+	for _, r := range sc.cands {
+		if v.deletes != nil && v.deletes.Contains(seg.ordAt(r)) {
 			continue
 		}
-		rep := seg.class(ord)
 		var hit bool
-		switch sc.memo[rep] {
-		case memoMatch:
+		switch rep := seg.verdictClass(r); {
+		case rep == trivialClass:
 			hit = true
-		case memoMiss:
+		case rep == noClass:
+			hit = sc.evalProg(seg.program(r))
+			st.count(hit)
+		case sc.memo[rep] == memoMatch:
+			hit = true
+		case sc.memo[rep] == memoMiss:
 		default:
-			c, err := seg.compiledQuery(rep)
-			if err != nil {
-				return err
-			}
-			hit = c.Match(d)
-			if hit {
-				st.verifiedMatch++
-				sc.memo[rep] = memoMatch
-			} else {
-				st.verifiedMiss++
-				sc.memo[rep] = memoMiss
-			}
+			hit = sc.evalProg(seg.program(r))
+			st.count(hit)
+			sc.memo[rep] = pick[uint8](hit, memoMatch, memoMiss)
 			sc.memoSet = append(sc.memoSet, rep)
 		}
 		if hit {
-			sc.matched = append(sc.matched, uint64(seg.rank(ord))<<32|uint64(ord))
+			sc.hits = append(sc.hits, seg.idAt(r))
+			matched++
 		}
 	}
-	st.matched += len(sc.matched)
-	slices.Sort(sc.matched) // by rank: by id
-	for _, m := range sc.matched {
-		sc.hits = append(sc.hits, seg.id(lo32(m))) // the low half is the ordinal
-	}
-	return nil
+	st.matched += matched
 }
 
 // bruteForce checks every live query of a segment the percolator did not build.
@@ -359,7 +355,7 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 		}
 		st.verifiedMatch++
 		st.matched++
-		sc.hits = append(sc.hits, []byte(q.ID))
+		sc.hits = append(sc.hits, idLiteral(q.ID))
 	}
 	return nil
 }

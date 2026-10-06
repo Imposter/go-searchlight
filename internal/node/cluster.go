@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -53,8 +54,9 @@ type ShardTarget interface {
 	// another copy.
 	Fetch(ctx context.Context, hits []search.Hit, fields []string) error
 	// Percolate matches docs, analyzed under mapping (its catalogue JSON), against the
-	// copy's saved queries: the ids each document matches, in order.
-	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([][]string, error)
+	// copy's saved queries: the ids each document matches, in order, as
+	// [percolate.Percolator.Percolate] returns them.
+	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error)
 	// Get reads a stored document from the copy.
 	Get(ctx context.Context, id string) (body []byte, found bool, err error)
 	// GetQuery reads a saved query from the copy.

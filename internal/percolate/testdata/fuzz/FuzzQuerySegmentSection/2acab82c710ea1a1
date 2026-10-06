@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('P')
+uint32(266)
+[]byte("\x00")

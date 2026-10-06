@@ -74,6 +74,7 @@ func buildSample(t testing.TB) (string, *Segment) {
 	if !ok {
 		t.Fatalf("Open returned %T", qs)
 	}
+	t.Cleanup(func() { _ = seg.Close() })
 	return path, seg
 }
 
@@ -110,9 +111,12 @@ func TestSegmentRoundTrip(t *testing.T) {
 	if seg.NumAlways() != 1 {
 		t.Fatalf("%d always-check queries, want 1", seg.NumAlways())
 	}
-	// Equivalent queries share a class.
-	if a, b := seg.class(8), seg.class(9); a != 8 || b != 8 {
-		t.Fatalf("classes %d %d, want 8 8", a, b)
+	r8, r9 := rankOf(t, seg, 8), rankOf(t, seg, 9)
+	if a, b := seg.class(r8), seg.class(r9); a != min(r8, r9) || b != min(r8, r9) {
+		t.Fatalf("classes %d %d, want %d", a, b, min(r8, r9))
+	}
+	if c := seg.class(rankOf(t, seg, 0)); c != noClass {
+		t.Fatalf("a lone query's class %d", c)
 	}
 	if seg.Close() != nil {
 		t.Fatal("Close")
@@ -163,7 +167,7 @@ func TestEmptySegment(t *testing.T) {
 		t.Fatal("not empty")
 	}
 	sc := new(scratch)
-	sc.fit(0, 0)
+	sc.fit(0, 0, 0)
 	d, _, _ := schema.Analyze(testMapping(), "a", []byte(`{"brand":"x","price":1}`))
 	seg.collect(&d, sc)
 	if len(sc.cands) != 0 {
@@ -188,9 +192,12 @@ func TestCheckRefusesWhatCannotRoundTrip(t *testing.T) {
 
 // Every byte flipped, and every truncation, is refused with a *CorruptError.
 func TestCorruptSegmentRefused(t *testing.T) {
-	path, _ := buildSample(t)
+	path, seg := buildSample(t)
 	data, err := os.ReadFile(path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seg.Close(); err != nil {
 		t.Fatal(err)
 	}
 	for i := range data {
@@ -212,6 +219,18 @@ func TestCorruptSegmentRefused(t *testing.T) {
 	if _, err := (Index{}).Open(filepath.Dir(path), "s1"); !isCorrupt(err) {
 		t.Fatalf("Open of a truncated file: %v", err)
 	}
+}
+
+// rankOf returns the rank of the query at ordinal ord.
+func rankOf(t testing.TB, seg *Segment, ord uint32) uint32 {
+	t.Helper()
+	for r := range seg.NumQueries() {
+		if seg.ordAt(r) == ord {
+			return r
+		}
+	}
+	t.Fatalf("no rank holds ordinal %d", ord)
+	return 0
 }
 
 func isCorrupt(err error) bool {
@@ -275,12 +294,13 @@ func exercise(seg *Segment) {
 		if err == nil {
 			seg.Ord(q.ID)
 		}
-		_, _ = seg.compiledQuery(seg.class(ord))
-		_ = seg.id(ord)
+		_ = seg.program(ord)
+		_ = seg.idAt(ord)
+		_ = seg.ordAt(ord)
 	}
 	seg.Ord("q1")
 	sc := new(scratch)
-	sc.fit(seg.NumQueries(), seg.NumEntries())
+	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	for _, body := range []string{
 		`{"brand":"acme","title":"RTX 4090 café founders","tags":["a","ß"],"price":3,"stock":true}`,
 		`{"brand":1,"title":["x"],"price":"x","tags":"a, b"}`,
@@ -290,8 +310,8 @@ func exercise(seg *Segment) {
 		seg.collect(&d, sc)
 		v := &view{seg: seg, n: seg.NumQueries()}
 		var st docStats
-		_ = verify(v, &d, sc, &st)
-		_ = sc.results(false)
+		verify(v, sc, &st)
+		_ = sc.results()
 		sc.reset()
 	}
 }
@@ -314,7 +334,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			if lo > hi {
 				lo, hi = hi, lo
 			}
-			ivs[i] = interval{lo: lo, hi: hi, ord: uint32(i)}
+			ivs[i] = interval{lo: lo, hi: hi, rank: uint32(i)}
 		}
 		var nodes []treeNode
 		var byLo, byHi []interval
@@ -332,7 +352,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			seg.nodes = binary.LittleEndian.AppendUint32(seg.nodes, nd.count)
 		}
 		sc := new(scratch)
-		sc.fit(uint32(n), 0)
+		sc.fit(uint32(n), 0, 0)
 		for x := -2.0; x <= 102; x += 0.5 {
 			if root >= 0 {
 				seg.stab(root, x, sc)
@@ -342,7 +362,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			var want []uint32
 			for _, iv := range ivs {
 				if iv.lo <= x && x <= iv.hi {
-					want = append(want, iv.ord)
+					want = append(want, iv.rank)
 				}
 			}
 			if !slices.Equal(got, want) {

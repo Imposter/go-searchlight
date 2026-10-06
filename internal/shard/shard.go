@@ -199,8 +199,12 @@ type Options struct {
 	// 4; it is off when RefreshBytes is negative. A refresh in progress holds one more
 	// buffer, frozen, so memory is bounded at about MaxBufferFactor+1 times RefreshBytes.
 	MaxBufferFactor int
-	// MergePolicy chooses background merges. Nil means DefaultTieredPolicy().
+	// MergePolicy chooses background merges of document segments. Nil means
+	// DefaultTieredPolicy().
 	MergePolicy *TieredPolicy
+	// QueryMergePolicy chooses background merges of query segments. Nil means
+	// DefaultQueryTieredPolicy().
+	QueryMergePolicy *TieredPolicy
 	// DisableMerges turns background merges off; ForceMerge still merges.
 	DisableMerges bool
 	// MergeBudget bounds merge CPU and I/O. Share one across every shard on a node
@@ -278,6 +282,10 @@ func (o *Options) resolve() {
 	if o.MergePolicy == nil {
 		p := DefaultTieredPolicy()
 		o.MergePolicy = &p
+	}
+	if o.QueryMergePolicy == nil {
+		p := DefaultQueryTieredPolicy()
+		o.QueryMergePolicy = &p
 	}
 	if o.MergeBudget == nil {
 		o.MergeBudget = DefaultMergeBudget()

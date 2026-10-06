@@ -307,7 +307,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	}
 	docs := make([]schema.Doc, len(msg.Docs))
 	for i, d := range msg.Docs {
-		doc, _, err := schema.Analyze(m, d.ID, d.Body)
+		doc, _, err := schema.AnalyzeForMatch(m, d.ID, d.Body)
 		if err != nil {
 			return nil, api.InvalidAt("docs."+strconv.Itoa(i), "%v", err)
 		}
@@ -322,12 +322,14 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range matches {
-		if matches[i] == nil {
-			matches[i] = []string{}
+	out := make([]json.RawMessage, len(matches))
+	for i, m := range matches {
+		out[i] = json.RawMessage(m)
+		if len(m) == 0 {
+			out[i] = json.RawMessage("[]")
 		}
 	}
-	return &percolateReply{Matches: matches, Stale: t.Stale()}, nil
+	return &percolateReply{Matches: out, Stale: t.Stale()}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {

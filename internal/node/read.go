@@ -330,7 +330,7 @@ func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) (
 		docs := make([]schema.Doc, 0, len(bodies))
 		var failure error
 		for i, body := range bodies {
-			doc, _, err := schema.Analyze(m, "_percolate_"+strconv.Itoa(i), body)
+			doc, _, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
 			if err != nil {
 				failure = docProblem(err, "docs."+strconv.Itoa(i))
 				break
@@ -391,7 +391,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			return nil, err
 		}
 		if ok {
-			doc, _, err := schema.Analyze(m, id, body)
+			doc, _, err := schema.AnalyzeForMatch(m, id, body)
 			if err != nil {
 				return nil, docProblem(err, loc)
 			}
@@ -406,10 +406,10 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 		return nil, err
 	}
 	for i := range req.Docs {
-		out[i].Queries = matches[i]
+		out[i].Queries = json.RawMessage(matches[i])
 	}
 	for k, p := range stored {
-		out[p].Queries = matches[len(req.Docs)+k]
+		out[p].Queries = json.RawMessage(matches[len(req.Docs)+k])
 	}
 	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil
 }

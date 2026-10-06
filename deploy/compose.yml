@@ -12,10 +12,13 @@
 #
 # The nodes serve the API on 127.0.0.1:8780, :8782 and :8784, and their admin listeners
 # (/healthz, /readyz, /metrics) on 127.0.0.1:8781, :8783 and :8785. Any node takes any
-# request; put a load balancer in front for real use.
+# request, so an nginx service fronts all three on 127.0.0.1:8080 as the load balancer
+# a real deployment needs (docs/nginx.md); the nodes' own ports stay published too, for
+# the same local debugging as before.
 #
 # The nodes' healthchecks run the binary's own probe, "searchlight healthcheck", which
-# GETs /readyz on the admin listener.
+# GETs /readyz on the admin listener. nginx's healthcheck GETs /healthz through itself,
+# proxied to whichever node least_conn picks (that route needs no auth).
 #
 # A node stops within shutdown_grace (5 s) plus shutdown_timeout (60 s, the default);
 # stop_grace_period leaves 10 s more before Docker kills it.
@@ -54,7 +57,7 @@ x-searchlight-env: &searchlight-env
 
 services:
   secrets:
-    image: busybox:1.37-musl@sha256:5cec3fc171c87218698e85a52af7087de727372aae264a787b8112901a5b0092
+    image: busybox:1.38-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
     restart: "no"
     volumes:
       - secrets:/secrets
@@ -132,6 +135,27 @@ services:
     volumes:
       - data-3:/var/lib/searchlight
       - secrets:/run/secrets/searchlight:ro
+
+  nginx:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    restart: unless-stopped
+    depends_on:
+      searchlight-1:
+        condition: service_healthy
+      searchlight-2:
+        condition: service_healthy
+      searchlight-3:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:8080:8080
+    volumes:
+      - ./nginx/searchlight.conf:/etc/nginx/conf.d/searchlight.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
 
 volumes:
   secrets:

@@ -192,7 +192,7 @@ var Catalog = []MetricSpec{
 
 	{MetricPercolateDuration, KindHistogram, "s", "Percolation time per document by phase (probe, verify) and index.", FastBuckets},
 	{MetricPercolateCandidates, KindHistogram, "{query}", "Candidate queries per percolated document, by index.", CountBuckets},
-	{MetricPercolateVerifications, KindCounter, "{query}", "Candidate queries verified with the exact matcher, by index and result (match or miss).", nil},
+	{MetricPercolateVerifications, KindCounter, "{query}", "Verification programs run on candidate queries (once per class per document; a class decided without one is not counted), by index and result (match or miss).", nil},
 	{MetricPercolateAlwaysCheck, KindGauge, "{query}", "Saved queries on the always-check list, by index and shard.", nil},
 
 	{MetricIndexChanges, KindCounter, "{change}", "Changes applied to shard copies, by index and kind (upsert, delete, query_upsert, query_delete).", nil},

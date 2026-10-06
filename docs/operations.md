@@ -17,7 +17,9 @@ For what the components do, see [architecture.md](architecture.md). For the API,
 
 A node is one static binary, `searchlight`. It needs a SQL database and a directory for
 its segments, and nothing else: no coordination service, no shared disk. Every node is
-the same; any node takes any request.
+the same; any node takes any request. For how that cluster behaves (joining, writes,
+reads, recovery, failures) see [clustering.md](clustering.md); for putting nginx in
+front of it as the load balancer, see [nginx.md](nginx.md).
 
 | Port | Listener | Serves |
 |---|---|---|
@@ -121,6 +123,10 @@ curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
   `shutdown_timeout` (60 s), plus 10 s of slack.
 - **TLS.** The peer API runs in plain HTTP on the compose network, and the nodes log a
   warning that `cluster_token` crosses it in the clear.
+- **Load balancer.** An `nginx` service fronts the three nodes on `127.0.0.1:8080`,
+  using [`deploy/nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see
+  [nginx.md](nginx.md) for what it does and why. The nodes' own ports stay published
+  too.
 
 ### Kubernetes
 

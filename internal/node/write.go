@@ -577,7 +577,7 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 		return err
 	}
 	for k, p := range pos {
-		res.Items[p].Queries = matches[k]
+		res.Items[p].Queries = json.RawMessage(matches[k])
 	}
 	res.Percolated = true
 	return nil
@@ -585,23 +585,33 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 
 // percolateDocs percolates docs against the saved queries of every shard of idx (a
 // saved query lives on the shard its id hashes to), merging each document's matches.
-func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc) ([][]string, error) {
+func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc) ([]percolate.IDs, error) {
 	mapping := idx.meta.Load().meta.Mapping
-	out := make([][]string, len(docs))
+	perShard := make([][]percolate.IDs, len(ts))
 	for s, t := range ts {
 		ids, err := t.Percolate(ctx, mapping, docs)
 		if err != nil {
 			return nil, fmt.Errorf("percolate shard %d: %w", s, err)
 		}
-		for i := range ids {
-			out[i] = append(out[i], ids[i]...)
+		if len(ids) != len(docs) {
+			return nil, fmt.Errorf("percolate shard %d: %d answers for %d documents", s, len(ids), len(docs))
 		}
+		perShard[s] = ids
 	}
-	if len(ts) > 1 {
-		for i := range out {
-			slices.Sort(out[i])
-			out[i] = slices.Compact(out[i])
+	if len(ts) == 1 {
+		return perShard[0], nil
+	}
+	out := make([]percolate.IDs, len(docs))
+	lists := make([]percolate.IDs, len(ts))
+	for i := range docs {
+		for s := range ts {
+			lists[s] = perShard[s][i]
 		}
+		merged, err := percolate.MergeIDs(lists)
+		if err != nil {
+			return nil, fmt.Errorf("percolate: %w", err)
+		}
+		out[i] = merged
 	}
 	return out, nil
 }

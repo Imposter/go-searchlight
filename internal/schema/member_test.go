@@ -38,7 +38,7 @@ func TestFieldValueAgreesWithAnalyze(t *testing.T) {
 			if !ok {
 				continue
 			}
-			got := analyzeValue(m.Fields[f], v)
+			got := analyzeValue(m.Fields[f], v, true)
 			if a, b := mustJSON(t, got), mustJSON(t, want); a != b {
 				t.Errorf("%s %s: %s, Analyze %s", body, f, a, b)
 			}

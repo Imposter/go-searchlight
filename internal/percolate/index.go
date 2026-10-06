@@ -12,11 +12,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
-	"sync"
-	"sync/atomic"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -25,29 +22,38 @@ import (
 
 // The query segment format.
 //
-// A query segment is one file, NAME.perc, read wholly into memory at Open and checked
-// against a CRC32C over everything before its last four bytes, then validated
-// structurally (every offset, length, ordinal and tree link in range), so that a
-// damaged or crafted file is refused with a *CorruptError and every accessor of an
-// opened segment is safe. Its parts, each a length-prefixed section after the header
-// (magic, version, section count):
+// A query segment is one file, NAME.perc, memory-mapped at Open and checked against a
+// CRC32C over everything before its last four bytes, then validated structurally
+// (every offset, length, ordinal, tree link and program in range), so that a damaged or
+// crafted file is refused with a *CorruptError and every accessor of an opened segment
+// is safe. Nothing per query is decoded onto the heap: a segment of a million queries
+// costs its mapped pages, which the OS keeps or drops like any file cache. Its parts,
+// each a length-prefixed section after the header (magic, version, section count):
 //
 //	meta       queries, fields, dictionary entries, hash slots, always-check, tree nodes, tree records, pairs (u32 each)
-//	fields     per field: name, the atom kinds it has terms of (a bit mask), its interval tree's root, node and record ranges
+//	fields     per field a query names: name, the atom kinds it has terms of (a bit mask), its interval tree's root, node and record ranges
 //	offsets    u64 per query + 1: each query's record in records
 //	records    per query: id, seq (varint), query JSON, meta (id, JSON and meta uvarint-length-prefixed)
-//	classes    u32 per query: the first query with the same verification class (see below)
-//	ids        u32 per query: the ordinals sorted by id, for Ord
-//	ranks      u32 per query: its position in ids, so that matches sort by id as integers
+//	verify     32 bytes per rank: the first rank of its verification class (see below; all ones when no
+//	           other query shares it), its class's program's length, and the program itself when it fits
+//	           in the other 24 bytes, else its offset in programs
+//	ids        8 bytes per rank: its ordinal, and the end of its id in idtext
+//	idtext     the ids as JSON string literals, exactly as encoding/json writes them, concatenated in
+//	           rank order: what a match copies into its response, read front to back
+//	programs   the verification classes' programs too long to inline (prog.go)
 //	slots      u32 per hash slot (a power of two): 0 empty, else a dictionary entry + 1
-//	entries    24 bytes per dictionary entry: hash, field<<8|kind, term offset and length, postings offset and count
+//	entries    32 bytes per dictionary entry: hash, field<<8|kind, term offset and length, postings offset
+//	           and count, filtered offset and count
 //	terms      the dictionary terms
-//	postings   u32 query ordinals, ascending per entry and per pair
+//	postings   u32 ranks, ascending per entry and per pair
+//	filtered   24 bytes per filtered posting (see postFilter in anchors.go), ascending per entry: its rank,
+//	           field<<2|kind, and 16 bytes for the filter: a range's lo and hi (a bool's are both 0 or 1),
+//	           or a text's length and bytes
 //	partners   8 bytes per dictionary entry: the first pair record it owns and how many (a member's only)
 //	pairs      12 bytes per pair: its partner (a member entry), postings offset and count
-//	always     u32 ordinals of the always-check list, ascending
+//	always     u32 ranks of the always-check list, ascending
 //	nodes      24 bytes per interval tree node: center, left, right, record start and count
-//	bylo       20 bytes per tree record (lo, hi, ordinal), each node's sorted by lo ascending
+//	bylo       20 bytes per tree record (lo, hi, rank), each node's sorted by lo ascending
 //	byhi       the same records, each node's sorted by hi descending
 //
 // The dictionary is an open-addressing hash table over (kind, field, term) with a
@@ -55,6 +61,11 @@ import (
 // nothing decoded or allocated. The interval tree is a centered interval tree per
 // numeric field, its center the median of the field's endpoints, so a value finds the
 // ranges holding it in O(log n + k).
+//
+// Ranks: a query's ordinal is its position in the segment as the shard numbers it (its
+// deletes, Query and Ord use it), its rank its position sorted by id. Everything
+// percolation reads is numbered by rank, so the candidates, taken in ascending order,
+// are already in the order their ids are returned in.
 //
 // Pair anchors (two atoms a query needs together) are stored once each, under one of
 // their halves, both of which are AtomMember entries (whose postings are every query
@@ -64,24 +75,47 @@ import (
 // too: work linear in those lists, never quadratic in the members (see probePairs).
 //
 // Verification classes: queries whose canonical form ([query.Canonical]) is the same
-// match the same documents, so they share one compiled query and, per document, one
+// match the same documents, so they share one program and, per document, one
 // verification. A query with a words_* condition is its own class (keyed by its exact
 // JSON), because the matcher reads a phrase's words from the text as written, which the
 // canonical form does not keep.
+//
+// Posting filters: a query anchored on terms alone carries, in each of its filtered
+// postings, one conjunct of its root that is cheap to check, and is a candidate only for
+// documents passing it (see postFilter).
+//
+// Proven conditions: a condition at a query's root (a leaf or the not of a leaf: the
+// root itself, or a child of an all there) that every route to its candidacy implies
+// holds on every candidate, so its program leaves it out. A route is a term it is
+// anchored on with that term's filter, or a range it is anchored on (see provenRest).
+// The conditions left out are part of the class key, so a class's members all leave
+// out the same ones.
+//
+// Built at Open from the validated file: each field's gram prefilter, a bit filter of
+// its gram terms at 16 bits per term (a document's window whose bit is clear has no
+// entry, so skips the table), and a dense copy of every rank's class, which also marks
+// the ranks alone in their class with an empty program (a candidate there matches
+// without its verify record read; a memoized class's members are not read either).
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.
-	FormatName = "percolate/2"
+	FormatName = "percolate/3"
 	// FileExt is a query segment file's extension.
 	FileExt = ".perc"
 
-	formatVersion = 2
-	numSections   = 17
-	entrySize     = 24
+	formatVersion = 3
+	numSections   = 19
+	entrySize     = 32
+	filteredSize  = 24
 	nodeSize      = 24
 	recordSize    = 20
 	metaSize      = 8 * 4
 	pairSize      = 12
+	verifySize    = 32
+	inlineProg    = verifySize - 8
+	idSize        = 8
+	noClass       = math.MaxUint32
+	trivialClass  = math.MaxUint32 - 1
 	minFieldSize  = 1 + 6*4
 )
 
@@ -95,13 +129,15 @@ const (
 	secFields
 	secOffsets
 	secRecords
-	secClasses
+	secVerify
 	secIDs
-	secRanks
+	secIDText
+	secPrograms
 	secSlots
 	secEntries
 	secTerms
 	secPostings
+	secFiltered
 	secPartners
 	secPairs
 	secAlways
@@ -111,8 +147,8 @@ const (
 )
 
 var sectionNames = [numSections]string{
-	"meta", "fields", "offsets", "records", "classes", "ids", "ranks", "slots", "entries",
-	"terms", "postings", "partners", "pairs", "always", "nodes", "bylo", "byhi",
+	"meta", "fields", "offsets", "records", "verify", "ids", "idtext", "programs", "slots", "entries",
+	"terms", "postings", "filtered", "partners", "pairs", "always", "nodes", "bylo", "byhi",
 }
 
 // CorruptError is a query segment file that fails its checksum or does not parse.
@@ -167,20 +203,19 @@ func (Index) Build(ctx context.Context, dir, name string, queries []shard.Stored
 	return int64(len(data)), nil
 }
 
-// Open implements [shard.QueryIndexBuilder].
+// Open implements [shard.QueryIndexBuilder]: it maps the file and validates it.
 func (Index) Open(dir, name string) (shard.QuerySegment, error) {
 	path := filepath.Join(dir, name+FileExt)
-	data, err := os.ReadFile(path)
+	m, err := mapFile(path)
 	if err != nil {
 		return nil, err
 	}
-	seg, err := openData(path, data)
+	seg, err := openData(path, m.data)
 	if err != nil {
+		_ = m.close()
 		return nil, err
 	}
-	if warmOnOpen {
-		seg.warm()
-	}
+	seg.mapped = m
 	return seg, nil
 }
 
@@ -189,14 +224,21 @@ func (Index) Open(dir, name string) (shard.QuerySegment, error) {
 // interval is one Range of one query, as the tree holds it.
 type interval struct {
 	lo, hi float64
-	ord    uint32
+	rank   uint32
 }
 
 type dictEntry struct {
-	kind  AtomKind
-	field uint32
-	term  string
-	posts []uint32
+	kind     AtomKind
+	field    uint32
+	term     string
+	posts    []uint32
+	filtered []filteredPost
+}
+
+// filteredPost is one filtered posting, as built.
+type filteredPost struct {
+	rank, field uint32
+	filter      postFilter
 }
 
 type fieldBuild struct {
@@ -215,14 +257,22 @@ type segmentBuilder struct {
 	always  []uint32
 	classes []uint32
 	classOf map[string]uint32
-	offsets []uint64
-	records []byte
+	pc      progCompiler
+	progs   []byte
+	prog    []progRef
 
 	// pairs are the pair anchors, keyed by their members' dictionary keys in order;
 	// degree counts each member's pairs and memberCost its estimated frequency.
 	pairs      map[[2]string]*pairBuild
 	degree     map[string]int
 	memberCost map[string]float64
+}
+
+// progRef is a program as a verify record holds it: its length, and the program itself
+// when it fits, else its offset in programs.
+type progRef struct {
+	n  uint32
+	at [inlineProg]byte
 }
 
 type pairBuild struct {
@@ -243,57 +293,98 @@ func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard
 		degree:  map[string]int{},
 
 		memberCost: map[string]float64{},
-		offsets:    make([]uint64, 0, len(queries)+1),
+		prog:       make([]progRef, len(queries)),
 	}
-	ids := make(map[string]struct{}, len(queries))
+	b.pc.field = b.field
+	byID := make([]uint32, len(queries))
+	for i := range byID {
+		byID[i] = count32(i)
+	}
+	slices.SortFunc(byID, func(x, y uint32) int { return strings.Compare(queries[x].ID, queries[y].ID) })
+	for r := 1; r < len(byID); r++ {
+		if queries[byID[r]].ID == queries[byID[r-1]].ID {
+			return nil, fmt.Errorf("percolate: query %q twice in one segment", queries[byID[r]].ID)
+		}
+	}
+	offsets := make([]uint64, 0, len(queries)+1)
+	var records []byte
+	srcs := make([][]byte, len(queries))
 	for i := range queries {
 		if i%1024 == 0 && ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 		q := &queries[i]
-		if _, dup := ids[q.ID]; dup {
-			return nil, fmt.Errorf("percolate: query %q twice in one segment", q.ID)
-		}
-		ids[q.ID] = struct{}{}
-		if err := b.add(count32(i), q); err != nil {
+		src, err := encodeQuery(q.Query)
+		if err != nil {
 			return nil, fmt.Errorf("percolate: query %q: %w", q.ID, err)
 		}
+		srcs[i] = src
+		offsets = append(offsets, uint64(len(records)))
+		records = appendBytes(records, []byte(q.ID))
+		records = binary.AppendVarint(records, q.Seq)
+		records = appendBytes(records, src)
+		records = appendBytes(records, q.Meta)
 	}
-	return b.encode(queries)
+	offsets = append(offsets, uint64(len(records)))
+	for r, ord := range byID {
+		if r%1024 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err := b.add(count32(r), srcs[ord]); err != nil {
+			return nil, fmt.Errorf("percolate: query %q: %w", queries[ord].ID, err)
+		}
+	}
+	return b.encode(queries, byID, offsets, records)
 }
 
-func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
-	src, err := encodeQuery(q.Query)
-	if err != nil {
-		return err
-	}
+// add anchors the query at rank, src its stored JSON.
+func (b *segmentBuilder) add(rank uint32, src []byte) error {
 	// Anchors and the class come from the stored JSON parsed back, the very tree
 	// verification compiles, so the two can never disagree.
 	stored, problems := query.Parse(src)
 	if len(problems) > 0 {
 		return fmt.Errorf("query does not round-trip: %s: %s", problems[0].Loc, problems[0].Message)
 	}
-	b.offsets = append(b.offsets, uint64(len(b.records)))
-	b.records = appendBytes(b.records, []byte(q.ID))
-	b.records = binary.AppendVarint(b.records, q.Seq)
-	b.records = appendBytes(b.records, src)
-	b.records = appendBytes(b.records, q.Meta)
-
-	key := classKey(stored, src)
+	set := b.ex.node(stored)
+	filter, filtered := postingFilter(stored, &set)
+	rest, proven := provenRest(stored, &set, filter, filtered)
+	key := classKey(stored, src) + "\x00" + proven
 	if rep, ok := b.classOf[key]; ok {
-		b.classes[ord] = rep
+		b.classes[rank] = rep
+		b.prog[rank] = b.prog[rep]
 	} else {
-		b.classOf[key] = ord
-		b.classes[ord] = ord
+		b.classOf[key] = rank
+		b.classes[rank] = rank
+		prog := b.pc.compile(rest)
+		var ref progRef
+		switch {
+		case len(prog) == 1 && prog[0] == pTrue:
+		case len(prog) <= inlineProg:
+			ref.n = count32(len(prog))
+			copy(ref.at[:], prog)
+		default:
+			if len(b.progs) > math.MaxUint32-len(prog) {
+				return errors.New("query segment programs over 4 GiB")
+			}
+			ref.n = count32(len(prog))
+			binary.LittleEndian.PutUint32(ref.at[:], count32(len(b.progs)))
+			b.progs = append(b.progs, prog...)
+		}
+		b.prog[rank] = ref
 	}
 
-	set := b.ex.node(stored)
 	if !set.ok {
-		b.always = append(b.always, ord)
+		b.always = append(b.always, rank)
 		return nil
 	}
 	for _, t := range set.terms {
-		b.post(t.Kind, b.field(t.Field), t.Term, ord)
+		if filtered {
+			b.postFiltered(t.Kind, b.field(t.Field), t.Term, filteredPost{
+				rank: rank, field: b.field(filter.field), filter: filter,
+			})
+		} else {
+			b.post(t.Kind, b.field(t.Field), t.Term, rank)
+		}
 	}
 	for _, p := range set.pairs {
 		// Each half is a member of its field (postings: every query it is half of);
@@ -301,7 +392,7 @@ func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
 		var k [2]string
 		for i, t := range p {
 			fi := b.field(t.Field)
-			k[i] = b.post(AtomMember, fi, memberTerm(t.Kind, t.Term), ord)
+			k[i] = b.post(AtomMember, fi, memberTerm(t.Kind, t.Term), rank)
 			b.memberCost[k[i]] = b.ex.termCost(t.Kind, t.Field, t.Term)
 		}
 		if k[0] > k[1] {
@@ -314,13 +405,13 @@ func (b *segmentBuilder) add(ord uint32, q *shard.StoredQuery) error {
 			b.degree[k[0]]++
 			b.degree[k[1]]++
 		}
-		if n := len(pb.posts); n == 0 || pb.posts[n-1] != ord {
-			pb.posts = append(pb.posts, ord)
+		if n := len(pb.posts); n == 0 || pb.posts[n-1] != rank {
+			pb.posts = append(pb.posts, rank)
 		}
 	}
 	for _, r := range set.ranges {
 		fi := b.field(r.Field)
-		b.fields[fi].ranges = append(b.fields[fi].ranges, interval{lo: r.Lo, hi: r.Hi, ord: ord})
+		b.fields[fi].ranges = append(b.fields[fi].ranges, interval{lo: r.Lo, hi: r.Hi, rank: rank})
 	}
 	return nil
 }
@@ -358,16 +449,8 @@ type treeNode struct {
 	start, count uint32
 }
 
-func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
+func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offsets []uint64, records []byte) ([]byte, error) {
 	n := len(queries)
-	b.offsets = append(b.offsets, uint64(len(b.records)))
-
-	// Ordinals sorted by id.
-	byID := make([]uint32, n)
-	for i := range byID {
-		byID[i] = count32(i)
-	}
-	slices.SortFunc(byID, func(x, y uint32) int { return strings.Compare(queries[x].ID, queries[y].ID) })
 
 	// The dictionary, in key order (so a build is deterministic), and its hash table.
 	keys := make([]string, 0, len(b.dict))
@@ -380,10 +463,11 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 		tableSize <<= 1
 	}
 	slots := make([]uint32, tableSize)
-	var entries, terms, postings []byte
+	var entries, terms, postings, filtered []byte
 	for i, k := range keys {
 		e := b.dict[k]
-		if len(terms) > math.MaxUint32-len(e.term) || len(postings)/4 > math.MaxUint32-len(e.posts) {
+		if len(terms) > math.MaxUint32-len(e.term) || len(postings)/4 > math.MaxUint32-len(e.posts) ||
+			len(filtered)/filteredSize > math.MaxUint32-len(e.filtered) {
 			return nil, errors.New("percolate: query segment dictionary over 4 GiB")
 		}
 		h := hashTerm(e.kind, e.field, e.term)
@@ -393,9 +477,24 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 		entries = binary.LittleEndian.AppendUint32(entries, count32(len(e.term)))
 		entries = binary.LittleEndian.AppendUint32(entries, count32(len(postings)/4))
 		entries = binary.LittleEndian.AppendUint32(entries, count32(len(e.posts)))
+		entries = binary.LittleEndian.AppendUint32(entries, count32(len(filtered)/filteredSize))
+		entries = binary.LittleEndian.AppendUint32(entries, count32(len(e.filtered)))
 		terms = append(terms, e.term...)
 		for _, p := range e.posts {
 			postings = binary.LittleEndian.AppendUint32(postings, p)
+		}
+		for _, f := range e.filtered {
+			filtered = binary.LittleEndian.AppendUint32(filtered, f.rank)
+			filtered = binary.LittleEndian.AppendUint32(filtered, f.field<<2|uint32(f.filter.kind))
+			switch f.filter.kind {
+			case filterRange, filterBool:
+				filtered = appendF64(appendF64(filtered, f.filter.lo), f.filter.hi)
+			default:
+				var text [16]byte
+				text[0] = byte(len(f.filter.text)) //nolint:gosec // at most maxFilterText
+				copy(text[1:], f.filter.text)
+				filtered = append(filtered, text[:]...)
+			}
 		}
 		mask := tableSize - 1
 		for slot := lo32(h) & mask; ; slot = (slot + 1) & mask {
@@ -466,21 +565,39 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery) ([]byte, error) {
 	}
 	sec[secMeta] = meta
 	sec[secFields] = fields
-	for _, off := range b.offsets {
+	for _, off := range offsets {
 		sec[secOffsets] = binary.LittleEndian.AppendUint64(sec[secOffsets], off)
 	}
-	sec[secRecords] = b.records
-	sec[secClasses] = appendU32s(b.classes)
-	sec[secIDs] = appendU32s(byID)
-	ranks := make([]uint32, n)
-	for i, ord := range byID {
-		ranks[ord] = count32(i)
+	sec[secRecords] = records
+	members := make(map[uint32]int, len(b.classOf))
+	for _, rep := range b.classes {
+		members[rep]++
 	}
-	sec[secRanks] = appendU32s(ranks)
+	sec[secVerify] = make([]byte, 0, verifySize*n)
+	for r := range n {
+		class := b.classes[r]
+		if members[class] == 1 {
+			class = noClass
+		}
+		sec[secVerify] = binary.LittleEndian.AppendUint32(sec[secVerify], class)
+		sec[secVerify] = binary.LittleEndian.AppendUint32(sec[secVerify], b.prog[r].n)
+		sec[secVerify] = append(sec[secVerify], b.prog[r].at[:]...)
+	}
+	for _, ord := range byID {
+		lit := idLiteral(queries[ord].ID)
+		if len(sec[secIDText]) > math.MaxUint32-len(lit) {
+			return nil, errors.New("percolate: query segment ids over 4 GiB")
+		}
+		sec[secIDText] = append(sec[secIDText], lit...)
+		sec[secIDs] = binary.LittleEndian.AppendUint32(sec[secIDs], ord)
+		sec[secIDs] = binary.LittleEndian.AppendUint32(sec[secIDs], count32(len(sec[secIDText])))
+	}
+	sec[secPrograms] = b.progs
 	sec[secSlots] = appendU32s(slots)
 	sec[secEntries] = entries
 	sec[secTerms] = terms
 	sec[secPostings] = postings
+	sec[secFiltered] = filtered
 	sec[secPartners] = partners
 	sec[secPairs] = pairs
 	sec[secAlways] = appendU32s(b.always)
@@ -522,7 +639,7 @@ func appendIntervals(ivs []interval) []byte {
 	for _, iv := range ivs {
 		dst = binary.LittleEndian.AppendUint64(dst, math.Float64bits(iv.lo))
 		dst = binary.LittleEndian.AppendUint64(dst, math.Float64bits(iv.hi))
-		dst = binary.LittleEndian.AppendUint32(dst, iv.ord)
+		dst = binary.LittleEndian.AppendUint32(dst, iv.rank)
 	}
 	return dst
 }
@@ -623,10 +740,8 @@ type fieldInfo struct {
 	root               int32
 	nodeStart, nodeEnd uint32
 	recStart, recEnd   uint32
-	// grams is a 64K-bit prefilter of the field's AtomGram terms (bit: the entry's
-	// stored hash half, masked), built at Open: a document's window whose bit is clear
-	// has no entry, so it skips the table. Nil when the field has no gram terms.
-	grams []uint64
+	grams              []uint64
+	gramMask           uint32
 }
 
 // Segment is an open query segment: a [shard.QuerySegment] that also answers the
@@ -638,13 +753,15 @@ type Segment struct {
 	fields    []fieldInfo
 	offsets   []byte
 	records   []byte
-	classes   []byte
+	verifies  []byte
 	ids       []byte
-	ranks     []byte
+	idText    []byte
+	programs  []byte
 	slots     []byte
 	entries   []byte
 	terms     []byte
 	postings  []byte
+	filtered  []byte
 	partners  []byte
 	pairs     []byte
 	always    []byte
@@ -652,14 +769,9 @@ type Segment struct {
 	byLo      []byte
 	byHi      []byte
 
-	// compiled caches each verification class's compiled query, compiled on first use
-	// (by its representative's ordinal).
-	compiled []atomic.Pointer[query.Compiled]
+	classes []uint32
 
-	// stop ends the warm-up (see warm) at Close; warmed is closed once it has ended.
-	stop     chan struct{}
-	warmed   chan struct{}
-	stopOnce sync.Once
+	mapped *mapping
 }
 
 var _ shard.QuerySegment = (*Segment)(nil)
@@ -727,8 +839,8 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	n, numFields, numEntries, tableSize, numAlways, numNodes, numRecs, numPairs := meta[0], meta[1], meta[2], meta[3], meta[4], meta[5], meta[6], meta[7]
 	s := &Segment{
 		path: path, n: n,
-		offsets: sec[secOffsets], records: sec[secRecords], classes: sec[secClasses], ids: sec[secIDs], ranks: sec[secRanks],
-		slots: sec[secSlots], entries: sec[secEntries], terms: sec[secTerms], postings: sec[secPostings],
+		offsets: sec[secOffsets], records: sec[secRecords], verifies: sec[secVerify], ids: sec[secIDs], idText: sec[secIDText], programs: sec[secPrograms],
+		slots: sec[secSlots], entries: sec[secEntries], terms: sec[secTerms], postings: sec[secPostings], filtered: sec[secFiltered],
 		partners: sec[secPartners], pairs: sec[secPairs],
 		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi],
 	}
@@ -737,9 +849,8 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		want uint64
 	}{
 		{secOffsets, 8 * (uint64(n) + 1)},
-		{secClasses, 4 * uint64(n)},
-		{secIDs, 4 * uint64(n)},
-		{secRanks, 4 * uint64(n)},
+		{secVerify, verifySize * uint64(n)},
+		{secIDs, idSize * uint64(n)},
 		{secSlots, 4 * uint64(tableSize)},
 		{secEntries, entrySize * uint64(numEntries)},
 		{secAlways, 4 * uint64(numAlways)},
@@ -754,8 +865,8 @@ func parseBody(path string, body []byte) (*Segment, error) {
 			return nil, corrupt("section %s: %d bytes, want %d", sectionNames[sz.sec], len(sec[sz.sec]), sz.want)
 		}
 	}
-	if len(s.postings)%4 != 0 {
-		return nil, corrupt("postings: %d bytes", len(s.postings))
+	if len(s.postings)%4 != 0 || len(s.filtered)%filteredSize != 0 {
+		return nil, corrupt("postings: %d and %d bytes", len(s.postings), len(s.filtered))
 	}
 	if tableSize == 0 || tableSize&(tableSize-1) != 0 || tableSize <= numEntries {
 		return nil, corrupt("hash table of %d slots for %d entries", tableSize, numEntries)
@@ -765,22 +876,29 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if err := s.checkRecords(); err != nil {
 		return nil, corrupt("%v", err)
 	}
-	if err := s.checkDictionary(numEntries); err != nil {
-		return nil, corrupt("%v", err)
-	}
-	if err := s.checkOrdinals(); err != nil {
+	if err := s.checkDictionary(numEntries, numFields); err != nil {
 		return nil, corrupt("%v", err)
 	}
 	if err := s.parseFields(sec[secFields], numFields, numNodes, numRecs); err != nil {
 		return nil, corrupt("%v", err)
 	}
+	if err := s.checkRanks(); err != nil {
+		return nil, corrupt("%v", err)
+	}
 	s.buildGramFilters()
-	s.compiled = make([]atomic.Pointer[query.Compiled], n)
+	s.classes = make([]uint32, s.n)
+	for r := range s.n {
+		o := verifySize * int(r)
+		s.classes[r] = u32(s.verifies, o)
+		if s.classes[r] == noClass && u32(s.verifies, o+4) == 0 {
+			s.classes[r] = trivialClass
+		}
+	}
 	return s, nil
 }
 
-// checkRecords checks every query record and that ids holds the ordinals sorted by
-// distinct ids.
+// checkRecords checks every query record, and that ids and idtext hold every ordinal
+// and its id, sorted by distinct ids.
 func (s *Segment) checkRecords() error {
 	var prev uint64
 	for i := 0; i <= int(s.n); i++ {
@@ -799,52 +917,83 @@ func (s *Segment) checkRecords() error {
 		}
 	}
 	var last []byte
+	var end uint32
 	seen := make([]bool, s.n)
 	for i := range s.n {
-		ord := u32(s.ids, 4*int(i))
+		ord := s.ordAt(i)
 		if ord >= s.n || seen[ord] {
 			return fmt.Errorf("ids: ordinal %d out of range or repeated", ord)
 		}
 		seen[ord] = true
-		if u32(s.ranks, 4*int(ord)) != i {
-			return fmt.Errorf("ranks: query %d is not at %d", ord, i)
+		next := u32(s.ids, idSize*int(i)+4)
+		if next < end || uint64(next) > uint64(len(s.idText)) {
+			return fmt.Errorf("ids: id %d out of range", i)
 		}
+		end = next
 		_, id, _, _, _ := s.record(ord)
+		if !isLiteralOf(s.idAt(i), id) {
+			return fmt.Errorf("ids: id %d is not query %d's", i, ord)
+		}
 		if i > 0 && bytes.Compare(last, id) >= 0 {
 			return errors.New("ids: not sorted, or an id repeated")
 		}
 		last = id
 	}
+	if uint64(end) != uint64(len(s.idText)) {
+		return errors.New("idtext: trailing bytes")
+	}
 	return nil
 }
 
-// checkOrdinals checks the classes, the always-check list and the tree records.
-func (s *Segment) checkOrdinals() error {
-	for ord := range s.n {
-		rep := u32(s.classes, 4*int(ord))
-		if rep > ord || u32(s.classes, 4*int(rep)) != rep {
-			return fmt.Errorf("classes: query %d names %d", ord, rep)
+// checkRanks checks the classes and their programs (each class's once, at its
+// first rank; the others must hold the same), the always-check list and the tree
+// records.
+func (s *Segment) checkRanks() error {
+	numFields := uint32(len(s.fields)) //nolint:gosec // bounded by a u32 count
+	for r := range s.n {
+		rep := s.class(r)
+		if rep == noClass {
+			rep = r
+		} else if rep > r || s.class(rep) != rep {
+			return fmt.Errorf("classes: rank %d names %d", r, rep)
+		}
+		o := verifySize * int(r)
+		if rep != r {
+			if !bytes.Equal(s.verifies[o+4:o+verifySize], s.verifies[verifySize*int(rep)+4:verifySize*int(rep+1)]) {
+				return fmt.Errorf("rank %d: not its class's program", r)
+			}
+			continue
+		}
+		n := u32(s.verifies, o+4)
+		if n > inlineProg && uint64(u32(s.verifies, o+8))+uint64(n) > uint64(len(s.programs)) {
+			return fmt.Errorf("rank %d: program out of range", r)
+		}
+		if p := s.program(r); len(p) > 0 {
+			if err := checkProg(p, numFields); err != nil {
+				return fmt.Errorf("rank %d: %w", r, err)
+			}
 		}
 	}
 	for i := 0; i < len(s.always); i += 4 {
 		ord := u32(s.always, i)
 		if ord >= s.n || i > 0 && ord <= u32(s.always, i-4) {
-			return errors.New("always: an ordinal out of range or order")
+			return errors.New("always: a rank out of range or order")
 		}
 	}
 	for _, recs := range [][]byte{s.byLo, s.byHi} {
 		for i := 0; i < len(recs); i += recordSize {
 			lo, hi := f64(recs, i), f64(recs, i+8)
 			if !(lo <= hi) || u32(recs, i+16) >= s.n { // NaN fails lo <= hi
-				return errors.New("interval records: a bad interval or ordinal")
+				return errors.New("interval records: a bad interval or rank")
 			}
 		}
 	}
 	return nil
 }
 
-// checkDictionary checks every entry's term and postings, and every slot.
-func (s *Segment) checkDictionary(numEntries uint32) error {
+// checkDictionary checks every entry's term and postings (at least one, plain or
+// filtered), and every slot.
+func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 	for i := range numEntries {
 		e := int(i) * entrySize
 		fk := u32(s.entries, e+4)
@@ -859,7 +1008,11 @@ func (s *Segment) checkDictionary(numEntries uint32) error {
 		if kind == AtomSimKey && termLen != 8 {
 			return fmt.Errorf("entry %d: a trigram key of %d bytes", i, termLen)
 		}
-		if !s.validPostings(uint64(u32(s.entries, e+16)), uint64(u32(s.entries, e+20))) {
+		postOff, postN := uint64(u32(s.entries, e+16)), uint64(u32(s.entries, e+20))
+		filtOff, filtN := uint64(u32(s.entries, e+24)), uint64(u32(s.entries, e+28))
+		if postN+filtN == 0 || postOff+postN > uint64(len(s.postings)/4) || filtOff+filtN > uint64(len(s.filtered)/filteredSize) ||
+			postN > 0 && !s.validPostings(postOff, postN) ||
+			filtN > 0 && (kind == AtomMember || !s.validFiltered(filtOff, filtN, numFields)) {
 			return fmt.Errorf("entry %d: postings out of range or order", i)
 		}
 		// Partners: only a member lists any.
@@ -959,14 +1112,12 @@ func (s *Segment) NumAlways() int { return len(s.always) / 4 }
 
 // Ord implements [shard.QuerySegment].
 func (s *Segment) Ord(id string) (uint32, bool) {
-	lo, hi := 0, int(s.n)
+	lo, hi := uint32(0), s.n
 	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		ord := u32(s.ids, 4*mid)
-		_, got, _, _, _ := s.record(ord)
-		switch c := compareBytesString(got, id); {
+		mid := lo + (hi-lo)/2
+		switch c := compareBytesString(s.rawIDAt(mid), id); {
 		case c == 0:
-			return ord, true
+			return s.ordAt(mid), true
 		case c < 0:
 			lo = mid + 1
 		default:
@@ -974,6 +1125,29 @@ func (s *Segment) Ord(id string) (uint32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// ordAt returns the ordinal of the query at rank r (its position sorted by id).
+func (s *Segment) ordAt(r uint32) uint32 { return u32(s.ids, idSize*int(r)) }
+
+// rawIDAt returns the id of the query at rank r (a view into the segment unless it is
+// escaped).
+func (s *Segment) rawIDAt(r uint32) []byte {
+	lit := s.idAt(r)
+	if raw, ok := plainID(lit); ok {
+		return raw
+	}
+	return decodeLiteral(lit)
+}
+
+// idAt returns the JSON string literal of the id of the query at rank r, a view into
+// the segment.
+func (s *Segment) idAt(r uint32) []byte {
+	var start uint32
+	if r > 0 {
+		start = u32(s.ids, idSize*int(r)-4)
+	}
+	return s.idText[start:u32(s.ids, idSize*int(r)+4)]
 }
 
 func compareBytesString(b []byte, s string) int {
@@ -1009,87 +1183,97 @@ func (s *Segment) Query(ord uint32) (shard.StoredQuery, error) {
 	return shard.StoredQuery{ID: string(id), Seq: seq, Query: n, Meta: m}, nil
 }
 
-// Close implements [shard.QuerySegment]: it stops the warm-up (see warm) and waits
-// for it. The segment's memory is the collector's.
+// Close implements [shard.QuerySegment]: it unmaps the file. Nothing the segment
+// handed out views it (Query and Percolate return copies).
 func (s *Segment) Close() error {
-	if s.stop != nil {
-		s.stopOnce.Do(func() { close(s.stop) })
-		<-s.warmed
+	if s.mapped == nil {
+		return nil
 	}
-	return nil
+	return s.mapped.close()
 }
 
-// id returns query ord's id (a view into the segment).
-func (s *Segment) id(ord uint32) []byte {
-	r := byteReader{b: s.records[u64(s.offsets, 8*int(ord)):u64(s.offsets, 8*int(ord)+8)]}
-	return r.bytes()
+// class returns the first rank of rank r's verification class, noClass when no other
+// query shares it.
+func (s *Segment) class(r uint32) uint32 { return u32(s.verifies, verifySize*int(r)) }
+
+// verdictClass returns the first rank of rank r's verification class, noClass when no
+// other query shares it, or trivialClass when it also holds (an empty program), from
+// the dense copy Open makes, so that a candidate's verify record is read only when its
+// program must run.
+func (s *Segment) verdictClass(r uint32) uint32 { return s.classes[r] }
+
+// program returns rank r's class's program (empty: it holds).
+func (s *Segment) program(r uint32) []byte {
+	o := verifySize * int(r)
+	n := u32(s.verifies, o+4)
+	if n <= inlineProg {
+		return s.verifies[o+8 : o+8+int(n)]
+	}
+	off := u32(s.verifies, o+8)
+	return s.programs[off : off+n]
 }
 
-// rank returns ord's position among the segment's queries sorted by id.
-func (s *Segment) rank(ord uint32) uint32 { return u32(s.ranks, 4*int(ord)) }
-
-// class returns the representative of ord's verification class.
-func (s *Segment) class(ord uint32) uint32 { return u32(s.classes, 4*int(ord)) }
-
-// compiledQuery returns the compiled query of ord's verification class, compiling it
-// on first use.
-func (s *Segment) compiledQuery(rep uint32) (*query.Compiled, error) {
-	if c := s.compiled[rep].Load(); c != nil {
-		return c, nil
-	}
-	_, id, src, _, err := s.record(rep)
-	if err != nil {
-		return nil, &CorruptError{Path: s.path, Why: err.Error()}
-	}
-	n, problems := query.Parse(src)
-	if len(problems) > 0 {
-		return nil, &CorruptError{Path: s.path, Why: fmt.Sprintf("query %q: %s", id, problems[0].Message)}
-	}
-	s.compiled[rep].CompareAndSwap(nil, query.Compile(n))
-	return s.compiled[rep].Load(), nil
-}
-
-// lookup returns the postings of (kind, field, term), nil when the dictionary has none.
-func (s *Segment) lookup(kind AtomKind, field uint32, term string) []byte {
+// lookup returns the entry (its offset in entries) of (kind, field, term), -1 when the
+// dictionary has none.
+func (s *Segment) lookup(kind AtomKind, field uint32, term string) int {
 	return s.lookupHashed(kind, field, term, hashTerm(kind, field, term))
 }
 
-// gramFilterBits is a gram prefilter's size: 65,536 bits, 8 KiB per field.
-const gramFilterBits = 1 << 16
+// Gram prefilter sizes: gramFilterBitsPerTerm bits per gram term (a false positive
+// rate under 1 in 16 per window), as a power of two from 512 bits up to 2^26 (8 MiB).
+const (
+	gramFilterBitsPerTerm = 16
+	minGramFilterBits     = 1 << 9
+	maxGramFilterBits     = 1 << 26
+)
 
-// buildGramFilters sets each gram entry's bit in its field's prefilter. It runs after
-// the entries and fields are validated.
+// buildGramFilters sizes each field's gram prefilter to its gram terms and sets each
+// one's bit. It runs after the entries and fields are validated.
 func (s *Segment) buildGramFilters() {
+	counts := make([]uint64, len(s.fields))
+	for o := 0; o < len(s.entries); o += entrySize {
+		if fk := u32(s.entries, o+4); AtomKind(fk&0xff) == AtomGram && int(fk>>8) < len(s.fields) {
+			counts[fk>>8]++
+		}
+	}
+	for fi, c := range counts {
+		if c == 0 {
+			continue
+		}
+		bits := uint64(minGramFilterBits)
+		for bits < gramFilterBitsPerTerm*c && bits < maxGramFilterBits {
+			bits <<= 1
+		}
+		s.fields[fi].grams = make([]uint64, bits/64)
+		s.fields[fi].gramMask = uint32(bits - 1)
+	}
 	for o := 0; o < len(s.entries); o += entrySize {
 		fk := u32(s.entries, o+4)
 		if AtomKind(fk&0xff) != AtomGram || int(fk>>8) >= len(s.fields) {
 			continue
 		}
 		f := &s.fields[fk>>8]
-		if f.grams == nil {
-			f.grams = make([]uint64, gramFilterBits/64)
-		}
-		bit := u32(s.entries, o) & (gramFilterBits - 1)
+		bit := u32(s.entries, o) & f.gramMask
 		f.grams[bit>>6] |= 1 << (bit & 63)
 	}
 }
 
 // lookupGram is lookup of an AtomGram term of field f, through its prefilter.
-func (s *Segment) lookupGram(f *fieldInfo, field uint32, gram string) []byte {
+func (s *Segment) lookupGram(f *fieldInfo, field uint32, gram string) int {
 	h := hashTerm(AtomGram, field, gram)
-	if bit := hi32(h) & (gramFilterBits - 1); len(f.grams) == 0 || f.grams[bit>>6]&(1<<(bit&63)) == 0 {
-		return nil
+	if bit := hi32(h) & f.gramMask; len(f.grams) == 0 || f.grams[bit>>6]&(1<<(bit&63)) == 0 {
+		return -1
 	}
 	return s.lookupHashed(AtomGram, field, gram, h)
 }
 
 // lookupHashed is lookup with the term's hash computed.
-func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint64) []byte {
+func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint64) int {
 	fk := field<<8 | uint32(kind)
 	for slot, probes := lo32(h)&s.tableMask, uint32(0); probes <= s.tableMask; slot, probes = (slot+1)&s.tableMask, probes+1 {
 		e := u32(s.slots, 4*int(slot))
 		if e == 0 {
-			return nil
+			return -1
 		}
 		o := int(e-1) * entrySize
 		if u32(s.entries, o) != hi32(h) || u32(s.entries, o+4) != fk {
@@ -1097,20 +1281,20 @@ func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint6
 		}
 		off, n := u32(s.entries, o+8), u32(s.entries, o+12)
 		if string(s.terms[off:off+n]) == term {
-			return s.posts(o)
+			return o
 		}
 	}
-	return nil
+	return -1
 }
 
 // lookupKey is lookup of an AtomSimKey term.
-func (s *Segment) lookupKey(field uint32, key uint64) []byte {
+func (s *Segment) lookupKey(field uint32, key uint64) int {
 	h := hashKey(field, key)
 	fk := field<<8 | uint32(AtomSimKey)
 	for slot, probes := lo32(h)&s.tableMask, uint32(0); probes <= s.tableMask; slot, probes = (slot+1)&s.tableMask, probes+1 {
 		e := u32(s.slots, 4*int(slot))
 		if e == 0 {
-			return nil
+			return -1
 		}
 		o := int(e-1) * entrySize
 		if u32(s.entries, o) != hi32(h) || u32(s.entries, o+4) != fk {
@@ -1118,15 +1302,21 @@ func (s *Segment) lookupKey(field uint32, key uint64) []byte {
 		}
 		off := u32(s.entries, o+8) // validated: 8 bytes
 		if binary.BigEndian.Uint64(s.terms[off:]) == key {
-			return s.posts(o)
+			return o
 		}
 	}
-	return nil
+	return -1
 }
 
 func (s *Segment) posts(entry int) []byte {
 	off, n := u32(s.entries, entry+16), u32(s.entries, entry+20)
 	return s.postings[4*int(off) : 4*int(off+n)]
+}
+
+// filteredOf returns the entry's filtered postings.
+func (s *Segment) filteredOf(entry int) []byte {
+	off, n := u32(s.entries, entry+24), u32(s.entries, entry+28)
+	return s.filtered[filteredSize*int(off) : filteredSize*int(off+n)]
 }
 
 // ---- small helpers ----
@@ -1293,9 +1483,9 @@ func writeFile(path string, data []byte) error {
 	return nil
 }
 
-// post adds ord to the postings of (kind, field fi, term), marking the field as having
+// post adds rank to the postings of (kind, field fi, term), marking the field as having
 // terms of the kind, and returns the entry's dictionary key.
-func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, ord uint32) string {
+func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, rank uint32) string {
 	b.fields[fi].kinds |= 1 << kind
 	b.key = append(b.key[:0], byte(kind))
 	b.key = binary.LittleEndian.AppendUint32(b.key, fi)
@@ -1305,10 +1495,26 @@ func (b *segmentBuilder) post(kind AtomKind, fi uint32, term string, ord uint32)
 		e = &dictEntry{kind: kind, field: fi, term: term}
 		b.dict[string(b.key)] = e
 	}
-	if n := len(e.posts); n == 0 || e.posts[n-1] != ord {
-		e.posts = append(e.posts, ord)
+	if n := len(e.posts); n == 0 || e.posts[n-1] != rank {
+		e.posts = append(e.posts, rank)
 	}
 	return string(b.key)
+}
+
+// postFiltered adds a filtered posting to (kind, field fi, term), as post does.
+func (b *segmentBuilder) postFiltered(kind AtomKind, fi uint32, term string, fp filteredPost) {
+	b.fields[fi].kinds |= 1 << kind
+	b.key = append(b.key[:0], byte(kind))
+	b.key = binary.LittleEndian.AppendUint32(b.key, fi)
+	b.key = append(b.key, term...)
+	e := b.dict[string(b.key)]
+	if e == nil {
+		e = &dictEntry{kind: kind, field: fi, term: term}
+		b.dict[string(b.key)] = e
+	}
+	if n := len(e.filtered); n == 0 || e.filtered[n-1].rank != fp.rank {
+		e.filtered = append(e.filtered, fp)
+	}
 }
 
 // memberTerm is an AtomMember term: the atom's kind, then its term.
@@ -1377,7 +1583,7 @@ func (b *segmentBuilder) ownsAfter(a, other string) bool {
 }
 
 // validPostings reports whether postings [off, off+n) lie in the section, are not
-// empty, and hold ascending ordinals below the query count.
+// empty, and hold ascending ranks below the query count.
 func (s *Segment) validPostings(off, n uint64) bool {
 	if n == 0 || off+n > uint64(len(s.postings)/4) {
 		return false
@@ -1390,6 +1596,38 @@ func (s *Segment) validPostings(off, n uint64) bool {
 			return false
 		}
 		prev = ord
+	}
+	return true
+}
+
+// validFiltered reports whether filtered postings [off, off+n) lie in the section and
+// hold ascending ranks below the query count, fields below numFields, known kinds, and
+// ranges (a bool's 0 or 1) or texts that fit.
+func (s *Segment) validFiltered(off, n uint64, numFields uint32) bool {
+	if off+n > uint64(len(s.filtered)/filteredSize) {
+		return false
+	}
+	for i := range int(n) { //nolint:gosec // n is a u32 count
+		r := (int(off) + i) * filteredSize //nolint:gosec // off is a u32 offset
+		ord, fb := u32(s.filtered, r), u32(s.filtered, r+4)
+		if ord >= s.n || i > 0 && ord <= u32(s.filtered, r-filteredSize) || fb>>2 >= numFields {
+			return false
+		}
+		lo, hi := f64(s.filtered, r+8), f64(s.filtered, r+16)
+		switch uint8(fb & 3) {
+		case filterRange:
+			if !(lo <= hi) {
+				return false
+			}
+		case filterBool:
+			if lo != hi || lo != 0 && lo != 1 {
+				return false
+			}
+		default:
+			if s.filtered[r+8] > maxFilterText {
+				return false
+			}
+		}
 	}
 	return true
 }
@@ -1411,62 +1649,3 @@ func (s *Segment) pairAt(r int) (partner uint32, posts []byte) {
 
 // NumEntries is how many terms the segment's dictionary holds.
 func (s *Segment) NumEntries() uint32 { return uint32(len(s.entries) / entrySize) } //nolint:gosec // validated against a u32 count
-
-// warmSlots bounds the goroutines warming segments across the process, so a merge or a
-// reopen never takes every core from percolation.
-var warmSlots = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/4))
-
-// warmOnOpen turns the warm-up on (benchmarks turn it off to measure a cold segment).
-var warmOnOpen = true
-
-// warmBatch is how many queries a warm-up compiles per slot it takes.
-const warmBatch = 256
-
-// warm compiles every verification class in the background, so the first documents
-// after a refresh, a merge or a reopen do not pay for compiling their candidates (a
-// cold 100k-query segment costs about 10 µs per class). Up to cap(warmSlots) workers
-// per segment claim batches in turn, each holding one of the process-wide warmSlots
-// per batch, until done or Close; a class a percolation compiles first is found
-// compiled.
-func (s *Segment) warm() {
-	s.stop, s.warmed = make(chan struct{}), make(chan struct{})
-	batches := int((s.n + warmBatch - 1) / warmBatch)
-	workers := min(cap(warmSlots), batches)
-	if workers == 0 {
-		close(s.warmed)
-		return
-	}
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	for range workers {
-		wg.Go(func() {
-			for {
-				b := next.Add(1) - 1
-				if b >= int64(batches) {
-					return
-				}
-				select {
-				case warmSlots <- struct{}{}:
-				case <-s.stop:
-					return
-				}
-				start := uint32(b) * warmBatch //nolint:gosec // b < batches, which fit a u32
-				for ord := start; ord < min(start+warmBatch, s.n); ord++ {
-					if s.class(ord) == ord && s.compiled[ord].Load() == nil {
-						_, _ = s.compiledQuery(ord) // a parse error surfaces at verification
-					}
-				}
-				<-warmSlots
-				select {
-				case <-s.stop:
-					return
-				default:
-				}
-			}
-		})
-	}
-	go func() {
-		wg.Wait()
-		close(s.warmed)
-	}()
-}

@@ -59,8 +59,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       # Each node opens up to 64 connections plus one for LISTEN; three nodes and the
@@ -84,7 +84,7 @@ jobs:
         run: go test -tags chaos -count=1 -v -timeout 30m ./test/chaos
       - name: upload the nodes' logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chaos-logs
           path: ${{ runner.temp }}/chaos

@@ -82,7 +82,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 	percBatch := fs.Int("percolate-batch", 100, "documents per percolate request")
 	percConc := fs.Int("percolate-concurrency", 4, "concurrent percolate batch requests")
 	percIter := fs.Int("percolate-iterations", 50, "measured percolate batches per saved-search set")
-	percSingle := fs.Int("percolate-single", 300, "measured single-document percolations per saved-search set")
+	percSingle := fs.Int("percolate-single", 1000, "measured single-document percolations per saved-search set (1000 is minSamples(0.99), the fewest a trusted p99 needs)")
 	bulkPercIter := fs.Int("bulk-percolate-iterations", 20, "measured _bulk?percolate requests")
 	visible := fs.Int("visible-iterations", 1000, "measured write-to-visible iterations per direction (visible and wait_for), at concurrency 1 so queueing never shows up as latency; 1000 is minSamples(0.99), the fewest a trusted p99 needs")
 	mixed := fs.Duration("mixed", 30*time.Second, "how long the mixed read/write workload runs")

@@ -103,7 +103,11 @@ func (s *Shard) planMerges() []mergePlan {
 			}
 			byID[st.ref.id] = st.ref
 		}
-		for _, ids := range s.opts.MergePolicy.FindMerges(cands) {
+		policy := s.opts.MergePolicy
+		if kind == kindQueries {
+			policy = s.opts.QueryMergePolicy
+		}
+		for _, ids := range policy.FindMerges(cands) {
 			p := mergePlan{kind: kind}
 			for _, id := range ids {
 				p.inputs = append(p.inputs, byID[id])

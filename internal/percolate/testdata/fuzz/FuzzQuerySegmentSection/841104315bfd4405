@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('O')
+uint32(179)
+[]byte("\xf3\U000f2cb2")

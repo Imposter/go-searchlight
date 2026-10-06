@@ -295,7 +295,7 @@ func benchDoc(b *testing.B, env *benchEnv, p *Percolator) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		matches += len(out[0])
+		matches += len(strs(b, out[0]))
 	}
 	reportLatency(b, lat)
 	b.ReportMetric(float64(matches)/float64(len(lat)), "matches/doc")
@@ -304,7 +304,7 @@ func benchDoc(b *testing.B, env *benchEnv, p *Percolator) {
 	sample := env.docs[:min(500, len(env.docs))]
 	for qi := range env.g.QuerySegments {
 		if seg, ok := env.g.QuerySegments[qi].Segment.(*Segment); ok {
-			sc.fit(seg.NumQueries(), seg.NumEntries())
+			sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 			for _, d := range sample {
 				seg.collect(&d, sc)
 				cands += len(sc.cands)
@@ -373,39 +373,29 @@ func BenchmarkPercolateVariants(b *testing.B) {
 }
 
 // BenchmarkPercolateCold is the first 500 documents percolated one by one right after
-// a merge of 10 query segments into one (100k saved searches), with and without the
-// warm-up Open starts. Each iteration merges once: run it with -benchtime 1x.
+// a merge of 10 query segments into one (100k saved searches), on a segment just
+// mapped. Each iteration merges once: run it with -benchtime 1x.
 func BenchmarkPercolateCold(b *testing.B) {
-	for _, warm := range []bool{false, true} {
-		b.Run(fmt.Sprintf("warm=%v", warm), func(b *testing.B) {
-			defer func(w bool) { warmOnOpen = w }(warmOnOpen)
-			warmOnOpen = warm
-			env := newBenchEnv(b, benchConfig{queries: 100000, segments: 10})
-			p := New(Options{})
-			ctx := context.Background()
-			var lat []time.Duration
-			for b.Loop() {
-				if err := env.s.ForceMerge(ctx, 1); err != nil {
-					b.Fatal(err)
-				}
-				env.regenerate()
-				merged := time.Now()
-				for i := range 500 {
-					start := clockNow()
-					if _, err := p.Percolate(ctx, env.g, env.docs[i:i+1]); err != nil {
-						b.Fatal(err)
-					}
-					lat = append(lat, clockSince(start))
-				}
-				b.ReportMetric(float64(time.Since(merged).Milliseconds()), "first500-ms")
-				if seg, ok := env.g.QuerySegments[0].Segment.(*Segment); ok && warm {
-					<-seg.warmed
-					b.ReportMetric(float64(time.Since(merged).Milliseconds()), "warm-done-ms")
-				}
+	env := newBenchEnv(b, benchConfig{queries: 100000, segments: 10})
+	p := New(Options{})
+	ctx := context.Background()
+	var lat []time.Duration
+	for b.Loop() {
+		if err := env.s.ForceMerge(ctx, 1); err != nil {
+			b.Fatal(err)
+		}
+		env.regenerate()
+		merged := time.Now()
+		for i := range 500 {
+			start := clockNow()
+			if _, err := p.Percolate(ctx, env.g, env.docs[i:i+1]); err != nil {
+				b.Fatal(err)
 			}
-			reportLatency(b, lat)
-		})
+			lat = append(lat, clockSince(start))
+		}
+		b.ReportMetric(float64(time.Since(merged).Milliseconds()), "first500-ms")
 	}
+	reportLatency(b, lat)
 }
 
 // BenchmarkPercolatePairsLongDoc is the pair-probing worst case: 20k searches
@@ -416,7 +406,7 @@ func BenchmarkPercolatePairsLongDoc(b *testing.B) {
 		b.Run(fmt.Sprintf("words=%d", m), func(b *testing.B) {
 			d := wordsDoc(b, m)
 			sc := new(scratch)
-			sc.fit(seg.NumQueries(), seg.NumEntries())
+			sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 			v := &view{seg: seg, n: seg.NumQueries()}
 			b.Run("probe", func(b *testing.B) {
 				for b.Loop() {
@@ -430,10 +420,8 @@ func BenchmarkPercolatePairsLongDoc(b *testing.B) {
 				for b.Loop() {
 					seg.collect(&d, sc)
 					var st docStats
-					if err := verify(v, &d, sc, &st); err != nil {
-						b.Fatal(err)
-					}
-					sc.results(true)
+					verify(v, sc, &st)
+					sc.results()
 					sc.reset()
 				}
 			})

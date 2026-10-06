@@ -22,7 +22,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 | Filter / boolean search latency, p50 and p99 | ≤ Elasticsearch |
 | Sorted and paged search, p50 and p99 | ≤ Elasticsearch |
 | Aggregation latency (terms, range, histogram, stats) | ≤ Elasticsearch |
-| Percolation throughput (docs/s against 10k / 100k saved queries) | ≥ 10× Elasticsearch's percolator, with p99 per document < 1 ms at 100k queries |
+| Percolation throughput (docs/s against 10k / 100k saved queries) | ≥ 10× Elasticsearch's percolator, with p99 per document < 1 ms server time at 100k queries (measured like Elasticsearch's took) |
 | Index size on disk and resident memory per million documents | ≤ Elasticsearch |
 | Write-to-visible latency | ≤ 1 s by default (the refresh interval), and `refresh=wait_for` like Elasticsearch |
 | New replica from zero to serving (10M docs) | ≤ Elasticsearch peer recovery |
@@ -222,7 +222,7 @@ The percolator reverse-indexes the saved queries.
 - **Anchors per saved query:**
   - **`eq` / `in`:** value keys.
   - **`has*`:** entry keys.
-  - **`words_*`:** word keys.
+  - **`words_*`:** per phrase, the pair of its two rarest distinct words, or its one word. A phrase is found only where each of its words is, so a matching document holds both halves.
   - **`contains*` / `starts_with`:** the needle's rarest 3-character window. A needle shorter than three characters anchors on "the field has a text".
   - **`similar`** (min > 0): the union of the text's pg_trgm trigram keys. This is sound because a document sharing no trigram has similarity exactly 0 (`SimilarityKeys`), and 0 is below any minimum the matcher accepts (0 < min ≤ 1).
   - **Ranges:** interval anchors.
@@ -231,14 +231,37 @@ The percolator reverse-indexes the saved queries.
   - **`all`, pairs:** when cheaper, a pair of two children whose sets are made only of value, bool, entry or word keys, anchored on every pair of one key from each, at most 16 pairs per group. This is sound because both children hold whenever the group does, so a matching document holds a key of each. A document finds its pairs by walking the partner lists of the pair halves it holds, in time linear in those lists rather than quadratic in its keys. Past a budget, it adds every query any held half belongs to, which is also sound.
   - **`any`:** the union of the children's sets. One unanchorable child makes the whole group unanchorable.
   - **Unanchorable:** `not`, `ne`, `exists:false`, `empty`, and the root `{"all": []}`. These go on the always-check list.
-- **Query index.** Anchors are stored per shard in percolator segments: a term dictionary → postings of query ordinals, pair partner lists, an interval tree per field, the stored queries (compiled on open by a background warm-up), and the always-check list. It is refreshed and merged exactly like document segments.
+- **Posting filters.** A query anchored on terms alone stores one cheap conjunct of its root with each of its postings. A document holding the term is a candidate only if its value of that field passes the conjunct. This is sound because every match satisfies every conjunct of its root.
+  - **Kinds:** a range on a number (`lt` and `gt` kept closed, which only admits a candidate that verification refuses), `eq` on a bool, a text the field must not equal (`ne`, or `not eq`, on a string of at most 15 bytes), or an entry it must not hold (`not has` of one entry).
+  - **Choice:** the conjunct that leaves the least to verify, then a range, which prunes the most candidates.
+- **Query segments** (format `percolate/3`). Each refresh writes the queries it adds as one file per shard, merged like document segments under a policy of their own (two segments per tier, against ten for documents), because every query segment costs every percolated document a full probe.
+  - **Contents:**
+    - the hash term dictionary, mapping each term to postings and filtered postings of queries;
+    - pair partner lists;
+    - an interval tree per numeric field;
+    - the always-check list;
+    - the stored queries (their JSON, for merges and reads);
+    - one compiled program per verification class;
+    - every id as its JSON string literal.
+  - **Opening.** A segment is memory-mapped, then checked against its CRC32C and validated structurally: every offset, rank, tree link, filter and program, and every id literal against its query's id. A damaged or crafted file is refused, and no accessor of an open one reads out of range. Nothing per query is decoded onto the heap: a segment of a million queries costs its mapped pages.
+- **Ranks.** Within a segment, everything percolation reads is numbered by rank, a query's position sorted by id: postings, filters, pairs, intervals, the always list, programs and id literals. Candidates verified in rank order read the segment front to back and match in output order. Records stay numbered by the ordinal the shard deletes and merges by.
+- **Verification classes and memo.** Queries whose canonical form is the same share a class: one program, verified once per document, with the verdict memoized for the rest. A `words_*` query's class is its exact JSON, because phrases are read as written. Queries proven on different leaves are in different classes. Open keeps a dense copy of every query's class, which also marks a class of one query whose program is empty: such a candidate matches, and a memoized class's members are decided, without their records being read.
+- **Programs.** Each class's query is compiled at build time into a compact byte program that names fields by their index in the segment. It mirrors the matcher exactly: the same constant folding, the same reading of every value, children cheapest first. Verification evaluates it over a dense slice of the document's values, laid out once per segment: one map lookup per field, none per candidate.
+- **Proven conditions.** A condition at a query's root (a leaf, or the `not` of one) that every route to its candidacy implies holds on every candidate, so the program leaves it out. A route is a term it is anchored on (with its posting filter), or a range anchor. For example, `brand eq + price lte` with its price filter verifies nothing, and neither does `brand in + not condition eq used` with its text filter.
+- **Gram prefilter.** Each field with gram terms has a bit filter of them, 16 bits per term (512 bits to 64 Mbit). A window whose bit is clear skips the dictionary.
 - **Per document:**
-  1. Analyze it into atoms: values, entries, words, every 3-character window of the whole text, trigram keys, `present` keys and numbers. Atoms are never truncated or sampled.
-  2. Probe the query index to get candidates.
+  1. Analyze it for matching: every value the matcher reads, but no `Value.Grams`, which the percolator never reads.
+  2. In each query segment, lay out the document's values by field index. Probe with its atoms: values, entries, words, every 3-character window of the whole text, trigram keys, `present` keys and numbers. Atoms are never truncated or sampled. A filtered posting adds its query only if its filter passes.
   3. Add the always-check list.
-  4. Verify each candidate with the exact matcher.
+  4. Verify each candidate, in rank order, with its class's program.
+  5. Each segment's matches are a run sorted by id. The runs are merged (a heap over the segments) straight into the JSON array of ids, which the response copies as it is.
 - **Batches.** `_bulk?percolate=true` and `_percolate` with many documents process documents in parallel.
-- **Completeness guarantee.** A property test checks that the candidates always include every true match. A failure blocks release.
+- **Format upgrade.** A copy whose query segments are in an older format (`percolate/2`) does not open (`ErrOlderFormat`). The node wipes it and rebuilds it from a peer or the database, and the new segments are `percolate/3`. A binary rolled back to `percolate/2` refuses a `percolate/3` copy (`ErrNewerFormat`) and leaves its files as they are.
+- **Completeness guarantee.** A failure of any of these tests blocks release:
+  - A property test checks that the candidates always include every true match, and that the answer equals brute force with `query.Match`.
+  - A second checks every program against `query.Compile(...).Match` over random queries and documents, non-candidates included.
+  - Cross-checks run the benchmark's shapes and adversarial root conjunctions through segments with deletes, and scrape-bot's parity fixtures through the percolator.
+- **Where the p99 target is measured** (operator decision, 2026-10-05). The < 1 ms p99 per document at 100k queries (§1) is server time, measured the way Elasticsearch's `took` is: from the request's admission to the last byte of its answer encoded. It covers analysis, matching and encoding, and leaves out the network and the client's decoding. `_percolate` reports it as `took_us` (and `took_ms`, and a `Server-Timing` header). The benchmark reads each engine's own server time the same way.
 
 ## 8. Storage (SQL)
 

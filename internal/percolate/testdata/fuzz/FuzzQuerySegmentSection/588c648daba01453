@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('Á')
+uint32(301)
+[]byte("\x90\x90\x90\xff\x9f\x90\x90\x90\x90\x9e")

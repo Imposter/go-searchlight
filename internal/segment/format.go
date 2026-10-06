@@ -8,38 +8,51 @@
 //	         its prefix-compressed term blocks, then its sparse block index
 //	DOCVALS  per field columns: numbers (frame-of-reference bit-packed), keyword
 //	         ordinals, multi-valued entry ordinals
-//	POINTS   per number field: (value, doc) sorted into blocks with min/max (BKD-lite)
-//	PRESENCE per field roaring bitmaps: present docs, and docs whose grams were truncated
-//	STORED   zstd blocks of about 16 KB holding each document's id and JSON body
+//	POINTS   per number field: documents sorted by value into blocks with min/max
+//	         (BKD-lite)
+//	PRESENCE per field roaring bitmaps: present docs, docs whose grams were truncated,
+//	         and docs whose value the writer marked untyped
+//	STORED   an s2 dictionary, then s2 blocks of about 4 KB of documents, each one's
+//	         id and JSON body, then a bit-packed block table
 //	IDS      the primary key: every document's exact id (as given, never normalized)
 //	         to its ordinal, a term dictionary whose terms each hold one ordinal
 //	         inline, then u64 (the dictionary's index offset in the section) + 1, or
 //	         0 for a segment with no documents
-//	META     the field directory: names, types and where every structure starts
+//	META     segment flags and the field directory: names and where every structure
+//	         starts
 //	footer   section table (kind, offset, length, CRC32C), section count, end magic,
 //	         CRC32C of every byte before it
 //
 // All integers are little-endian. [Open] verifies the whole-file checksum and refuses a
-// file whose major version it does not know.
+// file whose major version it does not read.
 //
 // # Versions
 //
-// Format 3.0 is the current layout: 2.0 plus the IDS section. [Reader.Ord] finds a
-// document by its exact id there; 2.0 had only the _id field's dictionary, whose terms
-// are normalized ("SKU-1" and "sku-1" share one), so a 2.0 file cannot answer it and is
-// refused. 2.0 was incompatible with 1.x: 1.0 used absolute file offsets throughout,
-// and 1.1 (section-relative offsets, below) never recorded a stored block's
-// uncompressed length and wrote point block offsets relative to the wrong origin. Open
-// refuses every major but [FormatMajor] with a [VersionError], so an older file -
-// which this code would misread or could not serve, not merely fail to read - is
-// refused outright, whatever its minor. A minor bump is reserved for additions an
-// older reader of the same major can safely ignore.
+// Format 4.0 is the current layout, and the only one [Build] and [Merge] write. Open
+// reads it and the major before it ([ReadsMajor], 3.0), so an upgraded node reopens its
+// segments instead of rebuilding them, and merges rewrite them into the current major
+// as they go. Every other major is refused with a [VersionError]: an older one is
+// rebuilt ([ErrOlderFormat]), a newer one left as it is ([ErrNewerFormat]).
+//
+// 4.0 against 3.0:
+//   - The block index keys each term block by the shortest prefix that separates it
+//     from the block before, not by its whole first term.
+//   - A point block holds only its documents; a partly covered block reads their
+//     values from the number column.
+//   - Stored blocks are about 4 KB of s2 (format 3: 16 KB of zstd), compressed against
+//     a dictionary of the segment's first documents, behind a bit-packed block table.
+//   - META carries segment flags (whether the writer marks untyped values) and a
+//     per-field untyped bitmap. 3.0 overloaded the marks onto the truncated bitmap;
+//     a 3.0 segment's marks are split from it at Open ([Reader.Untyped]).
+//
+// 3.0 was 2.0 plus the IDS section, without which [Reader.Ord] cannot answer. A minor
+// bump is reserved for additions an older reader of the same major can safely ignore.
 //
 // # Offsets, and why most of them are section-relative
 //
 // META holds each field's entry points into TERMS, DOCVALS and POINTS (dictOff,
 // keywordColOff, multiColOff, numberColOff, pointsOff) and into PRESENCE (presOff,
-// truncOff). Every one of those is relative to its own section's
+// truncOff, untypedOff). Every one of those is relative to its own section's
 // absolute start (which the footer's section table gives), not to the file: Build and
 // Merge can then build one field's whole contribution to a section - a term
 // dictionary, a doc-values column, a point index - complete and self-contained, in
@@ -74,9 +87,11 @@ import (
 
 // File format identification.
 const (
-	// FormatMajor is the segment format's major version. Open refuses any other major,
-	// including every 1.x file (see the package doc comment's "Versions").
-	FormatMajor = 3
+	// FormatMajor is the segment format's major version: what Build and Merge write.
+	// Open reads it and [ReadsMajor] (see the package doc comment's "Versions").
+	FormatMajor = 4
+	// ReadsMajor is the oldest major Open reads: the one before FormatMajor.
+	ReadsMajor = FormatMajor - 1
 	// FormatMinor is the segment format's minor version: additions an older reader of
 	// the same major can ignore.
 	FormatMinor = 0
@@ -228,12 +243,19 @@ type VersionError struct {
 }
 
 func (e *VersionError) Error() string {
-	return fmt.Sprintf("segment %s: format %d.%d is not readable by format %d.%d",
-		e.Path, e.Major, e.Minor, FormatMajor, FormatMinor)
+	return fmt.Sprintf("segment %s: format %d.%d is not readable by format %d.%d, which reads majors %d and %d",
+		e.Path, e.Major, e.Minor, FormatMajor, FormatMinor, ReadsMajor, FormatMajor)
 }
 
 // Unwrap makes a VersionError match [ErrNewerFormat] or [ErrOlderFormat].
-func (e *VersionError) Unwrap() error { return FormatError(uint64(e.Major), FormatMajor) }
+func (e *VersionError) Unwrap() error {
+	if e.Major < ReadsMajor {
+		return ErrOlderFormat
+	}
+	return FormatError(uint64(e.Major), FormatMajor)
+}
+
+func readsMajor(major uint16) bool { return major == FormatMajor || major == ReadsMajor }
 
 // errShort is a structure that runs past the end of its bytes.
 var errShort = errors.New("truncated structure")

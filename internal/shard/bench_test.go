@@ -232,7 +232,7 @@ func BenchmarkRefreshKinds(b *testing.B) {
 	})
 	b.Run("delete-1", func(b *testing.B) {
 		run(b, func(s *Shard, i int, seq int64) int64 {
-			if err := s.Apply(context.Background(), []Change{{Seq: seq, Kind: Delete, DocID: docs[i].ID}}); err != nil {
+			if err := s.Apply(context.Background(), []Change{{Seq: seq, Kind: Delete, DocID: docs[i%10_000].ID}}); err != nil {
 				b.Fatal(err)
 			}
 			return seq + 1

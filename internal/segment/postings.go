@@ -12,12 +12,14 @@ import (
 // run-optimized roaring bitmap in the portable serialization, read in place from the
 // mapping by roaring's FromBuffer: the containers' data is never copied.
 
-// termInfo is what a term's dictionary entry says about its postings.
+// termInfo is what a term's dictionary entry says about its postings: its ordinal, its
+// document frequency, and either its one document (single, when docFreq is 1) or its
+// serialized postings (post).
 type termInfo struct {
-	ord     uint32 // the term's ordinal in its dictionary
+	ord     uint32
 	docFreq uint32
-	single  uint32 // the one document, when docFreq is 1
-	post    region // the serialized bitmap, when docFreq > 1
+	single  uint32
+	post    region
 }
 
 // postingsEncoder serializes sorted document lists as roaring bitmaps, reusing its
@@ -73,13 +75,13 @@ func bitmapAt(data []byte, info termInfo, numDocs uint32) *roaring.Bitmap {
 // viewBitmap reads the serialized bitmap at r in place, with no copy: its containers
 // hold slices of data itself. The result is only valid for as long as data's backing
 // mapping stays mapped - callers that return it to package callers (Postings, Present,
-// Truncated) document that lifetime there; a caller that needs it to outlive the
-// mapping must Clone() it.
+// Truncated, Untyped) document that lifetime there; a caller that needs it to outlive
+// the mapping must Clone() it.
 //
 // viewBitmap trusts r to hold a well-formed bitmap: every caller has checked it with
 // [checkBitmap] first - bitmapAt on each call, Reader.parseMeta once at Open for the
-// presence and truncated bitmaps. A region outside data, or one FromBuffer refuses,
-// still reads as empty.
+// presence, truncated and untyped bitmaps. A region outside data, or one FromBuffer
+// refuses, still reads as empty.
 func viewBitmap(data []byte, r region) *roaring.Bitmap {
 	rb := roaring.New()
 	b, ok := r.slice(data)
@@ -92,25 +94,22 @@ func viewBitmap(data []byte, r region) *roaring.Bitmap {
 	return rb
 }
 
-// forEachDoc calls fn with each of a term's documents, ascending, a chunk at a time
-// without listing them all first. numDocs bounds them as it does for [bitmapAt]: a
-// damaged file's postings read as empty rather than reaching fn.
-func forEachDoc(data []byte, info termInfo, numDocs uint32, fn func(doc uint32)) {
+// appendDocs appends a term's documents, ascending, to dst. numDocs bounds them as it
+// does for [bitmapAt]: a damaged file's postings append nothing.
+func appendDocs(data []byte, info termInfo, numDocs uint32, dst []uint32) []uint32 {
 	if info.docFreq == 1 {
 		if info.single < numDocs {
-			fn(info.single)
+			dst = append(dst, info.single)
 		}
-		return
+		return dst
 	}
 	it := bitmapAt(data, info, numDocs).ManyIterator()
 	var buf [256]uint32
 	for {
 		n := it.NextMany(buf[:])
 		if n == 0 {
-			return
+			return dst
 		}
-		for _, doc := range buf[:n] {
-			fn(doc)
-		}
+		dst = append(dst, buf[:n]...)
 	}
 }

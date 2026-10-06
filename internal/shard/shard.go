@@ -322,16 +322,14 @@ type Shard struct {
 	cur atomic.Pointer[Generation]
 
 	// mu guards the write buffer and what has been applied to it.
-	mu       sync.Mutex
-	buf      *buffer
-	bufBytes atomic.Int64 // buf.bytes, for Admit without the lock
-	// marksUntyped is MarksUntyped: fixed at Open.
-	marksUntyped bool
-	applied      int64 // every change with seq <= applied is in a segment or buf
-	maxChange    int64 // the newest change applied
-	indexUID     string
-	mapState     *mappingState // the mapping as of applied
-	closing      bool
+	mu        sync.Mutex
+	buf       *buffer
+	bufBytes  atomic.Int64 // buf.bytes, for Admit without the lock
+	applied   int64        // every change with seq <= applied is in a segment or buf
+	maxChange int64        // the newest change applied
+	indexUID  string
+	mapState  *mappingState // the mapping as of applied
+	closing   bool
 
 	// failed is set once the shard cannot vouch for its durable state.
 	failed atomic.Pointer[error]
@@ -482,8 +480,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		}
 	}
 	s.sidecarBytes.Store(sidecarBytes)
-	// A shard with no segment yet has nothing unmarked: everything it builds is.
-	s.marksUntyped = man.UntypedMarks == untypedMarksFormat || len(man.Segments) == 0
 	s.applied = man.Seq
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
@@ -532,14 +528,6 @@ func (s *Shard) IndexUID() string {
 // Mapping returns the index mapping as of the applied seq: the last Remap applied,
 // the manifest's at Open, or the one Open or SetMapping was given.
 func (s *Shard) Mapping() *schema.Mapping { return s.mapping.Load() }
-
-// MarksUntyped reports whether every segment of the shard was committed by a shard
-// that records untyped-value marks: in the segments of a shard that does, a field the
-// mapping does not map has a Truncated bit exactly for the documents whose value of it
-// would analyze as a typed value (its writer, the replica, sets GramsTruncated on
-// them). A shard opened from a manifest written before the marks existed reports
-// false until it is rebuilt: its older segments lack them.
-func (s *Shard) MarksUntyped() bool { return s.marksUntyped }
 
 // MappingVersion returns the version of Mapping: the last Remap's, the manifest's at
 // Open, and 0 for a mapping only Open or SetMapping gave.

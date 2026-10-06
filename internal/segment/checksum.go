@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync/atomic"
 )
 
 // castagnoli is the CRC32C table; the standard library uses the CPU's CRC instructions.
@@ -36,6 +37,9 @@ type fileWriter struct {
 	secStart uint64
 	sections []sectionEntry
 	err      error
+	// abort, when set, is shared by every writer of one segment file: set once any of
+	// them fails, so the others stop early.
+	abort *atomic.Bool
 }
 
 const writeChunk = 256 << 10
@@ -52,8 +56,16 @@ func (w *fileWriter) flush() {
 	w.secCRC = crc32.Update(w.secCRC, castagnoli, w.chunk)
 	if w.err == nil {
 		_, w.err = w.out.Write(w.chunk)
+		if w.err != nil && w.abort != nil {
+			w.abort.Store(true)
+		}
 	}
 	w.chunk = w.chunk[:0]
+}
+
+// aborted reports whether w, or another writer of the same segment, has failed.
+func (w *fileWriter) aborted() bool {
+	return w.err != nil || (w.abort != nil && w.abort.Load())
 }
 
 func (w *fileWriter) writeByte(b byte) {
@@ -101,10 +113,12 @@ func (w *fileWriter) endSection() {
 }
 
 // header writes the file header.
-func (w *fileWriter) header() {
+func (w *fileWriter) header() { w.headerMajor(FormatMajor) }
+
+func (w *fileWriter) headerMajor(major uint16) {
 	w.write(magic[:])
 	var b [8]byte
-	binary.LittleEndian.PutUint16(b[0:], FormatMajor)
+	binary.LittleEndian.PutUint16(b[0:], major)
 	binary.LittleEndian.PutUint16(b[2:], FormatMinor)
 	w.write(b[:])
 }
@@ -125,8 +139,9 @@ func (w *fileWriter) footer() {
 	w.flush()
 }
 
-// parsedFooter is a verified file's section table.
+// parsedFooter is a verified file's major version and section table.
 type parsedFooter struct {
+	major    uint16
 	sections map[sectionKind]sectionEntry
 	checksum uint32
 }
@@ -152,7 +167,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 	}
 	major := binary.LittleEndian.Uint16(data[8:])
 	minor := binary.LittleEndian.Uint16(data[10:])
-	if major != FormatMajor {
+	if !readsMajor(major) {
 		return parsedFooter{}, &VersionError{Path: path, Major: major, Minor: minor}
 	}
 	tail := data[len(data)-tailSize:]
@@ -166,7 +181,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 	}
 	want := binary.LittleEndian.Uint32(tail[12:])
 	got := crc32c(data[:len(data)-4])
-	footer := parsedFooter{sections: make(map[sectionKind]sectionEntry, count), checksum: want}
+	footer := parsedFooter{major: major, sections: make(map[sectionKind]sectionEntry, count), checksum: want}
 	table := data[tableStart : len(data)-tailSize]
 	for i := range count {
 		e := table[i*sectionEntrySize:]

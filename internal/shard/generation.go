@@ -72,6 +72,27 @@ type segRef struct {
 	// segment), by the flush that first persisted it, or because Open found it in the
 	// manifest. Flushes read and set it holding flushSem.
 	synced bool
+	// marks is whether the segment marks untyped values (SegmentView.MarksUntyped).
+	marks bool
+}
+
+// newDocRef is a document segment's segRef. A segment in the previous format major
+// cannot say whether it marks untyped values; legacyMarks, from the manifest that
+// lists it, does.
+func newDocRef(id string, r *segment.Reader, bytes int64, legacyMarks bool) *segRef {
+	marks := r.MarksUntyped() || (r.FormatMajor() < segment.FormatMajor && legacyMarks)
+	return &segRef{id: id, kind: kindDocs, numDocs: r.NumDocs(), bytes: bytes, reader: r, marks: marks}
+}
+
+// legacyMarks is the manifest's UntypedMarks for docs: untypedMarksFormat when every
+// segment of the previous format major among them marks untyped values.
+func legacyMarks(docs []segState) int {
+	for i := range docs {
+		if ref := docs[i].ref; ref.reader.FormatMajor() < segment.FormatMajor && !ref.marks {
+			return 0
+		}
+	}
+	return untypedMarksFormat
 }
 
 // lookup returns the ordinal of the document or query whose id is exactly id, deleted
@@ -83,6 +104,16 @@ func (r *segRef) lookup(id string) (uint32, bool) {
 		return r.reader.Ord(id)
 	}
 	return r.qs.Ord(id)
+}
+
+// sidecarMajor is the format major the segment's deletes sidecars are stamped with: a
+// document segment's own, so its copy opens wherever the segment does; for a query
+// segment, whose format is its own, the oldest major this build reads.
+func (r *segRef) sidecarMajor() int {
+	if r.kind == kindDocs {
+		return r.reader.FormatMajor()
+	}
+	return segment.ReadsMajor
 }
 
 // close releases the segment (the final unmap, for a document segment).
@@ -118,6 +149,11 @@ type SegmentView struct {
 	// Base is the segment's first ordinal in the generation's ordinal space (the
 	// NumDocs of every segment before it, added up).
 	Base uint64
+	// MarksUntyped is whether the segment marks untyped values: its Reader.Untyped
+	// lists exactly the documents whose value of a field the mapping does not map
+	// would analyze as a typed value. Every segment this shard builds or merges from
+	// marked ones does; one written before the marks existed does not.
+	MarksUntyped bool
 	// NumDocs is the segment's ordinals, live and deleted; Live the live ones.
 	NumDocs uint32
 	Live    uint32
@@ -183,7 +219,7 @@ func newGeneration(s *Shard, gen uint64, seq, maxSeq int64, uid string, mp *mapp
 		live := st.ref.numDocs - uint32(st.deletes.GetCardinality()) //nolint:gosec // deletes are ordinals below numDocs
 		g.Segments[i] = SegmentView{
 			ID: st.ref.id, Reader: st.ref.reader, Deletes: st.deletes,
-			Base: base, NumDocs: st.ref.numDocs, Live: live,
+			Base: base, NumDocs: st.ref.numDocs, Live: live, MarksUntyped: st.ref.marks,
 		}
 		base += uint64(st.ref.numDocs)
 		g.numDocs += uint64(live)
@@ -266,6 +302,29 @@ func (g *Generation) MappingVersion() int64 { return g.mp.version }
 // Mapping is the index mapping as of the generation's seq.
 func (g *Generation) Mapping() *schema.Mapping { return g.mapping }
 
+// FormatMajors are the oldest and newest segment format majors among the generation's
+// document segments, both segment.FormatMajor when it has none: a copy made from it
+// carries segments as old as oldest until merges rewrite them, and opens only where
+// newest is read - which counts the deletes sidecars it would carry too.
+func (g *Generation) FormatMajors() (oldest, newest int) {
+	oldest, newest = segment.FormatMajor, 0
+	for i := range g.docs {
+		m := g.docs[i].ref.reader.FormatMajor()
+		oldest, newest = min(oldest, m), max(newest, m)
+	}
+	for _, list := range [][]segState{g.docs, g.queries} {
+		for i := range list {
+			if list[i].delGen > 0 {
+				newest = max(newest, list[i].ref.sidecarMajor())
+			}
+		}
+	}
+	if newest == 0 {
+		newest = segment.FormatMajor
+	}
+	return oldest, newest
+}
+
 // NumDocs is how many live documents the generation holds.
 func (g *Generation) NumDocs() uint64 { return g.numDocs }
 
@@ -323,6 +382,7 @@ func (g *Generation) LookupQuery(id string) (seg int, ord uint32, ok bool) {
 
 // openGeneration opens every segment the manifest lists, checking each against it.
 func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, error) {
+	legacy := man.UntypedMarks == untypedMarksFormat
 	var docs, queries []segState
 	fail := func(err error) (*Generation, error) {
 		for _, list := range [][]segState{docs, queries} {
@@ -337,8 +397,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		if err != nil {
 			return fail(fmt.Errorf("shard: segment %s: %w", ms.ID, missingIsCorrupt(err)))
 		}
-		ref := &segRef{id: ms.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: ms.Bytes, reader: r}
-		docs = append(docs, segState{ref: ref, deletes: emptyDeletes})
+		docs = append(docs, segState{ref: newDocRef(ms.ID, r, ms.Bytes, legacy), deletes: emptyDeletes})
 		if r.NumDocs() != ms.Docs {
 			return fail(fmt.Errorf("shard: %w: segment %s holds %d documents, the manifest says %d", segment.ErrCorrupt, ms.ID, r.NumDocs(), ms.Docs))
 		}

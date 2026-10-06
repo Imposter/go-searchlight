@@ -334,7 +334,9 @@ func (f *partialFetcher) Fetch(ctx context.Context, _ ShardID, dir string) (stri
 }
 
 // TestPruneDuringLoad: the changelog pruned past a snapshot while it loads makes the
-// copy rebuild again, and it converges.
+// copy rebuild again, and it converges. The copy is held at its first poll after the
+// load, tailing at the snapshot's seq: consistent with the store as of that seq, only
+// behind, until the poll finds the changelog pruned past it.
 func TestPruneDuringLoad(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		ctx := context.Background()
@@ -346,38 +348,77 @@ func TestPruneDuringLoad(t *testing.T) {
 			batch = append(batch, upsert("pl", 0, "d"+string(rune('a'+i)), docBody("x", i)))
 		}
 		mustApply(t, st, batch...)
+		snapshot := mustApply(t, st, upsert("pl", 0, "end", `{}`))
 		fs := newFaultStore(d.open(t))
-		var pruned atomic.Bool
+		var hooked atomic.Bool
+		written := make(chan error, 1)
 		fs.onRecord = func(_ context.Context, n int, _ store.Record) error {
-			if n == 10 && pruned.CompareAndSwap(false, true) {
-				_, last, err := st.Apply(ctx, []store.Change{del("pl", 0, "da"), upsert("pl", 0, "new", `{}`)})
-				if err != nil {
-					return err
-				}
-				return st.Prune(ctx, id, last+1)
+			if n != 10 || !hooked.CompareAndSwap(false, true) {
+				return nil
 			}
-			return nil
+			_, last, err := st.Apply(ctx, []store.Change{del("pl", 0, "da"), upsert("pl", 0, "new", `{}`)})
+			if err == nil {
+				err = st.Prune(ctx, id, last+1)
+			}
+			written <- err
+			return err
+		}
+		var gated atomic.Bool
+		polled := make(chan int64, 1)
+		release := make(chan struct{})
+		fs.onChanges = func(ctx context.Context, seq int64) error {
+			if !hooked.Load() || !gated.CompareAndSwap(false, true) {
+				return nil
+			}
+			polled <- seq
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		opts, reader := meteredOptions()
 		c := newCopy(t, fs, id, opts)
 		c.start()
-		mustApply(t, st, upsert("pl", 0, "end", `{}`))
-		// The hook writes too: wait for it, then for everything there is.
-		deadline := time.Now().Add(30 * time.Second)
-		for !pruned.Load() {
-			if time.Now().After(deadline) {
-				t.Fatal("the load never reached the prune")
+
+		select {
+		case err := <-written:
+			if err != nil {
+				t.Fatalf("the hook's apply and prune: %v", err)
 			}
-			time.Sleep(5 * time.Millisecond)
+		case <-time.After(30 * time.Second):
+			t.Fatal("the load never reached the prune")
 		}
+		select {
+		case from := <-polled:
+			if from != snapshot {
+				t.Fatalf("the copy polled after seq %d; want the snapshot's %d", from, snapshot)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("the copy never polled after its load")
+		}
+		stale := c.shard()
+		if err := stale.WaitRefreshed(tctx(t), snapshot); err != nil {
+			t.Fatal(err)
+		}
+		v := viewOf(t, stale)
+		_, da := v.docs["da"]
+		_, added := v.docs["new"]
+		_, end := v.docs["end"]
+		if !da || added || !end {
+			t.Fatalf("the copy at seq %d does not hold the store as of that seq: %v", snapshot, v.docs)
+		}
+
 		head, _, err := st.HeadSeq(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
+		close(release)
 		if dd := diff(viewOf(t, c.waitApplied(head)), truthOf(t, st, id), false); dd != "" {
 			t.Fatalf("copy differs:\n%s", dd)
 		}
-		if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonPruned); n == 0 || !pruned.Load() {
+		if n := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "reason", reasonPruned); n == 0 {
 			t.Fatalf("%d rebuilds after the prune", n)
 		}
 	})

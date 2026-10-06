@@ -53,6 +53,7 @@ flowchart LR
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
 | `internal/telemetry` | slog JSON logs with trace ids, OpenTelemetry traces and metrics, Prometheus, pprof |
+| `internal/heapfloor` | Keeps the garbage collector from running while the heap is under `gc_heap_floor`: segments are mapped, so the live heap is small |
 | `internal/clock` | The engine's source of time: every timer, ticker, sleep and elapsed-time reading goes through an injected `clock.Clock`, `clock.Real` in production and `clock.Fake` in tests |
 
 Packages depend one way: `cmd → api, cluster → node → replica → shard → segment`, with
@@ -155,9 +156,17 @@ data_dir/
   first flush whose manifest drops it. A merged-away segment goes once that flush has
   run and the last reader has released it. Open removes whatever a crash left that the
   manifest does not list.
-- **Caches.** The filter cache keeps per-segment bitmaps of frequent leaves, and needs no
-  invalidation because segments are immutable. The OS page cache holds the mmap'd
-  files.
+- **Caches.**
+  - The filter cache keeps per-segment bitmaps of frequent leaves, and needs no
+    invalidation because segments are immutable.
+  - The rank cache keeps each segment's id ranks for sorts that tie: up to 256 MiB, at
+    most 64 MiB for one segment.
+  - The global-ordinals cache keeps, per field and segment list, the map from each
+    segment's term ordinals to the shard's sorted union of them: up to 256 MiB, built
+    by a terms or cardinality aggregation over many of the field's terms, at a cost
+    that grows with its distinct terms, and dropped when a refresh or merge replaces
+    the segment list.
+  - The OS page cache holds the mmap'd files.
 - **Format versions.** The segment format is versioned (major 3). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:
   `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
@@ -174,6 +183,15 @@ data_dir/
      prefilter, `similar` behind trigram candidates, and ranges served by points.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
+   - A range leaf is collected from the point index, or checked on doc values when far
+     fewer documents are left in question than it matches.
+   - A number sort over many hits walks the point index's blocks from the cursor and
+     stops once its top-k is settled.
+   - Range and histogram aggregations over most of a segment count from the point index;
+     terms and cardinality on keyword and list fields count by ordinal, merged across
+     segments by global ordinal when the hits hold many of the field's terms, by term
+     otherwise.
+   - A large segment's per-document aggregation is collected in parallel parts.
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for

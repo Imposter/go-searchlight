@@ -106,10 +106,10 @@ func cmpSorts(a, b []any, sorts []SortField) int {
 	return 0
 }
 
-// TestNumberSortWindows: number sorts over enough documents that the point-index
-// windows (not a full scan) find the top hits, with ties, missing values, deletes,
-// filters and cursors, equal brute force.
-func TestNumberSortWindows(t *testing.T) {
+// TestNumberSortByPoints: number sorts found by walking the point index and by reading
+// every hit's value, with ties, missing values, deletes, filters and cursors, equal
+// brute force.
+func TestNumberSortByPoints(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x50e7))
 	c := newCluster(t, 2)
@@ -127,6 +127,11 @@ func TestNumberSortWindows(t *testing.T) {
 		}
 		c.refreshAll()
 	}
+	for range 300 {
+		c.remove(fmt.Sprintf("d%05d", rng.IntN(5000)))
+	}
+	c.refreshAll()
+	defer func() { sortWalkFactor = 2 }()
 	docs := c.docs()
 	for range 150 {
 		sorts := []SortField{{Field: "price", Desc: rng.IntN(2) == 0}}
@@ -146,13 +151,16 @@ func TestNumberSortWindows(t *testing.T) {
 			after = expectedSort(want[start], sorts)
 			start++
 		}
-		got, err := c.search(&Request{Query: q, Sort: sorts, Size: size, SearchAfter: after})
-		if err != nil {
-			t.Fatal(err)
-		}
 		wantIDs := docIDs(want[min(start, len(want)):min(start+size, len(want))])
-		if ids := hitIDs(got.Hits); !slices.Equal(ids, wantIDs) {
-			t.Fatalf("sort %+v after %v size %d:\n got %q\nwant %q", sorts, after, size, ids, wantIDs)
+		for _, factor := range []uint64{0, 1 << 40} {
+			sortWalkFactor = factor
+			got, err := c.search(&Request{Query: q, Sort: sorts, Size: size, SearchAfter: after})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ids := hitIDs(got.Hits); !slices.Equal(ids, wantIDs) {
+				t.Fatalf("walk factor %d, sort %+v after %v size %d:\n got %q\nwant %q", factor, sorts, after, size, ids, wantIDs)
+			}
 		}
 	}
 }

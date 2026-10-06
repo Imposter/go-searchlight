@@ -47,6 +47,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/cluster"
 	"github.com/Imposter/go-searchlight/internal/config"
+	"github.com/Imposter/go-searchlight/internal/heapfloor"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -98,6 +99,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 		return fmt.Errorf("telemetry: %w", err)
 	}
 	log := tel.Logger
+	floor := int64(0)
+	if getenv("GOGC") == "" {
+		floor = heapfloor.Effective(cfg.GCHeapFloor)
+	}
+	if floor > 0 {
+		defer heapfloor.Keep(floor)()
+	}
+	log.InfoContext(ctx, "garbage collector heap floor", slog.String("gc_heap_floor", config.FormatBytes(floor)), slog.Bool("gogc_set", getenv("GOGC") != ""))
 	clk := clock.Real{}
 	budget := &shutdownBudget{cfg: cfg, clock: clk}
 	defer func() {

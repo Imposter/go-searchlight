@@ -36,6 +36,15 @@ type prepared struct {
 	// confirmed counts the matches the shard's segments have confirmed so far, sure
 	// or verified: shared, so segments stop counting together.
 	confirmed atomic.Int64
+	// ords are the global ordinals of the keyword and list fields the aggregations
+	// count by ordinal: top-level terms, and every cardinality.
+	ords map[ordField]*globalOrds
+}
+
+// ordField names one field's global ordinals: its values, or its list entries.
+type ordField struct {
+	field string
+	list  bool
 }
 
 // sortKind is how a sort key reads its values.
@@ -362,10 +371,15 @@ func numberKey(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-// requestID identifies a request while it runs (its address): the shards of one
-// request count a leaf's use once between them.
-func requestID(r *Request) uintptr {
-	return reflect.ValueOf(r).Pointer()
+// requestID identifies a request while it runs: the shards of one request count a
+// leaf's use once between them. A parsed request has a serial of its own; any other
+// is known by its address, which a later request may reuse once it is collected, so
+// a serial is never confused with an address.
+func requestID(r *Request) uint64 {
+	if r.serial != 0 {
+		return r.serial
+	}
+	return uint64(reflect.ValueOf(r).Pointer()) | 1<<63
 }
 
 // checkBuckets refuses a shard's histogram past MaxBuckets, as Elasticsearch refuses

@@ -5,6 +5,7 @@ import (
 	"container/heap"
 	"container/list"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 
@@ -28,9 +29,10 @@ import (
 // array) is only computed for documents that tie on every other key. Early
 // termination:
 //
-//   - a number sort walks the point index in windows from the cursor outward, sized
-//     from the column's stats to hold about k matches, and stops once the heap is full:
-//     every document past a window is worse than everything in it;
+//   - a number sort over a dense hit set walks the point index's blocks from the
+//     cursor (or the column's best end) outward, offering each block's hits, and stops
+//     once the heap is full and the next block holds only worse values: the visits are
+//     about k divided by the hits' density, not the hits;
 //   - an ascending _id sort (the default) over a dense hit set walks the segment's id
 //     dictionary from the cursor and stops at k hits.
 //
@@ -80,6 +82,7 @@ type segSorter struct {
 	after     []part
 	afterDone []bool
 	rank      []uint32
+	probe     entry
 }
 
 func newSegSorter(s *segExec) *segSorter {
@@ -286,51 +289,52 @@ func (ss *segSorter) collect(h *topHeap, docs *roaring.Bitmap, k int) {
 	if docs.IsEmpty() {
 		return
 	}
-	s := ss.s
-	var probe entry
 	it := docs.ManyIterator()
 	buf := make([]uint32, 512)
 	for {
 		n := it.NextMany(buf)
-		if n == 0 {
+		if n == 0 || ss.s.checkCtx() {
 			return
 		}
-		if s.checkCtx() {
-			return
+		ss.offer(h, buf[:n], k)
+	}
+}
+
+// offer offers docs to the heap of at most k.
+func (ss *segSorter) offer(h *topHeap, docs []uint32, k int) {
+	s := ss.s
+	for _, d := range docs {
+		k0 := ss.key(d, 0)
+		if ss.after != nil && !ss.afterOK(d, k0) {
+			continue
 		}
-		for _, d := range buf[:n] {
-			k0 := ss.key(d, 0)
-			if ss.after != nil && !ss.afterOK(d, k0) {
+		if len(h.entries) == k {
+			top := &h.entries[0]
+			c := cmpPart(k0, top.keys[0], ss.cols[0].spec.desc)
+			if c > 0 {
 				continue
 			}
-			if len(h.entries) == k {
-				top := &h.entries[0]
-				c := cmpPart(k0, top.keys[0], ss.cols[0].spec.desc)
-				if c > 0 {
+			if c == 0 {
+				ss.fill(&ss.probe, d, k0)
+				if ss.compare(&ss.probe, top) >= 0 {
 					continue
 				}
-				if c == 0 {
-					ss.fill(&probe, d, k0)
-					if ss.compare(&probe, top) >= 0 {
-						continue
-					}
-				}
-				// It would enter: only now is a maybe candidate verified.
-				if !s.accept(d) {
-					continue
-				}
-				// Replace the worst in place, reusing its keys.
-				ss.fill(top, d, k0)
-				heap.Fix(h, 0)
-				continue
 			}
+			// It would enter: only now is a maybe candidate verified.
 			if !s.accept(d) {
 				continue
 			}
-			var e entry
-			ss.fill(&e, d, k0)
-			heap.Push(h, e)
+			// Replace the worst in place, reusing its keys.
+			ss.fill(top, d, k0)
+			heap.Fix(h, 0)
+			continue
 		}
+		if !s.accept(d) {
+			continue
+		}
+		var e entry
+		ss.fill(&e, d, k0)
+		heap.Push(h, e)
 	}
 }
 
@@ -348,8 +352,8 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 		return s.topByIDWalk(hits, k)
 	}
 	h := &topHeap{ss: ss, entries: make([]entry, 0, k)}
-	if first.kind == sortNumber {
-		s.collectNumberWindows(ss, h, hits, k)
+	if first.kind == sortNumber && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
+		s.collectByPoints(ss, h, hits, k)
 	} else {
 		ss.collect(h, hits, k)
 	}
@@ -363,23 +367,28 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 	return s.toSegHits(ss, out)
 }
 
-// collectNumberWindows feeds the heap from windows of the point index, outward from
-// the cursor, until the heap is full; whatever is left (documents past the last
-// window, and those missing the value) is offered last, only if it is not.
-func (s *segExec) collectNumberWindows(ss *segSorter, h *topHeap, hits *roaring.Bitmap, k int) {
+// sortWalkFactor: a number sort walks the point index when hits² exceeds
+// sortWalkFactor·k·n: when the k/density documents the walk expects to visit (each a
+// membership test) cost less than reading every hit's value. A variable so tests can
+// force either path.
+var sortWalkFactor uint64 = 2
+
+// walkPoints reports whether the top k of hits are cheaper to find by walking the point
+// index than by reading every hit's value.
+func (s *segExec) walkPoints(hits *roaring.Bitmap, k int) bool {
+	c := hits.GetCardinality()
+	return c*c > sortWalkFactor*uint64(k)*uint64(s.n) //nolint:gosec // k is at most MaxSize
+}
+
+// collectByPoints feeds the heap from the point index's blocks in sort order, from the
+// cursor (or the column's best end), offering each block's hits best first; it stops
+// once the heap is full and the next block holds only values worse than its worst.
+// Documents with no value sort after every value: they are offered only if every block
+// has been walked and the heap is still not full.
+func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitmap, k int) {
 	c := &ss.cols[0]
-	st := c.nc.Stats()
-	if st.Count == 0 {
-		ss.collect(h, hits, k)
-		return
-	}
 	desc := c.spec.desc
-	// The cursor's value bounds the first window; a cursor past every value (missing)
-	// leaves only missing documents.
-	edge := st.Min
-	if desc {
-		edge = st.Max
-	}
+	lo, hi := negInf, posInf
 	if ss.after != nil {
 		ap := ss.afterPart(0)
 		if ap.miss {
@@ -387,57 +396,83 @@ func (s *segExec) collectNumberWindows(ss *segSorter, h *topHeap, hits *roaring.
 			return
 		}
 		if desc {
-			edge = min(edge, ap.v)
+			hi = ap.v
 		} else {
-			edge = max(edge, ap.v)
+			lo = ap.v
 		}
 	}
-	span := st.Max - edge
-	if desc {
-		span = edge - st.Min
-	}
-	density := float64(hits.GetCardinality()) / float64(max(s.n, 1))
-	// Start narrow (a skewed column holds many values near its edge) and widen fast.
-	frac := float64(k) / (8 * density * float64(st.Count))
-	if density == 0 || frac >= 1 || span <= 0 || math.IsInf(span, 0) {
-		ss.collect(h, hits, k)
+	walked := true
+	member := membership{bm: hits, n: s.n}
+	buf := make([]uint32, 0, 128)
+	var docs []uint32
+	c.nc.EachBlock(lo, hi, desc, func(b segment.PointBlock) bool {
+		if len(h.entries) == k {
+			edge := b.Min
+			if desc {
+				edge = b.Max
+			}
+			if cmpPart(part{v: edge}, h.entries[0].keys[0], desc) > 0 {
+				walked = false
+				return false
+			}
+		}
+		docs = b.Docs(docs[:0])
+		buf = buf[:0]
+		for _, d := range docs {
+			if member.contains(d) {
+				buf = append(buf, d)
+			}
+		}
+		if desc {
+			slices.Reverse(buf)
+		}
+		ss.offer(h, buf, k)
+		if s.checkCtx() {
+			walked = false
+			return false
+		}
+		return true
+	})
+	if !walked || len(h.entries) == k || s.err != nil {
 		return
 	}
-	seen := roaring.New()
-	width := span * frac
-	from, inclusive := edge, true
+	it := hits.ManyIterator()
+	batch := make([]uint32, 512)
+	var missing []uint32
 	for {
-		var to float64
-		var window *roaring.Bitmap
-		if desc {
-			to = from - width
-			if to <= st.Min {
-				to = negInf
-			}
-			window = c.nc.Range(to, from, true, inclusive)
-		} else {
-			to = from + width
-			if to >= st.Max {
-				to = posInf
-			}
-			window = c.nc.Range(from, to, inclusive, true)
-		}
-		window.And(hits)
-		ss.collect(h, window, k)
-		if s.err != nil {
+		n := it.NextMany(batch)
+		if n == 0 || s.checkCtx() {
 			return
 		}
-		seen.Or(window)
-		if len(h.entries) == k || math.IsInf(to, 0) {
-			break
-		}
-		from, inclusive = to, false
-		width *= 4
+		missing = c.nc.Missing(batch[:n], missing[:0])
+		ss.offer(h, missing, k)
 	}
-	if len(h.entries) < k {
-		rest := roaring.AndNot(hits, seen)
-		ss.collect(h, rest, k)
+}
+
+// denseMembershipAfter is how many membership tests a walk makes on the hits' bitmap
+// before it copies the hits into a plain bitset: a walk over sparse hits visits many
+// documents, and each roaring lookup searches the bitmap's containers.
+const denseMembershipAfter = 512
+
+// membership tests whether documents are hits: on the roaring bitmap at first, on a
+// plain bitset of it once a walk has made denseMembershipAfter tests.
+type membership struct {
+	bm    *roaring.Bitmap
+	n     uint32
+	tests int
+	words []uint64
+}
+
+func (m *membership) contains(d uint32) bool {
+	if m.words != nil {
+		return m.words[d>>6]&(1<<(d&63)) != 0
 	}
+	m.tests++
+	if m.tests == denseMembershipAfter {
+		m.words = make([]uint64, (uint64(m.n)+63)/64)
+		m.bm.WriteDenseTo(m.words)
+	}
+	return m.bm.Contains(d)
 }
 
 // topByIDWalk walks the segment's ids in order from the cursor, keeping the first k
@@ -473,6 +508,9 @@ type segHit struct {
 	vals  []any // per sort key; an id key's value is id, read on demand
 	id    string
 	hasID bool
+	// rank is the id's rank in the segment's id dictionary, when hasRank.
+	rank    uint32
+	hasRank bool
 }
 
 func (s *segExec) toSegHits(ss *segSorter, es []entry) []segHit {
@@ -497,9 +535,7 @@ func (s *segExec) toSegHits(ss *segSorter, es []entry) []segHit {
 		}
 		out[i] = segHit{seg: s.seg, ord: e.ord, vals: vals}
 		if ss.rank != nil {
-			// The rank array was built: the id is one dictionary lookup away, no
-			// stored record to decompress.
-			out[i].id, out[i].hasID = s.r.IDAt(ss.rank[e.ord])
+			out[i].rank, out[i].hasRank = ss.rank[e.ord], true
 		}
 	}
 	return out
@@ -548,10 +584,14 @@ func cmpValue(a, b any, desc bool) int {
 
 // The rank cache.
 
-// rankCacheBytes bounds the rank arrays kept (4 bytes per document). A segment of more
-// than rankCacheBytes/4 documents (64M) is never cached: its rank array is rebuilt for
+// rankCacheBytes bounds the rank arrays kept (4 bytes per document). A segment whose
+// array would take more than 1/rankEntryShare of it (16M documents) is never cached, so
+// one segment cannot evict every other's: its rank array is rebuilt for
 // each search that needs it.
-const rankCacheBytes = 256 << 20
+const (
+	rankCacheBytes = 256 << 20
+	rankEntryShare = 4
+)
 
 // rankLRU caches each segment's rank array: ord -> the rank of its id among the
 // segment's ids. Segments never change, so an entry never goes stale; an entry whose
@@ -583,7 +623,7 @@ func (c *rankLRU) get(seg string) []uint32 {
 
 func (c *rankLRU) put(seg string, r *segment.Reader, ranks []uint32) {
 	size := int64(len(ranks)) * 4
-	if size > rankCacheBytes {
+	if size > rankCacheBytes/rankEntryShare {
 		return
 	}
 	c.mu.Lock()

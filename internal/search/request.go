@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
@@ -110,7 +111,14 @@ type Request struct {
 	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
+
+	// serial identifies a parsed request for the filter cache's admission (0: not
+	// parsed here; its address stands in).
+	serial uint64
 }
+
+// requestSerials numbers parsed requests.
+var requestSerials atomic.Uint64
 
 // SortField is one sort key: a field (or IDField), ascending unless Desc.
 type SortField struct {
@@ -207,7 +215,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 	if err := dec.Decode(&top); err != nil {
 		return nil, []query.Problem{{Loc: "body", Message: "the request is not a JSON object: " + err.Error()}}
 	}
-	r := &Request{Query: &query.All{}}
+	r := &Request{Query: &query.All{}, serial: requestSerials.Add(1)}
 	var ps problems
 	for _, key := range slices.Sorted(maps.Keys(top)) {
 		val := top[key]

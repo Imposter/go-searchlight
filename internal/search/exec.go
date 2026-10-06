@@ -423,6 +423,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	n := len(g.Segments)
 	p.segments = n
+	loadOrds(g, p)
 	results := make([]segResult, n)
 	if err := runParallel(n, func(i int) { results[i] = runSegment(ctx, p, g, i) }); err != nil {
 		return fail(err, "segment panicked")
@@ -439,6 +440,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 			aggs[spec.name] = &AggPartial{Type: spec.typ}
 		}
 	}
+	ordParts := map[*aggSpec][]*ordPartial{}
 	complete := true
 	for i := range results {
 		sr := &results[i]
@@ -456,8 +458,16 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 			tops = append(tops, sr.top)
 		}
 		for _, spec := range p.aggs {
-			mergePartial(aggs[spec.name], sr.aggs[spec.name], spec)
+			part := sr.aggs[spec.name]
+			if part != nil && part.ords != nil {
+				ordParts[spec] = append(ordParts[spec], part.ords...)
+				continue
+			}
+			mergePartial(aggs[spec.name], part, spec)
 		}
+	}
+	for spec, parts := range ordParts {
+		finishOrds(ctx, aggs[spec.name], parts, spec, g, p)
 	}
 	for _, spec := range p.aggs {
 		cutShard(aggs[spec.name], spec)
@@ -551,14 +561,30 @@ type topMerge struct {
 }
 
 func (m *topMerge) id(h *segHit) string {
-	if !h.hasID {
-		id, err := m.g.Segments[h.seg].Reader.ID(h.ord)
-		if err != nil && m.err == nil {
-			m.err = fmt.Errorf("search: segment %s: %w", m.g.Segments[h.seg].ID, err)
-		}
-		h.id, h.hasID = id, true
+	if err := resolveID(&m.g.Segments[h.seg], h); err != nil && m.err == nil {
+		m.err = err
 	}
 	return h.id
+}
+
+// resolveID reads h's id, once: from the id dictionary when h has its rank, else (or
+// when the dictionary has no such rank) from its stored record.
+func resolveID(sv *shard.SegmentView, h *segHit) error {
+	if h.hasID {
+		return nil
+	}
+	if h.hasRank {
+		if id, ok := sv.Reader.IDAt(h.rank); ok {
+			h.id, h.hasID = id, true
+			return nil
+		}
+	}
+	id, err := sv.Reader.ID(h.ord)
+	if err != nil {
+		return fmt.Errorf("search: segment %s: %w", sv.ID, err)
+	}
+	h.id, h.hasID = id, true
+	return nil
 }
 
 func (m *topMerge) compare(a, b *segHit) int {
@@ -638,12 +664,8 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 // fetchHit reads one chosen hit's id and body.
 func fetchHit(g *shard.Generation, p *prepared, h *segHit) (Hit, error) {
 	sv := &g.Segments[h.seg]
-	if !h.hasID {
-		id, err := sv.Reader.ID(h.ord)
-		if err != nil {
-			return Hit{}, fmt.Errorf("search: segment %s: %w", sv.ID, err)
-		}
-		h.id, h.hasID = id, true
+	if err := resolveID(sv, h); err != nil {
+		return Hit{}, err
 	}
 	hit := Hit{ID: h.id, Ref: &HitRef{Segment: sv.ID, Ord: h.ord}}
 	if !p.req.NoBodies {

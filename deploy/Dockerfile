@@ -17,7 +17,7 @@
 #
 # The base images are pinned by digest; Dependabot (.github/dependabot.yml) bumps them.
 
-FROM --platform=$BUILDPLATFORM golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS build
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev

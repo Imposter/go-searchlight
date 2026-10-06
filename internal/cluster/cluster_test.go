@@ -609,7 +609,10 @@ func expireLeases(t testing.TB, d *db, index string) {
 	}
 }
 
-// sqliteExec runs a statement on d, a SQLite database, outside every node's store.
+// sqliteExec runs a statement on d, a SQLite database, outside every node's store. A
+// node's own write connections wait out a held lock (store/sqlite.DefaultBusyTimeoutMS);
+// this ad hoc one needs the same busy_timeout, or a node's own writer (a heartbeat, a
+// checkpoint) holding the lock when this runs fails it with SQLITE_BUSY at once.
 func sqliteExec(t testing.TB, d *db, q string, args ...any) {
 	t.Helper()
 	u, err := url.Parse(d.url)
@@ -620,7 +623,7 @@ func sqliteExec(t testing.TB, d *db, q string, args ...any) {
 	if _, err := os.Stat(dsn); err != nil {
 		dsn = u.Path
 	}
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", dsn+"?_pragma=busy_timeout(10000)")
 	if err != nil {
 		t.Fatal(err)
 	}

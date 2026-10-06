@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -255,11 +256,33 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 	}
 }
 
+// waitAllServing polls /_cluster/health until shards of it are serving: a fresh
+// index's shards recover from an empty snapshot, and a write arriving before one does
+// is a correct, retryable 503 ("shard is recovering") rather than a bug. Create
+// returns once it has waited up to max_lag for that, but on a loaded runner it can
+// still return before every shard is there, so a caller that needs every shard up
+// confirms it here instead of racing the recovery.
+func waitAllServing(t *testing.T, e *env, shards int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h := e.must(http.StatusOK, "GET", "/_cluster/health", "")
+		if n, ok := h["serving_shards"].(float64); ok && int(n) >= shards {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not every shard is serving within the deadline: %v", h)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestBulkPercolateMatchesBruteForce checks _bulk?percolate=true against query.Match
 // over every saved query, for random queries and documents on several shards.
 func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.must(http.StatusCreated, "PUT", "/indexes/bf", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
+	waitAllServing(t, e, 3)
 	rng := rand.New(rand.NewPCG(1, 2))
 	brands := []string{"Acme", "Globex", "Initech", "Umbrella"}
 	words := []string{"red", "chair", "table", "lamp", "oak", "steel"}

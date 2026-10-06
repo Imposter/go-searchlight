@@ -157,7 +157,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 			return
 		}
 		st := writes[i-len(syncs)]
-		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true})
+		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true, Major: st.ref.sidecarMajor()})
 	})
 	for _, st := range writes {
 		s.strays[filepath.Join(s.dir, deletesName(st.ref.id, st.delGen))] = true

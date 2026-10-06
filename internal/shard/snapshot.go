@@ -83,7 +83,7 @@ func (sn *Snapshot) build() error {
 			return nil
 		}
 		var buf bytes.Buffer
-		if err := segment.EncodeDeletes(&buf, st.deletes); err != nil {
+		if err := segment.EncodeDeletes(&buf, st.deletes, st.ref.sidecarMajor()); err != nil {
 			return fmt.Errorf("shard: snapshot: encoding the deletes of %s: %w", st.ref.id, err)
 		}
 		name := deletesName(st.ref.id, st.delGen)

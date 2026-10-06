@@ -113,10 +113,12 @@ func (w *fileWriter) endSection() {
 }
 
 // header writes the file header.
-func (w *fileWriter) header() {
+func (w *fileWriter) header() { w.headerMajor(FormatMajor) }
+
+func (w *fileWriter) headerMajor(major uint16) {
 	w.write(magic[:])
 	var b [8]byte
-	binary.LittleEndian.PutUint16(b[0:], FormatMajor)
+	binary.LittleEndian.PutUint16(b[0:], major)
 	binary.LittleEndian.PutUint16(b[2:], FormatMinor)
 	w.write(b[:])
 }

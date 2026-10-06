@@ -498,9 +498,10 @@ Notes:
     bundles, and otherwise rebuilds the copy from the database. Finish a rolling upgrade
     before replacing nodes.
 - **Upgrading to segment format 4** (from 3). Nothing to do: the first start reopens the
-  format-3 segments and serves at once. Merges rewrite them as they go (about 5% smaller
-  on the benchmark's documents, with stored fields 12% smaller); deletes sidecars
-  written from then on are format 4 too.
+  format-3 segments and serves at once. Merges rewrite them as they go (about 2%
+  smaller on the benchmark's documents, with hit fetches several times faster). A
+  segment's deletes sidecars are stamped with the segment's own format, so deletes
+  alone never make a format-3 copy unreadable to a node not yet upgraded.
   Untyped-value marks (which decide whether a mapping change that maps a new field
   needs a rebuild) carry over from the copy's manifest. A rollback to a format-3
   binary refuses every copy that has written a segment since the upgrade, as above.

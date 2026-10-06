@@ -562,3 +562,32 @@ func TestMergeCancelStopsWriting(t *testing.T) {
 		}
 	}
 }
+
+// TestDeletesStampedWithTheirMajor: a sidecar is written in the major asked for, reads
+// back either way, and cannot be stamped with a major Open does not read.
+func TestDeletesStampedWithTheirMajor(t *testing.T) {
+	dir := t.TempDir()
+	want := roaring.BitmapOf(1, 5, 9)
+	for _, major := range []int{ReadsMajor, FormatMajor} {
+		if err := WriteDeletes(dir, "seg", uint64(major), want, DeletesOptions{Major: major}); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, DeletesName("seg", uint64(major))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := int(binary.LittleEndian.Uint16(data[8:])); got != major {
+			t.Fatalf("stamped %d, want %d", got, major)
+		}
+		got, err := LoadDeletes(dir, "seg", uint64(major))
+		if err != nil || !got.Equals(want) {
+			t.Fatalf("major %d: %v, %v", major, got.ToArray(), err)
+		}
+	}
+	var buf bytes.Buffer
+	for _, major := range []int{-1, ReadsMajor - 1, FormatMajor + 1} {
+		if err := EncodeDeletes(&buf, want, major); err == nil {
+			t.Fatalf("a sidecar stamped %d was written", major)
+		}
+	}
+}

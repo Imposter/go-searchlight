@@ -2,10 +2,12 @@ package shard
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -104,5 +106,98 @@ func TestOpensPreviousMajorSegments(t *testing.T) {
 			}
 			g.Release()
 		})
+	}
+}
+
+// TestPreviousMajorDeletesStayReadable: a node on this build that holds only format-3
+// segments and refreshes nothing but a delete writes the sidecar stamped as format 3,
+// so a snapshot of the copy - segments and sidecar alike - is all format 3: a peer that
+// reads only format 3 is served it (FormatMajors) and opens every file of it.
+func TestPreviousMajorDeletesStayReadable(t *testing.T) {
+	dir := t.TempDir()
+	man := &manifest{Gen: 1, Seq: 7, MaxSeq: 7, UntypedMarks: untypedMarksFormat}
+	src := filepath.Join("..", "segment", "testdata", "v3", "marked"+segment.FileExt)
+	id := fmt.Sprintf("%032x", 300)
+	size := copyFile(t, src, filepath.Join(dir, id+segment.FileExt))
+	man.Segments = append(man.Segments, manifestSegment{ID: id, Docs: 300, Bytes: size})
+	if _, _, err := writeManifest(dir, man, func(string) error { return nil }, func(...string) {}, quietLogger); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	s, err := Open(ctx, dir, testMapping, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.shutdown() }()
+	if err := s.Apply(ctx, []Change{{Seq: 8, Kind: Delete, DocID: "m7"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sn, err := s.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Release()
+	if oldest, newest := sn.FormatMajors(); oldest != segment.ReadsMajor || newest != segment.ReadsMajor {
+		t.Fatalf("FormatMajors = %d, %d, want both %d", oldest, newest, segment.ReadsMajor)
+	}
+	out := t.TempDir()
+	sidecars := 0
+	for _, f := range sn.Files() {
+		r, err := sn.Open(f.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(r)
+		_ = r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(out, f.Name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if f.Name == ManifestName {
+			continue
+		}
+		if major := binary.LittleEndian.Uint16(data[8:]); major != segment.ReadsMajor {
+			t.Fatalf("%s is stamped format %d, want %d", f.Name, major, segment.ReadsMajor)
+		}
+		if strings.HasSuffix(f.Name, deletesExt) {
+			sidecars++
+		}
+	}
+	if sidecars != 1 {
+		t.Fatalf("the snapshot carries %d sidecars, want the delete's one", sidecars)
+	}
+	onDisk, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range onDisk {
+		if !strings.HasSuffix(e.Name(), deletesExt) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if major := binary.LittleEndian.Uint16(data[8:]); major != segment.ReadsMajor {
+			t.Fatalf("the flushed sidecar %s is stamped format %d", e.Name(), major)
+		}
+	}
+	copied, err := Open(ctx, out, testMapping, testOptions())
+	if err != nil {
+		t.Fatalf("opening the copy: %v", err)
+	}
+	defer copied.shutdown()
+	g := copied.Acquire()
+	defer g.Release()
+	if _, ok, _ := g.Get("m7"); ok {
+		t.Fatal("the copy lost the delete")
+	}
+	if _, ok, _ := g.Get("m8"); !ok {
+		t.Fatal("the copy lost a live document")
 	}
 }

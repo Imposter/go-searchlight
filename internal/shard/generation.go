@@ -106,6 +106,16 @@ func (r *segRef) lookup(id string) (uint32, bool) {
 	return r.qs.Ord(id)
 }
 
+// sidecarMajor is the format major the segment's deletes sidecars are stamped with: a
+// document segment's own, so its copy opens wherever the segment does; for a query
+// segment, whose format is its own, the oldest major this build reads.
+func (r *segRef) sidecarMajor() int {
+	if r.kind == kindDocs {
+		return r.reader.FormatMajor()
+	}
+	return segment.ReadsMajor
+}
+
 // close releases the segment (the final unmap, for a document segment).
 func (r *segRef) close() error {
 	if r.kind == kindDocs {
@@ -295,12 +305,19 @@ func (g *Generation) Mapping() *schema.Mapping { return g.mapping }
 // FormatMajors are the oldest and newest segment format majors among the generation's
 // document segments, both segment.FormatMajor when it has none: a copy made from it
 // carries segments as old as oldest until merges rewrite them, and opens only where
-// newest is read.
+// newest is read - which counts the deletes sidecars it would carry too.
 func (g *Generation) FormatMajors() (oldest, newest int) {
 	oldest, newest = segment.FormatMajor, 0
 	for i := range g.docs {
 		m := g.docs[i].ref.reader.FormatMajor()
 		oldest, newest = min(oldest, m), max(newest, m)
+	}
+	for _, list := range [][]segState{g.docs, g.queries} {
+		for i := range list {
+			if list[i].delGen > 0 {
+				newest = max(newest, list[i].ref.sidecarMajor())
+			}
+		}
 	}
 	if newest == 0 {
 		newest = segment.FormatMajor

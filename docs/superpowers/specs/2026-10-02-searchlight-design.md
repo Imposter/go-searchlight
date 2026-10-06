@@ -46,6 +46,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 - Stateful alerting. Matching is stateless; clients keep their own match state.
 - History and time-series conditions (scrape-bot keeps them).
 - Cross-index joins and scripting.
+- Log storage and a log explorer (Grafana, Loki-compatible API, a pipe/SQL query language). This is part 2, after v1 ships: [roadmap](2026-10-05-searchlight-part2-logs-roadmap.md).
 
 ## 2. Architecture
 
@@ -430,3 +431,5 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | History ops | stay in scrape-bot |
 | BM25 / nested documents | v2 |
 | Go | 1.25 |
+| System of record | SQL for document indexes; no embedded consensus database |
+| Logs (part 2) | `stream` indexes with segments in blob storage and SQL as the metastore; Grafana via the Loki API; SLQ query language ([roadmap](2026-10-05-searchlight-part2-logs-roadmap.md)) |

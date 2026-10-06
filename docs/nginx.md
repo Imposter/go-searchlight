@@ -113,10 +113,14 @@ http_502 http_503` rather than add to them.)
   out the failure mode that makes retrying Elasticsearch's auto-id `POST
   /index/_doc` unsafe: a retry can never produce a second document under a different
   id, because there is no "different id" a retry could get.
-  - **Plain upserts** (`upsert`/`index`, no `if_seq`) are safe to re-send outright:
-    applying the same body to the same id twice leaves the same document, just at a
-    newer `seq` — nothing is duplicated, and nothing a caller already recorded (the
-    document's content) changes.
+  - **Plain upserts** (`upsert`/`index`, no `if_seq`) are last-write-wins, retried or
+    not: applying the same body to the same id twice leaves the same document at a
+    newer `seq`, and nothing is duplicated. The one hazard is a retry of a write that
+    did commit on the first attempt landing *after* another client's newer write to the
+    same id, which it then silently replaces. That race exists without nginx too (a
+    client's own retry, or nginx retrying a `PUT`, which it does by default), and
+    `non_idempotent` only extends it to `_bulk` items. A client that must not lose such
+    an update writes with `if_seq`, which turns the race into a 409.
   - **`op_type=create` and `if_seq`-conditioned writes** are the ones worth
     understanding, not avoiding: if the first attempt actually committed before the
     connection died, a retry of the same op fails its condition and comes back with
@@ -196,13 +200,15 @@ node's `SEARCHLIGHT_ADVERTISE_ADDRESS` is its own Compose service name
 
 ### The admin listener stays off the proxy
 
-`/healthz`, `/readyz`, `/metrics` and pprof live on each node's admin listener
-(`127.0.0.1:8781` by default, loopback-only) and are never something nginx — or
-anything reachable from outside the host or pod — should be able to reach. The
-shipped conf has no `location` or `upstream` entry that points at 8781 on any node;
-give Prometheus and your own readiness checks direct access to it instead (it needs
-no auth), the way `deploy/compose.yml`'s healthchecks and Kubernetes's probes already
-do (operations.md's [port table](operations.md#deploy)).
+Each node serves `/healthz` and `/readyz` on both listeners, without auth, and
+`/metrics` on both (the public one requires a read token). pprof is only on the admin
+listener (`127.0.0.1:8781` by default, loopback-only), and nothing outside the host or
+pod should reach that listener: the shipped conf has no `location` or `upstream` entry
+that points at 8781. Through nginx, `/healthz` and `/readyz` answer for whichever node
+`least_conn` picked, which is what the Compose nginx healthcheck relies on; per-node
+health and scraping go to each node directly, as `deploy/compose.yml`'s node
+healthchecks and the Kubernetes probes do (operations.md's
+[port table](operations.md#deploy)).
 
 ## Compose
 

@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
@@ -493,15 +495,31 @@ func TestOversizedBodyOverHTTP2(t *testing.T) {
 	hs.EnableHTTP2 = true
 	hs.StartTLS()
 	t.Cleanup(hs.Close)
-	for i := range 20 {
+	attempt := func() (*http.Response, error) {
 		body := io.MultiReader(strings.NewReader(`{"pad": "`), io.LimitReader(neverEnding('x'), 4<<20))
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, hs.URL+"/indexes/h/_search", body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		res, err := hs.Client().Do(req)
+		return hs.Client().Do(req)
+	}
+	for i := range 20 {
+		res, err := attempt()
 		if err != nil {
-			t.Fatalf("request %d: %v", i, err)
+			// The 413 answers with Connection: close; HTTP/2 honors that the way
+			// net/http2's server does for HTTP/1 (server.go: "Connection" == "close"
+			// starts a graceful shutdown), sending a GOAWAY once this stream is done
+			// and then closing the connection. That GOAWAY can race the client's own
+			// read of this very stream's answer, which the server already sent in
+			// full; a retry lands on a fresh connection and sees the 413 cleanly.
+			var ga http2.GoAwayError
+			if !errors.As(err, &ga) {
+				t.Fatalf("request %d: %v", i, err)
+			}
+			res, err = attempt()
+			if err != nil {
+				t.Fatalf("request %d, retried after its GOAWAY: %v", i, err)
+			}
 		}
 		_ = res.Body.Close()
 		if res.ProtoMajor != 2 || res.StatusCode != http.StatusRequestEntityTooLarge {

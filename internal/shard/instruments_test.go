@@ -47,6 +47,10 @@ func TestShardMetrics(t *testing.T) {
 		t.Fatal("Refresh did not fail")
 	}
 	h.s.opts.hooks = nil
+	h.s.jan.drain()
+	if p := h.s.jan.pendingFiles(); len(p) != 0 {
+		t.Fatalf("the failed refresh's files are still pending removal: %v", p)
+	}
 	h.refresh()
 	g := h.s.Acquire()
 	for range 2 {

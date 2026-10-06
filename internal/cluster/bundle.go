@@ -77,12 +77,17 @@ const (
 
 // bundleHeader describes a bundle's files.
 type bundleHeader struct {
-	Index          string     `json:"index"`
-	UID            string     `json:"uid"`
-	Shard          int        `json:"shard"`
-	Seq            int64      `json:"seq"`
-	MappingVersion int64      `json:"mapping_version"`
-	Files          []wireFile `json:"files"`
+	Index          string `json:"index"`
+	UID            string `json:"uid"`
+	Shard          int    `json:"shard"`
+	Seq            int64  `json:"seq"`
+	MappingVersion int64  `json:"mapping_version"`
+	// SegmentMajor is the newest segment format major among the bundle's segments;
+	// absent from a bundle written before it, whose segments are legacyReadsMajor. A
+	// build that predates the field refuses the header as unknown, so a bundle never
+	// reaches a node that could not open its segments.
+	SegmentMajor int        `json:"segment_major,omitempty"`
+	Files        []wireFile `json:"files"`
 }
 
 // bundleRef is a stored bundle, as its name describes it.
@@ -228,7 +233,8 @@ func (n *Node) publishBundle(ctx context.Context, id store.ShardID, uid string) 
 	if sn.IndexUID() != uid || sn.Seq() <= 0 || (len(have) > 0 && have[len(have)-1].seq >= sn.Seq()) {
 		return nil
 	}
-	hdr := bundleHeader{Index: id.Index, UID: uid, Shard: id.Shard, Seq: sn.Seq(), MappingVersion: sn.MappingVersion()}
+	_, newest := sn.FormatMajors()
+	hdr := bundleHeader{Index: id.Index, UID: uid, Shard: id.Shard, Seq: sn.Seq(), MappingVersion: sn.MappingVersion(), SegmentMajor: newest}
 	for _, f := range sn.Files() {
 		sum, err := n.sums.sum(id, sn, f)
 		if err != nil {
@@ -449,6 +455,9 @@ func readBundleHeader(r *bufio.Reader) (*bundleHeader, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&hdr); err != nil {
 		return nil, fmt.Errorf("the bundle's header: %w", err)
+	}
+	if major := cmp.Or(hdr.SegmentMajor, legacyReadsMajor); major > segment.FormatMajor {
+		return nil, fmt.Errorf("the bundle's segments are in format %d, newer than this build reads (%d)", major, segment.FormatMajor)
 	}
 	if len(hdr.Files) == 0 || hdr.Files[len(hdr.Files)-1].Name != shard.ManifestName {
 		return nil, errors.New("the bundle's files do not end with its manifest")

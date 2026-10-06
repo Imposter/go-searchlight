@@ -49,7 +49,7 @@ flowchart LR
 | `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
 | `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
 | `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort and `search_after`, aggregations, cross-shard reduce |
-| `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, exact verification |
+| `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, verification by compiled programs that mirror the exact matcher |
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
 | `internal/telemetry` | slog JSON logs with trace ids, OpenTelemetry traces and metrics, Prometheus, pprof |
@@ -177,29 +177,55 @@ data_dir/
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for
-   `PinTTL`, 30 s).
+   `PinTTL`, 30 s), and a pin outlives its copy's serving: a copy that retires or
+   closes between the phases still answers the fetch. A shard whose fetch finds its
+   pin gone anyway (expired, or its node stopped) has its query phase run again,
+   preferring another copy, up to three times within the request's deadline and what
+   is left of its `timeout`, and the shards' results are reduced again; only the
+   shards run again are fetched again.
 
 ### Percolator
 
 ```mermaid
 flowchart LR
-  Q[saved query] -->|Extract| AN[anchors: value, entry, word,<br/>trigram, interval, present keys,<br/>pairs of all-children]
-  AN --> QS[query segment:<br/>term dict to query ordinals,<br/>interval trees, always-check list]
-  D[document] -->|analyze| AT[atoms]
+  Q[saved query] -->|Extract| AN[anchors: value, entry, word,<br/>trigram, interval, present keys,<br/>pairs, posting filters]
+  Q -->|compile| PR[program per<br/>verification class]
+  AN --> QS[query segment, mmap'd:<br/>term dict to query ranks,<br/>interval trees, always-check,<br/>programs, id literals]
+  PR --> QS
+  D[document] -->|analyze for matching| AT[atoms + values by field]
   AT -->|probe| QS
   QS --> CAND[candidates + always-check]
-  CAND -->|exact matcher| M[matching query ids]
+  CAND -->|programs, in rank order| M[runs of matching ids]
+  M -->|merge| J[JSON array of ids]
 ```
 
 - **Anchors.** Each saved query is reduced to anchors: atoms at least one of which every
   matching document must hold. Queries that cannot be anchored (`not`, `ne`,
-  `exists:false`, `empty`, the match-all root) go on the always-check list.
-- **Query segments.** Anchors live in percolator segments that refresh and merge like
-  document segments.
-- **Percolating a document.** The document becomes atoms, which probe the query index
-  for candidates. The always-check list is added, and every candidate is verified with
-  the exact matcher. The answer is therefore exactly the brute-force one, and a property
-  test checks that the candidates always include every true match.
+  `exists:false`, `empty`, the match-all root) go on the always-check list. A query
+  anchored on terms alone also carries a posting filter, a cheap conjunct of its root
+  (a number range, a bool, a text the field must not equal, or an entry it must not
+  hold) that a document must pass to become a candidate. A `words_*` phrase anchors on
+  the pair of its two rarest words.
+- **Query segments.** Anchors live in percolator segments (`percolate/3`) that refresh
+  and merge like document segments, under their own merge policy (two per tier). Every
+  query segment costs every document a probe, so the policy keeps them few. A segment is
+  memory-mapped and validated at open; nothing per query goes on the heap. It holds the
+  term dictionary, interval trees, always-check list, one compiled program per
+  verification class (queries with the same canonical form), and every id as its JSON
+  literal. All of these are numbered by rank (id order), so candidates read in order
+  are matches in output order.
+- **Percolating a document.** The document is analyzed for matching (no grams). Its
+  values are laid out by field index, and its atoms probe each query segment for
+  candidates, with filtered postings checked as they are read. The always-check list
+  is added.
+  - **Verification.** Each candidate's class runs its program over the document's
+    values, once per class per document. A program mirrors the exact matcher and leaves
+    out the root conditions the candidate's anchors and filter already prove.
+  - **Output.** Each segment's matches are a run sorted by id, and the runs are merged
+    into the JSON array the response copies as it is.
+  - **Exactness.** The answer is exactly the brute-force one. Property tests check that
+    the candidates always include every true match, and that every program decides as
+    the matcher does.
 
 ## The cluster
 

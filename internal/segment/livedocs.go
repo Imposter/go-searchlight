@@ -15,7 +15,9 @@ import (
 // old copy) only ever adds a sidecar.
 //
 // A sidecar is the segment's own header and footer wrapped around one section, so it is
-// checksummed and versioned exactly like a segment file.
+// checksummed and versioned exactly like a segment file. Its layout is the same in every
+// major Open reads, and it is stamped with its segment's major: a copy of a format-3
+// segment keeps opening where only format 3 is read, its deletes included.
 
 const deletesExt = ".del"
 
@@ -28,6 +30,9 @@ func deletesPath(segmentDir, segmentID string, gen uint64) string {
 type DeletesOptions struct {
 	// NoDirSync is [BuildOptions.NoDirSync].
 	NoDirSync bool
+	// Major is the format major the sidecar is stamped with: its segment's
+	// ([Reader.FormatMajor]). 0 means FormatMajor.
+	Major int
 }
 
 // WriteDeletes writes segmentID's generation gen deletes bitmap to segmentDir, replacing
@@ -40,7 +45,7 @@ func WriteDeletes(segmentDir, segmentID string, gen uint64, deletes *roaring.Bit
 	if err != nil {
 		return err
 	}
-	if err := EncodeDeletes(f, deletes); err != nil {
+	if err := EncodeDeletes(f, deletes, opts.Major); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmp)
 		return err
@@ -68,13 +73,20 @@ func DeletesName(segmentID string, gen uint64) string {
 	return fmt.Sprintf("%s.%d%s", segmentID, gen, deletesExt)
 }
 
-// EncodeDeletes writes a deletes sidecar's bytes for deletes (nil: none deleted) to w:
-// exactly what [WriteDeletes] puts in the file, so a copy of a shard can carry a
-// sidecar from memory (a snapshot of a generation whose sidecar a later commit has
-// already replaced on disk).
-func EncodeDeletes(w io.Writer, deletes *roaring.Bitmap) error {
+// EncodeDeletes writes a deletes sidecar's bytes for deletes (nil: none deleted),
+// stamped with major (0: FormatMajor; else a major Open reads), to w: exactly what
+// [WriteDeletes] puts in the file, so a copy of a shard can carry a sidecar from memory
+// (a snapshot of a generation whose sidecar a later commit has already replaced on
+// disk).
+func EncodeDeletes(w io.Writer, deletes *roaring.Bitmap, major int) error {
+	if major == 0 {
+		major = FormatMajor
+	}
+	if major < 0 || major > FormatMajor || !readsMajor(uint16(major)) {
+		return fmt.Errorf("segment: a deletes sidecar cannot be written in format %d", major)
+	}
 	fw := newFileWriter(w)
-	fw.header()
+	fw.headerMajor(uint16(major))
 	fw.beginSection(sectionPresence)
 	var buf bytes.Buffer
 	if deletes == nil {

@@ -158,7 +158,7 @@ func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef
 	// Each Build worker keeps its own per-term structures for its range of documents,
 	// so a small refresh split many ways mostly multiplies that overhead.
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
-	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true})
+	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true, MarksUntyped: true})
 	if err != nil {
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, fmt.Errorf("shard: building a segment: %w", err)
@@ -184,7 +184,7 @@ func (s *Shard) openDocSegment(meta segment.Meta) (*segRef, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shard: opening segment %s: %w", meta.ID, err)
 	}
-	return &segRef{id: meta.ID, kind: kindDocs, numDocs: r.NumDocs(), bytes: info.Size(), reader: r}, nil
+	return newDocRef(meta.ID, r, info.Size(), false), nil
 }
 
 // buildQuerySegment writes queries as a new query segment and opens it.

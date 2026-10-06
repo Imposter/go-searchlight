@@ -271,10 +271,11 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
 ```
 
 ```json
-{"took_ms": 1, "results": [
+{"results": [
   {"found": true, "queries": ["cheap"]},
   {"id": "sku-1", "found": true, "queries": []},
-  {"id": "missing", "found": false, "queries": []}]}
+  {"id": "missing", "found": false, "queries": []}],
+ "took_ms": 1, "took_us": 1288}
 ```
 
 - **Order.** Results list the given documents first, then the ids, each in request
@@ -283,6 +284,11 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
 - **Stored documents** are read from this node's copies, as a search reads them, so
   pass `wait_for_seq` to see a recent write.
 - **Limits.** Up to 10,000 of each per request.
+- **Server time.** `took_ms` and `took_us` are the server's time for the request, from
+  its admission to the last byte of its answer encoded, in whole milliseconds and
+  microseconds. The `Server-Timing` header carries the same time
+  (`total;dur=1.288`, in milliseconds). Like Elasticsearch's `took`, it leaves out the
+  network and the client's decoding.
 
 ## Field catalogue
 

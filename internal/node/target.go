@@ -32,9 +32,9 @@ func (t *localTarget) Fetch(ctx context.Context, hits []search.Hit, fields []str
 	return search.FetchShard(ctx, t.g, hits, fields)
 }
 
-func (t *localTarget) Percolate(ctx context.Context, _ json.RawMessage, docs []schema.Doc) ([][]string, error) {
+func (t *localTarget) Percolate(ctx context.Context, _ json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error) {
 	if t.g.NumQueries() == 0 {
-		return make([][]string, len(docs)), nil
+		return make([]percolate.IDs, len(docs)), nil
 	}
 	return t.c.perc.Percolate(ctx, t.g, docs)
 }
@@ -110,7 +110,7 @@ func (f *fallbackTarget) Fetch(ctx context.Context, hits []search.Hit, fields []
 	return f.used.Fetch(ctx, hits, fields)
 }
 
-func (f *fallbackTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) (out [][]string, err error) {
+func (f *fallbackTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) (out []percolate.IDs, err error) {
 	err = f.first(func(t ShardTarget) error {
 		out, err = t.Percolate(ctx, mapping, docs)
 		return err

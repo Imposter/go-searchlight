@@ -24,6 +24,7 @@ import (
 type fieldBuilder struct {
 	presence  *roaring.Bitmap
 	truncated *roaring.Bitmap
+	untyped   *roaring.Bitmap
 
 	valuePairs termPairs // KindValue: text, or "true"/"false"
 	entryPairs termPairs // KindEntry
@@ -48,7 +49,7 @@ type docFloat struct {
 }
 
 func newFieldBuilder() *fieldBuilder {
-	return &fieldBuilder{presence: roaring.New(), truncated: roaring.New()}
+	return &fieldBuilder{presence: roaring.New(), truncated: roaring.New(), untyped: roaring.New()}
 }
 
 func (b *fieldBuilder) addValueTerm(doc uint32, term string) { b.valuePairs.addString(term, doc) }
@@ -78,13 +79,14 @@ func (b *fieldBuilder) sortTermGroups() {
 // alone, still meaning absent), and Reader.parseMeta subtracts the 1 back out, after
 // adding the section's own absolute start, before calling openDict and friends.
 type fieldOutput struct {
-	presOff, presLen   uint64
-	truncOff, truncLen uint64
-	dictOff            [numKinds]uint64
-	keywordColOff      uint64
-	multiColOff        uint64
-	numberColOff       uint64
-	pointsOff          uint64
+	presOff, presLen       uint64
+	truncOff, truncLen     uint64
+	untypedOff, untypedLen uint64
+	dictOff                [numKinds]uint64
+	keywordColOff          uint64
+	multiColOff            uint64
+	numberColOff           uint64
+	pointsOff              uint64
 }
 
 // fieldScratch is one field's working state across the terms, doc-values and points
@@ -170,13 +172,23 @@ func fnv1a(b []byte) uint64 {
 // add records one occurrence of term in doc. Must be called with doc non-decreasing
 // across calls for the same term (true of every call site: [Build] and [Merge] each
 // hand one fieldBuilder a strictly ascending run of document ordinals).
+//
+// A term's first document is kept in its group alone (lastDoc), and moves to the slab
+// with its second: most terms of a value or id field occur once, and a slab block for
+// each would cost slabBlockSize ordinals apiece.
 func (t *termPairs) add(term []byte, doc uint32) {
 	idx := t.findOrCreate(term)
 	g := &t.groups[idx]
-	if g.hasDoc && g.lastDoc == doc {
+	switch {
+	case !g.hasDoc:
+	case g.lastDoc == doc:
 		return // the same term occurring again in the same document: nothing new
+	case g.head < 0:
+		g.head, g.tail = t.slab.append(g.head, g.tail, g.lastDoc)
+		fallthrough
+	default:
+		g.head, g.tail = t.slab.append(g.head, g.tail, doc)
 	}
-	g.head, g.tail = t.slab.append(g.head, g.tail, doc)
 	g.lastDoc, g.hasDoc = doc, true
 }
 
@@ -230,6 +242,12 @@ func (t *termPairs) growTable() {
 func (t *termPairs) termBytes(g *termGroup) []byte { return t.arena[g.off : g.off+g.length] }
 
 func (t *termPairs) appendDocs(g *termGroup, dst []uint32) []uint32 {
+	if g.head < 0 {
+		if g.hasDoc {
+			dst = append(dst, g.lastDoc)
+		}
+		return dst
+	}
 	return t.slab.appendDocs(g.head, dst)
 }
 
@@ -319,58 +337,46 @@ func (s *docSlab) appendDocs(head int32, dst []uint32) []uint32 {
 // docOrd is one document's ordinal into a dictionary it has a term in.
 type docOrd struct{ doc, ord uint32 }
 
-// writeMergedDict k-way merges parts' already-sorted term groups ([termPairs.sortGroups])
-// and writes the result as one dictionary, in ascending term order. A term present in
-// more than one part gets that term's parts' docs concatenated in part order: since
-// every caller gives parts in ascending order of the (disjoint) document-ordinal range
-// each covers - true whether there is one part (a sequential build) or many (one per
-// worker, or one per Merge input reader) - that keeps the combined list ascending with
-// no re-sort, exactly the same list a single part covering every document would have
-// produced. onTerm, when non-nil, is called once per distinct term, in ascending
-// ordinal order, with its combined docs. Returns the dictionary's offset (0 if every
-// part is empty) and how many distinct terms it holds.
-func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
-	cursor := make([]int, len(parts))
-	anyLeft := func() bool {
-		for p := range parts {
-			if cursor[p] < len(parts[p].groups) {
-				return true
-			}
-		}
-		return false
+// writeMergedDict k-way merges srcs (each sorted, covering disjoint ascending document
+// ranges, in order) and writes the result as one dictionary, in ascending term order.
+// A term in more than one source gets their documents concatenated in source order,
+// which keeps them ascending with no re-sort: exactly the list one source covering
+// every document would have given. onTerm, when non-nil, is called once per distinct
+// term, in ascending ordinal order, with its combined docs. It stops early once w has
+// failed. Returns the dictionary's offset
+// (0 if every source is empty) and how many distinct terms it holds.
+func writeMergedDict(w *fileWriter, srcs []termSource, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
+	live := make([]bool, len(srcs))
+	anyLeft := false
+	for i, src := range srcs {
+		live[i] = src.next()
+		anyLeft = anyLeft || live[i]
 	}
-	if !anyLeft() {
+	if !anyLeft {
 		return 0, 0
 	}
 	enc := newPostingsEncoder()
 	dw := newDictWriter(w, enc)
 	var ord uint32
 	docBuf := make([]uint32, 0, 64)
-	for anyLeft() {
-		// The smallest current term is tracked by which part holds it (minPart), never
-		// by whether minTerm is nil: "" is a real term, and a part whose arena holds
+	matched := make([]int, 0, len(srcs))
+	for anyLeft && (ord%failCheckTerms != 0 || !w.aborted()) {
+		// The smallest current term is tracked by which source holds it (minSrc), never
+		// by whether minTerm is nil: "" is a real term, and a source whose arena holds
 		// nothing but "" hands it back as a nil slice, which a nil-means-unset check
-		// would mistake for "no minimum yet" and let a later part's term beat it.
+		// would mistake for "no minimum yet" and let a later source's term beat it.
 		var minTerm []byte
-		minPart := -1
-		for p := range parts {
-			if cursor[p] >= len(parts[p].groups) {
-				continue
-			}
-			term := parts[p].termBytes(&parts[p].groups[cursor[p]])
-			if minPart < 0 || bytes.Compare(term, minTerm) < 0 {
-				minTerm, minPart = term, p
+		minSrc := -1
+		for i, src := range srcs {
+			if live[i] && (minSrc < 0 || bytes.Compare(src.term(), minTerm) < 0) {
+				minTerm, minSrc = src.term(), i
 			}
 		}
-		docBuf = docBuf[:0]
-		for p := range parts {
-			if cursor[p] >= len(parts[p].groups) {
-				continue
-			}
-			g := &parts[p].groups[cursor[p]]
-			if bytes.Equal(parts[p].termBytes(g), minTerm) {
-				docBuf = parts[p].appendDocs(g, docBuf)
-				cursor[p]++
+		docBuf, matched = docBuf[:0], matched[:0]
+		for i, src := range srcs {
+			if live[i] && bytes.Equal(src.term(), minTerm) {
+				docBuf = src.appendDocs(docBuf)
+				matched = append(matched, i)
 			}
 		}
 		dw.add(minTerm, docBuf)
@@ -378,6 +384,14 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, 
 			onTerm(ord, docBuf)
 		}
 		ord++
+		// Only now: advancing a source may overwrite the term minTerm points into.
+		anyLeft = false
+		for _, i := range matched {
+			live[i] = srcs[i].next()
+		}
+		for i := range srcs {
+			anyLeft = anyLeft || live[i]
+		}
 	}
 	off, ok := dw.finish()
 	if !ok {
@@ -386,21 +400,63 @@ func writeMergedDict(w *fileWriter, parts []*termPairs, onTerm func(ord uint32, 
 	return off, ord
 }
 
+// failCheckTerms is how many terms writeMergedDict writes between checks that its
+// writer has not failed.
+const failCheckTerms = 1024
+
+// termSource is one sorted run of a dictionary's terms, each with its documents: a
+// part's accumulated groups ([Build]), or an input's dictionary with its postings
+// remapped and its deleted documents dropped ([Merge]). Sources of one dictionary
+// cover disjoint, ascending document ranges, in order.
+type termSource interface {
+	// next moves to the next term (the first, on the first call); false at the end.
+	next() bool
+	// term is the current term, valid until next.
+	term() []byte
+	// appendDocs appends the current term's documents, ascending.
+	appendDocs(dst []uint32) []uint32
+}
+
+// dictSources returns the term sources of field name's kind dictionary, given the
+// field's parts.
+type dictSources func(name string, parts []*fieldBuilder, kind TermKind) []termSource
+
+type pairsSource struct {
+	p *termPairs
+	i int
+}
+
+func (s *pairsSource) next() bool                       { s.i++; return s.i < len(s.p.groups) }
+func (s *pairsSource) term() []byte                     { return s.p.termBytes(&s.p.groups[s.i]) }
+func (s *pairsSource) appendDocs(dst []uint32) []uint32 { return s.p.appendDocs(&s.p.groups[s.i], dst) }
+
+func partsDicts(_ string, parts []*fieldBuilder, kind TermKind) []termSource {
+	out := make([]termSource, len(parts))
+	for i, p := range parts {
+		out[i] = &pairsSource{p: p.pairs(kind), i: -1}
+	}
+	return out
+}
+
+func (b *fieldBuilder) pairs(kind TermKind) *termPairs {
+	switch kind {
+	case KindEntry:
+		return &b.entryPairs
+	case KindWord:
+		return &b.wordPairs
+	case KindGram:
+		return &b.gramPairs
+	}
+	return &b.valuePairs
+}
+
 // writeFieldDicts writes one field's four term dictionaries (terms section), merging
 // parts (one fieldBuilder per worker that built any of this field, each already
 // term-sorted) and recording each document's value and entry ordinals into s for
 // writeFieldDocValues.
-func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
-	sel := func(which func(*fieldBuilder) *termPairs) []*termPairs {
-		out := make([]*termPairs, len(parts))
-		for i, p := range parts {
-			out[i] = which(p)
-		}
-		return out
-	}
+func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts dictSources, s *fieldScratch) {
 	var off uint64
-	off, s.numValueTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.valuePairs }),
+	off, s.numValueTerms = writeMergedDict(w, dicts(name, parts, KindValue),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
@@ -409,8 +465,7 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	if s.numValueTerms > 0 {
 		s.out.dictOff[KindValue] = off + 1
 	}
-	off, s.numEntryTerms = writeMergedDict(w,
-		sel(func(p *fieldBuilder) *termPairs { return &p.entryPairs }),
+	off, s.numEntryTerms = writeMergedDict(w, dicts(name, parts, KindEntry),
 		func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
@@ -419,10 +474,10 @@ func writeFieldDicts(w *fileWriter, parts []*fieldBuilder, s *fieldScratch) {
 	if s.numEntryTerms > 0 {
 		s.out.dictOff[KindEntry] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.wordPairs }), nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindWord), nil); n > 0 {
 		s.out.dictOff[KindWord] = off + 1
 	}
-	if off, n := writeMergedDict(w, sel(func(p *fieldBuilder) *termPairs { return &p.gramPairs }), nil); n > 0 {
+	if off, n := writeMergedDict(w, dicts(name, parts, KindGram), nil); n > 0 {
 		s.out.dictOff[KindGram] = off + 1
 	}
 }
@@ -512,32 +567,48 @@ func writeFieldPoints(w *fileWriter, numDocs uint32, s *fieldScratch) {
 	s.out.pointsOff = off + 1
 }
 
-// writeFieldPresence writes one field's presence and truncated bitmaps (presence
-// section), as the union of every part's (each part's bitmaps only ever set bits
-// inside that part's own disjoint range, so a union is exactly what one bitmap built
-// from the whole range would hold).
+// writeFieldPresence writes one field's presence, truncated and untyped bitmaps
+// (presence section), as the union of every part's (each part's bitmaps only ever set
+// bits inside that part's own disjoint range, so a union is exactly what one bitmap
+// built from the whole range would hold). The truncated and untyped bitmaps are
+// written only when they hold a document.
 func writeFieldPresence(w *fileWriter, parts []*fieldBuilder, out *fieldOutput) {
 	presence := roaring.New()
 	truncated := roaring.New()
+	untyped := roaring.New()
 	for _, p := range parts {
 		presence.Or(p.presence)
 		truncated.Or(p.truncated)
+		untyped.Or(p.untyped)
 	}
 	blob := serializeBitmap(presence)
 	out.presOff, out.presLen = w.off+1, uint64(len(blob))
 	w.write(blob)
 	if !truncated.IsEmpty() {
-		blob2 := serializeBitmap(truncated)
-		out.truncOff, out.truncLen = w.off+1, uint64(len(blob2))
-		w.write(blob2)
+		blob := serializeBitmap(truncated)
+		out.truncOff, out.truncLen = w.off+1, uint64(len(blob))
+		w.write(blob)
+	}
+	if !untyped.IsEmpty() {
+		blob := serializeBitmap(untyped)
+		out.untypedOff, out.untypedLen = w.off+1, uint64(len(blob))
+		w.write(blob)
 	}
 }
 
-// writeMeta writes the META section: numDocs, the stored index's offset, and each
-// field's directory entry, sorted by name.
-func writeMeta(w *fileWriter, numDocs uint32, storedIndexOff uint64, names []string, outs map[string]*fieldOutput) {
+// Segment flags, in META.
+const (
+	// flagMarksUntyped: the writer marked every untyped value (BuildOptions.MarksUntyped).
+	flagMarksUntyped = 1 << 0
+	flagsKnown       = flagMarksUntyped
+)
+
+// writeMeta writes the META section: numDocs, the segment flags, the stored index's
+// offset, and each field's directory entry, sorted by name.
+func writeMeta(w *fileWriter, numDocs, flags uint32, storedIndexOff uint64, names []string, outs map[string]*fieldOutput) {
 	var h encoder
 	h.u32(numDocs)
+	h.u32(flags)
 	h.u64(storedIndexOff)
 	h.u32(uint32(len(names))) //nolint:gosec // a segment holds far fewer than 4 billion fields
 	w.write(h.b)
@@ -549,6 +620,8 @@ func writeMeta(w *fileWriter, numDocs uint32, storedIndexOff uint64, names []str
 		fh.u64(out.presLen)
 		fh.u64(out.truncOff)
 		fh.u64(out.truncLen)
+		fh.u64(out.untypedOff)
+		fh.u64(out.untypedLen)
 		for k := range numKinds {
 			fh.u64(out.dictOff[k])
 		}

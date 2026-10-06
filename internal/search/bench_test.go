@@ -20,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
@@ -168,7 +169,7 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 	benchOnce.Do(func() {
 		benchCorp = newCorpus()
 		n := benchDocs()
-		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d/%v", benchCorpusVersion, n, benchMapping.Fields)))
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d/%v/format%d", benchCorpusVersion, n, benchMapping.Fields, segment.FormatMajor)))
 		dir := filepath.Join(benchDir(), hex.EncodeToString(sum[:8]))
 		marker := filepath.Join(dir, "complete")
 		opts := shard.Options{
@@ -228,6 +229,10 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 				errBench = err
 				return
 			}
+		}
+		if err := s.Flush(context.Background()); err != nil {
+			errBench = err
+			return
 		}
 		if err := os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)), 0o600); err != nil {
 			errBench = err

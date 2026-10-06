@@ -46,13 +46,17 @@ func FuzzOpen(f *testing.F) {
 	})
 }
 
-// normalizeFuzzInput copies in and stamps it with the current header and end magic
-// and matching checksums, wherever it is long enough to hold them.
+// normalizeFuzzInput copies in and stamps it with a header and end magic and matching
+// checksums, wherever it is long enough to hold them. The header keeps the input's
+// major when Open reads it (so format-3 seeds exercise the format-3 parsers), and is
+// stamped with FormatMajor otherwise.
 func normalizeFuzzInput(in []byte) []byte {
 	data := append([]byte(nil), in...)
 	if len(data) >= headerSize {
 		copy(data, magic[:])
-		binary.LittleEndian.PutUint16(data[8:], FormatMajor)
+		if !readsMajor(binary.LittleEndian.Uint16(data[8:])) {
+			binary.LittleEndian.PutUint16(data[8:], FormatMajor)
+		}
 		binary.LittleEndian.PutUint16(data[10:], FormatMinor)
 	}
 	if len(data) >= headerSize+tailSize {
@@ -128,7 +132,10 @@ func exerciseReader(r *Reader) {
 
 		consumeBitmap(r.Present(name))
 		consumeBitmap(r.Truncated(name))
+		consumeBitmap(r.Untyped(name))
 	}
+	_, _ = r.MarksUntyped(), r.FormatMajor()
+	_ = r.DiskUsage()
 
 	for _, doc := range docs {
 		_, _ = r.Stored(doc)
@@ -174,11 +181,28 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, emptyTermDocs(tb)),
 		buildFile(tb, numberDocs),
 		buildFile(tb, nil),
+		buildFile(tb, markedDocs(tb, 40)),
+		buildFile(tb, genCorpus(40)),
 	}
+	seeds = append(seeds, buildWithStoredDict(tb, genCorpus(40)))
 	for _, craft := range craftedCases() {
 		seeds = append(seeds, craft.make(tb))
 	}
+	for _, name := range compatFixtures {
+		seeds = append(seeds, readCompatFixture(tb, name))
+	}
 	return seeds
+}
+
+// buildWithStoredDict builds docs with a stored dictionary however small they are.
+func buildWithStoredDict(tb testing.TB, docs []schema.Doc) []byte {
+	defer func(n int) { storedDictSample = n }(storedDictSample)
+	storedDictSample = 1 << 10
+	data := buildFile(tb, docs)
+	if r := openValid(tb, data); len(r.stored.dict) == 0 {
+		tb.Fatal("buildWithStoredDict: no dictionary")
+	}
+	return data
 }
 
 // craftedCase is one hand-damaged segment: a specific way a checksum-valid file used to
@@ -206,6 +230,11 @@ func craftedCases() []craftedCase {
 			fixChecksums(data)
 			return data
 		}},
+		{"stored table offset past the section", craftStoredOffset},
+		{"stored table first ordinals out of order", craftStoredFirstOrd},
+		{"untyped bitmap malformed", craftUntypedBitmap},
+		{"unknown segment flags", craftMetaFlags},
+		{"format 3 point block outside the file", craftV3PointBlockOffset},
 	}
 }
 
@@ -268,7 +297,7 @@ func craftPointBlockOffset(tb testing.TB) []byte {
 	}
 	data := buildFile(tb, docs)
 	p := openValid(tb, data).fields["n"].numberCol.points
-	binary.LittleEndian.PutUint64(data[p.base+pointsHeaderLen+20:], 1<<40)
+	binary.LittleEndian.PutUint64(data[p.base+pointsHeaderLen(FormatMajor)+20:], 1<<40)
 	fixChecksums(data)
 	return data
 }

@@ -36,7 +36,22 @@ type shardRef struct {
 	Shard      int    `json:"shard"`
 	WaitSeq    int64  `json:"wait_seq,omitempty"`
 	AllowStale bool   `json:"allow_stale,omitempty"`
+	// ReadsMajor, in a snapshot request, is the newest segment format major the
+	// requester reads; absent, legacyReadsMajor. MinMajor, when set, asks the peer to
+	// refuse if its segments are older than it.
+	ReadsMajor int `json:"reads_major,omitempty"`
+	MinMajor   int `json:"min_major,omitempty"`
 }
+
+// legacyReadsMajor is the segment format major a snapshot request without reads_major
+// reads: the requester predates the field, and read only that major.
+const legacyReadsMajor = 3
+
+// Problem codes of a snapshot a peer refused for its segments' format major.
+const (
+	codeNewerSegments = "segments_newer_format"
+	codeOlderSegments = "segments_older_format"
+)
 
 // codeStale is the problem code of a read a peer refused because its copy is stale.
 const codeStale = "stale_copy"
@@ -115,8 +130,8 @@ type wireDoc struct {
 }
 
 type percolateReply struct {
-	Matches [][]string `json:"matches"`
-	Stale   bool       `json:"stale,omitempty"`
+	Matches []json.RawMessage `json:"matches"`
+	Stale   bool              `json:"stale,omitempty"`
 }
 
 // getMsg reads a document or a saved query from a peer's copy.
@@ -163,6 +178,9 @@ type snapshotReply struct {
 	IndexUID       string     `json:"index_uid"`
 	MappingVersion int64      `json:"mapping_version"`
 	Files          []wireFile `json:"files"`
+	// FormatMajor is the oldest segment format major among the snapshot's segments;
+	// 0 from a peer too old to say (whose segments are the previous major).
+	FormatMajor int `json:"format_major,omitempty"`
 }
 
 type wireFile struct {

@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -129,9 +130,9 @@ func (n *Single) validQuery(ctx context.Context, idx *index, q query.Node) error
 	return nil
 }
 
-// searchAttempts bounds a search's runs: one more when the copy a fetch needed went
-// away after its query phase.
-const searchAttempts = 2
+// requeryRounds bounds how many times a search runs the query phase again on the
+// shards whose fetch found their copy's generation gone.
+const requeryRounds = 3
 
 // Search implements [api.Coordinator]: a query-then-fetch over every shard, each
 // shard's generation held from its query to its fetch.
@@ -146,20 +147,28 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 		return nil, err
 	}
 	r.Index = name
-	for attempt := 1; ; attempt++ {
-		ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
-		if err != nil {
-			return nil, err
+	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
+	if err != nil {
+		return nil, err
+	}
+	defer ts.release()
+	resp, err := n.searchTargets(ctx, ts, r, n.reacquirer(ctx, idx, opts.WaitForSeq))
+	if err != nil {
+		return nil, err
+	}
+	return &api.SearchResult{Response: resp, Stale: ts.stale() || n.stale()}, nil
+}
+
+// reacquirer returns a fresh read target for shard s of idx, for a search whose
+// target's generation went away between its phases: a cluster ranks the copy that lost
+// it after the others. An index dropped meanwhile is not found (404).
+func (n *Single) reacquirer(ctx context.Context, idx *index, waitSeq int64) func(s int) (ShardTarget, error) {
+	return func(s int) (ShardTarget, error) {
+		t, err := n.acquireShard(ctx, idx, s, waitSeq, false)
+		if err != nil && idx.dropped.Load() {
+			return nil, indexNotFound(idx.name)
 		}
-		resp, err := searchTargets(ctx, ts, r)
-		stale := ts.stale() || n.stale()
-		ts.release()
-		if err == nil {
-			return &api.SearchResult{Response: resp, Stale: stale}, nil
-		}
-		if attempt == searchAttempts || ctx.Err() != nil || (!errors.Is(err, search.ErrStaleHit) && !errors.Is(err, ErrTargetLost)) {
-			return nil, err
-		}
+		return t, err
 	}
 }
 
@@ -167,7 +176,14 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 // shard; otherwise the query phase per shard (NoBodies), the reduce, then the fetch of
 // the winning hits' bodies from the copies that found them (a hit's shard is the one
 // its id routes to).
-func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.Response, error) {
+//
+// A shard whose fetch finds its generation gone (the copy stopped, or the pin expired)
+// has its query phase run again on a target reacquire gives, which replaces it in ts,
+// within what is left of r.Timeout; the shards' results are then reduced again, so the
+// hits, their order, the total and the aggregations are those of the results the
+// bodies come from. Only the shards re-queried are fetched again. That happens at most
+// requeryRounds times, within ctx; past them the search is unavailable (503).
+func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Request, reacquire func(s int) (ShardTarget, error)) (*search.Response, error) {
 	if len(ts) == 1 {
 		sr, err := ts[0].Search(ctx, r)
 		if err != nil {
@@ -175,22 +191,72 @@ func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.
 		}
 		return search.ReduceContext(ctx, []*search.ShardResult{sr}, r), nil
 	}
+	began := n.clock.Now()
 	q := *r
 	q.NoBodies = true
 	results := make([]*search.ShardResult, len(ts))
-	errs := make([]error, len(ts))
-	var wg sync.WaitGroup
-	for i, t := range ts {
-		wg.Go(func() { results[i], errs[i] = t.Search(ctx, &q) })
-	}
-	wg.Wait()
-	if err := firstError(errs); err != nil {
+	if err := queryShards(ctx, ts, &q, results, allShards(len(ts))); err != nil {
 		return nil, err
 	}
-	resp := search.ReduceContext(ctx, results, &q)
-	if len(resp.Hits) == 0 {
-		return resp, nil
+	bodies := make([]map[search.HitRef]json.RawMessage, len(ts))
+	for round := 0; ; round++ {
+		resp := search.ReduceContext(ctx, results, &q)
+		lost, err := fetchHits(ctx, ts, resp, r.Fields, bodies)
+		if err != nil {
+			return nil, err
+		}
+		if len(lost) == 0 {
+			return resp, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		shards := slices.Sorted(maps.Keys(lost))
+		if round == requeryRounds {
+			return nil, api.Unavailable(lost[shards[0]], "the copies of shard %d of index %q went away during the search; retry", shards[0], r.Index)
+		}
+		for _, s := range shards {
+			t, err := reacquire(s)
+			if err != nil {
+				return nil, err
+			}
+			ts[s].Release()
+			ts[s] = t
+			bodies[s] = nil
+		}
+		rq := q
+		if r.Timeout > 0 {
+			rq.Timeout = max(r.Timeout-n.clock.Since(began), time.Nanosecond)
+		}
+		if err := queryShards(ctx, ts, &rq, results, shards); err != nil {
+			return nil, err
+		}
 	}
+}
+
+// allShards lists the shards 0 to count-1.
+func allShards(count int) []int {
+	out := make([]int, count)
+	for s := range out {
+		out[s] = s
+	}
+	return out
+}
+
+// queryShards runs the query phase q on the shards given, together, into results.
+func queryShards(ctx context.Context, ts targets, q *search.Request, results []*search.ShardResult, shards []int) error {
+	errs := make([]error, len(ts))
+	var wg sync.WaitGroup
+	for _, s := range shards {
+		wg.Go(func() { results[s], errs[s] = ts[s].Search(ctx, q) })
+	}
+	wg.Wait()
+	return firstError(errs)
+}
+
+// fetchHits returns the shards whose generation was gone (search.ErrStaleHit,
+// ErrTargetLost) with why, and fails on any other error.
+func fetchHits(ctx context.Context, ts targets, resp *search.Response, fields []string, bodies []map[search.HitRef]json.RawMessage) (map[int]error, error) {
 	byShard := map[int][]int{}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
@@ -198,30 +264,52 @@ func searchTargets(ctx context.Context, ts targets, r *search.Request) (*search.
 			return nil, fmt.Errorf("node: hit %q has no ref to fetch", h.ID)
 		}
 		s := ShardFor(h.ID, len(ts))
+		if b, ok := bodies[s][*h.Ref]; ok {
+			h.Body = b
+			continue
+		}
 		byShard[s] = append(byShard[s], i)
 	}
-	ferrs := make([]error, len(ts))
-	for _, s := range slices.Sorted(maps.Keys(byShard)) {
+	errs := make([]error, len(ts))
+	fetched := make([][]search.Hit, len(ts))
+	var wg sync.WaitGroup
+	for s, pos := range byShard {
 		wg.Go(func() {
-			pos := byShard[s]
 			hits := make([]search.Hit, len(pos))
 			for k, i := range pos {
 				hits[k] = resp.Hits[i]
 			}
-			if err := ts[s].Fetch(ctx, hits, r.Fields); err != nil {
-				ferrs[s] = err
+			if err := ts[s].Fetch(ctx, hits, fields); err != nil {
+				errs[s] = err
 				return
 			}
 			for k, i := range pos {
 				resp.Hits[i].Body = hits[k].Body
 			}
+			fetched[s] = hits
 		})
 	}
 	wg.Wait()
-	if err := firstError(ferrs); err != nil {
-		return nil, err
+	var lost map[int]error
+	for s, err := range errs {
+		switch {
+		case err == nil:
+			for _, h := range fetched[s] {
+				if bodies[s] == nil {
+					bodies[s] = map[search.HitRef]json.RawMessage{}
+				}
+				bodies[s][*h.Ref] = h.Body
+			}
+		case errors.Is(err, search.ErrStaleHit) || errors.Is(err, ErrTargetLost):
+			if lost == nil {
+				lost = map[int]error{}
+			}
+			lost[s] = err
+		default:
+			return nil, err
+		}
 	}
-	return resp, nil
+	return lost, nil
 }
 
 func firstError(errs []error) error {
@@ -242,7 +330,7 @@ func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) (
 		docs := make([]schema.Doc, 0, len(bodies))
 		var failure error
 		for i, body := range bodies {
-			doc, _, err := schema.Analyze(m, "_percolate_"+strconv.Itoa(i), body)
+			doc, _, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
 			if err != nil {
 				failure = docProblem(err, "docs."+strconv.Itoa(i))
 				break
@@ -303,7 +391,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			return nil, err
 		}
 		if ok {
-			doc, _, err := schema.Analyze(m, id, body)
+			doc, _, err := schema.AnalyzeForMatch(m, id, body)
 			if err != nil {
 				return nil, docProblem(err, loc)
 			}
@@ -318,10 +406,10 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 		return nil, err
 	}
 	for i := range req.Docs {
-		out[i].Queries = matches[i]
+		out[i].Queries = json.RawMessage(matches[i])
 	}
 	for k, p := range stored {
-		out[p].Queries = matches[len(req.Docs)+k]
+		out[p].Queries = json.RawMessage(matches[len(req.Docs)+k])
 	}
 	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil
 }
@@ -364,7 +452,7 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 		return nil, err
 	}
 	defer ts.release()
-	resp, err := searchTargets(ctx, ts, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name})
+	resp, err := n.searchTargets(ctx, ts, &search.Request{Query: &query.All{}, Aggs: aggs, TrackTotal: search.TrackTotalNone, Index: name}, n.reacquirer(ctx, idx, opts.WaitForSeq))
 	if err != nil {
 		return nil, err
 	}

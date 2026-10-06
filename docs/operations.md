@@ -17,7 +17,9 @@ For what the components do, see [architecture.md](architecture.md). For the API,
 
 A node is one static binary, `searchlight`. It needs a SQL database and a directory for
 its segments, and nothing else: no coordination service, no shared disk. Every node is
-the same; any node takes any request.
+the same; any node takes any request. For how that cluster behaves (joining, writes,
+reads, recovery, failures) see [clustering.md](clustering.md); for putting nginx in
+front of it as the load balancer, see [nginx.md](nginx.md).
 
 | Port | Listener | Serves |
 |---|---|---|
@@ -121,6 +123,10 @@ curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
   `shutdown_timeout` (60 s), plus 10 s of slack.
 - **TLS.** The peer API runs in plain HTTP on the compose network, and the nodes log a
   warning that `cluster_token` crosses it in the clear.
+- **Load balancer.** An `nginx` service fronts the three nodes on `127.0.0.1:8080`,
+  using [`deploy/nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see
+  [nginx.md](nginx.md) for what it does and why. The nodes' own ports stay published
+  too.
 
 ### Kubernetes
 
@@ -356,9 +362,14 @@ A node's memory is three budgets, plus the page cache:
      A refresh in progress holds one more, frozen.
    - So a copy taking writes faster than it refreshes holds up to **about 320 MiB**, and
      an idle copy almost nothing. Count the copies that ingest at once, not every copy.
-3. **Caches and the runtime.** The filter cache, the generations readers hold, and Go's
-   own overhead: a few hundred MiB.
-4. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
+3. **Merges.** A merge streams its inputs into the merged file and holds only
+   per-document state, under 1 KiB a document, plus up to 8 MiB for each field it
+   writes at once (one per thread it runs on). A merge of a million of the benchmark's
+   products peaks at about 0.6 GiB of heap on 4 threads and 0.7 GiB on 16.
+   `merge_threads` merges can run at once.
+4. **Caches and the runtime.** The filter cache, the search rank cache (up to
+   256 MiB), the generations readers hold, and Go's own overhead.
+5. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
    container they count against the memory limit but are reclaimed under pressure.
    Searches stay fast while the hot segments fit in memory. The
    `searchlight_shard_mmap_resident_bytes` and `searchlight_shard_disk_size_bytes`
@@ -380,11 +391,19 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 
 ### Disk
 
-- **Segments.** A copy's segments are compressed: zstd stored fields, bit-packed doc
-  values, roaring postings.
+- **Segments.** A copy's segments are compressed: stored fields in small s2 blocks
+  against a per-segment dictionary, bit-packed doc values and point blocks, roaring
+  postings and prefix-compressed term dictionaries. On the benchmark's product listings
+  (about 870 bytes of JSON each) a fully merged copy takes about 1.2 GiB per million
+  documents; 3-grams of every keyword and text field, which make contains and similar
+  fast, are about a quarter of it.
 - **Headroom.** Leave at least the size of the largest shard copy free. A peer recovery
   stages a whole copy under `data_dir/recovery`, and an aside rebuild holds the old copy
-  and the new one at once.
+  and the new one at once. A merge needs room for its result while its inputs are
+  still on disk, plus, briefly, up to its result's term dictionaries again: fields
+  written while an earlier one is still being written wait in temp files beside the
+  segment (`<segment>.seg.spill*`, removed when the merge ends, or at the next start
+  after a crash). Those writes count against `merge_budget`.
 - **Speed.** Use local SSDs. Refreshes write segments without fsync, into the page
   cache. Each flush, every `flush_interval`, fsyncs what the refreshes since the last one
   wrote.
@@ -465,11 +484,33 @@ Notes:
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
   is one migration, the initial schema.
-- **Segment format.** It is versioned. A node rebuilds a copy whose segments are of a
-  format older than it reads. A copy in a **newer** format is refused and left as it is
-  (`shard copy is in a newer format than this binary reads`): a binary rolled back never
-  destroys what its successor wrote. Roll forward again, or wipe that node's `data_dir`
-  to have it rebuild from its peers or the database.
+- **Segment format.** It is versioned by a major number, and each binary reads its own
+  major and the one before it (N−1). An upgrade across one major therefore reopens its
+  segments, as a restart does; merges rewrite them into the new major as they go, and
+  every segment the node writes from then on is in it.
+  - A copy whose segments are older than N−1 (an upgrade that skips a major) is rebuilt:
+    from a peer, a recovery bundle or the database. Upgrade one major at a time to
+    avoid it, or budget for the rebuild.
+  - A recovering copy fetches from a peer already in the current major when one serves
+    it, and from an older-major peer only when none does (its segments still open).
+  - A copy in a **newer** format is refused and left as it is (`shard copy is in a newer
+    format than this binary reads`): a binary rolled back never destroys what its
+    successor wrote. Roll forward again, or wipe that node's `data_dir` to have it
+    rebuild from its peers or the database.
+  - A node still on the old binary that must recover a copy during the upgrade cannot
+    use an upgraded peer's segments: the peer refuses the snapshot (409
+    `segments_newer_format`, before taking it), and the old node's bundle reader
+    refuses a bundle an upgraded node wrote. It tries its other peers, then older
+    bundles, and otherwise rebuilds the copy from the database. Finish a rolling upgrade
+    before replacing nodes.
+- **Upgrading to segment format 4** (from 3). Nothing to do: the first start reopens the
+  format-3 segments and serves at once. Merges rewrite them as they go (about 2%
+  smaller on the benchmark's documents, with hit fetches several times faster). A
+  segment's deletes sidecars are stamped with the segment's own format, so deletes
+  alone never make a format-3 copy unreadable to a node not yet upgraded.
+  Untyped-value marks (which decide whether a mapping change that maps a new field
+  needs a rebuild) carry over from the copy's manifest. A rollback to a format-3
+  binary refuses every copy that has written a segment since the upgrade, as above.
 - **Readiness gates traffic.** A restarted node reports ready only after its copies have
   finished their startup recovery. Until then, the other nodes serve its shards.
 

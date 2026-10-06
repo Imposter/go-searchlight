@@ -302,11 +302,27 @@ func TestReadsRetryAroundDeadNode(t *testing.T) {
 
 // TestRollingRestartNoClientErrors restarts every node in turn, gracefully, while
 // readers on the other nodes search and a writer writes: no client error, and every
-// acknowledged write stays searchable.
+// acknowledged write stays searchable. The stopping node holds the replies of the query
+// phases it pins until its copy retires (its registry write slowed, as a busy database
+// does), so searches fetch from copies that stopped serving between their phases: every
+// such fetch still finds its pinned generation.
 func TestRollingRestartNoClientErrors(t *testing.T) {
 	testtier.Heavy(t)
 	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
-		c := newCluster(t, d, nil)
+		var (
+			c        *cluster
+			stopping atomic.Pointer[tnode]
+			crossed  atomic.Int64
+			gone     atomic.Int64
+		)
+		c = newCluster(t, d, func(i int, o *Options) {
+			o.Transport = &goneFetches{base: http.DefaultTransport.(*http.Transport).Clone(), gone: &gone} //nolint:forcetypeassert,errcheck // the default transport is an *http.Transport
+			o.hooks.pinned = func(id store.ShardID, _ string) {
+				if tn := stopping.Load(); tn != nil && tn.i == i {
+					holdPinned(tn.n, id, &crossed)
+				}
+			}
+		})
 		a := c.start(0)
 		c.start(1)
 		c.start(2)
@@ -317,6 +333,7 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			mustWrite(t, a.n, "roll", upsertOp(fmt.Sprintf("seed%d", k), k))
 		}
 		acked.Store(30)
+		var heldAll int64
 		for i := range 3 {
 			var others []*tnode
 			for _, tn := range c.live() {
@@ -358,8 +375,12 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 					time.Sleep(20 * time.Millisecond)
 				}
 			})
+			slowRetire := func() { time.Sleep(50 * time.Millisecond) }
+			c.node(i).wrap.onRetire.Store(&slowRetire)
+			stopping.Store(c.node(i))
 			time.Sleep(200 * time.Millisecond)
 			c.node(i).stop()
+			stopping.Store(nil)
 			time.Sleep(500 * time.Millisecond)
 			c.start(i)
 			waitCopies(t, others[0].st, "roll", 3, 2, 60*time.Second)
@@ -375,7 +396,16 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 					tails[op] = max(tails[op], d)
 				}
 			}
-			t.Logf("restart of node %d: slowest write %s; slowest store calls %v", i, time.Duration(slowestWrite.Load()).Round(time.Millisecond), roundAll(tails))
+			held := crossed.Swap(0)
+			heldAll += held
+			t.Logf("restart of node %d: slowest write %s; slowest store calls %v; %d searches fetched from a copy that stopped serving after their query phase",
+				i, time.Duration(slowestWrite.Load()).Round(time.Millisecond), roundAll(tails), held)
+		}
+		if n := gone.Load(); n > 0 {
+			t.Fatalf("%d fetches found their pinned generation gone", n)
+		}
+		if heldAll == 0 {
+			t.Fatal("no search fetched from a copy that stopped serving after its query phase: the restarts did not exercise the fetch path")
 		}
 		st := c.node(0).st
 		head, _, err := st.HeadSeq(tctx(t))
@@ -386,6 +416,34 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			waitCount(t, tn.n, "roll", head, acked.Load())
 		}
 	})
+}
+
+// holdPinned holds a query phase's reply on n until n's copy of id stops serving (it is
+// paused to retire, or closed), so the search fetches after it did, counting the
+// replies it held that long in crossed; it gives up after 2 s.
+func holdPinned(n *Node, id store.ShardID, crossed *atomic.Int64) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, hosted := n.Hosted(id); !hosted || n.Paused(id) {
+			crossed.Add(1)
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// goneFetches counts the fetches a peer answered 410: their pinned generation was gone.
+type goneFetches struct {
+	base http.RoundTripper
+	gone *atomic.Int64
+}
+
+func (g *goneFetches) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := g.base.RoundTrip(r)
+	if err == nil && resp.StatusCode == http.StatusGone && r.URL.Path == peerPrefix+"fetch" {
+		g.gone.Add(1)
+	}
+	return resp, err
 }
 
 // roundAll rounds durations to the millisecond, for logs.

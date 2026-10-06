@@ -167,12 +167,17 @@ type testHooks struct {
 
 	// peerFile wraps the writer a snapshot file is streamed to.
 	peerFile func(name string, w http.ResponseWriter) http.ResponseWriter
+	// snapshotMajor rewrites the segment format major a snapshot reply reports.
+	snapshotMajor func(major int) int
 	// served is told of every read target this node's copy of id gave a peer, with the
 	// leaseClock readings taken before the copy was checked.
 	served func(id store.ShardID, began time.Duration, wall time.Time)
 	// servedLocal is told of every read of this node's copy of id held under l, local
 	// reads included.
 	servedLocal func(id store.ShardID, l *lease)
+	// pinned is told of every generation of this node's copy of id a peer's query phase
+	// pinned, before the reply goes back.
+	pinned func(id store.ShardID, pin string)
 }
 
 func (o *Options) resolve() error {

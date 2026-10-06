@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/http"
-	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -426,7 +428,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("node %d percolate: %v", tn.i, err)
 			}
-			if !slices.Equal(pres.Results[0].Queries, []string{"cheap"}) || !slices.Equal(pres.Results[1].Queries, []string{"cheap"}) ||
+			if string(pres.Results[0].Queries) != `["cheap"]` || string(pres.Results[1].Queries) != `["cheap"]` ||
 				len(pres.Results[2].Queries) != 0 || !pres.Results[2].Found {
 				t.Fatalf("node %d percolated %+v", tn.i, pres.Results)
 			}
@@ -443,10 +445,23 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 }
 
 // TestFetchAfterPinLostRetries: when a peer loses the generation a search pinned (the
-// pin expires before the fetch), the search runs again and still answers.
+// pin expires before the fetch), the shard's query phase runs again and the search
+// still answers; when every round loses its pins, the client gets a 503 with
+// Retry-After, not the peer's 410.
 func TestFetchAfterPinLostRetries(t *testing.T) {
 	d := sqliteDB(t)
-	c := newCluster(t, d, func(_ int, o *Options) { o.PinTTL = time.Millisecond })
+	var (
+		c       *cluster
+		dropAll atomic.Bool
+	)
+	c = newCluster(t, d, func(i int, o *Options) {
+		o.PinTTL = time.Millisecond
+		o.hooks.pinned = func(_ store.ShardID, pin string) {
+			if dropAll.Load() {
+				c.node(i).n.pins.remove(pin)
+			}
+		}
+	})
 	a := c.start(0)
 	c.start(1)
 	createIndex(t, a.n, "pin", 4, 1)
@@ -472,17 +487,55 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 			}
 		})
 	}
-	defer func() { close(stop); wg.Wait() }()
 	for _, tn := range c.live() {
 		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
 		if err != nil {
-			// Every attempt may lose its pins; the error must then be clean.
+			var ae *api.Error
+			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+				t.Fatalf("node %d: a search whose every round lost its pins failed with %v, want a 503", tn.i, err)
+			}
 			t.Logf("node %d: %v", tn.i, err)
 			continue
 		}
 		if res.Total != 20 {
 			t.Fatalf("node %d: total %d", tn.i, res.Total)
 		}
+	}
+	close(stop)
+	wg.Wait()
+
+	dropAll.Store(true)
+	checked := 0
+	for _, tn := range c.live() {
+		reads := false
+		for s := range 4 {
+			if _, ok := tn.n.Hosted(store.ShardID{Index: "pin", Shard: s}); !ok {
+				reads = true
+			}
+		}
+		if !reads {
+			continue
+		}
+		checked++
+		url := fmt.Sprintf("http://%s/indexes/pin/_search?wait_for_seq=%d", tn.addr, last)
+		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+			t.Fatalf("node %d: a search whose every round lost its pins answered %d (Retry-After %q): %s, want a 503 with Retry-After",
+				tn.i, resp.StatusCode, resp.Header.Get("Retry-After"), b)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("every node hosts every shard: no search reads a peer")
 	}
 }
 

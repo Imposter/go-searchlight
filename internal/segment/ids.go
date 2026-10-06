@@ -47,20 +47,36 @@ func sortedIDs(numDocs uint32, idAt func(ord uint32) string) ([]idOrd, error) {
 }
 
 // writeIDs writes the IDS section's contents: the dictionary, then its index offset
-// relative to the section's start, plus one (0: no documents).
-func writeIDs(w *fileWriter, ids []idOrd) {
+// relative to the section's start, plus one (0: no documents). It refuses an id that
+// ids yields twice with a *DuplicateIDError.
+func writeIDs(w *fileWriter, ids idSource) error {
 	sectionStart := w.off
 	dw := newDictWriter(w, newPostingsEncoder())
 	var one [1]uint32
-	for _, e := range ids {
-		one[0] = e.ord
-		dw.add(stringBytes(e.id), one[:])
+	var prev []byte
+	first := true
+	err := ids(func(id []byte, ord uint32) error {
+		if w.err != nil {
+			return w.err
+		}
+		if !first && bytes.Equal(id, prev) {
+			return &DuplicateIDError{ID: string(id)}
+		}
+		first = false
+		prev = append(prev[:0], id...)
+		one[0] = ord
+		dw.add(id, one[:])
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	var trailer uint64
 	if off, ok := dw.finish(); ok {
 		trailer = off - sectionStart + 1
 	}
 	w.u64(trailer)
+	return nil
 }
 
 // openIDs opens the IDS section sec: a dictionary of exactly numDocs ids, or none for

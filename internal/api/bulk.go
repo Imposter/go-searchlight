@@ -29,8 +29,8 @@ type bulkItem struct {
 	Seq    int64  `json:"seq,omitempty"`
 	// Queries are the upserted document's matching saved queries, with
 	// percolate=true.
-	Queries *[]string      `json:"queries,omitempty"`
-	Error   map[string]any `json:"error,omitempty"`
+	Queries *json.RawMessage `json:"queries,omitempty"`
+	Error   map[string]any   `json:"error,omitempty"`
 }
 
 // bulkResponse answers a _bulk request.
@@ -97,8 +97,8 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 			out.Errors = true
 		} else if perc && res.Percolated && ops[i].Kind == OpUpsert {
 			q := it.Queries
-			if q == nil {
-				q = []string{}
+			if len(q) == 0 {
+				q = json.RawMessage(emptyArray)
 			}
 			item.Queries = &q
 		}

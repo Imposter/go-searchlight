@@ -23,10 +23,9 @@ type TieredPolicy struct {
 	SegmentsPerTier int
 	// MaxMergeAtOnce is the most segments one merge takes. Default 10.
 	MaxMergeAtOnce int
-	// MaxMergedBytes caps a merge's result. Default 1 GiB, not Lucene's 5 GiB:
-	// segment.Merge holds every live document's stored body in memory while it
-	// writes (a streaming merge is parked to Task 14), so this also bounds a merge's
-	// memory, once per concurrent merge.
+	// MaxMergedBytes caps a merge's result. Default 1 GiB, not Lucene's 5 GiB: it
+	// bounds how much a merge rewrites at once, and the per-document state
+	// segment.Merge holds while it writes.
 	MaxMergedBytes int64
 	// FloorSegmentBytes is the size a smaller segment counts as. Default 2 MiB.
 	FloorSegmentBytes int64
@@ -45,6 +44,16 @@ func DefaultTieredPolicy() TieredPolicy {
 		FloorSegmentBytes: 2 << 20,
 		DeletesPctAllowed: 20,
 	}
+}
+
+// DefaultQueryTieredPolicy returns the policy for query segments: two segments per
+// tier. Percolating a document probes every query segment with all of its atoms, so
+// each one costs every document a full probe, while saved queries change rarely and a
+// query segment is cheap to rebuild: few, larger query segments are worth the merges.
+func DefaultQueryTieredPolicy() TieredPolicy {
+	p := DefaultTieredPolicy()
+	p.SegmentsPerTier = 2
+	return p
 }
 
 func (p TieredPolicy) normalized() TieredPolicy {

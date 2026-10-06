@@ -250,6 +250,9 @@ func renderMethod(w io.Writer, r *Run) {
 		fmt.Fprintf(w, "- Filter, sorted/paging, aggregation and percolate-single workloads each repeat %d times (independent warmup and measured requests every time), merged into one histogram; a table's \"p99 (± run-to-run)\" is the coefficient of variation across the repeats' own p99s, not a confidence interval.\n", o.Repeats)
 	}
 	fmt.Fprintf(w, "- Bulk loads send %d documents per request at concurrency %d. Percolation batches hold %d documents at concurrency %d. Deep paging walks to depth %d.\n", o.BulkBatch, o.BulkConcurrency, o.PercolateBatch, o.PercolateConcurrency, o.PageDepth)
+	if o.PercolateSingle > 0 {
+		fmt.Fprintf(w, "- Single-document percolation measures %d requests per saved-search set, at concurrency 1: at least 1000, the fewest a trusted p99 needs (runs before October 2026 took 300, too few to judge T5's p99).\n", o.PercolateSingle)
+	}
 	if o.MixedSeconds > 0 {
 		fmt.Fprintf(w, "- The mixed workload runs for %.0f s.\n", o.MixedSeconds)
 	}

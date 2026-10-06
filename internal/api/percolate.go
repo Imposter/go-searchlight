@@ -3,6 +3,9 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"sync"
+	"time"
 )
 
 // MaxPercolateDocs bounds the documents (given and stored) of one _percolate request.
@@ -17,7 +20,6 @@ type percolateBody struct {
 // percolate serves POST /indexes/{index}/_percolate: {"docs": [{...}], "ids": [...]}
 // in; for each document, given ones first, the ids of the saved queries it matches.
 func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) error {
-	start := s.clock.Now()
 	wait, e := p.waitForSeq()
 	if e != nil {
 		return e
@@ -45,14 +47,73 @@ func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) err
 	if err != nil {
 		return err
 	}
+	admitted := info(r.Context()).admitted
+	return writePercolate(w, res, func() time.Duration { return s.clock.Since(admitted) })
+}
+
+// emptyArray is the queries of a document that matches none.
+const emptyArray = "[]"
+
+// percolateBuffers hold the responses writePercolate builds.
+var percolateBuffers = sync.Pool{New: func() any { return new([]byte) }}
+
+// maxPooledResponse is the largest response buffer kept for reuse.
+const maxPooledResponse = 4 << 20
+
+// writePercolate writes res as {"results":[...],"stale":true,"took_ms":N,"took_us":M},
+// exactly as encoding/json would, copying each result's queries array as it is. took
+// is read once the results are encoded: the server's time for the request, from its
+// admission to its last byte encoded, which took_ms and took_us (whole milliseconds
+// and microseconds) and the Server-Timing header (total;dur, in milliseconds with
+// microseconds) report.
+func writePercolate(w http.ResponseWriter, res *PercolateResponse, took func() time.Duration) error {
+	bp, _ := percolateBuffers.Get().(*[]byte)
+	if bp == nil {
+		bp = new([]byte)
+	}
+	b := (*bp)[:0]
+	b = append(b, `{"results":[`...)
 	for i := range res.Results {
-		if res.Results[i].Queries == nil {
-			res.Results[i].Queries = []string{}
+		r := &res.Results[i]
+		if i > 0 {
+			b = append(b, ',')
 		}
+		b = append(b, '{')
+		if r.ID != "" {
+			id, err := json.Marshal(r.ID)
+			if err != nil {
+				return err
+			}
+			b = append(b, `"id":`...)
+			b = append(b, id...)
+			b = append(b, ',')
+		}
+		b = strconv.AppendBool(append(b, `"found":`...), r.Found)
+		b = append(b, `,"queries":`...)
+		if len(r.Queries) == 0 {
+			b = append(b, emptyArray...)
+		} else {
+			b = append(b, r.Queries...)
+		}
+		b = append(b, '}')
 	}
-	out := map[string]any{"took_ms": s.clock.Since(start).Milliseconds(), "results": res.Results}
+	b = append(b, ']')
 	if res.Stale {
-		out["stale"] = true
+		b = append(b, `,"stale":true`...)
 	}
-	return writeJSON(w, http.StatusOK, out)
+	d := took()
+	b = strconv.AppendInt(append(b, `,"took_ms":`...), d.Milliseconds(), 10)
+	b = strconv.AppendInt(append(b, `,"took_us":`...), d.Microseconds(), 10)
+	b = append(b, "}\n"...)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Server-Timing", "total;dur="+strconv.FormatFloat(float64(d.Microseconds())/1000, 'f', 3, 64))
+	w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b) //nolint:gosec // JSON built from encoding/json's own literals, served as application/json
+	if cap(b) <= maxPooledResponse {
+		*bp = b
+		percolateBuffers.Put(bp)
+	}
+	return nil
 }

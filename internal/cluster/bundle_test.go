@@ -1,8 +1,11 @@
 package cluster
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/segment"
+	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
 
@@ -227,5 +232,32 @@ func TestCorruptNewestBundleFallsBackToAnOlderOne(t *testing.T) {
 	}
 	if got := a.n.fetch.restored.Load(); got != 1 {
 		t.Fatalf("%d bundles restored, want the older one", got)
+	}
+}
+
+// TestBundleHeaderSegmentMajor: a bundle header with no segment_major (written before
+// it) holds format-3 segments and is read; one whose segments are newer than this build
+// reads is refused before anything is staged.
+func TestBundleHeaderSegmentMajor(t *testing.T) {
+	header := func(major int) []byte {
+		files := []wireFile{{Name: shard.ManifestName, Size: 1, SHA256: strings.Repeat("0", 64)}}
+		hdr := bundleHeader{Index: "i", UID: "u", Shard: 0, Seq: 1, SegmentMajor: major, Files: files}
+		body, err := json.Marshal(hdr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte(fmt.Sprintf("%s %d %d\n", bundleMagic, bundleFormat, len(body))), body...)
+	}
+	for _, c := range []struct {
+		major int
+		ok    bool
+	}{{0, true}, {segment.ReadsMajor, true}, {segment.FormatMajor, true}, {segment.FormatMajor + 1, false}} {
+		_, err := readBundleHeader(bufio.NewReader(bytes.NewReader(header(c.major))))
+		if (err == nil) != c.ok {
+			t.Fatalf("segment_major %d: %v, want ok %v", c.major, err, c.ok)
+		}
+	}
+	if !bytes.Contains(header(0), []byte(`"files"`)) || bytes.Contains(header(0), []byte("segment_major")) {
+		t.Fatal("a header without a segment major should omit the field")
 	}
 }

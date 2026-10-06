@@ -252,7 +252,10 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	}
 	reply := &searchReply{Result: res, Stale: t.Stale()}
 	if msg.Pin {
-		reply.Pin = p.n.pins.add(store.ShardID{Index: msg.Index, Shard: msg.Shard}, t)
+		reply.Pin = p.n.pins.add(t)
+		if h := p.n.opts.hooks; h != nil && h.pinned != nil {
+			h.pinned(store.ShardID{Index: msg.Index, Shard: msg.Shard}, reply.Pin)
+		}
 	} else {
 		t.Release()
 	}
@@ -266,7 +269,7 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		return nil, err
 	}
 	var reply fetchReply
-	err := p.n.pins.use(msg.Pin, p.n.peerValid, func(t node.ShardTarget) error {
+	err := p.n.pins.use(msg.Pin, func(t node.ShardTarget) error {
 		if err := t.Fetch(ctx, msg.Hits, msg.Fields); err != nil {
 			return err
 		}
@@ -277,7 +280,7 @@ func (p *peerAPI) fetch(r *http.Request) (any, error) {
 		return nil
 	})
 	if errors.Is(err, errPinGone) {
-		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired, or its copy no longer serves"}
+		return nil, &api.Error{Status: http.StatusGone, Code: api.CodeNotFound, Detail: "the pinned generation expired or was released"}
 	}
 	if err != nil {
 		return nil, err
@@ -304,7 +307,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	}
 	docs := make([]schema.Doc, len(msg.Docs))
 	for i, d := range msg.Docs {
-		doc, _, err := schema.Analyze(m, d.ID, d.Body)
+		doc, _, err := schema.AnalyzeForMatch(m, d.ID, d.Body)
 		if err != nil {
 			return nil, api.InvalidAt("docs."+strconv.Itoa(i), "%v", err)
 		}
@@ -319,12 +322,14 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range matches {
-		if matches[i] == nil {
-			matches[i] = []string{}
+	out := make([]json.RawMessage, len(matches))
+	for i, m := range matches {
+		out[i] = json.RawMessage(m)
+		if len(m) == 0 {
+			out[i] = json.RawMessage("[]")
 		}
 	}
-	return &percolateReply{Matches: matches, Stale: t.Stale()}, nil
+	return &percolateReply{Matches: out, Stale: t.Stale()}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {
@@ -437,12 +442,27 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	id := store.ShardID{Index: msg.Index, Shard: msg.Shard}
+	oldest, newest, err := p.n.SegmentMajors(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := p.servableMajors(msg, oldest, newest); err != nil {
+		return err
+	}
 	sn, err := p.n.Snapshot(ctx, id)
 	if err != nil {
 		return err
 	}
+	oldest, newest = sn.FormatMajors()
+	if err := p.servableMajors(msg, oldest, newest); err != nil {
+		sn.Release()
+		return err
+	}
 	rc := http.NewResponseController(w)
-	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion()}
+	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion(), FormatMajor: oldest}
+	if h := p.n.opts.hooks; h != nil && h.snapshotMajor != nil {
+		reply.FormatMajor = h.snapshotMajor(reply.FormatMajor)
+	}
 	for _, f := range sn.Files() {
 		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 		sum, err := p.n.sums.sum(id, sn, f)
@@ -461,6 +481,25 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 	_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(reply)
+}
+
+// servableMajors refuses a snapshot whose segments the requester could not open
+// (newer than it reads) or did not want (older than its MinMajor).
+func (p *peerAPI) servableMajors(msg shardRef, oldest, newest int) error {
+	if h := p.n.opts.hooks; h != nil && h.snapshotMajor != nil {
+		oldest = h.snapshotMajor(oldest)
+	}
+	reads := msg.ReadsMajor
+	if reads == 0 {
+		reads = legacyReadsMajor
+	}
+	switch {
+	case newest > reads:
+		return api.Conflict(codeNewerSegments, "this copy's segments are in format %d, newer than the %d the requester reads", newest, reads)
+	case oldest < msg.MinMajor:
+		return api.Conflict(codeOlderSegments, "this copy's segments are as old as format %d, the requester asked for %d", oldest, msg.MinMajor)
+	}
+	return nil
 }
 
 // snapshotHashBound bounds hashing one snapshot file (and writing a snapshot file's
@@ -525,10 +564,18 @@ func (n *Node) peerValid(id store.ShardID) bool {
 
 // --- pins and snapshots ---------------------------------------------------------------
 
-// errPinGone is a pin that expired or was released, or whose copy no longer serves.
+// errPinGone is a pin that expired or was released.
 var errPinGone = errors.New("cluster: the pin is gone")
 
 // pinTable holds the generations searches pinned on this node for their fetch phase.
+//
+// A pin outlives its copy's serving: the query phase was admitted while the copy served
+// under its lease, and the fetch reads only the generation that phase searched, which
+// the pin holds open whatever becomes of the copy. So a copy that pauses, retires, is
+// released or closes between a search's phases still answers its fetch. A pin lasts
+// until the search releases it, PinTTL passes unused, or the node stops: a stopping
+// node retires its copies first and keeps serving for shutdown_grace, so the fetches
+// of searches under way drain before Stop drops the pins.
 type pinTable struct {
 	ttl   time.Duration
 	clock clock.Clock
@@ -538,7 +585,6 @@ type pinTable struct {
 
 type pinEntry struct {
 	mu      sync.Mutex // held while a fetch uses the target
-	id      store.ShardID
 	t       node.ShardTarget
 	expires time.Time
 	gone    bool
@@ -554,17 +600,16 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
-func (p *pinTable) add(id store.ShardID, t node.ShardTarget) string {
+func (p *pinTable) add(t node.ShardTarget) string {
 	pin := newID()
 	p.mu.Lock()
-	p.m[pin] = &pinEntry{id: id, t: t, expires: p.clock.Now().Add(p.ttl)}
+	p.m[pin] = &pinEntry{t: t, expires: p.clock.Now().Add(p.ttl)}
 	p.mu.Unlock()
 	return pin
 }
 
-// use runs fn on a pinned target, keeping it pinned meanwhile, while its copy still
-// serves peers (valid).
-func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.ShardTarget) error) error {
+// use runs fn on a pinned target, keeping it pinned meanwhile.
+func (p *pinTable) use(pin string, fn func(node.ShardTarget) error) error {
 	p.mu.Lock()
 	e := p.m[pin]
 	if e != nil {
@@ -576,7 +621,7 @@ func (p *pinTable) use(pin string, valid func(store.ShardID) bool, fn func(node.
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.gone || !valid(e.id) {
+	if e.gone {
 		return errPinGone
 	}
 	return fn(e.t)

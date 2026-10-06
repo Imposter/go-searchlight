@@ -333,6 +333,8 @@ func (sd *Shutdown) within(now time.Time, d time.Duration) time.Time {
 type reqInfo struct {
 	id  string
 	log *slog.Logger
+	// admitted is when the request reached the API, before authentication.
+	admitted time.Time
 }
 
 type ctxKey struct{}
@@ -404,7 +406,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 		))
 		defer span.End()
 		log := telemetry.WithRequest(ctx).With(slog.String("request_id", id))
-		ctx = context.WithValue(ctx, ctxKey{}, &reqInfo{id: id, log: log})
+		ctx = context.WithValue(ctx, ctxKey{}, &reqInfo{id: id, log: log, admitted: start})
 		sw := &statusWriter{ResponseWriter: w}
 		sw.Header().Set("X-Request-Id", id)
 		routeSet := metric.WithAttributeSet(rt.attrs)

@@ -1002,7 +1002,7 @@ func TestPercolateAfterRestartSeesQueries(t *testing.T) {
 	n2 := open(t, cfg, st, nil)
 	waitReady(t, n2)
 	res, err := n2.Percolate(ctx(t), "p", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"x": 1}`)}}, api.ReadOptions{})
-	if err != nil || fmt.Sprint(res.Results[0].Queries) != "[q]" {
+	if err != nil || string(res.Results[0].Queries) != `["q"]` {
 		t.Errorf("percolation after a restart: %+v %v", res, err)
 	}
 }

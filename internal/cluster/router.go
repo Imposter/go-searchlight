@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
+	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -339,6 +341,9 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 	return reply.Result, nil
 }
 
+// Fetch fills hits' bodies from the generation the query phase pinned. When the pin is
+// gone (410) the copy is suspected, so the query phase the engine runs again for the
+// shard goes to another copy first.
 func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []string) error {
 	if t.chosen == nil || t.pin == "" {
 		return fmt.Errorf("%w: no pinned generation to fetch from", search.ErrStaleHit)
@@ -349,6 +354,7 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 		var ae *api.Error
 		switch {
 		case errors.As(err, &ae) && ae.Status == http.StatusGone:
+			t.n.ars.suspect(t.chosen.key())
 			return fmt.Errorf("%w: %w", search.ErrStaleHit, err)
 		case retryable(err) && ctx.Err() == nil:
 			return fmt.Errorf("%w: %w", node.ErrTargetLost, err)
@@ -364,7 +370,7 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 	return nil
 }
 
-func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([][]string, error) {
+func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error) {
 	wdocs := make([]wireDoc, len(docs))
 	for i := range docs {
 		wdocs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
@@ -385,7 +391,13 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 	if len(reply.Matches) != len(docs) {
 		return nil, fmt.Errorf("cluster: the peer percolated %d documents of %d", len(reply.Matches), len(docs))
 	}
-	return reply.Matches, nil
+	out := make([]percolate.IDs, len(docs))
+	for i, m := range reply.Matches {
+		if s := strings.TrimSpace(string(m)); s != "[]" && s != "null" {
+			out[i] = percolate.IDs(m)
+		}
+	}
+	return out, nil
 }
 
 func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getReply, error) {

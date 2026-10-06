@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/Imposter/go-searchlight/internal/analysis"
 )
 
 func TestFieldTypeText(t *testing.T) {
@@ -225,11 +227,11 @@ func TestAnalyzeReviewFocus(t *testing.T) {
 	if title.Words != wantWords {
 		t.Errorf("title words %+q,\nwant %+q", title.Words, wantWords)
 	}
-	if !slices.Contains(title.Grams, "a\ufffdb") || !slices.IsSorted(title.Grams) {
-		t.Errorf("title grams miss the cleaned NUL or are unsorted")
+	if !title.Grams || !slices.Contains(analysis.Substrings3(*title.Text), "a\ufffdb") {
+		t.Errorf("title grams miss the cleaned NUL")
 	}
 
-	if brand := doc.Fields["brand"]; !brand.Present || *brand.Text != "" || brand.Grams != nil {
+	if brand := doc.Fields["brand"]; !brand.Present || *brand.Text != "" || brand.Grams {
 		t.Errorf("empty brand %+v", brand)
 	}
 	if sizes := doc.Fields["sizes"].Entries; !slices.Equal(sizes, []string{"l", "m", "s"}) {

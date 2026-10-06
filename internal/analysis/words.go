@@ -48,3 +48,18 @@ func Words(s string) string {
 	b.WriteByte(' ')
 	return b.String()
 }
+
+// EachWord calls fn with every word of a [Words] string (" a b "), in order.
+func EachWord(words string, fn func(word string)) {
+	for words != "" {
+		i := strings.IndexByte(words, ' ')
+		if i < 0 {
+			fn(words)
+			return
+		}
+		if i > 0 {
+			fn(words[:i])
+		}
+		words = words[i+1:]
+	}
+}

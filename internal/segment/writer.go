@@ -10,10 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
 
@@ -203,7 +203,7 @@ func buildPart(docs []schema.Doc, rg docRange) map[string]*fieldBuilder {
 // [schema.Value] directly, where Merge reads a reader's already-analyzed columns). A
 // duplicate (term, doc) pair - the same word or gram occurring more than once in one
 // document's text - is harmless to add more than once: [termPairs.add] collapses it
-// into one posting, so there is no need to deduplicate here.
+// into one posting, so words and grams are added as they occur, unsorted and repeated.
 func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	b.presence.Add(ord)
 	if v.GramsTruncated {
@@ -217,12 +217,10 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 		b.addValueTerm(ord, *v.Text)
 		b.hasText = true
 		if v.Words != "" {
-			for _, word := range strings.Fields(v.Words) {
-				b.addWordTerm(ord, word)
-			}
+			analysis.EachWord(v.Words, func(word string) { b.addWordTerm(ord, word) })
 		}
-		for _, g := range v.Grams {
-			b.addGramTerm(ord, g)
+		if v.Grams {
+			analysis.EachGram(*v.Text, func(gram string) { b.addGramTerm(ord, gram) })
 		}
 	case v.Number != nil:
 		b.numDocs = append(b.numDocs, docFloat{doc: ord, v: *v.Number})

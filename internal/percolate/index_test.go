@@ -14,7 +14,6 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -378,23 +377,6 @@ func treeDepth(nodes []treeNode, at int32) int {
 		return 0
 	}
 	return 1 + max(treeDepth(nodes, nodes[at].left), treeDepth(nodes, nodes[at].right))
-}
-
-func TestEachWindowIsSubstrings3(t *testing.T) {
-	for _, s := range []string{"", "a", "ab", "abc", "abcd", "aaaa", "café au lait", "日本語テキスト", "éte", "a\xffb\xfec", "😀😀😀😀"} {
-		seen := map[string]bool{}
-		eachWindow(s, func(w string) { seen[w] = true })
-		got := slices.Sorted(func(yield func(string) bool) {
-			for w := range seen {
-				if !yield(w) {
-					return
-				}
-			}
-		})
-		if want := analysis.Substrings3(s); !slices.Equal(got, want) && (len(got) != 0 || len(want) != 0) {
-			t.Fatalf("%q: windows %q, Substrings3 %q", s, got, want)
-		}
-	}
 }
 
 func TestHashKeyIsHashTerm(t *testing.T) {

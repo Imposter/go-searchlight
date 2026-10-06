@@ -796,42 +796,12 @@ func (e *extractor) needle(f, norm string) aset {
 		return e.term(AtomText, f, "")
 	}
 	best := always
-	eachWindow(norm, func(gram string) {
+	analysis.EachGram(norm, func(gram string) {
 		if s := e.term(AtomGram, f, gram); !best.ok || s.cost < best.cost {
 			best = s
 		}
 	})
 	return best
-}
-
-// eachWindow calls fn with every 3-rune window of s, in order (repeats included), as
-// [analysis.Substrings3] takes them.
-func eachWindow(s string, fn func(string)) {
-	a, b, c := -1, -1, -1 // the starts of the three latest runes
-	for i := range s {
-		if a >= 0 {
-			fn(s[a:i])
-		}
-		a, b, c = b, c, i
-	}
-	if a >= 0 {
-		fn(s[a:])
-	}
-}
-
-// eachWord calls fn with every word of a Value.Words or analysis.Words string (" a b ").
-func eachWord(words string, fn func(string)) {
-	for words != "" {
-		i := strings.IndexByte(words, ' ')
-		if i < 0 {
-			fn(words)
-			return
-		}
-		if i > 0 {
-			fn(words[:i])
-		}
-		words = words[i+1:]
-	}
 }
 
 // words anchors words_all and words_any. A phrase's words string (" a b ") is a
@@ -848,7 +818,7 @@ func (e *extractor) words(f string, a *query.Arg, every bool) aset {
 			continue // a phrase with no word matches nothing
 		}
 		var best, second aset
-		eachWord(w, func(word string) {
+		analysis.EachWord(w, func(word string) {
 			switch s := e.term(AtomWord, f, word); {
 			case best.ok && s.terms[0] == best.terms[0], second.ok && s.terms[0] == second.terms[0]:
 			case !best.ok || s.cost < best.cost:

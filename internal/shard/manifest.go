@@ -54,13 +54,15 @@ type manifest struct {
 	MappingVersion int64             `json:"mapping_version,omitempty"`
 	Segments       []manifestSegment `json:"segments"`
 	QuerySegments  []manifestSegment `json:"query_segments"`
-	// UntypedMarks, when untypedMarksFormat, says every segment marks typeable
-	// untyped values (see Shard.MarksUntyped).
+	// UntypedMarks, when untypedMarksFormat, says every segment of the previous
+	// segment format major the manifest lists marks typeable untyped values (in its
+	// truncated bitmap, which segment.Reader.Untyped reads them from). A segment of the
+	// current major says so itself (segment.Reader.MarksUntyped).
 	UntypedMarks int `json:"untyped_marks,omitempty"`
 }
 
-// untypedMarksFormat is the manifest's UntypedMarks of a shard whose segments all
-// carry the marks.
+// untypedMarksFormat is the manifest's UntypedMarks when its previous-major segments
+// all carry the marks.
 const untypedMarksFormat = 1
 
 type manifestSegment struct {

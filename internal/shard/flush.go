@@ -157,7 +157,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 			return
 		}
 		st := writes[i-len(syncs)]
-		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true})
+		errs[i] = segment.WriteDeletes(s.dir, st.ref.id, st.delGen, st.deletes, segment.DeletesOptions{NoDirSync: true, Major: st.ref.sidecarMajor()})
 	})
 	for _, st := range writes {
 		s.strays[filepath.Join(s.dir, deletesName(st.ref.id, st.delGen))] = true
@@ -191,9 +191,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 	if err != nil {
 		return nil, err
 	}
-	if s.marksUntyped {
-		man.UntypedMarks = untypedMarksFormat
-	}
+	man.UntypedMarks = legacyMarks(g.docs)
 	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	switch {
 	case err == nil:

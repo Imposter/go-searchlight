@@ -54,6 +54,11 @@ type Value struct {
 	// treat it as a candidate for every needle (a residual check, or the always-verify
 	// path), never skip it for lacking a gram.
 	GramsTruncated bool
+	// Untyped marks a present value of a field the mapping does not map, of a kind
+	// dynamic typing would type: mapping the field would analyze it differently.
+	// Analyze never sets it; a writer that indexes such fields for presence only does,
+	// so a segment can tell a mapping change that needs a rebuild from one that does not.
+	Untyped bool
 }
 
 // Doc is an analyzed document. Fields holds every present field, by name, and the

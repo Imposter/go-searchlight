@@ -16,18 +16,24 @@ import (
 //	[postings of block 0][block 0][postings of block 1][block 1] ... [index]
 //
 //	block  uvarint postingsLen (this block's postings' byte length, so its postings
-//	       start postingsLen bytes before the block itself - see below)
-//	       then per term: uvarint shared prefix (with the previous term in the block),
+//	       start postingsLen bytes before the block itself - see below), then per
+//	       term: uvarint shared prefix (with the previous term in the block),
 //	       uvarint suffix length, suffix, uvarint docFreq, and either uvarint doc
 //	       (docFreq 1, the postings inline) or uvarint postings length (laid out
 //	       back to back, working backward from the block's own start)
 //	index  u32 numTerms, u32 numBlocks, u64 sumDocFreq, u64 blockBack[numBlocks] (each
 //	       block's distance back from the index itself to its own start),
-//	       u32 firstTermOffset[numBlocks+1], the blocks' first terms back to back
+//	       u32 keyOffset[numBlocks+1], the blocks' keys back to back
+//
+// A block's key is its first term in format 3. In format 4 it is the shortest prefix of
+// its first term that sorts after the previous block's last term (the empty string for
+// block 0): every term of the block sorts at or after it, and every term of the block
+// before sorts before it, so a binary search over keys finds the only block a term can
+// be in, as it does over first terms, at a fraction of the index's size for long terms.
 //
 // The index is the sparse block index: Open keeps views of its arrays, a lookup binary
-// searches the first terms (O(log blocks)) and scans one block. Term ordinals are
-// positions in the sorted dictionary, so ordinal o lives in block o/blockTerms.
+// searches the keys (O(log blocks)) and scans one block. Term ordinals are positions
+// in the sorted dictionary, so ordinal o lives in block o/blockTerms.
 //
 // Every position a dictionary's own bytes bake in is stored as a distance back from a
 // point the reader already has in hand, not as a forward offset from some notional
@@ -57,8 +63,8 @@ type dictWriter struct {
 	block      encoder
 	prev       []byte
 	blockOffs  []uint64
-	firstOffs  []uint32
-	firstTerms []byte
+	keyOffs    []uint32
+	keys       []byte
 	numTerms   uint32
 	sumDocFreq uint64
 }
@@ -103,14 +109,12 @@ func (d *dictWriter) flushBlock() {
 	d.w.write(d.postBuf)
 	blockStart := d.w.off
 	d.blockOffs = append(d.blockOffs, blockStart)
-	d.firstOffs = append(d.firstOffs, uint32(len(d.firstTerms))) //nolint:gosec // first terms stay far below 4 GiB
-	first := d.pending[0]
-	d.firstTerms = append(d.firstTerms, d.termBuf[first.start:first.end]...)
+	d.keyOffs = append(d.keyOffs, uint32(len(d.keys))) //nolint:gosec // keys stay far below 4 GiB
+	first := d.termBuf[d.pending[0].start:d.pending[0].end]
+	if len(d.blockOffs) > 1 {
+		d.keys = append(d.keys, first[:min(commonPrefix(d.prev, first)+1, len(first))]...)
+	}
 	d.block.b = d.block.b[:0]
-	// postingsLen, not postingsStart itself: a distance back from this block's own
-	// start (blockStart, which the reader already has - it is how it found this
-	// block), not a forward offset from anywhere - see the type comment above.
-	d.block.uvarint(blockStart - postingsStart)
 	d.prev = d.prev[:0]
 	for _, p := range d.pending {
 		term := d.termBuf[p.start:p.end]
@@ -125,6 +129,9 @@ func (d *dictWriter) flushBlock() {
 		}
 		d.prev = append(d.prev[:0], term...)
 	}
+	var h encoder
+	h.uvarint(blockStart - postingsStart)
+	d.w.write(h.b)
 	d.w.write(d.block.b)
 	d.pending = d.pending[:0]
 	d.termBuf = d.termBuf[:0]
@@ -143,15 +150,13 @@ func (d *dictWriter) finish() (uint64, bool) {
 	d.w.u32(uint32(len(d.blockOffs))) //nolint:gosec // blocks fit uint32
 	d.w.u64(d.sumDocFreq)
 	for _, o := range d.blockOffs {
-		// A distance back from the index (off, written here) to that block's own
-		// start (o), not o itself - see the type comment above.
 		d.w.u64(off - o)
 	}
-	for _, o := range d.firstOffs {
+	for _, o := range d.keyOffs {
 		d.w.u32(o)
 	}
-	d.w.u32(uint32(len(d.firstTerms))) //nolint:gosec // first terms stay far below 4 GiB
-	d.w.write(d.firstTerms)
+	d.w.u32(uint32(len(d.keys))) //nolint:gosec // keys stay far below 4 GiB
+	d.w.write(d.keys)
 	return off, true
 }
 
@@ -177,10 +182,10 @@ type termDict struct {
 	numBlocks  uint32
 	sumDocFreq uint64
 	blockOffs  []byte // numBlocks u64, each a distance back from base
-	firstOffs  []byte // numBlocks+1 u32
-	firstTerms []byte
+	keyOffs    []byte // numBlocks+1 u32
+	keys       []byte
 
-	// checked has bit o set once ordinal o's serialized postings have passed
+	// checked has bit o set once ordinal o's serialized roaring postings have passed
 	// checkBitmap (see postings). Set with atomic Or and read with atomic Load, so
 	// concurrent Postings calls need no lock: two racing on the same unchecked term
 	// both check it, then both set the same bit, which is harmless.
@@ -198,11 +203,11 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 	t.numBlocks = d.u32()
 	t.sumDocFreq = d.u64()
 	t.blockOffs = d.bytes(uint64(t.numBlocks) * 8)
-	t.firstOffs = d.bytes((uint64(t.numBlocks) + 1) * 4)
+	t.keyOffs = d.bytes((uint64(t.numBlocks) + 1) * 4)
 	if d.err != nil {
 		return nil, d.err
 	}
-	t.firstTerms = d.bytes(uint64(t.firstOff(t.numBlocks)))
+	t.keys = d.bytes(uint64(t.keyOff(t.numBlocks)))
 	if d.err != nil {
 		return nil, d.err
 	}
@@ -213,7 +218,7 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 	}
 	for i := range t.numBlocks {
 		back := binary.LittleEndian.Uint64(t.blockOffs[i*8:])
-		if back > t.base || t.firstOff(i) > t.firstOff(i+1) {
+		if back > t.base || t.keyOff(i) > t.keyOff(i+1) {
 			return nil, errShort
 		}
 	}
@@ -226,17 +231,17 @@ func (t *termDict) blockOff(i uint32) uint64 {
 	return t.base - binary.LittleEndian.Uint64(t.blockOffs[i*8:])
 }
 
-func (t *termDict) firstOff(i uint32) uint32 {
-	return binary.LittleEndian.Uint32(t.firstOffs[i*4:])
+func (t *termDict) keyOff(i uint32) uint32 {
+	return binary.LittleEndian.Uint32(t.keyOffs[i*4:])
 }
 
-func (t *termDict) firstTerm(i uint32) []byte {
-	return t.firstTerms[t.firstOff(i):t.firstOff(i+1)]
+func (t *termDict) key(i uint32) []byte {
+	return t.keys[t.keyOff(i):t.keyOff(i+1)]
 }
 
 // postings returns info's documents (info from this dictionary's lookup or iteration),
-// as [bitmapAt] does, but checks a serialized bitmap only the first time it is asked
-// for: the mapping never changes, so once ordinal info.ord's bitmap has passed
+// as [bitmapAt] does, but checks a serialized roaring bitmap only the first time it is
+// asked for: the mapping never changes, so once ordinal info.ord's bitmap has passed
 // checkBitmap it always will, and every later call costs one atomic load instead of a
 // pass over the bitmap. A bitmap that fails is not remembered, and reads as empty
 // every time.
@@ -255,13 +260,13 @@ func (t *termDict) postings(info termInfo, numDocs uint32) *roaring.Bitmap {
 	return rb
 }
 
-// blockFor returns the last block whose first term is at most term, or false when term
-// sorts before every term.
+// blockFor returns the last block whose key is at most term, or false when term sorts
+// before every key.
 func (t *termDict) blockFor(term []byte) (uint32, bool) {
-	lo, hi := uint32(0), t.numBlocks // the answer is the last i in [lo, hi) with first(i) <= term
+	lo, hi := uint32(0), t.numBlocks
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if bytes.Compare(t.firstTerm(mid), term) <= 0 {
+		if bytes.Compare(t.key(mid), term) <= 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -290,10 +295,6 @@ func (t *termDict) cursor(block uint32) blockCursor {
 		ord:  block * blockTerms,
 		left: min(blockTerms, t.numTerms-block*blockTerms),
 	}
-	// postingsLen is a distance back from this block's own start (blockStart, just
-	// resolved above), not a forward offset from anywhere; postings regions built
-	// from it (blockCursor.next) come out as ordinary absolute mmap positions, so
-	// every other reader of one - bitmapAt, viewBitmap, appendDocs - needs no change.
 	postingsLen := c.d.uvarint()
 	c.post = blockStart - postingsLen
 	return c

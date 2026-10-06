@@ -46,6 +46,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 - Stateful alerting. Matching is stateless; clients keep their own match state.
 - History and time-series conditions (scrape-bot keeps them).
 - Cross-index joins and scripting.
+- Log storage and a log explorer (Grafana, Loki-compatible API, a pipe/SQL query language). This is part 2, after v1 ships: [roadmap](2026-10-05-searchlight-part2-logs-roadmap.md).
 
 ## 2. Architecture
 
@@ -76,7 +77,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `internal/config` | flags and environment, validated |
 | `internal/analysis` | normalizers (casefold, whitespace fold, NFKC words, list entries, trigrams) |
 | `internal/query` | DSL AST, parse and validate (problem locations), exact matcher over an analyzed document |
-| `internal/segment` | the on-disk segment format: term dictionary (FST-style sorted blocks), roaring postings, doc values (columnar, compressed), stored fields (zstd blocks), live-docs bitmap; writer, mmap reader, merge |
+| `internal/segment` | the on-disk segment format: term dictionary (FST-style sorted blocks), roaring postings, doc values (columnar, compressed), stored fields (compressed blocks), live-docs bitmap; writer, mmap reader, merge |
 | `internal/shard` | one shard copy: write buffer, refresh, segment set and generation, merges, filter cache, per-shard search and percolate |
 | `internal/search` | query planning (cost-based leaf order, bitmap and residual), per-shard execution, sort, `search_after`, aggregations, cross-shard reduce |
 | `internal/percolate` | anchor extraction, per-shard query index (persisted as a segment kind), candidate generation, verification |
@@ -182,8 +183,8 @@ A segment is immutable and written once at refresh or merge time. It is one file
 | Term dictionary | Per field and kind (value, entry, word, trigram), sorted terms in prefix-compressed blocks with a sparse in-memory index. Lookup is O(log blocks), plus a short scan inside one block. |
 | Postings | Roaring bitmaps in serialized form, used directly from mmap with no copy |
 | Doc values | Columnar per field: numbers delta- and bit-packed; keywords as ordinals into a per-segment sorted dictionary; multi-valued lists as offsets plus ordinals. Used for sorting, aggregations and residual filters. |
-| Points | Per-field sorted value blocks with min/max (a BKD-lite), giving range queries without scanning |
-| Stored fields | zstd-compressed blocks of 16 KB of original JSON, fetched for hits only |
+| Points | Per-field blocks of documents sorted by value, with min/max (a BKD-lite), giving range queries without scanning; a partly covered block reads values from the doc-value column |
+| Stored fields | s2-compressed blocks of about 4 KB of original JSON, against a per-segment dictionary of the segment's first documents, fetched for hits only |
 | Live docs | A roaring bitmap of deleted documents, with a sidecar file per generation (the segment itself is never rewritten) |
 | Percolator queries | A segment kind of its own holding saved queries' compiled anchors (§7) |
 
@@ -321,6 +322,7 @@ The logical schema is the same in every dialect.
   - On shutdown a node marks its copies `retiring`, finishes in-flight requests, writes its manifests and exits.
   - It comes back by reopening its segments and replaying the tail of the changelog.
   - The on-disk format is versioned, and a node refuses segments from a newer major version.
+  - A node reads segments of its own major and the one before it (N−1), so an upgrade across one major reopens its segments; merges rewrite them into the new major, and peer recovery prefers peers already on it.
 - **Changelog pruning** stays behind the lowest `applied_seq` of any live copy, and behind the oldest retained recovery point. A copy's `applied_seq` is its `CommittedSeq`, what its last flush made durable (§6).
 
 ## 10. Failure handling
@@ -452,3 +454,5 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | History ops | stay in scrape-bot |
 | BM25 / nested documents | v2 |
 | Go | 1.25 |
+| System of record | SQL for document indexes; no embedded consensus database |
+| Logs (part 2) | `stream` indexes with segments in blob storage and SQL as the metastore; Grafana via the Loki API; SLQ query language ([roadmap](2026-10-05-searchlight-part2-logs-roadmap.md)) |

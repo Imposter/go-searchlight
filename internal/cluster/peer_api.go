@@ -442,12 +442,27 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	id := store.ShardID{Index: msg.Index, Shard: msg.Shard}
+	oldest, newest, err := p.n.SegmentMajors(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := p.servableMajors(msg, oldest, newest); err != nil {
+		return err
+	}
 	sn, err := p.n.Snapshot(ctx, id)
 	if err != nil {
 		return err
 	}
+	oldest, newest = sn.FormatMajors()
+	if err := p.servableMajors(msg, oldest, newest); err != nil {
+		sn.Release()
+		return err
+	}
 	rc := http.NewResponseController(w)
-	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion()}
+	reply := &snapshotReply{Seq: sn.Seq(), IndexUID: sn.IndexUID(), MappingVersion: sn.MappingVersion(), FormatMajor: oldest}
+	if h := p.n.opts.hooks; h != nil && h.snapshotMajor != nil {
+		reply.FormatMajor = h.snapshotMajor(reply.FormatMajor)
+	}
 	for _, f := range sn.Files() {
 		_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 		sum, err := p.n.sums.sum(id, sn, f)
@@ -466,6 +481,25 @@ func (p *peerAPI) snapshot(w http.ResponseWriter, r *http.Request) error {
 	_ = rc.SetWriteDeadline(time.Now().Add(snapshotHashBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(reply)
+}
+
+// servableMajors refuses a snapshot whose segments the requester could not open
+// (newer than it reads) or did not want (older than its MinMajor).
+func (p *peerAPI) servableMajors(msg shardRef, oldest, newest int) error {
+	if h := p.n.opts.hooks; h != nil && h.snapshotMajor != nil {
+		oldest = h.snapshotMajor(oldest)
+	}
+	reads := msg.ReadsMajor
+	if reads == 0 {
+		reads = legacyReadsMajor
+	}
+	switch {
+	case newest > reads:
+		return api.Conflict(codeNewerSegments, "this copy's segments are in format %d, newer than the %d the requester reads", newest, reads)
+	case oldest < msg.MinMajor:
+		return api.Conflict(codeOlderSegments, "this copy's segments are as old as format %d, the requester asked for %d", oldest, msg.MinMajor)
+	}
+	return nil
 }
 
 // snapshotHashBound bounds hashing one snapshot file (and writing a snapshot file's

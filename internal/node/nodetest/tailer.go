@@ -69,8 +69,16 @@ func (t *Tailer) Wake() {
 	}
 }
 
-// Pause stops the tailer applying changes until Resume (tests of a copy that lags).
-func (t *Tailer) Pause() { t.paused.Store(true) }
+// Pause stops the tailer applying changes until Resume (tests of a copy that lags). It
+// blocks until a catch-up already under way (started before the flag was visible to
+// it) finishes, so no write committed after Pause returns can ever be read by one that
+// was already looping against the live store: CatchUp itself re-checks the flag, under
+// the same lock, before doing anything.
+func (t *Tailer) Pause() {
+	t.paused.Store(true)
+	t.mu.Lock()
+	t.mu.Unlock() //nolint:gocritic,staticcheck // the lock, not what it guards, is the barrier: no defer needed, the empty section is the point
+}
 
 // Resume undoes Pause and wakes the tailer.
 func (t *Tailer) Resume() {
@@ -110,6 +118,9 @@ func (t *Tailer) Run(ctx context.Context) error {
 func (t *Tailer) CatchUp(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.paused.Load() {
+		return nil
+	}
 	head := t.head()
 	for {
 		changes, err := t.st.ChangesAfter(ctx, t.id, t.sh.AppliedSeq(), pageSize)

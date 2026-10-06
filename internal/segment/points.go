@@ -95,10 +95,6 @@ type points struct {
 	numBlocks  uint32
 	docWidth   uint8
 	table      []byte // numBlocks table entries
-	// starts holds each block's first entry when some block before the last is short
-	// (nil when every block but the last holds pointsBlockSize entries, as the writer
-	// lays them out).
-	starts []uint32
 }
 
 // openPoints opens the point index at off of col, in a file of the given major.
@@ -125,29 +121,22 @@ func openPoints(data []byte, off uint64, col *numberColumn, major uint16) (*poin
 	if uint64(p.numBlocks) != (uint64(p.numEntries)+pointsBlockSize-1)/pointsBlockSize {
 		return nil, errShort
 	}
-	// Every block must hold 1 to pointsBlockSize entries, together exactly numEntries,
-	// with its packed data inside data: rangeDocs slices them unchecked.
+	// Every block but the last holds pointsBlockSize entries, as both formats' writers
+	// lay them out, together exactly numEntries, with its packed data inside data:
+	// rangeDocs slices them unchecked, and a block's first entry is its index times
+	// pointsBlockSize.
 	var total uint64
 	room := uint64(len(data)) - off
-	uniform := true
 	for i := range p.numBlocks {
 		_, _, count, rel := p.blockEntry(i)
 		size := p.blockSize(count)
-		if count == 0 || count > pointsBlockSize || rel > room || size > room-rel {
+		if count == 0 || count > pointsBlockSize || (count != pointsBlockSize && i != p.numBlocks-1) || rel > room || size > room-rel {
 			return nil, errShort
 		}
-		uniform = uniform && (count == pointsBlockSize || i == p.numBlocks-1)
 		total += uint64(count)
 	}
 	if total != uint64(p.numEntries) {
 		return nil, errShort
-	}
-	if !uniform {
-		p.starts = make([]uint32, p.numBlocks+1)
-		for i := range p.numBlocks {
-			_, _, count, _ := p.blockEntry(i)
-			p.starts[i+1] = p.starts[i] + count
-		}
 	}
 	return p, nil
 }
@@ -180,12 +169,7 @@ func inRange(v, lo, hi float64, incLo, incHi bool) bool {
 	return okLo && okHi
 }
 
-// blockStart is the position of block i's first entry among all entries (i may be
-// numBlocks: then it is numEntries).
 func (p *points) blockStart(i uint32) uint64 {
-	if p.starts != nil {
-		return uint64(p.starts[i])
-	}
 	return min(uint64(i)*pointsBlockSize, uint64(p.numEntries))
 }
 
@@ -247,8 +231,6 @@ func (p *points) blockEntries(i uint32, docs []uint32, vals []float64) ([]uint32
 	return docs, vals
 }
 
-// below counts the entries whose value is below x, or at most x when inclusive: a
-// binary search of the block table, then one block's values.
 func (p *points) below(x float64, inclusive bool) uint64 {
 	if p == nil || p.numBlocks == 0 {
 		return 0
@@ -274,8 +256,6 @@ func (p *points) below(x float64, inclusive bool) uint64 {
 	return n
 }
 
-// count is how many entries hold a value within [lo, hi], each bound inclusive per
-// incLo/incHi.
 func (p *points) count(lo, hi float64, incLo, incHi bool) uint64 {
 	if p == nil || hi < lo {
 		return 0
@@ -287,7 +267,6 @@ func (p *points) count(lo, hi float64, incLo, incHi bool) uint64 {
 	return upTo - before
 }
 
-// candidateBlocks is the half-open run of blocks that may hold a value within [lo, hi].
 func (p *points) candidateBlocks(lo, hi float64, incLo, incHi bool) (first, end uint32) {
 	first = p.searchBlocks(func(i uint32) bool {
 		v := p.blockMax(i)

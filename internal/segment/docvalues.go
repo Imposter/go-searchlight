@@ -650,23 +650,6 @@ func (m MultiColumn) Term(ord uint32) string {
 	return string(m.c.dict.termAt(nil, ord))
 }
 
-// EachTerm calls fn with the ordinal and value of every entry from ordinal from on, in
-// order, until fn returns false or the entries run out, as [KeywordColumn.EachTerm].
-func (m MultiColumn) EachTerm(from uint32, fn func(ord uint32, term []byte) bool) {
-	if m.c == nil || from >= m.c.dict.numTerms {
-		return
-	}
-	it := m.c.dict.iter(from / blockTerms)
-	for it.next() {
-		if it.info.ord < from {
-			continue
-		}
-		if !fn(it.info.ord, it.term) {
-			return
-		}
-	}
-}
-
 // AppendTerm appends the entry of ordinal ord to dst.
 func (m MultiColumn) AppendTerm(dst []byte, ord uint32) []byte {
 	if m.c == nil {

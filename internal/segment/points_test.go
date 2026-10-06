@@ -94,7 +94,7 @@ func TestPointsCountRangeFilterAndBlocks(t *testing.T) {
 
 func TestPointsOnPreviousMajor(t *testing.T) {
 	rng := rand.New(rand.NewPCG(3, 4))
-	for _, name := range []string{"dense", "sparse"} {
+	for _, name := range []string{"dense", "sparse", "points"} {
 		r := openCompatFixture(t, name)
 		for _, field := range []string{"price", "created", "rating"} {
 			if nc := r.Numbers(field); nc.Exists() {
@@ -175,6 +175,30 @@ func checkPoints(t *testing.T, rng *rand.Rand, nc NumericColumn, numDocs uint32)
 			if inclusive := bruteRange(nc, numDocs, lo, hi, true, true); !roaring.AndNot(inclusive, seen).IsEmpty() {
 				t.Fatalf("EachBlock%s desc %v missed documents in range", desc, descending)
 			}
+		}
+	}
+}
+
+func TestTermCursorWalksTheDictionary(t *testing.T) {
+	r := mustBuild(t, testDocs(t))
+	for _, c := range []struct {
+		field string
+		kind  TermKind
+	}{{"brand", KindValue}, {"tags", KindEntry}, {"title", KindWord}, {"nope", KindValue}, {"brand", TermKind(99)}} {
+		var want []string
+		var wantDF []uint32
+		r.Terms(c.field, c.kind, "", func(term string, df uint32) bool {
+			want, wantDF = append(want, term), append(wantDF, df)
+			return true
+		})
+		cur := r.Cursor(c.field, c.kind)
+		var got []string
+		var gotDF []uint32
+		for cur.Next() {
+			got, gotDF = append(got, string(cur.Term())), append(gotDF, cur.DocFreq())
+		}
+		if !slices.Equal(got, want) || !slices.Equal(gotDF, wantDF) || int(cur.Len()) != len(want) {
+			t.Fatalf("%s/%d: cursor %q %v (len %d), Terms %q %v", c.field, c.kind, got, gotDF, cur.Len(), want, wantDF)
 		}
 	}
 }

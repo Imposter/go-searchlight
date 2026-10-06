@@ -37,14 +37,15 @@ type Returning struct {
 	Read  string
 }
 
-// ChangeRow is one changelog row.
+// ChangeRow is one changelog row. Payload, like DocumentRow's Body, is the stored
+// form of the JSON: the JSON itself, or a codec byte and its encoding (binary).
 type ChangeRow struct {
 	Seq            int64
 	Index          string
 	Shard          int
 	Kind           string
 	ID             string
-	Payload        string
+	Payload        []byte
 	At             int64
 	IndexUID       string
 	MappingVersion int64
@@ -55,7 +56,7 @@ type DocumentRow struct {
 	Index string
 	Shard int
 	ID    string
-	Body  string
+	Body  []byte
 	Seq   int64
 }
 

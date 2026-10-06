@@ -1,10 +1,10 @@
 package postgres
 
 import (
+	"bytes"
 	"fmt"
 	"regexp"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
@@ -43,10 +43,10 @@ func TestWriteParts(t *testing.T) {
 		Notify:          []string{"n1", "n2"},
 	}
 	for i := range 10 {
-		w.Changes = append(w.Changes, dialect.ChangeRow{Seq: int64(90 + i), Index: "i", ID: fmt.Sprint("c", i), Payload: strings.Repeat("p", 40)})
+		w.Changes = append(w.Changes, dialect.ChangeRow{Seq: int64(90 + i), Index: "i", ID: fmt.Sprint("c", i), Payload: bytes.Repeat([]byte("p"), 40)})
 	}
 	for i := range 3 {
-		w.Documents = append(w.Documents, dialect.DocumentRow{Index: "i", ID: fmt.Sprint("d", i), Body: strings.Repeat("b", 40), Seq: int64(i)})
+		w.Documents = append(w.Documents, dialect.DocumentRow{Index: "i", ID: fmt.Sprint("d", i), Body: bytes.Repeat([]byte("b"), 40), Seq: int64(i)})
 	}
 	parts := write(w, dialect.Limits{Bytes: 120}) // three 40-byte rows a part
 	if len(parts) != 4 {

@@ -56,10 +56,10 @@ var changelog = dialect.Changelog{
 // win; only two upserts of one key fail ("cannot affect row a second time").
 const writeSQL = `WITH changes AS (
 	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version)
-	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bigint[], $8::text[], $9::bigint[])
+	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::bytea[], $7::bigint[], $8::text[], $9::bigint[])
 ), documents AS (
 	INSERT INTO sl_documents (index_name, shard, id, body, seq)
-	SELECT * FROM unnest($10::text[], $11::int[], $12::text[], $13::text[], $14::bigint[])
+	SELECT * FROM unnest($10::text[], $11::int[], $12::text[], $13::bytea[], $14::bigint[])
 	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, seq = EXCLUDED.seq
 ), queries AS (
 	INSERT INTO sl_queries (index_name, shard, id, query, meta, seq)
@@ -162,16 +162,17 @@ func keys(groups []dialect.DeleteGroup) keyColumns {
 }
 
 type writeArgs struct {
-	cSeq, cAt, cMV        []int64
-	cKind, cPayload, cUID []string
-	c                     keyColumns
-	d                     keyColumns
-	dBody                 []string
-	dSeq                  []int64
-	q                     keyColumns
-	qQuery, qMeta         []string
-	qSeq                  []int64
-	dDel, qDel            keyColumns
+	cSeq, cAt, cMV []int64
+	cKind, cUID    []string
+	cPayload       [][]byte
+	c              keyColumns
+	d              keyColumns
+	dBody          [][]byte
+	dSeq           []int64
+	q              keyColumns
+	qQuery, qMeta  []string
+	qSeq           []int64
+	dDel, qDel     keyColumns
 }
 
 func (a *writeArgs) changes(rows []dialect.ChangeRow) {
@@ -211,8 +212,8 @@ func (a *writeArgs) queries(rows []dialect.QueryRow) {
 // what is meant.
 func (a *writeArgs) args(counter int64, notify []string) []any {
 	return []any{
-		ints64(a.cSeq), strs(a.c.index), ints(a.c.shard), strs(a.cKind), strs(a.c.id), strs(a.cPayload), ints64(a.cAt), strs(a.cUID), ints64(a.cMV),
-		strs(a.d.index), ints(a.d.shard), strs(a.d.id), strs(a.dBody), ints64(a.dSeq),
+		ints64(a.cSeq), strs(a.c.index), ints(a.c.shard), strs(a.cKind), strs(a.c.id), byteas(a.cPayload), ints64(a.cAt), strs(a.cUID), ints64(a.cMV),
+		strs(a.d.index), ints(a.d.shard), strs(a.d.id), byteas(a.dBody), ints64(a.dSeq),
 		strs(a.q.index), ints(a.q.shard), strs(a.q.id), strs(a.qQuery), strs(a.qMeta), ints64(a.qSeq),
 		strs(a.dDel.index), ints(a.dDel.shard), strs(a.dDel.id),
 		strs(a.qDel.index), ints(a.qDel.shard), strs(a.qDel.id),
@@ -224,6 +225,13 @@ func (a *writeArgs) args(counter int64, notify []string) []any {
 func strs(s []string) []string {
 	if s == nil {
 		return []string{}
+	}
+	return s
+}
+
+func byteas(s [][]byte) [][]byte {
+	if s == nil {
+		return [][]byte{}
 	}
 	return s
 }

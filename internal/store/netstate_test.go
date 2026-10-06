@@ -20,11 +20,11 @@ func TestNetStateDisjoint(t *testing.T) {
 		r := rand.New(rand.NewPCG(seed, 7))
 		n := 1 + r.IntN(40)
 		batch := make([]Change, n)
-		p := &prepared{payload: make([]string, n), query: make([]QueryPayload, n)}
+		p := &prepared{payload: make([][]byte, n), query: make([]QueryPayload, n)}
 		for i := range batch {
 			c := Change{Index: fmt.Sprint("i", r.IntN(2)), Shard: r.IntN(3), Kind: kinds[r.IntN(len(kinds))], ID: fmt.Sprint("k", r.IntN(4))}
 			batch[i] = c
-			p.payload[i] = fmt.Sprintf(`{"n":%d}`, i)
+			p.payload[i] = fmt.Appendf(nil, `{"n":%d}`, i)
 			p.query[i] = QueryPayload{Query: json.RawMessage(fmt.Sprintf(`{"q":%d}`, i)), Meta: json.RawMessage(`{}`)}
 		}
 		const first = 100

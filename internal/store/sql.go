@@ -321,10 +321,10 @@ func rollback(tx *sql.Tx) { _ = tx.Rollback() }
 
 // --- Apply ---------------------------------------------------------------
 
-// prepared is a validated batch with its stored payload text. The prepared
+// prepared is a validated batch with its stored payloads (encodeBody). The prepared
 // forms of several requests concatenate (GroupCommitter).
 type prepared struct {
-	payload     []string
+	payload     [][]byte
 	query       []QueryPayload // KindQueryUpsert only
 	conditional bool
 }
@@ -338,7 +338,7 @@ func (p *prepared) append(q *prepared) {
 // prepare validates a batch and reports the first bad change as a
 // *ChangeError with its position in batch.
 func prepare(batch []Change) (*prepared, error) {
-	p := &prepared{payload: make([]string, len(batch)), query: make([]QueryPayload, len(batch))}
+	p := &prepared{payload: make([][]byte, len(batch)), query: make([]QueryPayload, len(batch))}
 	for i := range batch {
 		if err := p.prepareOne(i, &batch[i]); err != nil {
 			return nil, &ChangeError{Position: i, Err: err}
@@ -371,7 +371,7 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
 		}
-		p.payload[i] = string(c.Payload)
+		p.payload[i] = encodeBody(c.Payload)
 	case KindQueryUpsert:
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
@@ -384,11 +384,12 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 			q.Meta = json.RawMessage("{}")
 		}
 		p.query[i] = q
-		p.payload[i] = string(c.Payload)
+		p.payload[i] = c.Payload
 	case KindDelete, KindQueryDelete:
 		if len(c.Payload) != 0 {
 			return invalidf("%s carries a payload", c.Kind)
 		}
+		p.payload[i] = []byte{}
 	}
 	return nil
 }
@@ -777,7 +778,9 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		}
 		c.Kind = Kind(kind)
 		if len(payload) > 0 {
-			c.Payload = payload
+			if c.Payload, err = decodeBody(payload); err != nil {
+				return nil, fmt.Errorf("%s seq %d: %w", shard, c.Seq, err)
+			}
 		}
 		c.At = millis(at)
 		out = append(out, c)
@@ -836,7 +839,13 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanDocuments, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
-		return r, rows.Scan(&r.ID, &r.Body, &r.Seq)
+		var stored []byte
+		if err := rows.Scan(&r.ID, &stored, &r.Seq); err != nil {
+			return r, err
+		}
+		var err error
+		r.Body, err = decodeBody(stored)
+		return r, err
 	}, fn); err != nil {
 		return 0, err
 	}

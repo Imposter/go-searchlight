@@ -499,7 +499,16 @@ Notes:
   brings a migration cannot be rolled back by downgrading the binary: restore the
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
-  is one migration, the initial schema.
+  are two: the initial schema, and stored bodies (below).
+- **Upgrading to stored bodies** (schema migration 2). From then on document bodies
+  (`sl_documents`) and changelog payloads (`sl_changes`) are stored compressed (zstd, behind
+  a codec byte); rows written before keep their JSON and read as they always did, so
+  nothing is rewritten in bulk on SQLite. On Postgres and MySQL the migration turns the
+  two columns into bytes (`BYTEA`, `LONGBLOB`), which rewrites both tables once, under the
+  migration lock: the first upgraded node takes longer to start on a large database.
+  Nodes still on the old binary cannot read compressed rows (their copies halt until the
+  node is upgraded) and, on Postgres, cannot write into the converted columns. **Stop
+  every node, then start the upgraded ones**, rather than rolling this upgrade.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

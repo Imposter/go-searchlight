@@ -148,24 +148,19 @@ func TestSnapshotHoldsSegmentFiles(t *testing.T) {
 	sn.Release()
 	sn.Release() // idempotent
 	h.refresh()
-	deadline := 50
-	for ; deadline > 0; deadline-- {
-		gone := true
-		for _, n := range names {
-			if n == ManifestName {
-				continue
-			}
-			if _, err := os.Stat(filepath.Join(h.dir, n)); err == nil {
-				gone = false
-			}
+	// Release may hand the files to the janitor on its own goroutine rather than
+	// delete them inline: wait it out (waitNoOrphans's drain-and-recheck loop,
+	// spaced out rather than spun) instead of calling drain a fixed number of times
+	// back to back, which can all run before that goroutine gets to removeLater
+	// under -race's heavier scheduling.
+	h.waitNoOrphans()
+	for _, n := range names {
+		if n == ManifestName {
+			continue
 		}
-		if gone {
-			break
+		if _, err := os.Stat(filepath.Join(h.dir, n)); err == nil {
+			t.Fatalf("merged-away file %s outlived the snapshot's release: %v", n, dirFiles(t, h.dir))
 		}
-		h.s.jan.drain()
-	}
-	if deadline == 0 {
-		t.Fatalf("merged-away files %v outlived the snapshot's release: %v", names, dirFiles(t, h.dir))
 	}
 	if !slices.Contains(dirFiles(t, h.dir), ManifestName) {
 		t.Fatal("no manifest")

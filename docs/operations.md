@@ -427,10 +427,17 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 ### The database
 
 - **Records.** It holds every document and saved query (`sl_documents`, `sl_queries`).
+  Document bodies are stored compressed (zstd): on the benchmark's product listings
+  (about 870 bytes of JSON each) `sl_documents` takes about 0.8 GB per million documents
+  on Postgres, against 1 GB uncompressed.
 - **Changelog.** `sl_changes` holds the changes not yet pruned: at most
-  `changelog_retention` (24 h) of writes, usually far less. Pruning follows the slowest
-  live copy, so a stalled copy holds the floor for at most `prune_stall_timeout`. Each
-  retained recovery bundle holds it too, at its seq.
+  `changelog_retention` (24 h) of writes, usually far less. The leader prunes every 10 s,
+  below what every live copy has flushed, so under a steady stream of writes it holds
+  about two `flush_interval`s of them. Pruning follows the slowest live copy, so a
+  stalled copy holds the floor for at most `prune_stall_timeout`. Each retained recovery
+  bundle holds it too, at its seq. Its payloads are compressed like the bodies. A pruned
+  row's space is reused by later writes (SQLite's free pages, Postgres's vacuum), so the
+  database grows to the documents plus the changelog's high-water mark.
 - **Recovery bundles** (with `bundle_interval` set) take about each shard's segment size
   times `bundle_retention` in `sl_blobs`.
 - **Write rate.** Group commit coalesces each node's concurrent writes into one

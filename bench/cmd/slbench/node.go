@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Imposter/go-searchlight/bench/workloads"
@@ -74,6 +75,8 @@ type recoverer struct {
 	engine     *workloads.Searchlight
 	replicas   int
 	client     *http.Client
+	log        io.Writer
+	closeOnce  sync.Once
 }
 
 // newRecoverer starts the recovery cluster's source node.
@@ -91,7 +94,7 @@ func newRecoverer(ctx context.Context, sp nodeSpec, log io.Writer) (*recoverer, 
 		return nil, err
 	}
 	return &recoverer{
-		spec: sp, source: node, stopSource: stop, client: &http.Client{},
+		spec: sp, source: node, stopSource: stop, client: &http.Client{}, log: log,
 		engine: workloads.NewSearchlight(workloads.SearchlightOptions{URL: node.URL, Token: node.Token, Log: log}),
 	}, nil
 }
@@ -196,5 +199,14 @@ func (r *recoverer) servedBy(ctx context.Context, node *slproc.Node, index strin
 	return docs, nil
 }
 
-// close stops the source node.
-func (r *recoverer) close(w io.Writer) { r.stopSource(w) }
+// Close implements workloads.Recoverer: stops the source node, releasing its full
+// copy of the dataset -- about 3.6 GiB at 1M documents -- before the suite moves to
+// the next engine's own recovery measurement (observed overlapping with
+// Elasticsearch's two full-heap JVMs in earlier runs: exit 143 and an external
+// cancellation, both near the recovery step). Idempotent: cmdRun's own deferred
+// close, a safety net for a run that skips the recovery workload entirely, calls it
+// too.
+func (r *recoverer) Close(context.Context) error {
+	r.closeOnce.Do(func() { r.stopSource(r.log) })
+	return nil
+}

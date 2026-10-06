@@ -42,14 +42,12 @@ jobs:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     # The default --visible-iterations (1000, minSamples(0.99)) costs roughly 36
     # extra minutes by itself (bench/workloads/suite.go's VisibleIterations comment
-    # has the measured per-iteration cost). On top of that, --repeats (default 3)
-    # reruns every filter/sorted/aggs/percolate-single workload for stable p99s
-    # (target: run-to-run variance), and --es-recovery adds Elasticsearch's own
-    # peer-recovery timing (target T8) to the Searchlight-only recovery workload
-    # that already ran here. 240 leaves room for a 1M-document run's load, searches,
-    # aggregations, percolation and both engines' recovery; narrow it back down
-    # once a real 1M run's wall time is measured.
-    timeout-minutes: 240
+    # has the measured per-iteration cost); 180 still leaves room for a 1M-document
+    # run's load, searches, aggregations, percolation and both engines' recovery.
+    # (A 240-minute bump was tried here briefly, diagnosing two runs that were cut
+    # off near the recovery step as a time-budget problem; it was a memory-overlap
+    # problem instead -- recoverer.Close -- and 180 is back to being enough.)
+    timeout-minutes: 180
     # The recovery workload (target T8: a new replica from zero to serving) needs a
     # second Searchlight node, and so a store two nodes can share: this Postgres, for a
     # cluster of slbench's own beside the SQLite node every other workload runs on.
@@ -137,6 +135,17 @@ jobs:
           go build -o /tmp/slbench ./bench/cmd/slbench
           make build
 
+      # Backgrounded for the rest of the job (killed in "collect server logs", the
+      # next if: always() step): `free -m` every 10 s, so a run that fails near the
+      # memory-heavy recovery step (two full-heap Elasticsearch JVMs plus, until
+      # recoverer.Close, a held-open third Searchlight copy) leaves evidence of
+      # whether memory pressure was why, not just a guess from the symptom.
+      - name: sample memory every 10s in the background
+        run: |
+          mkdir -p "$SL_DIR"
+          nohup bash -c 'while true; do date -u +%FT%TZ; free -m; echo; sleep 10; done' >> "$SL_DIR/mem.log" 2>&1 &
+          echo $! > "$SL_DIR/mem.pid"
+
       - name: start Elasticsearch
         run: docker compose -f bench/docker-compose.es.yml up -d
 
@@ -165,17 +174,23 @@ jobs:
         run: |
           DATA_FILE=$(ls "$DATA_DIR"/products-*.ndjson | head -1)
           SEARCH_FILE=$(ls "$DATA_DIR"/searches-*.ndjson | sort -t- -k2 -V | tail -1)
-          # The host-visible PID of the JVM inside es1 (the node slbench talks to), so
-          # its RSS is read the same way as Searchlight's: /proc/<pid>/status VmRSS of
-          # the actual server process, not a container-wide cgroup estimate that
-          # counts page cache differently (T6 ruling, 2026-10-05: measure RSS the same
-          # way for both engines). "docker top", not "docker inspect -f
+          # The host-visible PID of the server JVM inside es1 (the node slbench talks
+          # to), so its RSS is read the same way as Searchlight's: /proc/<pid>/status
+          # VmRSS of the actual server process, not a container-wide cgroup estimate
+          # that counts page cache differently (T6 ruling, 2026-10-05: measure RSS the
+          # same way for both engines). "docker top", not "docker inspect -f
           # '{{.State.Pid}}'": the image's entrypoint does not exec into java, so
           # State.Pid names a lightweight wrapper process, not the JVM -- confirmed by
-          # run 37399767772 reading a 1.35 MiB "RSS" for all of Elasticsearch. "docker
-          # top" lists every process in the container with its real host PID, letting
-          # this find the java process specifically.
-          ES_PID=$(docker top slbench-elasticsearch -eo pid,comm | awk '$2=="java"{print $1; exit}')
+          # run 37399767772 reading a 1.35 MiB "RSS" for all of Elasticsearch.
+          #
+          # More than one "java"-named process can exist in the container (helper
+          # processes, a controller, ...): run 37447038121's "docker top ... | awk
+          # '$2==\"java\"{print $1; exit}'" picked one of those (30-59 MiB) instead of
+          # the real server, which at 1M documents holds multiple GB. The highest-RSS
+          # "java" row is the server; slbench's own 64 MiB floor is kept only as a
+          # guard against this same mistake happening again, not the primary check.
+          ES_PID=$(docker top slbench-elasticsearch -eo pid,rss,comm | tail -n +2 | awk '$3=="java"' | sort -k2,2 -n | tail -1 | awk '{print $1}')
+          echo "es-pid: picked $(docker top slbench-elasticsearch -eo pid,rss,comm | tail -n +2 | awk -v p="$ES_PID" '$1==p')"
           /tmp/slbench run \
             --data "$DATA_FILE" \
             --searches "$SEARCH_FILE" \
@@ -188,7 +203,6 @@ jobs:
             --es-pid "$ES_PID" \
             --es-config "heap_max=${ES_HEAP}" \
             --es-recovery \
-            --repeats 1 \
             --label "CI (${{ github.sha }})" \
             --out "$DATA_DIR/bench-results.json" \
             --md docs/benchmarks.md \
@@ -196,16 +210,14 @@ jobs:
           # No --allow-mismatch: an untolerated engine disagreement must fail this job
           # (exit code 3), not just a line in the report.
           #
-          # --repeats 1 (not the CLI's own default of 3): two back-to-back dispatches
-          # at 1M documents (identical otherwise) each got cut off by what looks like
-          # an execution ceiling well under this job's own 240-minute timeout-minutes
-          # (109 min and 120 min; main's own unmodified baseline run finished cleanly
-          # in 106 min, so the margin here is tight) -- right as Elasticsearch's own
-          # recovery measurement (the heaviest addition besides repeats) was about to
-          # start, both times. Until that ceiling is understood (it is not this
-          # workflow's own setting) or the run is otherwise trimmed, 1M-document CI
-          # dispatches drop the repeat multiplier to fit; --repeats 2 or 3 is still
-          # the better choice for a smaller or more leisurely run.
+          # --repeats is the CLI's own default (3) again: two earlier 1M dispatches
+          # that dropped it to 1 got cut off near the recovery step anyway (109 min,
+          # 120 min), which recovery.go's Close fix (this same change) addresses more
+          # directly -- the recovery-source node's full extra copy, held open until
+          # the whole process exited, overlapping with Elasticsearch's own two
+          # full-heap JVMs during exactly that step. If a dispatch with the default
+          # repeats still does not fit, drop it again and say so in the commit, rather
+          # than silently leaving it dropped once the actual cause looked different.
         continue-on-error: true
 
       # Captured before the services stop (docker compose down drops the
@@ -219,6 +231,14 @@ jobs:
       - name: collect server logs
         if: always()
         run: |
+          if [ -f "$SL_DIR/mem.pid" ]; then
+            kill "$(cat "$SL_DIR/mem.pid")" 2>/dev/null || true
+          fi
+          if [ -f "$SL_DIR/mem.log" ]; then
+            PEAK_USED=$(awk '/^Mem:/{print $3}' "$SL_DIR/mem.log" | sort -n | tail -1)
+            PEAK_AVAIL=$(awk '/^Mem:/{print $7}' "$SL_DIR/mem.log" | sort -n | head -1)
+            echo "peak memory used (MB): ${PEAK_USED:-unknown}; lowest memory available (MB): ${PEAK_AVAIL:-unknown}"
+          fi
           docker compose -f bench/docker-compose.es.yml logs --no-color --timestamps \
             > "$SL_DIR/elasticsearch.log" 2>&1 || true
           if [ "${{ steps.run.outcome }}" = "failure" ]; then
@@ -246,6 +266,7 @@ jobs:
             ${{ env.SL_DIR }}/recovery/*/searchlight.log
             ${{ env.SL_DIR }}/elasticsearch.log
             ${{ env.SL_DIR }}/pprof/*
+            ${{ env.SL_DIR }}/mem.log
           if-no-files-found: warn
           retention-days: 90
 

@@ -350,11 +350,10 @@ func (s *Searchlight) PutQueries(ctx context.Context, index string, qs []dataset
 	return s.Refresh(ctx, index)
 }
 
-// Percolate implements Engine. server prefers a Server-Timing response header,
-// then a top-level "took" field (assumed microseconds -- "a µs-precision took", the
-// operator's own description of it -- unlike Elasticsearch's own "took", which is
-// milliseconds; fix this field's unit or name here if the server ships something
-// different), and is (0, false) when the response carries neither yet.
+// Percolate implements Engine. server prefers a Server-Timing response header
+// (PR #49 emits "Server-Timing: total;dur=<ms>"), then a top-level "took_us" field
+// (PR #49: microseconds, unlike Elasticsearch's own "took", which is milliseconds),
+// and is (0, false) when the response carries neither yet.
 func (s *Searchlight) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, time.Duration, bool, error) {
 	body, err := json.Marshal(map[string]any{"docs": docs})
 	if err != nil {
@@ -368,7 +367,7 @@ func (s *Searchlight) Percolate(ctx context.Context, index string, docs []json.R
 		Results []struct {
 			Queries []string `json:"queries"`
 		} `json:"results"`
-		TookMicros *int64 `json:"took,omitempty"`
+		TookMicros *int64 `json:"took_us,omitempty"`
 	}
 	if err := json.Unmarshal(b, &res); err != nil {
 		return nil, 0, false, fmt.Errorf("searchlight percolate: %w", err)

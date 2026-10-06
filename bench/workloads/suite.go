@@ -1278,6 +1278,12 @@ func (s *suite) restart(ctx context.Context) error {
 type Recoverer interface {
 	Source() Engine
 	Recover(ctx context.Context, index string, want int64) (time.Duration, error)
+	// Close releases Source's own resources (a loaded node holding a full copy of
+	// the dataset): the suite calls it right after this engine's own iterations,
+	// before moving to the next engine's, so that copy's memory is not still
+	// resident while the next engine's recovery measurement runs. A Recoverer with
+	// no Source of its own (nil Source()) does nothing here.
+	Close(ctx context.Context) error
 }
 
 // recovery loads the dataset into each recoverer's own source, when it has one, and
@@ -1315,6 +1321,9 @@ func (s *suite) recovery(ctx context.Context) error {
 		res := s.result("recovery", report.GroupRecovery, desc, eng, o, Run(ctx, o, op))
 		res.Values = map[string]float64{"docs": float64(n)}
 		s.add(res)
+		if err := rec.Close(ctx); err != nil {
+			s.logf("  %s: closing the recovery source: %v", eng.Name(), err)
+		}
 	}
 	return nil
 }

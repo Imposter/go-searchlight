@@ -581,6 +581,9 @@ func NewElasticsearchRecoverer(eng *Elasticsearch) *ElasticsearchRecoverer {
 // rest of the suite already loaded, not a separate source cluster.
 func (*ElasticsearchRecoverer) Source() Engine { return nil }
 
+// Close implements Recoverer: nothing to release, since Source is nil.
+func (*ElasticsearchRecoverer) Close(context.Context) error { return nil }
+
 // Recover implements Recoverer.
 func (r *ElasticsearchRecoverer) Recover(ctx context.Context, index string, _ int64) (time.Duration, error) {
 	e := r.eng

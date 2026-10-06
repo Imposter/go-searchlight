@@ -172,7 +172,7 @@ func cmdRun(ctx context.Context, args []string, stdout, stderr io.Writer, loadOn
 			if err != nil {
 				return err
 			}
-			defer rec.close(stderr)
+			defer func() { _ = rec.Close(ctx) }()
 			recoverers[report.Searchlight] = rec
 		}
 	} else if *recoveryStore != "" {

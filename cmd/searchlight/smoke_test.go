@@ -192,6 +192,7 @@ func startBinary(t *testing.T, bin string, args []string) *binaryNode {
 	go func() {
 		n.exitErr = cmd.Wait()
 		_ = logs.Close()
+		<-logs.drained
 		close(n.done)
 	}()
 	t.Cleanup(func() {

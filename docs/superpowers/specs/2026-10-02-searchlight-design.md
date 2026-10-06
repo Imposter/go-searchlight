@@ -204,6 +204,8 @@ A segment is immutable and written once at refresh or merge time. It is one file
   - **A peer snapshot** flushes first, then streams the generation that flush made durable, so a copy never hands out a `seq` it could itself lose.
 - **Caches:**
   - a **filter cache**: an LRU of bitmaps for frequent leaves, per segment, invalidated naturally because segments are immutable;
+  - a **rank cache** of each segment's id ranks for tied sorts: 256 MiB, at most 64 MiB for one segment;
+  - a **global-ordinals cache**: per keyword or list field and segment list, the map from segment ordinals to the shard's sorted union of terms, for terms and cardinality over many of a field's terms; 256 MiB, rebuilt when the segment list changes, at a cost that grows with the field's distinct terms;
   - the OS page cache for mmap.
 
 ### Query execution (`internal/search`)
@@ -350,6 +352,7 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `max_lag` | 2 s |
 | `merge_budget` | I/O and CPU budget for merges |
 | `search_threads` | defaults to GOMAXPROCS |
+| `gc_heap_floor` | 64 MiB: the heap below which the GC does not run (0 = off; GOGC overrides) |
 | `log_level` | log verbosity |
 
 Configuration is validated at start.

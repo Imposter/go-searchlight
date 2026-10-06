@@ -302,9 +302,10 @@ type Tailer struct {
 	// can only be rebuilt, which waits until the halted row is superseded.
 	gate *HaltError
 	// scanFor and scanFrom are where the search for a change superseding a halted
-	// one got to.
-	scanFor  *HaltError
-	scanFrom int64
+	// one got to; scanPruned that it has met the changelog pruned past it.
+	scanFor    *HaltError
+	scanFrom   int64
+	scanPruned bool
 	// remapSince and remapVersion are when a remap's rebuild started waiting, and
 	// the newest mapping version seen since.
 	remapSince   time.Time

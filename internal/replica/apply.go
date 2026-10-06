@@ -721,15 +721,21 @@ func (t *Tailer) clearHalt() {
 // superseded reports whether the changelog holds a change of h's document or query
 // (or mapping) after h's seq: the bad row is then no longer current, and a rebuild
 // from a snapshot gets past it. The search resumes where the last one for h stopped.
-// A changelog pruned past h needs a rebuild anyway: that counts as superseded.
+// A changelog pruned past h needs a rebuild anyway: that counts as superseded once.
+// After that rebuild has stopped at h again, the record itself decides
+// ([Tailer.recordMoved]), so a halted copy is not rescanned at every backoff.
 func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 	if t.scanFor == nil || t.scanFor.Seq != h.Seq || t.scanFor.ID != h.ID {
-		t.scanFor, t.scanFrom = h, h.Seq
+		t.scanFor, t.scanFrom, t.scanPruned = h, h.Seq, false
 	}
 	for {
 		page, err := t.st.ChangesAfter(ctx, t.id, t.scanFrom, t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
-			return true, nil
+			if !t.scanPruned {
+				t.scanPruned = true
+				return true, nil
+			}
+			return t.recordMoved(ctx, h)
 		}
 		if err != nil {
 			return false, err
@@ -748,4 +754,31 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 			return false, nil
 		}
 	}
+}
+
+// recordMoved reports whether h's document or saved query is no longer the row h
+// halted at: deleted, or written again since. A mapping, or a store that cannot read
+// records, never reports it.
+func (t *Tailer) recordMoved(ctx context.Context, h *HaltError) (bool, error) {
+	rr, ok := t.st.(store.RecordReader)
+	if !ok {
+		return false, nil
+	}
+	var kind store.RecordKind
+	switch h.class {
+	case classDocument:
+		kind = store.RecordDocument
+	case classQuery:
+		kind = store.RecordQuery
+	default:
+		return false, nil
+	}
+	r, err := rr.GetRecord(ctx, kind, t.id, h.ID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+	return r.Seq != h.Seq, nil
 }

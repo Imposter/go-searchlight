@@ -76,9 +76,11 @@ func TestGateLanesAndFIFO(t *testing.T) {
 }
 
 // TestRenewalLatencyUnderBulkLoad (probe P3): on SQLite, whose writes share one
-// connection, lease renewals made while writers keep committing large batches wait
-// for about one transaction, never behind the queue of bulk commits. The fixed
-// margins scale under the race detector, which slows the commit path several-fold.
+// connection, lease renewals made while writers keep committing large batches are not
+// stuck behind the queue of bulk commits, and a truncation of the log holds the write
+// connection for about a commit. The lane order that keeps a renewal ahead of the
+// queue is TestGateLanesAndFIFO's; here the latencies are measured and logged, and
+// only a gross stall, judged against the commit time measured alongside, fails.
 func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	testtier.Heavy(t)
 	st := durableSQLiteHarness(t).open(t)
@@ -134,20 +136,11 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	for _, d := range renewals {
 		worst = max(worst, d)
 	}
-	// The gate's high lane (registry writes: renewals, claims, heartbeats) always
-	// goes before its low lane (changelog commits), and the pool has one write
-	// connection, released not at the end of a writer's transaction but once its
-	// BeginTx or Conn call already has the connection. So at any instant at most two
-	// writers are ahead of a newly enqueued renewal: the one already holding the
-	// real connection, and the one already holding the gate, blocked behind it alone
-	// at the pool. A renewal never queues behind a third, deterministically,
-	// regardless of how loaded the pool's disk is.
-	var worstQueued int64
+	// landed counts commits that finished at any point during a renewal's call, not only
+	// those granted between its enqueue and its own grant: logged, not asserted.
+	var landed int64
 	for _, n := range queuedAhead {
-		if n > 2 {
-			t.Errorf("a renewal let %d bulk commits land while it ran, want at most 2 (the gate's FIFO lane priority)", n)
-		}
-		worstQueued = max(worstQueued, n)
+		landed = max(landed, n)
 	}
 	// The writers hold the one connection back to back, so the mean time a commit
 	// holds it is the window over the commits made in it.
@@ -166,14 +159,18 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 	t.Logf("renewals: median %s, p90 %s, slowest %s, at most %d commit(s) landed during any one; "+
 		"a bulk commit (2000 changes) holds the connection %s on average (%d commits); "+
 		"log file %d bytes, %d truncations holding it up to %s",
-		median, p90, worst, worstQueued, commit, done, s.walSize(), s.truncates.Load(), truncateHold)
-	// Loose sanity checks only, past the deterministic FIFO proof above: catch a
-	// real stall or deadlock, not a slow disk on a shared runner.
+		median, p90, worst, landed, commit, done, s.walSize(), s.truncates.Load(), truncateHold)
+	// Loose sanity checks only, scaled by the commit time measured on the same disk in
+	// the same window: catch a real stall, not a slow shared runner.
 	if limit := 50 * commit; median > limit {
 		t.Fatalf("the median renewal took %s under bulk load, way past about one commit in flight (%s)", median, limit)
 	}
-	if limit := 50 * commit; truncateHold > limit {
-		t.Fatalf("a truncation of the log held the write connection %s (limit %s, way past one bulk commit)", truncateHold, limit)
+	// A truncation runs just after a checkpoint has copied the log back beside the
+	// writers, so on the write connection it copies only the few commits made since and
+	// waits for readers at most truncateBusyMS: about a commit's work plus that wait.
+	// Ten commits' worth means it copied or waited for something unbounded.
+	if limit := 10*commit + truncateBusyMS*time.Millisecond; truncateHold > limit {
+		t.Fatalf("a truncation of the log held the write connection %s (limit %s, ten bulk commits and its reader wait)", truncateHold, limit)
 	}
 	if limit := 3 * s.d.TruncateAbove; s.truncates.Load() == 0 || s.walSize() > limit {
 		t.Fatalf("a steady stream of commits left a %d-byte log after %d truncations (limit %d): it never restarts on its own",

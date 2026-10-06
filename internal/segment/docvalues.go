@@ -321,6 +321,112 @@ func (n NumericColumn) Range(lo, hi float64, incLo, incHi bool) *roaring.Bitmap 
 	return n.c.points.rangeDocs(lo, hi, incLo, incHi)
 }
 
+// Count returns how many documents hold a value within [lo, hi], each bound inclusive
+// per incLo/incHi, deleted ones included: two binary searches of the point index and
+// at most two of its blocks read.
+func (n NumericColumn) Count(lo, hi float64, incLo, incHi bool) uint64 {
+	if n.c == nil {
+		return 0
+	}
+	return n.c.points.count(lo, hi, incLo, incHi)
+}
+
+// EachBlock calls fn with every block of the point index that may hold a value within
+// [lo, hi] (inclusive), in ascending value order (descending when desc), until fn
+// returns false. Deleted documents are included.
+func (n NumericColumn) EachBlock(lo, hi float64, desc bool, fn func(PointBlock) bool) {
+	if n.c == nil {
+		return
+	}
+	n.c.points.eachBlock(lo, hi, desc, fn)
+}
+
+// Filter appends to dst the documents of docs whose value is within [lo, hi], each
+// bound inclusive per incLo/incHi, comparing packed keys rather than values.
+func (n NumericColumn) Filter(docs []uint32, lo, hi float64, incLo, incHi bool, dst []uint32) []uint32 {
+	c := n.c
+	if c == nil {
+		return dst
+	}
+	kLo, kHi, ok := c.keyBounds(lo, hi, incLo, incHi)
+	if !ok {
+		return dst
+	}
+	for _, d := range docs {
+		if d >= c.numDocs || (!c.allPresent && c.present[d/8]>>(d%8)&1 == 0) {
+			continue
+		}
+		if k := unpack(c.packed, uint64(d), c.width); k >= kLo && k <= kHi {
+			dst = append(dst, d)
+		}
+	}
+	return dst
+}
+
+// Missing appends to dst the documents of docs that hold no value.
+func (n NumericColumn) Missing(docs, dst []uint32) []uint32 {
+	c := n.c
+	if c == nil {
+		return append(dst, docs...)
+	}
+	if c.allPresent {
+		for _, d := range docs {
+			if d >= c.numDocs {
+				dst = append(dst, d)
+			}
+		}
+		return dst
+	}
+	for _, d := range docs {
+		if !c.has(d) {
+			dst = append(dst, d)
+		}
+	}
+	return dst
+}
+
+// keyBounds is the run of keys [kLo, kHi] whose values lie within [lo, hi]; false when
+// no value of the column can.
+func (c *numberColumn) keyBounds(lo, hi float64, incLo, incHi bool) (kLo, kHi uint64, ok bool) {
+	st := c.stats
+	if st.Count == 0 || hi < lo || !inRangeOverlap(st.Min, st.Max, lo, hi, incLo, incHi) {
+		return 0, 0, false
+	}
+	top := c.enc.key(st.Max)
+	kLo = searchKeys(top+1, func(k uint64) bool {
+		v := c.enc.value(k)
+		return v > lo || (incLo && v == lo)
+	})
+	end := searchKeys(top+1, func(k uint64) bool {
+		v := c.enc.value(k)
+		return v > hi || (!incHi && v == hi)
+	})
+	if end <= kLo {
+		return 0, 0, false
+	}
+	return kLo, end - 1, true
+}
+
+// inRangeOverlap reports whether [lo, hi] (per incLo/incHi) meets [vmin, vmax].
+func inRangeOverlap(vmin, vmax, lo, hi float64, incLo, incHi bool) bool {
+	return (vmax > lo || (incLo && vmax == lo)) && (vmin < hi || (incHi && vmin == hi))
+}
+
+// searchKeys is the least key below n for which f, monotone in the key, holds (n when
+// none does).
+func searchKeys(n uint64, f func(k uint64) bool) uint64 {
+	lo, hi := uint64(0), n
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if f(mid) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
 // keywordSource yields each document's ordinal in ascending document order.
 type keywordSource func(yield func(doc, ord uint32))
 
@@ -542,6 +648,23 @@ func (m MultiColumn) Term(ord uint32) string {
 		return ""
 	}
 	return string(m.c.dict.termAt(nil, ord))
+}
+
+// EachTerm calls fn with the ordinal and value of every entry from ordinal from on, in
+// order, until fn returns false or the entries run out, as [KeywordColumn.EachTerm].
+func (m MultiColumn) EachTerm(from uint32, fn func(ord uint32, term []byte) bool) {
+	if m.c == nil || from >= m.c.dict.numTerms {
+		return
+	}
+	it := m.c.dict.iter(from / blockTerms)
+	for it.next() {
+		if it.info.ord < from {
+			continue
+		}
+		if !fn(it.info.ord, it.term) {
+			return
+		}
+	}
 }
 
 // AppendTerm appends the entry of ordinal ord to dst.

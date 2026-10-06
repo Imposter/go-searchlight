@@ -95,6 +95,10 @@ type points struct {
 	numBlocks  uint32
 	docWidth   uint8
 	table      []byte // numBlocks table entries
+	// starts holds each block's first entry when some block before the last is short
+	// (nil when every block but the last holds pointsBlockSize entries, as the writer
+	// lays them out).
+	starts []uint32
 }
 
 // openPoints opens the point index at off of col, in a file of the given major.
@@ -125,16 +129,25 @@ func openPoints(data []byte, off uint64, col *numberColumn, major uint16) (*poin
 	// with its packed data inside data: rangeDocs slices them unchecked.
 	var total uint64
 	room := uint64(len(data)) - off
+	uniform := true
 	for i := range p.numBlocks {
 		_, _, count, rel := p.blockEntry(i)
 		size := p.blockSize(count)
 		if count == 0 || count > pointsBlockSize || rel > room || size > room-rel {
 			return nil, errShort
 		}
+		uniform = uniform && (count == pointsBlockSize || i == p.numBlocks-1)
 		total += uint64(count)
 	}
 	if total != uint64(p.numEntries) {
 		return nil, errShort
+	}
+	if !uniform {
+		p.starts = make([]uint32, p.numBlocks+1)
+		for i := range p.numBlocks {
+			_, _, count, _ := p.blockEntry(i)
+			p.starts[i+1] = p.starts[i] + count
+		}
 	}
 	return p, nil
 }
@@ -167,55 +180,217 @@ func inRange(v, lo, hi float64, incLo, incHi bool) bool {
 	return okLo && okHi
 }
 
-// rangeDocs returns the documents whose value is within [lo, hi]. Matches are
-// collected per block and added with one AddMany call each, rather than one Add call
-// per document: AddMany amortizes roaring's container lookup and growth over the whole
-// batch instead of repeating it per match, which matters here since a range query's
-// match count is typically a sizeable fraction of the column, not a handful of terms.
-func (p *points) rangeDocs(lo, hi float64, incLo, incHi bool) *roaring.Bitmap {
-	result := roaring.New()
-	if p == nil {
-		return result
+// blockStart is the position of block i's first entry among all entries (i may be
+// numBlocks: then it is numEntries).
+func (p *points) blockStart(i uint32) uint64 {
+	if p.starts != nil {
+		return uint64(p.starts[i])
 	}
-	var buf []uint32
-	for i := range p.numBlocks {
-		minKey, maxKey, count, off := p.blockRange(i)
-		bmin, bmax := p.col.enc.value(minKey), p.col.enc.value(maxKey)
-		if bmin > hi || (bmin == hi && !incHi) {
-			break // blocks ascend by key: nothing further can be in range
+	return min(uint64(i)*pointsBlockSize, uint64(p.numEntries))
+}
+
+func (p *points) blockMin(i uint32) float64 {
+	return p.col.enc.value(binary.LittleEndian.Uint64(p.table[i*pointsEntryLen:]))
+}
+
+func (p *points) blockMax(i uint32) float64 {
+	return p.col.enc.value(binary.LittleEndian.Uint64(p.table[i*pointsEntryLen+8:]))
+}
+
+// searchBlocks is the first block for which f, monotone in the block index, holds
+// (numBlocks when none does).
+func (p *points) searchBlocks(f func(i uint32) bool) uint32 {
+	lo, hi := uint32(0), p.numBlocks
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if f(mid) {
+			hi = mid
+		} else {
+			lo = mid + 1
 		}
-		if bmax < lo || (bmax == lo && !incLo) {
+	}
+	return lo
+}
+
+// blockEntries reads block i: its documents in (value, doc) order into docs, and,
+// when vals is not nil, their values into vals. A document past the column (corrupt
+// data openPoints cannot see) is skipped. Both are reused buffers.
+func (p *points) blockEntries(i uint32, docs []uint32, vals []float64) ([]uint32, []float64) {
+	_, _, count, off := p.blockRange(i)
+	var keys []byte
+	if p.hasKeys {
+		keyBytes := packedSize(uint64(count), p.keyWidth)
+		keys, off = p.data[off:off+keyBytes], off+keyBytes
+	}
+	packed := p.data[off : off+packedSize(uint64(count), p.docWidth)]
+	docs = docs[:0]
+	if vals != nil {
+		vals = vals[:0]
+	}
+	c := p.col
+	for j := range uint64(count) {
+		doc := unpack(packed, j, p.docWidth)
+		if doc >= uint64(c.numDocs) {
 			continue
 		}
-		fullyIn := inRange(bmin, lo, hi, incLo, incHi) && inRange(bmax, lo, hi, incLo, incHi)
-		var keys []byte
-		if p.hasKeys {
-			keyBytes := packedSize(uint64(count), p.keyWidth)
-			keys, off = p.data[off:off+keyBytes], off+keyBytes
-		}
-		docs := p.data[off : off+packedSize(uint64(count), p.docWidth)]
-		buf = buf[:0]
-		for j := range uint64(count) {
-			doc := unpack(docs, j, p.docWidth)
-			if doc >= uint64(p.col.numDocs) {
-				continue
+		docs = append(docs, uint32(doc)) //nolint:gosec // below numDocs, a uint32
+		if vals != nil {
+			var key uint64
+			if p.hasKeys {
+				key = unpack(keys, j, p.keyWidth)
+			} else {
+				key = unpack(c.packed, doc, c.width)
 			}
-			if !fullyIn {
-				var key uint64
-				if p.hasKeys {
-					key = unpack(keys, j, p.keyWidth)
-				} else {
-					key = unpack(p.col.packed, doc, p.col.width)
-				}
-				if !inRange(p.col.enc.value(key), lo, hi, incLo, incHi) {
-					continue
-				}
-			}
-			buf = append(buf, uint32(doc)) //nolint:gosec // below numDocs, a uint32
-		}
-		if len(buf) > 0 {
-			result.AddMany(buf)
+			vals = append(vals, c.enc.value(key))
 		}
 	}
+	return docs, vals
+}
+
+// below counts the entries whose value is below x, or at most x when inclusive: a
+// binary search of the block table, then one block's values.
+func (p *points) below(x float64, inclusive bool) uint64 {
+	if p == nil || p.numBlocks == 0 {
+		return 0
+	}
+	past := func(v float64) bool { return v > x || (!inclusive && v == x) }
+	i := p.searchBlocks(func(i uint32) bool { return past(p.blockMax(i)) })
+	if i == p.numBlocks {
+		return uint64(p.numEntries)
+	}
+	n := p.blockStart(i)
+	if past(p.blockMin(i)) {
+		return n
+	}
+	var docBuf [pointsBlockSize]uint32
+	var valBuf [pointsBlockSize]float64
+	_, vals := p.blockEntries(i, docBuf[:0], valBuf[:0])
+	for _, v := range vals {
+		if past(v) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// count is how many entries hold a value within [lo, hi], each bound inclusive per
+// incLo/incHi.
+func (p *points) count(lo, hi float64, incLo, incHi bool) uint64 {
+	if p == nil || hi < lo {
+		return 0
+	}
+	upTo, before := p.below(hi, incHi), p.below(lo, !incLo)
+	if upTo <= before {
+		return 0
+	}
+	return upTo - before
+}
+
+// candidateBlocks is the half-open run of blocks that may hold a value within [lo, hi].
+func (p *points) candidateBlocks(lo, hi float64, incLo, incHi bool) (first, end uint32) {
+	first = p.searchBlocks(func(i uint32) bool {
+		v := p.blockMax(i)
+		return v > lo || (incLo && v == lo)
+	})
+	end = p.searchBlocks(func(i uint32) bool {
+		v := p.blockMin(i)
+		return v > hi || (!incHi && v == hi)
+	})
+	return first, max(first, end)
+}
+
+// denseRangeShare: a range whose candidate blocks hold at least 1/denseRangeShare of
+// the segment's documents is collected into a plain bitset and converted once, rather
+// than added to a roaring bitmap block by block (each add of a block's unordered
+// documents searches the bitmap's containers again).
+const denseRangeShare = 64
+
+// rangeDocs returns the documents whose value is within [lo, hi]. Only the blocks a
+// binary search of the block table finds may hold such a value are read, and a block
+// the range covers whole is taken without reading its values.
+func (p *points) rangeDocs(lo, hi float64, incLo, incHi bool) *roaring.Bitmap {
+	if p == nil || p.numBlocks == 0 || hi < lo {
+		return roaring.New()
+	}
+	first, end := p.candidateBlocks(lo, hi, incLo, incHi)
+	if first >= end {
+		return roaring.New()
+	}
+	var words []uint64
+	var result *roaring.Bitmap
+	if (p.blockStart(end)-p.blockStart(first))*denseRangeShare >= uint64(p.col.numDocs) {
+		words = make([]uint64, (uint64(p.col.numDocs)+63)/64)
+	} else {
+		result = roaring.New()
+	}
+	var docBuf [pointsBlockSize]uint32
+	var valBuf [pointsBlockSize]float64
+	buf := make([]uint32, 0, pointsBlockSize)
+	for i := first; i < end; i++ {
+		bmin, bmax := p.blockMin(i), p.blockMax(i)
+		var docs []uint32
+		if inRange(bmin, lo, hi, incLo, incHi) && inRange(bmax, lo, hi, incLo, incHi) {
+			docs, _ = p.blockEntries(i, docBuf[:0], nil)
+		} else {
+			var vals []float64
+			docs, vals = p.blockEntries(i, docBuf[:0], valBuf[:0])
+			buf = buf[:0]
+			for j, d := range docs {
+				if inRange(vals[j], lo, hi, incLo, incHi) {
+					buf = append(buf, d)
+				}
+			}
+			docs = buf
+		}
+		if words != nil {
+			for _, d := range docs {
+				words[d>>6] |= 1 << (d & 63)
+			}
+		} else if len(docs) > 0 {
+			result.AddMany(docs)
+		}
+	}
+	if words != nil {
+		return roaring.FromDense(words, false)
+	}
 	return result
+}
+
+// PointBlock is one block of a number column's point index: up to 128 documents of
+// adjacent values.
+type PointBlock struct {
+	// Min and Max are the least and greatest values in the block.
+	Min, Max float64
+	// Count is how many documents the block holds.
+	Count int
+	p     *points
+	i     uint32
+}
+
+// Docs appends the block's documents, in (value, doc) order, to dst.
+func (b PointBlock) Docs(dst []uint32) []uint32 {
+	var buf [pointsBlockSize]uint32
+	docs, _ := b.p.blockEntries(b.i, buf[:0], nil)
+	return append(dst, docs...)
+}
+
+// eachBlock calls fn with every block that may hold a value within [lo, hi]
+// (inclusive), in ascending value order (descending when desc), until fn returns
+// false.
+func (p *points) eachBlock(lo, hi float64, desc bool, fn func(PointBlock) bool) {
+	if p == nil || p.numBlocks == 0 || hi < lo {
+		return
+	}
+	first, end := p.candidateBlocks(lo, hi, true, true)
+	for k := first; k < end; k++ {
+		i := k
+		if desc {
+			i = end - 1 - (k - first)
+		}
+		_, _, count, _ := p.blockEntry(i)
+		if !fn(PointBlock{Min: p.blockMin(i), Max: p.blockMax(i), Count: int(count), p: p, i: i}) {
+			return
+		}
+	}
 }

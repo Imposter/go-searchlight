@@ -88,9 +88,31 @@ func (s *Sketch) seal() {
 	s.set = nil
 }
 
+// sketchOf returns a sketch of precision p holding hashes, which are sorted and
+// distinct (and taken over).
+func sketchOf(p uint8, hashes []uint64) *Sketch {
+	s := NewSketch(p)
+	if len(hashes) <= s.exactLimit() {
+		s.Hashes = hashes
+		return s
+	}
+	s.Registers = make([]uint8, 1<<p)
+	for _, h := range hashes {
+		s.addRegister(h)
+	}
+	return s
+}
+
 // Merge adds o's values to s. Both must have the same precision.
 func (s *Sketch) Merge(o *Sketch) {
 	if o == nil {
+		return
+	}
+	if s.Registers == nil && o.Registers == nil && s.set == nil && o.set == nil {
+		s.Hashes = unionSorted(s.Hashes, o.Hashes)
+		if len(s.Hashes) > s.exactLimit() {
+			s.densify()
+		}
 		return
 	}
 	if o.Registers != nil {
@@ -117,6 +139,34 @@ func (s *Sketch) Merge(o *Sketch) {
 	for h := range o.set {
 		s.Add(h)
 	}
+}
+
+// unionSorted is the sorted union of two sorted, distinct lists.
+func unionSorted(a, b []uint64) []uint64 {
+	if len(b) == 0 {
+		return a
+	}
+	if len(a) == 0 {
+		return slices.Clone(b)
+	}
+	out := make([]uint64, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] < b[j]:
+			out = append(out, a[i])
+			i++
+		case a[i] > b[j]:
+			out = append(out, b[j])
+			j++
+		default:
+			out = append(out, a[i])
+			i++
+			j++
+		}
+	}
+	out = append(out, a[i:]...)
+	return append(out, b[j:]...)
 }
 
 // Estimate returns the number of distinct values: exact while the sketch is.

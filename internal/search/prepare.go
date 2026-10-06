@@ -36,6 +36,15 @@ type prepared struct {
 	// confirmed counts the matches the shard's segments have confirmed so far, sure
 	// or verified: shared, so segments stop counting together.
 	confirmed atomic.Int64
+	// ords are the global ordinals of the keyword and list fields the aggregations
+	// count by ordinal: top-level terms, and every cardinality.
+	ords map[ordField]*globalOrds
+}
+
+// ordField names one field's global ordinals: its values, or its list entries.
+type ordField struct {
+	field string
+	list  bool
 }
 
 // sortKind is how a sort key reads its values.

@@ -423,6 +423,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	n := len(g.Segments)
 	p.segments = n
+	loadOrds(g, p)
 	results := make([]segResult, n)
 	if err := runParallel(n, func(i int) { results[i] = runSegment(ctx, p, g, i) }); err != nil {
 		return fail(err, "segment panicked")
@@ -439,6 +440,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 			aggs[spec.name] = &AggPartial{Type: spec.typ}
 		}
 	}
+	ordParts := map[*aggSpec][]*ordPartial{}
 	complete := true
 	for i := range results {
 		sr := &results[i]
@@ -456,7 +458,21 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 			tops = append(tops, sr.top)
 		}
 		for _, spec := range p.aggs {
-			mergePartial(aggs[spec.name], sr.aggs[spec.name], spec)
+			part := sr.aggs[spec.name]
+			if part != nil && part.ords != nil {
+				ordParts[spec] = append(ordParts[spec], part.ords)
+				continue
+			}
+			mergePartial(aggs[spec.name], part, spec)
+		}
+	}
+	for spec, parts := range ordParts {
+		list, _ := ordKind(spec.ftype)
+		ords := p.ords[ordField{spec.field, list}]
+		if spec.typ == AggTerms {
+			finishTerms(aggs[spec.name], parts, spec, g, ords, list)
+		} else {
+			finishCardinality(aggs[spec.name], parts, spec, ords)
 		}
 	}
 	for _, spec := range p.aggs {
@@ -552,11 +568,17 @@ type topMerge struct {
 
 func (m *topMerge) id(h *segHit) string {
 	if !h.hasID {
-		id, err := m.g.Segments[h.seg].Reader.ID(h.ord)
-		if err != nil && m.err == nil {
-			m.err = fmt.Errorf("search: segment %s: %w", m.g.Segments[h.seg].ID, err)
+		r := m.g.Segments[h.seg].Reader
+		if h.hasRank {
+			h.id, _ = r.IDAt(h.rank)
+		} else {
+			id, err := r.ID(h.ord)
+			if err != nil && m.err == nil {
+				m.err = fmt.Errorf("search: segment %s: %w", m.g.Segments[h.seg].ID, err)
+			}
+			h.id = id
 		}
-		h.id, h.hasID = id, true
+		h.hasID = true
 	}
 	return h.id
 }

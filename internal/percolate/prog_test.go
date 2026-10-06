@@ -154,7 +154,7 @@ func TestParityPercolate(t *testing.T) {
 			seg.collect(&d, sc)
 			var st docStats
 			verify(v, sc, &st)
-			for _, id := range sc.results() {
+			for _, id := range strs(t, sc.results()) {
 				var qi int
 				if _, err := fmt.Sscanf(id, "q%04d", &qi); err != nil {
 					t.Fatal(err)
@@ -217,10 +217,11 @@ func TestProductsCrossCheck(t *testing.T) {
 	}
 	matches, candidates := 0, 0
 	for _, d := range productDocs(t, productsMapping(t), 300_000, numDocs) {
-		got, st, err := p.one(context.Background(), nil, views, &d, sc)
+		ids, st, err := p.one(context.Background(), nil, views, &d, sc)
 		if err != nil {
 			t.Fatal(err)
 		}
+		got := strs(t, ids)
 		var want []string
 		for i := range qs {
 			if !deleted[qs[i].ID] && compiled[i].Match(&d) {
@@ -235,6 +236,16 @@ func TestProductsCrossCheck(t *testing.T) {
 		candidates += st.candidates
 	}
 	t.Logf("%d pairs: %d matches, %d candidates", numQueries*numDocs, matches, candidates)
+}
+
+// strs decodes ids.
+func strs(tb testing.TB, ids IDs) []string {
+	tb.Helper()
+	out, err := ids.Strings()
+	if err != nil {
+		tb.Fatalf("%s: %v", ids, err)
+	}
+	return out
 }
 
 // deletesEvery deletes every k-th ordinal of seg, recording the ids in deleted.

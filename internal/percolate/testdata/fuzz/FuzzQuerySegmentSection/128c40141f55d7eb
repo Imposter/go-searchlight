@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('Ô')
+uint32(188)
+[]byte("0\xa0\xf50\xf9\x93\x8500")

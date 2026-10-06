@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('-')
+uint32(2)
+[]byte("\xb9\xb9\xb9\xb9\xb9\xb9\xb9\xe9\xea")

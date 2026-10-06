@@ -161,42 +161,144 @@ func Extract(n query.Node, stats TermStats) Anchors {
 
 // postFilter is a cheap condition stored with a query's term postings: a document
 // holding the term is a candidate only if its value of field passes too. It is a
-// conjunct at the query's root, so every match passes it. A bool filter is on
-// Value.Bool (lo is 1 for true, 0 for false); the others on Value.Number lying in
-// [lo, hi].
+// conjunct at the query's root, so every match passes it. By kind:
+//
+//   - filterRange: Value.Number lies in [lo, hi];
+//   - filterBool: Value.Bool is lo (1 for true, 0 for false);
+//   - filterTextNe: the field's text is not text (ne, or not eq, on a string);
+//   - filterNotHas: the field's entries do not hold text (not has of one entry).
 type postFilter struct {
 	field  string
-	isBool bool
+	kind   uint8
 	lo, hi float64
+	text   string
 }
 
-// postingFilter chooses the filter for a query anchored on terms alone: the first
-// range on a finite number (as a closed range: lt and gt keep their bound, which only
-// admits a candidate the program then refuses), else the first eq on a bool, among
-// the leaves at n's root. False when there is none.
+// The filter kinds, as stored.
+const (
+	filterRange uint8 = iota
+	filterBool
+	filterTextNe
+	filterNotHas
+)
+
+// maxFilterText is the longest text a filter holds (its record keeps 16 bytes for it,
+// one of them its length).
+const maxFilterText = 15
+
+// conjunct is one condition at a query's root: a leaf, or the not of a leaf.
+type conjunct struct {
+	node    query.Node
+	leaf    *query.Leaf
+	negated bool
+}
+
+// rootConjuncts are the conditions at n's root that are leaves or nots of leaves: n
+// itself, or such children of an all.
+func rootConjuncts(n query.Node) []conjunct {
+	one := func(c query.Node) (conjunct, bool) {
+		switch x := c.(type) {
+		case *query.Leaf:
+			return conjunct{node: c, leaf: x}, x != nil
+		case *query.Not:
+			if x != nil {
+				if l, ok := x.Child.(*query.Leaf); ok && l != nil {
+					return conjunct{node: c, leaf: l, negated: true}, true
+				}
+			}
+		}
+		return conjunct{}, false
+	}
+	if all, ok := n.(*query.All); ok && all != nil {
+		var out []conjunct
+		for _, c := range all.Children {
+			if cj, ok := one(c); ok {
+				out = append(out, cj)
+			}
+		}
+		return out
+	}
+	if cj, ok := one(n); ok {
+		return []conjunct{cj}
+	}
+	return nil
+}
+
+// filterOf is the posting filter conjunct c makes, false when it makes none.
+func filterOf(c conjunct) (postFilter, bool) {
+	l := c.leaf
+	a := l.Decoded()
+	if c.negated {
+		switch l.Op {
+		case query.OpEq:
+			if a.Kind == query.ArgString && len(a.Scalar.Norm) <= maxFilterText {
+				return postFilter{field: l.Field, kind: filterTextNe, text: a.Scalar.Norm}, true
+			}
+		case query.OpHas, query.OpHasAny, query.OpHasAll:
+			if e, ok := oneEntry(&a); ok && len(e) <= maxFilterText {
+				return postFilter{field: l.Field, kind: filterNotHas, text: e}, true
+			}
+		}
+		return postFilter{}, false
+	}
+	switch l.Op {
+	case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween:
+		if lo, hi, ok := leafRange(l, &a); ok {
+			return postFilter{field: l.Field, lo: lo, hi: hi}, true
+		}
+	case query.OpEq:
+		switch {
+		case a.Kind == query.ArgNumber && a.Scalar.Finite:
+			return postFilter{field: l.Field, lo: a.Scalar.Number, hi: a.Scalar.Number}, true
+		case a.Kind == query.ArgBool:
+			b := boolNumber(a.Scalar.Bool)
+			return postFilter{field: l.Field, kind: filterBool, lo: b, hi: b}, true
+		}
+	case query.OpNe:
+		if a.Kind == query.ArgString && len(a.Scalar.Norm) <= maxFilterText {
+			return postFilter{field: l.Field, kind: filterTextNe, text: a.Scalar.Norm}, true
+		}
+	}
+	return postFilter{}, false
+}
+
+// oneEntry is the entry a has, has_any or has_all names, when it names one (perhaps
+// more than once) and nothing else.
+func oneEntry(a *query.Arg) (string, bool) {
+	list := texts(a)
+	if len(list) == 0 {
+		return "", false
+	}
+	for _, s := range list[1:] {
+		if s.Norm != list[0].Norm {
+			return "", false
+		}
+	}
+	return list[0].Norm, true
+}
+
+// postingFilter chooses the filter for a query anchored on terms alone, among those its
+// root conjuncts make: the one that leaves the least to verify (see provenRest), then a
+// range (which prunes the most candidates), then the first. lt and gt are kept as closed
+// ranges, which only admit a candidate the program then refuses. False when there is
+// none.
 func postingFilter(n query.Node, set *aset) (postFilter, bool) {
 	if !set.ok || len(set.terms) == 0 || len(set.ranges) > 0 || len(set.pairs) > 0 {
 		return postFilter{}, false
 	}
-	var flag postFilter
-	found := false
-	for _, l := range rootLeaves(n) {
-		a := l.Decoded()
-		switch l.Op {
-		case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween:
-			if lo, hi, ok := leafRange(l, &a); ok {
-				return postFilter{field: l.Field, lo: lo, hi: hi}, true
-			}
-		case query.OpEq:
-			switch {
-			case a.Kind == query.ArgNumber && a.Scalar.Finite:
-				return postFilter{field: l.Field, lo: a.Scalar.Number, hi: a.Scalar.Number}, true
-			case a.Kind == query.ArgBool && !found:
-				flag, found = postFilter{field: l.Field, isBool: true, lo: boolNumber(a.Scalar.Bool), hi: boolNumber(a.Scalar.Bool)}, true
-			}
+	var best postFilter
+	bestLeft, found := 0, false
+	for _, c := range rootConjuncts(n) {
+		f, ok := filterOf(c)
+		if !ok {
+			continue
+		}
+		left := len(rootConjuncts(n)) - len(provenConjuncts(n, set, f, true))
+		if !found || left < bestLeft || left == bestLeft && f.kind == filterRange && best.kind != filterRange {
+			best, bestLeft, found = f, left, true
 		}
 	}
-	return flag, found
+	return best, found
 }
 
 func boolNumber(b bool) float64 { return pick[float64](b, 1, 0) }
@@ -221,76 +323,27 @@ func leafRange(l *query.Leaf, a *query.Arg) (lo, hi float64, ok bool) {
 	return 0, 0, false
 }
 
-// rootLeaves are the leaves at n's root: n itself, or the leaf children of an all.
-func rootLeaves(n query.Node) []*query.Leaf {
-	switch x := n.(type) {
-	case *query.Leaf:
-		if x != nil {
-			return []*query.Leaf{x}
-		}
-	case *query.All:
-		if x != nil {
-			var out []*query.Leaf
-			for _, c := range x.Children {
-				if l, ok := c.(*query.Leaf); ok && l != nil {
-					out = append(out, l)
-				}
-			}
-			return out
-		}
-	}
-	return nil
-}
-
-// fact is one thing a candidate is known to hold: a term atom, or its value of Field
-// in [Lo, Hi] (a range anchor or a number filter; a bool filter is an AtomBool term).
+// fact is one thing a candidate is known to hold: a term atom, its value of field in
+// [lo, hi] (a range anchor or a number filter; a bool filter is an AtomBool term), or a
+// text or entry filter.
 type fact struct {
 	term   Term
 	isTerm bool
 	field  string
 	lo, hi float64
+	filter *postFilter
 }
 
 // provenRest returns what is left of n to verify on a candidate, and a key naming the
-// leaves left out ("" for none). A query is a candidate only through one of its
-// routes: a term it is anchored on (with its filter), or a range it is anchored on.
-// A leaf at n's root that every route implies holds on every candidate, so the rest is
-// n without it. Pair anchors prove nothing (the pair fallback adds a query on one
-// half), and neither do grams, trigram keys or words.
+// conditions left out ("" for none): n without provenConjuncts.
 func provenRest(n query.Node, set *aset, filter postFilter, filtered bool) (query.Node, string) {
-	if !set.ok || len(set.pairs) > 0 || len(set.terms)+len(set.ranges) == 0 {
-		return n, ""
-	}
-	routes := make([][]fact, 0, len(set.terms)+len(set.ranges))
-	for _, t := range set.terms {
-		r := []fact{{term: t, isTerm: true}}
-		if filtered && filter.isBool {
-			r = append(r, fact{term: Term{Kind: AtomBool, Field: filter.field, Term: boolTerm(filter.lo == 1)}, isTerm: true})
-		} else if filtered {
-			r = append(r, fact{field: filter.field, lo: filter.lo, hi: filter.hi})
-		}
-		routes = append(routes, r)
-	}
-	for _, rg := range set.ranges {
-		routes = append(routes, []fact{{field: rg.Field, lo: rg.Lo, hi: rg.Hi}})
-	}
-	var proven []*query.Leaf
-	var keys []string
-	for _, l := range rootLeaves(n) {
-		every := true
-		for _, r := range routes {
-			if !slices.ContainsFunc(r, func(f fact) bool { return f.implies(l) }) {
-				every = false
-				break
-			}
-		}
-		if every {
-			proven = append(proven, l)
-			keys = append(keys, string(query.Canonical(l)))
-		}
-	}
+	proven := provenConjuncts(n, set, filter, filtered)
 	if len(proven) == 0 {
 		return n, ""
+	}
+	keys := make([]string, len(proven))
+	for i, c := range proven {
+		keys[i] = string(query.Canonical(c.node))
 	}
 	slices.Sort(keys)
 	key := strings.Join(keys, "\x00")
@@ -300,16 +353,68 @@ func provenRest(n query.Node, set *aset, filter postFilter, filtered bool) (quer
 	}
 	rest := make([]query.Node, 0, len(all.Children))
 	for _, c := range all.Children {
-		if l, ok := c.(*query.Leaf); !ok || !slices.Contains(proven, l) {
+		if !slices.ContainsFunc(proven, func(p conjunct) bool { return p.node == c }) {
 			rest = append(rest, c)
 		}
 	}
 	return &query.All{Children: rest}, key
 }
 
-// implies reports whether every document holding f satisfies leaf l, as the matcher
-// reads l: f is the very atom l's value is compared with, or a range inside l's.
-func (f fact) implies(l *query.Leaf) bool {
+// provenConjuncts are n's root conjuncts that hold on every candidate. A query is a
+// candidate only through one of its routes: a term it is anchored on (with its
+// filter), or a range it is anchored on. A conjunct every route implies holds on every
+// candidate. Pair anchors prove nothing (the pair fallback adds a query on one half),
+// and neither do grams, trigram keys or words.
+func provenConjuncts(n query.Node, set *aset, filter postFilter, filtered bool) []conjunct {
+	if !set.ok || len(set.pairs) > 0 || len(set.terms)+len(set.ranges) == 0 {
+		return nil
+	}
+	routes := make([][]fact, 0, len(set.terms)+len(set.ranges))
+	for _, t := range set.terms {
+		r := []fact{{term: t, isTerm: true}}
+		if filtered {
+			switch filter.kind {
+			case filterBool:
+				r = append(r, fact{term: Term{Kind: AtomBool, Field: filter.field, Term: boolTerm(filter.lo == 1)}, isTerm: true})
+			case filterRange:
+				r = append(r, fact{field: filter.field, lo: filter.lo, hi: filter.hi})
+			default:
+				r = append(r, fact{filter: &filter})
+			}
+		}
+		routes = append(routes, r)
+	}
+	for _, rg := range set.ranges {
+		routes = append(routes, []fact{{field: rg.Field, lo: rg.Lo, hi: rg.Hi}})
+	}
+	var proven []conjunct
+	for _, c := range rootConjuncts(n) {
+		every := true
+		for _, r := range routes {
+			if !slices.ContainsFunc(r, func(f fact) bool { return f.implies(c) }) {
+				every = false
+				break
+			}
+		}
+		if every {
+			proven = append(proven, c)
+		}
+	}
+	return proven
+}
+
+// implies reports whether every document holding f satisfies conjunct c, as the
+// matcher reads it: f is the very atom c's value is compared with, a range inside c's,
+// or the very filter c makes.
+func (f fact) implies(c conjunct) bool {
+	l := c.leaf
+	if f.filter != nil {
+		g, ok := filterOf(c)
+		return ok && g == *f.filter
+	}
+	if c.negated {
+		return false
+	}
 	a := l.Decoded()
 	if !f.isTerm {
 		if f.field != l.Field {

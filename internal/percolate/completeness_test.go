@@ -37,19 +37,16 @@ var (
 func longMode() bool { return *flagLong || os.Getenv("SEARCHLIGHT_LONG") != "" }
 
 // coverage counts what the completeness property's segments hold, so the property
-// fails if a generator change stops exercising a path: posting filters on numbers and
-// bools, proven leaves (an empty program), and inline and stored programs.
+// fails if a generator change stops exercising a path: posting filters of every kind,
+// proven conditions (an empty program), and inline and stored programs.
 var coverage struct {
-	numberFilters, boolFilters, emptyPrograms, inlinePrograms, storedPrograms int
+	filters                                       [4]int
+	emptyPrograms, inlinePrograms, storedPrograms int
 }
 
 func (s *Segment) countCoverage() {
 	for r := 0; r < len(s.filtered); r += filteredSize {
-		if u32(s.filtered, r+4)&1 == 1 {
-			coverage.boolFilters++
-		} else {
-			coverage.numberFilters++
-		}
+		coverage.filters[u32(s.filtered, r+4)&3]++
 	}
 	for r := range s.n {
 		switch n := u32(s.verifies, verifySize*int(r)+4); {
@@ -79,7 +76,7 @@ func TestCompletenessProperty(t *testing.T) {
 			// rarely negates, so most queries are anchored and most matches come
 			// through anchors; dense is positive over a tiny vocabulary, so that
 			// conjunctions (pair anchors) match often.
-			for _, mode := range []string{"mixed", "positive", "dense"} {
+			for _, mode := range []string{"mixed", "positive", "dense", "filters"} {
 				t.Run(fmt.Sprintf("seed=%d/%s/%s", seed, regime, mode), func(t *testing.T) {
 					var stats shard.TermStats
 					switch regime {
@@ -91,6 +88,7 @@ func TestCompletenessProperty(t *testing.T) {
 					g := newGen(seed)
 					g.positive = mode != "mixed"
 					g.dense = mode == "dense"
+					g.filters = mode == "filters"
 					checkCompleteness(t, g, seed, queries, docs, stats)
 				})
 			}
@@ -98,7 +96,7 @@ func TestCompletenessProperty(t *testing.T) {
 	}
 	if *flagSeed == 0 {
 		c := coverage
-		if c.numberFilters == 0 || c.boolFilters == 0 || c.emptyPrograms == 0 || c.inlinePrograms == 0 || c.storedPrograms == 0 {
+		if slices.Contains(c.filters[:], 0) || c.emptyPrograms == 0 || c.inlinePrograms == 0 || c.storedPrograms == 0 {
 			t.Fatalf("a path went unexercised: %+v", c)
 		}
 		t.Logf("coverage: %+v", c)
@@ -179,7 +177,7 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 		}
 		var st docStats
 		verify(v, sc, &st)
-		got := sc.results()
+		got := strs(t, sc.results())
 		sc.reset()
 		slices.Sort(got)
 		if !slices.Equal(got, want) {
@@ -217,6 +215,7 @@ type gen struct {
 	r        *rand.Rand
 	positive bool // rarely negate: no ne, empty or exists:false, few nots
 	dense    bool // draw words from a tiny vocabulary
+	filters  bool // root conjunctions of a term anchor and conditions posting filters carry
 }
 
 // positiveOps are the ops a positive generator draws: the anchorable ones.
@@ -385,11 +384,54 @@ func (g *gen) queryJSON() []byte {
 	if g.r.IntN(100) == 0 {
 		return []byte(`{"all":[]}`)
 	}
+	if g.filters {
+		raw, err := json.Marshal(g.filterQuery())
+		if err != nil {
+			panic(err)
+		}
+		return raw
+	}
 	raw, err := json.Marshal(g.node(3))
 	if err != nil {
 		panic(err)
 	}
 	return raw
+}
+
+// filterQuery is a root conjunction of a leaf anchored on terms and one to three
+// conditions of the kinds a posting filter carries (a range, eq on a bool, ne or not eq
+// on a string, not has of an entry), sometimes as their near misses (a long text, two
+// entries, a not of a range).
+func (g *gen) filterQuery() map[string]any {
+	leaf := func(field, op string, v any) map[string]any {
+		return map[string]any{"field": field, "op": op, "value": v}
+	}
+	not := func(c any) map[string]any { return map[string]any{"not": c} }
+	anchors := []func() any{
+		func() any { return leaf(g.pick(fields), "eq", g.word()) },
+		func() any { return leaf("tags", "has_any", []any{g.word(), g.word()}) },
+		func() any { return leaf(g.pick(fields), "in", []any{g.word(), g.word()}) },
+	}
+	conds := []func() any{
+		func() any { return leaf(g.pick(fields), []string{"lt", "lte", "gt", "gte"}[g.r.IntN(4)], g.number()) },
+		func() any { return leaf(g.pick(fields), "between", []any{g.number(), g.number()}) },
+		func() any { return leaf(g.pick(fields), "eq", g.number()) },
+		func() any { return leaf(g.pick(fields), "eq", g.r.IntN(2) == 0) },
+		func() any { return leaf(g.pick(fields), "ne", g.word()) },
+		func() any { return not(leaf(g.pick(fields), "eq", g.word())) },
+		func() any {
+			return not(leaf(g.pick(fields), []string{"has", "has_any", "has_all"}[g.r.IntN(3)], g.word()))
+		},
+		func() any { return not(leaf("tags", "has_any", []any{g.word(), g.word()})) },
+		func() any { return not(leaf(g.pick(fields), "eq", strings.Repeat(g.word(), 6))) },
+		func() any { return not(leaf(g.pick(fields), "lt", g.number())) },
+	}
+	children := []any{anchors[g.r.IntN(len(anchors))]()}
+	for range 1 + g.r.IntN(3) {
+		children = append(children, conds[g.r.IntN(len(conds))]())
+	}
+	g.r.Shuffle(len(children), func(i, j int) { children[i], children[j] = children[j], children[i] })
+	return map[string]any{"all": children}
 }
 
 // docJSON returns a random document: each field present or not, of its type or of

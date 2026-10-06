@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('u')
+uint32(34)
+[]byte("鈧\u05edس")

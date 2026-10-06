@@ -5,46 +5,39 @@ import (
 	"encoding/binary"
 	stdbits "math/bits"
 	"slices"
+	"unsafe"
 
 	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
 
-// scratch is one worker's reusable per-document state: a candidate set (a bitmap over
-// a segment's query ranks, plus the list of the ranks set, so it is cleared in
-// time proportional to the candidates), a verification memo per class, the document's
-// values by field index, and buffers. A worker takes one from the pool per call and
-// keeps it for every document it handles, so the steady state allocates nothing but
-// results.
+// scratch is one worker's reusable per-document state, kept for every document the
+// worker handles so that the steady state allocates nothing but results:
+//
+//   - the candidates, a bitmap over a segment's ranks and the list of ranks set (so it
+//     clears in time proportional to them);
+//   - a verdict per verification class (memoMatch or memoMiss), and the classes set;
+//   - the document's values of the segment's fields, by field index, which programs
+//     read, and each field's trigram keys once a similar condition has needed them;
+//   - the matching ids so far, JSON string literals viewing the segments, in runs
+//     sorted by id (unsorted when a run is not), and the buffers results merges into;
+//   - the pair members the document holds (see probePairs).
 type scratch struct {
-	bits  []uint64
-	cands []uint32
-	// memo holds a class representative's verdict for the current document: 0 unknown,
-	// 1 match, 2 miss; memoSet lists the ranks set.
-	memo    []uint8
-	memoSet []uint32
-	keys    []uint64
-	// vals are the document's values of the segment's fields, by field index (a missing
-	// field's is the zero Value), set by collect for the programs verification runs.
-	vals []schema.Value
-	// simKeys are a field's trigram keys, computed for the first similar condition on it
-	// (simDone; simSet lists the fields done); want is a buffer for a program's keys.
-	simKeys [][]uint64
-	simDone []bool
-	simSet  []int
-	want    []uint64
-	// hits are the document's matching ids so far (views into the segments), in runs
-	// sorted by id (runs holds where each starts; unsorted is set when one is not), and
-	// buf the bytes results copies them into; spare and spareRuns are merge buffers.
-	hits      [][]byte
-	runs      []int
-	unsorted  bool
-	buf       []byte
-	spare     [][]byte
-	spareRuns []int
-	// held are the dictionary entries of the pair members the document holds, also
-	// set in heldBits; pairOps counts pair-probing work (for tests); key is a buffer
-	// for probe keys.
+	bits     []uint64
+	cands    []uint32
+	memo     []uint8
+	memoSet  []uint32
+	keys     []uint64
+	vals     []schema.Value
+	simKeys  [][]uint64
+	simDone  []bool
+	simSet   []int
+	want     []uint64
+	hits     [][]byte
+	runs     []int
+	unsorted bool
+	buf      []byte
+	merger   merger
 	held     []uint32
 	heldBits []uint64
 	pairOps  int
@@ -100,19 +93,32 @@ func (s *scratch) addEntry(seg *Segment, e int) {
 	recs := seg.filteredOf(e)
 	for r := 0; r+filteredSize <= len(recs); r += filteredSize {
 		fb := binary.LittleEndian.Uint32(recs[r+4:])
-		v := &s.vals[fb>>1]
-		if fb&1 == 0 {
-			if v.Number == nil || *v.Number < f64(recs, r+8) || *v.Number > f64(recs, r+16) {
-				continue
-			}
-		} else if v.Bool == nil || boolNumber(*v.Bool) != f64(recs, r+8) {
-			continue
+		if passes(&s.vals[fb>>2], uint8(fb&3), recs[r+8:r+filteredSize]) {
+			s.add(binary.LittleEndian.Uint32(recs[r:]))
 		}
-		s.add(binary.LittleEndian.Uint32(recs[r:]))
 	}
 }
 
-// reset clears the candidate set and the memo.
+// passes reports whether v passes a stored filter of kind (see postFilter), its 16
+// bytes f.
+func passes(v *schema.Value, kind uint8, f []byte) bool {
+	switch kind {
+	case filterRange:
+		return v.Number != nil && f64(f, 0) <= *v.Number && *v.Number <= f64(f, 8)
+	case filterBool:
+		return v.Bool != nil && boolNumber(*v.Bool) == f64(f, 0)
+	case filterTextNe:
+		text := f[1 : 1+f[0]]
+		return !v.Present || v.Text == nil || *v.Text != string(text)
+	default:
+		text := unsafe.String(unsafe.SliceData(f[1:]), int(f[0]))
+		_, found := slices.BinarySearch(v.Entries, text)
+		return !v.Present || !found
+	}
+}
+
+// reset clears the candidates, the verdicts and the document's values (so a pooled
+// scratch pins no document).
 func (s *scratch) reset() {
 	for _, ord := range s.cands {
 		s.bits[ord>>6] = 0
@@ -124,8 +130,10 @@ func (s *scratch) reset() {
 	s.memoSet = s.memoSet[:0]
 	for _, f := range s.simSet {
 		s.simDone[f] = false
+		s.simKeys[f] = s.simKeys[f][:0]
 	}
 	s.simSet = s.simSet[:0]
+	clear(s.vals)
 }
 
 // inOrder puts the candidates in ascending order, so verification reads the segment's
@@ -297,84 +305,26 @@ func (s *scratch) run(start int) {
 	}
 }
 
-// results returns the document's hits as strings sharing one allocation, sorted (the
-// runs merged, or all sorted when one is not), and clears the hits.
-func (s *scratch) results() []string {
+// results returns the document's hits as one JSON array (nil for none), the runs
+// merged (or all sorted, when one is not), and clears the hits.
+func (s *scratch) results() IDs {
 	if len(s.hits) == 0 {
 		s.clearHits()
 		return nil
 	}
-	if !s.unsorted {
-		s.mergeRuns()
+	if s.unsorted {
+		slices.SortFunc(s.hits, idCompare)
+		s.runs = append(s.runs[:0], 0)
 	}
-	s.buf = s.buf[:0]
-	for _, h := range s.hits {
-		s.buf = append(s.buf, h...)
-	}
-	all := string(s.buf)
-	out := make([]string, len(s.hits))
-	off := 0
-	for i, h := range s.hits {
-		out[i] = all[off : off+len(h)]
-		off += len(h)
-	}
-	sort := s.unsorted
+	s.buf = s.merger.merge(s.buf[:0], s.hits, s.runs, false)
 	s.clearHits()
-	if sort {
-		slices.Sort(out)
-	}
-	return out
-}
-
-// mergeRuns merges the sorted runs of hits into one, pairwise: in time linear in the
-// hits times the log of the runs.
-func (s *scratch) mergeRuns() {
-	for len(s.runs) > 1 {
-		end := func(i int) int {
-			if i+1 < len(s.runs) {
-				return s.runs[i+1]
-			}
-			return len(s.hits)
-		}
-		merged, starts := s.spare[:0], s.spareRuns[:0]
-		for i := 0; i < len(s.runs); i += 2 {
-			starts = append(starts, len(merged))
-			a := s.hits[s.runs[i]:end(i)]
-			if i+1 == len(s.runs) {
-				merged = append(merged, a...)
-				break
-			}
-			b := s.hits[s.runs[i+1]:end(i+1)]
-			for len(a) > 0 && len(b) > 0 {
-				if !idLess(b[0], a[0]) {
-					merged, a = append(merged, a[0]), a[1:]
-				} else {
-					merged, b = append(merged, b[0]), b[1:]
-				}
-			}
-			merged = append(append(merged, a...), b...)
-		}
-		s.hits, s.spare = merged, s.hits
-		s.runs, s.spareRuns = starts, s.runs
-	}
-}
-
-// idLess reports whether id a sorts before id b, comparing their first eight bytes as
-// one integer first.
-func idLess(a, b []byte) bool {
-	if len(a) >= 8 && len(b) >= 8 {
-		if x, y := binary.BigEndian.Uint64(a), binary.BigEndian.Uint64(b); x != y {
-			return x < y
-		}
-	}
-	return bytes.Compare(a, b) < 0
+	return IDs(bytes.Clone(s.buf))
 }
 
 // clearHits drops the hits (views into segments, not kept past the call).
 func (s *scratch) clearHits() {
 	clear(s.hits)
-	clear(s.spare)
-	s.hits, s.spare = s.hits[:0], s.spare[:0]
+	s.hits = s.hits[:0]
 	s.runs, s.unsorted = s.runs[:0], false
 }
 

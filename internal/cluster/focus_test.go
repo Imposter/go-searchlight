@@ -9,7 +9,6 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
-	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -429,7 +428,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("node %d percolate: %v", tn.i, err)
 			}
-			if !slices.Equal(pres.Results[0].Queries, []string{"cheap"}) || !slices.Equal(pres.Results[1].Queries, []string{"cheap"}) ||
+			if string(pres.Results[0].Queries) != `["cheap"]` || string(pres.Results[1].Queries) != `["cheap"]` ||
 				len(pres.Results[2].Queries) != 0 || !pres.Results[2].Found {
 				t.Fatalf("node %d percolated %+v", tn.i, pres.Results)
 			}

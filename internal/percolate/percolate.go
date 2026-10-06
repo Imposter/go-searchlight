@@ -100,7 +100,7 @@ var defaultPercolator = sync.OnceValue(func() *Percolator { return New(Options{}
 
 // Percolate is [Percolator.Percolate] on a process-wide Percolator with default
 // options.
-func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([][]string, error) {
+func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	return defaultPercolator().Percolate(ctx, g, docs)
 }
 
@@ -140,12 +140,12 @@ func (s *docStats) add(o *docStats) {
 }
 
 // Percolate returns, for each document, the ids of the live saved queries in g that
-// match it, sorted (nil when none). A document whose Fields is nil is analyzed from
-// its ID and Body with g's mapping (an unmapped field under a strict mapping is an
-// error); one whose Fields is set is taken as already analyzed under the index's
-// mapping, as a bulk write analyzes it. Documents are percolated in parallel, at most
-// Options.Threads at a time. g must stay acquired for the call; the ids returned are
-// copies, valid after it.
+// match it, sorted, as a JSON array (nil when none). A document whose Fields is nil is
+// analyzed from its ID and Body with g's mapping (an unmapped field under a strict
+// mapping is an error); one whose Fields is set is taken as already analyzed under the
+// index's mapping, as a bulk write or [schema.AnalyzeForMatch] analyzes it. Documents
+// are percolated in parallel, at most Options.Threads at a time. g must stay acquired
+// for the call; the arrays returned are copies, valid after it.
 //
 // The span records the call's candidates, programs run and matches, and probe_ms and
 // verify_ms: per-document probe and verify time summed over every worker (busy time,
@@ -154,7 +154,7 @@ func (s *docStats) add(o *docStats) {
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match, and each
 // candidate's program decides as the matcher does.
-func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([][]string, error) {
+func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	if g == nil {
 		return nil, errors.New("percolate: no generation")
 	}
@@ -185,7 +185,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	}
 	p.alwaysCheck.Record(ctx, float64(always), p.set)
 
-	out := make([][]string, len(docs))
+	out := make([]IDs, len(docs))
 	var total docStats
 	var mu sync.Mutex
 	var firstErr error
@@ -266,10 +266,10 @@ func cmpErr(have, got error) error {
 }
 
 // one percolates one document across every query segment.
-func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, sc *scratch) ([]string, docStats, error) {
+func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, sc *scratch) (IDs, docStats, error) {
 	var st docStats
 	if d.Fields == nil {
-		analyzed, _, err := schema.Analyze(g.Mapping(), d.ID, d.Body)
+		analyzed, _, err := schema.AnalyzeForMatch(g.Mapping(), d.ID, d.Body)
 		if err != nil {
 			return nil, st, err
 		}
@@ -315,7 +315,9 @@ func verify(v *view, sc *scratch, st *docStats) {
 			continue
 		}
 		var hit bool
-		switch rep := seg.class(r); {
+		switch rep := seg.verdictClass(r); {
+		case rep == trivialClass:
+			hit = true
 		case rep == noClass:
 			hit = sc.evalProg(seg.program(r))
 			st.count(hit)
@@ -353,7 +355,7 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 		}
 		st.verifiedMatch++
 		st.matched++
-		sc.hits = append(sc.hits, []byte(q.ID))
+		sc.hits = append(sc.hits, idLiteral(q.ID))
 	}
 	return nil
 }

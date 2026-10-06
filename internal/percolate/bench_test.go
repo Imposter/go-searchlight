@@ -295,7 +295,7 @@ func benchDoc(b *testing.B, env *benchEnv, p *Percolator) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		matches += len(out[0])
+		matches += len(strs(b, out[0]))
 	}
 	reportLatency(b, lat)
 	b.ReportMetric(float64(matches)/float64(len(lat)), "matches/doc")

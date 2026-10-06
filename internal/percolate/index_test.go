@@ -111,8 +111,6 @@ func TestSegmentRoundTrip(t *testing.T) {
 	if seg.NumAlways() != 1 {
 		t.Fatalf("%d always-check queries, want 1", seg.NumAlways())
 	}
-	// Equivalent queries share a class, keyed by the first's rank; the others are
-	// alone in theirs.
 	r8, r9 := rankOf(t, seg, 8), rankOf(t, seg, 9)
 	if a, b := seg.class(r8), seg.class(r9); a != min(r8, r9) || b != min(r8, r9) {
 		t.Fatalf("classes %d %d, want %d", a, b, min(r8, r9))

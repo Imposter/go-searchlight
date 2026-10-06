@@ -147,8 +147,8 @@ func (m *shardModel) check(docs map[string]string) {
 			m.t.Fatal(err)
 		}
 		for i := range ids {
-			if !slices.Equal(got[i], want[i]) {
-				m.t.Fatalf("document %s: percolate %v, brute force %v", ids[i], got[i], want[i])
+			if g := strs(m.t, got[i]); !slices.Equal(g, want[i]) {
+				m.t.Fatalf("document %s: percolate %v, brute force %v", ids[i], g, want[i])
 			}
 		}
 	}
@@ -288,7 +288,7 @@ func TestPercolateCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got[0], []string{"q"}) || got[1] != nil {
+	if !slices.Equal(strs(t, got[0]), []string{"q"}) || got[1] != nil {
 		t.Fatalf("got %v", got)
 	}
 }
@@ -328,7 +328,7 @@ func TestPercolateDefaultQueryIndexFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(got[0], []string{"q"}) || got[1] != nil {
+	if !slices.Equal(strs(t, got[0]), []string{"q"}) || got[1] != nil {
 		t.Fatalf("got %v", got)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -166,6 +167,107 @@ func BenchmarkPercolateProductsMemory(b *testing.B) {
 		_ = seg.Close()
 	}
 	runtime.KeepAlive(qs)
+}
+
+// BenchmarkPercolateStages times what a single-document _percolate costs, stage by
+// stage, against 100k saved searches: analysis as the server does it (for matching)
+// and as it did (with grams), percolation, the response (the matches copied into the
+// body, as the API writes them), and the client decoding the body into strings as
+// slbench does. It reports each stage's p50, p90 and p99 over 3000 documents, and the
+// p99 of the server's stages by how many saved searches a document matches. Run it
+// with -benchtime 1x.
+func BenchmarkPercolateStages(b *testing.B) {
+	for _, segs := range []int{10, 3, 1} {
+		b.Run(fmt.Sprintf("segments=%d", segs), func(b *testing.B) {
+			env := newProductsEnv(b, 100_000, segs)
+			m := productsMapping(b)
+			p := New(Options{Threads: 1})
+			type sample struct {
+				analyzeFull, analyze, perc, response, decode time.Duration
+				matches                                      int
+			}
+			var rows []sample
+			var body []byte
+			for b.Loop() {
+				rows = rows[:0]
+				for i := range 3100 {
+					doc := datasets.AppendProduct(nil, productsSeed, 300_000+int64(i))
+					var r sample
+					t0 := clockNow()
+					if _, _, err := schema.Analyze(m, "_percolate_0", doc); err != nil {
+						b.Fatal(err)
+					}
+					r.analyzeFull = clockSince(t0)
+					t0 = clockNow()
+					d, _, err := schema.AnalyzeForMatch(m, "_percolate_0", doc)
+					if err != nil {
+						b.Fatal(err)
+					}
+					r.analyze = clockSince(t0)
+					t0 = clockNow()
+					ids, err := p.Percolate(context.Background(), env.g, []schema.Doc{d})
+					if err != nil {
+						b.Fatal(err)
+					}
+					r.perc = clockSince(t0)
+					t0 = clockNow()
+					body = append(append(append(body[:0], `{"results":[{"found":true,"queries":`...), ids[0]...), `}],"took_ms":0}`...)
+					r.response = clockSince(t0)
+					t0 = clockNow()
+					var res struct {
+						Results []struct {
+							Queries []string `json:"queries"`
+						} `json:"results"`
+					}
+					if err := json.Unmarshal(body, &res); err != nil {
+						b.Fatal(err)
+					}
+					r.decode = clockSince(t0)
+					r.matches = len(res.Results[0].Queries)
+					if i >= 100 {
+						rows = append(rows, r)
+					}
+				}
+			}
+			pct := func(rows []sample, get func(sample) time.Duration, q float64) time.Duration {
+				v := make([]time.Duration, len(rows))
+				for i, r := range rows {
+					v[i] = get(r)
+				}
+				slices.Sort(v)
+				return v[int(q*float64(len(v)-1))]
+			}
+			server := func(r sample) time.Duration { return r.analyze + r.perc + r.response }
+			for _, st := range []struct {
+				name string
+				get  func(sample) time.Duration
+			}{
+				{"analyze (with grams)", func(r sample) time.Duration { return r.analyzeFull }},
+				{"analyze for match", func(r sample) time.Duration { return r.analyze }},
+				{"percolate", func(r sample) time.Duration { return r.perc }},
+				{"response", func(r sample) time.Duration { return r.response }},
+				{"server (analyze+percolate+response)", server},
+				{"client decode", func(r sample) time.Duration { return r.decode }},
+			} {
+				b.Logf("%-36s p50 %9v p90 %9v p99 %9v", st.name, pct(rows, st.get, .5), pct(rows, st.get, .9), pct(rows, st.get, .99))
+			}
+			for _, bk := range []struct {
+				name   string
+				lo, hi int
+			}{{"<500", 0, 500}, {"500-2k", 500, 2000}, {"2k-6k", 2000, 6000}, {">=6k", 6000, 1 << 30}} {
+				var in []sample
+				for _, r := range rows {
+					if r.matches >= bk.lo && r.matches < bk.hi {
+						in = append(in, r)
+					}
+				}
+				if len(in) > 0 {
+					b.Logf("matches %-7s n=%4d server p99 %9v, with client decode p99 %9v", bk.name, len(in), pct(in, server, .99),
+						pct(in, func(r sample) time.Duration { return server(r) + r.decode }, .99))
+				}
+			}
+		})
+	}
 }
 
 func liveHeap() uint64 {

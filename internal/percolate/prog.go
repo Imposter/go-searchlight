@@ -87,7 +87,6 @@ const (
 	costSimilar = 16
 )
 
-// pnode is a program node under construction.
 type pnode struct {
 	tag      byte
 	cost     int
@@ -106,7 +105,6 @@ type progCompiler struct {
 	field func(name string) uint32
 }
 
-// compile returns n's program.
 func (pc *progCompiler) compile(n query.Node) []byte {
 	root := pc.node(n)
 	return appendProg(nil, &root)
@@ -390,7 +388,6 @@ func appendF64(dst []byte, f float64) []byte {
 	return binary.LittleEndian.AppendUint64(dst, math.Float64bits(f))
 }
 
-// appendProg appends n's encoding.
 func appendProg(dst []byte, n *pnode) []byte {
 	dst = append(dst, n.tag)
 	switch n.tag {
@@ -413,7 +410,6 @@ func appendProg(dst []byte, n *pnode) []byte {
 
 // ---- evaluating ----
 
-// uv reads a uvarint of a validated program.
 func uv(p []byte) (int, []byte) {
 	if p[0] < 0x80 {
 		return int(p[0]), p[1:]
@@ -431,7 +427,6 @@ func str(p []byte) (string, []byte) {
 
 func pf64(p []byte) float64 { return math.Float64frombits(binary.LittleEndian.Uint64(p)) }
 
-// evalProg is eval of a stored program, the empty one holding.
 func (sc *scratch) evalProg(p []byte) bool { return len(p) == 0 || sc.eval(p) }
 
 // eval reports whether the document whose values sc holds satisfies program p.
@@ -508,7 +503,6 @@ func (sc *scratch) eval(p []byte) bool {
 	}
 }
 
-// equals is eq's verdict (tag pEqText, pEqNum or pEqBool) on v.
 func equals(tag byte, p []byte, v *schema.Value) bool {
 	switch tag {
 	case pEqText:
@@ -552,8 +546,6 @@ func in(p []byte, v *schema.Value) bool {
 	return false
 }
 
-// some reports whether every (contains_all, words_all) or any wanted text of p is a
-// substring of text.
 func some(text string, p []byte, every bool) bool {
 	n, p := uv(p)
 	for range n {
@@ -566,8 +558,6 @@ func some(text string, p []byte, every bool) bool {
 	return every
 }
 
-// has reports whether every (has_all) or any wanted entry of p is among entries
-// (sorted).
 func has(entries []string, p []byte, every bool) bool {
 	if len(entries) == 0 {
 		return false
@@ -617,7 +607,6 @@ func checkProg(p []byte, numFields uint32) error {
 	return nil
 }
 
-// progNode returns the length of the node p starts with.
 func progNode(p []byte, numFields uint32, depth int) (int, error) {
 	if len(p) == 0 || depth > maxProgDepth {
 		return 0, errBadProgram

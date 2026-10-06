@@ -115,8 +115,8 @@ type wireDoc struct {
 }
 
 type percolateReply struct {
-	Matches [][]string `json:"matches"`
-	Stale   bool       `json:"stale,omitempty"`
+	Matches []json.RawMessage `json:"matches"`
+	Stale   bool              `json:"stale,omitempty"`
 }
 
 // getMsg reads a document or a saved query from a peer's copy.

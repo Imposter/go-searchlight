@@ -17,10 +17,11 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// Group commit defaults (plan Task 8): flush every 2 ms or at 1,000 changes.
+// Group commit defaults: flush every 2 ms or at 4,096 changes, so a few concurrent
+// _bulk requests of a thousand documents share one transaction (and its fsync).
 const (
 	DefaultGroupCommitDelay   = 2 * time.Millisecond
-	DefaultGroupCommitChanges = 1000
+	DefaultGroupCommitChanges = 4096
 )
 
 // GroupCommitOptions tune a GroupCommitter. Zero values take the defaults.

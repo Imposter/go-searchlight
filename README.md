@@ -22,6 +22,11 @@ and the build plan is in [docs/superpowers/plans/2026-10-02-searchlight.md](docs
   Kubernetes), every setting, sizing, backups, upgrades, monitoring and troubleshooting.
 - [docs/architecture.md](docs/architecture.md): the components and how data flows
   through them.
+- [docs/clustering.md](docs/clustering.md): how clustering on Postgres (or MySQL)
+  works — joining, writes, reads, shard allocation, recovery and failure handling.
+- [docs/nginx.md](docs/nginx.md): putting nginx in front of the cluster as the load
+  balancer for queries and writes, with a working config at
+  [deploy/nginx/searchlight.conf](deploy/nginx/searchlight.conf).
 
 ## Building
 

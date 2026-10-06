@@ -580,6 +580,12 @@ type faultStore struct {
 	// onRetire, when set, runs at the start of every RetireCopy, before it reaches the
 	// store.
 	onRetire atomic.Pointer[func()]
+	// stallTail, while set, holds every ChangesAfter until it is closed or the call's
+	// context ends: the node's tailers stay where they are, serving and current by
+	// their own measure.
+	stallTail atomic.Pointer[chan struct{}]
+	// stalled counts the ChangesAfter calls stallTail holds now.
+	stalled atomic.Int32
 }
 
 // timed records an operation's duration: defer f.timed("op")().
@@ -696,6 +702,15 @@ func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, in
 func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {
 	if f.isDown() {
 		return nil, errPartitioned
+	}
+	if stall := f.stallTail.Load(); stall != nil {
+		f.stalled.Add(1)
+		defer f.stalled.Add(-1)
+		select {
+		case <-*stall:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return f.Store.ChangesAfter(ctx, id, seq, limit)
 }

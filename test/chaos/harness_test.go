@@ -346,14 +346,7 @@ func (b *balancer) do(ctx context.Context, method, path, body string, deadline t
 			continue
 		case a.status == http.StatusTooManyRequests || a.status == http.StatusServiceUnavailable:
 			b.retried(fmt.Sprintf("%s %d", kind, a.status))
-			switch {
-			case a.status == http.StatusServiceUnavailable && m.disrupted.Load() && b.c.refusedOnly:
-				// A node stopping gracefully keeps its listener open through its grace
-				// period, so health checks have time to catch up (Server.Run); a request
-				// that lands on it meanwhile and finds its own copies already retiring
-				// gets a clean 503, not work half-done and then cut. That is exactly what
-				// refusedOnly allows a disrupted node, same as a refused connection.
-			case a.status == http.StatusTooManyRequests || !write || !b.c.write503:
+			if a.status == http.StatusTooManyRequests || !write || !b.c.write503 {
 				b.violate("%s %s: %s answered HTTP %d %s", method, path, m.NodeID(), a.status, truncate(bytes.TrimSpace(a.body)))
 			}
 			last = fmt.Sprintf("HTTP %d %s", a.status, bytes.TrimSpace(a.body))

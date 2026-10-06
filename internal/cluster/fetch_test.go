@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +88,75 @@ func TestPinnedFetchSurvivesRetire(t *testing.T) {
 		t.Fatal("the retired copy is still hosted")
 	}
 	fetch("after the copy retired")
+}
+
+// TestWaitForSeqReadSurvivesDrain (#66): a wait_for_seq search parked on a node's own
+// copy, which has not applied the seq, while that node drains and retires the copy. The
+// read is answered by the copy on the other node, a 200, not a 503 from the closed one.
+func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	p := c.start(1)
+	createIndex(t, a.n, "dr", 1, 0)
+	waitCopies(t, a.st, "dr", 1, 2, time.Minute)
+	var last int64
+	for k := range 10 {
+		last = mustWrite(t, a.n, "dr", upsertOp(fmt.Sprintf("d%d", k), k))
+	}
+	waitCount(t, p.n, "dr", last, 10)
+
+	stall := make(chan struct{})
+	t.Cleanup(func() { close(stall) })
+	p.wrap.stallTail.Store(&stall)
+	eventually(t, 10*time.Second, "node-1's tailer is held", func() error {
+		if p.wrap.stalled.Load() == 0 {
+			return errors.New("no poll held yet")
+		}
+		return nil
+	})
+	last = mustWrite(t, a.n, "dr", upsertOp("late", 10))
+	waitCount(t, a.n, "dr", last, 11)
+
+	type answer struct {
+		status int
+		body   []byte
+		err    error
+	}
+	got := make(chan answer, 1)
+	go func() {
+		url := fmt.Sprintf("http://%s/indexes/dr/_search?wait_for_seq=%d", p.addr, last)
+		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
+		if err != nil {
+			got <- answer{err: err}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			got <- answer{err: err}
+			return
+		}
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		got <- answer{status: resp.StatusCode, body: b, err: err}
+	}()
+	select {
+	case r := <-got:
+		t.Fatalf("the read answered before the drain (%d %s, %v): it did not park on node-1's copy", r.status, r.body, r.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	p.n.Drain(tctx(t))
+	if _, hosted := p.n.Hosted(store.ShardID{Index: "dr", Shard: 0}); hosted {
+		t.Fatal("the drained copy is still hosted")
+	}
+	r := <-got
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if r.status != http.StatusOK || !bytes.Contains(r.body, []byte(`"late"`)) {
+		t.Fatalf("the parked read answered %d: %s, want a 200 with the late document", r.status, r.body)
+	}
 }
 
 // TestSearchRequeriesShardWhoseFetchFails: the copy a shard's hits came from loses

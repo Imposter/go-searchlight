@@ -247,6 +247,9 @@ func renderMethod(w io.Writer, r *Run) {
 	}
 	fmt.Fprintf(w, "- Each search workload runs %d warmup then %d measured requests, %s, cycling through %d query variants. Latencies are client-side wall time per request, recorded in an HDR-style histogram (0.1%% precision).\n", o.Warmup, o.Iterations, loop, o.Variants)
 	fmt.Fprintf(w, "- Bulk loads send %d documents per request at concurrency %d. Percolation batches hold %d documents at concurrency %d. Deep paging walks to depth %d.\n", o.BulkBatch, o.BulkConcurrency, o.PercolateBatch, o.PercolateConcurrency, o.PageDepth)
+	if o.PercolateSingle > 0 {
+		fmt.Fprintf(w, "- Single-document percolation measures %d requests per saved-search set, at concurrency 1: at least 1000, the fewest a trusted p99 needs (runs before October 2026 took 300, too few to judge T5's p99).\n", o.PercolateSingle)
+	}
 	if o.MixedSeconds > 0 {
 		fmt.Fprintf(w, "- The mixed workload runs for %.0f s.\n", o.MixedSeconds)
 	}

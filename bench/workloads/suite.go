@@ -188,7 +188,7 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 		Options: report.Options{
 			Warmup: cfg.Search.Warmup, Iterations: cfg.Search.Iterations, Concurrency: cfg.Search.Concurrency, Rate: cfg.Search.Rate,
 			Variants: cfg.Variants, BulkBatch: cfg.BulkBatch, BulkConcurrency: cfg.BulkConcurrency,
-			PercolateBatch: cfg.PercolateBatch, PercolateConcurrency: cfg.PercolateConcurrency, PageDepth: cfg.PageDepth,
+			PercolateBatch: cfg.PercolateBatch, PercolateConcurrency: cfg.PercolateConcurrency, PercolateSingle: cfg.PercolateSingle, PageDepth: cfg.PageDepth,
 			MixedSeconds: cfg.MixedDuration.Seconds(),
 		},
 	}}

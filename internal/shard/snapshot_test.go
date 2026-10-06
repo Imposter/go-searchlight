@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 // copySnapshot writes every file of sn into dir, the manifest last, as a peer recovery
@@ -148,19 +149,20 @@ func TestSnapshotHoldsSegmentFiles(t *testing.T) {
 	sn.Release()
 	sn.Release() // idempotent
 	h.refresh()
-	// Release may hand the files to the janitor on its own goroutine rather than
-	// delete them inline: wait it out (waitNoOrphans's drain-and-recheck loop,
-	// spaced out rather than spun) instead of calling drain a fixed number of times
-	// back to back, which can all run before that goroutine gets to removeLater
-	// under -race's heavier scheduling.
-	h.waitNoOrphans()
-	for _, n := range names {
-		if n == ManifestName {
-			continue
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h.s.jan.drain()
+		left := slices.DeleteFunc(slices.Clone(names), func(n string) bool {
+			_, err := os.Stat(filepath.Join(h.dir, n))
+			return n == ManifestName || err != nil
+		})
+		if len(left) == 0 {
+			break
 		}
-		if _, err := os.Stat(filepath.Join(h.dir, n)); err == nil {
-			t.Fatalf("merged-away file %s outlived the snapshot's release: %v", n, dirFiles(t, h.dir))
+		if time.Now().After(deadline) {
+			t.Fatalf("merged-away files %v outlived the snapshot's release: %v", left, dirFiles(t, h.dir))
 		}
+		time.Sleep(time.Millisecond)
 	}
 	if !slices.Contains(dirFiles(t, h.dir), ManifestName) {
 		t.Fatal("no manifest")

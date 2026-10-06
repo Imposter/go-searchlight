@@ -371,10 +371,15 @@ func numberKey(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-// requestID identifies a request while it runs (its address): the shards of one
-// request count a leaf's use once between them.
-func requestID(r *Request) uintptr {
-	return reflect.ValueOf(r).Pointer()
+// requestID identifies a request while it runs: the shards of one request count a
+// leaf's use once between them. A parsed request has a serial of its own; any other
+// is known by its address, which a later request may reuse once it is collected, so
+// a serial is never confused with an address.
+func requestID(r *Request) uint64 {
+	if r.serial != 0 {
+		return r.serial
+	}
+	return uint64(reflect.ValueOf(r).Pointer()) | 1<<63
 }
 
 // checkBuckets refuses a shard's histogram past MaxBuckets, as Elasticsearch refuses

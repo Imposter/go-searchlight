@@ -561,10 +561,14 @@ func cmpValue(a, b any, desc bool) int {
 
 // The rank cache.
 
-// rankCacheBytes bounds the rank arrays kept (4 bytes per document). A segment of more
-// than rankCacheBytes/4 documents (64M) is never cached: its rank array is rebuilt for
+// rankCacheBytes bounds the rank arrays kept (4 bytes per document). A segment whose
+// array would take more than 1/rankEntryShare of it (16M documents) is never cached, so
+// one segment cannot evict every other's: its rank array is rebuilt for
 // each search that needs it.
-const rankCacheBytes = 256 << 20
+const (
+	rankCacheBytes = 256 << 20
+	rankEntryShare = 4
+)
 
 // rankLRU caches each segment's rank array: ord -> the rank of its id among the
 // segment's ids. Segments never change, so an entry never goes stale; an entry whose
@@ -596,7 +600,7 @@ func (c *rankLRU) get(seg string) []uint32 {
 
 func (c *rankLRU) put(seg string, r *segment.Reader, ranks []uint32) {
 	size := int64(len(ranks)) * 4
-	if size > rankCacheBytes {
+	if size > rankCacheBytes/rankEntryShare {
 		return
 	}
 	c.mu.Lock()

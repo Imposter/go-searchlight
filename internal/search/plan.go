@@ -93,7 +93,7 @@ type leafPlan struct {
 	every   bool
 }
 
-func compileNode(n query.Node, req uintptr) *pnode {
+func compileNode(n query.Node, req uint64) *pnode {
 	switch x := n.(type) {
 	case *query.All:
 		if x == nil {
@@ -131,7 +131,7 @@ func compileNode(n query.Node, req uintptr) *pnode {
 	}
 }
 
-func compileLeaf(l *query.Leaf, req uintptr) *leafPlan {
+func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 	lp := &leafPlan{
 		leaf: l, field: l.Field, op: l.Op, arg: l.Decoded(),
 		key:   string(query.Canonical(l)),
@@ -220,7 +220,7 @@ type usageSketch struct {
 
 type usageSlot struct {
 	count atomic.Uint32
-	last  atomic.Uintptr // the request that last counted this slot
+	last  atomic.Uint64 // the request that last counted this slot
 }
 
 const (
@@ -231,7 +231,7 @@ const (
 var leafUsage usageSketch
 
 // seen counts key once for request req and reports whether an earlier request saw it.
-func (u *usageSketch) seen(key string, req uintptr) bool {
+func (u *usageSketch) seen(key string, req uint64) bool {
 	slot := &u.slots[hashString(key)%usageSlots]
 	if slot.last.Swap(req) == req {
 		return slot.count.Load() >= 2 // this request counted it already
@@ -742,8 +742,8 @@ func rangeOf(lp *leafPlan) (numBounds, bool) {
 }
 
 // scanChunk is how many ordinals one parallel task of a column scan covers: one
-// roaring container.
-const scanChunk = 1 << 16
+// roaring container. A variable so tests can split small segments.
+var scanChunk uint32 = 1 << 16
 
 // numericScan returns the documents of scope whose number lies within b.
 func (s *segExec) numericScan(field string, b numBounds, scope *roaring.Bitmap) *roaring.Bitmap {
@@ -767,11 +767,11 @@ func (s *segExec) columnScan(scope *roaring.Bitmap, keep func(docs, dst []uint32
 	chunks := int(last-first) + 1
 	parts := make([]*roaring.Bitmap, chunks)
 	err := runParallel(chunks, func(c int) {
-		lo := uint64(first+uint32(c)) * scanChunk //nolint:gosec // c < chunks
+		lo := uint64(first+uint32(c)) * uint64(scanChunk) //nolint:gosec // c < chunks
 		part := scope
 		if chunks > 1 {
 			window := roaring.New()
-			window.AddRange(lo, lo+scanChunk)
+			window.AddRange(lo, lo+uint64(scanChunk))
 			part = roaring.And(scope, window)
 		}
 		out := roaring.New()

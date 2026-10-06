@@ -176,8 +176,9 @@ func (g *globalOrds) term(gen *shard.Generation, field string, gl uint32, entrie
 	return r.Keywords(field).Term(at.ord)
 }
 
-// globalOrdsCacheBytes bounds the global ordinals kept across searches.
-const globalOrdsCacheBytes = 256 << 20
+// globalOrdsCacheBytes bounds the global ordinals kept across searches. A variable so
+// tests can make it small.
+var globalOrdsCacheBytes int64 = 256 << 20
 
 // ordsCache is the LRU of global ordinals, by field, kind and segment list.
 type ordsCache struct {

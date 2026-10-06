@@ -460,7 +460,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		for _, spec := range p.aggs {
 			part := sr.aggs[spec.name]
 			if part != nil && part.ords != nil {
-				ordParts[spec] = append(ordParts[spec], part.ords)
+				ordParts[spec] = append(ordParts[spec], part.ords...)
 				continue
 			}
 			mergePartial(aggs[spec.name], part, spec)

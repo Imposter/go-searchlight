@@ -2,6 +2,7 @@ package search
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"slices"
 	"time"
@@ -39,9 +40,10 @@ type AggPartial struct {
 	Stats         *StatsPartial `json:"stats,omitempty"`
 	Sketch        *Sketch       `json:"sketch,omitempty"`
 
-	// ords is a segment's partial by local ordinal (a keyword or list field's terms or
-	// cardinality), which the shard merges by global ordinal into the fields above.
-	ords *ordPartial
+	// ords are a segment's partials by local ordinal (a keyword or list field's terms
+	// or cardinality, one per part of the segment collected apart), which the shard
+	// merges by global ordinal into the fields above.
+	ords []*ordPartial
 }
 
 // BucketPartial is one bucket of a partial: its key (a string, float64 or bool; a
@@ -313,7 +315,7 @@ func (c *cardColl) countDense(notHit *roaring.Bitmap) bool {
 
 func (c *cardColl) partial() *AggPartial {
 	if c.seen != nil {
-		return &AggPartial{Type: AggCardinality, ords: &ordPartial{seg: c.s.seg, seen: c.seen}}
+		return &AggPartial{Type: AggCardinality, ords: []*ordPartial{{seg: c.s.seg, seen: c.seen}}}
 	}
 	c.sketch.seal()
 	return &AggPartial{Type: AggCardinality, Sketch: c.sketch}
@@ -444,7 +446,7 @@ func (c *termsColl) partial() *AggPartial {
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
 	case c.src.ords != nil:
-		p.ords = &ordPartial{seg: c.s.seg, counts: c.counts, subs: c.subs}
+		p.ords = []*ordPartial{{seg: c.s.seg, counts: c.counts, subs: c.subs}}
 	default:
 		for o, n := range c.counts {
 			if n == 0 {
@@ -795,7 +797,7 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 		return nil
 	}
 	colls := make([]collector, len(s.p.aggs))
-	var perDoc []collector
+	var perDoc []int
 	var notHit *roaring.Bitmap
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
 	for i, spec := range s.p.aggs {
@@ -817,31 +819,117 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 			}
 			continue
 		}
-		perDoc = append(perDoc, c)
+		perDoc = append(perDoc, i)
+	}
+	out := make(map[string]*AggPartial, len(colls))
+	if hits.GetCardinality() >= aggChunkMin && hits.Maximum()/aggChunk > hits.Minimum()/aggChunk {
+		for i, p := range s.collectChunked(hits, perDoc) {
+			out[s.p.aggs[perDoc[i]].name] = p
+		}
+		perDoc = nil
 	}
 	if len(perDoc) > 0 {
-		it := hits.ManyIterator()
-		buf := make([]uint32, 512)
-		for {
-			n := it.NextMany(buf)
-			if n == 0 || s.checkCtx() {
-				break
-			}
-			for _, d := range buf[:n] {
-				for _, c := range perDoc {
-					c.collect(d)
-				}
-			}
+		cs := make([]collector, len(perDoc))
+		for j, i := range perDoc {
+			cs[j] = colls[i]
 		}
+		s.collect(hits, cs)
 	}
 	if s.err != nil {
 		return nil
 	}
-	out := make(map[string]*AggPartial, len(colls))
 	for i, spec := range s.p.aggs {
-		out[spec.name] = colls[i].partial()
+		if out[spec.name] == nil {
+			out[spec.name] = colls[i].partial()
+		}
 	}
 	return out
+}
+
+// collect feeds every document of docs to every collector of cs.
+func (s *segExec) collect(docs *roaring.Bitmap, cs []collector) {
+	it := docs.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 || s.checkCtx() {
+			return
+		}
+		for _, d := range buf[:n] {
+			for _, c := range cs {
+				c.collect(d)
+			}
+		}
+	}
+}
+
+// aggChunkMin is the fewest hits a segment's per-document aggregation is split for:
+// each stretch of aggChunk ordinals is collected apart on the search pool, and the
+// parts' partials merged. Variables so tests can split small segments.
+var (
+	aggChunkMin uint64 = 1 << 15
+	aggChunk           = scanChunk
+)
+
+// collectChunked collects the aggregations specs (indexes into the request's) over
+// hits in parts, in parallel, and returns each one's partial, merged.
+func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartial {
+	first, last := hits.Minimum()/aggChunk, hits.Maximum()/aggChunk
+	chunks := int(last-first) + 1
+	parts := make([][]*AggPartial, chunks)
+	errs := make([]error, chunks)
+	err := runParallel(chunks, func(c int) {
+		lo := uint64(first+uint32(c)) * uint64(aggChunk) //nolint:gosec // c < chunks
+		window := roaring.New()
+		window.AddRange(lo, lo+uint64(aggChunk))
+		docs := roaring.And(hits, window)
+		cs := s.fork()
+		colls := make([]collector, len(specs))
+		for j, i := range specs {
+			colls[j] = cs.newCollector(s.p.aggs[i], true)
+		}
+		cs.collect(docs, colls)
+		if cs.err != nil {
+			errs[c] = cs.err
+			return
+		}
+		parts[c] = make([]*AggPartial, len(specs))
+		for j := range colls {
+			parts[c][j] = colls[j].partial()
+		}
+	})
+	if err == nil {
+		err = errors.Join(errs...)
+	}
+	if err != nil {
+		if s.err == nil {
+			s.err = err
+		}
+		return nil
+	}
+	out := make([]*AggPartial, len(specs))
+	for j, i := range specs {
+		spec := s.p.aggs[i]
+		merged := &AggPartial{Type: spec.typ}
+		for c := range parts {
+			if p := parts[c][j]; p.ords != nil {
+				merged.ords = append(merged.ords, p.ords...)
+			} else {
+				mergePartial(merged, p, spec)
+			}
+		}
+		out[j] = merged
+	}
+	return out
+}
+
+// fork is a copy of s for one part of a segment collected apart: its own field
+// sources (their scratch buffers) and error.
+func (s *segExec) fork() *segExec {
+	cs := *s
+	cs.sources = map[string]*fieldSrc{}
+	cs.err = nil
+	return &cs
 }
 
 // mergePartial adds src into dst (the same aggregation).

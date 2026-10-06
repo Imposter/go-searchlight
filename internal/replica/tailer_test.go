@@ -169,17 +169,20 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		wake()
 	}
 
-	// Concurrent writers through the group committer, all along.
-	bg, stopWriters := context.WithCancel(context.Background())
+	// Concurrent writers through the group committer, all along. No writer gives up
+	// on a commit: one whose callers all cancel is cancelled mid-transaction, and on
+	// Postgres its COMMIT can still land after Close, past the head read below.
+	var stopped atomic.Bool
+	stopWriters := func() { stopped.Store(true) }
 	var writers sync.WaitGroup
 	for range 2 {
 		writers.Add(1)
 		go func() {
 			defer writers.Done()
-			for bg.Err() == nil {
-				_, _, err := gc.Apply(bg, randomBatch())
+			for !stopped.Load() {
+				_, _, err := gc.Apply(context.Background(), randomBatch())
 				// A batch can meet a dropped index (it is recreated at once).
-				if err != nil && bg.Err() == nil && !errors.Is(err, store.ErrNotFound) {
+				if err != nil && !errors.Is(err, store.ErrNotFound) {
 					t.Errorf("group commit: %v", err)
 					return
 				}
@@ -276,8 +279,6 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 	}
 	stopWriters()
 	writers.Wait()
-	// A group commit its caller gave up on may still commit: wait for every one
-	// before reading the head.
 	if err := gc.Close(); err != nil {
 		t.Fatal(err)
 	}

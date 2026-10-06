@@ -100,16 +100,21 @@ const (
 
 // fieldSrc reads one field's values in one segment.
 type fieldSrc struct {
-	kind srcKind
-	kc   segment.KeywordColumn
-	mc   segment.MultiColumn
-	nc   segment.NumericColumn
-	t, f *roaring.Bitmap
-	// ords are the field's global ordinals (keyword and list fields): this segment's
-	// local-to-global map, document frequencies, and every global ordinal's hash.
+	r     *segment.Reader
+	field string
+	seg   int
+	kind  srcKind
+	kc    segment.KeywordColumn
+	mc    segment.MultiColumn
+	nc    segment.NumericColumn
+	t, f  *roaring.Bitmap
+	// ords are the field's cached global ordinals, when a keyword or list field has
+	// them: this segment's local-to-global map, and every global ordinal's hash.
 	ords   *globalOrds
 	global []uint32
-	dfs    []uint32
+	// hashes memoizes each local ordinal's value hash when there are no global
+	// ordinals (0: not yet).
+	hashes []uint64
 	buf    []uint32
 }
 
@@ -118,7 +123,7 @@ func (s *segExec) source(field string, t schema.FieldType) *fieldSrc {
 	if fs, ok := s.sources[key]; ok {
 		return fs
 	}
-	fs := &fieldSrc{}
+	fs := &fieldSrc{r: s.r, field: field, seg: s.seg}
 	switch t {
 	case schema.Keyword, schema.Text:
 		if kc := s.r.Keywords(field); kc.Exists() {
@@ -131,7 +136,7 @@ func (s *segExec) source(field string, t schema.FieldType) *fieldSrc {
 	}
 	if list, ok := ordKind(t); ok && (fs.kind == srcKeyword || fs.kind == srcList) {
 		if g := s.p.ords[ordField{field, list}]; g != nil {
-			fs.ords, fs.global, fs.dfs = g, g.segs[s.seg], g.dfs[s.seg]
+			fs.ords, fs.global = g, g.segs[s.seg]
 		}
 	}
 	switch t {
@@ -164,10 +169,38 @@ func (fs *fieldSrc) boolOf(d uint32) (bool, bool) {
 	return false, false
 }
 
-// ordHash is local ordinal o's value hash.
 func (fs *fieldSrc) ordHash(o uint32) uint64 {
-	return fs.ords.hashes[fs.global[o]]
+	if fs.ords != nil {
+		return fs.ords.hashes[fs.global[o]]
+	}
+	if fs.hashes == nil {
+		fs.hashes = make([]uint64, fs.numTerms())
+	}
+	h := fs.hashes[o]
+	if h == 0 {
+		if fs.kind == srcList {
+			h = hashString(fs.mc.Term(o)) | 1
+		} else {
+			h = hashString(fs.kc.Term(o)) | 1
+		}
+		fs.hashes[o] = h
+	}
+	return h
 }
+
+// numTerms is how many terms the field's keyword or list column holds.
+func (fs *fieldSrc) numTerms() uint32 {
+	switch fs.kind {
+	case srcKeyword:
+		return fs.kc.NumTerms()
+	case srcList:
+		return fs.mc.NumTerms()
+	}
+	return 0
+}
+
+// ordinal reports whether the field counts by ordinal: a keyword or list column.
+func (fs *fieldSrc) ordinal() bool { return fs.kind == srcKeyword || fs.kind == srcList }
 
 // eachHash calls fn with the hash of each of document d's values.
 func (fs *fieldSrc) eachHash(d uint32, fn func(uint64)) {
@@ -207,8 +240,8 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		return &statsColl{src: src}
 	case AggCardinality:
 		c := &cardColl{s: s, src: src, sketch: NewSketch(spec.precision)}
-		if top && src.ords != nil {
-			c.seen = make([]uint64, (len(src.global)+63)/64)
+		if top && src.ordinal() {
+			c.seen = make([]uint64, (src.numTerms()+63)/64)
 		}
 		return c
 	case AggTerms:
@@ -277,7 +310,7 @@ type cardColl struct {
 	s      *segExec
 	src    *fieldSrc
 	sketch *Sketch
-	seen   []uint64 // top level over local ordinals, merged by global ordinal
+	seen   []uint64
 }
 
 func (c *cardColl) collect(d uint32) {
@@ -324,9 +357,16 @@ func (c *cardColl) partial() *AggPartial {
 // denseCounts is each local ordinal's documents among a dense hit set: its document
 // frequency, minus the documents not hit that hold it.
 func (fs *fieldSrc) denseCounts(notHit *roaring.Bitmap) []int64 {
-	counts := make([]int64, len(fs.dfs))
-	for o, df := range fs.dfs {
-		counts[o] = int64(df)
+	counts := make([]int64, fs.numTerms())
+	if fs.ords != nil {
+		for o, df := range fs.ords.dfs[fs.seg] {
+			counts[o] = int64(df)
+		}
+	} else {
+		cur := fs.r.Cursor(fs.field, ordTermKind(fs.kind == srcList))
+		for o := 0; o < len(counts) && cur.Next(); o++ {
+			counts[o] = int64(cur.DocFreq())
+		}
 	}
 	it := notHit.ManyIterator()
 	buf := make([]uint32, 512)
@@ -365,8 +405,8 @@ type termsColl struct {
 func (c *termsColl) slot(o uint32) {
 	if c.counts == nil {
 		n := uint32(2)
-		if c.src.ords != nil {
-			n = uint32(len(c.src.global)) //nolint:gosec // a segment holds at most 2^32 terms
+		if c.src.ordinal() {
+			n = c.src.numTerms()
 		}
 		c.counts = make([]int64, n)
 		if len(c.spec.subs) > 0 {
@@ -431,7 +471,7 @@ func (c *termsColl) collect(d uint32) {
 // document frequencies, minus the documents not hit: cheaper than reading every hit's
 // value when most of the segment matches.
 func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
-	if len(c.spec.subs) > 0 || c.src.ords == nil {
+	if len(c.spec.subs) > 0 || !c.src.ordinal() {
 		return false
 	}
 	c.counts = c.src.denseCounts(notHit)
@@ -445,7 +485,7 @@ func (c *termsColl) partial() *AggPartial {
 		for v, b := range c.numbers {
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
-	case c.src.ords != nil:
+	case c.src.ordinal():
 		p.ords = []*ordPartial{{seg: c.s.seg, counts: c.counts, subs: c.subs}}
 	default:
 		for o, n := range c.counts {
@@ -514,7 +554,6 @@ func (c *rangeColl) countDense(notHit *roaring.Bitmap) bool {
 	return true
 }
 
-// eachValue calls fn with the value of each document of docs that has one.
 func eachValue(nc segment.NumericColumn, docs *roaring.Bitmap, fn func(v float64)) {
 	it := docs.ManyIterator()
 	buf := make([]uint32, 512)
@@ -822,7 +861,7 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 		perDoc = append(perDoc, i)
 	}
 	out := make(map[string]*AggPartial, len(colls))
-	if hits.GetCardinality() >= aggChunkMin && hits.Maximum()/aggChunk > hits.Minimum()/aggChunk {
+	if len(perDoc) > 0 && hits.GetCardinality() >= aggChunkMin && hits.Maximum()/aggChunk > hits.Minimum()/aggChunk {
 		for i, p := range s.collectChunked(hits, perDoc) {
 			out[s.p.aggs[perDoc[i]].name] = p
 		}
@@ -846,7 +885,6 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 	return out
 }
 
-// collect feeds every document of docs to every collector of cs.
 func (s *segExec) collect(docs *roaring.Bitmap, cs []collector) {
 	it := docs.ManyIterator()
 	buf := make([]uint32, 512)
@@ -923,8 +961,8 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartia
 	return out
 }
 
-// fork is a copy of s for one part of a segment collected apart: its own field
-// sources (their scratch buffers) and error.
+// fork is a copy of s for one part of a segment collected apart, with field sources
+// and an error of its own.
 func (s *segExec) fork() *segExec {
 	cs := *s
 	cs.sources = map[string]*fieldSrc{}

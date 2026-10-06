@@ -381,10 +381,10 @@ func (s *segExec) walkPoints(hits *roaring.Bitmap, k int) bool {
 }
 
 // collectByPoints feeds the heap from the point index's blocks in sort order, from the
-// cursor (or the column's best end), offering each block's hits; it stops once the
-// heap is full and the next block holds only values worse than its worst. Documents
-// with no value sort after every value: they are offered only if every block has been
-// walked and the heap is still not full.
+// cursor (or the column's best end), offering each block's hits best first; it stops
+// once the heap is full and the next block holds only values worse than its worst.
+// Documents with no value sort after every value: they are offered only if every block
+// has been walked and the heap is still not full.
 func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitmap, k int) {
 	c := &ss.cols[0]
 	desc := c.spec.desc
@@ -424,8 +424,6 @@ func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitma
 			}
 		}
 		if desc {
-			// Best first, so the heap fills with the block's best and the rest are
-			// refused without a check.
 			slices.Reverse(buf)
 		}
 		ss.offer(h, buf, k)
@@ -537,8 +535,6 @@ func (s *segExec) toSegHits(ss *segSorter, es []entry) []segHit {
 		}
 		out[i] = segHit{seg: s.seg, ord: e.ord, vals: vals}
 		if ss.rank != nil {
-			// The rank array was built: should the shard's merge need the id to break
-			// a tie, it is one dictionary lookup away, no stored record to decompress.
 			out[i].rank, out[i].hasRank = ss.rank[e.ord], true
 		}
 	}

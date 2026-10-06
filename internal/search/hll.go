@@ -232,7 +232,7 @@ const (
 	fnvPrime  = 1099511628211
 )
 
-func hashString(s string) uint64 {
+func hashString[T string | []byte](s T) uint64 {
 	h := uint64(fnvOffset)
 	for i := 0; i < len(s); i++ {
 		h ^= uint64(s[i])

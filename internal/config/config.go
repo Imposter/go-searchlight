@@ -125,6 +125,10 @@ type Config struct {
 	MergeThreads int
 	// SearchThreads sizes the search worker pool.
 	SearchThreads int
+	// GCHeapFloor is the heap size below which the garbage collector does not start
+	// a cycle (at most a quarter of GOMEMLIMIT); 0 turns the floor off, and a GOGC
+	// environment variable overrides it.
+	GCHeapFloor int64
 	// LogLevel is the minimum level logged.
 	LogLevel slog.Level
 	// Pprof serves /debug/pprof/* on the admin listener.
@@ -207,6 +211,7 @@ func Default() Config {
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
+		GCHeapFloor:           64 << 20,
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       time.Minute,
 		MaxBodyBytes:          16 << 20,
@@ -420,6 +425,15 @@ var settings = []setting{
 		name: "merge_threads", usage: "concurrent background merges (default: GOMAXPROCS/4, at least 1)",
 		parse:  func(c *Config, v string) error { return positiveInt(&c.MergeThreads, v) },
 		format: func(c *Config) string { return strconv.Itoa(c.MergeThreads) },
+	},
+	{
+		name: "gc_heap_floor", usage: "heap size below which the garbage collector does not start a cycle, e.g. 64MiB (0 = off; GOGC overrides; at most GOMEMLIMIT/4)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.GCHeapFloor = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.GCHeapFloor) },
 	},
 	{
 		name: "search_threads", usage: "search worker pool size (default: GOMAXPROCS)",

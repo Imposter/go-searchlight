@@ -14,6 +14,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // Every range, sort and aggregation fast path against brute force over the visible
@@ -65,11 +66,11 @@ func revDoc(rng *rand.Rand, round int) string {
 		body["created"] = v
 	}
 	if round != 2 || rng.IntN(10) == 0 { // round 2's segment has almost no brand
-		switch k := rng.IntN(40); {
-		case k == 0:
-		case k == 1:
+		switch rng.IntN(40) {
+		case 0:
+		case 1:
 			body["brand"] = "7" // a number in a keyword field
-		case k == 2:
+		case 2:
 			body["brand"] = "true"
 		default:
 			body["brand"] = strconv.Quote(fmt.Sprintf("b%03d", int(rng.ExpFloat64()*40)%400+round*3))
@@ -179,7 +180,7 @@ func revRangeLeaf(rng *rand.Rand, field string, vals []float64) string {
 func TestRangeFiltersEveryPath(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c1))
-	c := revCorpus(t, rng, 2, 5, 3000)
+	c := revCorpus(t, rng, 2, 5, testtier.Pick(1000, 3000))
 	docs := c.docs()
 	vals := map[string][]float64{"price": revValues(docs, "price"), "created": revValues(docs, "created")}
 	defer func() { docValuesFactor, scanChunk = defaultDocValuesFactor, 1<<16 }()
@@ -247,7 +248,7 @@ func TestRangeNonFiniteBounds(t *testing.T) {
 func TestSortWalkEveryPath(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c2))
-	c := revCorpus(t, rng, 2, 5, 3000)
+	c := revCorpus(t, rng, 2, 5, testtier.Pick(1000, 3000))
 	docs := c.docs()
 	vals := revValues(docs, "price")
 	defer func() { sortWalkFactor = 2 }()
@@ -262,7 +263,7 @@ func TestSortWalkEveryPath(t *testing.T) {
 		case 0:
 			raw = fmt.Sprintf(`{"field":"brand","op":"ne","value":"b%03d"}`, rng.IntN(5))
 		case 1:
-			raw = fmt.Sprintf(`{"field":"title","op":"contains","value":"%s"}`, pick(rng, []string{"red", "cup 1", "pan"}))
+			raw = fmt.Sprintf(`{"field":"title","op":"contains","value":%q}`, pick(rng, []string{"red", "cup 1", "pan"}))
 		case 2:
 			raw = revRangeLeaf(rng, "price", vals)
 		}
@@ -304,12 +305,14 @@ func TestSortWalkEveryPath(t *testing.T) {
 	}
 }
 
-// cases is n, or a fifth of it in short mode.
+// cases is n in the heavy tier, a tenth of it in the short tier, and a quarter of
+// either under the race detector.
 func cases(n int) int {
-	if testing.Short() {
-		return n / 5
+	n = testtier.Pick(n/10, n)
+	if testtier.Race {
+		n /= 4
 	}
-	return n
+	return max(n, 4)
 }
 
 func head(xs []string) []string { return xs[:min(len(xs), 8)] }
@@ -319,7 +322,7 @@ func head(xs []string) []string { return xs[:min(len(xs), 8)] }
 func TestSearchAfterAcrossMerge(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c3))
-	c := revCorpus(t, rng, 2, 4, 2500)
+	c := revCorpus(t, rng, 2, 4, testtier.Pick(600, 2500))
 	docs := c.docs()
 	defer func() { sortWalkFactor = 2 }()
 	for _, sorts := range [][]SortField{
@@ -409,7 +412,7 @@ func revAgg(rng *rand.Rand, vals []float64) Agg {
 func TestAggregationsEveryPath(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c4))
-	c := revCorpus(t, rng, 2, 5, 3000)
+	c := revCorpus(t, rng, 2, 5, testtier.Pick(1000, 3000))
 	docs := c.docs()
 	vals := revValues(docs, "price")
 	defer func() { aggChunkMin, aggChunk = 1<<15, 1<<16 }()
@@ -450,7 +453,7 @@ func TestAggregationsEveryPath(t *testing.T) {
 func TestOrdinalsAcrossChanges(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c5))
-	c := revCorpus(t, rng, 1, 3, 2000)
+	c := revCorpus(t, rng, 1, 3, testtier.Pick(800, 2000))
 	check := func(step string) {
 		t.Helper()
 		docs := c.docs()
@@ -506,7 +509,7 @@ func TestOrdinalsAcrossChanges(t *testing.T) {
 func TestOrdinalsConcurrent(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0x14c6))
-	c := revCorpus(t, rng, 2, 3, 2000)
+	c := revCorpus(t, rng, 2, 3, testtier.Pick(800, 2000))
 	docs := c.docs()
 	globalOrdsCacheBytes, globalOrdsDensity = 4<<10, 1<<40
 	defer func() {
@@ -597,7 +600,8 @@ func TestOrdinalsConcurrent(t *testing.T) {
 	globalOrdsCache.mu.Lock()
 	var held int64
 	for el := globalOrdsCache.lru.Front(); el != nil; el = el.Next() {
-		held += el.Value.(*ordsEntry).charged
+		e, _ := el.Value.(*ordsEntry)
+		held += e.charged
 	}
 	t.Logf("cache: accounted %d bytes, entries hold %d bytes, %d entries; lowest accounted %d", globalOrdsCache.bytes, held, globalOrdsCache.lru.Len(), lowest)
 	if lowest < 0 || globalOrdsCache.bytes != held {
@@ -693,8 +697,10 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	}
 	c.upsert("x", `{"brand":"zzz"}`)
 	c.refreshAll()
-	sparse := &Request{Query: mustParse(t, `{"field":"brand","op":"eq","value":"zzz"}`), Timeout: 50 * time.Millisecond,
-		Aggs: map[string]Agg{"n": {Type: AggCardinality, Field: "brand"}}}
+	sparse := &Request{
+		Query: mustParse(t, `{"field":"brand","op":"eq","value":"zzz"}`), Timeout: 50 * time.Millisecond,
+		Aggs: map[string]Agg{"n": {Type: AggCardinality, Field: "brand"}},
+	}
 	var ms runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&ms)
@@ -767,7 +773,7 @@ func TestShardSizeBoundsManySegments(t *testing.T) {
 	for round := range 4 {
 		for i := range 800 {
 			b := fmt.Sprintf("b%02d", min(39, int(rng.ExpFloat64()*6)+round))
-			c.upsert(fmt.Sprintf("d%04d", rng.IntN(2500)+i%2), fmt.Sprintf(`{"brand":%q,"tags":["%s","x%d"]}`, b, b, rng.IntN(9)))
+			c.upsert(fmt.Sprintf("d%04d", rng.IntN(2500)+i%2), fmt.Sprintf(`{"brand":%q,"tags":[%q,"x%d"]}`, b, b, rng.IntN(9)))
 		}
 		for range 60 {
 			c.remove(fmt.Sprintf("d%04d", rng.IntN(2500)))
@@ -780,7 +786,8 @@ func TestShardSizeBoundsManySegments(t *testing.T) {
 			truth := map[string]int64{}
 			for _, d := range brute(c.docs(), q, nil) {
 				for _, v := range aggValues(d, field) {
-					truth[v.(string)]++
+					s, _ := v.(string)
+					truth[s]++
 				}
 			}
 			var all int64

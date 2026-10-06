@@ -467,13 +467,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		}
 	}
 	for spec, parts := range ordParts {
-		list, _ := ordKind(spec.ftype)
-		ords := p.ords[ordField{spec.field, list}]
-		if spec.typ == AggTerms {
-			finishTerms(aggs[spec.name], parts, spec, g, ords, list)
-		} else {
-			finishCardinality(aggs[spec.name], parts, spec, ords)
-		}
+		finishOrds(ctx, aggs[spec.name], parts, spec, g, p)
 	}
 	for _, spec := range p.aggs {
 		cutShard(aggs[spec.name], spec)
@@ -567,20 +561,30 @@ type topMerge struct {
 }
 
 func (m *topMerge) id(h *segHit) string {
-	if !h.hasID {
-		r := m.g.Segments[h.seg].Reader
-		if h.hasRank {
-			h.id, _ = r.IDAt(h.rank)
-		} else {
-			id, err := r.ID(h.ord)
-			if err != nil && m.err == nil {
-				m.err = fmt.Errorf("search: segment %s: %w", m.g.Segments[h.seg].ID, err)
-			}
-			h.id = id
-		}
-		h.hasID = true
+	if err := resolveID(&m.g.Segments[h.seg], h); err != nil && m.err == nil {
+		m.err = err
 	}
 	return h.id
+}
+
+// resolveID reads h's id, once: from the id dictionary when h has its rank, else (or
+// when the dictionary has no such rank) from its stored record.
+func resolveID(sv *shard.SegmentView, h *segHit) error {
+	if h.hasID {
+		return nil
+	}
+	if h.hasRank {
+		if id, ok := sv.Reader.IDAt(h.rank); ok {
+			h.id, h.hasID = id, true
+			return nil
+		}
+	}
+	id, err := sv.Reader.ID(h.ord)
+	if err != nil {
+		return fmt.Errorf("search: segment %s: %w", sv.ID, err)
+	}
+	h.id, h.hasID = id, true
+	return nil
 }
 
 func (m *topMerge) compare(a, b *segHit) int {
@@ -660,12 +664,8 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 // fetchHit reads one chosen hit's id and body.
 func fetchHit(g *shard.Generation, p *prepared, h *segHit) (Hit, error) {
 	sv := &g.Segments[h.seg]
-	if !h.hasID {
-		id, err := sv.Reader.ID(h.ord)
-		if err != nil {
-			return Hit{}, fmt.Errorf("search: segment %s: %w", sv.ID, err)
-		}
-		h.id, h.hasID = id, true
+	if err := resolveID(sv, h); err != nil {
+		return Hit{}, err
 	}
 	hit := Hit{ID: h.id, Ref: &HitRef{Segment: sv.ID, Ord: h.ord}}
 	if !p.req.NoBodies {

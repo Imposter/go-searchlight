@@ -545,9 +545,6 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 		}
 	}
 	if b, ok := rangeOf(lp); ok && s.preferDocValues(lp, scope) {
-		// When far fewer documents are in question than the range holds, reading their
-		// values beats collecting the range's documents from the point index (Lucene's
-		// IndexOrDocValuesQuery).
 		return approx{sure: s.numericScan(lp.field, b, scope), maybe: roaring.New()}
 	}
 	c := s.candidates(lp)
@@ -572,9 +569,8 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	return approx{sure: sure, maybe: maybe}
 }
 
-// within is the documents of bm in scope, read-only: bm itself when scope is every
-// document of the segment (a root scope with no deletes), so a leaf's postings or
-// cached bitmap are used in place rather than copied.
+// within is bm in scope, read-only: a leaf's postings or cached bitmap are used in
+// place when the scope is every document of the segment.
 func (s *segExec) within(bm, scope *roaring.Bitmap) *roaring.Bitmap {
 	if scope == s.allDocs {
 		return bm
@@ -703,7 +699,8 @@ const defaultDocValuesFactor = 0.5
 const cachedRangeDiscount = 4
 
 // preferDocValues reports whether range leaf lp is cheaper to check over scope's values
-// than to collect from the point index.
+// than to collect from the point index: when far fewer documents are in question than
+// the range holds (Lucene's IndexOrDocValuesQuery).
 func (s *segExec) preferDocValues(lp *leafPlan, scope *roaring.Bitmap) bool {
 	limit := docValuesFactor * float64(s.estimateLeaf(lp).card)
 	if lp.useCache {

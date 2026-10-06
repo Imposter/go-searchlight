@@ -47,6 +47,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/cluster"
 	"github.com/Imposter/go-searchlight/internal/config"
+	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
@@ -98,6 +99,9 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 		return fmt.Errorf("telemetry: %w", err)
 	}
 	log := tel.Logger
+	if getenv("GOGC") == "" {
+		defer search.KeepHeapFloor(search.HeapFloor)()
+	}
 	clk := clock.Real{}
 	budget := &shutdownBudget{cfg: cfg, clock: clk}
 	defer func() {

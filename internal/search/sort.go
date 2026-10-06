@@ -402,6 +402,7 @@ func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitma
 		}
 	}
 	walked := true
+	member := membership{bm: hits, n: s.n}
 	buf := make([]uint32, 0, 128)
 	var docs []uint32
 	c.nc.EachBlock(lo, hi, desc, func(b segment.PointBlock) bool {
@@ -418,7 +419,7 @@ func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitma
 		docs = b.Docs(docs[:0])
 		buf = buf[:0]
 		for _, d := range docs {
-			if hits.Contains(d) {
+			if member.contains(d) {
 				buf = append(buf, d)
 			}
 		}
@@ -448,6 +449,32 @@ func (s *segExec) collectByPoints(ss *segSorter, h *topHeap, hits *roaring.Bitma
 		missing = c.nc.Missing(batch[:n], missing[:0])
 		ss.offer(h, missing, k)
 	}
+}
+
+// denseMembershipAfter is how many membership tests a walk makes on the hits' bitmap
+// before it copies the hits into a plain bitset: a walk over sparse hits visits many
+// documents, and each roaring lookup searches the bitmap's containers.
+const denseMembershipAfter = 512
+
+// membership tests whether documents are hits: on the roaring bitmap at first, on a
+// plain bitset of it once a walk has made denseMembershipAfter tests.
+type membership struct {
+	bm    *roaring.Bitmap
+	n     uint32
+	tests int
+	words []uint64
+}
+
+func (m *membership) contains(d uint32) bool {
+	if m.words != nil {
+		return m.words[d>>6]&(1<<(d&63)) != 0
+	}
+	m.tests++
+	if m.tests == denseMembershipAfter {
+		m.words = make([]uint64, (uint64(m.n)+63)/64)
+		m.bm.WriteDenseTo(m.words)
+	}
+	return m.bm.Contains(d)
 }
 
 // topByIDWalk walks the segment's ids in order from the cursor, keeping the first k

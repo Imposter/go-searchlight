@@ -505,7 +505,7 @@ func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 		sure, possible := scope, scope
 		for _, c := range order {
 			a := s.approximate(c, possible)
-			sure = roaring.And(sure, a.sure)
+			sure = s.within(a.sure, sure)
 			possible = a.possible()
 			if possible.IsEmpty() {
 				break
@@ -541,7 +541,7 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	}
 	if lp.useCache {
 		if bm, ok := s.cacheGet(lp); ok {
-			return approx{sure: roaring.And(bm, scope), maybe: roaring.New()}
+			return approx{sure: s.within(bm, scope), maybe: roaring.New()}
 		}
 	}
 	if b, ok := rangeOf(lp); ok && s.preferDocValues(lp, scope) {
@@ -553,9 +553,9 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	c := s.candidates(lp)
 	if c.maybe == nil || c.maybe.IsEmpty() {
 		if lp.useCache {
-			return approx{sure: roaring.And(s.cachePut(lp, c.sure), scope), maybe: roaring.New()}
+			return approx{sure: s.within(s.cachePut(lp, c.sure), scope), maybe: roaring.New()}
 		}
-		return approx{sure: roaring.And(c.sure, scope), maybe: roaring.New()}
+		return approx{sure: s.within(c.sure, scope), maybe: roaring.New()}
 	}
 	if lp.useCache && 2*scope.GetCardinality() >= uint64(s.n) {
 		// Most of the segment is in question anyway: verify all of it once, and cache.
@@ -564,12 +564,22 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 		if s.err != nil {
 			return emptyApprox
 		}
-		return approx{sure: roaring.And(s.cachePut(lp, full), scope), maybe: roaring.New()}
+		return approx{sure: s.within(s.cachePut(lp, full), scope), maybe: roaring.New()}
 	}
-	sure := roaring.And(c.sure, scope)
+	sure := s.within(c.sure, scope)
 	maybe := roaring.And(c.maybe, scope)
 	maybe.AndNot(sure)
 	return approx{sure: sure, maybe: maybe}
+}
+
+// within is the documents of bm in scope, read-only: bm itself when scope is every
+// document of the segment (a root scope with no deletes), so a leaf's postings or
+// cached bitmap are used in place rather than copied.
+func (s *segExec) within(bm, scope *roaring.Bitmap) *roaring.Bitmap {
+	if scope == s.allDocs {
+		return bm
+	}
+	return roaring.And(bm, scope)
 }
 
 // resolve returns exactly the documents of d that n matches, verifying in batches:

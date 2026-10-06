@@ -106,7 +106,15 @@ func ValidateID(id string) error {
 // buffer, so a caller may reuse it, and a document sliced out of a large request does
 // not pin the whole request in memory for as long as the document lives.
 func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
-	return analyze(m, id, body, false)
+	return analyze(m, id, body, modeIndex)
+}
+
+// AnalyzeForMatch analyzes a document exactly as [Analyze] does, for matching only:
+// what query.Match and the percolator read is the same, but no Value.Grams are computed
+// (GramsTruncated is never set) and Body is body itself when it is valid UTF-8, not a
+// copy. A percolated document, which is matched and never indexed, needs no more.
+func AnalyzeForMatch(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
+	return analyze(m, id, body, modeMatch)
 }
 
 // Check validates and types a document exactly as [Analyze] does (the same errors
@@ -115,15 +123,25 @@ func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
 // commits a document, at a fraction of Analyze's memory (no text, words or grams).
 // Unlike Analyze it returns body itself, not a copy, when it is valid UTF-8.
 func Check(m *Mapping, id string, body []byte) ([]byte, MappingUpdate, error) {
-	d, u, err := analyze(m, id, body, true)
+	d, u, err := analyze(m, id, body, modeTypes)
 	return d.Body, u, err
 }
 
-func analyze(m *Mapping, id string, body []byte, typesOnly bool) (Doc, MappingUpdate, error) {
+// analyzeMode is what analyze makes of a document's values.
+type analyzeMode uint8
+
+const (
+	modeIndex analyzeMode = iota // everything an index reads, grams included
+	modeMatch                    // everything the matcher reads
+	modeTypes                    // the fields' types alone
+)
+
+func analyze(m *Mapping, id string, body []byte, mode analyzeMode) (Doc, MappingUpdate, error) {
 	if err := ValidateID(id); err != nil {
 		return Doc{}, MappingUpdate{}, err
 	}
-	if !typesOnly || !utf8.Valid(body) {
+	typesOnly := mode == modeTypes
+	if mode == modeIndex || !utf8.Valid(body) {
 		body = validUTF8Copy(body)
 	}
 	object, err := decodeObject(body)
@@ -136,6 +154,7 @@ func analyze(m *Mapping, id string, body []byte, typesOnly bool) (Doc, MappingUp
 	a := analyzer{
 		mapping:   m,
 		typesOnly: typesOnly,
+		grams:     mode == modeIndex,
 		doc:       Doc{ID: id, Body: body},
 	}
 	if !typesOnly {
@@ -171,6 +190,7 @@ func analyze(m *Mapping, id string, body []byte, typesOnly bool) (Doc, MappingUp
 type analyzer struct {
 	mapping   *Mapping
 	typesOnly bool // Check: type the fields, analyze no value
+	grams     bool // compute Value.Grams
 	doc       Doc
 	update    MappingUpdate
 	claimed   map[string]bool // cleaned names taken so far, when names hold NULs
@@ -217,7 +237,7 @@ func (a *analyzer) member(name string, value any) error {
 		}
 	}
 	if !a.typesOnly {
-		a.doc.Fields[name] = analyzeValue(t, value)
+		a.doc.Fields[name] = analyzeValue(t, value, a.grams)
 	}
 	return nil
 }
@@ -363,10 +383,10 @@ func infer(value any) (FieldType, bool) {
 	}
 }
 
-func analyzeValue(t FieldType, value any) Value {
+func analyzeValue(t FieldType, value any, grams bool) Value {
 	switch t {
 	case Keyword, Text:
-		return textValue(t, value, true)
+		return textValue(t, value, grams)
 	case KeywordList:
 		return Value{Present: true, Entries: listEntries(value)}
 	case Number:

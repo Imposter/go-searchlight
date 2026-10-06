@@ -165,12 +165,17 @@ jobs:
         run: |
           DATA_FILE=$(ls "$DATA_DIR"/products-*.ndjson | head -1)
           SEARCH_FILE=$(ls "$DATA_DIR"/searches-*.ndjson | sort -t- -k2 -V | tail -1)
-          # The host-visible PID of es1 (the node slbench talks to), so its RSS is read
-          # the same way as Searchlight's: /proc/<pid>/status VmRSS of the actual
-          # server process, not a container-wide cgroup estimate that counts page
-          # cache differently (T6 ruling, 2026-10-05: measure RSS the same way for
-          # both engines).
-          ES_PID=$(docker inspect -f '{{.State.Pid}}' slbench-elasticsearch)
+          # The host-visible PID of the JVM inside es1 (the node slbench talks to), so
+          # its RSS is read the same way as Searchlight's: /proc/<pid>/status VmRSS of
+          # the actual server process, not a container-wide cgroup estimate that
+          # counts page cache differently (T6 ruling, 2026-10-05: measure RSS the same
+          # way for both engines). "docker top", not "docker inspect -f
+          # '{{.State.Pid}}'": the image's entrypoint does not exec into java, so
+          # State.Pid names a lightweight wrapper process, not the JVM -- confirmed by
+          # run 37399767772 reading a 1.35 MiB "RSS" for all of Elasticsearch. "docker
+          # top" lists every process in the container with its real host PID, letting
+          # this find the java process specifically.
+          ES_PID=$(docker top slbench-elasticsearch -eo pid,comm | awk '$2=="java"{print $1; exit}')
           /tmp/slbench run \
             --data "$DATA_FILE" \
             --searches "$SEARCH_FILE" \

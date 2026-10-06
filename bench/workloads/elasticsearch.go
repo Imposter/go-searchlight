@@ -415,6 +415,13 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 	}
 }
 
+// minPlausibleJVMRSS floors a --es-pid reading as genuinely the JVM's: any real JVM,
+// even idle, holds well over this much resident memory. A live process reporting
+// less is almost certainly the wrong one (an entrypoint's wrapper process, not one
+// it exec'd into) -- not "the JVM happens to be unusually small" -- so it is
+// treated as not found rather than trusted.
+const minPlausibleJVMRSS = 64 << 20
+
 // Resources implements Engine. Both disk and RSS are the single node Searchlight's
 // own equivalent footprint is: primaries only (never replicas' bytes, so a transient
 // replica -- bench/docker-compose.es.yml's second node, --es-recovery -- never
@@ -439,9 +446,16 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 		r.DiskBytes += s.Primaries.Store.Size
 	}
 	r.DiskSource = "_stats/store primaries.store.size_in_bytes (this node's own copy; index files, translog excluded)"
-	if rss := procRSS(e.opts.PID); rss > 0 {
+	if rss := procRSS(e.opts.PID); rss >= minPlausibleJVMRSS {
 		r.RSSBytes, r.RSSSource = rss, fmt.Sprintf("/proc/%d/status VmRSS (the JVM)", e.opts.PID)
 		return r, nil
+	} else if rss > 0 {
+		// --es-pid named a real, live process, but one with implausibly little RSS
+		// for a JVM (seen in practice: the image's entrypoint not exec'ing into java,
+		// so the PID was a lightweight wrapper, not the server -- run 37399767772
+		// read 1.35 MiB this way for the whole run). Falling through to the cgroup
+		// estimate below is a far smaller error than reporting that.
+		fmt.Fprintf(e.c.log, "elasticsearch: --es-pid %d has %s RSS, implausible for a JVM; falling back to the cgroup estimate\n", e.opts.PID, report.FormatBytes(float64(rss)))
 	}
 	var ns struct {
 		Nodes map[string]struct {

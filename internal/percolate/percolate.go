@@ -320,28 +320,38 @@ type scratchSize struct {
 	fields     int
 }
 
-// minWindowQueries is the fewest saved queries per window when one document's
-// percolation is split (a variable so tests can force splits).
+// Splitting one document: minWindowQueries is the fewest saved queries per worker
+// (a variable so tests can force splits), windowsPerWorker how many windows each
+// worker's share is cut into, and pivotSamples how many ids per window the pivots
+// are chosen from.
 var minWindowQueries uint32 = 16 << 10
+
+const (
+	windowsPerWorker = 2
+	pivotSamples     = 32
+)
 
 // splitPlan splits a generation's query segments into k windows by id, so that one
 // document's percolation runs on several cores: window w holds, in every segment, the
-// ranks whose ids lie in [pivot w, pivot w+1), the pivots being the ids at ranks
-// n*w/k of the largest segment. Windows hold disjoint id ranges in order, so their
-// matches, each window's merged, concatenate into the sorted answer.
+// ranks whose ids lie in [pivot w, pivot w+1). The pivots are quantiles of ids sampled
+// from every segment in proportion to its size, so windows hold about as many queries
+// each. Windows hold disjoint id ranges in order, so their matches, each window's
+// merged, concatenate into the sorted answer.
 type splitPlan struct {
-	segs   []*Segment
-	k      int
-	bounds []uint32 // per segment, its k+1 window boundaries (ranks)
+	segs    []*Segment
+	workers int
+	k       int
+	bounds  []uint32 // per segment, its k+1 window boundaries (ranks)
 }
 
 // bound returns the first rank of window w in segment i (w == k: its rank count).
 func (win *splitPlan) bound(i, w int) uint32 { return win.bounds[i*(win.k+1)+w] }
 
 // planFor returns how one document's percolation splits across views, nil when it
-// does not: a document gets an equal share of the threads, and a window at least
-// minWindowQueries queries. Only segments the percolator built split. The split of the
-// last generation seen is kept for the next call.
+// does not: a document gets an equal share of the threads as workers, each with at
+// least minWindowQueries queries, and windowsPerWorker windows per worker. Only
+// segments the percolator built split. The plan of the last generation seen is kept
+// for the next call.
 func (p *Percolator) planFor(views []view, docs int) *splitPlan {
 	if docs == 0 {
 		return nil
@@ -353,50 +363,57 @@ func (p *Percolator) planFor(views []view, docs int) *splitPlan {
 		}
 		total += uint64(views[i].n)
 	}
-	k := int(min(uint64(p.threads/docs), total/uint64(minWindowQueries))) //nolint:gosec // at most the thread count
-	if k <= 1 {
+	workers := int(min(uint64(p.threads/docs), total/uint64(minWindowQueries))) //nolint:gosec // at most the thread count
+	if workers <= 1 {
 		return nil
 	}
-	if win := p.plan.Load(); win != nil && win.k == k && slices.EqualFunc(win.segs, views, func(s *Segment, v view) bool { return s == v.seg }) {
+	if win := p.plan.Load(); win != nil && win.workers == workers && slices.EqualFunc(win.segs, views, func(s *Segment, v view) bool { return s == v.seg }) {
 		return win
 	}
-	win := newSplitPlan(views, k)
+	win := newSplitPlan(views, workers, workers*windowsPerWorker)
 	p.plan.Store(win)
 	return win
 }
 
-// newSplitPlan splits views (each a segment the percolator built) into k windows.
-func newSplitPlan(views []view, k int) *splitPlan {
-	big := 0
+// newSplitPlan splits views (each a segment the percolator built) into k windows for
+// workers workers.
+func newSplitPlan(views []view, workers, k int) *splitPlan {
+	var total uint64
 	for i := range views {
-		if views[i].n > views[big].n {
-			big = i
+		total += uint64(views[i].n)
+	}
+	samples := uint64(k) * pivotSamples //nolint:gosec // k is a small positive count
+	var sample [][]byte
+	for i := range views {
+		seg := views[i].seg
+		m := (uint64(seg.n)*samples + total - 1) / max(total, 1)
+		for j := range m {
+			sample = append(sample, seg.rawIDAt(uint32(uint64(seg.n)*j/m))) //nolint:gosec // below seg.n
 		}
 	}
-	win := &splitPlan{k: k, segs: make([]*Segment, len(views)), bounds: make([]uint32, len(views)*(k+1))}
-	pivot := views[big].seg
+	slices.SortFunc(sample, bytes.Compare)
+	win := &splitPlan{workers: workers, k: k, segs: make([]*Segment, len(views)), bounds: make([]uint32, len(views)*(k+1))}
 	for i := range views {
 		seg := views[i].seg
 		win.segs[i] = seg
 		b := win.bounds[i*(k+1) : (i+1)*(k+1)]
 		b[k] = seg.n
 		for w := 1; w < k; w++ {
-			at := uint32(uint64(pivot.n) * uint64(w) / uint64(k)) //nolint:gosec // below pivot.n
-			if seg == pivot {
-				b[w] = at
+			if len(sample) == 0 {
 				continue
 			}
-			id := pivot.rawIDAt(at)
+			pivot := sample[len(sample)*w/k]
 			b[w] = uint32(sort.Search(int(seg.n), func(r int) bool { //nolint:gosec // a rank
-				return bytes.Compare(seg.rawIDAt(uint32(r)), id) >= 0 //nolint:gosec // a rank
+				return bytes.Compare(seg.rawIDAt(uint32(r)), pivot) >= 0 //nolint:gosec // a rank
 			}))
 		}
 	}
 	return win
 }
 
-// split percolates one document across every query segment, window by window in
-// parallel (sc, already fit, serves the first), and joins the windows' matches.
+// split percolates one document across every query segment, window by window, on
+// win.workers goroutines (this one and helpers, sc serving this one) that take the
+// windows in turn, and joins the windows' matches in order.
 func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, win *splitPlan, sc *scratch, size scratchSize) (IDs, docStats, error) {
 	if d.Fields == nil {
 		analyzed, _, err := schema.AnalyzeForMatch(g.Mapping(), d.ID, d.Body)
@@ -405,63 +422,81 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 		}
 		d = &analyzed
 	}
+	// A window's matches are buf[lo:hi] of the scratch of the worker that took it.
 	type part struct {
-		sc *scratch
-		st docStats
+		buf    *[]byte
+		lo, hi int
 	}
 	parts := make([]part, win.k)
-	parts[0].sc = sc
-	run := func(w int) {
-		pt := &parts[w]
-		if pt.sc == nil {
-			pt.sc, _ = p.scratchCache.Get().(*scratch)
-			if pt.sc == nil {
-				pt.sc = new(scratch)
+	scs := make([]*scratch, win.workers)
+	stats := make([]docStats, win.workers)
+	var next atomic.Int32
+	work := func(id int) {
+		c := scs[id]
+		if c == nil {
+			c, _ = p.scratchCache.Get().(*scratch)
+			if c == nil {
+				c = new(scratch)
 			}
-			pt.sc.fit(size.n, size.entries, size.fields)
+			c.fit(size.n, size.entries, size.fields)
+			scs[id] = c
 		}
-		c := pt.sc
-		for i := range views {
-			v := &views[i]
-			lo, hi := win.bound(i, w), win.bound(i, w+1)
-			if lo == hi {
-				continue
+		st := &stats[id]
+		c.buf = c.buf[:0]
+		for {
+			w := int(next.Add(1) - 1)
+			if w >= win.k {
+				return
 			}
-			t0 := time.Now()
-			v.seg.collectIn(d, c, lo, hi)
-			t1 := time.Now()
-			pt.st.candidates += len(c.cands)
-			verify(v, c, &pt.st)
-			c.reset()
-			pt.st.probe += t1.Sub(t0)
-			pt.st.verify += time.Since(t1)
+			for i := range views {
+				v := &views[i]
+				lo, hi := win.bound(i, w), win.bound(i, w+1)
+				if lo == hi {
+					continue
+				}
+				t0 := time.Now()
+				v.seg.collectIn(d, c, lo, hi)
+				t1 := time.Now()
+				st.candidates += len(c.cands)
+				verify(v, c, st)
+				c.reset()
+				st.probe += t1.Sub(t0)
+				st.verify += time.Since(t1)
+			}
+			lo := len(c.buf)
+			c.buf = c.merger.appendRanks(c.buf, c.ranks, c.runs)
+			parts[w] = part{buf: &c.buf, lo: lo, hi: len(c.buf)}
+			c.clearHits()
 		}
-		c.buf = c.merger.appendRanks(c.buf[:0], c.ranks, c.runs)
-		c.clearHits()
 	}
+	scs[0] = sc
 	var wg sync.WaitGroup
-	for w := 1; w < win.k; w++ {
-		wg.Go(func() { run(w) })
+	for id := 1; id < win.workers; id++ {
+		wg.Go(func() { work(id) })
 	}
-	run(0)
+	work(0)
 	wg.Wait()
 	var st docStats
+	for i := range stats {
+		st.add(&stats[i])
+	}
 	n := 1
-	for i := range parts {
-		st.add(&parts[i].st)
-		n += len(parts[i].sc.buf)
+	for _, pt := range parts {
+		n += pt.hi - pt.lo
 	}
 	var ids IDs
 	if n > 1 {
 		ids = make(IDs, 1, n)
 		ids[0] = '['
-		for i := range parts {
-			ids = append(ids, parts[i].sc.buf...)
+		for _, pt := range parts {
+			ids = append(ids, (*pt.buf)[pt.lo:pt.hi]...)
 		}
 		ids[n-1] = ']'
 	}
-	for i := 1; i < len(parts); i++ {
-		p.scratchCache.Put(parts[i].sc)
+	for _, c := range scs[1:] {
+		if c != nil {
+			p.scratchCache.Put(c)
+		}
 	}
 	p.duration.Record(ctx, st.probe.Seconds(), p.probeSet)
 	p.duration.Record(ctx, st.verify.Seconds(), p.verifySet)

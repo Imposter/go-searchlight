@@ -13,8 +13,8 @@ import (
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
-// percolateEveryWay percolates d through views whole and split into 2, 3 and 5
-// windows, fails unless every way gives the same answer, and returns it.
+// percolateEveryWay percolates d through views whole and split into windows (2 to 7,
+// on 1 to 3 workers), fails unless every way gives the same answer, and returns it.
 func percolateEveryWay(tb testing.TB, p *Percolator, views []view, d *schema.Doc, sc *scratch) (IDs, docStats) {
 	tb.Helper()
 	ids, st, err := p.one(context.Background(), nil, views, d, sc)
@@ -25,8 +25,9 @@ func percolateEveryWay(tb testing.TB, p *Percolator, views []view, d *schema.Doc
 	for _, v := range views {
 		size = scratchSize{n: max(size.n, v.n), entries: max(size.entries, v.seg.NumEntries()), fields: max(size.fields, len(v.seg.fields))}
 	}
-	for _, k := range []int{2, 3, 5} {
-		got, gst, err := p.split(context.Background(), nil, views, d, newSplitPlan(views, k), sc, size)
+	for _, w := range [][2]int{{1, 2}, {2, 3}, {2, 4}, {3, 7}} {
+		k := w[1]
+		got, gst, err := p.split(context.Background(), nil, views, d, newSplitPlan(views, w[0], k), sc, size)
 		if err != nil {
 			tb.Fatal(err)
 		}

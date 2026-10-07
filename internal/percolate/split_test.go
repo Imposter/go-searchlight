@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"slices"
@@ -122,5 +123,31 @@ func TestSegmentRunsMergeAsSortedUnion(t *testing.T) {
 		if !bytes.Equal(ids, wantJSON) {
 			t.Fatalf("round %d: %s, want %s", round, ids, wantJSON)
 		}
+	}
+}
+
+// A canceled split stops before its next window and reports the cancellation.
+func TestSplitStopsWhenCanceled(t *testing.T) {
+	ids := make([]string, 200)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("q%03d", i)
+	}
+	seg := segmentOf(t, ids, func(string) string { return "acme" })
+	views := []view{{seg: seg, n: seg.n}}
+	d, _, err := schema.Analyze(testMapping(), "d", []byte(`{"brand":"acme"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p := New(Options{Threads: 2})
+	sc := new(scratch)
+	sc.fit(seg.n, seg.NumEntries(), len(seg.fields))
+	size := scratchSize{n: seg.n, entries: seg.NumEntries(), fields: len(seg.fields)}
+	if got, _, err := p.split(ctx, nil, views, &d, newSplitPlan(views, 2, 4), sc, size); !errors.Is(err, context.Canceled) || got != nil {
+		t.Fatalf("got %s, %v; want the cancellation", got, err)
+	}
+	if got, _, err := p.split(context.Background(), nil, views, &d, newSplitPlan(views, 2, 4), sc, size); err != nil || len(strs(t, got)) != len(ids) {
+		t.Fatalf("after a canceled split: %d matches, %v", len(strs(t, got)), err)
 	}
 }

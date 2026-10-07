@@ -156,7 +156,6 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 			cand[seg.ordAt(r)] = true
 		}
 		candidates += len(cand)
-		// Collecting window by window finds exactly the candidates in each window.
 		cuts := []uint32{0, seg.n}
 		for range g.r.IntN(4) {
 			cuts = append(cuts, uint32(g.r.IntN(int(seg.n)+1)))

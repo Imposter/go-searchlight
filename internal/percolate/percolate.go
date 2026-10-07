@@ -34,6 +34,10 @@ type Options struct {
 	// Threads bounds the goroutines one call verifies documents with; 0 means
 	// GOMAXPROCS.
 	Threads int
+	// Splits is shared by the percolators of one node, so that documents split into
+	// windows only while the workers of all of them fit in Threads; nil gives the
+	// Percolator one of its own.
+	Splits *SplitBudget
 	// Logger, Tracer and Meter are the telemetry; nil means slog.Default() and the
 	// global OpenTelemetry providers (which telemetry.Setup installs).
 	Logger *slog.Logger
@@ -60,10 +64,14 @@ type Percolator struct {
 	missSet      metric.AddOption
 	scratchCache sync.Pool
 	plan         atomic.Pointer[splitPlan]
-	// splitting counts the workers of the documents being split now: a document
-	// splits only while they fit in the threads, so concurrent requests do not pile
-	// helpers onto busy cores.
-	splitting atomic.Int64
+	splits       *SplitBudget
+}
+
+// SplitBudget counts the workers of the documents being split into windows now, by
+// every Percolator sharing it: a document splits only while they fit in the threads,
+// so concurrent requests do not pile helpers onto busy cores. Its zero value is ready.
+type SplitBudget struct {
+	workers atomic.Int64
 }
 
 // New returns a Percolator.
@@ -73,6 +81,9 @@ func New(opts Options) *Percolator {
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.Splits == nil {
+		opts.Splits = new(SplitBudget)
 	}
 	if opts.Tracer == nil {
 		opts.Tracer = otel.GetTracerProvider().Tracer(telemetry.ScopeName)
@@ -84,6 +95,7 @@ func New(opts Options) *Percolator {
 	in := telemetry.NewInstruments(opts.Meter)
 	p := &Percolator{
 		threads:     opts.Threads,
+		splits:      opts.Splits,
 		log:         opts.Logger.With(telemetry.KeyIndex, opts.Index, telemetry.KeyShard, opts.Shard),
 		tr:          opts.Tracer,
 		attrs:       base,
@@ -221,12 +233,12 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 			var ids IDs
 			var st docStats
 			var err error
-			if win != nil && p.splitting.Add(int64(win.workers)) <= int64(p.threads) {
+			if win != nil && p.splits.workers.Add(int64(win.workers)) <= int64(p.threads) {
 				ids, st, err = p.split(ctx, g, views, &docs[i], win, sc, size)
-				p.splitting.Add(-int64(win.workers))
+				p.splits.workers.Add(-int64(win.workers))
 			} else {
 				if win != nil {
-					p.splitting.Add(-int64(win.workers))
+					p.splits.workers.Add(-int64(win.workers))
 				}
 				ids, st, err = p.one(ctx, g, views, &docs[i], sc)
 			}
@@ -344,16 +356,17 @@ const (
 // ranks whose ids lie in [pivot w, pivot w+1). The pivots are quantiles of ids sampled
 // from every segment in proportion to its size, so windows hold about as many queries
 // each. Windows hold disjoint id ranges in order, so their matches, each window's
-// merged, concatenate into the sorted answer.
+// merged, concatenate into the sorted answer. The plan names its segments by their
+// files (immutable), and holds each one's k+1 window boundaries, as ranks.
 type splitPlan struct {
-	paths   []string // the segments', which name their immutable files
-	workers int
-	k       int
-	bounds  []uint32 // per segment, its k+1 window boundaries (ranks)
+	segFiles   []string
+	workers    int
+	k          int
+	boundaries []uint32
 }
 
 // bound returns the first rank of window w in segment i (w == k: its rank count).
-func (win *splitPlan) bound(i, w int) uint32 { return win.bounds[i*(win.k+1)+w] }
+func (win *splitPlan) bound(i, w int) uint32 { return win.boundaries[i*(win.k+1)+w] }
 
 // planFor returns how one document's percolation splits across views, nil when it
 // does not: a document gets an equal share of the threads as workers, each with at
@@ -375,7 +388,7 @@ func (p *Percolator) planFor(views []view, docs int) *splitPlan {
 	if workers <= 1 {
 		return nil
 	}
-	if win := p.plan.Load(); win != nil && win.workers == workers && slices.EqualFunc(win.paths, views, func(path string, v view) bool { return path == v.seg.path }) {
+	if win := p.plan.Load(); win != nil && win.workers == workers && slices.EqualFunc(win.segFiles, views, func(path string, v view) bool { return path == v.seg.path }) {
 		return win
 	}
 	win := newSplitPlan(views, workers, workers*windowsPerWorker)
@@ -400,11 +413,11 @@ func newSplitPlan(views []view, workers, k int) *splitPlan {
 		}
 	}
 	slices.SortFunc(sample, bytes.Compare)
-	win := &splitPlan{workers: workers, k: k, paths: make([]string, len(views)), bounds: make([]uint32, len(views)*(k+1))}
+	win := &splitPlan{workers: workers, k: k, segFiles: make([]string, len(views)), boundaries: make([]uint32, len(views)*(k+1))}
 	for i := range views {
 		seg := views[i].seg
-		win.paths[i] = seg.path
-		b := win.bounds[i*(k+1) : (i+1)*(k+1)]
+		win.segFiles[i] = seg.path
+		b := win.boundaries[i*(k+1) : (i+1)*(k+1)]
 		b[k] = seg.n
 		for w := 1; w < k; w++ {
 			if len(sample) == 0 {
@@ -421,7 +434,9 @@ func newSplitPlan(views []view, workers, k int) *splitPlan {
 
 // split percolates one document across every query segment, window by window, on
 // win.workers goroutines (this one and helpers, sc serving this one) that take the
-// windows in turn, and joins the windows' matches in order.
+// windows in turn, and joins the windows' matches in order: window w's are
+// buf[lo:hi] of the scratch of the worker that took it. A canceled ctx stops the
+// workers before their next window.
 func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, win *splitPlan, sc *scratch, size scratchSize) (IDs, docStats, error) {
 	if d.Fields == nil {
 		analyzed, _, err := schema.AnalyzeForMatch(g.Mapping(), d.ID, d.Body)
@@ -430,7 +445,6 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 		}
 		d = &analyzed
 	}
-	// A window's matches are buf[lo:hi] of the scratch of the worker that took it.
 	type part struct {
 		buf    *[]byte
 		lo, hi int
@@ -451,7 +465,7 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 		}
 		st := &stats[id]
 		c.buf = c.buf[:0]
-		for {
+		for ctx.Err() == nil {
 			w := int(next.Add(1) - 1)
 			if w >= win.k {
 				return
@@ -484,6 +498,14 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 	}
 	work(0)
 	wg.Wait()
+	for _, c := range scs[1:] {
+		if c != nil {
+			p.scratchCache.Put(c)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, docStats{}, err
+	}
 	var st docStats
 	for i := range stats {
 		st.add(&stats[i])
@@ -500,11 +522,6 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 			ids = append(ids, (*pt.buf)[pt.lo:pt.hi]...)
 		}
 		ids[n-1] = ']'
-	}
-	for _, c := range scs[1:] {
-		if c != nil {
-			p.scratchCache.Put(c)
-		}
 	}
 	p.duration.Record(ctx, st.probe.Seconds(), p.probeSet)
 	p.duration.Record(ctx, st.verify.Seconds(), p.verifySet)

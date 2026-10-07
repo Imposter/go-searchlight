@@ -135,6 +135,7 @@ type Single struct {
 	cache      *shard.FilterCache
 	maxLag     int64
 	openFailed metric.Int64Counter
+	splits     percolate.SplitBudget
 
 	// head is the newest seq committed or seen applied.
 	head atomic.Int64
@@ -683,7 +684,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		spec:    spec,
 		copy:    env.Copy,
 		perc: percolate.New(percolate.Options{
-			Index: idx.name, Shard: s, Threads: n.cfg.SearchThreads,
+			Index: idx.name, Shard: s, Threads: n.cfg.SearchThreads, Splits: &n.splits,
 			Logger: n.log, Tracer: n.tr, Meter: n.meter,
 		}),
 	}

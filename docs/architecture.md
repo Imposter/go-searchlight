@@ -246,7 +246,12 @@ flowchart LR
     the node has cores, a large enough document splits by id into windows: quantiles of
     ids sampled from every segment, two windows per worker. Workers take the windows in
     turn, each collecting, verifying and merging only the ranks in its window. Windows
-    hold disjoint id ranges in order, so their answers concatenate.
+    hold disjoint id ranges in order, so their answers concatenate. A document splits
+    only while the workers of every document being split on the node fit in
+    `search_threads` (one count the node's percolators share). Each shard copy's
+    percolator keeps the plan of the last set of query segments and worker count it
+    split for, so requests alternating between documents whose worker counts differ
+    (one document, then two) rebuild it each time: a few hundred id reads and a sort.
   - **Exactness.** The answer is exactly the brute-force one. Property tests check that
     the candidates always include every true match, and that every program decides as
     the matcher does.

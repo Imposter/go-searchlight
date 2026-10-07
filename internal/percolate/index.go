@@ -770,13 +770,8 @@ type Segment struct {
 	byLo      []byte
 	byHi      []byte
 
-	// classes is, per rank, the first rank of its verification class, noClass when no
-	// other query shares it, or trivialClass when its program is empty (it holds):
-	// a dense copy Open makes, so that a candidate's verify record is read only when
-	// its program must run.
-	classes []uint32
-	// escapes is whether an id literal holds an escape.
-	escapes bool
+	classes    []uint32
+	anyEscaped bool
 
 	mapped *mapping
 }
@@ -892,7 +887,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if err := s.checkRanks(); err != nil {
 		return nil, corrupt("%v", err)
 	}
-	s.escapes = bytes.IndexByte(s.idText, '\\') >= 0
+	s.anyEscaped = bytes.IndexByte(s.idText, '\\') >= 0
 	s.buildGramFilters()
 	s.classes = make([]uint32, s.n)
 	for r := range s.n {
@@ -1142,7 +1137,7 @@ func (s *Segment) ordAt(r uint32) uint32 { return u32(s.ids, idSize*int(r)) }
 // escaped).
 func (s *Segment) rawIDAt(r uint32) []byte {
 	lit := s.idAt(r)
-	if !s.escapes {
+	if !s.anyEscaped {
 		return lit[1 : len(lit)-1]
 	}
 	if raw, ok := plainID(lit); ok {

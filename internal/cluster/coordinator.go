@@ -73,7 +73,7 @@ const (
 	// renewal behind a long commit (and a checkpoint) for a while.
 	DefaultSQLiteLeaseTTL  = 30 * time.Second
 	DefaultCatalogInterval = time.Second
-	DefaultPruneInterval   = 10 * time.Second
+	DefaultPruneInterval   = 30 * time.Second
 	DefaultPruneStall      = 15 * time.Minute
 	DefaultRetiringKeep    = 15 * time.Minute
 	DefaultChangelogKeep   = 24 * time.Hour
@@ -111,9 +111,7 @@ type Options struct {
 	ViewInterval time.Duration
 	// CatalogInterval is how often the index catalogue is synced (1 s).
 	CatalogInterval time.Duration
-	// PruneInterval is how often the leader prunes the changelog (10 s, the default
-	// flush_interval: the floor moves when copies flush, so under steady writes the
-	// changelog holds about two of them).
+	// PruneInterval is how often the leader prunes the changelog (30 s).
 	// PruneStallTimeout is how long a copy behind the others may make no progress and
 	// still hold the prune floor (config prune_stall_timeout, 15 min);
 	// RetiringRetention how long a cleanly stopped copy's row holds it

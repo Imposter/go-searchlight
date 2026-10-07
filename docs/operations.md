@@ -432,9 +432,9 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
   (about 870 bytes of JSON each) `sl_documents` takes about 0.8 GB per million documents
   on Postgres, against 1 GB uncompressed.
 - **Changelog.** `sl_changes` holds the changes not yet pruned: at most
-  `changelog_retention` (24 h) of writes, usually far less. The leader prunes every 10 s,
+  `changelog_retention` (24 h) of writes, usually far less. The leader prunes every 30 s,
   below what every live copy has flushed, so under a steady stream of writes it holds
-  about two `flush_interval`s of them. Pruning follows the slowest live copy, so a
+  three to four `flush_interval`s of them. Pruning follows the slowest live copy, so a
   stalled copy holds the floor for at most `prune_stall_timeout`. Each retained recovery
   bundle holds it too, at its seq. Its payloads are compressed like the bodies. A pruned
   row's space is reused by later writes (SQLite's free pages, Postgres's vacuum), so the

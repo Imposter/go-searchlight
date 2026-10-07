@@ -99,6 +99,7 @@ func TestEndToEndOnEveryDialect(t *testing.T) {
 			}
 		}})
 		e.must(http.StatusCreated, "PUT", "/indexes/e2e", `{"mapping": {"fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 2}}`)
+		waitAllServing(t, e, 2)
 		q := e.must(http.StatusOK, "PUT", "/indexes/e2e/queries/cheap", `{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"owner": "x"}}`)
 		w := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/e2e/_bulk?percolate=true&wait_for_seq=%d", seqOf(t, q)), ndjson(
 			`{"upsert": {"id": "a"}}`, `{"brand": "acme", "price": 5}`,

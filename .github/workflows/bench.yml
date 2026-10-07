@@ -17,6 +17,10 @@ on:
         description: "runner label; the default ubuntu-latest (~7 GB RAM) caps 'docs' at 1,000,000 — use a self-hosted or larger runner for more"
         default: "ubuntu-latest"
         required: false
+      repeats:
+        description: "times to repeat each latency-gated workload (filter, sorted/paging, aggregations, percolate-single); blank picks 1 on the hosted runner at >=1,000,000 docs (time budget: repeats roughly multiply those phases' latency) or 3 otherwise. Set explicitly to override either way -- repeats-for-variance belongs on a longer self-hosted run"
+        default: ""
+        required: false
   schedule:
     - cron: "0 7 * * 1" # Monday 07:00 UTC
 
@@ -117,6 +121,26 @@ jobs:
           echo "ES_HEAP=${HEAP_GB}g" >> "$GITHUB_ENV"
           echo "sizing: $DOCS documents (~$N), Elasticsearch heap ${HEAP_GB}g per node (x2 nodes), runner $RUNNER_LABEL"
 
+          # --repeats roughly multiplies the time of every latency-gated workload
+          # (filter, sorted/paging, aggregations, percolate-single): a confirming 1M
+          # run with the CLI's own default of 3 was cancelled at this job's 180-minute
+          # timeout during "run workloads" (run 37498622533), even with memory fine
+          # (recoverer.Close already fixed the earlier OOM-shaped cutoffs). On the
+          # default hosted runner at 1,000,000+ docs, default to 1 repeat -- the
+          # single-run behavior that fit before -- and let an explicit 'repeats'
+          # input override it either direction. Smaller docs, or any self-hosted/
+          # larger runner, keep the CLI's 3-repeat default for run-to-run p99 variance.
+          REPEATS="${{ inputs.repeats }}"
+          if [ -z "$REPEATS" ]; then
+            if [ "$RUNNER_LABEL" = "ubuntu-latest" ] && [ "$N" -ge 1000000 ]; then
+              REPEATS=1
+            else
+              REPEATS=3
+            fi
+          fi
+          echo "REPEATS=$REPEATS" >> "$GITHUB_ENV"
+          echo "repeats: $REPEATS"
+
       # Each recovery-cluster node opens up to 64 connections plus one for LISTEN; two
       # nodes and slbench's own pass the image's default of 100.
       - name: raise Postgres's max_connections
@@ -203,6 +227,7 @@ jobs:
             --es-pid "$ES_PID" \
             --es-config "heap_max=${ES_HEAP}" \
             --es-recovery \
+            --repeats "$REPEATS" \
             --label "CI (${{ github.sha }})" \
             --out "$DATA_DIR/bench-results.json" \
             --md docs/benchmarks.md \
@@ -210,14 +235,15 @@ jobs:
           # No --allow-mismatch: an untolerated engine disagreement must fail this job
           # (exit code 3), not just a line in the report.
           #
-          # --repeats is the CLI's own default (3) again: two earlier 1M dispatches
-          # that dropped it to 1 got cut off near the recovery step anyway (109 min,
-          # 120 min), which recovery.go's Close fix (this same change) addresses more
-          # directly -- the recovery-source node's full extra copy, held open until
-          # the whole process exited, overlapping with Elasticsearch's own two
-          # full-heap JVMs during exactly that step. If a dispatch with the default
-          # repeats still does not fit, drop it again and say so in the commit, rather
-          # than silently leaving it dropped once the actual cause looked different.
+          # --repeats is $REPEATS from the sizing step above, not the CLI's own
+          # default (3) -- see that step's comment. A confirming run with the CLI
+          # default of 3 restored was cancelled at the 180-minute job timeout
+          # (run 37498622533), memory fine (peak used 9757 MB, lowest available
+          # 6232 MB -- recoverer.Close's fix holds), so the remaining problem was
+          # time, not memory: repeats roughly triples the latency-gated workloads'
+          # phases. If a 1-repeat dispatch at 1M docs still does not fit 180
+          # minutes, split this job into two dispatchable phases (search/
+          # aggregations, percolate/recovery) rather than raising the timeout again.
         continue-on-error: true
 
       # Captured before the services stop (docker compose down drops the

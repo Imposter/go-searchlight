@@ -93,9 +93,10 @@ import (
 //
 // Built at Open from the validated file: each field's gram prefilter, a bit filter of
 // its gram terms at 16 bits per term (a document's window whose bit is clear has no
-// entry, so skips the table), and a dense copy of every rank's class, which also marks
-// the ranks alone in their class with an empty program (a candidate there matches
-// without its verify record read; a memoized class's members are not read either).
+// entry, so skips the table), a dense copy of every rank's class, which also marks the
+// ranks whose class's program is empty (a candidate there matches without its verify
+// record read; a memoized class's members are not read either), and whether any id
+// literal is escaped (when none is, an id is read in place).
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.

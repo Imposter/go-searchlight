@@ -239,8 +239,14 @@ flowchart LR
   - **Verification.** Each candidate's class runs its program over the document's
     values, once per class per document. A program mirrors the exact matcher and leaves
     out the root conditions the candidate's anchors and filter already prove.
-  - **Output.** Each segment's matches are a run sorted by id, and the runs are merged
-    into the JSON array the response copies as it is.
+  - **Output.** Each segment's matches are a run of ranks, so sorted by id. The runs
+    merge into the JSON array the response copies as it is; the least run's ids below
+    the next least run's are found by galloping and copied in one go.
+  - **One document on several cores.** When a request percolates fewer documents than
+    the node has cores, a large enough document splits by id into windows: quantiles of
+    ids sampled from every segment, two windows per worker. Workers take the windows in
+    turn, each collecting, verifying and merging only the ranks in its window. Windows
+    hold disjoint id ranges in order, so their answers concatenate.
   - **Exactness.** The answer is exactly the brute-force one. Property tests check that
     the candidates always include every true match, and that every program decides as
     the matcher does.

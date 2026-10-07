@@ -338,7 +338,7 @@ const (
 // each. Windows hold disjoint id ranges in order, so their matches, each window's
 // merged, concatenate into the sorted answer.
 type splitPlan struct {
-	segs    []*Segment
+	paths   []string // the segments', which name their immutable files
 	workers int
 	k       int
 	bounds  []uint32 // per segment, its k+1 window boundaries (ranks)
@@ -350,8 +350,8 @@ func (win *splitPlan) bound(i, w int) uint32 { return win.bounds[i*(win.k+1)+w] 
 // planFor returns how one document's percolation splits across views, nil when it
 // does not: a document gets an equal share of the threads as workers, each with at
 // least minWindowQueries queries, and windowsPerWorker windows per worker. Only
-// segments the percolator built split. The plan of the last generation seen is kept
-// for the next call.
+// segments the percolator built split. The plan of the last set of segment files seen
+// is kept for the next call.
 func (p *Percolator) planFor(views []view, docs int) *splitPlan {
 	if docs == 0 {
 		return nil
@@ -367,7 +367,7 @@ func (p *Percolator) planFor(views []view, docs int) *splitPlan {
 	if workers <= 1 {
 		return nil
 	}
-	if win := p.plan.Load(); win != nil && win.workers == workers && slices.EqualFunc(win.segs, views, func(s *Segment, v view) bool { return s == v.seg }) {
+	if win := p.plan.Load(); win != nil && win.workers == workers && slices.EqualFunc(win.paths, views, func(path string, v view) bool { return path == v.seg.path }) {
 		return win
 	}
 	win := newSplitPlan(views, workers, workers*windowsPerWorker)
@@ -392,10 +392,10 @@ func newSplitPlan(views []view, workers, k int) *splitPlan {
 		}
 	}
 	slices.SortFunc(sample, bytes.Compare)
-	win := &splitPlan{workers: workers, k: k, segs: make([]*Segment, len(views)), bounds: make([]uint32, len(views)*(k+1))}
+	win := &splitPlan{workers: workers, k: k, paths: make([]string, len(views)), bounds: make([]uint32, len(views)*(k+1))}
 	for i := range views {
 		seg := views[i].seg
-		win.segs[i] = seg
+		win.paths[i] = seg.path
 		b := win.bounds[i*(k+1) : (i+1)*(k+1)]
 		b[k] = seg.n
 		for w := 1; w < k; w++ {

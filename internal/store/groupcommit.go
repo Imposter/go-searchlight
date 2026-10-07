@@ -17,11 +17,14 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// Group commit defaults: flush every 2 ms or at 4,096 changes, so a few concurrent
-// _bulk requests of a thousand documents share one transaction (and its fsync).
+// Group commit defaults: flush every 2 ms, at 4,096 changes or at 16 MiB of stored
+// payload, so a few concurrent _bulk requests of a thousand documents share one
+// transaction (and its fsync) while one of large documents does not hold the next
+// requests behind a long write.
 const (
 	DefaultGroupCommitDelay   = 2 * time.Millisecond
 	DefaultGroupCommitChanges = 4096
+	DefaultGroupCommitBytes   = 16 << 20
 )
 
 // GroupCommitOptions tune a GroupCommitter. Zero values take the defaults.
@@ -32,6 +35,10 @@ type GroupCommitOptions struct {
 	// MaxChanges flushes a batch as soon as it holds this many changes. A
 	// single request larger than this is committed on its own.
 	MaxChanges int
+	// MaxBytes flushes a batch as soon as its stored payloads (compressed where
+	// they are) reach this size. A single request larger than this is committed
+	// on its own.
+	MaxBytes int
 	// Tracer and Meter default to the global providers'.
 	Tracer trace.Tracer
 	Meter  metric.Meter
@@ -66,6 +73,7 @@ type GroupCommitter struct {
 	st         Applier
 	maxDelay   time.Duration
 	maxChanges int
+	maxBytes   int
 	tracer     trace.Tracer
 	clock      clock.Clock
 	batchSize  metric.Float64Histogram
@@ -102,6 +110,9 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 	if o.MaxChanges <= 0 {
 		o.MaxChanges = DefaultGroupCommitChanges
 	}
+	if o.MaxBytes <= 0 {
+		o.MaxBytes = DefaultGroupCommitBytes
+	}
 	if o.Tracer == nil {
 		o.Tracer = otel.Tracer(telemetry.ScopeName)
 	}
@@ -116,6 +127,7 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 		st:         st,
 		maxDelay:   o.MaxDelay,
 		maxChanges: o.MaxChanges,
+		maxBytes:   o.MaxBytes,
 		tracer:     o.Tracer,
 		clock:      o.Clock,
 		batchSize:  in.Histogram(telemetry.MetricGroupCommitBatchSize),
@@ -191,11 +203,11 @@ func (g *GroupCommitter) run() {
 			}
 		}
 		batch := []*gcRequest{first}
-		n := len(first.changes)
+		n, size := len(first.changes), first.prep.bytes
 		deadline := first.arrived.Add(g.maxDelay)
 		var timer clock.Timer
 	collect:
-		for n < g.maxChanges {
+		for n < g.maxChanges && size < g.maxBytes {
 			// Take whoever is already waiting before looking at the clock,
 			// so a backlog is never flushed one request at a time.
 			var r *gcRequest
@@ -218,12 +230,13 @@ func (g *GroupCommitter) run() {
 				}
 			}
 			g.noteReceived()
-			if n+len(r.changes) > g.maxChanges {
+			if n+len(r.changes) > g.maxChanges || size+r.prep.bytes > g.maxBytes {
 				carry = r
 				break
 			}
 			batch = append(batch, r)
 			n += len(r.changes)
+			size += r.prep.bytes
 		}
 		if timer != nil {
 			timer.Stop()

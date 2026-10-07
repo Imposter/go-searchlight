@@ -97,6 +97,10 @@ type Options struct {
 	PercolateSingle int     `json:"percolate_single,omitempty"`
 	PageDepth       int     `json:"page_depth"`
 	MixedSeconds    float64 `json:"mixed_seconds"`
+	// Repeats is how many independent times each latency-gated workload (filter,
+	// sorted/paging, aggregations, percolate-single) ran, merged into one histogram;
+	// 1 means no repeat.
+	Repeats int `json:"repeats,omitempty"`
 }
 
 // Latency is a latency distribution in microseconds.

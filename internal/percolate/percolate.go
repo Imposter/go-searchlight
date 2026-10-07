@@ -60,6 +60,10 @@ type Percolator struct {
 	missSet      metric.AddOption
 	scratchCache sync.Pool
 	plan         atomic.Pointer[splitPlan]
+	// splitting counts the workers of the documents being split now: a document
+	// splits only while they fit in the threads, so concurrent requests do not pile
+	// helpers onto busy cores.
+	splitting atomic.Int64
 }
 
 // New returns a Percolator.
@@ -217,9 +221,13 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 			var ids IDs
 			var st docStats
 			var err error
-			if win != nil {
+			if win != nil && p.splitting.Add(int64(win.workers)) <= int64(p.threads) {
 				ids, st, err = p.split(ctx, g, views, &docs[i], win, sc, size)
+				p.splitting.Add(-int64(win.workers))
 			} else {
+				if win != nil {
+					p.splitting.Add(-int64(win.workers))
+				}
 				ids, st, err = p.one(ctx, g, views, &docs[i], sc)
 			}
 			if err != nil {

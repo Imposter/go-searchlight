@@ -184,7 +184,10 @@ func (n *Node) dropLease(l *lease) {
 
 // heartbeat registers the node or refreshes its registration.
 func (n *Node) heartbeat(ctx context.Context) error {
-	err := n.reg.Heartbeat(ctx, store.Node{ID: n.id, Address: n.cfg.AdvertiseAddress, Version: n.opts.Version, Capacity: n.opts.Capacity})
+	err := n.reg.Heartbeat(ctx, store.Node{
+		ID: n.id, Address: n.cfg.AdvertiseAddress, Version: n.opts.Version, Capacity: n.opts.Capacity,
+		BodyCodecs: store.BodyCodecs,
+	})
 	n.NoteDB(err)
 	return err
 }
@@ -535,7 +538,11 @@ func (n *Node) viewLoop(ctx context.Context) {
 			return
 		case <-t.C():
 		}
-		if err := n.refreshView(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+		err := n.refreshView(ctx)
+		if err == nil {
+			err = n.bodyCodecGate(ctx)
+		}
+		if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			n.log.DebugContext(ctx, "reading the registry failed", slog.Any("error", err))
 		}
 	}

@@ -35,10 +35,43 @@ func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 	if err := validNode(n.ID); err != nil {
 		return err
 	}
-	if n.Capacity < 0 {
-		return invalidf("capacity %d", n.Capacity)
+	if n.Capacity < 0 || n.BodyCodecs < 0 {
+		return invalidf("capacity %d, body codecs %d", n.Capacity, n.BodyCodecs)
 	}
-	_, err = s.w.ExecContext(ctx, s.d.Registry.Heartbeat, n.ID, n.Address, n.Version, n.Capacity)
+	_, err = s.w.ExecContext(ctx, s.d.Registry.Heartbeat, n.ID, n.Address, n.Version, n.Capacity, n.BodyCodecs)
+	return err
+}
+
+func (g *registry) Features(ctx context.Context) (out map[string]time.Time, err error) {
+	s := g.s
+	ctx, end := s.start(ctx, "features")
+	defer end(&err)
+	rows, err := s.r.QueryContext(ctx, s.d.Registry.Features)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out = map[string]time.Time{}
+	for rows.Next() {
+		var name string
+		var at int64
+		if err := rows.Scan(&name, &at); err != nil {
+			return nil, err
+		}
+		out[name] = millis(at)
+	}
+	return out, rows.Err()
+}
+
+func (g *registry) EnableFeature(ctx context.Context, name string) (err error) {
+	s := g.s
+	ctx, end := s.start(ctx, "enable_feature", attribute.String("feature", name))
+	ctx = withHighLane(ctx)
+	defer end(&err)
+	if err := validKey("feature", name, MaxNodeID); err != nil {
+		return err
+	}
+	_, err = s.w.ExecContext(ctx, s.d.Registry.EnableFeature, name)
 	return err
 }
 
@@ -66,7 +99,7 @@ func (g *registry) Nodes(ctx context.Context) (out []Node, err error) {
 	for rows.Next() {
 		var n Node
 		var hb, started, now int64
-		if err := rows.Scan(&n.ID, &n.Address, &n.Version, &n.Capacity, &hb, &started, &now); err != nil {
+		if err := rows.Scan(&n.ID, &n.Address, &n.Version, &n.Capacity, &n.BodyCodecs, &hb, &started, &now); err != nil {
 			return nil, err
 		}
 		n.HeartbeatAt, n.StartedAt = millis(hb), millis(started)

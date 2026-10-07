@@ -288,16 +288,17 @@ The logical schema is the same in every dialect.
 | Table | Columns |
 |---|---|
 | `sl_indexes` | name, mapping, settings |
-| `sl_documents` | index, shard, id, body, seq |
+| `sl_documents` | index, shard, id, body, body_z, seq |
 | `sl_queries` | index, shard, id, query, meta, seq |
-| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, at; index on (index, shard, seq) |
+| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at; index on (index, shard, seq) |
 | `sl_counter` | the sequence row, locked per `Apply` |
-| `sl_nodes` | node_id, address, version, heartbeat_at, capacity |
+| `sl_nodes` | node_id, address, version, heartbeat_at, capacity, body_codecs |
+| `sl_features` | name, enabled_at: cluster features turned on for good (`zstd_bodies`) |
 | `sl_shard_copies` | index, shard, node_id, state (`recovering` / `serving` / `retiring`), applied_seq, lease_until |
 | `sl_blobs` | optional segment bundles for recovery without a peer |
 
 - **Write ordering.** `Apply` locks the counter row, takes contiguous `seq` values and commits. Visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: concurrent requests on a coordinator are coalesced into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs.
-- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). JSON is stored as text and no dialect JSON functions are used.
+- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
 - **Drivers:** `pgx/v5/stdlib`, `go-sql-driver/mysql`, `modernc.org/sqlite`.
 - **Supported versions:** Postgres (tested on 17), MySQL 8.0.19+ (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default), SQLite 3.35+ (bundled by modernc.org/sqlite).
 - **Migrations** are embedded and run under a lock.

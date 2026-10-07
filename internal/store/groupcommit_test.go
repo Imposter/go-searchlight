@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,6 +142,36 @@ func TestGroupCommitMaxChanges(t *testing.T) {
 	}
 	if total != 6*400+1500 {
 		t.Fatalf("committed %d changes", total)
+	}
+}
+
+// A batch closes before the request that would take its stored payloads past
+// MaxBytes, and as soon as they reach it.
+func TestGroupCommitMaxBytes(t *testing.T) {
+	f := &fakeApplier{}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxBytes: 300, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	sized := func(id string, n int) []Change {
+		body := fmt.Sprintf(`{"p":%q}`, strings.Repeat("x", n-8))
+		return []Change{{Index: "i", Kind: KindUpsert, ID: id, Payload: []byte(body)}}
+	}
+	res := gather(t, g, collected, nil, [][]Change{sized("a", 100), sized("b", 150), sized("c", 100), sized("d", 200)})
+	for i, r := range res {
+		if r.err != nil {
+			t.Fatalf("request %d: %v", i, r.err)
+		}
+	}
+	var got []string
+	for _, b := range f.batches {
+		var ids []string
+		for _, c := range b {
+			ids = append(ids, c.ID)
+		}
+		got = append(got, strings.Join(ids, ","))
+	}
+	if strings.Join(got, " ") != "a,b c,d" {
+		t.Fatalf("batches %v, want [a,b c,d]", got)
 	}
 }
 

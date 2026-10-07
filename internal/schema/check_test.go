@@ -62,7 +62,7 @@ func TestAnalyzeForMatchAgreesWithAnalyze(t *testing.T) {
 				t.Fatalf("mapping %d, body %q:\nAnalyze %q %v %v\nAnalyzeForMatch %q %v %v", mi, b, full.Body, fu, ferr, match.Body, mu, merr)
 			}
 			for name, v := range full.Fields {
-				v.Grams, v.GramsTruncated = nil, false
+				v.Grams, v.GramsTruncated = false, false
 				if got := match.Fields[name]; !reflect.DeepEqual(got, v) {
 					t.Fatalf("mapping %d, body %q, field %s: %+v, want %+v", mi, b, name, got, v)
 				}

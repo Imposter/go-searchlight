@@ -43,8 +43,13 @@ func (s *sqlStore) GetRecord(ctx context.Context, kind RecordKind, shard ShardID
 	var row *sql.Row
 	switch kind {
 	case RecordDocument:
+		var plain, z []byte
 		row = s.r.QueryRowContext(ctx, s.d.Records.GetDocument, shard.Index, shard.Shard, id)
-		err = row.Scan(&r.Body, &r.Seq)
+		if err = row.Scan(&plain, &z, &r.Seq); err == nil {
+			if r.Body, err = readBody(plain, z); err != nil {
+				return r, &CorruptError{Shard: shard, Seq: r.Seq, ID: id, Err: err}
+			}
+		}
 	case RecordQuery:
 		row = s.r.QueryRowContext(ctx, s.d.Records.GetQuery, shard.Index, shard.Shard, id)
 		err = row.Scan(&r.Body, &r.Meta, &r.Seq)

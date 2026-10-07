@@ -630,6 +630,18 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		t.pollOK()
 		return false, &rebuildError{reason: reasonPruned, err: err}
 	}
+	var ce *store.CorruptError
+	if errors.As(err, &ce) {
+		// Apply the changes before the damaged one, then halt at it: retrying would
+		// read the same bytes. A later write of the document gets past it.
+		t.pollOK()
+		if len(changes) > 0 {
+			if err := t.applyChanges(ctx, sh, changes); err != nil {
+				return false, err
+			}
+		}
+		return false, corruptHalt(t.id, ce)
+	}
 	if err != nil {
 		t.pollFailed()
 		return false, err

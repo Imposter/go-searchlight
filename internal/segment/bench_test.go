@@ -259,7 +259,9 @@ func BenchmarkMerge(b *testing.B) {
 }
 
 // BenchmarkBuildSweep reports Build's docs/s at a range of Threads values on the
-// realistic corpus, showing how throughput scales (or stops scaling) with workers.
+// realistic corpus, showing how throughput scales (or stops scaling) with workers. It
+// builds as a refresh does, without fsync (a flush syncs later), so it measures the
+// build and not the disk.
 func BenchmarkBuildSweep(b *testing.B) {
 	for _, threads := range []int{1, 2, 4, 8, 16} {
 		b.Run(fmt.Sprintf("T%d", threads), func(b *testing.B) {
@@ -268,7 +270,7 @@ func BenchmarkBuildSweep(b *testing.B) {
 			var lastPath string
 			b.ResetTimer()
 			for range b.N {
-				meta, err := Build(dir, docs, BuildOptions{Threads: threads})
+				meta, err := Build(dir, docs, BuildOptions{Threads: threads, NoSync: true})
 				if err != nil {
 					b.Fatal(err)
 				}

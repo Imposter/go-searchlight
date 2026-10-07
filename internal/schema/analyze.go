@@ -44,11 +44,12 @@ type Value struct {
 	// Entries is a keyword_list field's entries, normalized and cleaned, distinct and
 	// sorted ([analysis.EntryTerms]).
 	Entries []string
-	// Grams is every distinct 3-rune substring of Text ([analysis.Substrings3]), the
-	// anchors and prefilters of contains and starts_with. It is computed only for a Text
-	// of at most MaxGramChars characters, and never for the IDField.
-	Grams []string
-	// GramsTruncated is true when Text is longer than MaxGramChars and so has no Grams.
+	// Grams says Text's 3-rune substrings ([analysis.EachGram]) are indexed, as the
+	// anchors and prefilters of contains and starts_with: true for a Text of three to
+	// MaxGramChars characters, never for the IDField. They are read from Text where they
+	// are indexed, not kept here.
+	Grams bool
+	// GramsTruncated is true when Text is longer than MaxGramChars and so has no grams.
 	// Such a value can match a contains or starts_with needle that shares no gram with
 	// any index: segment term statistics, search prefilters and percolator anchors must
 	// treat it as a candidate for every needle (a residual check, or the always-verify
@@ -115,8 +116,8 @@ func Analyze(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
 }
 
 // AnalyzeForMatch analyzes a document exactly as [Analyze] does, for matching only:
-// what query.Match and the percolator read is the same, but no Value.Grams are computed
-// (GramsTruncated is never set) and Body is body itself when it is valid UTF-8, not a
+// what query.Match and the percolator read is the same, but Value.Grams and
+// GramsTruncated are never set and Body is body itself when it is valid UTF-8, not a
 // copy. A percolated document, which is matched and never indexed, needs no more.
 func AnalyzeForMatch(m *Mapping, id string, body []byte) (Doc, MappingUpdate, error) {
 	return analyze(m, id, body, modeMatch)
@@ -411,7 +412,7 @@ func analyzeValue(t FieldType, value any, grams bool) Value {
 }
 
 // textValue is a keyword or text field's value: its text, (text only) words, and, when
-// grams is set, its grams up to MaxGramChars.
+// grams is set, whether its grams are indexed.
 func textValue(t FieldType, value any, grams bool) Value {
 	text, ok := analysis.AsText(value)
 	if !ok {
@@ -420,11 +421,9 @@ func textValue(t FieldType, value any, grams bool) Value {
 	text = analysis.Clean(text)
 	v := Value{Present: true, Text: &text}
 	if grams {
-		if utf8.RuneCountInString(text) > MaxGramChars {
-			v.GramsTruncated = true
-		} else {
-			v.Grams = analysis.Substrings3(text)
-		}
+		n := utf8.RuneCountInString(text)
+		v.GramsTruncated = n > MaxGramChars
+		v.Grams = n >= 3 && !v.GramsTruncated
 	}
 	if s, isString := value.(string); isString && t == Text {
 		v.Words = analysis.Words(s) // a NUL is no word character, so Words never holds one

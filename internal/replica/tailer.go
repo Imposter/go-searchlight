@@ -161,6 +161,9 @@ type testHooks struct {
 	beforeSwap func(ctx context.Context, dir string) error
 	// inPlace rebuilds every copy in place, as one that cannot be built aside is.
 	inPlace bool
+	// beforeApply runs before every Apply or Load of a batch into sh; an error is taken
+	// as the shard's answer instead (shard.ErrBackpressure: a full buffer).
+	beforeApply func(sh *shard.Shard) error
 }
 
 func (o *Options) resolve() {

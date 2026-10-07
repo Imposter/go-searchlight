@@ -637,8 +637,11 @@ func waitCopyState(t testing.TB, st store.Store, id ShardID, want store.CopyStat
 	}
 }
 
-// TestBackpressureIsRetried: a write buffer that is always full makes the tailer
-// refresh and retry, never halt, until everything is applied.
+// TestBackpressureIsRetried: a shard that refuses every batch's first try with a full
+// buffer makes the tailer refresh, wait for that refresh, and retry, never halt, until
+// everything is applied. The refusal is forced (beforeApply): a real full buffer also
+// wakes the shard's own background refresh, which can drain it before the tailer's next
+// batch arrives, so load alone never reliably produces one.
 func TestBackpressureIsRetried(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		st := d.open(t)
@@ -648,10 +651,20 @@ func TestBackpressureIsRetried(t *testing.T) {
 		opts := testOptions()
 		opts.BatchSize = 7
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+		var calls, forced atomic.Int64
+		opts.hooks = &testHooks{beforeApply: func(sh *shard.Shard) error {
+			if calls.Add(1)%2 == 1 {
+				forced.Add(1)
+				return fmt.Errorf("%w: forced by the test", shard.ErrBackpressure)
+			}
+			// The retry follows the tailer's drain, which waits for its refresh:
+			// everything applied so far is searchable.
+			if r, a := sh.RefreshedSeq(), sh.AppliedSeq(); r != a {
+				t.Errorf("retried with refreshed seq %d, applied %d: the drain did not wait for its refresh", r, a)
+			}
+			return nil
+		}}
 		c := newCopy(t, d.open(t), id, opts)
-		c.sopt.RefreshInterval = -1 // only the tailer's refreshes drain it
-		c.sopt.RefreshBytes = 1     // full after every batch
-		c.sopt.MaxBufferFactor = 1
 		c.start()
 		var batch []store.Change
 		for i := range 60 {
@@ -662,8 +675,11 @@ func TestBackpressureIsRetried(t *testing.T) {
 		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
 			t.Fatalf("copy differs:\n%s", dd)
 		}
-		if n := counterSum(t, reader, telemetry.MetricReplicaBackpressure, "", ""); n == 0 {
-			t.Fatal("no backpressure was met")
+		if forced.Load() < 60/7 {
+			t.Fatalf("%d batches refused, want one per batch of the 60 changes", forced.Load())
+		}
+		if n := counterSum(t, reader, telemetry.MetricReplicaBackpressure, "", ""); n != forced.Load() {
+			t.Fatalf("backpressure counted %d times, want the %d forced", n, forced.Load())
 		}
 		if n := counterSum(t, reader, telemetry.MetricReplicaHalts, "", ""); n != 0 {
 			t.Fatalf("%d halts", n)

@@ -1,4 +1,15 @@
-# Elasticsearch 8.x, single node, for slbench (spec section 14).
+# Elasticsearch 8.x, two nodes, for slbench (spec section 14).
+#
+# The second node (elasticsearch2) is not a load-balancing peer for the benchmark's
+# own traffic -- slbench only ever talks to "elasticsearch" at 127.0.0.1:9200, never
+# to elasticsearch2 directly -- it exists so target T8 (new replica from zero to
+# serving) has somewhere to recover a peer onto: slbench run --es-recovery flips the
+# "products" index's number_of_replicas from 0 to 1 and times it until the cluster is
+# green, which Elasticsearch can only satisfy by copying the whole primary onto
+# whichever node does not already hold a copy. Both nodes get the identical heap
+# (ES_HEAP): recovery is itself being measured on elasticsearch2, so it is sized like
+# "elasticsearch", not tuned down, same as every other target's "never tune
+# Elasticsearch down" (see bench.yml's fairness comment).
 #
 # Security is off (no TLS, no auth) because this is a disposable benchmark target, not
 # a deployment: slbench talks to it over plain HTTP with no credentials. The heap is
@@ -8,13 +19,17 @@
 # Usage:
 #   docker compose -f bench/docker-compose.es.yml up -d
 #   curl http://127.0.0.1:9200
+#   curl http://127.0.0.1:9200/_cat/nodes
 #   docker compose -f bench/docker-compose.es.yml down -v
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
     container_name: slbench-elasticsearch
     environment:
-      - discovery.type=single-node
+      - node.name=es1
+      - cluster.name=slbench
+      - discovery.seed_hosts=elasticsearch2
+      - cluster.initial_master_nodes=es1,es2
       - xpack.security.enabled=false
       - xpack.security.http.ssl.enabled=false
       - xpack.security.transport.ssl.enabled=false
@@ -22,7 +37,7 @@ services:
       - action.destructive_requires_name=false
       - "ES_JAVA_OPTS=-Xms${ES_HEAP:-4g} -Xmx${ES_HEAP:-4g}"
       - bootstrap.memory_lock=true
-    ulimits:
+    ulimits: &es-ulimits
       memlock:
         soft: -1
         hard: -1
@@ -39,5 +54,32 @@ services:
       timeout: 5s
       retries: 60
 
+  # No published port: slbench only ever reaches "elasticsearch" (es1) at
+  # 127.0.0.1:9200. es2 exists so T8 has a peer to recover a replica onto.
+  elasticsearch2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: slbench-elasticsearch2
+    environment:
+      - node.name=es2
+      - cluster.name=slbench
+      - discovery.seed_hosts=elasticsearch
+      - cluster.initial_master_nodes=es1,es2
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - xpack.ml.enabled=false
+      - action.destructive_requires_name=false
+      - "ES_JAVA_OPTS=-Xms${ES_HEAP:-4g} -Xmx${ES_HEAP:-4g}"
+      - bootstrap.memory_lock=true
+    ulimits: *es-ulimits
+    volumes:
+      - slbench-es-data2:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
 volumes:
   slbench-es-data:
+  slbench-es-data2:

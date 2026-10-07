@@ -302,10 +302,9 @@ type Tailer struct {
 	// can only be rebuilt, which waits until the halted row is superseded.
 	gate *HaltError
 	// scanFor and scanFrom are where the search for a change superseding a halted
-	// one got to; scanPruned that it has met the changelog pruned past it.
-	scanFor    *HaltError
-	scanFrom   int64
-	scanPruned bool
+	// one got to.
+	scanFor  *HaltError
+	scanFrom int64
 	// remapSince and remapVersion are when a remap's rebuild started waiting, and
 	// the newest mapping version seen since.
 	remapSince   time.Time
@@ -630,6 +629,18 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	if errors.Is(err, store.ErrPruned) {
 		t.pollOK()
 		return false, &rebuildError{reason: reasonPruned, err: err}
+	}
+	var ce *store.CorruptError
+	if errors.As(err, &ce) {
+		// Apply the changes before the damaged one, then halt at it: retrying would
+		// read the same bytes. A later write of the document gets past it.
+		t.pollOK()
+		if len(changes) > 0 {
+			if err := t.applyChanges(ctx, sh, changes); err != nil {
+				return false, err
+			}
+		}
+		return false, corruptHalt(t.id, ce)
 	}
 	if err != nil {
 		t.pollFailed()

@@ -536,6 +536,10 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 	if res.err != nil {
 		return 0, res.err
 	}
+	var ce *store.CorruptError
+	if errors.As(scanErr, &ce) {
+		return 0, corruptHalt(t.id, ce)
+	}
 	if scanErr != nil {
 		return 0, scanErr
 	}

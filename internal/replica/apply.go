@@ -31,6 +31,7 @@ const (
 	ReasonRefused  = "refused"  // the shard refused the change (too large, invalid)
 	ReasonOrder    = "order"    // the shard refused the change's seq: a tailer bug
 	ReasonMapping  = "mapping"  // a mapping change that does not parse
+	ReasonCorrupt  = "corrupt"  // the stored body does not decode (store.ErrCorrupt)
 )
 
 // HaltError is a change the store accepted that this copy cannot apply. The copy has
@@ -47,6 +48,15 @@ type HaltError struct {
 	// only a later change of the same thing counts as superseding it; "" matches
 	// any.
 	class string
+	// version is the mapping version the change was written under (a mapping
+	// change's own): a mapping halt is past once the index's mapping moves on.
+	version int64
+}
+
+// corruptHalt is the halt at a record whose stored body does not decode: written
+// again, the document replaces the row, and the copy gets past it.
+func corruptHalt(id ShardID, ce *store.CorruptError) *HaltError {
+	return &HaltError{Shard: id, Seq: ce.Seq, ID: ce.ID, Reason: ReasonCorrupt, Err: ce, class: classDocument}
 }
 
 // Classes of the things a change targets.
@@ -412,7 +422,7 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 }
 
 func (t *Tailer) haltAt(it *item, reason string, err error) *HaltError {
-	return &HaltError{Shard: t.id, Seq: it.seq, ID: it.id, Reason: reason, Err: err, class: classOfShardKind(it.kind)}
+	return &HaltError{Shard: t.id, Seq: it.seq, ID: it.id, Reason: reason, Err: err, class: classOfShardKind(it.kind), version: it.version}
 }
 
 // applyChanges applies one page of the changelog and moves the applied seq past what
@@ -635,7 +645,7 @@ func (t *Tailer) applyBatch(ctx context.Context, sh *shard.Shard, changes []shar
 			reason = ReasonOrder
 		}
 		bad := &changes[ce.Pos]
-		return n, &HaltError{Shard: t.id, Seq: bad.Seq, ID: ce.ID, Reason: reason, Err: err, class: classOfShardKind(bad.Kind)}
+		return n, &HaltError{Shard: t.id, Seq: bad.Seq, ID: ce.ID, Reason: reason, Err: err, class: classOfShardKind(bad.Kind), version: bad.MappingVersion}
 	}
 }
 
@@ -721,30 +731,30 @@ func (t *Tailer) clearHalt() {
 // superseded reports whether the changelog holds a change of h's document or query
 // (or mapping) after h's seq: the bad row is then no longer current, and a rebuild
 // from a snapshot gets past it. The search resumes where the last one for h stopped.
-// A changelog pruned past h needs a rebuild anyway: that counts as superseded once.
-// After that rebuild has stopped at h again, the record itself decides
-// ([Tailer.recordMoved]), so a halted copy is not rescanned at every backoff.
+// Once the changelog is pruned past h the changes are gone, and the record (or the
+// index's mapping) itself decides ([Tailer.recordMoved]); a tailing copy pruned past
+// is rebuilt by its next read anyway (reasonPruned).
 func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 	if t.scanFor == nil || t.scanFor.Seq != h.Seq || t.scanFor.ID != h.ID {
-		t.scanFor, t.scanFrom, t.scanPruned = h, h.Seq, false
+		t.scanFor, t.scanFrom = h, h.Seq
 	}
 	for {
 		page, err := t.st.ChangesAfter(ctx, t.id, t.scanFrom, t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
-			if !t.scanPruned {
-				t.scanPruned = true
-				return true, nil
-			}
 			return t.recordMoved(ctx, h)
 		}
-		if err != nil {
-			return false, err
+		var ce *store.CorruptError
+		if errors.As(err, &ce) && ce.ID == h.ID && (h.class == "" || h.class == classDocument) {
+			return true, nil // a later write of the same document, damaged itself
 		}
 		for i := range page {
 			c := &page[i]
 			if c.ID == h.ID && (h.class == "" || classOfStoreKind(c.Kind) == h.class) {
 				return true, nil
 			}
+		}
+		if err != nil {
+			return false, err
 		}
 		if len(page) == 0 {
 			return false, nil
@@ -757,9 +767,20 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 }
 
 // recordMoved reports whether h's document or saved query is no longer the row h
-// halted at: deleted, or written again since. A mapping, or a store that cannot read
-// records, never reports it.
+// halted at (deleted, or written again since), or for a mapping halt whether the
+// index's mapping has moved past the version h was written under. A store that
+// cannot read records never reports a record moved.
 func (t *Tailer) recordMoved(ctx context.Context, h *HaltError) (bool, error) {
+	if h.class == classMapping {
+		meta, err := t.st.Indexes().Get(ctx, t.id.Index)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return true, nil // dropped: the copy's next start finds out
+		case err != nil:
+			return false, err
+		}
+		return meta.MappingVersion != h.version, nil
+	}
 	rr, ok := t.st.(store.RecordReader)
 	if !ok {
 		return false, nil
@@ -774,9 +795,12 @@ func (t *Tailer) recordMoved(ctx context.Context, h *HaltError) (bool, error) {
 		return false, nil
 	}
 	r, err := rr.GetRecord(ctx, kind, t.id, h.ID)
+	var ce *store.CorruptError
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return true, nil
+	case errors.As(err, &ce):
+		return ce.Seq != h.Seq, nil // still damaged: moved only if written again
 	case err != nil:
 		return false, err
 	}

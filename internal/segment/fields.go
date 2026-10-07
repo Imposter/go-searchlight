@@ -12,7 +12,7 @@ import (
 // in ascending document ordinal order, for both [Build] and [Merge]. With
 // BuildOptions.Threads > 1 (or, for Merge, always, up to GOMAXPROCS), there is one
 // fieldBuilder per worker per field, each covering a different, disjoint range of the
-// final document ordinals; [writeFieldDicts], [writeFieldDocValues],
+// final document ordinals; [writeFieldDict], [writeFieldDocValues],
 // [writeFieldPoints] and [writeFieldPresence] combine every worker's fieldBuilder for
 // one field into that field's structures, in a way that depends only on the workers'
 // ranges being disjoint and ascending - never on there being just one of them - so the
@@ -74,7 +74,7 @@ func (b *fieldBuilder) sortTermGroups() {
 // private buffer (format.go) with its own offset starting at 0: a structure that
 // happens to be the very first thing in its buffer has a real offset of 0, which 0-as-
 // "absent" could not otherwise be told apart from. The writers in this file
-// (writeFieldDicts and friends) are what add the 1; writeSegmentParts' per-section
+// (writeFieldDict and friends) are what add the 1; writeSegmentParts' per-section
 // fixup adds a field's position within the section on top of that (still leaving 0
 // alone, still meaning absent), and Reader.parseMeta subtracts the 1 back out, after
 // adding the section's own absolute start, before calling openDict and friends.
@@ -90,7 +90,7 @@ type fieldOutput struct {
 }
 
 // fieldScratch is one field's working state across the terms, doc-values and points
-// sections: fieldOutput plus the doc-values inputs writeFieldDicts derives as a
+// sections: fieldOutput plus the doc-values inputs writeFieldDict derives as a
 // byproduct of writing the term dictionaries (so writeFieldDocValues needs no second
 // pass over them) and writeFieldDocValues derives for writeFieldPoints in turn.
 type fieldScratch struct {
@@ -450,35 +450,36 @@ func (b *fieldBuilder) pairs(kind TermKind) *termPairs {
 	return &b.valuePairs
 }
 
-// writeFieldDicts writes one field's four term dictionaries (terms section), merging
-// parts (one fieldBuilder per worker that built any of this field, each already
-// term-sorted) and recording each document's value and entry ordinals into s for
-// writeFieldDocValues.
-func writeFieldDicts(w *fileWriter, name string, parts []*fieldBuilder, dicts dictSources, s *fieldScratch) {
-	var off uint64
-	off, s.numValueTerms = writeMergedDict(w, dicts(name, parts, KindValue),
-		func(ord uint32, docs []uint32) {
+// writeFieldDict writes the kind term dictionary of a field (terms section), merging
+// every part's sorted groups, and records where it starts and, for the value and entry
+// dictionaries, their doc-ordinal pairs and term counts (for the doc values section).
+// A field's four dictionaries are written in kind order, and may be written
+// concurrently: each touches its own part of s.
+func writeFieldDict(w *fileWriter, name string, kind TermKind, parts []*fieldBuilder, dicts dictSources, s *fieldScratch) {
+	var onTerm func(ord uint32, docs []uint32)
+	switch kind {
+	case KindValue:
+		onTerm = func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.valueDocOrds = append(s.valueDocOrds, docOrd{doc: d, ord: ord})
 			}
-		})
-	if s.numValueTerms > 0 {
-		s.out.dictOff[KindValue] = off + 1
-	}
-	off, s.numEntryTerms = writeMergedDict(w, dicts(name, parts, KindEntry),
-		func(ord uint32, docs []uint32) {
+		}
+	case KindEntry:
+		onTerm = func(ord uint32, docs []uint32) {
 			for _, d := range docs {
 				s.entryDocOrds = append(s.entryDocOrds, docOrd{doc: d, ord: ord})
 			}
-		})
-	if s.numEntryTerms > 0 {
-		s.out.dictOff[KindEntry] = off + 1
+		}
 	}
-	if off, n := writeMergedDict(w, dicts(name, parts, KindWord), nil); n > 0 {
-		s.out.dictOff[KindWord] = off + 1
+	off, n := writeMergedDict(w, dicts(name, parts, kind), onTerm)
+	switch kind {
+	case KindValue:
+		s.numValueTerms = n
+	case KindEntry:
+		s.numEntryTerms = n
 	}
-	if off, n := writeMergedDict(w, dicts(name, parts, KindGram), nil); n > 0 {
-		s.out.dictOff[KindGram] = off + 1
+	if n > 0 {
+		s.out.dictOff[kind] = off + 1
 	}
 }
 
@@ -493,7 +494,7 @@ func sortByDoc(pairs []docOrd) {
 
 // writeFieldDocValues writes one field's keyword, multi and number columns (doc
 // values section), combining parts. The keyword and multi columns are driven by s's
-// doc-ordinal lists, already combined across parts by writeFieldDicts; the number
+// doc-ordinal lists, already combined across parts by writeFieldDict; the number
 // column is combined here by concatenating every part's numDocs in part order, which
 // (parts cover ascending, disjoint ranges, and each part's own numDocs is itself
 // already ascending - see fieldBuilder's doc comment) needs no re-sort either.

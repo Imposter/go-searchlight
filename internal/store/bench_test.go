@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"testing"
@@ -47,10 +48,12 @@ func forEachDialectB(b *testing.B, fn func(b *testing.B, fresh func(testing.TB) 
 	})
 }
 
-// benchStore opens a store on a fresh database with the bench index.
+// benchStore opens a store on a fresh database with the bench index, storing bodies
+// compressed as a cluster does once every node reads them.
 func benchStore(b *testing.B, fresh func(testing.TB) *harness) Store {
 	b.Helper()
 	st := fresh(b).open(b)
+	st.CompressBodies(true)
 	mustCreateIndex(b, st, "bench")
 	return st
 }
@@ -59,13 +62,44 @@ func benchStore(b *testing.B, fresh func(testing.TB) *harness) Store {
 // does.
 const benchShards = 4
 
-// benchBody is a document of about 1 KB.
-var benchBody = `{"title":"benchmark document","body":"` + strings.Repeat("lorem ipsum ", 80) + `","n":`
+// benchBody is a product listing of about 900 bytes, shaped like the benchmark
+// dataset's (bench/datasets): its text drawn from a few thousand words, the common
+// ones far more often, so it compresses about as the dataset's documents do. n makes
+// each one its own.
+func benchBody(n int) string {
+	r := rand.New(rand.NewPCG(uint64(n), 3))
+	words := func(k int) string {
+		w := make([]string, k)
+		for i := range w {
+			w[i] = benchWords[r.IntN(1+r.IntN(1+r.IntN(len(benchWords))))]
+		}
+		return strings.Join(w, " ")
+	}
+	return fmt.Sprintf(`{"title":%q,"description":%q,"brand":"Brand %d","category":"Home > %s","tags":[%q,%q],`+
+		`"sku":"SKU-%08d","url":"https://shop.example.com/p/%s-%d","price":%d.%02d,"rating":%d.%d,"reviews":%d,`+
+		`"in_stock":%t,"first_seen":"2026-09-%02dT04:55:05Z","n":%d}`,
+		words(6), words(60), r.IntN(2000), words(1), words(1), words(1), n, words(1), n, r.IntN(500), r.IntN(100),
+		r.IntN(5), r.IntN(10), r.IntN(1000), r.IntN(2) == 0, 1+r.IntN(28), n)
+}
+
+var benchWords = func() []string {
+	out := strings.Fields("the and with for this made great quality black outdoor set travel table high electric large includes perfect")
+	r := rand.New(rand.NewPCG(1, 2))
+	syllables := strings.Fields("ka ne mi tru pol ver du kit bam ris dur mor fal cra mup lo pe gab sim fi vi ho nel tar kane ru")
+	for len(out) < 3000 {
+		var b strings.Builder
+		for range 2 + r.IntN(3) {
+			b.WriteString(syllables[r.IntN(len(syllables))])
+		}
+		out = append(out, b.String())
+	}
+	return out
+}()
 
 func benchBatch(prefix string, n int) []Change {
 	batch := make([]Change, n)
 	for j := range batch {
-		batch[j] = upsert("bench", j%benchShards, fmt.Sprintf("%s-%d", prefix, j), benchBody+fmt.Sprint(j)+"}")
+		batch[j] = upsert("bench", j%benchShards, fmt.Sprintf("%s-%d", prefix, j), benchBody(j))
 	}
 	return batch
 }
@@ -109,7 +143,7 @@ func BenchmarkApplyMix(b *testing.B) {
 				for k := 0; k < pool; k += n {
 					batch := make([]Change, n)
 					for j := range batch {
-						batch[j] = upsert("bench", (k+j)%benchShards, id(k+j), benchBody+"0}")
+						batch[j] = upsert("bench", (k+j)%benchShards, id(k+j), benchBody(k+j))
 					}
 					if _, _, err := st.Apply(ctx, batch); err != nil {
 						b.Fatal(err)
@@ -124,7 +158,7 @@ func BenchmarkApplyMix(b *testing.B) {
 						if j%4 == 3 {
 							batch[j] = del("bench", k%pool%benchShards, id(k))
 						} else {
-							batch[j] = upsert("bench", k%pool%benchShards, id(k), benchBody+fmt.Sprint(i)+"}")
+							batch[j] = upsert("bench", k%pool%benchShards, id(k), benchBody(k+i))
 						}
 					}
 					i++

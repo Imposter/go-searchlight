@@ -123,7 +123,8 @@ sequenceDiagram
 - **Any node commits any write.** The coordinator locks the `sl_counter` row, takes
   contiguous `seq` values for the batch, inserts the change rows and the document or
   query rows, and commits in one transaction. Concurrent writes on the same node are
-  coalesced into that one transaction every 2 ms or at 1,000 changes, whichever comes first (**group commit**), the way
+  coalesced into that one transaction every 2 ms, at 4,096 changes or at 16 MiB of stored payload, whichever comes
+  first (**group commit**), the way
   Elasticsearch amortizes translog fsyncs — so `_bulk` is the throughput path, not many
   small single-document writes (spec §8).
 - **The write is acknowledged with its `seq` only after the commit.** That `seq` is a

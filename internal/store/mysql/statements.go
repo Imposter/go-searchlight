@@ -39,9 +39,9 @@ var changelog = dialect.Changelog{
 	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	Write:         write,
 	Limits:        limits,
-	ChangesAfter:  "SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	ChangesAfter:  "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
-	ScanDocuments: "SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanDocuments: "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
 	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
@@ -49,10 +49,10 @@ var changelog = dialect.Changelog{
 // DUPLICATE KEY UPDATE through a row alias, and IN-list deletes.
 func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 	out := values("insert changes", "INSERT INTO sl_changes ("+changeColumns+") VALUES ", "",
-		9, l, changeArgs(w.Changes))
+		10, l, changeArgs(w.Changes))
 	out = append(out, values("upsert documents", "INSERT INTO sl_documents ("+documentColumns+") VALUES ",
-		" AS new ON DUPLICATE KEY UPDATE body = new.body, seq = new.seq",
-		5, l, documentArgs(w.Documents))...)
+		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq",
+		6, l, documentArgs(w.Documents))...)
 	out = append(out, values("upsert queries", "INSERT INTO sl_queries ("+queryColumns+") VALUES ",
 		" AS new ON DUPLICATE KEY UPDATE query = new.query, meta = new.meta, seq = new.seq",
 		6, l, queryArgs(w.Queries))...)
@@ -68,18 +68,20 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 }
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetDocument: "SELECT body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?",
 }
 
 var registry = dialect.Registry{
-	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, heartbeat_at, started_at) VALUES (?, ?, ?, ?, NOW, NOW)
-AS new ON DUPLICATE KEY UPDATE address = new.address, version = new.version, capacity = new.capacity, heartbeat_at = new.heartbeat_at`),
-	RemoveNode:  "DELETE FROM sl_nodes WHERE node_id = ?",
-	Nodes:       withNow("SELECT node_id, address, version, capacity, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
-	IndexExists: "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",
-	Slots:       withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot"),
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, heartbeat_at, started_at) VALUES (?, ?, ?, ?, ?, NOW, NOW)
+AS new ON DUPLICATE KEY UPDATE address = new.address, version = new.version, capacity = new.capacity, body_codecs = new.body_codecs, heartbeat_at = new.heartbeat_at`),
+	RemoveNode:    "DELETE FROM sl_nodes WHERE node_id = ?",
+	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	Features:      "SELECT name, enabled_at FROM sl_features",
+	EnableFeature: withNow("INSERT IGNORE INTO sl_features (name, enabled_at) VALUES (?, NOW)"),
+	IndexExists:   "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",
+	Slots:         withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot"),
 	NextEpoch: dialect.Returning{
 		Write: "UPDATE sl_counter SET value = value + 1 WHERE id = 2",
 		Read:  "SELECT value FROM sl_counter WHERE id = 2",
@@ -177,4 +179,11 @@ var maintenance = dialect.Maintenance{
 	MigrateInTx:       false,
 	SessionLock:       "SELECT GET_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())), 120)",
 	SessionUnlock:     "SELECT RELEASE_LOCK(CONCAT('searchlight.migrate.', MD5(DATABASE())))",
+	// Even an instant ALTER TABLE takes its table's metadata lock, queued behind
+	// the transactions using the table, with every later statement queued behind
+	// it meanwhile.
+	MigrateLockTimeout: "SET SESSION lock_wait_timeout = 1",
+	MigrateLockReset:   "SET SESSION lock_wait_timeout = DEFAULT",
+	LockTimedOut:       lockTimedOut,
+	AlreadyApplied:     alreadyApplied,
 }

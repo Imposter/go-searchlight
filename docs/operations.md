@@ -427,10 +427,18 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 ### The database
 
 - **Records.** It holds every document and saved query (`sl_documents`, `sl_queries`).
+  Document bodies are stored compressed (zstd) once the cluster has turned compression on
+  (see [upgrading to compressed bodies](#upgrades-and-rolling-restarts)): on the benchmark's product listings
+  (about 870 bytes of JSON each) `sl_documents` takes about 0.8 GB per million documents
+  on Postgres, against 1 GB uncompressed.
 - **Changelog.** `sl_changes` holds the changes not yet pruned: at most
-  `changelog_retention` (24 h) of writes, usually far less. Pruning follows the slowest
-  live copy, so a stalled copy holds the floor for at most `prune_stall_timeout`. Each
-  retained recovery bundle holds it too, at its seq.
+  `changelog_retention` (24 h) of writes, usually far less. The leader prunes every 30 s,
+  below what every live copy has flushed, so under a steady stream of writes it holds
+  three to four `flush_interval`s of them. Pruning follows the slowest live copy, so a
+  stalled copy holds the floor for at most `prune_stall_timeout`. Each retained recovery
+  bundle holds it too, at its seq. Its payloads are compressed like the bodies. A pruned
+  row's space is reused by later writes (SQLite's free pages, Postgres's vacuum), so the
+  database grows to the documents plus the changelog's high-water mark.
 - **Recovery bundles** (with `bundle_interval` set) take about each shard's segment size
   times `bundle_retention` in `sl_blobs`.
 - **Write rate.** Group commit coalesces each node's concurrent writes into one
@@ -499,7 +507,32 @@ Notes:
   brings a migration cannot be rolled back by downgrading the binary: restore the
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
-  is one migration, the initial schema.
+  are two: the initial schema, and compressed bodies (below). Each migration's DDL waits
+  at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
+  so a long query on the table holds the table's other queries behind the migration for
+  at most that second; one that times out is retried, up to 40 times over about three
+  minutes, half a second to five seconds apart.
+- **Upgrading to compressed bodies** (schema migration 2) is a rolling upgrade. The
+  migration only adds columns and a table, which takes milliseconds whatever the
+  database holds: `body_z` beside `sl_documents.body` and `payload_z` beside
+  `sl_changes.payload` (bytes, NULL until used), `sl_nodes.body_codecs` (0 by default),
+  and `sl_features`. Nothing is rewritten, and nodes still on the old binary keep reading
+  and writing as before: they never touch the new columns.
+  - Upgraded nodes heartbeat `body_codecs = 1` and keep writing bodies as JSON text until
+    the cluster turns compression on. The leader does that once every node in `sl_nodes`
+    reads compressed bodies, or has been silent for longer than `dead_after` plus
+    `lease_ttl` (its leases have run out, so it serves nothing): it writes the row
+    `zstd_bodies` into `sl_features`, for good. Each node sees it at its next registry
+    read and from then on stores document bodies and changelog payloads compressed (zstd,
+    behind a codec byte, in `body_z` and `payload_z` with the text column empty). Rows
+    written before keep their JSON text and read as they always did. On a single node,
+    compression comes on within a second of the upgraded node starting.
+  - `SELECT * FROM sl_features` shows whether it is on, and since when.
+  - Once the first node has migrated, an old binary refuses to start (the schema is newer
+    than it knows), so **an old pod that crashes or restarts mid-rollout crash-loops** on
+    `store: database schema is newer than this binary` until it runs the new image:
+    finish the rollout rather than waiting on it. For the same reason a rollback means
+    restoring the database, as above.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

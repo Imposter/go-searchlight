@@ -66,7 +66,7 @@ func TestInflightByteBudget(t *testing.T) {
 
 func TestRequestShapeChecks(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/r", "")
+	e.createIndex("r", "")
 	// I8: a malformed query string is refused, not partly read.
 	p := e.problem(e.do("POST", "/indexes/r/_search?wait_for_seq=1&x=%zz", `{}`), http.StatusBadRequest, "invalid_request")
 	if !hasLoc(p, "params") {

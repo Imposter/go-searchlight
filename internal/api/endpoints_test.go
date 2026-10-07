@@ -12,7 +12,7 @@ import (
 
 func TestIndexLifecycle(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	created := e.must(http.StatusCreated, "PUT", "/indexes/items",
+	created := e.createIndex("items",
 		`{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}, "settings": {"shards": 2, "refresh_interval": "50ms"}}`)
 	if created["name"] != "items" || created["uid"] == "" {
 		t.Errorf("created = %v", created)
@@ -22,7 +22,7 @@ func TestIndexLifecycle(t *testing.T) {
 		t.Errorf("settings = %v", settings)
 	}
 	e.problem(e.do("PUT", "/indexes/items", `{}`), http.StatusConflict, "index_exists")
-	e.must(http.StatusCreated, "PUT", "/indexes/other", "")
+	e.createIndex("other", "")
 
 	list := e.must(http.StatusOK, "GET", "/indexes", "")
 	var names []string
@@ -75,7 +75,7 @@ func TestIndexLifecycle(t *testing.T) {
 	e.problem(e.do("DELETE", "/indexes/items", ""), http.StatusNotFound, "index_not_found")
 	e.problem(e.do("POST", "/indexes/items/_search", `{}`), http.StatusNotFound, "index_not_found")
 	// A recreated index starts empty.
-	e.must(http.StatusCreated, "PUT", "/indexes/items", "")
+	e.createIndex("items", "")
 	r := e.must(http.StatusOK, "POST", "/indexes/items/_count", "")
 	if r["count"] != 0.0 {
 		t.Errorf("recreated index count = %v", r)
@@ -84,7 +84,7 @@ func TestIndexLifecycle(t *testing.T) {
 
 func TestDocuments(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/shop", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}}`)
+	e.createIndex("shop", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}}`)
 
 	w := e.must(http.StatusOK, "PUT", "/indexes/shop/docs/a%2Fb", `{"title": "Red Chair", "price": 10}`)
 	seq := seqOf(t, w)
@@ -132,7 +132,7 @@ func TestDocuments(t *testing.T) {
 
 	// Dynamic mapping types new fields from their first value, before the write
 	// commits, so the field is searchable at once.
-	e.must(http.StatusCreated, "PUT", "/indexes/dyn", "")
+	e.createIndex("dyn", "")
 	w = e.must(http.StatusOK, "PUT", "/indexes/dyn/docs/1?refresh=wait_for", `{"brand": "Acme", "price": 3, "tags": ["a", "b"], "ok": true}`)
 	if w["timed_out"] != nil {
 		t.Errorf("refresh=wait_for timed out: %v", w)
@@ -156,7 +156,7 @@ func TestReadYourWrites(t *testing.T) {
 	// The background refresh is off: only wait_for_seq and refresh make writes
 	// searchable, so the test sees each mechanism alone.
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/ryw", `{"settings": {"shards": 3, "refresh_interval": -1}}`)
+	e.createIndex("ryw", `{"settings": {"shards": 3, "refresh_interval": -1}}`)
 	search := func(q string) map[string]any {
 		return e.must(http.StatusOK, "POST", "/indexes/ryw/_search"+q, `{"query": {"all": []}, "size": 100}`)
 	}
@@ -199,7 +199,7 @@ func TestReadYourWrites(t *testing.T) {
 // under it, and a search on the field finds the document.
 func TestPatchMappingIndexesKeptFields(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/loose", `{"mapping": {"dynamic": false, "fields": {"title": "text"}}, "settings": {"shards": 2}}`)
+	e.createIndex("loose", `{"mapping": {"dynamic": false, "fields": {"title": "text"}}, "settings": {"shards": 2}}`)
 	w := e.must(http.StatusOK, "PUT", "/indexes/loose/docs/1", `{"title": "red chair", "colour": "Red"}`)
 	e.must(http.StatusOK, "PUT", "/indexes/loose/docs/2", `{"title": "blue chair", "colour": "Blue"}`)
 	// Unmapped, the field is kept in the body but cannot be queried.

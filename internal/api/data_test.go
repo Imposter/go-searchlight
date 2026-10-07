@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -16,7 +15,7 @@ import (
 
 func TestBulk(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/b", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}, "settings": {"shards": 2}}`)
+	e.createIndex("b", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}, "settings": {"shards": 2}}`)
 	r := e.must(http.StatusOK, "POST", "/indexes/b/_bulk?refresh=wait_for", ndjson(
 		`{"upsert": {"id": "1"}}`,
 		`{"title": "one", "price": 1}`,
@@ -96,7 +95,7 @@ func TestBulk(t *testing.T) {
 
 func TestSearch(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/s", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
+	e.createIndex("s", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
 	var lines []string
 	brands := []string{"acme", "globex", "initech"}
 	for i := range 60 {
@@ -193,7 +192,7 @@ func TestSearch(t *testing.T) {
 
 func TestSavedQueriesAndPercolate(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/p", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
+	e.createIndex("p", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
 	put := func(id, q string) int64 {
 		return seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/p/queries/"+id, q))
 	}
@@ -256,33 +255,11 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 	}
 }
 
-// waitAllServing polls /_cluster/health until shards of it are serving: a fresh
-// index's shards recover from an empty snapshot, and a write arriving before one does
-// is a correct, retryable 503 ("shard is recovering") rather than a bug. Create
-// returns once it has waited up to max_lag for that, but on a loaded runner it can
-// still return before every shard is there, so a caller that needs every shard up
-// confirms it here instead of racing the recovery.
-func waitAllServing(t *testing.T, e *env, shards int) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		h := e.must(http.StatusOK, "GET", "/_cluster/health", "")
-		if n, ok := h["serving_shards"].(float64); ok && int(n) >= shards {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("not every shard is serving within the deadline: %v", h)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // TestBulkPercolateMatchesBruteForce checks _bulk?percolate=true against query.Match
 // over every saved query, for random queries and documents on several shards.
 func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/bf", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
-	waitAllServing(t, e, 3)
+	e.createIndex("bf", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
 	rng := rand.New(rand.NewPCG(1, 2))
 	brands := []string{"Acme", "Globex", "Initech", "Umbrella"}
 	words := []string{"red", "chair", "table", "lamp", "oak", "steel"}
@@ -361,7 +338,7 @@ func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 
 func TestFieldsAndCluster(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/f", `{"mapping": {"fields": {"tags": "keyword_list", "brand": "keyword"}}, "settings": {"shards": 2}}`)
+	e.createIndex("f", `{"mapping": {"fields": {"tags": "keyword_list", "brand": "keyword"}}, "settings": {"shards": 2}}`)
 	w := e.must(http.StatusOK, "POST", "/indexes/f/_bulk", ndjson(
 		`{"upsert": {"id": "1"}}`, `{"tags": ["a", "b"], "brand": "x"}`,
 		`{"upsert": {"id": "2"}}`, `{"tags": ["a"], "brand": "y"}`,

@@ -40,7 +40,7 @@ func TestHostileRequests(t *testing.T) {
 		c.MaxBodyBytes = 256 << 10
 		c.MaxDocBytes = 8 << 10
 	}})
-	e.must(http.StatusCreated, "PUT", "/indexes/h", `{"mapping": {"fields": {"title": "text", "price": "number"}}}`)
+	e.createIndex("h", `{"mapping": {"fields": {"title": "text", "price": "number"}}}`)
 
 	t.Run("oversized body with a length", func(t *testing.T) {
 		e := e.with(t)
@@ -155,7 +155,7 @@ func TestHostileRequests(t *testing.T) {
 // read_timeout is short: a client that stalls its headers or body is cut off.
 func TestSlowClients(t *testing.T) {
 	e := newEnv(t, envOpts{cfg: func(c *config.Config) { c.ReadTimeout = 400 * time.Millisecond }})
-	e.must(http.StatusCreated, "PUT", "/indexes/h", "")
+	e.createIndex("h", "")
 	t.Run("a slow body", func(t *testing.T) {
 		e := e.with(t)
 		conn := dial(t, e.url)
@@ -222,7 +222,7 @@ func readStatus(t *testing.T, conn net.Conn, within time.Duration) int {
 
 func TestUnknownParametersAreRefused(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/u", "")
+	e.createIndex("u", "")
 	p := e.problem(e.do("POST", "/indexes/u/_search?wait_for_sq=3", `{}`), http.StatusBadRequest, "invalid_request")
 	if !hasLoc(p, "params.wait_for_sq") {
 		t.Errorf("a misspelled parameter: %v", p)
@@ -257,7 +257,7 @@ func TestAuth(t *testing.T) {
 	e.token = ro
 	e.problem(e.do("PUT", "/indexes/a", ""), http.StatusForbidden, "forbidden")
 	e.token = rw
-	e.must(http.StatusCreated, "PUT", "/indexes/a", "")
+	e.createIndex("a", "")
 	e.must(http.StatusOK, "PUT", "/indexes/a/docs/1", `{"x": 1}`)
 	e.token = ro
 	e.must(http.StatusOK, "POST", "/indexes/a/_search", `{}`)
@@ -295,12 +295,12 @@ func TestAuthConfiguration(t *testing.T) {
 	}
 	// Auth off is served without a token.
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/open", "")
+	e.createIndex("open", "")
 }
 
 func TestBackpressure(t *testing.T) {
 	e := newEnv(t, envOpts{fakeTailers: true, node: func(o *node.Options) { o.MaxApplyLag = 2 }})
-	e.must(http.StatusCreated, "PUT", "/indexes/bp", "")
+	e.createIndex("bp", "")
 	tl := e.tailer("bp", 0)
 	tl.Pause()
 	var got resp
@@ -422,7 +422,7 @@ func TestWaitForSeqTimesOut(t *testing.T) {
 	// can be scheduled out past 2 s; a real tailer never takes this long, but the
 	// deadline below still has to actually elapse once, by design.
 	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 8 * time.Second }})
-	e.must(http.StatusCreated, "PUT", "/indexes/w", "")
+	e.createIndex("w", "")
 	// A seq past the newest committed one is refused at once, before a bulk writes.
 	e.problem(e.do("POST", "/indexes/w/_search?wait_for_seq=999999", `{}`), http.StatusBadRequest, "invalid_request")
 	p := e.problem(e.do("POST", "/indexes/w/_bulk?percolate=true&wait_for_seq=999999", ndjson(`{"upsert": {"id": "a"}}`, `{"x": 1}`)), http.StatusBadRequest, "invalid_request")
@@ -461,7 +461,7 @@ func TestInvalidUTF8CannotPoisonTheChangelog(t *testing.T) {
 		c.MaxBodyBytes = 16 << 20
 		c.MaxDocBytes = 12 << 20
 	}})
-	e.must(http.StatusCreated, "PUT", "/indexes/p", "")
+	e.createIndex("p", "")
 	body := `{"t": "` + strings.Repeat("\xff", 11<<20) + `"}`
 	e.problem(e.do("PUT", "/indexes/p/docs/bad", body), http.StatusRequestEntityTooLarge, "too_large")
 	r := e.must(http.StatusOK, "POST", "/indexes/p/_bulk", ndjson(`{"upsert": {"id": "bad2"}}`, body[:len(body)-2]+`"}`))

@@ -135,8 +135,9 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 		}
 	}
 	v := &view{seg: seg, n: seg.NumQueries(), deletes: deletes}
-	sc := new(scratch)
+	sc, wsc := new(scratch), new(scratch)
 	sc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
+	wsc.fit(seg.NumQueries(), seg.NumEntries(), len(seg.fields))
 	m := testMapping()
 	isAlways := make(map[uint32]bool)
 	for i := 0; i < len(seg.always); i += 4 {
@@ -155,6 +156,25 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 			cand[seg.ordAt(r)] = true
 		}
 		candidates += len(cand)
+		cuts := []uint32{0, seg.n}
+		for range g.r.IntN(4) {
+			cuts = append(cuts, uint32(g.r.IntN(int(seg.n)+1)))
+		}
+		slices.Sort(cuts)
+		windowed := 0
+		for w := 1; w < len(cuts); w++ {
+			seg.collectIn(&d, wsc, cuts[w-1], cuts[w])
+			for _, r := range wsc.cands {
+				if r < cuts[w-1] || r >= cuts[w] || !cand[seg.ordAt(r)] {
+					t.Fatalf("seed %d: window [%d, %d) of document %s: candidate %d", seed, cuts[w-1], cuts[w], body, r)
+				}
+			}
+			windowed += len(wsc.cands)
+			wsc.reset()
+		}
+		if windowed != len(sc.cands) {
+			t.Fatalf("seed %d: document %s: %d candidates in windows %v, %d whole", seed, body, windowed, cuts, len(sc.cands))
+		}
 		var want []string
 		for i := range qs {
 			pairs++

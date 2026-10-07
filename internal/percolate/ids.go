@@ -91,12 +91,158 @@ func appendLiterals(dst [][]byte, a []byte) ([][]byte, error) {
 	return dst, nil
 }
 
-// merger merges sorted runs of id literals; its buffers are reused across merges.
+// merger merges sorted runs of id literals, or of ranks; its buffers are reused across
+// merges.
 type merger struct {
 	raws      [][]byte
 	keys      []uint64
 	pos, ends []int
 	heap      []int
+	heads     []runHead
+}
+
+// rankRun is one query segment's matches of a document: ranks[start:end] of the
+// scratch, ascending, so sorted by id.
+type rankRun struct {
+	seg        *Segment
+	start, end int
+}
+
+// runHead is a run's next match while runs merge: its position, and its id and that
+// id's key.
+type runHead struct {
+	seg      *Segment
+	pos, end int
+	key      uint64
+	raw      []byte
+}
+
+// load reads the id of the match h is at.
+func (h *runHead) load(ranks []uint32) {
+	h.raw = h.seg.rawIDAt(ranks[h.pos])
+	if len(h.raw) >= 8 {
+		h.key = binary.BigEndian.Uint64(h.raw)
+	} else {
+		h.key = idKey(h.raw)
+	}
+}
+
+func (h *runHead) less(o *runHead) bool {
+	if h.key != o.key {
+		return h.key < o.key
+	}
+	return bytes.Compare(h.raw, o.raw) < 0
+}
+
+// below reports whether the id of the match at rank r of h's segment sorts before o's.
+func (h *runHead) below(r uint32, o *runHead) bool {
+	raw := h.seg.rawIDAt(r)
+	var key uint64
+	if len(raw) >= 8 {
+		key = binary.BigEndian.Uint64(raw)
+	} else {
+		key = idKey(raw)
+	}
+	if key != o.key {
+		return key < o.key
+	}
+	return bytes.Compare(raw, o.raw) < 0
+}
+
+// streak returns the first position after h's whose id does not sort before bound's
+// (h.end when every one does), galloping: a streak of k ids costs about 2 log2(k)
+// compares.
+func (h *runHead) streak(ranks []uint32, bound *runHead) int {
+	lo, step := h.pos, 1
+	var hi int
+	for {
+		hi = lo + step
+		if hi >= h.end {
+			hi = h.end
+			break
+		}
+		if !h.below(ranks[hi], bound) {
+			break
+		}
+		lo, step = hi, 2*step
+	}
+	for hi-lo > 1 {
+		mid := lo + (hi-lo)/2
+		if h.below(ranks[mid], bound) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return hi
+}
+
+// appendRanks appends to dst the JSON string literals of the ids of runs' ranks, each
+// followed by a comma, sorted: each run is sorted by id and no id is in two runs, and
+// they merge with a heap over the runs. The least run's ids below the next least
+// run's are found by galloping and copied without touching the heap, so runs that
+// interleave little (queries saved in about id order) cost a few compares per run, not
+// one per id.
+func (m *merger) appendRanks(dst []byte, ranks []uint32, runs []rankRun) []byte {
+	m.heads, m.heap = m.heads[:0], m.heap[:0]
+	for _, run := range runs {
+		if run.start < run.end {
+			h := runHead{seg: run.seg, pos: run.start, end: run.end}
+			if len(runs) > 1 {
+				h.load(ranks)
+			}
+			m.heap = append(m.heap, len(m.heads))
+			m.heads = append(m.heads, h)
+		}
+	}
+	for i := len(m.heap)/2 - 1; i >= 0; i-- {
+		m.downHead(i)
+	}
+	for len(m.heap) > 1 {
+		top := &m.heads[m.heap[0]]
+		next := m.heap[1]
+		if len(m.heap) > 2 && m.heads[m.heap[2]].less(&m.heads[next]) {
+			next = m.heap[2]
+		}
+		stop := top.streak(ranks, &m.heads[next])
+		for _, r := range ranks[top.pos:stop] {
+			dst = append(append(dst, top.seg.idAt(r)...), ',')
+		}
+		top.pos = stop
+		if stop == top.end {
+			m.heap[0] = m.heap[len(m.heap)-1]
+			m.heap = m.heap[:len(m.heap)-1]
+		} else {
+			top.load(ranks)
+		}
+		m.downHead(0)
+	}
+	if len(m.heap) == 1 {
+		h := &m.heads[m.heap[0]]
+		for _, r := range ranks[h.pos:h.end] {
+			dst = append(append(dst, h.seg.idAt(r)...), ',')
+		}
+	}
+	clear(m.heads)
+	return dst
+}
+
+func (m *merger) downHead(i int) {
+	h := m.heap
+	for {
+		c := 2*i + 1
+		if c >= len(h) {
+			return
+		}
+		if c+1 < len(h) && m.heads[h[c+1]].less(&m.heads[h[c]]) {
+			c++
+		}
+		if !m.heads[h[c]].less(&m.heads[h[i]]) {
+			return
+		}
+		h[i], h[c] = h[c], h[i]
+		i = c
+	}
 }
 
 // merge appends to dst the JSON array of the string literals lits, whose runs

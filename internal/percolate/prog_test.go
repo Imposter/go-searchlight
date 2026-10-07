@@ -217,10 +217,7 @@ func TestProductsCrossCheck(t *testing.T) {
 	}
 	matches, candidates := 0, 0
 	for _, d := range productDocs(t, productsMapping(t), 300_000, numDocs) {
-		ids, st, err := p.one(context.Background(), nil, views, &d, sc)
-		if err != nil {
-			t.Fatal(err)
-		}
+		ids, st := percolateEveryWay(t, p, views, &d, sc)
 		got := strs(t, ids)
 		var want []string
 		for i := range qs {

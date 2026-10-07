@@ -133,8 +133,8 @@ func TestCraftedFieldCountRefusedCheaply(t *testing.T) {
 }
 
 // The verifications metric counts program evaluations by verdict: a verdict memoized
-// for a class is not one, nor is a match a lone class's empty program decides (the in,
-// proven by its anchor), and misses never go negative.
+// for a class is not one, nor is a match an empty program decides (the eq and the in,
+// proven by their anchor), and misses never go negative.
 func TestVerificationsCountMatchCalls(t *testing.T) {
 	raws := []string{
 		`{"field":"brand","op":"eq","value":"acme"}`,
@@ -165,8 +165,8 @@ func TestVerificationsCountMatchCalls(t *testing.T) {
 	if want := []string{"q0", "q1", "q2"}; !slices.Equal(got, want) {
 		t.Fatalf("matches %v, want %v", got, want)
 	}
-	if st.verifiedMatch != 1 || st.verifiedMiss != 1 || st.matched != 3 {
-		t.Fatalf("programs run %d match, %d miss; %d matched; want 1, 1, 3", st.verifiedMatch, st.verifiedMiss, st.matched)
+	if st.verifiedMatch != 0 || st.verifiedMiss != 1 || st.matched != 3 {
+		t.Fatalf("programs run %d match, %d miss; %d matched; want 0, 1, 3", st.verifiedMatch, st.verifiedMiss, st.matched)
 	}
 }
 

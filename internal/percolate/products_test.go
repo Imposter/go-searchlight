@@ -174,14 +174,15 @@ func BenchmarkPercolateProductsMemory(b *testing.B) {
 // and as it did (with grams), percolation, the response (the matches copied into the
 // body, as the API writes them), and the client decoding the body into strings as
 // slbench does. It reports each stage's p50, p90 and p99 over 3000 documents, and the
-// p99 of the server's stages by how many saved searches a document matches. Run it
-// with -benchtime 1x.
+// p99 of the server's stages by how many saved searches a document matches. The
+// percolator has the default threads (GOMAXPROCS, set by -cpu), so a document splits
+// into windows as it does in a node. Run it with -benchtime 1x.
 func BenchmarkPercolateStages(b *testing.B) {
 	for _, segs := range []int{10, 3, 1} {
 		b.Run(fmt.Sprintf("segments=%d", segs), func(b *testing.B) {
 			env := newProductsEnv(b, 100_000, segs)
 			m := productsMapping(b)
-			p := New(Options{Threads: 1})
+			p := New(Options{})
 			type sample struct {
 				analyzeFull, analyze, perc, response, decode time.Duration
 				matches                                      int

@@ -93,7 +93,7 @@ type leafPlan struct {
 	every   bool
 }
 
-func compileNode(n query.Node, req uintptr) *pnode {
+func compileNode(n query.Node, req uint64) *pnode {
 	switch x := n.(type) {
 	case *query.All:
 		if x == nil {
@@ -131,7 +131,7 @@ func compileNode(n query.Node, req uintptr) *pnode {
 	}
 }
 
-func compileLeaf(l *query.Leaf, req uintptr) *leafPlan {
+func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 	lp := &leafPlan{
 		leaf: l, field: l.Field, op: l.Op, arg: l.Decoded(),
 		key:   string(query.Canonical(l)),
@@ -220,7 +220,7 @@ type usageSketch struct {
 
 type usageSlot struct {
 	count atomic.Uint32
-	last  atomic.Uintptr // the request that last counted this slot
+	last  atomic.Uint64 // the request that last counted this slot
 }
 
 const (
@@ -231,7 +231,7 @@ const (
 var leafUsage usageSketch
 
 // seen counts key once for request req and reports whether an earlier request saw it.
-func (u *usageSketch) seen(key string, req uintptr) bool {
+func (u *usageSketch) seen(key string, req uint64) bool {
 	slot := &u.slots[hashString(key)%usageSlots]
 	if slot.last.Swap(req) == req {
 		return slot.count.Load() >= 2 // this request counted it already
@@ -334,7 +334,7 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 		case query.ArgBool:
 			c = uint64(r.TermFreq(f, kindValue, boolTerm(lp.arg.Scalar.Bool)))
 		case query.ArgNumber:
-			c = s.rangeEstimate(f, lp.arg.Scalar.Number, lp.arg.Scalar.Number)
+			c = r.Numbers(f).Count(lp.arg.Scalar.Number, lp.arg.Scalar.Number, true, true)
 		}
 		if lp.op == query.OpNe {
 			return estimate{card: n - min(c, n)}
@@ -349,19 +349,16 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 			case query.ArgBool:
 				c += uint64(r.TermFreq(f, kindValue, boolTerm(sc.Bool)))
 			case query.ArgNumber:
-				c += s.rangeEstimate(f, sc.Number, sc.Number)
+				c += r.Numbers(f).Count(sc.Number, sc.Number, true, true)
 			}
 		}
 		return estimate{card: min(c, n)}
-	case query.OpLt, query.OpLte:
-		return estimate{card: s.rangeEstimate(f, negInf, lp.arg.Scalar.Number)}
-	case query.OpGt, query.OpGte:
-		return estimate{card: s.rangeEstimate(f, lp.arg.Scalar.Number, posInf)}
-	case query.OpBetween:
-		if len(lp.arg.List) == 2 {
-			return estimate{card: s.rangeEstimate(f, lp.arg.List[0].Number, lp.arg.List[1].Number)}
+	case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween:
+		b, ok := rangeOf(lp)
+		if !ok {
+			return estimate{}
 		}
-		return estimate{}
+		return estimate{card: r.Numbers(f).Count(b.lo, b.hi, b.incLo, b.incHi)}
 	case query.OpHas, query.OpHasAny, query.OpHasAll:
 		var c uint64
 		lowest := n
@@ -428,21 +425,6 @@ func (s *segExec) gramEstimate(field, needle string) uint64 {
 		lowest = min(lowest, uint64(s.r.TermFreq(field, kindGram, g)))
 	}
 	return lowest + s.r.Truncated(field).GetCardinality()
-}
-
-// rangeEstimate is how many values of field fall in [lo, hi], assuming them spread
-// evenly between the column's minimum and maximum.
-func (s *segExec) rangeEstimate(field string, lo, hi float64) uint64 {
-	st := s.r.Numbers(field).Stats()
-	if st.Count == 0 || hi < lo || hi < st.Min || lo > st.Max {
-		return 0
-	}
-	if st.Max == st.Min {
-		return uint64(st.Count)
-	}
-	lo, hi = max(lo, st.Min), min(hi, st.Max)
-	frac := (hi - lo) / (st.Max - st.Min)
-	return uint64(frac*float64(st.Count)) + 1
 }
 
 // order returns children in evaluation order: index-only children first, then by
@@ -523,7 +505,7 @@ func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 		sure, possible := scope, scope
 		for _, c := range order {
 			a := s.approximate(c, possible)
-			sure = roaring.And(sure, a.sure)
+			sure = s.within(a.sure, sure)
 			possible = a.possible()
 			if possible.IsEmpty() {
 				break
@@ -559,21 +541,18 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	}
 	if lp.useCache {
 		if bm, ok := s.cacheGet(lp); ok {
-			return approx{sure: roaring.And(bm, scope), maybe: roaring.New()}
+			return approx{sure: s.within(bm, scope), maybe: roaring.New()}
 		}
 	}
-	if pred, ok := numericPredicate(lp); ok && scope.GetCardinality() <= docValuesFactor*s.estimateLeaf(lp).card {
-		// Unless the range is far narrower than what is left in question, reading the
-		// documents' values (a few nanoseconds each) beats collecting the range's
-		// documents from the point index (Lucene's IndexOrDocValuesQuery).
-		return approx{sure: s.numericScan(lp.field, pred, scope), maybe: roaring.New()}
+	if b, ok := rangeOf(lp); ok && s.preferDocValues(lp, scope) {
+		return approx{sure: s.numericScan(lp.field, b, scope), maybe: roaring.New()}
 	}
 	c := s.candidates(lp)
 	if c.maybe == nil || c.maybe.IsEmpty() {
 		if lp.useCache {
-			return approx{sure: roaring.And(s.cachePut(lp, c.sure), scope), maybe: roaring.New()}
+			return approx{sure: s.within(s.cachePut(lp, c.sure), scope), maybe: roaring.New()}
 		}
-		return approx{sure: roaring.And(c.sure, scope), maybe: roaring.New()}
+		return approx{sure: s.within(c.sure, scope), maybe: roaring.New()}
 	}
 	if lp.useCache && 2*scope.GetCardinality() >= uint64(s.n) {
 		// Most of the segment is in question anyway: verify all of it once, and cache.
@@ -582,12 +561,21 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 		if s.err != nil {
 			return emptyApprox
 		}
-		return approx{sure: roaring.And(s.cachePut(lp, full), scope), maybe: roaring.New()}
+		return approx{sure: s.within(s.cachePut(lp, full), scope), maybe: roaring.New()}
 	}
-	sure := roaring.And(c.sure, scope)
+	sure := s.within(c.sure, scope)
 	maybe := roaring.And(c.maybe, scope)
 	maybe.AndNot(sure)
 	return approx{sure: sure, maybe: maybe}
+}
+
+// within is bm in scope, read-only: a leaf's postings or cached bitmap are used in
+// place when the scope is every document of the segment.
+func (s *segExec) within(bm, scope *roaring.Bitmap) *roaring.Bitmap {
+	if scope == s.allDocs {
+		return bm
+	}
+	return roaring.And(bm, scope)
 }
 
 // resolve returns exactly the documents of d that n matches, verifying in batches:
@@ -697,88 +685,114 @@ func boolTerm(b bool) string {
 	return "false"
 }
 
-// docValuesFactor is how much larger than a range's estimated matches the scope may
-// be for the range to be checked on doc values rather than collected from the point
-// index. A variable so tests can force either path.
-var docValuesFactor uint64 = 16
+// docValuesFactor bounds the scope a range is checked over on doc values instead of
+// collected from the point index: at most docValuesFactor times the range's matches
+// (a fraction, as collecting a match from the points costs about what reading a value
+// does, but has to visit every match, in the scope or not). A variable so tests can
+// force either path.
+var docValuesFactor = defaultDocValuesFactor
 
-// numericPredicate returns a range condition's test on a number, as candidates
-// computes its range: false when the leaf is not a range or holds nothing.
-func numericPredicate(lp *leafPlan) (func(float64) bool, bool) {
+const defaultDocValuesFactor = 0.5
+
+// cachedRangeDiscount divides docValuesFactor for a leaf the filter cache will keep:
+// its point-index bitmap is collected once and then served from the cache.
+const cachedRangeDiscount = 4
+
+// preferDocValues reports whether range leaf lp is cheaper to check over scope's values
+// than to collect from the point index: when far fewer documents are in question than
+// the range holds (Lucene's IndexOrDocValuesQuery).
+func (s *segExec) preferDocValues(lp *leafPlan, scope *roaring.Bitmap) bool {
+	limit := docValuesFactor * float64(s.estimateLeaf(lp).card)
+	if lp.useCache {
+		limit /= cachedRangeDiscount
+	}
+	return float64(scope.GetCardinality()) <= limit
+}
+
+// numBounds is a number range: [lo, hi], each end inclusive per incLo/incHi.
+type numBounds struct {
+	lo, hi       float64
+	incLo, incHi bool
+}
+
+// rangeOf returns a range condition's bounds, as candidates computes its range: false
+// when the leaf is not a range or holds nothing.
+func rangeOf(lp *leafPlan) (numBounds, bool) {
 	a := &lp.arg
 	switch lp.op {
 	case query.OpLt, query.OpLte, query.OpGt, query.OpGte:
 		if a.Kind != query.ArgNumber || !a.Scalar.Finite {
-			return nil, false
+			return numBounds{}, false
 		}
 		x := a.Scalar.Number
 		switch lp.op {
 		case query.OpLt:
-			return func(v float64) bool { return v < x }, true
+			return numBounds{lo: negInf, hi: x, incLo: true}, true
 		case query.OpLte:
-			return func(v float64) bool { return v <= x }, true
+			return numBounds{lo: negInf, hi: x, incLo: true, incHi: true}, true
 		case query.OpGt:
-			return func(v float64) bool { return v > x }, true
+			return numBounds{lo: x, hi: posInf, incHi: true}, true
 		default:
-			return func(v float64) bool { return v >= x }, true
+			return numBounds{lo: x, hi: posInf, incLo: true, incHi: true}, true
 		}
 	case query.OpBetween:
 		if a.Kind != query.ArgList || len(a.List) != 2 {
-			return nil, false
+			return numBounds{}, false
 		}
 		lo, hi := a.List[0], a.List[1]
 		if lo.Kind != query.ArgNumber || !lo.Finite || hi.Kind != query.ArgNumber || !hi.Finite || lo.Number > hi.Number {
-			return nil, false
+			return numBounds{}, false
 		}
-		return func(v float64) bool { return lo.Number <= v && v <= hi.Number }, true
+		return numBounds{lo: lo.Number, hi: hi.Number, incLo: true, incHi: true}, true
 	}
-	return nil, false
+	return numBounds{}, false
 }
 
-// scanChunk is how many ordinals one parallel task of a column scan covers.
-const scanChunk = 1 << 16
+// scanChunk is how many ordinals one parallel task of a column scan covers: one
+// roaring container. A variable so tests can split small segments.
+var scanChunk uint32 = 1 << 16
 
-// numericScan returns the documents of scope whose number holds pred.
-func (s *segExec) numericScan(field string, pred func(float64) bool, scope *roaring.Bitmap) *roaring.Bitmap {
+// numericScan returns the documents of scope whose number lies within b.
+func (s *segExec) numericScan(field string, b numBounds, scope *roaring.Bitmap) *roaring.Bitmap {
 	nc := s.r.Numbers(field)
 	if !nc.Exists() {
 		return roaring.New()
 	}
-	return s.columnScan(scope, func(d uint32) bool {
-		v, ok := nc.Value(d)
-		return ok && pred(v)
+	return s.columnScan(scope, func(docs, dst []uint32) []uint32 {
+		return nc.Filter(docs, b.lo, b.hi, b.incLo, b.incHi, dst)
 	})
 }
 
-// columnScan returns the documents of scope that keep holds, scanning stretches of
-// scanChunk ordinals in parallel on the search pool.
-func (s *segExec) columnScan(scope *roaring.Bitmap, keep func(d uint32) bool) *roaring.Bitmap {
+// columnScan returns the documents of scope that keep retains (keep appends the ones
+// of docs it retains to dst), scanning stretches of scanChunk ordinals in parallel on
+// the search pool.
+func (s *segExec) columnScan(scope *roaring.Bitmap, keep func(docs, dst []uint32) []uint32) *roaring.Bitmap {
 	if scope.IsEmpty() {
 		return roaring.New()
 	}
-	first, last := scope.Minimum(), scope.Maximum()
-	chunks := int(last/scanChunk-first/scanChunk) + 1
+	first, last := scope.Minimum()/scanChunk, scope.Maximum()/scanChunk
+	chunks := int(last-first) + 1
 	parts := make([]*roaring.Bitmap, chunks)
 	err := runParallel(chunks, func(c int) {
-		lo := (first/scanChunk + uint32(c)) * scanChunk //nolint:gosec // c < chunks
+		lo := uint64(first+uint32(c)) * uint64(scanChunk) //nolint:gosec // c < chunks
+		part := scope
+		if chunks > 1 {
+			window := roaring.New()
+			window.AddRange(lo, lo+uint64(scanChunk))
+			part = roaring.And(scope, window)
+		}
 		out := roaring.New()
-		kept := make([]uint32, 0, 256)
-		it := scope.Iterator()
-		it.AdvanceIfNeeded(lo)
-		for it.HasNext() {
-			d := it.Next()
-			if d-lo >= scanChunk {
+		buf := make([]uint32, 1024)
+		kept := make([]uint32, 0, 1024)
+		it := part.ManyIterator()
+		for {
+			n := it.NextMany(buf)
+			if n == 0 {
 				break
 			}
-			if keep(d) {
-				kept = append(kept, d)
-				if len(kept) == cap(kept) {
-					out.AddMany(kept)
-					kept = kept[:0]
-				}
-			}
+			kept = keep(buf[:n], kept[:0])
+			out.AddMany(kept)
 		}
-		out.AddMany(kept)
 		parts[c] = out
 	})
 	if err != nil {

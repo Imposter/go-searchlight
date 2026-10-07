@@ -18,7 +18,7 @@ jobs:
     name: vet and lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -26,7 +26,7 @@ jobs:
         run: go mod tidy -diff
       - name: go vet
         run: go vet ./...
-      - uses: golangci/golangci-lint-action@v8
+      - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.13.2
 
@@ -75,7 +75,7 @@ jobs:
       SEARCHLIGHT_TEST_PG_URL: postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable
       SEARCHLIGHT_TEST_MYSQL_URL: mysql://searchlight:searchlight@127.0.0.1:3306/searchlight
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -88,7 +88,7 @@ jobs:
     name: build, test -short, smoke and NTFS heavy (Windows, SQLite)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -110,7 +110,7 @@ jobs:
     name: image, compose and Kubernetes manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: compose file is valid
         run: docker compose -f deploy/compose.yml config --quiet
       # Dependabot does not track an image pinned inside a run step: bump this one by hand

@@ -2,8 +2,8 @@ package search
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
-	"math/bits"
 	"slices"
 	"time"
 
@@ -39,6 +39,11 @@ type AggPartial struct {
 	OtherDocCount int64         `json:"other_doc_count,omitempty"`
 	Stats         *StatsPartial `json:"stats,omitempty"`
 	Sketch        *Sketch       `json:"sketch,omitempty"`
+
+	// ords are a segment's partials by local ordinal (a keyword or list field's terms
+	// or cardinality, one per part of the segment collected apart), which the shard
+	// merges by global ordinal into the fields above.
+	ords []*ordPartial
 }
 
 // BucketPartial is one bucket of a partial: its key (a string, float64 or bool; a
@@ -95,12 +100,20 @@ const (
 
 // fieldSrc reads one field's values in one segment.
 type fieldSrc struct {
-	kind srcKind
-	kc   segment.KeywordColumn
-	mc   segment.MultiColumn
-	nc   segment.NumericColumn
-	t, f *roaring.Bitmap
-	// hashes memoizes each ordinal's value hash (0: not yet).
+	r     *segment.Reader
+	field string
+	seg   int
+	kind  srcKind
+	kc    segment.KeywordColumn
+	mc    segment.MultiColumn
+	nc    segment.NumericColumn
+	t, f  *roaring.Bitmap
+	// ords are the field's cached global ordinals, when a keyword or list field has
+	// them: this segment's local-to-global map, and every global ordinal's hash.
+	ords   *globalOrds
+	global []uint32
+	// hashes memoizes each local ordinal's value hash when there are no global
+	// ordinals (0: not yet).
 	hashes []uint64
 	buf    []uint32
 }
@@ -110,7 +123,7 @@ func (s *segExec) source(field string, t schema.FieldType) *fieldSrc {
 	if fs, ok := s.sources[key]; ok {
 		return fs
 	}
-	fs := &fieldSrc{}
+	fs := &fieldSrc{r: s.r, field: field, seg: s.seg}
 	switch t {
 	case schema.Keyword, schema.Text:
 		if kc := s.r.Keywords(field); kc.Exists() {
@@ -120,6 +133,13 @@ func (s *segExec) source(field string, t schema.FieldType) *fieldSrc {
 		if mc := s.r.Entries(field); mc.Exists() {
 			fs.kind, fs.mc = srcList, mc
 		}
+	}
+	if list, ok := ordKind(t); ok && (fs.kind == srcKeyword || fs.kind == srcList) {
+		if g := s.p.ords[ordField{field, list}]; g != nil {
+			fs.ords, fs.global = g, g.segs[s.seg]
+		}
+	}
+	switch t {
 	case schema.Number, schema.Date:
 		if nc := s.r.Numbers(field); nc.Exists() {
 			fs.kind, fs.nc = srcNumber, nc
@@ -149,29 +169,50 @@ func (fs *fieldSrc) boolOf(d uint32) (bool, bool) {
 	return false, false
 }
 
-func (fs *fieldSrc) ordHash(o uint32, term func(uint32) string, n uint32) uint64 {
+func (fs *fieldSrc) ordHash(o uint32) uint64 {
+	if fs.ords != nil {
+		return fs.ords.hashes[fs.global[o]]
+	}
 	if fs.hashes == nil {
-		fs.hashes = make([]uint64, n)
+		fs.hashes = make([]uint64, fs.numTerms())
 	}
 	h := fs.hashes[o]
 	if h == 0 {
-		h = hashString(term(o)) | 1 // never 0, the "not yet" mark
+		if fs.kind == srcList {
+			h = hashString(fs.mc.Term(o)) | 1
+		} else {
+			h = hashString(fs.kc.Term(o)) | 1
+		}
 		fs.hashes[o] = h
 	}
 	return h
 }
+
+// numTerms is how many terms the field's keyword or list column holds.
+func (fs *fieldSrc) numTerms() uint32 {
+	switch fs.kind {
+	case srcKeyword:
+		return fs.kc.NumTerms()
+	case srcList:
+		return fs.mc.NumTerms()
+	}
+	return 0
+}
+
+// ordinal reports whether the field counts by ordinal: a keyword or list column.
+func (fs *fieldSrc) ordinal() bool { return fs.kind == srcKeyword || fs.kind == srcList }
 
 // eachHash calls fn with the hash of each of document d's values.
 func (fs *fieldSrc) eachHash(d uint32, fn func(uint64)) {
 	switch fs.kind {
 	case srcKeyword:
 		if o, ok := fs.kc.Ord(d); ok {
-			fn(fs.ordHash(o, fs.kc.Term, fs.kc.NumTerms()))
+			fn(fs.ordHash(o))
 		}
 	case srcList:
 		fs.buf = fs.mc.Ords(d, fs.buf[:0])
 		for _, o := range fs.buf {
-			fn(fs.ordHash(o, fs.mc.Term, fs.mc.NumTerms()))
+			fn(fs.ordHash(o))
 		}
 	case srcNumber:
 		if v, ok := fs.nc.Value(d); ok {
@@ -198,13 +239,9 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 	case AggStats:
 		return &statsColl{src: src}
 	case AggCardinality:
-		c := &cardColl{src: src, sketch: NewSketch(spec.precision)}
-		if top && (src.kind == srcKeyword || src.kind == srcList) {
-			n := src.kc.NumTerms()
-			if src.kind == srcList {
-				n = src.mc.NumTerms()
-			}
-			c.seen = make([]uint64, (n+63)/64)
+		c := &cardColl{s: s, src: src, sketch: NewSketch(spec.precision)}
+		if top && src.ordinal() {
+			c.seen = make([]uint64, (src.numTerms()+63)/64)
 		}
 		return c
 	case AggTerms:
@@ -212,7 +249,16 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
 	default: // histograms
-		return &histColl{s: s, spec: spec, src: src, buckets: map[float64]*histBucket{}}
+		c := &histColl{s: s, spec: spec, src: src}
+		if src.kind == srcNumber {
+			c.b = newBucketer(spec, src.nc.Stats())
+		}
+		if c.b != nil {
+			c.slots = make([]histBucket, c.b.n)
+		} else {
+			c.buckets = map[float64]*histBucket{}
+		}
+		return c
 	}
 }
 
@@ -261,9 +307,10 @@ func (c *statsColl) partial() *AggPartial {
 }
 
 type cardColl struct {
+	s      *segExec
 	src    *fieldSrc
 	sketch *Sketch
-	seen   []uint64 // top level over ordinals: hashed once each in partial
+	seen   []uint64
 }
 
 func (c *cardColl) collect(d uint32) {
@@ -284,23 +331,64 @@ func (c *cardColl) collect(d uint32) {
 	c.src.eachHash(d, c.sketch.Add)
 }
 
+// countDense marks the ordinals of a dense hit set from the dictionary's document
+// frequencies, minus the documents not hit.
+func (c *cardColl) countDense(notHit *roaring.Bitmap) bool {
+	if c.seen == nil {
+		return false
+	}
+	counts := c.src.denseCounts(notHit)
+	for o, n := range counts {
+		if n > 0 {
+			c.seen[o/64] |= 1 << (o % 64)
+		}
+	}
+	return true
+}
+
 func (c *cardColl) partial() *AggPartial {
 	if c.seen != nil {
-		term := c.src.kc.Term
-		if c.src.kind == srcList {
-			term = c.src.mc.Term
-		}
-		for w, word := range c.seen {
-			for word != 0 {
-				b := uint32(w*64) + uint32(bits.TrailingZeros64(word)) //nolint:gosec // ordinals are uint32
-				word &= word - 1
-				c.sketch.Add(hashString(term(b)) | 1)
-			}
-		}
-		c.seen = nil
+		return &AggPartial{Type: AggCardinality, ords: []*ordPartial{{seg: c.s.seg, seen: c.seen}}}
 	}
 	c.sketch.seal()
 	return &AggPartial{Type: AggCardinality, Sketch: c.sketch}
+}
+
+// denseCounts is each local ordinal's documents among a dense hit set: its document
+// frequency, minus the documents not hit that hold it.
+func (fs *fieldSrc) denseCounts(notHit *roaring.Bitmap) []int64 {
+	counts := make([]int64, fs.numTerms())
+	if fs.ords != nil {
+		for o, df := range fs.ords.dfs[fs.seg] {
+			counts[o] = int64(df)
+		}
+	} else {
+		cur := fs.r.Cursor(fs.field, ordTermKind(fs.kind == srcList))
+		for o := 0; o < len(counts) && cur.Next(); o++ {
+			counts[o] = int64(cur.DocFreq())
+		}
+	}
+	it := notHit.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 {
+			return counts
+		}
+		for _, d := range buf[:n] {
+			switch fs.kind {
+			case srcKeyword:
+				if o, ok := fs.kc.Ord(d); ok {
+					counts[o]--
+				}
+			case srcList:
+				fs.buf = fs.mc.Ords(d, fs.buf[:0])
+				for _, o := range fs.buf {
+					counts[o]--
+				}
+			}
+		}
+	}
 }
 
 // termsColl counts documents per value.
@@ -317,11 +405,8 @@ type termsColl struct {
 func (c *termsColl) slot(o uint32) {
 	if c.counts == nil {
 		n := uint32(2)
-		switch c.src.kind {
-		case srcKeyword:
-			n = c.src.kc.NumTerms()
-		case srcList:
-			n = c.src.mc.NumTerms()
+		if c.src.ordinal() {
+			n = c.src.numTerms()
 		}
 		c.counts = make([]int64, n)
 		if len(c.spec.subs) > 0 {
@@ -386,128 +471,38 @@ func (c *termsColl) collect(d uint32) {
 // document frequencies, minus the documents not hit: cheaper than reading every hit's
 // value when most of the segment matches.
 func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
-	if len(c.spec.subs) > 0 {
+	if len(c.spec.subs) > 0 || !c.src.ordinal() {
 		return false
 	}
-	var kind segment.TermKind
-	switch c.src.kind {
-	case srcKeyword:
-		kind = kindValue
-	case srcList:
-		kind = kindEntry
-	default:
-		return false
-	}
-	n := c.src.kc.NumTerms()
-	if c.src.kind == srcList {
-		n = c.src.mc.NumTerms()
-	}
-	c.counts = make([]int64, n)
-	var o uint32
-	c.s.r.Terms(c.spec.field, kind, "", func(_ string, df uint32) bool {
-		if o < n {
-			c.counts[o] = int64(df)
-		}
-		o++
-		return true
-	})
-	it := notHit.Iterator()
-	for it.HasNext() {
-		d := it.Next()
-		switch c.src.kind {
-		case srcKeyword:
-			if o, ok := c.src.kc.Ord(d); ok {
-				c.counts[o]--
-			}
-		case srcList:
-			c.src.buf = c.src.mc.Ords(d, c.src.buf[:0])
-			for _, o := range c.src.buf {
-				c.counts[o]--
-			}
-		}
-	}
+	c.counts = c.src.denseCounts(notHit)
 	return true
 }
 
 func (c *termsColl) partial() *AggPartial {
 	p := &AggPartial{Type: AggTerms}
-	if c.src.kind == srcNumber {
+	switch {
+	case c.src.kind == srcNumber:
 		for v, b := range c.numbers {
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
-		return p
-	}
-	// The ordinals to return: every one with documents, or, when this segment is the
-	// shard's only one (so its counts are the shard's), just the shard_size best by
-	// count then ordinal, which is key order: the shard's cut, made before any term
-	// is read, so a field of unique values materializes shard_size strings, not
-	// millions. (Several segments still merge by key: global ordinals are Task 14's.)
-	ords := make([]uint32, 0, 64)
-	for o, n := range c.counts {
-		if n > 0 {
-			ords = append(ords, uint32(o))
-		}
-	}
-	if c.s.p.segments == 1 && len(ords) > c.spec.shardSize {
-		slices.SortFunc(ords, func(a, b uint32) int {
-			if c.counts[a] != c.counts[b] {
-				return int(c.counts[b] - c.counts[a])
+	case c.src.ordinal():
+		p.ords = []*ordPartial{{seg: c.s.seg, counts: c.counts, subs: c.subs}}
+	default:
+		for o, n := range c.counts {
+			if n == 0 {
+				continue
 			}
-			return int(a) - int(b)
-		})
-		for _, o := range ords[c.spec.shardSize:] {
-			p.OtherDocCount += c.counts[o]
+			var subs []collector
+			if c.subs != nil {
+				subs = c.subs[o]
+			}
+			if subs == nil && len(c.spec.subs) > 0 {
+				subs = c.s.newSubs(c.spec)
+			}
+			p.Buckets = append(p.Buckets, &BucketPartial{Key: o == 1, DocCount: n, Aggs: subPartials(c.spec, subs)})
 		}
-		ords = ords[:c.spec.shardSize]
-		p.DocCountError = c.counts[ords[len(ords)-1]]
-		slices.Sort(ords)
-	}
-	keys := c.keys(ords)
-	for i, o := range ords {
-		var subs []collector
-		if c.subs != nil {
-			subs = c.subs[o]
-		}
-		if subs == nil && len(c.spec.subs) > 0 {
-			subs = c.s.newSubs(c.spec)
-		}
-		p.Buckets = append(p.Buckets, &BucketPartial{Key: keys[i], DocCount: c.counts[o], Aggs: subPartials(c.spec, subs)})
 	}
 	return p
-}
-
-// keys returns the values of ords (ascending): a keyword column's in one walk of its
-// dictionary, each block decoded once.
-func (c *termsColl) keys(ords []uint32) []any {
-	out := make([]any, len(ords))
-	switch c.src.kind {
-	case srcKeyword:
-		k := 0
-		for k < len(ords) {
-			from := k
-			end := (ords[k]/segment.TermsPerBlock + 1) * segment.TermsPerBlock
-			c.src.kc.EachTerm(ords[k], func(o uint32, term []byte) bool {
-				if o == ords[k] {
-					out[k] = string(term)
-					k++
-				}
-				return k < len(ords) && ords[k] < end
-			})
-			if k == from {
-				out[k] = c.src.kc.Term(ords[k])
-				k++
-			}
-		}
-	case srcList:
-		for i, o := range ords {
-			out[i] = c.src.mc.Term(o)
-		}
-	default:
-		for i, o := range ords {
-			out[i] = o == 1
-		}
-	}
-	return out
 }
 
 // rangeColl counts documents per range: From inclusive, To exclusive.
@@ -538,6 +533,43 @@ func (c *rangeColl) collect(d uint32) {
 	}
 }
 
+// countDense counts a dense hit set (no sub-aggregations) from the point index: each
+// range's documents, minus the documents not hit.
+func (c *rangeColl) countDense(notHit *roaring.Bitmap) bool {
+	if len(c.spec.subs) > 0 || c.src.kind != srcNumber {
+		return false
+	}
+	nc := c.src.nc
+	for i := range c.spec.ranges {
+		r := &c.spec.ranges[i]
+		c.counts[i] = int64(nc.Count(r.from, r.to, true, false)) //nolint:gosec // at most 2^32 documents
+	}
+	eachValue(nc, notHit, func(v float64) {
+		for i := range c.spec.ranges {
+			if r := &c.spec.ranges[i]; v >= r.from && v < r.to {
+				c.counts[i]--
+			}
+		}
+	})
+	return true
+}
+
+func eachValue(nc segment.NumericColumn, docs *roaring.Bitmap, fn func(v float64)) {
+	it := docs.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 {
+			return
+		}
+		for _, d := range buf[:n] {
+			if v, ok := nc.Value(d); ok {
+				fn(v)
+			}
+		}
+	}
+}
+
 func (c *rangeColl) partial() *AggPartial {
 	p := &AggPartial{Type: AggRange}
 	for i := range c.spec.ranges {
@@ -555,17 +587,35 @@ type histBucket struct {
 	subs  []collector
 }
 
-// histColl counts documents per histogram bucket.
+// histColl counts documents per histogram bucket: by slot when the segment's values
+// span few enough buckets for a bucketer, else in a map by key.
 type histColl struct {
 	s       *segExec
 	spec    *aggSpec
 	src     *fieldSrc
+	b       *bucketer
+	slots   []histBucket
 	buckets map[float64]*histBucket
 }
 
 func (c *histColl) collect(d uint32) {
 	v, ok := c.src.number(d)
 	if !ok {
+		return
+	}
+	if c.b != nil {
+		i, ok := c.b.slot(v)
+		if !ok {
+			return
+		}
+		b := &c.slots[i]
+		b.count++
+		if len(c.spec.subs) > 0 {
+			if b.subs == nil {
+				b.subs = c.s.newSubs(c.spec)
+			}
+			collectSubs(b.subs, d)
+		}
 		return
 	}
 	key, ok := bucketKey(c.spec, v)
@@ -587,12 +637,131 @@ func (c *histColl) collect(d uint32) {
 	collectSubs(b.subs, d)
 }
 
+// countDense counts a dense hit set (no sub-aggregations) from the point index: a walk
+// of its blocks in value order, adding a block whose least and greatest values share a
+// bucket whole and reading the values of the few that straddle a bucket's edge, then
+// the documents not hit are taken off.
+func (c *histColl) countDense(notHit *roaring.Bitmap) bool {
+	if c.b == nil || len(c.spec.subs) > 0 {
+		return false
+	}
+	nc := c.src.nc
+	var docs []uint32
+	nc.EachBlock(negInf, posInf, false, func(pb segment.PointBlock) bool {
+		i, ok := c.b.slot(pb.Min)
+		j, okMax := c.b.slot(pb.Max)
+		if ok && okMax && i == j {
+			c.slots[i].count += int64(pb.Count)
+			return true
+		}
+		docs = pb.Docs(docs[:0])
+		for _, d := range docs {
+			if v, ok := nc.Value(d); ok {
+				if k, ok := c.b.slot(v); ok {
+					c.slots[k].count++
+				}
+			}
+		}
+		return true
+	})
+	eachValue(nc, notHit, func(v float64) {
+		if k, ok := c.b.slot(v); ok {
+			c.slots[k].count--
+		}
+	})
+	return true
+}
+
 func (c *histColl) partial() *AggPartial {
 	p := &AggPartial{Type: c.spec.typ}
+	for i := range c.slots {
+		if b := &c.slots[i]; b.count > 0 {
+			if b.subs == nil && len(c.spec.subs) > 0 {
+				b.subs = c.s.newSubs(c.spec)
+			}
+			p.Buckets = append(p.Buckets, &BucketPartial{Key: c.b.key(i), DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
+		}
+	}
 	for key, b := range c.buckets {
 		p.Buckets = append(p.Buckets, &BucketPartial{Key: key, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 	}
 	return p
+}
+
+// maxSlots bounds the buckets a bucketer spans: a histogram over a wider spread of
+// values collects into a map.
+const maxSlots = 4096
+
+// bucketer places one segment's values into a histogram's buckets by index: the
+// buckets between the column's least and greatest value, each value's the one
+// bucketKey gives it.
+type bucketer struct {
+	spec *aggSpec
+	// first is a fixed interval's first bucket, as a count of intervals from offset;
+	// starts are a calendar's bucket starts (milliseconds, before offset), ascending.
+	first  float64
+	starts []int64
+	n      int
+}
+
+// newBucketer returns the bucketer of spec over values within st, or nil when they
+// span more than maxSlots buckets.
+func newBucketer(spec *aggSpec, st segment.Stats) *bucketer {
+	if st.Count == 0 {
+		return nil
+	}
+	if spec.calendar == "" {
+		lo := math.Floor((st.Min - spec.offset) / spec.interval)
+		hi := math.Floor((st.Max - spec.offset) / spec.interval)
+		if !(hi-lo < maxSlots) || math.IsInf(lo, 0) {
+			return nil
+		}
+		b := &bucketer{spec: spec, first: lo, n: int(hi-lo) + 1}
+		if k := b.key(b.n - 1); math.IsInf(k, 0) || math.IsNaN(k) || math.IsInf(b.key(0), 0) {
+			return nil
+		}
+		return b
+	}
+	lo, hi := st.Min-spec.offset, st.Max-spec.offset
+	if math.Abs(lo) > maxDateMillis || math.Abs(hi) > maxDateMillis {
+		return nil
+	}
+	end := int64(math.Floor(hi))
+	b := &bucketer{spec: spec}
+	for t := calendarFloor(time.UnixMilli(int64(math.Floor(lo))).UTC(), spec.calendar); t.UnixMilli() <= end; t = calendarFloor(calendarNext(t, spec.calendar), spec.calendar) {
+		if len(b.starts) == maxSlots {
+			return nil
+		}
+		b.starts = append(b.starts, t.UnixMilli())
+	}
+	b.n = len(b.starts)
+	return b
+}
+
+// slot is v's bucket; false where bucketKey places it in none.
+func (b *bucketer) slot(v float64) (int, bool) {
+	if b.starts == nil {
+		i := math.Floor((v-b.spec.offset)/b.spec.interval) - b.first
+		if !(i >= 0 && i < float64(b.n)) {
+			return 0, false
+		}
+		return int(i), true
+	}
+	ms := v - b.spec.offset
+	if math.Abs(ms) > maxDateMillis {
+		return 0, false
+	}
+	m := int64(math.Floor(ms))
+	i := sortSearch(len(b.starts), func(i int) bool { return b.starts[i] > m }) - 1
+	return i, i >= 0
+}
+
+// key is slot i's bucket key, as bucketKey computes it.
+func (b *bucketer) key(i int) float64 {
+	if b.starts == nil {
+		return (b.first+float64(i))*b.spec.interval + b.spec.offset
+	}
+	return float64(b.starts[i]) + b.spec.offset
 }
 
 // maxDateMillis bounds the values a calendar interval buckets: JavaScript's (and
@@ -654,23 +823,30 @@ func calendarNext(t time.Time, unit string) time.Time {
 	}
 }
 
+// denseCounter is a collector that can count a dense hit set from the index (every
+// document's values) minus the documents not hit, cheaper than reading every hit's;
+// countDense reports false when it cannot (sub-aggregations, say).
+type denseCounter interface {
+	countDense(notHit *roaring.Bitmap) bool
+}
+
 // aggregate collects every aggregation over a segment's hits.
 func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 	if len(s.p.aggs) == 0 {
 		return nil
 	}
 	colls := make([]collector, len(s.p.aggs))
-	var perDoc []collector
+	var perDoc []int
 	var notHit *roaring.Bitmap
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
 	for i, spec := range s.p.aggs {
 		c := s.newCollector(spec, true)
 		colls[i] = c
-		if tc, ok := c.(*termsColl); ok && dense {
+		if dc, ok := c.(denseCounter); ok && dense {
 			if notHit == nil {
 				notHit = s.flip(hits)
 			}
-			if tc.countDense(notHit) {
+			if dc.countDense(notHit) {
 				continue
 			}
 		}
@@ -682,31 +858,116 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 			}
 			continue
 		}
-		perDoc = append(perDoc, c)
+		perDoc = append(perDoc, i)
+	}
+	out := make(map[string]*AggPartial, len(colls))
+	if len(perDoc) > 0 && hits.GetCardinality() >= aggChunkMin && hits.Maximum()/aggChunk > hits.Minimum()/aggChunk {
+		for i, p := range s.collectChunked(hits, perDoc) {
+			out[s.p.aggs[perDoc[i]].name] = p
+		}
+		perDoc = nil
 	}
 	if len(perDoc) > 0 {
-		it := hits.ManyIterator()
-		buf := make([]uint32, 512)
-		for {
-			n := it.NextMany(buf)
-			if n == 0 || s.checkCtx() {
-				break
-			}
-			for _, d := range buf[:n] {
-				for _, c := range perDoc {
-					c.collect(d)
-				}
-			}
+		cs := make([]collector, len(perDoc))
+		for j, i := range perDoc {
+			cs[j] = colls[i]
 		}
+		s.collect(hits, cs)
 	}
 	if s.err != nil {
 		return nil
 	}
-	out := make(map[string]*AggPartial, len(colls))
 	for i, spec := range s.p.aggs {
-		out[spec.name] = colls[i].partial()
+		if out[spec.name] == nil {
+			out[spec.name] = colls[i].partial()
+		}
 	}
 	return out
+}
+
+func (s *segExec) collect(docs *roaring.Bitmap, cs []collector) {
+	it := docs.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 || s.checkCtx() {
+			return
+		}
+		for _, d := range buf[:n] {
+			for _, c := range cs {
+				c.collect(d)
+			}
+		}
+	}
+}
+
+// aggChunkMin is the fewest hits a segment's per-document aggregation is split for:
+// each stretch of aggChunk ordinals is collected apart on the search pool, and the
+// parts' partials merged. Variables so tests can split small segments.
+var (
+	aggChunkMin uint64 = 1 << 15
+	aggChunk           = scanChunk
+)
+
+// collectChunked collects the aggregations specs (indexes into the request's) over
+// hits in parts, in parallel, and returns each one's partial, merged.
+func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartial {
+	first, last := hits.Minimum()/aggChunk, hits.Maximum()/aggChunk
+	chunks := int(last-first) + 1
+	parts := make([][]*AggPartial, chunks)
+	errs := make([]error, chunks)
+	err := runParallel(chunks, func(c int) {
+		lo := uint64(first+uint32(c)) * uint64(aggChunk) //nolint:gosec // c < chunks
+		window := roaring.New()
+		window.AddRange(lo, lo+uint64(aggChunk))
+		docs := roaring.And(hits, window)
+		cs := s.fork()
+		colls := make([]collector, len(specs))
+		for j, i := range specs {
+			colls[j] = cs.newCollector(s.p.aggs[i], true)
+		}
+		cs.collect(docs, colls)
+		if cs.err != nil {
+			errs[c] = cs.err
+			return
+		}
+		parts[c] = make([]*AggPartial, len(specs))
+		for j := range colls {
+			parts[c][j] = colls[j].partial()
+		}
+	})
+	if err == nil {
+		err = errors.Join(errs...)
+	}
+	if err != nil {
+		if s.err == nil {
+			s.err = err
+		}
+		return nil
+	}
+	out := make([]*AggPartial, len(specs))
+	for j, i := range specs {
+		spec := s.p.aggs[i]
+		merged := &AggPartial{Type: spec.typ}
+		for c := range parts {
+			if p := parts[c][j]; p.ords != nil {
+				merged.ords = append(merged.ords, p.ords...)
+			} else {
+				mergePartial(merged, p, spec)
+			}
+		}
+		out[j] = merged
+	}
+	return out
+}
+
+// fork is a copy of s for one part of a segment collected apart, with field sources
+// and an error of its own.
+func (s *segExec) fork() *segExec {
+	cs := *s
+	cs.sources = map[string]*fieldSrc{}
+	cs.err = nil
+	return &cs
 }
 
 // mergePartial adds src into dst (the same aggregation).

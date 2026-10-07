@@ -353,6 +353,39 @@ func (r *Reader) Terms(field string, kind TermKind, prefix string, fn func(term 
 	}
 }
 
+// TermCursor walks one field's dictionary of one kind in term order, without
+// allocating a string per term.
+type TermCursor struct {
+	it *termIter
+	n  uint32
+}
+
+// Cursor returns a cursor before the first term of field's kind dictionary: one that
+// yields nothing when the field has none.
+func (r *Reader) Cursor(field string, kind TermKind) *TermCursor {
+	if !kind.Valid() {
+		return &TermCursor{it: &termIter{}}
+	}
+	fi := r.fields[field]
+	if fi == nil || fi.dicts[kind] == nil {
+		return &TermCursor{it: &termIter{}}
+	}
+	d := fi.dicts[kind]
+	return &TermCursor{it: d.iter(0), n: d.numTerms}
+}
+
+// Len is how many terms the dictionary holds.
+func (c *TermCursor) Len() uint32 { return c.n }
+
+// Next moves to the next term, false past the last.
+func (c *TermCursor) Next() bool { return c.it.next() }
+
+// Term is the current term, valid until the next call to Next.
+func (c *TermCursor) Term() []byte { return c.it.term }
+
+// DocFreq is how many documents hold the current term.
+func (c *TermCursor) DocFreq() uint32 { return c.it.info.docFreq }
+
 // Numbers returns field's number column (a number, date or bool field; a bool is 0 or
 // 1). The zero [NumericColumn] when field has none.
 func (r *Reader) Numbers(field string) NumericColumn {

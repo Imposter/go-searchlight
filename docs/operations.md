@@ -235,6 +235,7 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
+| `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
 | `max_body_bytes` | `16MiB` | largest request body (at most 32 MiB less 1 KiB) |
 | `max_doc_bytes` | `4MiB` | largest document or saved query JSON, in a PUT or a `_bulk` line |
@@ -367,8 +368,23 @@ A node's memory is three budgets, plus the page cache:
    writes at once (one per thread it runs on). A merge of a million of the benchmark's
    products peaks at about 0.6 GiB of heap on 4 threads and 0.7 GiB on 16.
    `merge_threads` merges can run at once.
-4. **Caches and the runtime.** The filter cache, the search rank cache (up to
-   256 MiB), the generations readers hold, and Go's own overhead.
+4. **Caches and the runtime.**
+   - The filter cache.
+   - The search rank cache: up to 256 MiB, at most 64 MiB of it for one segment (a
+     segment past 16M documents rebuilds its rank array per search instead).
+   - The global-ordinals cache: up to 256 MiB. A terms aggregation or cardinality on a
+     keyword or list field over many of its terms merges the field's dictionaries
+     across a shard's segments once, and keeps that for later searches until a
+     refresh or merge changes the segment list. Its size and build time grow with the
+     field's distinct terms (about 24 bytes each, plus 8 per term per segment): a few
+     milliseconds for thousands of values, tens of milliseconds and megabytes for
+     hundreds of thousands. A search whose hits hold few of the terms builds nothing.
+   - The generations readers hold, and Go's own overhead.
+   - **The heap floor.** Segments are mapped files, so a serving node's live heap is
+     only a few megabytes, and at Go's default `GOGC` the garbage collector would run
+     every few searches and lengthen their tails. `gc_heap_floor` (64 MiB) lets the
+     heap grow to that size before a cycle starts; past twice the live heap, `GOGC` is
+     the default. Expect the heap to sit near the floor even when idle.
 5. **Segments are memory-mapped.** Their resident pages are page cache, not heap. In a
    container they count against the memory limit but are reclaimed under pressure.
    Searches stay fast while the hot segments fit in memory. The
@@ -636,6 +652,15 @@ database, and then replaying the changelog.
 `cluster: a SQLite store serves a single node; use Postgres or MySQL for a cluster` is
 expected: SQLite serves one node. If no other node is in fact running, the registration
 of the earlier one ages out after 10 s.
+
+### Heap above the live set at idle
+
+A node's heap (`go_memstats_heap_alloc_bytes`) holding tens of megabytes while its live
+set (the in-use space of a heap profile, `/debug/pprof/heap`) is a few megabytes is the
+[heap floor](#memory): the collector waits until the heap reaches `gc_heap_floor`
+(64 MiB by default) before it starts a cycle. It is not a leak. Lower the floor, set it
+to `0`, or set `GOGC`, to trade that memory back for more frequent collections and
+slower search tails. Under a tight `GOMEMLIMIT` the floor is capped at a quarter of it.
 
 ### Other messages
 

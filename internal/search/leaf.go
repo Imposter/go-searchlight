@@ -232,9 +232,13 @@ func (s *segExec) prefix(f, p string) cands {
 		return cands{sure: union(parts)}
 	default:
 		from, to := uint32(lo), uint32(hi) //nolint:gosec // both at most n
-		return cands{sure: s.columnScan(s.r.Present(f), func(d uint32) bool {
-			o, ok := kc.Ord(d)
-			return ok && o >= from && o < to
+		return cands{sure: s.columnScan(s.r.Present(f), func(docs, dst []uint32) []uint32 {
+			for _, d := range docs {
+				if o, ok := kc.Ord(d); ok && o >= from && o < to {
+					dst = append(dst, d)
+				}
+			}
+			return dst
 		})}
 	}
 }

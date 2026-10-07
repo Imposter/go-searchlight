@@ -380,7 +380,12 @@ func TestAggregationsEqualBruteForce(t *testing.T) {
 				q, raw = &query.All{}, "all"
 			}
 			aggs := map[string]Agg{"a": randomAgg(rng), "b": randomAgg(rng)}
+			if rng.IntN(2) == 0 {
+				aggChunkMin, aggChunk = 1, 1+rng.Uint32N(40) // segments collected in parts
+			}
+			globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40}) // merged by term, either, by global ordinal
 			got, err := c.search(&Request{Query: q, Aggs: aggs})
+			aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8
 			if err != nil {
 				t.Fatalf("%s %+v: %v", raw, aggs, err)
 			}

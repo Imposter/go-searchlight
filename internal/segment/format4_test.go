@@ -17,7 +17,7 @@ import (
 )
 
 // compatFixtures are the format-3 files in testdata/v3, built from compatCorpora.
-var compatFixtures = []string{"dense", "sparse", "marked"}
+var compatFixtures = []string{"dense", "sparse", "marked", "points"}
 
 func readCompatFixture(tb testing.TB, name string) []byte {
 	tb.Helper()
@@ -457,6 +457,20 @@ func craftV3PointBlockOffset(tb testing.TB) []byte {
 	return data
 }
 
+// craftShortPointBlock moves an entry from a point index's first block to its last: a
+// table no writer lays out, whose block starts are no longer the index times the block
+// size.
+func craftShortPointBlock(tb testing.TB) []byte {
+	data := buildFile(tb, genCorpus(300))
+	p := openValid(tb, data).fields["price"].numberCol.points
+	entry := func(i uint32) uint64 { return p.base + pointsHeaderLen(FormatMajor) + uint64(i)*pointsEntryLen + 16 }
+	last := p.numBlocks - 1
+	binary.LittleEndian.PutUint32(data[entry(0):], pointsBlockSize-1)
+	binary.LittleEndian.PutUint32(data[entry(last):], binary.LittleEndian.Uint32(data[entry(last):])+1)
+	fixChecksums(data)
+	return data
+}
+
 // TestCraftedFailSafelyNamed checks that the format-4 crafted files are refused at Open
 // in the section they damage, or read safely.
 func TestCraftedFailSafelyNamed(t *testing.T) {
@@ -464,11 +478,12 @@ func TestCraftedFailSafelyNamed(t *testing.T) {
 		make    func(testing.TB) []byte
 		section string // "" when the damage is found on read, not at Open
 	}{
-		"untyped bitmap":   {craftUntypedBitmap, "presence"},
-		"meta flags":       {craftMetaFlags, "meta"},
-		"stored offset":    {craftStoredOffset, "stored"},
-		"stored first ord": {craftStoredFirstOrd, "stored"},
-		"v3 point block":   {craftV3PointBlockOffset, "points"},
+		"untyped bitmap":    {craftUntypedBitmap, "presence"},
+		"meta flags":        {craftMetaFlags, "meta"},
+		"stored offset":     {craftStoredOffset, "stored"},
+		"stored first ord":  {craftStoredFirstOrd, "stored"},
+		"v3 point block":    {craftV3PointBlockOffset, "points"},
+		"short point block": {craftShortPointBlock, "points"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r, err := openData("crafted", c.make(t))

@@ -23,7 +23,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 | Sorted and paged search, p50 and p99 | ≤ Elasticsearch |
 | Aggregation latency (terms, range, histogram, stats) | ≤ Elasticsearch |
 | Percolation throughput (docs/s against 10k / 100k saved queries) | ≥ 10× Elasticsearch's percolator, with p99 per document < 1 ms server time at 100k queries (measured like Elasticsearch's took) |
-| Index size on disk and resident memory per million documents | ≤ Elasticsearch |
+| Index size on disk and resident memory per million documents | Resident memory ≤ Elasticsearch. Disk is reported, not graded: Searchlight indexes 3-grams of every keyword and text field so substring and similarity search are fast on any field, which Elasticsearch offers only on fields given an n-gram subfield (decided 2026-10-05) |
 | Write-to-visible latency | ≤ 1 s by default (the refresh interval), and `refresh=wait_for` like Elasticsearch |
 | New replica from zero to serving (10M docs) | ≤ Elasticsearch peer recovery |
 | Node restart to serving | seconds, not proportional to index size (segments are reopened, not rebuilt) |
@@ -458,4 +458,5 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | BM25 / nested documents | v2 |
 | Go | 1.25 |
 | System of record | SQL for document indexes; no embedded consensus database |
+| T6 disk | A deliberate trade-off: 3-grams on every keyword and text field cost more disk than Elasticsearch's index; the bench reports node-local disk but grades only resident memory |
 | Logs (part 2) | `stream` indexes with segments in blob storage and SQL as the metastore; Grafana via the Loki API; SLQ query language ([roadmap](2026-10-05-searchlight-part2-logs-roadmap.md)) |

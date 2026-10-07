@@ -12,8 +12,9 @@ import (
 // cannot read. Each node heartbeats the codecs it reads (store.BodyCodecs; an old
 // node's row stays at 0). The leader turns store.FeatureZstdBodies on, for good, once
 // every registered node reads them or has been silent past the fence time, DeadAfter
-// plus LeaseTTL: its leases have run out by then, so it serves and tails nothing
-// unless it comes back and claims a copy again. Nodes learn of the feature as they
+// plus LeaseTTL, and holds no copy under a live lease: leases are renewed apart from
+// heartbeats, so a node whose heartbeats stall can still be tailing. Past both it
+// serves and tails nothing unless it comes back and claims a copy again. Nodes learn of the feature as they
 // refresh their view of the registry, and from then on store document bodies
 // compressed. A node that has not learned of it yet writes text, which every node
 // reads, so the switch needs no coordination.
@@ -47,12 +48,24 @@ func (n *Node) bodyCodecGate(ctx context.Context) error {
 }
 
 // everyNodeReadsCodecs reports whether every node v registers reads compressed bodies
-// or has been silent past the fence time.
+// or has been silent past the fence time, and no node that does not read them (or
+// that v does not register) holds a copy under a live lease.
 func (n *Node) everyNodeReadsCodecs(v *view) bool {
+	reads := func(id string) bool {
+		nd, ok := v.nodes[id]
+		return ok && nd.BodyCodecs >= store.BodyCodecs
+	}
 	fence := n.opts.DeadAfter + n.opts.LeaseTTL
 	for _, nd := range v.nodes {
-		if nd.BodyCodecs < store.BodyCodecs && nd.HeartbeatAge <= fence {
+		if !reads(nd.ID) && nd.HeartbeatAge <= fence {
 			return false
+		}
+	}
+	for _, list := range v.copies {
+		for i := range list {
+			if c := &list[i]; !c.Expired() && !reads(c.NodeID) {
+				return false
+			}
 		}
 	}
 	return true

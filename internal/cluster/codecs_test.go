@@ -108,3 +108,40 @@ func bigOp(id string, v int) api.WriteOp {
 	desc := strings.Repeat(fmt.Sprintf("item %s in stock and ready to ship ", id), 20)
 	return api.WriteOp{Kind: api.OpUpsert, ID: id, Body: json.RawMessage(fmt.Sprintf(`{"title":"item %s","description":%q,"price":%d}`, id, desc, v))}
 }
+
+// TestEveryNodeReadsCodecs: the gate waits for every node without codecs to be silent
+// past the fence time and to hold no live lease (leases are renewed apart from
+// heartbeats), and counts a lease held by a node it does not register against it.
+func TestEveryNodeReadsCodecs(t *testing.T) {
+	n := &Node{opts: Options{DeadAfter: 3 * time.Second, LeaseTTL: 4 * time.Second}}
+	id := store.ShardID{Index: "i"}
+	newNode := store.Node{ID: "new", BodyCodecs: store.BodyCodecs}
+	silentOld := store.Node{ID: "old", HeartbeatAge: 8 * time.Second}
+	for _, tc := range []struct {
+		name   string
+		nodes  []store.Node
+		copies []store.Copy
+		want   bool
+	}{
+		{"every node reads codecs", []store.Node{newNode}, []store.Copy{{Shard: id, NodeID: "new", LeaseLeft: time.Second}}, true},
+		{"an old node heartbeating", []store.Node{newNode, {ID: "old", HeartbeatAge: time.Second}}, nil, false},
+		{"an old node silent past the fence", []store.Node{newNode, silentOld}, nil, true},
+		{"an old node silent but still leasing", []store.Node{newNode, silentOld}, []store.Copy{{Shard: id, NodeID: "old", LeaseLeft: time.Second}}, false},
+		{"an old node's lease at its last instant", []store.Node{newNode, silentOld}, []store.Copy{{Shard: id, NodeID: "old"}}, false},
+		{"an old node's lease run out", []store.Node{newNode, silentOld}, []store.Copy{{Shard: id, NodeID: "old", LeaseLeft: -time.Second}}, true},
+		{"a lease of an unregistered node", []store.Node{newNode}, []store.Copy{{Shard: id, NodeID: "gone", LeaseLeft: time.Second}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := &view{nodes: map[string]store.Node{}, copies: map[store.ShardID][]store.Copy{}}
+			for _, nd := range tc.nodes {
+				v.nodes[nd.ID] = nd
+			}
+			for _, c := range tc.copies {
+				v.copies[c.Shard] = append(v.copies[c.Shard], c)
+			}
+			if got := n.everyNodeReadsCodecs(v); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

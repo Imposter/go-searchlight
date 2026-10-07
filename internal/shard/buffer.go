@@ -144,7 +144,6 @@ func docBytes(id string, d *schema.Doc) int64 {
 		for _, e := range v.Entries {
 			n += int64(len(e)) + 16
 		}
-		n += int64(len(v.Grams)) * 20
 	}
 	return n
 }

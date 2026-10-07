@@ -63,6 +63,19 @@ func retryable(err error) bool {
 	return errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205)
 }
 
+// lockTimedOut reports a statement that waited past lock_wait_timeout (1205).
+func lockTimedOut(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1205
+}
+
+// alreadyApplied reports DDL that an interrupted migration had already run: a
+// duplicate column (1060), table (1050) or index name (1061).
+func alreadyApplied(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061)
+}
+
 // Config converts a store URL of the form
 // mysql://user:pass@host[:port]/db[?param=value...] into a driver config. The
 // query parameters are go-sql-driver DSN parameters (tls, timeout, ...) or

@@ -311,7 +311,7 @@ func TestElasticsearchPercolatePaging(t *testing.T) {
 	}))
 	defer srv.Close()
 	e := NewElasticsearch(ElasticsearchOptions{URL: srv.URL})
-	out, err := e.Percolate(context.Background(), "q", []json.RawMessage{json.RawMessage(`{}`), json.RawMessage(`{}`)})
+	out, _, _, err := e.Percolate(context.Background(), "q", []json.RawMessage{json.RawMessage(`{}`), json.RawMessage(`{}`)})
 	if err != nil {
 		t.Fatal(err)
 	}

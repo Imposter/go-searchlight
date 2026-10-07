@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"encoding/json"
+	"maps"
 	"math"
 	"math/big"
 	"math/rand/v2"
@@ -208,6 +209,27 @@ func TestSubstrings3(t *testing.T) {
 	for in, want := range tests {
 		if got := Substrings3(in); !slices.Equal(got, want) {
 			t.Errorf("Substrings3(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestEachGramIsSubstrings3(t *testing.T) {
+	for _, s := range []string{"", "a", "ab", "abc", "abcd", "aaaa", "café au lait", "日本語テキスト", "éte", "aÿbþc", "😀😀😀😀"} {
+		seen := map[string]bool{}
+		EachGram(s, func(w string) { seen[w] = true })
+		got := slices.Sorted(maps.Keys(seen))
+		if want := Substrings3(s); !slices.Equal(got, want) && (len(got) != 0 || len(want) != 0) {
+			t.Fatalf("%q: windows %q, Substrings3 %q", s, got, want)
+		}
+	}
+}
+
+func TestEachWord(t *testing.T) {
+	for words, want := range map[string][]string{"": nil, NoWords: nil, " a ": {"a"}, " a bb ccc ": {"a", "bb", "ccc"}, Words("Café, au-lait!"): {"café", "au", "lait"}} {
+		var got []string
+		EachWord(words, func(w string) { got = append(got, w) })
+		if !slices.Equal(got, want) {
+			t.Errorf("EachWord(%q) = %q, want %q", words, got, want)
 		}
 	}
 }

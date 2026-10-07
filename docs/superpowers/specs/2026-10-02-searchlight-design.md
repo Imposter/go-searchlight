@@ -23,7 +23,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 | Sorted and paged search, p50 and p99 | ≤ Elasticsearch |
 | Aggregation latency (terms, range, histogram, stats) | ≤ Elasticsearch |
 | Percolation throughput (docs/s against 10k / 100k saved queries) | ≥ 10× Elasticsearch's percolator, with p99 per document < 1 ms server time at 100k queries (measured like Elasticsearch's took) |
-| Index size on disk and resident memory per million documents | ≤ Elasticsearch |
+| Index size on disk and resident memory per million documents | Resident memory ≤ Elasticsearch. Disk is reported, not graded: Searchlight indexes 3-grams of every keyword and text field so substring and similarity search are fast on any field, which Elasticsearch offers only on fields given an n-gram subfield (decided 2026-10-05) |
 | Write-to-visible latency | ≤ 1 s by default (the refresh interval), and `refresh=wait_for` like Elasticsearch |
 | New replica from zero to serving (10M docs) | ≤ Elasticsearch peer recovery |
 | Node restart to serving | seconds, not proportional to index size (segments are reopened, not rebuilt) |
@@ -245,7 +245,7 @@ The percolator reverse-indexes the saved queries.
     - every id as its JSON string literal.
   - **Opening.** A segment is memory-mapped, then checked against its CRC32C and validated structurally: every offset, rank, tree link, filter and program, and every id literal against its query's id. A damaged or crafted file is refused, and no accessor of an open one reads out of range. Nothing per query is decoded onto the heap: a segment of a million queries costs its mapped pages.
 - **Ranks.** Within a segment, everything percolation reads is numbered by rank, a query's position sorted by id: postings, filters, pairs, intervals, the always list, programs and id literals. Candidates verified in rank order read the segment front to back and match in output order. Records stay numbered by the ordinal the shard deletes and merges by.
-- **Verification classes and memo.** Queries whose canonical form is the same share a class: one program, verified once per document, with the verdict memoized for the rest. A `words_*` query's class is its exact JSON, because phrases are read as written. Queries proven on different leaves are in different classes. Open keeps a dense copy of every query's class, which also marks a class of one query whose program is empty: such a candidate matches, and a memoized class's members are decided, without their records being read.
+- **Verification classes and memo.** Queries whose canonical form is the same share a class: one program, verified once per document, with the verdict memoized for the rest. A `words_*` query's class is its exact JSON, because phrases are read as written. Queries proven on different leaves are in different classes. Open keeps a dense copy of every query's class, which also marks every query whose class's program is empty: such a candidate matches, and a memoized class's members are decided, without their records being read.
 - **Programs.** Each class's query is compiled at build time into a compact byte program that names fields by their index in the segment. It mirrors the matcher exactly: the same constant folding, the same reading of every value, children cheapest first. Verification evaluates it over a dense slice of the document's values, laid out once per segment: one map lookup per field, none per candidate.
 - **Proven conditions.** A condition at a query's root (a leaf, or the `not` of one) that every route to its candidacy implies holds on every candidate, so the program leaves it out. A route is a term it is anchored on (with its posting filter), or a range anchor. For example, `brand eq + price lte` with its price filter verifies nothing, and neither does `brand in + not condition eq used` with its text filter.
 - **Gram prefilter.** Each field with gram terms has a bit filter of them, 16 bits per term (512 bits to 64 Mbit). A window whose bit is clear skips the dictionary.
@@ -254,13 +254,14 @@ The percolator reverse-indexes the saved queries.
   2. In each query segment, lay out the document's values by field index. Probe with its atoms: values, entries, words, every 3-character window of the whole text, trigram keys, `present` keys and numbers. Atoms are never truncated or sampled. A filtered posting adds its query only if its filter passes.
   3. Add the always-check list.
   4. Verify each candidate, in rank order, with its class's program.
-  5. Each segment's matches are a run sorted by id. The runs are merged (a heap over the segments) straight into the JSON array of ids, which the response copies as it is.
+  5. Each segment's matches are a run of ranks, so sorted by id. The runs are merged (a heap over the segments; the least run's ids below the next least run's are found by galloping and copied in one go) straight into the JSON array of ids, which the response copies as it is.
+- **One document on several cores.** A request percolating fewer documents than there are threads gives each document an equal share of them as workers, when each worker gets at least 16k saved queries and the workers of the documents already being split on the node (one count its percolators share) leave room on the threads. The document's queries are cut by id into two windows per worker: the pivots are quantiles of ids sampled from every query segment in proportion to its size, and a window holds, in every segment, the ranks whose ids lie between two pivots. Workers take the windows in turn; each runs steps 2 to 5 on its window alone (postings, filtered postings, intervals, pairs and the always-check list are cut to it). Windows hold disjoint id ranges in order, so their arrays concatenate into the answer. The plan is computed once per set of query segment files.
 - **Batches.** `_bulk?percolate=true` and `_percolate` with many documents process documents in parallel.
 - **Format upgrade.** A copy whose query segments are in an older format (`percolate/2`) does not open (`ErrOlderFormat`). The node wipes it and rebuilds it from a peer or the database, and the new segments are `percolate/3`. A binary rolled back to `percolate/2` refuses a `percolate/3` copy (`ErrNewerFormat`) and leaves its files as they are.
 - **Completeness guarantee.** A failure of any of these tests blocks release:
   - A property test checks that the candidates always include every true match, and that the answer equals brute force with `query.Match`.
   - A second checks every program against `query.Compile(...).Match` over random queries and documents, non-candidates included.
-  - Cross-checks run the benchmark's shapes and adversarial root conjunctions through segments with deletes, and scrape-bot's parity fixtures through the percolator.
+  - Cross-checks run the benchmark's shapes and adversarial root conjunctions through segments with deletes, whole and split into windows, and scrape-bot's parity fixtures through the percolator.
 - **Where the p99 target is measured** (operator decision, 2026-10-05). The < 1 ms p99 per document at 100k queries (§1) is server time, measured the way Elasticsearch's `took` is: from the request's admission to the last byte of its answer encoded. It covers analysis, matching and encoding, and leaves out the network and the client's decoding. `_percolate` reports it as `took_us` (and `took_ms`, and a `Server-Timing` header). The benchmark reads each engine's own server time the same way.
 
 ## 8. Storage (SQL)
@@ -287,16 +288,17 @@ The logical schema is the same in every dialect.
 | Table | Columns |
 |---|---|
 | `sl_indexes` | name, mapping, settings |
-| `sl_documents` | index, shard, id, body, seq |
+| `sl_documents` | index, shard, id, body, body_z, seq |
 | `sl_queries` | index, shard, id, query, meta, seq |
-| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, at; index on (index, shard, seq) |
+| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at; index on (index, shard, seq) |
 | `sl_counter` | the sequence row, locked per `Apply` |
-| `sl_nodes` | node_id, address, version, heartbeat_at, capacity |
+| `sl_nodes` | node_id, address, version, heartbeat_at, capacity, body_codecs |
+| `sl_features` | name, enabled_at: cluster features turned on for good (`zstd_bodies`) |
 | `sl_shard_copies` | index, shard, node_id, state (`recovering` / `serving` / `retiring`), applied_seq, lease_until |
 | `sl_blobs` | optional segment bundles for recovery without a peer |
 
 - **Write ordering.** `Apply` locks the counter row, takes contiguous `seq` values and commits. Visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: concurrent requests on a coordinator are coalesced into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs.
-- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). JSON is stored as text and no dialect JSON functions are used.
+- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
 - **Drivers:** `pgx/v5/stdlib`, `go-sql-driver/mysql`, `modernc.org/sqlite`.
 - **Supported versions:** Postgres (tested on 17), MySQL 8.0.19+ (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default), SQLite 3.35+ (bundled by modernc.org/sqlite).
 - **Migrations** are embedded and run under a lock.
@@ -458,4 +460,5 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | BM25 / nested documents | v2 |
 | Go | 1.25 |
 | System of record | SQL for document indexes; no embedded consensus database |
+| T6 disk | A deliberate trade-off: 3-grams on every keyword and text field cost more disk than Elasticsearch's index; the bench reports node-local disk but grades only resident memory |
 | Logs (part 2) | `stream` indexes with segments in blob storage and SQL as the metastore; Grafana via the Loki API; SLQ query language ([roadmap](2026-10-05-searchlight-part2-logs-roadmap.md)) |

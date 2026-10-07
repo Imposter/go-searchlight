@@ -54,13 +54,15 @@ type Store interface {
 
 	// ChangesAfter returns up to limit changes of shard with seq > seq, in
 	// seq order (limit <= 0 means DefaultChangesLimit). It returns ErrPruned
-	// when some of those changes have been pruned.
+	// when some of those changes have been pruned, and a *CorruptError, with the
+	// changes before it, at a change whose payload does not decode.
 	ChangesAfter(ctx context.Context, shard ShardID, seq int64, limit int) ([]Change, error)
 
 	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
 	// the index does not exist), then every document and every saved query of
 	// shard, from one consistent snapshot, and returns the seq that snapshot
-	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact.
+	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact. A
+	// document whose body does not decode ends the scan with a *CorruptError.
 	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
 
 	// HeadSeq returns the newest committed seq across every shard (0 before
@@ -85,6 +87,12 @@ type Store interface {
 	// calls that would need them return ErrPruned. The caller keeps belowSeq
 	// behind every live copy's applied seq (spec §9).
 	Prune(ctx context.Context, shard ShardID, belowSeq int64) error
+
+	// CompressBodies sets whether Apply stores document bodies compressed from now
+	// on: only once FeatureZstdBodies is on, since nodes from before codecs read
+	// the text column alone. Off (the default), bodies are stored as text. Either
+	// way every read takes both forms.
+	CompressBodies(on bool)
 
 	// Ping checks the database is reachable.
 	Ping(ctx context.Context) error
@@ -113,6 +121,12 @@ type RegistryStore interface {
 	RemoveNode(ctx context.Context, nodeID string) error
 	// Nodes lists every registered node, live or not.
 	Nodes(ctx context.Context) ([]Node, error)
+	// Features returns the cluster's feature flags (sl_features) that are on,
+	// with when each was turned on, by the database clock.
+	Features(ctx context.Context) (map[string]time.Time, error)
+	// EnableFeature turns a feature flag on, for good; it is a no-op when the
+	// flag is on already.
+	EnableFeature(ctx context.Context, name string) error
 
 	// ClaimCopy gives nodeID a copy of shard when the shard has fewer than
 	// target live copies: it takes a free slot below target, or steals one

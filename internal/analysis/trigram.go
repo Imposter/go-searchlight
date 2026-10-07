@@ -201,3 +201,18 @@ func Substrings3(s string) []string {
 	slices.Sort(out)
 	return slices.Compact(out)
 }
+
+// EachGram calls fn with every 3-rune window of s in order, repeats included: the
+// grams [Substrings3] sorts and dedupes, without allocating.
+func EachGram(s string, fn func(gram string)) {
+	a, b, c := -1, -1, -1
+	for i := range s {
+		if a >= 0 {
+			fn(s[a:i])
+		}
+		a, b, c = b, c, i
+	}
+	if a >= 0 {
+		fn(s[a:])
+	}
+}

@@ -238,6 +238,9 @@ type Node struct {
 	Address  string
 	Version  string
 	Capacity int
+	// BodyCodecs is the stored-body codecs the node reads ([BodyCodecs]); 0 for a
+	// node from before codecs, whose heartbeat leaves the column at its default.
+	BodyCodecs int
 	// HeartbeatAt is the last heartbeat by the database clock, and
 	// HeartbeatAge how long ago that was, also by the database clock, so a
 	// caller judges liveness without comparing clocks.
@@ -317,7 +320,28 @@ var (
 	// racing the server's own decision): the blob may or may not have been
 	// replaced. The caller should Stat or Get to find out.
 	ErrAmbiguousCommit = errors.New("store: blob commit outcome is unknown")
+	// ErrCorrupt is returned when a stored document body or change payload does not
+	// decode (damaged, or written by a codec this binary does not know). Reads
+	// return a *CorruptError, which matches it.
+	ErrCorrupt = errors.New("store: stored body is corrupt")
 )
+
+// CorruptError names the record whose stored body does not decode: the change at
+// Seq (ChangesAfter) or the document ID at its Seq (ScanShard, GetRecord). Writing
+// the document again replaces the row.
+type CorruptError struct {
+	Shard ShardID
+	Seq   int64
+	ID    string
+	Err   error
+}
+
+func (e *CorruptError) Error() string {
+	return fmt.Sprintf("store: %s %q at seq %d: %v", e.Shard, e.ID, e.Seq, e.Err)
+}
+
+// Unwrap returns ErrCorrupt and the reason.
+func (e *CorruptError) Unwrap() []error { return []error{ErrCorrupt, e.Err} }
 
 // ConflictError is returned by Apply when changes' IfSeq conditions fail.
 // Nothing in the batch was applied.

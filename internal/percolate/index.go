@@ -93,9 +93,10 @@ import (
 //
 // Built at Open from the validated file: each field's gram prefilter, a bit filter of
 // its gram terms at 16 bits per term (a document's window whose bit is clear has no
-// entry, so skips the table), and a dense copy of every rank's class, which also marks
-// the ranks alone in their class with an empty program (a candidate there matches
-// without its verify record read; a memoized class's members are not read either).
+// entry, so skips the table), a dense copy of every rank's class, which also marks the
+// ranks whose class's program is empty (a candidate there matches without its verify
+// record read; a memoized class's members are not read either), and whether any id
+// literal is escaped (when none is, an id is read in place).
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.
@@ -769,7 +770,8 @@ type Segment struct {
 	byLo      []byte
 	byHi      []byte
 
-	classes []uint32
+	classes    []uint32
+	anyEscaped bool
 
 	mapped *mapping
 }
@@ -885,12 +887,13 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if err := s.checkRanks(); err != nil {
 		return nil, corrupt("%v", err)
 	}
+	s.anyEscaped = bytes.IndexByte(s.idText, '\\') >= 0
 	s.buildGramFilters()
 	s.classes = make([]uint32, s.n)
 	for r := range s.n {
 		o := verifySize * int(r)
 		s.classes[r] = u32(s.verifies, o)
-		if s.classes[r] == noClass && u32(s.verifies, o+4) == 0 {
+		if u32(s.verifies, o+4) == 0 {
 			s.classes[r] = trivialClass
 		}
 	}
@@ -1134,6 +1137,9 @@ func (s *Segment) ordAt(r uint32) uint32 { return u32(s.ids, idSize*int(r)) }
 // escaped).
 func (s *Segment) rawIDAt(r uint32) []byte {
 	lit := s.idAt(r)
+	if !s.anyEscaped {
+		return lit[1 : len(lit)-1]
+	}
 	if raw, ok := plainID(lit); ok {
 		return raw
 	}
@@ -1195,12 +1201,6 @@ func (s *Segment) Close() error {
 // class returns the first rank of rank r's verification class, noClass when no other
 // query shares it.
 func (s *Segment) class(r uint32) uint32 { return u32(s.verifies, verifySize*int(r)) }
-
-// verdictClass returns the first rank of rank r's verification class, noClass when no
-// other query shares it, or trivialClass when it also holds (an empty program), from
-// the dense copy Open makes, so that a candidate's verify record is read only when its
-// program must run.
-func (s *Segment) verdictClass(r uint32) uint32 { return s.classes[r] }
 
 // program returns rank r's class's program (empty: it holds).
 func (s *Segment) program(r uint32) []byte {

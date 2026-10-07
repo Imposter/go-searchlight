@@ -77,18 +77,27 @@ func TestAnalyzeGrams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v := doc.Fields["k"]; v.GramsTruncated || len(v.Grams) != 2 {
-		t.Errorf("%d characters: grams %q, truncated %v", MaxGramChars, v.Grams, v.GramsTruncated)
+	if v := doc.Fields["k"]; v.GramsTruncated || !v.Grams {
+		t.Errorf("%d characters: grams %v, truncated %v", MaxGramChars, v.Grams, v.GramsTruncated)
 	}
-	if id := doc.Fields[IDField]; id.Grams != nil || id.GramsTruncated {
-		t.Errorf("_id has grams %q", id.Grams)
+	if id := doc.Fields[IDField]; id.Grams || id.GramsTruncated {
+		t.Error("_id has grams")
 	}
 	doc, _, err = Analyze(m, "d", object(t, "k", atCap+"c"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v := doc.Fields["k"]; !v.GramsTruncated || v.Grams != nil || v.Text == nil {
-		t.Errorf("%d characters: grams %d, truncated %v", MaxGramChars+1, len(v.Grams), v.GramsTruncated)
+	if v := doc.Fields["k"]; !v.GramsTruncated || v.Grams || v.Text == nil {
+		t.Errorf("%d characters: grams %v, truncated %v", MaxGramChars+1, v.Grams, v.GramsTruncated)
+	}
+	for text, want := range map[string]bool{"ab": false, "abc": true, "日本語": true} {
+		doc, _, err = Analyze(m, "d", object(t, "k", text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := doc.Fields["k"].Grams; got != want {
+			t.Errorf("%q: grams %v, want %v", text, got, want)
+		}
 	}
 }
 

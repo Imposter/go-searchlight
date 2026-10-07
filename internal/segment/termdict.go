@@ -41,11 +41,10 @@ import (
 // Open already knows: it is where it started parsing, termDict.base), and that block's
 // postings start is "this many bytes before the block" (which blockFor/blockOff already
 // computed to find the block at all). Every one of those distances is translation
-// invariant - unaffected by where either endpoint ends up in the final file - so a
-// field's dictionary (every kind of it: value, entry, word and gram share one write
-// pass and one buffer) can be built complete, in its own private buffer, independently
-// of and in parallel with every other field's, and nothing about where that buffer (or
-// even where this one dictionary within it) ends up concatenated needs to be known
+// invariant - unaffected by where either endpoint ends up in the final file - so each
+// dictionary (each of a field's value, entry, word and gram dictionaries) can be built
+// complete, in its own private buffer, independently of and in parallel with every
+// other, and nothing about where that buffer ends up concatenated needs to be known
 // until the moment it is, which is also the only moment META's one offset per
 // dictionary (resolved once, in Reader.parseMeta, from the TERMS section's own absolute
 // start in the footer plus META's section-relative dictOff) is filled in.

@@ -14,7 +14,6 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -354,6 +353,11 @@ func TestIntervalTreeStabbing(t *testing.T) {
 		sc := new(scratch)
 		sc.fit(uint32(n), 0, 0)
 		for x := -2.0; x <= 102; x += 0.5 {
+			sc.lo, sc.hi = 0, uint32(n)
+			if r.IntN(2) == 0 {
+				sc.lo, sc.hi = uint32(r.IntN(n+1)), uint32(r.IntN(n+1))
+				sc.lo, sc.hi = min(sc.lo, sc.hi), max(sc.lo, sc.hi)
+			}
 			if root >= 0 {
 				seg.stab(root, x, sc)
 			}
@@ -361,7 +365,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			slices.Sort(got)
 			var want []uint32
 			for _, iv := range ivs {
-				if iv.lo <= x && x <= iv.hi {
+				if iv.lo <= x && x <= iv.hi && sc.lo <= iv.rank && iv.rank < sc.hi {
 					want = append(want, iv.rank)
 				}
 			}
@@ -378,23 +382,6 @@ func treeDepth(nodes []treeNode, at int32) int {
 		return 0
 	}
 	return 1 + max(treeDepth(nodes, nodes[at].left), treeDepth(nodes, nodes[at].right))
-}
-
-func TestEachWindowIsSubstrings3(t *testing.T) {
-	for _, s := range []string{"", "a", "ab", "abc", "abcd", "aaaa", "café au lait", "日本語テキスト", "éte", "a\xffb\xfec", "😀😀😀😀"} {
-		seen := map[string]bool{}
-		eachWindow(s, func(w string) { seen[w] = true })
-		got := slices.Sorted(func(yield func(string) bool) {
-			for w := range seen {
-				if !yield(w) {
-					return
-				}
-			}
-		})
-		if want := analysis.Substrings3(s); !slices.Equal(got, want) && (len(got) != 0 || len(want) != 0) {
-			t.Fatalf("%q: windows %q, Substrings3 %q", s, got, want)
-		}
-	}
 }
 
 func TestHashKeyIsHashTerm(t *testing.T) {

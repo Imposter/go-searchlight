@@ -61,6 +61,12 @@ func retryable(err error) bool {
 	return errors.As(err, &pe) && (pe.Code == "40001" || pe.Code == "40P01")
 }
 
+// lockTimedOut reports a statement that waited past lock_timeout (55P03).
+func lockTimedOut(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "55P03"
+}
+
 // Config parses a postgres:// or postgresql:// store URL into a pgx
 // connection config. Query parameters are libpq's (sslmode, ...) or runtime
 // parameters such as search_path.

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	stdbits "math/bits"
 	"slices"
+	"sort"
 	"unsafe"
 
 	"github.com/Imposter/go-searchlight/internal/analysis"
@@ -19,9 +20,12 @@ import (
 //   - a verdict per verification class (memoMatch or memoMiss), and the classes set;
 //   - the document's values of the segment's fields, by field index, which programs
 //     read, and each field's trigram keys once a similar condition has needed them;
-//   - the matching ids so far, JSON string literals viewing the segments, in runs
-//     sorted by id (unsorted when a run is not), and the buffers results merges into;
-//   - the pair members the document holds (see probePairs).
+//   - the matches so far: per query segment a run of ranks (in id order), and the
+//     literals of the ids a brute-force check matched (in no order), and the buffers
+//     results merges them into;
+//   - the pair members the document holds (see probePairs);
+//   - the window of ranks [lo, hi) of the segment being percolated: collect adds only
+//     candidates in it, so that one document's work splits into windows.
 type scratch struct {
 	bits     []uint64
 	cands    []uint32
@@ -33,15 +37,16 @@ type scratch struct {
 	simDone  []bool
 	simSet   []int
 	want     []uint64
-	hits     [][]byte
-	runs     []int
-	unsorted bool
+	ranks    []uint32
+	runs     []rankRun
+	lits     [][]byte
 	buf      []byte
 	merger   merger
 	held     []uint32
 	heldBits []uint64
 	pairOps  int
 	key      []byte
+	lo, hi   uint32
 }
 
 const (
@@ -68,6 +73,13 @@ func (s *scratch) fit(n, entries uint32, fields int) {
 	}
 }
 
+// addIn adds rank r when it lies in the window.
+func (s *scratch) addIn(r uint32) {
+	if r-s.lo < s.hi-s.lo {
+		s.add(r)
+	}
+}
+
 func (s *scratch) add(ord uint32) {
 	w, bit := ord>>6, uint64(1)<<(ord&63)
 	if s.bits[w]&bit == 0 {
@@ -76,25 +88,44 @@ func (s *scratch) add(ord uint32) {
 	}
 }
 
-// addPosts adds every rank of a postings list (little-endian u32s).
+// addPosts adds every rank of a postings list (ascending little-endian u32s) in the
+// window.
 func (s *scratch) addPosts(posts []byte) {
-	for i := 0; i+4 <= len(posts); i += 4 {
-		s.add(binary.LittleEndian.Uint32(posts[i:]))
+	i := 0
+	if s.lo > 0 {
+		i = 4 * sort.Search(len(posts)/4, func(j int) bool { return binary.LittleEndian.Uint32(posts[4*j:]) >= s.lo })
+	}
+	for ; i+4 <= len(posts); i += 4 {
+		r := binary.LittleEndian.Uint32(posts[i:])
+		if r >= s.hi {
+			return
+		}
+		s.add(r)
 	}
 }
 
-// addEntry adds dictionary entry e's queries (none for -1): its postings, and its
-// filtered postings whose filter the document's values pass.
+// addEntry adds dictionary entry e's queries in the window (none for -1): its
+// postings, and its filtered postings whose filter the document's values pass.
 func (s *scratch) addEntry(seg *Segment, e int) {
 	if e < 0 {
 		return
 	}
 	s.addPosts(seg.posts(e))
 	recs := seg.filteredOf(e)
-	for r := 0; r+filteredSize <= len(recs); r += filteredSize {
+	r := 0
+	if s.lo > 0 {
+		r = filteredSize * sort.Search(len(recs)/filteredSize, func(j int) bool {
+			return binary.LittleEndian.Uint32(recs[filteredSize*j:]) >= s.lo
+		})
+	}
+	for ; r+filteredSize <= len(recs); r += filteredSize {
+		rank := binary.LittleEndian.Uint32(recs[r:])
+		if rank >= s.hi {
+			return
+		}
 		fb := binary.LittleEndian.Uint32(recs[r+4:])
 		if passes(&s.vals[fb>>2], uint8(fb&3), recs[r+8:r+filteredSize]) {
-			s.add(binary.LittleEndian.Uint32(recs[r:]))
+			s.add(rank)
 		}
 	}
 }
@@ -138,20 +169,23 @@ func (s *scratch) reset() {
 
 // inOrder puts the candidates in ascending order, so verification reads the segment's
 // per-query records and programs front to back: by sorting a few, or by reading many
-// back from the bitmap (words long).
-func (s *scratch) inOrder(words int) {
-	if len(s.cands)*16 < words {
+// back from the window's part of the bitmap.
+func (s *scratch) inOrder() {
+	first, end := s.lo>>6, (s.hi+63)>>6
+	if len(s.cands)*16 < int(end-first) {
 		slices.Sort(s.cands)
 		return
 	}
-	s.cands = appendSet(s.cands[:0], s.bits[:words])
+	s.cands = appendSet(s.cands[:0], s.bits[first:end], first)
 }
 
-// appendSet appends the positions of bits' set bits, in order.
-func appendSet(dst []uint32, bits []uint64) []uint32 {
+// appendSet appends the positions of bits' set bits, in order, bits being the words
+// of the bitmap from word first on.
+func appendSet(dst []uint32, bits []uint64, first uint32) []uint32 {
 	for w, word := range bits {
+		base := (first + uint32(w)) << 6
 		for word != 0 {
-			dst = append(dst, uint32(w)<<6|uint32(stdbits.TrailingZeros64(word))) //nolint:gosec // a bit position within a u32 range
+			dst = append(dst, base|uint32(stdbits.TrailingZeros64(word))) //nolint:gosec // a bit position within a word
 			word &= word - 1
 		}
 	}
@@ -162,7 +196,11 @@ func appendSet(dst []uint32, bits []uint64) []uint32 {
 // anchored on an atom d holds, and the always-check list. sc must be fit to the
 // segment and empty. The atoms are read exactly where the matcher reads them (see
 // [AtomKind]), only for the kinds of atoms the segment has terms of on each field.
-func (s *Segment) collect(d *schema.Doc, sc *scratch) {
+func (s *Segment) collect(d *schema.Doc, sc *scratch) { s.collectIn(d, sc, 0, s.n) }
+
+// collectIn is collect of the queries whose ranks lie in [lo, hi) alone.
+func (s *Segment) collectIn(d *schema.Doc, sc *scratch, lo, hi uint32) {
+	sc.lo, sc.hi = lo, hi
 	for fi := range s.fields {
 		sc.vals[fi] = d.Fields[s.fields[fi].name]
 	}
@@ -277,7 +315,7 @@ func (s *Segment) stab(root int32, x float64, sc *scratch) {
 				if f64(s.byLo, p) > x {
 					break
 				}
-				sc.add(u32(s.byLo, p+16))
+				sc.addIn(u32(s.byLo, p+16))
 			}
 			nd = signed(u32(s.nodes, o+8))
 		case x > center:
@@ -286,46 +324,52 @@ func (s *Segment) stab(root int32, x float64, sc *scratch) {
 				if f64(s.byHi, p+8) < x {
 					break
 				}
-				sc.add(u32(s.byHi, p+16))
+				sc.addIn(u32(s.byHi, p+16))
 			}
 			nd = signed(u32(s.nodes, o+12))
 		default:
 			for r := start; r < start+count; r++ {
-				sc.add(u32(s.byLo, r*recordSize+16))
+				sc.addIn(u32(s.byLo, r*recordSize+16))
 			}
 			return
 		}
 	}
 }
 
-// run marks the hits from start on as one run sorted by id (none if empty).
-func (s *scratch) run(start int) {
-	if start < len(s.hits) {
-		s.runs = append(s.runs, start)
+// endRun records the ranks from start on as seg's run of matches (none if empty).
+func (s *scratch) endRun(seg *Segment, start int) {
+	if start < len(s.ranks) {
+		s.runs = append(s.runs, rankRun{seg: seg, start: start, end: len(s.ranks)})
 	}
 }
 
-// results returns the document's hits as one JSON array (nil for none), the runs
-// merged (or all sorted, when one is not), and clears the hits.
+// results returns the document's matches as one JSON array sorted by id (nil for
+// none), and clears them.
 func (s *scratch) results() IDs {
-	if len(s.hits) == 0 {
+	switch {
+	case len(s.ranks) == 0 && len(s.lits) == 0:
 		s.clearHits()
 		return nil
+	case len(s.lits) > 0:
+		for _, run := range s.runs {
+			for _, r := range s.ranks[run.start:run.end] {
+				s.lits = append(s.lits, run.seg.idAt(r))
+			}
+		}
+		slices.SortFunc(s.lits, idCompare)
+		s.buf = s.merger.merge(s.buf[:0], s.lits, nil, false)
+	default:
+		s.buf = s.merger.appendRanks(append(s.buf[:0], '['), s.ranks, s.runs)
+		s.buf[len(s.buf)-1] = ']'
 	}
-	if s.unsorted {
-		slices.SortFunc(s.hits, idCompare)
-		s.runs = append(s.runs[:0], 0)
-	}
-	s.buf = s.merger.merge(s.buf[:0], s.hits, s.runs, false)
 	s.clearHits()
 	return IDs(bytes.Clone(s.buf))
 }
 
-// clearHits drops the hits (views into segments, not kept past the call).
+// clearHits drops the matches (views into segments, not kept past the call).
 func (s *scratch) clearHits() {
-	clear(s.hits)
-	s.hits = s.hits[:0]
-	s.runs, s.unsorted = s.runs[:0], false
+	clear(s.lits)
+	s.lits, s.ranks, s.runs = s.lits[:0], s.ranks[:0], s.runs[:0]
 }
 
 // Pair probing limits (variables so tests can force each path). A document walks the

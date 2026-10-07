@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 	if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "wal", Mapping: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(fmt.Sprintf(`{"pad":%q}`, strings.Repeat("x", 4000)))
+	body := []byte(fmt.Sprintf(`{"pad":%q}`, noise(4000)))
 	burst := make([]Change, 6000)
 	for i := range burst {
 		burst[i] = Change{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("b%d", i), Payload: body}
@@ -98,7 +99,7 @@ func TestPinnedLogWarns(t *testing.T) {
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sl_indexes").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	body := []byte(fmt.Sprintf(`{"pad":%q}`, strings.Repeat("x", 4000)))
+	body := []byte(fmt.Sprintf(`{"pad":%q}`, noise(4000)))
 	for b := range 3 {
 		batch := make([]Change, 1000)
 		for i := range batch {
@@ -148,4 +149,16 @@ func (h *captureHandler) has(prefix string) bool {
 		}
 	}
 	return false
+}
+
+// noise is n characters a compressor cannot shrink by much, for bodies that must take
+// their size in the store.
+func noise(n int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	r := rand.New(rand.NewPCG(uint64(n), 1))
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alphabet[r.IntN(len(alphabet))]
+	}
+	return string(b)
 }

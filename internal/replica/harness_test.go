@@ -285,6 +285,9 @@ type faultStore struct {
 	always    map[string]bool
 	onRecord  func(ctx context.Context, n int, r store.Record) error
 	onChanges func(ctx context.Context, seq int64) error
+	// corrupt, when set, says which changes read back damaged: ChangesAfter returns
+	// the ones before the first such change with its *store.CorruptError.
+	corrupt func(c *store.Change) bool
 }
 
 func newFaultStore(st store.Store) *faultStore {
@@ -335,7 +338,16 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 			return nil, err
 		}
 	}
-	return f.Store.ChangesAfter(ctx, id, seq, limit)
+	page, err := f.Store.ChangesAfter(ctx, id, seq, limit)
+	f.mu.Lock()
+	corrupt := f.corrupt
+	f.mu.Unlock()
+	for i := range page {
+		if corrupt != nil && corrupt(&page[i]) {
+			return page[:i], &store.CorruptError{Shard: id, Seq: page[i].Seq, ID: page[i].ID, Err: errInjected}
+		}
+	}
+	return page, err
 }
 
 func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {

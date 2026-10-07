@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/bench/es"
@@ -213,7 +214,8 @@ func (e *Elasticsearch) BulkPercolate(ctx context.Context, index string, docs []
 	for i, d := range docs {
 		bodies[i] = d.Body
 	}
-	return e.Percolate(ctx, index, bodies)
+	matches, _, _, err := e.Percolate(ctx, index, bodies)
+	return matches, err
 }
 
 // Refresh implements Engine.
@@ -347,11 +349,15 @@ func (e *Elasticsearch) PutQueries(ctx context.Context, index string, qs []datas
 const percolatePage = 10_000
 
 // Percolate implements Engine: one percolate query for the batch, paged by query id
-// when more queries match than one page holds.
-func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, error) {
+// when more queries match than one page holds. server sums every page's own "took"
+// (milliseconds, Elasticsearch's standard search-response field): a percolation
+// fitting in one page, as every single-document call does unless it matches more
+// than percolatePage saved searches, is exactly that one page's took.
+func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, time.Duration, bool, error) {
 	out := make([][]string, len(docs))
 	body := es.PercolateBody(docs, percolatePage)
 	var after []any
+	var server time.Duration
 	for {
 		if after != nil {
 			body["sort"] = []any{map[string]any{es.QueryIDField: "asc"}}
@@ -359,14 +365,15 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 		}
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, 0, false, err
 		}
-		b, err := e.c.do(ctx, http.MethodPost, epath(index, "/_search?request_cache=false"), "application/json", raw)
+		b, _, err := e.c.doHeaders(ctx, http.MethodPost, epath(index, "/_search?request_cache=false"), "application/json", raw)
 		if err != nil {
-			return nil, err
+			return nil, 0, false, err
 		}
 		var res struct {
-			Hits struct {
+			TookMillis int64 `json:"took"`
+			Hits       struct {
 				Total struct {
 					Value int64 `json:"value"`
 				} `json:"total"`
@@ -380,8 +387,9 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 			} `json:"hits"`
 		}
 		if err := json.Unmarshal(b, &res); err != nil {
-			return nil, fmt.Errorf("elasticsearch percolate: %w", err)
+			return nil, 0, false, fmt.Errorf("elasticsearch percolate: %w", err)
 		}
+		server += time.Duration(res.TookMillis) * time.Millisecond
 		hits := res.Hits.Hits
 		if after == nil && int64(len(hits)) < res.Hits.Total.Value {
 			// More matches than a page: start over in qid order to page through them.
@@ -401,34 +409,53 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 			}
 		}
 		if after == nil || len(hits) < percolatePage {
-			return out, nil
+			return out, server, true, nil
 		}
 		after = hits[len(hits)-1].Sort
 	}
 }
 
-// Resources implements Engine.
+// minPlausibleJVMRSS floors a --es-pid reading as genuinely the JVM's: any real JVM,
+// even idle, holds well over this much resident memory. A live process reporting
+// less is almost certainly the wrong one (an entrypoint's wrapper process, not one
+// it exec'd into) -- not "the JVM happens to be unusually small" -- so it is
+// treated as not found rather than trusted.
+const minPlausibleJVMRSS = 64 << 20
+
+// Resources implements Engine. Both disk and RSS are the single node Searchlight's
+// own equivalent footprint is: primaries only (never replicas' bytes, so a transient
+// replica -- bench/docker-compose.es.yml's second node, --es-recovery -- never
+// inflates T6's numbers), and _local (this connected node, es1, not the whole
+// cluster: with a second node, /_nodes/stats answers for both, and picking one of a
+// map's entries would be an arbitrary, non-deterministic choice of which).
 func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Resources, error) {
 	var r report.Resources
 	var stats struct {
 		Indices map[string]struct {
-			Total struct {
+			Primaries struct {
 				Store struct {
 					Size int64 `json:"size_in_bytes"`
 				} `json:"store"`
-			} `json:"total"`
+			} `json:"primaries"`
 		} `json:"indices"`
 	}
 	if err := e.c.json(ctx, http.MethodGet, epath(index, "/_stats/store"), nil, &stats); err != nil {
 		return r, err
 	}
 	for _, s := range stats.Indices {
-		r.DiskBytes += s.Total.Store.Size
+		r.DiskBytes += s.Primaries.Store.Size
 	}
-	r.DiskSource = "_stats/store total.store.size_in_bytes (index files, translog excluded)"
-	if rss := procRSS(e.opts.PID); rss > 0 {
+	r.DiskSource = "_stats/store primaries.store.size_in_bytes (this node's own copy; index files, translog excluded)"
+	if rss := procRSS(e.opts.PID); rss >= minPlausibleJVMRSS {
 		r.RSSBytes, r.RSSSource = rss, fmt.Sprintf("/proc/%d/status VmRSS (the JVM)", e.opts.PID)
 		return r, nil
+	} else if rss > 0 {
+		// --es-pid named a real, live process, but one with implausibly little RSS
+		// for a JVM (seen in practice: the image's entrypoint not exec'ing into java,
+		// so the PID was a lightweight wrapper, not the server -- run 37399767772
+		// read 1.35 MiB this way for the whole run). Falling through to the cgroup
+		// estimate below is a far smaller error than reporting that.
+		fmt.Fprintf(e.c.log, "elasticsearch: --es-pid %d has %s RSS, implausible for a JVM; falling back to the cgroup estimate\n", e.opts.PID, report.FormatBytes(float64(rss)))
 	}
 	var ns struct {
 		Nodes map[string]struct {
@@ -447,19 +474,133 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 			} `json:"jvm"`
 		} `json:"nodes"`
 	}
-	if err := e.c.json(ctx, http.MethodGet, "/_nodes/stats/os,jvm", nil, &ns); err != nil {
+	if err := e.c.json(ctx, http.MethodGet, "/_nodes/_local/stats/os,jvm", nil, &ns); err != nil {
 		r.RSSSource = "not measured: " + err.Error()
 		return r, nil //nolint:nilerr // best-effort footprint: the failure is recorded in RSSSource, not fatal
 	}
 	for _, n := range ns.Nodes {
 		if v, err := strconv.ParseInt(n.OS.Cgroup.Memory.Usage, 10, 64); err == nil && v > 0 {
-			r.RSSBytes, r.RSSSource = v, "_nodes/stats os.cgroup.memory.usage_in_bytes (container, includes page cache)"
+			r.RSSBytes, r.RSSSource = v, "_nodes/_local/stats os.cgroup.memory.usage_in_bytes (this node's container, includes page cache)"
 			continue
 		}
 		r.RSSBytes = n.JVM.Mem.HeapCommitted + n.JVM.Mem.NonHeapCommitted
-		r.RSSSource = "_nodes/stats JVM heap + non-heap committed (a lower bound of the RSS)"
+		r.RSSSource = "_nodes/_local/stats JVM heap + non-heap committed (a lower bound of this node's RSS)"
 	}
 	return r, nil
+}
+
+// SectionSizes implements SectionSizer using Elasticsearch's _disk_usage API
+// (run_expensive_tasks=true: without it, a cached estimate can be absent and the
+// call returns nothing useful), aggregated to sit beside Searchlight's segment
+// sections: "inverted_index" as "terms" (the term dictionary and postings together,
+// as Searchlight's own "terms" section holds them), "doc_values" as "docvalues",
+// "points" as "points", "stored_fields" as "stored", and norms, term vectors and
+// knn vectors folded into "other" (structures Searchlight's format has no
+// equivalent of). There is no analog of Searchlight's "ids" or "meta" sections:
+// Elasticsearch's _id lives inside its inverted index and stored fields already
+// counted above.
+func (e *Elasticsearch) SectionSizes(ctx context.Context, index string) (map[string]int64, error) {
+	// Only "inverted_index" nests (total_in_bytes inside it); stored_fields,
+	// doc_values, points, norms, term_vectors and knn_vectors are each a flat
+	// "<name>_in_bytes" sibling of a human-readable "<name>" string, not an object
+	// of their own. Confirmed against a real Elasticsearch 8.15.3 response (a
+	// first guess at "stored_fields" nesting the same way failed to decode it).
+	var res map[string]struct {
+		AllFields struct {
+			InvertedIndex struct {
+				TotalInBytes int64 `json:"total_in_bytes"`
+			} `json:"inverted_index"`
+			StoredFieldsInBytes int64 `json:"stored_fields_in_bytes"`
+			DocValuesInBytes    int64 `json:"doc_values_in_bytes"`
+			PointsInBytes       int64 `json:"points_in_bytes"`
+			NormsInBytes        int64 `json:"norms_in_bytes"`
+			TermVectorsInBytes  int64 `json:"term_vectors_in_bytes"`
+			KnnVectorsInBytes   int64 `json:"knn_vectors_in_bytes"`
+		} `json:"all_fields"`
+	}
+	if err := e.c.json(ctx, http.MethodPost, epath(index, "/_disk_usage")+"?run_expensive_tasks=true", nil, &res); err != nil {
+		return nil, err
+	}
+	idx, ok := res[index]
+	if !ok {
+		return nil, fmt.Errorf("elasticsearch _disk_usage: no %q in the response", index)
+	}
+	af := idx.AllFields
+	return map[string]int64{
+		"terms":     af.InvertedIndex.TotalInBytes,
+		"stored":    af.StoredFieldsInBytes,
+		"docvalues": af.DocValuesInBytes,
+		"points":    af.PointsInBytes,
+		"other":     af.NormsInBytes + af.TermVectorsInBytes + af.KnnVectorsInBytes,
+	}, nil
+}
+
+// setReplicas sets index's number_of_replicas.
+func (e *Elasticsearch) setReplicas(ctx context.Context, index string, n int) error {
+	body := map[string]any{"index": map[string]any{"number_of_replicas": n}}
+	return e.c.json(ctx, http.MethodPut, epath(index, "/_settings"), body, nil)
+}
+
+// waitGreen polls index's cluster health until it reports green or timeout passes.
+func (e *Elasticsearch) waitGreen(ctx context.Context, index string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	path := "/_cluster/health/" + url.PathEscape(index) + "?wait_for_status=green&timeout=5s"
+	for {
+		if _, err := e.c.do(ctx, http.MethodGet, path, "", nil); err == nil {
+			return nil
+		} else if time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// ElasticsearchRecoverer is [Recoverer] for Elasticsearch's own peer recovery
+// (target T8): bench/docker-compose.es.yml always starts a second node, so the
+// baseline is measured on the same index and data [RunSuite]'s load step already
+// put in place (Source returns nil: there is no separate cluster to load), by
+// dropping the replica (number_of_replicas to 0, so the second node holds nothing
+// of the index) and then restoring it (back to 1, which can only be satisfied by a
+// full peer recovery onto whichever node does not already hold a copy), timed until
+// the cluster reports green again.
+type ElasticsearchRecoverer struct {
+	eng *Elasticsearch
+}
+
+// NewElasticsearchRecoverer returns a [Recoverer] measuring eng's own cluster's peer
+// recovery.
+func NewElasticsearchRecoverer(eng *Elasticsearch) *ElasticsearchRecoverer {
+	return &ElasticsearchRecoverer{eng: eng}
+}
+
+// Source implements Recoverer: nil, because recovery runs on the index and data the
+// rest of the suite already loaded, not a separate source cluster.
+func (*ElasticsearchRecoverer) Source() Engine { return nil }
+
+// Close implements Recoverer: nothing to release, since Source is nil.
+func (*ElasticsearchRecoverer) Close(context.Context) error { return nil }
+
+// Recover implements Recoverer.
+func (r *ElasticsearchRecoverer) Recover(ctx context.Context, index string, _ int64) (time.Duration, error) {
+	e := r.eng
+	if err := e.setReplicas(ctx, index, 0); err != nil {
+		return 0, fmt.Errorf("elasticsearch recovery: dropping the replica: %w", err)
+	}
+	if err := e.waitGreen(ctx, index, 2*time.Minute); err != nil {
+		return 0, fmt.Errorf("elasticsearch recovery: waiting for the drop: %w", err)
+	}
+	start := time.Now()
+	if err := e.setReplicas(ctx, index, 1); err != nil {
+		return 0, fmt.Errorf("elasticsearch recovery: adding the replica: %w", err)
+	}
+	if err := e.waitGreen(ctx, index, time.Hour); err != nil {
+		return 0, fmt.Errorf("elasticsearch recovery: waiting for green: %w", err)
+	}
+	return time.Since(start), nil
 }
 
 func formatBytes(n int64) string {

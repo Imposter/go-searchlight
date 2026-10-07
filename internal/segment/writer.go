@@ -10,10 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
 
@@ -203,7 +203,7 @@ func buildPart(docs []schema.Doc, rg docRange) map[string]*fieldBuilder {
 // [schema.Value] directly, where Merge reads a reader's already-analyzed columns). A
 // duplicate (term, doc) pair - the same word or gram occurring more than once in one
 // document's text - is harmless to add more than once: [termPairs.add] collapses it
-// into one posting, so there is no need to deduplicate here.
+// into one posting, so words and grams are added as they occur, unsorted and repeated.
 func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	b.presence.Add(ord)
 	if v.GramsTruncated {
@@ -217,12 +217,10 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 		b.addValueTerm(ord, *v.Text)
 		b.hasText = true
 		if v.Words != "" {
-			for _, word := range strings.Fields(v.Words) {
-				b.addWordTerm(ord, word)
-			}
+			analysis.EachWord(v.Words, func(word string) { b.addWordTerm(ord, word) })
 		}
-		for _, g := range v.Grams {
-			b.addGramTerm(ord, g)
+		if v.Grams {
+			analysis.EachGram(*v.Text, func(gram string) { b.addGramTerm(ord, gram) })
 		}
 	case v.Number != nil:
 		b.numDocs = append(b.numDocs, docFloat{doc: ord, v: *v.Number})
@@ -328,34 +326,34 @@ func runParallel(n, threads int, work func(i int)) {
 	wg.Wait()
 }
 
-// writeFieldSectionParallel writes one section's per-field contributions: writeOne(fw,
-// name) builds name's whole contribution into fw, whose offset starts at 0 exactly as
-// if it were the only field in the section, for every name in names, up to threads of
-// those running at once. The contributions land in w in field order (so the file is
-// identical regardless of how many ran concurrently), and fixup(name, fieldBase) is
-// called for each, with fieldBase its offset from the section's own start, to turn the
-// 0-based offsets writeOne left in that field's fieldOutput into offsets relative to
-// the section (format.go).
+// writeFieldSectionParallel writes one section's n contributions (a field's, or one
+// of a field's term dictionaries'): writeOne(fw, i) builds contribution i into fw,
+// whose offset starts at 0 exactly as if it were the only one in the section, up to
+// threads of them running at once. The contributions land in w in order (so the file
+// is identical regardless of how many ran concurrently), and fixup(i, base) is called
+// for each, with base its offset from the section's own start, to turn the 0-based
+// offsets writeOne left in its fieldOutput into offsets relative to the section
+// (format.go).
 //
-// A field whose turn has come when it starts - every field before it already in w -
-// writes straight through to w. Any other is held aside until its turn: in memory up
-// to spillAt bytes, then in a temp file named after spill (a path stem in the
+// A contribution whose turn has come when it starts - every one before it already in
+// w - writes straight through to w. Any other is held aside until its turn: in memory
+// up to spillAt bytes, then in a temp file named after spill (a path stem in the
 // segment's directory), written through throttle like the segment itself. So a write
-// holds at most spillAt bytes for each field running or waiting its turn, and needs up
-// to about one section's size of extra disk while fields wait. Once a write fails, no
-// further field starts and the first error is returned.
-func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int) error, names []string, threads int, writeOne func(fw *fileWriter, name string), fixup func(name string, fieldBase uint64)) error {
+// holds at most spillAt bytes for each contribution running or waiting its turn, and
+// needs up to about one section's size of extra disk while they wait. Once a write
+// fails, no further contribution starts and the first error is returned.
+func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int) error, n, threads int, writeOne func(fw *fileWriter, i int), fixup func(i int, base uint64)) error {
 	sectionStart := w.off
 	var mu sync.Mutex
 	next := 0
 	direct := false
 	failed := false
-	held := make([]*spillBuffer, len(names))
-	errs := make([]error, len(names))
+	held := make([]*spillBuffer, n)
+	errs := make([]error, n)
 	// place lands every held field whose turn has come; mu must be held.
 	place := func() {
-		for next < len(names) && held[next] != nil && !direct && !failed {
-			fixup(names[next], w.off-sectionStart)
+		for next < n && held[next] != nil && !direct && !failed {
+			fixup(next, w.off-sectionStart)
 			if err := held[next].copyTo(w); err != nil {
 				errs[next], failed = err, true
 			}
@@ -363,7 +361,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 			next++
 		}
 	}
-	runParallel(len(names), threads, func(i int) {
+	runParallel(n, threads, func(i int) {
 		mu.Lock()
 		if failed || w.abort.Load() {
 			failed = true
@@ -376,9 +374,9 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 			mu.Unlock()
 			fw := newFileWriter(sectionSink{w})
 			fw.abort = w.abort
-			writeOne(fw, names[i])
+			writeOne(fw, i)
 			fw.flush()
-			fixup(names[i], base)
+			fixup(i, base)
 			mu.Lock()
 			direct = false
 			if fw.err != nil {
@@ -393,7 +391,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 		buf := &spillBuffer{stem: spill, throttle: throttle}
 		fw := newFileWriter(buf)
 		fw.abort = w.abort
-		writeOne(fw, names[i])
+		writeOne(fw, i)
 		fw.flush()
 		mu.Lock()
 		defer mu.Unlock()
@@ -508,7 +506,7 @@ func (b *spillBuffer) discard() {
 // and presence from parts, its term dictionaries from dicts, then stored and ids.
 // parts may have any length: one (a sequential build, or any Merge with one effective
 // worker) or many (one per [BuildOptions.Threads] worker, or one per Merge reader
-// group) - writeFieldDicts and friends treat those identically, which is what makes
+// group) - writeFieldDict and friends treat those identically, which is what makes
 // the file byte-for-byte the same either way; so does threads, the degree of
 // parallelism the writing phase itself (as opposed to parts, accumulation's) uses.
 // throttle, when not nil, is called before every chunk written to the file
@@ -542,16 +540,15 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 
 	w.beginSection(sectionTerms)
-	err = writeFieldSectionParallel(w, path, throttle, names, threads,
-		func(fw *fileWriter, name string) {
-			writeFieldDicts(fw, name, partsFor(parts, name, empty), dicts, scratch[name])
+	err = writeFieldSectionParallel(w, path, throttle, len(names)*numKinds, threads,
+		func(fw *fileWriter, i int) {
+			name, kind := names[i/numKinds], TermKind(i%numKinds) //nolint:gosec // i%numKinds < numKinds
+			writeFieldDict(fw, name, kind, partsFor(parts, name, empty), dicts, scratch[name])
 		},
-		func(name string, fieldBase uint64) {
-			out := scratch[name].out
-			for k := range numKinds {
-				if out.dictOff[k] != 0 {
-					out.dictOff[k] += fieldBase
-				}
+		func(i int, base uint64) {
+			out := scratch[names[i/numKinds]].out
+			if k := i % numKinds; out.dictOff[k] != 0 {
+				out.dictOff[k] += base
 			}
 		})
 	if err != nil {
@@ -560,12 +557,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
-	err = writeFieldSectionParallel(w, path, throttle, names, threads,
-		func(fw *fileWriter, name string) {
-			writeFieldDocValues(fw, partsFor(parts, name, empty), numDocs, scratch[name])
+	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+		func(fw *fileWriter, i int) {
+			writeFieldDocValues(fw, partsFor(parts, names[i], empty), numDocs, scratch[names[i]])
 		},
-		func(name string, fieldBase uint64) {
-			out := scratch[name].out
+		func(i int, fieldBase uint64) {
+			out := scratch[names[i]].out
 			if out.keywordColOff != 0 {
 				out.keywordColOff += fieldBase
 			}
@@ -582,10 +579,10 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionPoints)
-	err = writeFieldSectionParallel(w, path, throttle, names, threads,
-		func(fw *fileWriter, name string) { writeFieldPoints(fw, numDocs, scratch[name]) },
-		func(name string, fieldBase uint64) {
-			out := scratch[name].out
+	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+		func(fw *fileWriter, i int) { writeFieldPoints(fw, numDocs, scratch[names[i]]) },
+		func(i int, fieldBase uint64) {
+			out := scratch[names[i]].out
 			if out.pointsOff != 0 {
 				out.pointsOff += fieldBase
 			}
@@ -596,12 +593,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	w.endSection()
 
 	w.beginSection(sectionPresence)
-	err = writeFieldSectionParallel(w, path, throttle, names, threads,
-		func(fw *fileWriter, name string) {
-			writeFieldPresence(fw, partsFor(parts, name, empty), scratch[name].out)
+	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+		func(fw *fileWriter, i int) {
+			writeFieldPresence(fw, partsFor(parts, names[i], empty), scratch[names[i]].out)
 		},
-		func(name string, fieldBase uint64) {
-			out := scratch[name].out
+		func(i int, fieldBase uint64) {
+			out := scratch[names[i]].out
 			out.presOff += fieldBase
 			if out.truncOff != 0 {
 				out.truncOff += fieldBase

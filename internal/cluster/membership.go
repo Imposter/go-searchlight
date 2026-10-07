@@ -77,16 +77,27 @@ type lease struct {
 // valid reports whether the lease surely holds: by both clocks, less than TTL less the
 // margin has passed since the last grant began.
 func (l *lease) valid() bool {
-	if l.clock.Now() >= time.Duration(l.deadline.Load())-l.margin {
+	return l.validAt(l.clock.Now(), l.clock.Wall())
+}
+
+// validAt is valid at the leaseClock readings now and wall.
+func (l *lease) validAt(now time.Duration, wall time.Time) bool {
+	if now >= time.Duration(l.deadline.Load())-l.margin {
 		return false
 	}
-	return l.clock.Wall().Sub(time.Unix(0, l.wallBefore.Load())) < l.ttl-l.margin
+	return wall.Sub(time.Unix(0, l.wallBefore.Load())) < l.ttl-l.margin
 }
 
 // quarantined reports whether the copy may not serve yet: it took over another node's
 // slot less than TTL plus margin ago, by this node's clock.
 func (l *lease) quarantined() bool {
-	return l.quarantine > 0 && l.clock.Now() < l.quarantine
+	return l.quarantinedAt(l.clock.Now())
+}
+
+// quarantinedAt is quarantined at the leaseClock reading now: the copy serves from the
+// quarantine's end on, not before.
+func (l *lease) quarantinedAt(now time.Duration) bool {
+	return l.quarantine > 0 && now < l.quarantine
 }
 
 // extend moves the lease to a grant that began at from (monotonic) and wall, never

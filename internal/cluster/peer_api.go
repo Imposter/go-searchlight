@@ -206,14 +206,10 @@ func errStale(ref shardRef) error {
 }
 
 // target returns a read target on this node's copy for ref: one that serves peers, and
-// is current unless the caller allows stale.
+// is current unless the caller allows stale. The copy's lease, quarantine and pause are
+// judged last, at one pair of leaseClock readings, once the target is held: the read
+// begins at that judgement, and the served hook is told exactly those readings.
 func (p *peerAPI) target(r *http.Request, ref shardRef) (node.ShardTarget, error) {
-	h := p.n.opts.hooks
-	var began time.Duration
-	var wall time.Time
-	if h != nil && h.served != nil {
-		began, wall = p.n.lc.Now(), p.n.lc.Wall()
-	}
 	t, err := p.n.LocalTarget(r.Context(), ref.Index, ref.Shard, ref.WaitSeq)
 	if err != nil {
 		return nil, err
@@ -222,8 +218,14 @@ func (p *peerAPI) target(r *http.Request, ref shardRef) (node.ShardTarget, error
 		t.Release()
 		return nil, errStale(ref)
 	}
-	if h != nil && h.served != nil {
-		h.served(store.ShardID{Index: ref.Index, Shard: ref.Shard}, began, wall)
+	id := store.ShardID{Index: ref.Index, Shard: ref.Shard}
+	now, wall := p.n.lc.Now(), p.n.lc.Wall()
+	if !p.n.peerValidAt(id, now, wall) {
+		t.Release()
+		return nil, api.Unavailable(store.ErrLeaseLost, "this node's copy of shard %d of index %q does not serve peers now", ref.Shard, ref.Index)
+	}
+	if h := p.n.opts.hooks; h != nil && h.served != nil {
+		h.served(id, now, wall)
 	}
 	return t, nil
 }
@@ -558,8 +560,14 @@ const peerWriteBound = 30 * time.Second
 // peerValid reports whether this node's copy of id serves peers now: its lease surely
 // holds, it is not quarantined, and it is not paused.
 func (n *Node) peerValid(id store.ShardID) bool {
+	return n.peerValidAt(id, n.lc.Now(), n.lc.Wall())
+}
+
+// peerValidAt is peerValid at the leaseClock readings now and wall, one pair for every
+// check, so a caller can report exactly when the copy was judged to serve.
+func (n *Node) peerValidAt(id store.ShardID, now time.Duration, wall time.Time) bool {
 	l := n.leaseFor(id)
-	return l != nil && l.valid() && !l.quarantined() && !n.Paused(id)
+	return l != nil && l.validAt(now, wall) && !l.quarantinedAt(now) && !n.Paused(id)
 }
 
 // --- pins and snapshots ---------------------------------------------------------------

@@ -245,9 +245,9 @@ type violation struct {
 }
 
 // checkServed checks the split-brain invariant on a read that tn's copy of id served
-// to a peer (began and wall are tn's leaseClock readings taken before the copy was
-// checked): the copy's lease held, by both clocks, and was not quarantined when the read
-// began, and no other node's copy of the same slot serves peers. A lease claimed after
+// to a peer (began and wall are the leaseClock readings at which tn judged the copy to
+// serve it, peerAPI.target): the copy's lease held, by both clocks, and was not
+// quarantined when the read began, and no other node's copy of the same slot serves peers. A lease claimed after
 // began, or dropped since, cannot be judged.
 func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration, wall time.Time) {
 	l := tn.n.leaseFor(id)

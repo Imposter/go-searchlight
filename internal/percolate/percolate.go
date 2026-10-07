@@ -1,11 +1,14 @@
 package percolate
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
+	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +59,7 @@ type Percolator struct {
 	matchSet     metric.AddOption
 	missSet      metric.AddOption
 	scratchCache sync.Pool
+	plan         atomic.Pointer[splitPlan]
 }
 
 // New returns a Percolator.
@@ -184,6 +188,8 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		maxN = max(maxN, v.n)
 	}
 	p.alwaysCheck.Record(ctx, float64(always), p.set)
+	size := scratchSize{n: maxN, entries: maxEntries, fields: maxFields}
+	win := p.planFor(views, len(docs))
 
 	out := make([]IDs, len(docs))
 	var total docStats
@@ -195,7 +201,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		if sc == nil {
 			sc = new(scratch)
 		}
-		sc.fit(maxN, maxEntries, maxFields)
+		sc.fit(size.n, size.entries, size.fields)
 		var local docStats
 		for {
 			i := int(next.Add(1) - 1)
@@ -208,7 +214,14 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 				mu.Unlock()
 				break
 			}
-			ids, st, err := p.one(ctx, g, views, &docs[i], sc)
+			var ids IDs
+			var st docStats
+			var err error
+			if win != nil {
+				ids, st, err = p.split(ctx, g, views, &docs[i], win, sc, size)
+			} else {
+				ids, st, err = p.one(ctx, g, views, &docs[i], sc)
+			}
 			if err != nil {
 				mu.Lock()
 				firstErr = cmpErr(firstErr, fmt.Errorf("percolate: document %d (%q): %w", i, docs[i].ID, err))
@@ -277,13 +290,11 @@ func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view,
 	}
 	for i := range views {
 		v := &views[i]
-		before := len(sc.hits)
 		if v.seg == nil {
 			if err := bruteForce(v, d, sc, &st); err != nil {
 				sc.clearHits()
 				return nil, st, err
 			}
-			sc.unsorted = true
 			continue
 		}
 		t0 := time.Now()
@@ -294,7 +305,6 @@ func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view,
 		sc.reset()
 		st.probe += t1.Sub(t0)
 		st.verify += time.Since(t1)
-		sc.run(before)
 	}
 	ids := sc.results()
 	p.duration.Record(ctx, st.probe.Seconds(), p.probeSet)
@@ -303,39 +313,196 @@ func (p *Percolator) one(ctx context.Context, g *shard.Generation, views []view,
 	return ids, st, nil
 }
 
+// scratchSize is what a scratch is fit to: the most queries, dictionary entries and
+// fields of a generation's query segments.
+type scratchSize struct {
+	n, entries uint32
+	fields     int
+}
+
+// minWindowQueries is the fewest saved queries per window when one document's
+// percolation is split (a variable so tests can force splits).
+var minWindowQueries uint32 = 16 << 10
+
+// splitPlan splits a generation's query segments into k windows by id, so that one
+// document's percolation runs on several cores: window w holds, in every segment, the
+// ranks whose ids lie in [pivot w, pivot w+1), the pivots being the ids at ranks
+// n*w/k of the largest segment. Windows hold disjoint id ranges in order, so their
+// matches, each window's merged, concatenate into the sorted answer.
+type splitPlan struct {
+	segs   []*Segment
+	k      int
+	bounds []uint32 // per segment, its k+1 window boundaries (ranks)
+}
+
+// bound returns the first rank of window w in segment i (w == k: its rank count).
+func (win *splitPlan) bound(i, w int) uint32 { return win.bounds[i*(win.k+1)+w] }
+
+// planFor returns how one document's percolation splits across views, nil when it
+// does not: a document gets an equal share of the threads, and a window at least
+// minWindowQueries queries. Only segments the percolator built split. The split of the
+// last generation seen is kept for the next call.
+func (p *Percolator) planFor(views []view, docs int) *splitPlan {
+	if docs == 0 {
+		return nil
+	}
+	var total uint64
+	for i := range views {
+		if views[i].seg == nil {
+			return nil
+		}
+		total += uint64(views[i].n)
+	}
+	k := int(min(uint64(p.threads/docs), total/uint64(minWindowQueries))) //nolint:gosec // at most the thread count
+	if k <= 1 {
+		return nil
+	}
+	if win := p.plan.Load(); win != nil && win.k == k && slices.EqualFunc(win.segs, views, func(s *Segment, v view) bool { return s == v.seg }) {
+		return win
+	}
+	win := newSplitPlan(views, k)
+	p.plan.Store(win)
+	return win
+}
+
+// newSplitPlan splits views (each a segment the percolator built) into k windows.
+func newSplitPlan(views []view, k int) *splitPlan {
+	big := 0
+	for i := range views {
+		if views[i].n > views[big].n {
+			big = i
+		}
+	}
+	win := &splitPlan{k: k, segs: make([]*Segment, len(views)), bounds: make([]uint32, len(views)*(k+1))}
+	pivot := views[big].seg
+	for i := range views {
+		seg := views[i].seg
+		win.segs[i] = seg
+		b := win.bounds[i*(k+1) : (i+1)*(k+1)]
+		b[k] = seg.n
+		for w := 1; w < k; w++ {
+			at := uint32(uint64(pivot.n) * uint64(w) / uint64(k)) //nolint:gosec // below pivot.n
+			if seg == pivot {
+				b[w] = at
+				continue
+			}
+			id := pivot.rawIDAt(at)
+			b[w] = uint32(sort.Search(int(seg.n), func(r int) bool { //nolint:gosec // a rank
+				return bytes.Compare(seg.rawIDAt(uint32(r)), id) >= 0 //nolint:gosec // a rank
+			}))
+		}
+	}
+	return win
+}
+
+// split percolates one document across every query segment, window by window in
+// parallel (sc, already fit, serves the first), and joins the windows' matches.
+func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, win *splitPlan, sc *scratch, size scratchSize) (IDs, docStats, error) {
+	if d.Fields == nil {
+		analyzed, _, err := schema.AnalyzeForMatch(g.Mapping(), d.ID, d.Body)
+		if err != nil {
+			return nil, docStats{}, err
+		}
+		d = &analyzed
+	}
+	type part struct {
+		sc *scratch
+		st docStats
+	}
+	parts := make([]part, win.k)
+	parts[0].sc = sc
+	run := func(w int) {
+		pt := &parts[w]
+		if pt.sc == nil {
+			pt.sc, _ = p.scratchCache.Get().(*scratch)
+			if pt.sc == nil {
+				pt.sc = new(scratch)
+			}
+			pt.sc.fit(size.n, size.entries, size.fields)
+		}
+		c := pt.sc
+		for i := range views {
+			v := &views[i]
+			lo, hi := win.bound(i, w), win.bound(i, w+1)
+			if lo == hi {
+				continue
+			}
+			t0 := time.Now()
+			v.seg.collectIn(d, c, lo, hi)
+			t1 := time.Now()
+			pt.st.candidates += len(c.cands)
+			verify(v, c, &pt.st)
+			c.reset()
+			pt.st.probe += t1.Sub(t0)
+			pt.st.verify += time.Since(t1)
+		}
+		c.buf = c.merger.appendRanks(c.buf[:0], c.ranks, c.runs)
+		c.clearHits()
+	}
+	var wg sync.WaitGroup
+	for w := 1; w < win.k; w++ {
+		wg.Go(func() { run(w) })
+	}
+	run(0)
+	wg.Wait()
+	var st docStats
+	n := 1
+	for i := range parts {
+		st.add(&parts[i].st)
+		n += len(parts[i].sc.buf)
+	}
+	var ids IDs
+	if n > 1 {
+		ids = make(IDs, 1, n)
+		ids[0] = '['
+		for i := range parts {
+			ids = append(ids, parts[i].sc.buf...)
+		}
+		ids[n-1] = ']'
+	}
+	for i := 1; i < len(parts); i++ {
+		p.scratchCache.Put(parts[i].sc)
+	}
+	p.duration.Record(ctx, st.probe.Seconds(), p.probeSet)
+	p.duration.Record(ctx, st.verify.Seconds(), p.verifySet)
+	p.candidates.Record(ctx, float64(st.candidates), p.set)
+	return ids, st, nil
+}
+
 // verify evaluates every candidate's program (see prog.go) on the document whose values
-// collect left in sc, appending the ids of the live ones that match to sc.hits, sorted
-// by id (the candidates are ranks: taken in order, so are their ids).
+// collect left in sc, and records the ranks of the live ones that match as one run of
+// sc's matches (the candidates are ranks: taken in order, they are in id order).
 func verify(v *view, sc *scratch, st *docStats) {
 	seg := v.seg
-	sc.inOrder(int(seg.n+63) / 64)
-	matched := 0
+	sc.inOrder()
+	start := len(sc.ranks)
+	classes, memo := seg.classes, sc.memo
 	for _, r := range sc.cands {
 		if v.deletes != nil && v.deletes.Contains(seg.ordAt(r)) {
 			continue
 		}
 		var hit bool
-		switch rep := seg.verdictClass(r); {
+		switch rep := classes[r]; {
 		case rep == trivialClass:
 			hit = true
 		case rep == noClass:
 			hit = sc.evalProg(seg.program(r))
 			st.count(hit)
-		case sc.memo[rep] == memoMatch:
+		case memo[rep] == memoMatch:
 			hit = true
-		case sc.memo[rep] == memoMiss:
+		case memo[rep] == memoMiss:
 		default:
 			hit = sc.evalProg(seg.program(r))
 			st.count(hit)
-			sc.memo[rep] = pick[uint8](hit, memoMatch, memoMiss)
+			memo[rep] = pick[uint8](hit, memoMatch, memoMiss)
 			sc.memoSet = append(sc.memoSet, rep)
 		}
 		if hit {
-			sc.hits = append(sc.hits, seg.idAt(r))
-			matched++
+			sc.ranks = append(sc.ranks, r)
 		}
 	}
-	st.matched += matched
+	st.matched += len(sc.ranks) - start
+	sc.endRun(seg, start)
 }
 
 // bruteForce checks every live query of a segment the percolator did not build.
@@ -355,7 +522,7 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 		}
 		st.verifiedMatch++
 		st.matched++
-		sc.hits = append(sc.hits, idLiteral(q.ID))
+		sc.lits = append(sc.lits, idLiteral(q.ID))
 	}
 	return nil
 }

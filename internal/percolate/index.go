@@ -769,7 +769,13 @@ type Segment struct {
 	byLo      []byte
 	byHi      []byte
 
+	// classes is, per rank, the first rank of its verification class, noClass when no
+	// other query shares it, or trivialClass when its program is empty (it holds):
+	// a dense copy Open makes, so that a candidate's verify record is read only when
+	// its program must run.
 	classes []uint32
+	// escapes is whether an id literal holds an escape.
+	escapes bool
 
 	mapped *mapping
 }
@@ -885,12 +891,13 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if err := s.checkRanks(); err != nil {
 		return nil, corrupt("%v", err)
 	}
+	s.escapes = bytes.IndexByte(s.idText, '\\') >= 0
 	s.buildGramFilters()
 	s.classes = make([]uint32, s.n)
 	for r := range s.n {
 		o := verifySize * int(r)
 		s.classes[r] = u32(s.verifies, o)
-		if s.classes[r] == noClass && u32(s.verifies, o+4) == 0 {
+		if u32(s.verifies, o+4) == 0 {
 			s.classes[r] = trivialClass
 		}
 	}
@@ -1134,6 +1141,9 @@ func (s *Segment) ordAt(r uint32) uint32 { return u32(s.ids, idSize*int(r)) }
 // escaped).
 func (s *Segment) rawIDAt(r uint32) []byte {
 	lit := s.idAt(r)
+	if !s.escapes {
+		return lit[1 : len(lit)-1]
+	}
 	if raw, ok := plainID(lit); ok {
 		return raw
 	}
@@ -1195,12 +1205,6 @@ func (s *Segment) Close() error {
 // class returns the first rank of rank r's verification class, noClass when no other
 // query shares it.
 func (s *Segment) class(r uint32) uint32 { return u32(s.verifies, verifySize*int(r)) }
-
-// verdictClass returns the first rank of rank r's verification class, noClass when no
-// other query shares it, or trivialClass when it also holds (an empty program), from
-// the dense copy Open makes, so that a candidate's verify record is read only when its
-// program must run.
-func (s *Segment) verdictClass(r uint32) uint32 { return s.classes[r] }
 
 // program returns rank r's class's program (empty: it holds).
 func (s *Segment) program(r uint32) []byte {

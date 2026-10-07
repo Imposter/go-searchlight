@@ -354,6 +354,11 @@ func TestIntervalTreeStabbing(t *testing.T) {
 		sc := new(scratch)
 		sc.fit(uint32(n), 0, 0)
 		for x := -2.0; x <= 102; x += 0.5 {
+			sc.lo, sc.hi = 0, uint32(n)
+			if r.IntN(2) == 0 {
+				sc.lo, sc.hi = uint32(r.IntN(n+1)), uint32(r.IntN(n+1))
+				sc.lo, sc.hi = min(sc.lo, sc.hi), max(sc.lo, sc.hi)
+			}
 			if root >= 0 {
 				seg.stab(root, x, sc)
 			}
@@ -361,7 +366,7 @@ func TestIntervalTreeStabbing(t *testing.T) {
 			slices.Sort(got)
 			var want []uint32
 			for _, iv := range ivs {
-				if iv.lo <= x && x <= iv.hi {
+				if iv.lo <= x && x <= iv.hi && sc.lo <= iv.rank && iv.rank < sc.hi {
 					want = append(want, iv.rank)
 				}
 			}

@@ -172,8 +172,8 @@ func (g *rgen) doc() []byte {
 
 // Root conjunctions over boundary numbers, Unicode-folded and NUL / U+FFFD texts,
 // missing and wrong-type fields, not and ne inside any, and permuted twins (class
-// members with different posting filters), in three segments with deletes, against
-// brute force through Percolator.one.
+// members with different posting filters), in three segments with deletes and
+// interleaved ids, against brute force through Percolator.one and split into windows.
 func TestRootConjunctionsCrossCheck(t *testing.T) {
 	m := testMapping()
 	for seed := range uint64(6) {
@@ -233,10 +233,7 @@ func TestRootConjunctionsCrossCheck(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			ids, _, err := p.one(context.Background(), nil, views, &d, sc)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ids, _ := percolateEveryWay(t, p, views, &d, sc)
 			got := strs(t, ids)
 			var want []string
 			for i := range qs {
@@ -255,8 +252,11 @@ func TestRootConjunctionsCrossCheck(t *testing.T) {
 }
 
 // Concurrent percolations on acquired generations while queries are upserted, deleted,
-// refreshed and merged: every answer equals brute force over its own generation.
+// refreshed and merged, small batches split into windows: every answer equals brute
+// force over its own generation.
 func TestConcurrentQueryChurn(t *testing.T) {
+	defer func(n uint32) { minWindowQueries = n }(minWindowQueries)
+	minWindowQueries = 16
 	m := newShardModel(t)
 	g := &rgen{r: rand.New(rand.NewPCG(5, 5))}
 	var docs []schema.Doc

@@ -782,6 +782,7 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		return nil, err
 	}
 	defer rows.Close()
+	var corrupt *CorruptError
 	for rows.Next() {
 		c := Change{Index: shard.Index, Shard: shard.Shard}
 		var kind string
@@ -791,8 +792,10 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 			return nil, err
 		}
 		c.Kind = Kind(kind)
-		if c.Payload, err = readBody(payload, payloadZ); err != nil {
-			return out, &CorruptError{Shard: shard, Seq: c.Seq, ID: c.ID, Err: err}
+		var derr error
+		if c.Payload, derr = readBody(payload, payloadZ); derr != nil {
+			corrupt = &CorruptError{Shard: shard, Seq: c.Seq, ID: c.ID, Err: derr}
+			break
 		}
 		if len(c.Payload) == 0 {
 			c.Payload = nil
@@ -801,6 +804,9 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		out = append(out, c)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	// Read the prune horizon after the changes: a prune that committed
@@ -813,7 +819,12 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	case err != nil:
 		return nil, err
 	case seq < below-1:
+		// Pruned past, which a damaged row does not change: the changes read may
+		// already lack some of those before them.
 		return nil, fmt.Errorf("%s after seq %d (pruned below %d): %w", shard, seq, below, ErrPruned)
+	}
+	if corrupt != nil {
+		return out, corrupt
 	}
 	return out, nil
 }

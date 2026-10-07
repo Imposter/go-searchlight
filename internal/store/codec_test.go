@@ -373,6 +373,35 @@ func TestCorruptBody(t *testing.T) {
 	})
 }
 
+// TestCorruptBodyPrunedPast: a read that meets a damaged change while the changelog
+// is pruned past it reports ErrPruned, not the changes before the damaged one (which
+// may already lack some of theirs). The prune is caught between its two steps: the
+// horizon raised, the rows not yet deleted, as a read racing it can see.
+func TestCorruptBodyPrunedPast(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		st.CompressBodies(true)
+		mustCreateIndex(t, st, "bp")
+		shard := ShardID{Index: "bp"}
+		_, last := mustApply(t, st, upsert("bp", 0, "a", repetitive(1)), upsert("bp", 0, "b", repetitive(2)), upsert("bp", 0, "c", repetitive(3)))
+		s := engine(st)
+		if _, err := s.w.ExecContext(ctx, rebind(s, "UPDATE sl_changes SET payload_z = ? WHERE id = ?"), []byte{0x02, 1, 2, 3}, "b"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.ChangesAfter(ctx, shard, 0, 10); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("before the prune: %v", err)
+		}
+		if _, err := s.w.ExecContext(ctx, rebind(s, "INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES (?, 0, ?)"), "bp", last+1); err != nil {
+			t.Fatal(err)
+		}
+		page, err := st.ChangesAfter(ctx, shard, 0, 10)
+		if !errors.Is(err, ErrPruned) || errors.Is(err, ErrCorrupt) || len(page) != 0 {
+			t.Fatalf("pruned past a damaged change: %d changes, %v; want ErrPruned", len(page), err)
+		}
+	})
+}
+
 // repetitive is a document zstd always shrinks.
 func repetitive(n int) string {
 	return fmt.Sprintf(`{"n":%d,"pad":%q}`, n, strings.Repeat(fmt.Sprint("word ", n, " "), 40))

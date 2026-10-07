@@ -350,6 +350,6 @@ ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = GREATEST(sl_pruned.bel
 	MigrateLock:       fmt.Sprintf("SELECT pg_advisory_xact_lock(%d)", int64(migrateLockKey)),
 	// ALTER TABLE queues for its table's lock behind the queries running on it,
 	// and every later query queues behind it meanwhile.
-	MigrateLockTimeout: "SET LOCAL lock_timeout = '5s'",
+	MigrateLockTimeout: "SET LOCAL lock_timeout = '1s'",
 	LockTimedOut:       lockTimedOut,
 }

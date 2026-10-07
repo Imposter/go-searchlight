@@ -508,9 +508,10 @@ Notes:
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
   are two: the initial schema, and compressed bodies (below). Each migration's DDL waits
-  at most 5 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
-  so a long query on the table cannot queue every other query behind the migration; one
-  that times out is retried, up to ten times, a few seconds apart.
+  at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
+  so a long query on the table holds the table's other queries behind the migration for
+  at most that second; one that times out is retried, up to 40 times over about three
+  minutes, half a second to five seconds apart.
 - **Upgrading to compressed bodies** (schema migration 2) is a rolling upgrade. The
   migration only adds columns and a table, which takes milliseconds whatever the
   database holds: `body_z` beside `sl_documents.body` and `payload_z` beside

@@ -182,7 +182,7 @@ var maintenance = dialect.Maintenance{
 	// Even an instant ALTER TABLE takes its table's metadata lock, queued behind
 	// the transactions using the table, with every later statement queued behind
 	// it meanwhile.
-	MigrateLockTimeout: "SET SESSION lock_wait_timeout = 5",
+	MigrateLockTimeout: "SET SESSION lock_wait_timeout = 1",
 	MigrateLockReset:   "SET SESSION lock_wait_timeout = DEFAULT",
 	LockTimedOut:       lockTimedOut,
 	AlreadyApplied:     alreadyApplied,

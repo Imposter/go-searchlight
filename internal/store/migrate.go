@@ -85,12 +85,13 @@ type execer interface {
 }
 
 // Migration retries: a migration whose DDL timed out waiting for a table lock
-// (Maintenance.MigrateLockTimeout) is tried again, up to migrateAttempts times, after
-// a pause growing from migrateRetryBase to migrateRetryCap.
+// (Maintenance.MigrateLockTimeout, 1 s, which is as long as it holds the table's other
+// queries behind it) is tried again, up to migrateAttempts times, after a pause
+// growing from migrateRetryBase to migrateRetryCap: about three minutes in all.
 const (
-	migrateAttempts  = 10
-	migrateRetryBase = time.Second
-	migrateRetryCap  = 10 * time.Second
+	migrateAttempts  = 40
+	migrateRetryBase = 500 * time.Millisecond
+	migrateRetryCap  = 5 * time.Second
 )
 
 func (s *sqlStore) Migrate(ctx context.Context) (err error) {

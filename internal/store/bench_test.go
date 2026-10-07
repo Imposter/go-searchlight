@@ -48,10 +48,12 @@ func forEachDialectB(b *testing.B, fn func(b *testing.B, fresh func(testing.TB) 
 	})
 }
 
-// benchStore opens a store on a fresh database with the bench index.
+// benchStore opens a store on a fresh database with the bench index, storing bodies
+// compressed as a cluster does once every node reads them.
 func benchStore(b *testing.B, fresh func(testing.TB) *harness) Store {
 	b.Helper()
 	st := fresh(b).open(b)
+	st.CompressBodies(true)
 	mustCreateIndex(b, st, "bench")
 	return st
 }
@@ -61,14 +63,15 @@ func benchStore(b *testing.B, fresh func(testing.TB) *harness) Store {
 const benchShards = 4
 
 // benchBody is a product listing of about 900 bytes, shaped like the benchmark
-// dataset's (bench/datasets): its text drawn from a few thousand words, so it
-// compresses about as the dataset's documents do. n makes each one its own.
+// dataset's (bench/datasets): its text drawn from a few thousand words, the common
+// ones far more often, so it compresses about as the dataset's documents do. n makes
+// each one its own.
 func benchBody(n int) string {
 	r := rand.New(rand.NewPCG(uint64(n), 3))
 	words := func(k int) string {
 		w := make([]string, k)
 		for i := range w {
-			w[i] = benchWords[r.IntN(1+r.IntN(1+r.IntN(len(benchWords))))] // skewed to the common ones
+			w[i] = benchWords[r.IntN(1+r.IntN(1+r.IntN(len(benchWords))))]
 		}
 		return strings.Join(w, " ")
 	}

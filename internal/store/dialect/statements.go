@@ -37,26 +37,38 @@ type Returning struct {
 	Read  string
 }
 
-// ChangeRow is one changelog row. Payload, like DocumentRow's Body, is the stored
-// form of the JSON: the JSON itself, or a codec byte and its encoding (binary).
+// ChangeRow is one changelog row. Its payload, like a DocumentRow's body, is in one
+// of two columns: Payload, the JSON as text, or PayloadZ (payload_z), a codec byte
+// and the JSON's encoding; the other is empty, and a nil PayloadZ is NULL.
 type ChangeRow struct {
 	Seq            int64
 	Index          string
 	Shard          int
 	Kind           string
 	ID             string
-	Payload        []byte
+	Payload        string
+	PayloadZ       []byte
 	At             int64
 	IndexUID       string
 	MappingVersion int64
 }
 
-// DocumentRow is a document's new state.
+// Blob is b as a statement argument: NULL when b is nil.
+func Blob(b []byte) any {
+	if b == nil {
+		return nil
+	}
+	return b
+}
+
+// DocumentRow is a document's new state: its body in Body (text) or BodyZ (body_z;
+// see ChangeRow). An upsert sets both columns.
 type DocumentRow struct {
 	Index string
 	Shard int
 	ID    string
-	Body  []byte
+	Body  string
+	BodyZ []byte
 	Seq   int64
 }
 
@@ -117,12 +129,13 @@ type Changelog struct {
 	// Limits are the engine's statement limits Write is called with. Tests
 	// shrink them to drive the split paths on a real server.
 	Limits Limits
-	// ChangesAfter: (index, shard, seq, limit) -> seq, kind, id, payload, at,
-	// index_uid, mapping_version of the shard's changes after seq, by seq.
+	// ChangesAfter: (index, shard, seq, limit) -> seq, kind, id, payload,
+	// payload_z, at, index_uid, mapping_version of the shard's changes after seq,
+	// by seq.
 	ChangesAfter string
 	// Horizon: (index, shard) -> below_seq of sl_pruned.
 	Horizon string
-	// ScanDocuments: (index, shard) -> id, body, seq, by id.
+	// ScanDocuments: (index, shard) -> id, body, body_z, seq, by id.
 	ScanDocuments string
 	// ScanQueries: (index, shard) -> id, query, meta, seq, by id.
 	ScanQueries string
@@ -130,7 +143,7 @@ type Changelog struct {
 
 // Records reads the system of record directly.
 type Records struct {
-	// GetDocument: (index, shard, id) -> body, seq.
+	// GetDocument: (index, shard, id) -> body, body_z, seq.
 	GetDocument string
 	// GetQuery: (index, shard, id) -> query, meta, seq.
 	GetQuery string
@@ -145,15 +158,20 @@ type Records struct {
 // arguments (index, shard, slot, node_id, epoch) naming one incarnation of a
 // copy.
 type Registry struct {
-	// Heartbeat: (node_id, address, version, capacity) inserts the node with
-	// heartbeat_at and started_at NOW, or updates its address, version,
-	// capacity and heartbeat_at.
+	// Heartbeat: (node_id, address, version, capacity, body_codecs) inserts the
+	// node with heartbeat_at and started_at NOW, or updates its address,
+	// version, capacity, body_codecs and heartbeat_at.
 	Heartbeat string
 	// RemoveNode: (node_id).
 	RemoveNode string
-	// Nodes: () -> node_id, address, version, capacity, heartbeat_at,
-	// started_at, NOW, by node_id.
+	// Nodes: () -> node_id, address, version, capacity, body_codecs,
+	// heartbeat_at, started_at, NOW, by node_id.
 	Nodes string
+	// Features: () -> name, enabled_at of sl_features.
+	Features string
+	// EnableFeature: (name) inserts the feature with enabled_at NOW unless it is
+	// there already.
+	EnableFeature string
 	// IndexExists: (name) -> the number of sl_indexes rows named name.
 	IndexExists string
 	// Slots: (index, shard) -> CopyColumns of the shard's slots, by slot.
@@ -289,4 +307,19 @@ type Maintenance struct {
 	MigrateLock   string
 	SessionLock   string // must return one row whose first column is 1 on success
 	SessionUnlock string
+	// MigrateLockTimeout bounds how long a migration's DDL waits for a table lock,
+	// run after MigrateLock or SessionLock: a statement queued behind a long query
+	// would otherwise hold back every query on its table meanwhile. A migration that
+	// times out is rolled back (or, not transactional, left where it stopped) and
+	// retried.
+	MigrateLockTimeout string
+	// MigrateLockReset puts the session's lock wait back after a migration on one
+	// connection (MigrateInTx false), before the connection returns to the pool.
+	MigrateLockReset string
+	// LockTimedOut reports whether err is MigrateLockTimeout's timeout.
+	LockTimedOut func(err error) bool
+	// AlreadyApplied reports whether a migration statement failed only because an
+	// interrupted earlier run of a non-transactional migration had applied it (a
+	// column that exists already), so a retry goes on past it.
+	AlreadyApplied func(err error) bool
 }

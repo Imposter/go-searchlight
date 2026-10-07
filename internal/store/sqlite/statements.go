@@ -32,9 +32,9 @@ var changelog = dialect.Changelog{
 	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	Write:         write,
-	ChangesAfter:  "SELECT seq, kind, id, payload, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	ChangesAfter:  "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
-	ScanDocuments: "SELECT id, body, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanDocuments: "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
 	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
@@ -45,12 +45,12 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 		r := &w.Changes[i]
 		out = append(out, dialect.Stmt{
 			What: "insert changes", SQL: insertChange,
-			Args: []any{r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, r.At, r.IndexUID, r.MappingVersion},
+			Args: []any{r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, dialect.Blob(r.PayloadZ), r.At, r.IndexUID, r.MappingVersion},
 		})
 	}
 	for i := range w.Documents {
 		r := &w.Documents[i]
-		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, r.Seq}})
+		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq}})
 	}
 	for i := range w.Queries {
 		r := &w.Queries[i]
@@ -70,27 +70,29 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 }
 
 const (
-	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	upsertDocument = "INSERT INTO sl_documents (index_name, shard, id, body, seq) VALUES (?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, seq = excluded.seq"
+	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	upsertDocument = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq"
 	upsertQuery    = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq"
 	deleteDocument = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
 	deleteQuery    = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
 )
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetDocument: "SELECT body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?",
 }
 
 var registry = dialect.Registry{
-	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, heartbeat_at, started_at) VALUES (?, ?, ?, ?, NOW, NOW)
-ON CONFLICT (node_id) DO UPDATE SET address = excluded.address, version = excluded.version, capacity = excluded.capacity, heartbeat_at = excluded.heartbeat_at`),
-	RemoveNode:  "DELETE FROM sl_nodes WHERE node_id = ?",
-	Nodes:       withNow("SELECT node_id, address, version, capacity, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
-	IndexExists: "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",
-	Slots:       withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot"),
-	NextEpoch:   dialect.Returning{Read: "UPDATE sl_counter SET value = value + 1 WHERE id = 2 RETURNING value"},
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, heartbeat_at, started_at) VALUES (?, ?, ?, ?, ?, NOW, NOW)
+ON CONFLICT (node_id) DO UPDATE SET address = excluded.address, version = excluded.version, capacity = excluded.capacity, body_codecs = excluded.body_codecs, heartbeat_at = excluded.heartbeat_at`),
+	RemoveNode:    "DELETE FROM sl_nodes WHERE node_id = ?",
+	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	Features:      "SELECT name, enabled_at FROM sl_features",
+	EnableFeature: withNow("INSERT INTO sl_features (name, enabled_at) VALUES (?, NOW) ON CONFLICT (name) DO NOTHING"),
+	IndexExists:   "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",
+	Slots:         withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? AND shard = ? ORDER BY slot"),
+	NextEpoch:     dialect.Returning{Read: "UPDATE sl_counter SET value = value + 1 WHERE id = 2 RETURNING value"},
 	// The conflict update's WHERE leaves a slot another node holds under a
 	// live lease untouched, and RETURNING then returns no row.
 	Claim: dialect.Returning{Read: withNow(`INSERT INTO sl_shard_copies (index_name, shard, slot, node_id, state, applied_seq, lease_until, epoch)

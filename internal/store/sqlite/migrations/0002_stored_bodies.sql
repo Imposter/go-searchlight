@@ -1,5 +1,0 @@
--- Searchlight schema v2: a document's body and a change's payload are stored either
--- as the JSON itself (text) or as a codec byte followed by its encoding (zstd;
--- internal/store/codec.go), a blob, which the columns' text affinity keeps as it is.
--- Nothing changes in the tables; the version tells a binary that cannot read the
--- encoded bodies to refuse the database.

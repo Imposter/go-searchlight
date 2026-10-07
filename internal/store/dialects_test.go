@@ -18,6 +18,11 @@ func optionalStatements(d *dialect.Dialect) map[string]bool {
 		// The session lock is for engines without transactional DDL.
 		"Maintenance.SessionLock":   !m.MigrateInTx,
 		"Maintenance.SessionUnlock": !m.MigrateInTx,
+		// A lock timeout is for engines whose DDL queues behind queries (not
+		// SQLite, whose writer lock excludes them), and resetting it for one set on
+		// a pooled session.
+		"Maintenance.MigrateLockTimeout": d.Name != "sqlite",
+		"Maintenance.MigrateLockReset":   d.Name != "sqlite" && !m.MigrateInTx,
 	}
 }
 
@@ -63,6 +68,12 @@ func TestStatementTables(t *testing.T) {
 				case func(*dialect.Write, dialect.Limits) []dialect.Stmt:
 					if x == nil {
 						t.Errorf("%s: %s is nil", scheme, name)
+					}
+				case func(error) bool:
+					// Optional: LockTimedOut comes with MigrateLockTimeout, and
+					// AlreadyApplied with non-transactional DDL.
+					if (x == nil) == (d.Name != "sqlite") && (name == "Maintenance.LockTimedOut" || !d.Maintenance.MigrateInTx) {
+						t.Errorf("%s: %s set = %v", scheme, name, x != nil)
 					}
 				case dialect.Limits, bool:
 				default:

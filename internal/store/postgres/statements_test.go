@@ -1,19 +1,19 @@
 package postgres
 
 import (
-	"bytes"
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
-// writeSQL takes 28 arguments, numbered once each.
+// writeSQL takes 30 arguments, numbered once each.
 func TestWriteSQLPlaceholders(t *testing.T) {
 	got := regexp.MustCompile(`\$\d+`).FindAllString(writeSQL, -1)
-	want := make([]string, 28)
+	want := make([]string, 30)
 	for i := range want {
 		want[i] = fmt.Sprintf("$%d", i+1)
 	}
@@ -22,7 +22,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 	}
 	w := &dialect.Write{Counter: 7}
 	st := write(w, limits)
-	if len(st) != 1 || len(st[0].Args) != 28 {
+	if len(st) != 1 || len(st[0].Args) != 30 {
 		t.Fatalf("an empty write: %d statements, %d args", len(st), len(st[0].Args))
 	}
 	for i, a := range st[0].Args {
@@ -43,10 +43,10 @@ func TestWriteParts(t *testing.T) {
 		Notify:          []string{"n1", "n2"},
 	}
 	for i := range 10 {
-		w.Changes = append(w.Changes, dialect.ChangeRow{Seq: int64(90 + i), Index: "i", ID: fmt.Sprint("c", i), Payload: bytes.Repeat([]byte("p"), 40)})
+		w.Changes = append(w.Changes, dialect.ChangeRow{Seq: int64(90 + i), Index: "i", ID: fmt.Sprint("c", i), Payload: strings.Repeat("p", 40)})
 	}
 	for i := range 3 {
-		w.Documents = append(w.Documents, dialect.DocumentRow{Index: "i", ID: fmt.Sprint("d", i), Body: bytes.Repeat([]byte("b"), 40), Seq: int64(i)})
+		w.Documents = append(w.Documents, dialect.DocumentRow{Index: "i", ID: fmt.Sprint("d", i), Body: strings.Repeat("b", 40), Seq: int64(i)})
 	}
 	parts := write(w, dialect.Limits{Bytes: 120}) // three 40-byte rows a part
 	if len(parts) != 4 {
@@ -56,11 +56,11 @@ func TestWriteParts(t *testing.T) {
 	var docs []string
 	for p, st := range parts {
 		a := st.Args
-		if st.SQL != writeSQL || a[26] != int64(99) {
-			t.Fatalf("part %d: counter %v", p, a[26])
+		if st.SQL != writeSQL || a[28] != int64(99) {
+			t.Fatalf("part %d: counter %v", p, a[28])
 		}
 		seqs = append(seqs, column[int64](t, a[0])...)
-		docs = append(docs, column[string](t, a[11])...)
+		docs = append(docs, column[string](t, a[12])...)
 		wantDeletes, wantNotify := 0, 0
 		if p == 0 {
 			wantDeletes = 2
@@ -68,10 +68,10 @@ func TestWriteParts(t *testing.T) {
 		if p == len(parts)-1 {
 			wantNotify = 2
 		}
-		if n := len(column[string](t, a[22])); n != wantDeletes {
+		if n := len(column[string](t, a[24])); n != wantDeletes {
 			t.Errorf("part %d: %d document deletes", p, n)
 		}
-		if n := len(column[string](t, a[27])); n != wantNotify {
+		if n := len(column[string](t, a[29])); n != wantNotify {
 			t.Errorf("part %d: %d notifications", p, n)
 		}
 	}

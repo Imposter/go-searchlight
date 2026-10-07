@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // migration is one embedded NNNN_name.sql file.
@@ -82,6 +84,15 @@ type execer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// Migration retries: a migration whose DDL timed out waiting for a table lock
+// (Maintenance.MigrateLockTimeout) is tried again, up to migrateAttempts times, after
+// a pause growing from migrateRetryBase to migrateRetryCap.
+const (
+	migrateAttempts  = 10
+	migrateRetryBase = time.Second
+	migrateRetryCap  = 10 * time.Second
+)
+
 func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	ctx, end := s.start(ctx, "migrate")
 	defer end(&err)
@@ -92,6 +103,24 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	timedOut := s.d.Maintenance.LockTimedOut
+	wait := migrateRetryBase
+	for attempt := 1; ; attempt++ {
+		err = s.migrateOnce(ctx, ms)
+		if err == nil || timedOut == nil || !timedOut(err) || attempt == migrateAttempts {
+			return err
+		}
+		s.log.WarnContext(ctx, "a migration timed out waiting for a table lock that queries hold; retrying",
+			slog.Int("attempt", attempt), slog.Duration("wait", wait), slog.Any("error", err))
+		if err := s.clock.Sleep(ctx, wait); err != nil {
+			return err
+		}
+		wait = min(2*wait, migrateRetryCap)
+	}
+}
+
+// migrateOnce applies the pending migrations under the migration lock.
+func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
 	m := &s.d.Maintenance
 	if m.MigrateInTx {
 		tx, err := s.w.BeginTx(ctx, nil)
@@ -104,7 +133,12 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 				return fmt.Errorf("migration lock: %w", err)
 			}
 		}
-		if err := s.migrateOn(ctx, tx, ms); err != nil {
+		if m.MigrateLockTimeout != "" {
+			if _, err := tx.ExecContext(ctx, m.MigrateLockTimeout); err != nil {
+				return fmt.Errorf("migration lock timeout: %w", err)
+			}
+		}
+		if err := s.migrateOn(ctx, tx, ms, false); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -126,12 +160,24 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 		var released sql.NullInt64
 		_ = conn.QueryRowContext(context.WithoutCancel(ctx), m.SessionUnlock).Scan(&released)
 	}()
-	return s.migrateOn(ctx, conn, ms)
+	if m.MigrateLockTimeout != "" {
+		if _, err := conn.ExecContext(ctx, m.MigrateLockTimeout); err != nil {
+			return fmt.Errorf("migration lock timeout: %w", err)
+		}
+		defer func() {
+			if _, err := conn.ExecContext(context.WithoutCancel(ctx), m.MigrateLockReset); err != nil {
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn }) // not back into the pool
+			}
+		}()
+	}
+	return s.migrateOn(ctx, conn, ms, true)
 }
 
 // migrateOn applies the pending migrations, recording each version as it
-// completes.
-func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration) error {
+// completes. resumable says a migration may have been interrupted part way (DDL is
+// not transactional): a statement failing only because it was applied then is
+// passed over.
+func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration, resumable bool) error {
 	if _, err := ex.ExecContext(ctx, s.d.Maintenance.VersionTable); err != nil {
 		return fmt.Errorf("create version table: %w", err)
 	}
@@ -166,8 +212,9 @@ func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration) err
 		if applied[m.version] {
 			continue
 		}
+		applied := s.d.Maintenance.AlreadyApplied
 		for i, st := range m.stmts {
-			if _, err := ex.ExecContext(ctx, st); err != nil {
+			if _, err := ex.ExecContext(ctx, st); err != nil && (!resumable || applied == nil || !applied(err)) {
 				return fmt.Errorf("migration %s statement %d: %w", m.name, i+1, err)
 			}
 		}

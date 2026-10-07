@@ -138,8 +138,14 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	// Validate here, so a bad change fails only this caller.
-	p, err := prepare(batch)
+	// Validate (and compress) here, in the caller's goroutine, so a bad change
+	// fails only this caller.
+	var p *prepared
+	if pa, ok := g.st.(preparedApplier); ok {
+		p, err = pa.prepare(batch)
+	} else {
+		p, err = prepare(batch, false)
+	}
 	if err != nil {
 		return 0, 0, err
 	}
@@ -403,8 +409,10 @@ func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 	return changes, nil
 }
 
-// preparedApplier is the store's Apply without re-validation.
+// preparedApplier is the store's Apply split in two: prepare validates and encodes a
+// batch, and applyPrepared commits it without doing that again.
 type preparedApplier interface {
+	prepare(batch []Change) (*prepared, error)
 	applyPrepared(ctx context.Context, batch []Change, p *prepared) (int64, int64, error)
 }
 

@@ -42,6 +42,8 @@ type sqlStore struct {
 	attr   attribute.KeyValue
 	chunk  int
 	closed atomic.Bool
+	// compress makes Apply store document bodies compressed (CompressBodies).
+	compress atomic.Bool
 
 	// beforeCommit, when set (tests only), runs inside Apply's transaction
 	// after the changes are written and before COMMIT.
@@ -324,30 +326,43 @@ func rollback(tx *sql.Tx) { _ = tx.Rollback() }
 // prepared is a validated batch with its stored payloads (encodeBody). The prepared
 // forms of several requests concatenate (GroupCommitter).
 type prepared struct {
-	payload     [][]byte
+	payload     []storedBody
 	query       []QueryPayload // KindQueryUpsert only
 	conditional bool
+	// bytes is the stored payloads' size.
+	bytes int
 }
 
 func (p *prepared) append(q *prepared) {
 	p.payload = append(p.payload, q.payload...)
 	p.query = append(p.query, q.query...)
 	p.conditional = p.conditional || q.conditional
+	p.bytes += q.bytes
 }
 
-// prepare validates a batch and reports the first bad change as a
-// *ChangeError with its position in batch.
-func prepare(batch []Change) (*prepared, error) {
-	p := &prepared{payload: make([][]byte, len(batch)), query: make([]QueryPayload, len(batch))}
+// prepare validates a batch, compressing its document bodies when compress is set,
+// and reports the first bad change as a *ChangeError with its position in batch. It
+// runs in the caller's goroutine, outside any transaction.
+func prepare(batch []Change, compress bool) (*prepared, error) {
+	p := &prepared{payload: make([]storedBody, len(batch)), query: make([]QueryPayload, len(batch))}
 	for i := range batch {
-		if err := p.prepareOne(i, &batch[i]); err != nil {
+		if err := p.prepareOne(i, &batch[i], compress); err != nil {
 			return nil, &ChangeError{Position: i, Err: err}
 		}
+		p.bytes += p.payload[i].size()
 	}
 	return p, nil
 }
 
-func (p *prepared) prepareOne(i int, c *Change) error {
+// prepare is prepare with the store's choice of compression.
+func (s *sqlStore) prepare(batch []Change) (*prepared, error) {
+	return prepare(batch, s.compress.Load())
+}
+
+// CompressBodies sets whether Apply stores document bodies compressed from now on.
+func (s *sqlStore) CompressBodies(on bool) { s.compress.Store(on) }
+
+func (p *prepared) prepareOne(i int, c *Change, compress bool) error {
 	if err := validShard(c.ShardID()); err != nil {
 		return err
 	}
@@ -371,7 +386,7 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
 		}
-		p.payload[i] = encodeBody(c.Payload)
+		p.payload[i] = encodeBody(c.Payload, compress)
 	case KindQueryUpsert:
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
@@ -384,12 +399,11 @@ func (p *prepared) prepareOne(i int, c *Change) error {
 			q.Meta = json.RawMessage("{}")
 		}
 		p.query[i] = q
-		p.payload[i] = c.Payload
+		p.payload[i] = storedBody{plain: string(c.Payload)}
 	case KindDelete, KindQueryDelete:
 		if len(c.Payload) != 0 {
 			return invalidf("%s carries a payload", c.Kind)
 		}
-		p.payload[i] = []byte{}
 	}
 	return nil
 }
@@ -398,7 +412,7 @@ func (s *sqlStore) Apply(ctx context.Context, batch []Change) (first, last int64
 	if len(batch) == 0 {
 		return 0, 0, nil
 	}
-	p, err := prepare(batch)
+	p, err := s.prepare(batch)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -495,8 +509,8 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		c := &batch[i]
 		st := idx[c.Index]
 		w.Changes[i] = dialect.ChangeRow{
-			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID, Payload: p.payload[i],
-			At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion,
+			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID,
+			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion,
 		}
 	}
 	netState(w, batch, p, first)
@@ -694,7 +708,7 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 		seq := first + int64(i)
 		switch c.Kind {
 		case KindUpsert:
-			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i], Seq: seq})
+			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i].plain, BodyZ: p.payload[i].z, Seq: seq})
 		case KindQueryUpsert:
 			w.Queries = append(w.Queries, dialect.QueryRow{
 				Index: c.Index, Shard: c.Shard, ID: c.ID, Query: string(p.query[i].Query), Meta: string(p.query[i].Meta), Seq: seq,
@@ -771,16 +785,17 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	for rows.Next() {
 		c := Change{Index: shard.Index, Shard: shard.Shard}
 		var kind string
-		var payload []byte
+		var payload, payloadZ []byte
 		var at int64
-		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &at, &c.IndexUID, &c.MappingVersion); err != nil {
+		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &payloadZ, &at, &c.IndexUID, &c.MappingVersion); err != nil {
 			return nil, err
 		}
 		c.Kind = Kind(kind)
-		if len(payload) > 0 {
-			if c.Payload, err = decodeBody(payload); err != nil {
-				return nil, fmt.Errorf("%s seq %d: %w", shard, c.Seq, err)
-			}
+		if c.Payload, err = readBody(payload, payloadZ); err != nil {
+			return out, &CorruptError{Shard: shard, Seq: c.Seq, ID: c.ID, Err: err}
+		}
+		if len(c.Payload) == 0 {
+			c.Payload = nil
 		}
 		c.At = millis(at)
 		out = append(out, c)
@@ -839,13 +854,15 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanDocuments, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordDocument, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
-		var stored []byte
-		if err := rows.Scan(&r.ID, &stored, &r.Seq); err != nil {
+		var plain, z []byte
+		if err := rows.Scan(&r.ID, &plain, &z, &r.Seq); err != nil {
 			return r, err
 		}
 		var err error
-		r.Body, err = decodeBody(stored)
-		return r, err
+		if r.Body, err = readBody(plain, z); err != nil {
+			return r, &CorruptError{Shard: shard, Seq: r.Seq, ID: r.ID, Err: err}
+		}
+		return r, nil
 	}, fn); err != nil {
 		return 0, err
 	}

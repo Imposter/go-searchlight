@@ -195,7 +195,7 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 			batch[sh] = Change{Index: m.Name, Shard: sh, Kind: KindMapping, ID: MappingChangeID}
 			w.Changes[sh] = dialect.ChangeRow{
 				Seq: counter + 1 + int64(sh), Index: m.Name, Shard: sh, Kind: string(KindMapping), ID: MappingChangeID,
-				Payload: m.Mapping, At: nowMs, IndexUID: uid, MappingVersion: mappingVersion,
+				Payload: string(m.Mapping), At: nowMs, IndexUID: uid, MappingVersion: mappingVersion,
 			}
 		}
 		if w.Notify, err = s.notifications(batch, counter+1); err != nil {

@@ -501,15 +501,17 @@ func testPartition(t *testing.T, d *db, stepClock bool) {
 		t.Fatal("node-0 holds no lease")
 	}
 	// peerServes reports whether tn's copy serves peers now: what a peer's read of it
-	// gets. A read it serves is held to the serving invariant, as the peer API's are.
+	// gets, through the peer API's own admission (peerAPI.target), stale allowed. A read
+	// it serves is held to the serving invariant by the served hook, at the readings the
+	// copy was judged at: readings taken before the copy's checks would date a read
+	// admitted at the quarantine's end to before it.
 	peerServes := func(tn *tnode) bool {
-		began, wall := tn.n.lc.Now(), tn.n.lc.Wall()
-		tg, err := tn.n.LocalTarget(context.Background(), "sb", 0, 0)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", nil)
+		tg, err := tn.n.peer.target(req, shardRef{Index: "sb", Shard: 0, AllowStale: true})
 		if err != nil {
 			return false
 		}
 		tg.Release()
-		c.checkServed(tn, id, began, wall)
 		return true
 	}
 

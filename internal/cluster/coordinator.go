@@ -157,6 +157,12 @@ type Options struct {
 	Tracer trace.Tracer
 	Meter  metric.Meter
 
+	// HoldRecovery is test-only (nil in production): when set, every recovery of a copy
+	// but the first this node starts waits for it before it fetches anything, and an
+	// error ends that recovery. The chaos suite kills a node mid-recovery with it
+	// (cmd/searchlight sets it from SEARCHLIGHT_TEST_HOLD_RECOVERY).
+	HoldRecovery func(ctx context.Context) error
+
 	// hooks are test seams; nil outside tests.
 	hooks *testHooks
 }

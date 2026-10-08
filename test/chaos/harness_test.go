@@ -183,6 +183,9 @@ type member struct {
 	// bulks counts the _bulk requests in flight on it.
 	bulks atomic.Int64
 	log   *os.File
+	// holdRecovery is the node's SEARCHLIGHT_TEST_HOLD_RECOVERY file: while it exists,
+	// every copy recovery but the first the process starts waits.
+	holdRecovery string
 }
 
 // newCluster starts n nodes of bin (the newVersion build when empty) with extra
@@ -227,15 +230,17 @@ func (c *cluster) launch(i int, bin string, extra []string) *member {
 	if err != nil {
 		c.t.Fatal(err)
 	}
+	hold := filepath.Join(dir, "hold-recovery")
 	n, err := slproc.Launch(c.t.Context(), slproc.Options{
 		Bin: bin, Dir: dir, StoreURL: c.store, NodeID: fmt.Sprintf("chaos-%d", i+1),
 		Token: apiToken, ClusterToken: clusterToken, Settings: append(slices.Clone(nodeSettings), extra...), Log: logFile,
+		Env: []string{"SEARCHLIGHT_TEST_HOLD_RECOVERY=" + hold},
 	})
 	if err != nil {
 		_ = logFile.Close()
 		c.t.Fatal(err)
 	}
-	return &member{Node: n, i: i, log: logFile}
+	return &member{Node: n, i: i, log: logFile, holdRecovery: hold}
 }
 
 func (c *cluster) close() {

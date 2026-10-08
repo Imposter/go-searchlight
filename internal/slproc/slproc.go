@@ -80,6 +80,10 @@ type Options struct {
 	Log io.Writer
 	// ReadyTimeout bounds waiting for a start; 0 means 5 minutes.
 	ReadyTimeout time.Duration
+	// Env are further environment variables for the node, each "NAME=value", set
+	// after the parent's SEARCHLIGHT_* variables are removed (test-only knobs such
+	// as SEARCHLIGHT_TEST_HOLD_RECOVERY).
+	Env []string
 }
 
 // Node is a searchlight child process.
@@ -222,7 +226,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	logs := newLogs(n.opts.Log)
 	cmd := exec.Command(n.opts.Bin, n.args()...) //nolint:gosec,noctx // the binary under test, started on purpose and outliving ctx
-	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "SEARCHLIGHT_") })
+	cmd.Env = append(slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "SEARCHLIGHT_") }), n.opts.Env...)
 	cmd.Stderr = logs
 	cmd.Stdout = io.Discard
 	prepareInterrupt(cmd)

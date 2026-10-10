@@ -639,9 +639,10 @@ func waitCopyState(t testing.TB, st store.Store, id ShardID, want store.CopyStat
 
 // TestBackpressureIsRetried: a shard that refuses every batch's first try with a full
 // buffer makes the tailer refresh, wait for that refresh, and retry, never halt, until
-// everything is applied. The refusal is forced (beforeApply): a real full buffer also
-// wakes the shard's own background refresh, which can drain it before the tailer's next
-// batch arrives, so load alone never reliably produces one.
+// everything is applied: a retry (the call after a forced refusal) finds everything
+// applied so far searchable. The refusal is forced (beforeApply): a real full buffer
+// also wakes the shard's own background refresh, which can drain it before the tailer's
+// next batch arrives, so load alone never reliably produces one.
 func TestBackpressureIsRetried(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		st := d.open(t)
@@ -651,14 +652,14 @@ func TestBackpressureIsRetried(t *testing.T) {
 		opts := testOptions()
 		opts.BatchSize = 7
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
-		var calls, forced atomic.Int64
+		var forced atomic.Int64
+		var lastForced atomic.Bool
 		opts.hooks = &testHooks{beforeApply: func(sh *shard.Shard) error {
-			if calls.Add(1)%2 == 1 {
+			if !lastForced.Swap(true) {
 				forced.Add(1)
 				return fmt.Errorf("%w: forced by the test", shard.ErrBackpressure)
 			}
-			// The retry follows the tailer's drain, which waits for its refresh:
-			// everything applied so far is searchable.
+			lastForced.Store(false)
 			if r, a := sh.RefreshedSeq(), sh.AppliedSeq(); r != a {
 				t.Errorf("retried with refreshed seq %d, applied %d: the drain did not wait for its refresh", r, a)
 			}

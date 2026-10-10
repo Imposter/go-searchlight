@@ -41,9 +41,8 @@ This design makes that cheap and safe:
    - One node per shard restores it, under a restore claim on its copy row.
    - The others wait for that copy to serve, then copy from it.
    - A per-node recovery cap bounds heap, database load and peer load: 2 recoveries at once, and recovery bandwidth capped by `recovery_budget`, configurable, like Elasticsearch's `indices.recovery.max_bytes_per_sec`.
-     - The operator decided a default of 40 MB/s, which is `40MiB` per second, as Elasticsearch's `40mb` is.
-     - At that cap, T9b's 30 s bound at 1M docs, and T8, both fail (E, §4.3). Meeting them needs at least 64 MiB/s, and 80 MiB/s leaves headroom.
-     - §13 flags this for the operator.
+     - The default is **80 MiB/s** per node, in each direction. It is the lowest round value that meets T9b (≤ 30 s at 1M docs) with headroom, ≈ 17–24 s (E, §4.3).
+     - A first default of 40 MB/s was rejected: it fails T9b and T8 (§13.3).
 5. **Readiness lets a cold start take writes.** A copy whose shard had no serving copy anywhere when it was claimed does not hold its node's readiness back. Pods join the Service, writes commit to SQL, and reads of a dark shard answer 503 with `Retry-After: 5`.
 6. **Identity churn is cleaned up.**
    - The leader reaps `sl_nodes` rows silent for 1 h.
@@ -408,7 +407,7 @@ Chunking already exists: 1 MiB chunks in `sl_blob_chunks` (`store.DefaultBlobChu
 **Expected time (E).**
 - **Data volume.** At 1M docs, about 1.6 GB per full copy (M, [spike]: 1.58 GB/M) for a node that holds every shard.
 - **Uncapped.** The store's own read path has a target of **≥ 150 MB/s** per node from Postgres (T), which gives ≈ 11 s. The spike's 37 MB/s was HDD- and Windows-bound (M).
-- **Capped.** Bundle downloads count against `recovery_budget` (§4.3), so a restore runs at the lower of the cap and the store. At the operator's 40 MiB/s default that is ≈ 38 s of transfer at 1M docs. §4.3 works this through against T9b.
+- **Capped.** Bundle downloads count against `recovery_budget` (§4.3), so a restore runs at the lower of the cap and the store. At the 80 MiB/s default that is ≈ 15–19 s of transfer at 1M docs. §4.3 works this through against T9b.
 
 ### 3.3 Readiness rules
 
@@ -480,27 +479,29 @@ The value is a target to tune with §11's runs.
   - incoming bytes: peer fetches and bundle downloads;
   - outgoing bytes: snapshot streams this node serves.
 - **Not capped:** `ScanShard` loads (rows, CPU-bound, already gated by the slot), and bundle **uploads**, which have `bundle_budget`.
-- **Default decided:** 40 MB/s, written `40MiB` per second, as Elasticsearch's `40mb` is.
+- **Default: `80MiB` per second** per node, in each direction. The coordinator ruled on 2026-10-10 (§13.3).
+  - The operator decided two things: recovery bandwidth is capped by default and configurable, and T9b is a release blocker graded with the shipped defaults.
+  - A first default of 40 MB/s, Elasticsearch's `40mb`, came from the coordinator, not the operator. It fails T9b (below), so the operator's T9b decision wins and the default is the lowest round value that meets T9b with headroom.
 
-**Check against T9b (≤ 30 s at 1M docs per node).** The decided default does not meet it:
+**Check against T9b (≤ 30 s at 1M docs per node):**
 
 | Item | Value |
 |---|---|
 | Bytes to fetch, node holding every shard at 1M docs | 1.29 GB fully merged (1.2 GiB, [ops]) to 1.58 GB freshly loaded (M, [spike]) |
-| Transfer time at 40 MiB/s (41.9 MB/s) | 31–38 s (E) |
-| Plus open, replay and the registry update | ≈ 2–5 s (E). The spike's peer path spent ≈ 0.5 s outside transfer at 200k (M), and replay is at most two intervals of writes, near zero in the idle bench |
-| **T9b at 40 MiB/s** | **≈ 33–43 s: FAIL** (E) |
-| Cap that meets 30 s, with 5 s left for open and replay | 1.58 GB / 25 s = 63 MB/s → **at least 64 MiB/s** |
-| Cap with headroom | **80 MiB/s**: 1.58 GB in ≈ 19 s, ≈ 24 s in all (E) |
+| Plus open, replay and the registry update | ≈ 2–5 s (E). The spike's peer path spent ≈ 0.5 s outside transfer at 200k (M). Replay is at most two intervals of writes, near zero in the idle bench |
+| Cap that just meets 30 s, with 5 s left for open and replay | 1.58 GB / 25 s = 63 MB/s → at least 64 MiB/s |
+| At 40 MiB/s (41.9 MB/s), rejected | 31–38 s of transfer, ≈ 33–43 s in all: **FAIL** (E) |
+| **At 80 MiB/s (83.9 MB/s), shipped** | 15–19 s of transfer, **≈ 17–24 s in all: PASS** with ≈ 6 s of headroom (E) |
 
-The same cap also regresses **T8**:
-- Today Searchlight's peer recovery at 1M is 11.6 s against Elasticsearch's 29.1 s (M, [bench]), uncapped.
-- At 40 MiB/s it would be ≈ 33–43 s, above Elasticsearch's, so T8 fails too (E).
-- At 80 MiB/s it is ≈ 24 s and passes.
+**T8 holds too.**
+- Today Searchlight's peer recovery at 1M takes 11.6 s, uncapped, against Elasticsearch's 29.1 s (M, [bench]).
+- At 80 MiB/s it is ≈ 17–24 s, still under Elasticsearch's (E). At 40 MiB/s it would have been ≈ 33–43 s, over it.
 
-T8 and T9b are release blockers graded with the shipped defaults (§1), so this is a conflict for the operator (§13):
-- **Recommended:** ship `recovery_budget=80MiB`.
-- **Or** keep 40 MiB/s and grade T8 and T9b with the cap off. The bench would then no longer measure what ships.
+**What the cap still buys.**
+- At 80 MiB/s, a serving peer streams at most about 84 MB/s of snapshots, against the ≥ 130 MB/s an uncapped 1M recovery reached on CI (E, from 1.5 GB in 11.6 s). That leaves disk and network for searches during rolling restarts (risk R4), and the search-p99 bench row checks it.
+- An operator with faster disks and network raises it, or sets `0` for unlimited. One with slower ones lowers it, at the cost of T9b on their hardware.
+
+The bench grades T8, T9b and T12 with this default (§11.2). If the CI measurements in SN-14 show T9b above 30 s at 80 MiB/s, raising the default is the fix, not grading with the cap off.
 
 At 10M docs, T9b's other bound (≤ Elasticsearch peer recovery) is measured, not derived. Elasticsearch runs under its own `max_bytes_per_sec` in that run.
 
@@ -744,7 +745,7 @@ The migration is rolling-safe, with no full stop at any point. One node is down 
 
 **Cost.** Phase B costs one full peer copy per node, each step while the others serve:
 - 11.6 s at 1M docs on CI uncapped (M, [bench] T8);
-- ≈ 24 s at an 80 MiB/s `recovery_budget`, or ≈ 33–43 s at 40 MiB/s (E, §4.3).
+- ≈ 17–24 s at the default 80 MiB/s `recovery_budget` (E, §4.3).
 
 **Rollback:**
 - From phase B or C, delete the StatefulSet with `--cascade=orphan` again, and apply the old manifest. While the PVCs still exist, pods reattach them and reopen, or rebuild if pruned past.
@@ -903,9 +904,9 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 | R2 | **Database volume.** Uploads go through WAL or binlog, replicas and PITR archives, plus TOAST and vacuum churn | Incremental uploads cut it. Size it in operations.md (§2.8). `searchlight_bundle_upload_bytes_total` shows it |
 | R3 | **Prune floor coupling.** A stuck uploader would hold `sl_changes`. The cap releases it after 1 h, but then the shard has no usable bundle until uploads resume | `bundle_max_hold` (1 h). The hold-nearing-cap and floor-released alerts. The bundle-age alert |
 | R4 | **Peer load on rolling restarts.** Every pod restart copies the whole index from peers: 1.6 GB per 1M docs | `recovery_concurrency` (outgoing). `recovery_budget` on by default. The search-p99 bench row |
-| R4b | **The decided 40 MiB/s `recovery_budget` breaks release blockers.** T9b (≤ 30 s at 1M) and T8 (≤ Elasticsearch, 29.1 s at 1M) both fail at ≈ 33–43 s (E, §4.3) | Ship 80 MiB/s (≈ 24 s, E), or grade with the cap off. This needs the operator's choice (§13) |
+| R4b | **Closed 2026-10-10.** A 40 MiB/s `recovery_budget` would have broken T9b and T8 at 1M (≈ 33–43 s, E) | The coordinator's ruling: the default is 80 MiB/s, ≈ 17–24 s (E), and the bench grades the shipped defaults. The operator's decision that T9b is a release blocker outranks a coordinator default (§4.3, §13.3). What remains is measurement risk, covered by R10 and SN-14 |
 | R5 | **Ready during a dark start.** The PDB counts those pods ready. A drain during a cold start can evict a restorer, whose claim then lapses and restarts elsewhere | Document: no node-pool operations during a cold start. Watch `searchlight_cluster_dark_shards`. Claims make an eviction cost time, never correctness |
-| R6 | **Cold-start outage grows with index size.** Reads of a dark shard 503 for one restore. At 1M docs that is about 11 s per node-index uncapped, ≈ 24 s at 80 MiB/s, or ≈ 38 s at 40 MiB/s (E). Writes stay up | Herd control, bundles every minute (short replay), parallel downloads. Stagger node-pool upgrades |
+| R6 | **Cold-start outage grows with index size.** Reads of a dark shard 503 for one restore. At 1M docs that is about 17–24 s per node-index at the default 80 MiB/s, or about 11 s uncapped (E). Writes stay up | Herd control, bundles every minute (short replay), parallel downloads. Stagger node-pool upgrades |
 | R7 | **Large files restart from zero.** A `Put` or `Get` of a multi-GB segment interrupted mid-file starts over | `GetAt` ranges make restore downloads resumable per range. Upload resumability is left out (rounds retry), and is revisited if R1 measurements show long uploads failing |
 | R8 | **`emptyDir` eviction.** A pod over `sizeLimit` is evicted, then restores elsewhere, and can loop if mis-sized | The sizing formula (§7.1). The free-bytes metric and alert |
 | R9 | **Claims depend on lease timing.** Like copy leases, claims assume bounded clock-rate drift within `LeaseMargin` | The same margin and local-deadline discipline as copies. Restores verify everything, so a fencing bug costs a fallback, not a corrupt copy |
@@ -922,7 +923,7 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 | `bundle_concurrency` | `2` | New |
 | `bundle_gc_grace` | `1h` | New |
 | `recovery_concurrency` | `2` | New |
-| `recovery_budget` | `40MiB` per second per node, in and out separately (`0` = unlimited) | New. The default was decided 2026-10-10. It fails T9b and T8 at 1M, and 80 MiB/s is needed (§4.3, §13) |
+| `recovery_budget` | **`80MiB`** per second per node, in and out separately (`0` = unlimited) | New. Capped by default and configurable (operator). 80 MiB/s is the lowest round value that meets T9b with headroom (coordinator's ruling, §4.3, §13.3) |
 | `bundle_max_hold` | `1h` | New: the longest a manifest holds the changelog's prune floor (§2.5) |
 | `restore_streams` | `4` | New |
 | `restore_stall_timeout` | `2m` | New |
@@ -945,7 +946,7 @@ The draft's open questions were answered by the operator on 2026-10-10. Each is 
 | Q2 | Migration 3 and rollback | Migration 3, with the claim columns `bundle_until` and `restore_until`, is accepted. A binary rollback past it needs a database restore. The upgrade docs say so, and the runbook backs up the database first | §2.6, §9, SN-1 |
 | Q3 | `retiring_retention` default | `0s`. Deployments that keep disks set `15m` | §5.2, §9, §12.3 |
 | Q4 | SQLite | Bundles stay off by default. On SQLite an ephemeral `data_dir` rebuilds via `ScanShard` at each start, which is fine for a single node, and is documented | §2.4, §2.8, C14 |
-| Q5 | Recovery bandwidth | Capped by default at 40 MB/s per node (`recovery_budget=40MiB`), like Elasticsearch's `indices.recovery.max_bytes_per_sec`. Configurable | §4.3, §12.3. See 13.3 |
+| Q5 | Recovery bandwidth | Capped by default and configurable, like Elasticsearch's `indices.recovery.max_bytes_per_sec`. The default is **80 MiB/s** per node (`recovery_budget=80MiB`), per the coordinator's ruling in 13.3 | §4.3, §12.3, 13.3 |
 | Q6 | A stuck uploader and the prune floor | The floor leaves out manifests that have held it for more than 1 h (`bundle_max_hold`). The metrics are `searchlight_bundle_hold_seconds` and `searchlight_bundle_floor_released_total`, each with an alert | §2.5, §10, C13 |
 | Q7 | Grading of T9b and T12 | Release blockers: graded in `bench/report/targets.go`, gated in `.github/workflows/bench.yml`, with the shipped defaults | §1, §11.2, SN-14 |
 | Q8 | Where bundles live | In the database. Object storage stays a non-goal. operations.md gains a sizing note: about 1.6–2.1 GB per 1M docs, plus WAL or binlog traffic | §1 non-goals, §2.8, SN-1 |
@@ -966,13 +967,11 @@ The draft's open questions were answered by the operator on 2026-10-10. Each is 
 
 ### 13.3 What the decisions changed in the design
 
-- **Q5 against Q7 is a conflict.**
-  - At the decided 40 MiB/s cap, T9b's 30 s bound at 1M docs fails: ≈ 33–43 s (E, §4.3).
-  - So does T8, today a pass at 11.6 s against Elasticsearch's 29.1 s (M, [bench]).
-  - Both are release blockers graded with the shipped defaults, so the decided default would block the release.
-  - Meeting T9b needs a cap of at least 64 MiB/s, and **80 MiB/s** (≈ 24 s, E) leaves headroom. This design recommends shipping `recovery_budget=80MiB`.
-  - The alternative is to keep 40 MiB/s and grade T8 and T9b with the cap off. The bench would then no longer measure what ships.
-  - The operator picks one before SN-6 lands. Until then the settings table carries the decided 40 MiB/s.
+- **The recovery cap's default is 80 MiB/s, not 40 MB/s** (resolved by the coordinator's ruling, 2026-10-10).
+  - **The conflict.** A 40 MB/s default (`40MiB`, as Elasticsearch's `40mb`) fails T9b's 30 s bound at 1M docs, at ≈ 33–43 s (E, §4.3). It also fails T8, today a pass at 11.6 s against Elasticsearch's 29.1 s (M, [bench]). Both are graded with the shipped defaults.
+  - **Who decided what.** The 40 MB/s figure was the coordinator's default, not the operator's decision. The operator decided only that the cap is on by default and configurable, and separately that T9b is a release blocker graded in the bench. An operator decision outranks a coordinator default, so T9b wins.
+  - **The ruling.** Ship `recovery_budget=80MiB`, the lowest round value that meets T9b with headroom: ≈ 17–24 s at 1M (E). Keep it configurable. Grade the shipped defaults; grading with the cap off was rejected, because the bench must measure what ships.
+  - **Risk R4b is closed.** If SN-14's CI runs show T9b above 30 s at 80 MiB/s, the fix is a higher default.
 - **Q6 is measured as hold, not as the manifest's age.**
   - A manifest stops counting once the oldest change after its seq is more than 1 h old, not once the manifest itself is.
   - With the literal reading, an idle shard's old manifest would stop counting on the first write after a quiet hour. The changelog could then be pruned past it before the next upload, leaving the shard briefly without a usable bundle (§2.5).

@@ -205,16 +205,19 @@ type logWatch struct {
 	lines []map[string]any
 	raw   strings.Builder
 	added chan struct{}
+	// drained is closed once collect has recorded every line written before Close.
+	drained chan struct{}
 }
 
 func newLogWatch() *logWatch {
 	r, w := io.Pipe()
-	l := &logWatch{PipeWriter: w, added: make(chan struct{}, 1)}
+	l := &logWatch{PipeWriter: w, added: make(chan struct{}, 1), drained: make(chan struct{})}
 	go l.collect(r)
 	return l
 }
 
 func (l *logWatch) collect(r io.Reader) {
+	defer close(l.drained)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 1<<20)
 	for sc.Scan() {

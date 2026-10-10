@@ -438,7 +438,9 @@ func (s *Server) wrap(rt *route) http.Handler {
 		fail := func(e *Error) {
 			failure = e
 			if e.Status == http.StatusRequestEntityTooLarge {
-				sw.Header().Set("Connection", "close") // no more requests on this connection
+				if r.ProtoMajor == 1 {
+					sw.Header().Set("Connection", "close") // no more requests on this connection
+				}
 				s.tooLarge.Add(1)
 			}
 			writeProblem(sw, e, id)

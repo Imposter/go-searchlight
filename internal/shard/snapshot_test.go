@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 )
 
 // copySnapshot writes every file of sn into dir, the manifest last, as a peer recovery
@@ -148,24 +149,20 @@ func TestSnapshotHoldsSegmentFiles(t *testing.T) {
 	sn.Release()
 	sn.Release() // idempotent
 	h.refresh()
-	deadline := 50
-	for ; deadline > 0; deadline-- {
-		gone := true
-		for _, n := range names {
-			if n == ManifestName {
-				continue
-			}
-			if _, err := os.Stat(filepath.Join(h.dir, n)); err == nil {
-				gone = false
-			}
-		}
-		if gone {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		h.s.jan.drain()
+		left := slices.DeleteFunc(slices.Clone(names), func(n string) bool {
+			_, err := os.Stat(filepath.Join(h.dir, n))
+			return n == ManifestName || err != nil
+		})
+		if len(left) == 0 {
 			break
 		}
-		h.s.jan.drain()
-	}
-	if deadline == 0 {
-		t.Fatalf("merged-away files %v outlived the snapshot's release: %v", names, dirFiles(t, h.dir))
+		if time.Now().After(deadline) {
+			t.Fatalf("merged-away files %v outlived the snapshot's release: %v", left, dirFiles(t, h.dir))
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if !slices.Contains(dirFiles(t, h.dir), ManifestName) {
 		t.Fatal("no manifest")

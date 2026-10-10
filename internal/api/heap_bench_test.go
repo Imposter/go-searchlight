@@ -74,7 +74,7 @@ func BenchmarkBulkPeakHeap(b *testing.B) {
 		b.Run(fmt.Sprintf("percolate=%v/applying=%v", c.perc, c.applying), func(b *testing.B) {
 			e := newEnv(b, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 5 * time.Minute }})
 			e.validate = false
-			e.must(http.StatusCreated, "PUT", "/indexes/heap", `{"settings": {"shards": 2}}`)
+			e.createIndex("heap", `{"settings": {"shards": 2}}`)
 			// With applying=false the tailers are paused, so the heap measured is
 			// the request's alone (the copies' write buffers are bounded on their
 			// own, by the shard's refresh bytes times its max buffer factor).

@@ -171,10 +171,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, logOut 
 		return interrupted(fmt.Errorf("listen: %w", err))
 	}
 	cfg.AdvertiseAddress = boundAdvertise(cfg.AdvertiseAddress, ln.Addr())
-	n, err := cluster.New(ctx, cluster.Options{
+	copts := cluster.Options{
 		Store: st, Config: cfg, Version: version, Clock: clk,
 		Logger: log, Tracer: tel.Tracer, Meter: tel.Meter,
-	})
+	}
+	if path := getenv(envTestHoldRecovery); path != "" {
+		log.WarnContext(ctx, "test-only recovery hold is set: every copy recovery but the first waits while its file exists", slog.String("file", path))
+		copts.HoldRecovery = holdWhileExists(path, clk)
+	}
+	n, err := cluster.New(ctx, copts)
 	if err != nil {
 		_ = ln.Close()
 		return interrupted(err)
@@ -364,4 +369,23 @@ func healthcheck(args []string, getenv func(string) string, stderr io.Writer) in
 		return 1
 	}
 	return 0
+}
+
+// envTestHoldRecovery names a file: while it exists, every copy recovery but the first
+// this process starts waits (cluster.Options.HoldRecovery). Test-only: the chaos suite
+// (test/chaos) uses it to kill a node mid-recovery. Never set it in production.
+const envTestHoldRecovery = "SEARCHLIGHT_TEST_HOLD_RECOVERY"
+
+// holdWhileExists returns a wait that lasts while path exists, or until ctx ends.
+func holdWhileExists(path string, clk clock.Clock) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		for {
+			if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			if err := clk.Sleep(ctx, 20*time.Millisecond); err != nil {
+				return err
+			}
+		}
+	}
 }

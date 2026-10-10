@@ -94,6 +94,8 @@ type fetcher struct {
 	// (tests, benchmarks).
 	bytes, resumes     atomic.Int64
 	restored, rejected atomic.Int64
+	// started counts the recoveries begun, for Options.HoldRecovery.
+	started atomic.Int64
 	// running are the shards recovering now, with the bytes each has fetched (their
 	// progress, for the prune leader's stall detection).
 	mu      sync.Mutex
@@ -155,6 +157,11 @@ var _ replica.Fetcher = (*fetcher)(nil)
 // Fetch implements replica.Fetcher: it fills dir with a serving peer's copy of id or,
 // when no peer can serve it, with the newest usable recovery bundle of id (bundle.go).
 func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) (string, error) {
+	if hold := f.n.opts.HoldRecovery; hold != nil && f.started.Add(1) > 1 {
+		if err := hold(ctx); err != nil {
+			return "", err
+		}
+	}
 	progress, end := f.begin(id)
 	defer end()
 	ctx = context.WithValue(ctx, progressKey{}, progress)

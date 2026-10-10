@@ -157,6 +157,12 @@ type Options struct {
 	Tracer trace.Tracer
 	Meter  metric.Meter
 
+	// HoldRecovery is test-only (nil in production): when set, every recovery of a copy
+	// but the first this node starts waits for it before it fetches anything, and an
+	// error ends that recovery. The chaos suite kills a node mid-recovery with it
+	// (cmd/searchlight sets it from SEARCHLIGHT_TEST_HOLD_RECOVERY).
+	HoldRecovery func(ctx context.Context) error
+
 	// hooks are test seams; nil outside tests.
 	hooks *testHooks
 }
@@ -170,7 +176,7 @@ type testHooks struct {
 	// snapshotMajor rewrites the segment format major a snapshot reply reports.
 	snapshotMajor func(major int) int
 	// served is told of every read target this node's copy of id gave a peer, with the
-	// leaseClock readings taken before the copy was checked.
+	// leaseClock readings at which the copy was judged to serve it (peerAPI.target).
 	served func(id store.ShardID, began time.Duration, wall time.Time)
 	// servedLocal is told of every read of this node's copy of id held under l, local
 	// reads included.

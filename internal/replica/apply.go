@@ -613,10 +613,15 @@ func (t *Tailer) applyBatch(ctx context.Context, sh *shard.Shard, changes []shar
 	wait := time.Duration(0)
 	for {
 		var err error
-		if load {
-			err = sh.Load(ctx, changes)
-		} else {
-			err = sh.Apply(ctx, changes)
+		if h := t.opts.hooks; h != nil && h.beforeApply != nil {
+			err = h.beforeApply(sh)
+		}
+		if err == nil {
+			if load {
+				err = sh.Load(ctx, changes)
+			} else {
+				err = sh.Apply(ctx, changes)
+			}
 		}
 		if err == nil {
 			return len(changes), nil

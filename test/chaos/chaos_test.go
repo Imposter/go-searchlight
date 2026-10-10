@@ -72,9 +72,9 @@ func TestKillMidMerge(t *testing.T) {
 }
 
 // TestKillMidRecovery: a node with an empty data directory, killed while it recovers
-// its copies from its peers (once the first copy has been fetched, while the others
-// transfer or replay the changelog), comes back, recovers them again and converges; the
-// load never sees an error.
+// its copies from its peers (once the first copy has been fetched, while the others wait
+// on the test-only recovery hold, SEARCHLIGHT_TEST_HOLD_RECOVERY), comes back, recovers
+// them again and converges; the load never sees an error.
 func TestKillMidRecovery(t *testing.T) {
 	c := newCluster(t, 3, "")
 	c.createIndex()
@@ -90,6 +90,9 @@ func TestKillMidRecovery(t *testing.T) {
 	if err := os.RemoveAll(r.DataDir()); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(r.holdRecovery, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	l.waitWrites(t, 1000)
 	if err := r.Start(t.Context()); err != nil {
 		t.Fatal(err)
@@ -98,6 +101,9 @@ func TestKillMidRecovery(t *testing.T) {
 		t.Fatalf("chaos-3 recovered no copy from a peer: %v", err)
 	}
 	c.kill(2)
+	if err := os.Remove(r.holdRecovery); err != nil {
+		t.Fatal(err)
+	}
 	recovered := len(r.Logs().All("shard copy recovered from a peer"))
 	serving := 0
 	for _, l := range r.Logs().All("shard copy state changed") {
@@ -107,7 +113,7 @@ func TestKillMidRecovery(t *testing.T) {
 	}
 	t.Logf("killed chaos-3 mid-recovery, once its first copy had been fetched: %d of %d copies fetched, %d serving", recovered, shards, serving)
 	if serving >= shards {
-		t.Fatalf("every copy of chaos-3 served before the kill: it hit no recovery (load more data before it)")
+		t.Fatalf("every copy of chaos-3 served before the kill: it hit no recovery (the recovery hold did not hold)")
 	}
 	l.waitWrites(t, 1000)
 	start := time.Now()

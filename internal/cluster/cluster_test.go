@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -466,6 +467,10 @@ func roundAll(m map[string]time.Duration) map[string]time.Duration {
 // in the database at once, so another node steals the slot while the cut-off node's
 // local deadline is still ahead. The thief's quarantine (TTL plus margin after its
 // claim, by its own clock) keeps the two from serving at once all the same.
+//
+// Whether a node's copy serves peers is asked through the peer API's own admission
+// (peerAPI.target, stale allowed), so the served hook judges each read at the readings
+// the copy was admitted at, not at readings taken before its checks.
 func TestPartitionedNodeStopsServingBeforeSteal(t *testing.T) {
 	testtier.Heavy(t)
 	for _, stepClock := range []bool{false, true} {
@@ -499,16 +504,13 @@ func testPartition(t *testing.T, d *db, stepClock bool) {
 	if a.n.leaseFor(id) == nil {
 		t.Fatal("node-0 holds no lease")
 	}
-	// peerServes reports whether tn's copy serves peers now: what a peer's read of it
-	// gets. A read it serves is held to the serving invariant, as the peer API's are.
 	peerServes := func(tn *tnode) bool {
-		began, wall := tn.n.lc.Now(), tn.n.lc.Wall()
-		tg, err := tn.n.LocalTarget(context.Background(), "sb", 0, 0)
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", nil)
+		tg, err := tn.n.peer.target(req, shardRef{Index: "sb", Shard: 0, AllowStale: true})
 		if err != nil {
 			return false
 		}
 		tg.Release()
-		c.checkServed(tn, id, began, wall)
 		return true
 	}
 
@@ -609,7 +611,10 @@ func expireLeases(t testing.TB, d *db, index string) {
 	}
 }
 
-// sqliteExec runs a statement on d, a SQLite database, outside every node's store.
+// sqliteExec runs a statement on d, a SQLite database, outside every node's store. A
+// node's own write connections wait out a held lock (store/sqlite.DefaultBusyTimeoutMS);
+// this ad hoc one needs the same busy_timeout, or a node's own writer (a heartbeat, a
+// checkpoint) holding the lock when this runs fails it with SQLITE_BUSY at once.
 func sqliteExec(t testing.TB, d *db, q string, args ...any) {
 	t.Helper()
 	u, err := url.Parse(d.url)
@@ -620,7 +625,7 @@ func sqliteExec(t testing.TB, d *db, q string, args ...any) {
 	if _, err := os.Stat(dsn); err != nil {
 		dsn = u.Path
 	}
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", dsn+"?_pragma=busy_timeout(10000)")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,8 +714,9 @@ func TestLeaseDeadlineByFakeClock(t *testing.T) {
 
 // takeoverCluster starts node-0, holding the one copy of sb/0, and node-1 on a fake
 // clock, then cuts node-0 off and expires its lease in the database. Node-1's loops
-// stand still: the test runs its view reads and claims.
-func takeoverCluster(t *testing.T) (*db, *clock.Fake, *tnode) {
+// stand still: the test runs its view reads and claims. mod, when set, adjusts node-1's
+// options last.
+func takeoverCluster(t *testing.T, mod func(o *Options)) (*db, *clock.Fake, *tnode) {
 	t.Helper()
 	d := sqliteDB(t)
 	clk := clock.NewFake(time.Now())
@@ -723,6 +729,9 @@ func takeoverCluster(t *testing.T) (*db, *clock.Fake, *tnode) {
 			o.ViewInterval = time.Hour
 			o.CatalogInterval = time.Hour
 			o.PruneInterval = time.Hour
+			if mod != nil {
+				mod(o)
+			}
 		}
 	})
 	a := c.start(0)
@@ -765,7 +774,7 @@ func stealSB(t *testing.T, b *tnode) *lease {
 // names no previous holder) keeps the takeover's quarantine. The claim hook reads a view
 // while the claim is under way.
 func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
-	_, clk, b := takeoverCluster(t)
+	_, clk, b := takeoverCluster(t, nil)
 	id := store.ShardID{Index: "sb", Shard: 0}
 	ctx := tctx(t)
 	duringClaim := func() {
@@ -808,12 +817,110 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 	}
 }
 
+// TestPeerReadJudgedAtQuarantineEnd: a stolen copy refuses a peer's read one
+// nanosecond before its quarantine ends and serves it from the end on, judged by one
+// leaseClock reading taken once the target is held, after every check the copy itself
+// made; the served hook reports exactly that reading. Inside LocalTarget (as the copy's
+// read is admitted) the fake clock moves 5 ms on, as a busy runner's clock would
+// between two readings: the read must be reported at the later reading, the one it was
+// judged at, never one taken before the checks.
+//
+// The copy recovers first (its timers run on the fake clock), so the boundary is about
+// the quarantine alone. Node-0, cut off from the database, stops serving peers once its
+// own lease lapses by its real clock, well before the quarantine ends, which node-1's
+// fake clock reaches at once. The lease is renewed as the clock moves (from the
+// readings before each step), so only the quarantine, never the lease, decides the read.
+func TestPeerReadJudgedAtQuarantineEnd(t *testing.T) {
+	var (
+		inside   atomic.Pointer[func()]
+		reported atomic.Int64
+		calls    atomic.Int32
+	)
+	_, clk, b := takeoverCluster(t, func(o *Options) {
+		served, servedLocal := o.hooks.served, o.hooks.servedLocal
+		o.hooks.served = func(id store.ShardID, began time.Duration, wall time.Time) {
+			calls.Add(1)
+			reported.Store(int64(began))
+			served(id, began, wall)
+		}
+		o.hooks.servedLocal = func(id store.ShardID, l *lease) {
+			if fn := inside.Load(); fn != nil {
+				(*fn)()
+			}
+			servedLocal(id, l)
+		}
+	})
+	id := store.ShardID{Index: "sb", Shard: 0}
+	stolen := stealSB(t, b)
+	q := stolen.quarantine
+	recovered := func() bool {
+		for _, lc := range b.n.LocalCopies() {
+			if lc.Info.Index == "sb" && lc.Info.Shard == 0 {
+				return lc.Info.State == api.ShardServing
+			}
+		}
+		return false
+	}
+	for deadline := time.Now().Add(20 * time.Second); !recovered(); {
+		if time.Now().After(deadline) {
+			t.Fatal("node-1's copy of sb/0 did not recover")
+		}
+		stolen.extend(b.n.lc.Now(), b.n.lc.Wall())
+		clk.Advance(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
+	}
+	for deadline := time.Now().Add(30 * time.Second); b.c.node(0).n.peerValid(id); {
+		if time.Now().After(deadline) {
+			t.Fatal("node-0, cut off, still serves peers")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for now := b.n.lc.Now(); now < q-time.Nanosecond; now = b.n.lc.Now() {
+		stolen.extend(now, b.n.lc.Wall())
+		clk.Advance(min(30*time.Minute, q-time.Nanosecond-now))
+	}
+	stolen.extend(b.n.lc.Now(), b.n.lc.Wall())
+	if b.n.leaseFor(id) != stolen {
+		t.Fatal("node-1's lease of sb/0 changed while the clock moved")
+	}
+	ref := shardRef{Index: "sb", Shard: 0, AllowStale: true}
+	read := func() (node.ShardTarget, error) {
+		return b.n.peer.target(httptest.NewRequestWithContext(tctx(t), http.MethodPost, "/", nil), ref)
+	}
+
+	if now := b.n.lc.Now(); now != q-time.Nanosecond {
+		t.Fatalf("the clock reads %s, want %s", now, q-time.Nanosecond)
+	}
+	if _, err := read(); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("a peer read 1ns before the quarantine ends: %v, want the quarantine's refusal", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("a refused read was reported served %d times", n)
+	}
+
+	clk.Advance(time.Nanosecond)
+	step := func() { clk.Advance(5 * time.Millisecond) }
+	inside.Store(&step)
+	tg, err := read()
+	inside.Store(nil)
+	if err != nil {
+		t.Fatalf("a peer read at the quarantine's end: %v", err)
+	}
+	tg.Release()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("the read was reported served %d times, want once", n)
+	}
+	if got := time.Duration(reported.Load()); got != q+5*time.Millisecond {
+		t.Fatalf("the read was reported at %s, want %s: the reading it was judged at, after the copy's own checks (quarantine ends %s)", got, q+5*time.Millisecond, q)
+	}
+}
+
 // TestReclaimTakeoverIsQuarantined: a renewal that finds its lease expired claims the
 // slot again; when another node held it meanwhile (and lapsed), that claim is a takeover
 // at a new epoch. The copy is dropped, and the allocator's claim back of the slot at
 // that epoch (the store names no previous holder) is quarantined all the same.
 func TestReclaimTakeoverIsQuarantined(t *testing.T) {
-	d, _, b := takeoverCluster(t)
+	d, _, b := takeoverCluster(t, nil)
 	id := store.ShardID{Index: "sb", Shard: 0}
 	ctx := tctx(t)
 	held := stealSB(t, b)
@@ -840,7 +947,7 @@ func TestReclaimTakeoverIsQuarantined(t *testing.T) {
 // be hosted keeps its row, and the claim back at that epoch stays quarantined; a lowered
 // target does not release a quarantined copy either.
 func TestQuarantinedTakeoverKeepsItsRow(t *testing.T) {
-	_, clk, b := takeoverCluster(t)
+	_, clk, b := takeoverCluster(t, nil)
 	id := store.ShardID{Index: "sb", Shard: 0}
 	ctx := tctx(t)
 	meta, err := b.st.Indexes().Get(ctx, "sb")

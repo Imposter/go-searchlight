@@ -15,7 +15,7 @@ import (
 
 func TestBulk(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/b", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}, "settings": {"shards": 2}}`)
+	e.createIndex("b", `{"mapping": {"dynamic": "strict", "fields": {"title": "text", "price": "number"}}, "settings": {"shards": 2}}`)
 	r := e.must(http.StatusOK, "POST", "/indexes/b/_bulk?refresh=wait_for", ndjson(
 		`{"upsert": {"id": "1"}}`,
 		`{"title": "one", "price": 1}`,
@@ -95,7 +95,7 @@ func TestBulk(t *testing.T) {
 
 func TestSearch(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/s", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
+	e.createIndex("s", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
 	var lines []string
 	brands := []string{"acme", "globex", "initech"}
 	for i := range 60 {
@@ -192,7 +192,7 @@ func TestSearch(t *testing.T) {
 
 func TestSavedQueriesAndPercolate(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/p", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
+	e.createIndex("p", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
 	put := func(id, q string) int64 {
 		return seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/p/queries/"+id, q))
 	}
@@ -259,7 +259,7 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 // over every saved query, for random queries and documents on several shards.
 func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/bf", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
+	e.createIndex("bf", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "tags": "keyword_list", "title": "text"}}, "settings": {"shards": 3}}`)
 	rng := rand.New(rand.NewPCG(1, 2))
 	brands := []string{"Acme", "Globex", "Initech", "Umbrella"}
 	words := []string{"red", "chair", "table", "lamp", "oak", "steel"}
@@ -338,7 +338,7 @@ func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 
 func TestFieldsAndCluster(t *testing.T) {
 	e := newEnv(t, envOpts{})
-	e.must(http.StatusCreated, "PUT", "/indexes/f", `{"mapping": {"fields": {"tags": "keyword_list", "brand": "keyword"}}, "settings": {"shards": 2}}`)
+	e.createIndex("f", `{"mapping": {"fields": {"tags": "keyword_list", "brand": "keyword"}}, "settings": {"shards": 2}}`)
 	w := e.must(http.StatusOK, "POST", "/indexes/f/_bulk", ndjson(
 		`{"upsert": {"id": "1"}}`, `{"tags": ["a", "b"], "brand": "x"}`,
 		`{"upsert": {"id": "2"}}`, `{"tags": ["a"], "brand": "y"}`,

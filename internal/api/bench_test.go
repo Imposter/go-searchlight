@@ -29,7 +29,7 @@ func benchBulk(start, n int) string {
 func benchEnv(b *testing.B) *env {
 	b.Helper()
 	e := newEnv(b, envOpts{cfg: func(c *config.Config) { c.RefreshInterval = time.Second }})
-	e.must(http.StatusCreated, "PUT", "/indexes/bench", `{"mapping": {"fields": {"title": "text", "brand": "keyword", "price": "number", "tags": "keyword_list", "url": "keyword"}}, "settings": {"shards": 2}}`)
+	e.createIndex("bench", `{"mapping": {"fields": {"title": "text", "brand": "keyword", "price": "number", "tags": "keyword_list", "url": "keyword"}}, "settings": {"shards": 2}}`)
 	return e
 }
 

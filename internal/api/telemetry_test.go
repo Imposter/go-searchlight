@@ -62,7 +62,7 @@ func TestRequestTelemetry(t *testing.T) {
 	hs := httptest.NewServer(srv)
 	t.Cleanup(hs.Close)
 	e := &env{t: t, url: hs.URL, client: hs.Client()}
-	e.must(http.StatusCreated, "PUT", "/indexes/tel", "")
+	e.createIndex("tel", "")
 	got := e.do("POST", "/indexes/tel/_search", `{}`, "X-Request-Id", "req-42", "traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 	if got.status != http.StatusOK {
 		t.Fatalf("search: %d %s", got.status, got.body)

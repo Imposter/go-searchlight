@@ -287,6 +287,46 @@ func (e *env) must(status int, method, path, body string) map[string]any {
 	return r.json(e.t)
 }
 
+// createIndex creates index from body (a 201) and waits until every copy of it
+// serves. Create itself waits up to max(max_lag, 1s) for that but returns either way
+// (#31), and a request reaching a copy still recovering from its empty snapshot gets a
+// correct, retryable 503; a test that goes on to use the index waits it out here
+// instead of racing it.
+func (e *env) createIndex(index, body string) map[string]any {
+	e.t.Helper()
+	created := e.must(http.StatusCreated, "PUT", "/indexes/"+index, body)
+	e.waitServing(index)
+	return created
+}
+
+// waitServing polls /_cluster/shards until every copy of index is serving.
+func (e *env) waitServing(index string) {
+	e.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var copies, serving int
+		var states []any
+		for _, s := range e.must(http.StatusOK, "GET", "/_cluster/shards", "")["shards"].([]any) { //nolint:forcetypeassert,errcheck // the shape
+			c := s.(map[string]any) //nolint:forcetypeassert,errcheck // the shape
+			if c["index"] != index {
+				continue
+			}
+			copies++
+			if c["state"] == api.ShardServing {
+				serving++
+			}
+			states = append(states, c["state"])
+		}
+		if copies > 0 && serving == copies {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.t.Fatalf("index %q: copies %v, not every one serving within the deadline", index, states)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // problem requires a problem response with status and code, returning it.
 func (e *env) problem(r resp, status int, code string) map[string]any {
 	e.t.Helper()

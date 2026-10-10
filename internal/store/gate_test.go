@@ -212,10 +212,10 @@ func TestTruncateBoundsItsHold(t *testing.T) {
 
 	d := *s.d
 	d.PendingLog = func(string) (int64, error) { return 1 << 20, nil }
-	real := s.d
+	orig := s.d
 	s.d = &d
 	ran, err := s.truncate(ctx, 1<<20-1)
-	s.d = real
+	s.d = orig
 	if err != nil || ran || s.truncates.Load() != 0 {
 		t.Fatalf("1 MiB left to copy, at most 1 MiB - 1 allowed: ran %v, err %v, %d truncations; want a skip", ran, err, s.truncates.Load())
 	}

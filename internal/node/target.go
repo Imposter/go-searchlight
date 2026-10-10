@@ -209,7 +209,8 @@ func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, 
 // current, else a serving copy elsewhere (a cluster node), falling back to this node's
 // copy when no other answers. A cluster node's read that this node's copy fails because
 // the copy closed or was unhosted under it (a drain retiring it) goes to a copy
-// elsewhere, under the same deadline.
+// elsewhere, under the same deadline, falling back to the copy hosted in its place, if
+// any (a peer restarting at the same time answers nothing).
 func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq int64, forQueries bool) (ShardTarget, error) {
 	sl := idx.shards[s]
 	queryWait := int64(0)
@@ -219,10 +220,17 @@ func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq in
 	c := sl.local.Load()
 	if c != nil && (n.cl == nil || (c.notServing() == nil && !n.copyStale(c))) {
 		t, err := n.localTarget(ctx, c, waitSeq, queryWait)
-		if err != nil && n.cl != nil && ctx.Err() == nil && (errors.Is(err, shard.ErrClosed) || sl.local.Load() != c) {
-			return n.cl.Remote(ctx, sl.id, max(waitSeq, queryWait))
+		if err == nil || n.cl == nil || ctx.Err() != nil {
+			return t, err
 		}
-		return t, err
+		now := sl.local.Load()
+		if !errors.Is(err, shard.ErrClosed) && now == c {
+			return t, err
+		}
+		if now == c {
+			now = nil
+		}
+		c = now
 	}
 	if n.cl != nil {
 		rt, err := n.cl.Remote(ctx, sl.id, max(waitSeq, queryWait))

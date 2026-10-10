@@ -1,6 +1,6 @@
 # Stateless nodes design
 
-**Status:** draft for operator review, 2026-10-10. No product code is written yet.
+**Status:** design, 2026-10-10. The operator's answers of 2026-10-10 are folded in as decisions (§13). No product code is written yet.
 **Base:** `main` at 198b96d. It amends the [main spec](2026-10-02-searchlight-design.md): §1 (T8, T9), §8 (`sl_blobs`), §9 (recovery, rolling restarts, pruning), §10, §12 and §17.
 **Inputs:**
 - The stateless spike, `.superpowers/reports/spike-stateless.md` (cited as **[spike]**, with its gaps G0–G12). Its code citations are at e2f3490. The citations below were re-checked at 198b96d.
@@ -35,12 +35,16 @@ This design makes that cheap and safe:
    - A bundle is a small manifest of file hashes plus the shard's seq and mapping version.
    - An upload sends only files that are new.
    - GC deletes file blobs that no retained manifest references.
-   - Bundles are **on by default, every minute**, on Postgres and MySQL.
+   - Bundles are **on by default, every minute**, on Postgres and MySQL, and off on SQLite.
+   - A manifest stops holding the changelog once it has held it for 1 h, so a stuck uploader cannot grow `sl_changes`.
 4. **Cold start has herd control.**
    - One node per shard restores it, under a restore claim on its copy row.
    - The others wait for that copy to serve, then copy from it.
-   - A per-node recovery cap bounds heap and database load.
-5. **Readiness lets a cold start take writes.** A copy whose shard had no serving copy anywhere when it was claimed does not hold its node's readiness back. Pods join the Service, writes commit to SQL, and reads of a dark shard answer 503 with `Retry-After`.
+   - A per-node recovery cap bounds heap, database load and peer load: 2 recoveries at once, and recovery bandwidth capped by `recovery_budget`, configurable, like Elasticsearch's `indices.recovery.max_bytes_per_sec`.
+     - The operator decided a default of 40 MB/s, which is `40MiB` per second, as Elasticsearch's `40mb` is.
+     - At that cap, T9b's 30 s bound at 1M docs, and T8, both fail (E, §4.3). Meeting them needs at least 64 MiB/s, and 80 MiB/s leaves headroom.
+     - §13 flags this for the operator.
+5. **Readiness lets a cold start take writes.** A copy whose shard had no serving copy anywhere when it was claimed does not hold its node's readiness back. Pods join the Service, writes commit to SQL, and reads of a dark shard answer 503 with `Retry-After: 5`.
 6. **Identity churn is cleaned up.**
    - The leader reaps `sl_nodes` rows silent for 1 h.
    - `retiring_retention` defaults to 0 s.
@@ -78,6 +82,11 @@ A new row covers the cold start:
 |---|---|---|
 | **T12** Cold start | Every node starts with an empty disk at once | First query OK on every shard ≤ 1.25 × one node's bundle restore. Every copy serving ≤ that, plus one peer copy. Writes accepted throughout (T) |
 
+**T9b and T12 are release blockers** (operator, 2026-10-10), like T1–T8.
+- `bench/report/targets.go` grades them, and `.github/workflows/bench.yml` fails the release run when either is `FAIL`, `INVALID` or `NOT MEASURED`.
+- They are graded with the **shipped defaults**, `recovery_budget` included, so a default that cannot meet them blocks the release (§4.3).
+- T9a keeps today's T9 grading.
+
 For scale:
 - T8 at 1M docs was 11.6 s for Searchlight against 29.1 s for Elasticsearch (M, [bench]).
 - At 200k on the spike's HDD, the paths took (M, [spike]):
@@ -99,7 +108,7 @@ Nothing in `data_dir` must survive, which is already true [spike] G0. This desig
 
 ### Non-goals
 
-- **Object storage.** S3 and GCS as a `BlobStore` backend are a later option: the part-2 logs roadmap already puts stream segments in blob storage. Here, bundles live in SQL, as the operator decided.
+- **Object storage.** Decided 2026-10-10: the database holds bundles. S3 or GCS as a `BlobStore` backend is out of scope; the part-2 logs roadmap already puts stream segments in blob storage, and could revisit it. Operators size the database for bundles (§2.8).
 - **Backups.** Bundles are not backups. They are a cache of the database's own rows, and they are deleted with their index. Back up the database (operations.md, "Backups").
 - **Cold-start read availability.** Reads of a shard with no serving copy still answer 503 until one serves. The aim is to shorten that window and keep writes up, not to remove it.
 - **Consensus and coordination.** No new coordination service. Claims are rows in `sl_shard_copies`, under the same leases and fencing as copies (spec §9).
@@ -268,7 +277,12 @@ Both depend on GC and upload never running concurrently for one shard, which the
 - So `sl_changes` holds about `bundle_retention × bundle_interval` of a shard's writes, plus one upload's duration.
 - At the defaults that is **2–3 min of writes (E)**. At the spike's 895 docs/s of steady ingest, that is about 107k–161k rows. Steady ingest without bundles already peaked at 175k rows, because pruning trails the flush floor (M, [spike] G6).
 - So bundles every minute keep `sl_changes` small, which is why the interval is minutes and not the spike's "about 5 m".
-- If uploads stop, the floor stays at the last manifest, capped by `changelog_retention` (24 h). The `searchlight_bundle_age_seconds` alert (§10) is how an operator learns of it.
+- **A manifest holds the floor for at most `bundle_max_hold` (1 h)** (decided 2026-10-10). A stuck uploader therefore cannot hold `sl_changes`: without this, the floor would stay at the last manifest for up to `changelog_retention` (24 h).
+  - **What "hold" measures.** A manifest's hold is the database-clock age of the **oldest change after its seq**: `now − At` of `ChangesAfter(seq, 1)`. It is not the manifest's own age.
+  - **Why not the manifest's own age.** An idle shard's newest manifest grows old legitimately, because rounds skip unchanged shards (§2.4). Measured by its own age, it would stop counting the moment writes resumed. The changelog could then be pruned past it in the up to one interval before the next upload, leaving the shard with no usable bundle. Measured by its hold, an idle shard's manifest holds nothing, and a manifest starts counting down only from the first write after it.
+  - **The rule.** In `pruneAll`, the leader leaves out of the floor every retained manifest whose hold exceeds `bundle_max_hold`. One `firstAfter` query per retained manifest per prune pass suffices, beside the one `ageFloor` already makes. Pruning then passes the manifest, and the existing rule deletes it ("the changelog was pruned past it").
+  - **What it costs.** A shard whose every manifest is released has no usable bundle until uploads resume, so a cold start would rebuild it with `ScanShard`. `searchlight_bundle_floor_released_total` and the "Bundle floor released" alert (§10) make that visible, and `searchlight_bundle_hold_seconds` warns before it happens.
+  - **At the defaults, a healthy uploader never reaches it.** The oldest retained manifest's hold is about two intervals, 2–3 min (E).
 
 ### 2.6 The bundle claim and the restore claim
 
@@ -281,7 +295,7 @@ ALTER TABLE sl_shard_copies ADD COLUMN bundle_until  BIGINT NOT NULL DEFAULT 0; 
 ALTER TABLE sl_shard_copies ADD COLUMN restore_until BIGINT NOT NULL DEFAULT 0;
 ```
 
-**Why the migration is safe for old binaries.** They select explicit columns (`copyColumns`, `internal/store/postgres/statements.go:271`), so they keep working against the migrated schema. Like every migration, it makes a binary rollback past it a database restore (operations.md, "Schema migrations"). See open question Q2.
+**Why the migration is safe for old binaries.** They select explicit columns (`copyColumns`, `internal/store/postgres/statements.go:271`), so they keep working against the migrated schema. **Rollback consequence (accepted by the operator, 2026-10-10).** Like every migration, it makes a binary rollback past it a database restore. A binary from before migration 3 refuses to start against the migrated schema (`store: database schema is newer than this binary`). An old pod that restarts mid-rollout therefore crash-loops until it runs the new image. SN-1 writes this into operations.md "Upgrades and rolling restarts", in the same place and words as the existing note for migration 2 (operations.md:531-535), and into the release notes.
 
 **`RegistryStore` additions:**
 
@@ -336,7 +350,12 @@ Chunking already exists: 1 MiB chunks in `sl_blob_chunks` (`store.DefaultBlobChu
 |---|---|
 | Postgres | `BYTEA` chunks go to TOAST with the default `EXTENDED` storage. The spike's bundles stored 315 MB as 281 MB of TOAST (M, [spike]), so pglz still saves about 11% on s2-compressed segments: keep the default. Every uploaded byte is also written to WAL and shipped to replicas and to any PITR archive. Size `max_wal_size` and the archive for the upload rate, not just the ingest WAL: 2.2 KB/doc of ingest WAL was measured (M, [spike]). Deleted chunks are reclaimed by autovacuum of the TOAST table. Incremental bundles cut both the WAL and the vacuum churn by roughly the dedup factor |
 | MySQL | `LONGBLOB` chunks. 1 MiB is far below the 64 MB `max_allowed_packet` floor (operations.md). Each chunk is a row event in the binlog, and in the redo log. Size the redo capacity (`innodb_redo_log_capacity`) and the binlog retention for the upload rate |
-| SQLite | A single node. Bundles default to off: the node's database file already needs a persistent disk, so `data_dir` can live there and reopen. If bundles are turned on, the file grows by about one copy, and freed pages are reused, not returned |
+| SQLite | A single node. Bundles default to off (decided 2026-10-10): the node's database file already needs a persistent disk, so `data_dir` can live there and reopen. **With an ephemeral `data_dir` on SQLite, every pod start rebuilds each copy with `ScanShard`**: there is no peer, and no bundle unless turned on. That is fine for a single node and is documented as such, at the bounded heap of §6. Measured: 10.9 s for 200k docs and 4 shards on the spike's HDD (M, [spike]); roughly linear in documents (E). An operator who wants faster restarts sets `bundle_interval`. The file then grows by about one copy, and freed pages are reused, not returned |
+
+**Database sizing note** (decided 2026-10-10: the database holds bundles). SN-1 adds this to operations.md "Sizing → The database", beside "Recovery bundles":
+- **Space.** Recovery bundles take about **1.6–2.1 GB per 1M docs** in `sl_blobs` at the defaults (E). That is at most 1.3 × one copy (T, G-4), with one copy at 1.2 GiB/M fully merged ([ops]), 1.58 GB/M freshly loaded (M, [spike]), or 2.09 GiB/M at the CI run's peak (M, [bench]). It comes on top of `sl_documents`, which is about 0.8 GB per 1M docs compressed ([ops]).
+- **Traffic.** Every uploaded byte also crosses the WAL (Postgres) or the binlog and redo log (MySQL), and so the replicas and any PITR archive. That is about the upload rate, at most `bundle_budget` (32 MiB/s) per node, and about 1.5 × the merge write rate under steady ingest (T, §2.4). It adds to the ingest WAL of about 2.2 KB/doc (M, [spike]).
+- **Before turning on.** Size the database volume, `max_wal_size` or `innodb_redo_log_capacity`, the binlog retention and the archive for both.
 
 **Large files.**
 - A merged segment can be gigabytes. `Put` writes it chunk by chunk, touching its upload registration every 16 chunks. `Sweep`'s 1 h age is far longer than that takes.
@@ -386,7 +405,10 @@ Chunking already exists: 1 MiB chunks in `sl_blob_chunks` (`store.DefaultBlobChu
 
 **Memory (E).** About `restore_streams` × the 1 MiB chunk buffer, plus `bufio`. The spike measured 141 MB peak for four concurrent format-1 restores (M, [spike]). The restore target is ≤ 256 MiB above idle (T).
 
-**Expected time (E).** At 1M docs, about 1.6 GB per full copy (M, [spike]: 1.58 GB/M), at the T-target node restore throughput of **≥ 150 MB/s** from Postgres. That is ≈ 11 s per node holding every shard. The spike's 37 MB/s was HDD- and Windows-bound (M).
+**Expected time (E).**
+- **Data volume.** At 1M docs, about 1.6 GB per full copy (M, [spike]: 1.58 GB/M) for a node that holds every shard.
+- **Uncapped.** The store's own read path has a target of **≥ 150 MB/s** per node from Postgres (T), which gives ≈ 11 s. The spike's 37 MB/s was HDD- and Windows-bound (M).
+- **Capped.** Bundle downloads count against `recovery_budget` (§4.3), so a restore runs at the lower of the cap and the store. At the operator's 40 MiB/s default that is ≈ 38 s of transfer at 1M docs. §4.3 works this through against T9b.
 
 ### 3.3 Readiness rules
 
@@ -400,7 +422,7 @@ Why this rule:
 - **Rolling restart.** The shards are lit elsewhere when the new pod claims its copies, so the rule is strict. The pod turns ready only once its copies serve, so the StatefulSet and the PDB never move on while redundancy is short. This is today's behaviour.
 - **Cold start.** Every shard is dark at claim time, so every pod is ready as soon as it joins.
   - The Service gets endpoints, and writes commit to SQL.
-  - Reads of a dark shard answer 503 `unavailable` with `Retry-After` (§4.4).
+  - Reads of a dark shard answer 503 `unavailable` with `Retry-After: 5` (§4.4).
   - When a shard lights up, nodes still copying it **stay** ready, because the exemption is fixed at claim time. That avoids the flap that would otherwise drop every node from the Service just as the cold start ends.
 - **Mixed case.** Example: a pod starts 20 s into a cold start, and finds shard 0 already lit. That copy holds back only that pod.
 - `/readyz`'s problem detail names the exempt copies: "N shard copies recover from a dark start; reads of their shards answer 503 until one serves".
@@ -453,13 +475,40 @@ These cold-start figures are **E**.
 
 The value is a target to tune with §11's runs.
 
-**`recovery_budget`** (bytes/s, default `0`, unlimited) throttles outgoing snapshot streams, like Elasticsearch's `indices.recovery.max_bytes_per_sec`. See Q5.
+**`recovery_budget`** (bytes/s, `0` = unlimited) caps recovery bandwidth per node, like Elasticsearch's `indices.recovery.max_bytes_per_sec`. The operator decided on 2026-10-10 that it is on by default and configurable.
+- **Two buckets.** It is a node-wide token bucket, applied separately to:
+  - incoming bytes: peer fetches and bundle downloads;
+  - outgoing bytes: snapshot streams this node serves.
+- **Not capped:** `ScanShard` loads (rows, CPU-bound, already gated by the slot), and bundle **uploads**, which have `bundle_budget`.
+- **Default decided:** 40 MB/s, written `40MiB` per second, as Elasticsearch's `40mb` is.
+
+**Check against T9b (≤ 30 s at 1M docs per node).** The decided default does not meet it:
+
+| Item | Value |
+|---|---|
+| Bytes to fetch, node holding every shard at 1M docs | 1.29 GB fully merged (1.2 GiB, [ops]) to 1.58 GB freshly loaded (M, [spike]) |
+| Transfer time at 40 MiB/s (41.9 MB/s) | 31–38 s (E) |
+| Plus open, replay and the registry update | ≈ 2–5 s (E). The spike's peer path spent ≈ 0.5 s outside transfer at 200k (M), and replay is at most two intervals of writes, near zero in the idle bench |
+| **T9b at 40 MiB/s** | **≈ 33–43 s: FAIL** (E) |
+| Cap that meets 30 s, with 5 s left for open and replay | 1.58 GB / 25 s = 63 MB/s → **at least 64 MiB/s** |
+| Cap with headroom | **80 MiB/s**: 1.58 GB in ≈ 19 s, ≈ 24 s in all (E) |
+
+The same cap also regresses **T8**:
+- Today Searchlight's peer recovery at 1M is 11.6 s against Elasticsearch's 29.1 s (M, [bench]), uncapped.
+- At 40 MiB/s it would be ≈ 33–43 s, above Elasticsearch's, so T8 fails too (E).
+- At 80 MiB/s it is ≈ 24 s and passes.
+
+T8 and T9b are release blockers graded with the shipped defaults (§1), so this is a conflict for the operator (§13):
+- **Recommended:** ship `recovery_budget=80MiB`.
+- **Or** keep 40 MiB/s and grade T8 and T9b with the cap off. The bench would then no longer measure what ships.
+
+At 10M docs, T9b's other bound (≤ Elasticsearch peer recovery) is measured, not derived. Elasticsearch runs under its own `max_bytes_per_sec` in that run.
 
 ### 4.4 Allocator, reads and writes while no copy serves
 
 - **Allocator:** unchanged. Every node claims its copies at once (`internal/cluster/allocator.go:93-183`). Herd control lives in the fetcher, not the allocator, so placement and fencing stay as they are.
 - **Reads** of a dark shard return 503 `unavailable` (`noServingCopy`, `internal/cluster/router.go:83-85`).
-  - `Retry-After` is **5 s** while some copy of the shard holds a restore claim, and 1 s (`api.DefaultRetryAfter`) otherwise.
+  - `Retry-After` is **5 s** for every read of a dark shard (decided 2026-10-10), in place of `api.DefaultRetryAfter` (1 s). A restore takes seconds to minutes, so a client polling every second only adds load.
   - A search across shards fails as a whole if any shard is dark, as today: no partial results.
   - The spike saw 0 wrong counts in 368 and 622 probes (M, [spike] G8).
 - **Writes** commit to SQL and answer 200: 50 of 50 in the spike (M).
@@ -515,7 +564,7 @@ A Deployment is documented as supported: set `SEARCHLIGHT_ADVERTISE_ADDRESS=$(PO
   - `releaseDecommissioned` (`maintenance.go:205-221`) then releases a cleanly stopped node's retiring rows one prune pass after their lease runs out: within about `lease_ttl` + 30 s, not 15 min.
   - Today every pod stop pins `sl_changes` for 15 min, for a replay an `emptyDir` can never make (M, [spike] G2).
   - **The fast restart is kept.** A node that keeps its disk (PVC, bare metal) and restarts within about two `bundle_interval`s still replays rather than rebuilds: the oldest manifest holds the prune floor that long (§2.5).
-  - Deployments that keep disks and want the old 15-minute window set `retiring_retention=15m`.
+  - **Decided 2026-10-10:** the default is 0 s. Deployments that keep their disks (PVC, bare metal, Compose with named volumes) set `retiring_retention=15m` for the old window. operations.md says so in the setting's row and in "Upgrades and rolling restarts".
   - The setting now accepts `0s`. Today it must be positive (`positiveDuration`, `config.go:342-344`).
 
 ### 5.3 Quarantine is not serving
@@ -671,12 +720,13 @@ Drop the `data-1..3` named volumes, and mount a tmpfs at the data directory. A C
 The migration is rolling-safe, with no full stop at any point. One node is down at a time (PDB `maxUnavailable: 1`), and readiness gates each step (spec §9, operations.md "Upgrades").
 
 **Phase A: upgrade the binary, PVCs still attached.**
-1. Roll the new image as usual.
+1. **Back up the database first.** Once migration 3 runs, rolling the binary back means restoring that backup (§2.6). An old pod that restarts mid-rollout crash-loops on `store: database schema is newer than this binary` until it runs the new image, so finish the rollout rather than wait on it.
+2. Roll the new image as usual.
    - The first upgraded node runs migration 3 (two additive columns, milliseconds; nodes on the old binary keep working).
    - Format-2 uploads start on every upgraded node, every minute.
    - Format-1 bundles remain readable and are deleted as format-2 manifests pass them (§2.7).
-2. `retiring_retention` is now 0 s. During this phase, a node that restarts after more than about two minutes rebuilds from a peer rather than replaying.
-3. **Gate:** every shard has a manifest younger than 2 × `bundle_interval`: `max(searchlight_bundle_age_seconds) < 120`. Do not start phase B before this. It is what makes a later cold start cheap.
+3. `retiring_retention` is now 0 s. During this phase, a node that restarts after more than about two minutes rebuilds from a peer rather than replaying. Set `retiring_retention=15m` for the phase to keep the old window.
+4. **Gate:** every shard has a manifest younger than 2 × `bundle_interval`: `max(searchlight_bundle_age_seconds) < 120`. Do not start phase B before this. It is what makes a later cold start cheap.
 
 **Phase B: switch storage.** `volumeClaimTemplates` is immutable, so:
 1. `kubectl delete statefulset searchlight --cascade=orphan`. The pods keep running and serving.
@@ -692,11 +742,13 @@ The migration is rolling-safe, with no full stop at any point. One node is down 
 
 **Phase C: clean up.** PVCs survive StatefulSet deletion, because the default retention policy is Retain. Delete them: `kubectl delete pvc -l app.kubernetes.io/name=searchlight`.
 
-**Cost.** Phase B costs one full peer copy per node: 11.6 s at 1M docs on CI (M, [bench] T8), each step while the others serve.
+**Cost.** Phase B costs one full peer copy per node, each step while the others serve:
+- 11.6 s at 1M docs on CI uncapped (M, [bench] T8);
+- ≈ 24 s at an 80 MiB/s `recovery_budget`, or ≈ 33–43 s at 40 MiB/s (E, §4.3).
 
 **Rollback:**
 - From phase B or C, delete the StatefulSet with `--cascade=orphan` again, and apply the old manifest. While the PVCs still exist, pods reattach them and reopen, or rebuild if pruned past.
-- A **binary** rollback past migration 3 needs a database restore, as for every migration (operations.md). See Q2.
+- A **binary** rollback past migration 3 needs a database restore, as for every migration. The operator accepted this on 2026-10-10. Phase A is therefore the point of no return for the binary, and the runbook says so before its first step (§2.6, "Rollback consequence").
 
 **Docker Compose, one node at a time:**
 1. Edit the service to use the tmpfs.
@@ -729,6 +781,9 @@ The migration is rolling-safe, with no full stop at any point. One node is down 
 | `searchlight_cluster_dark_shards` | gauge | Shards with no serving copy in this node's view |
 | `searchlight_cluster_nodes_reaped_total` | counter | `sl_nodes` rows reaped |
 | `searchlight_changelog_floor_lag_seq` | gauge; `index`, `shard`, `held_by` (`copy`, `bundle`, `retiring`, `age`) | How far the prune floor trails the head, and what holds it |
+| `searchlight_bundle_hold_seconds` | gauge; `index`, `shard` | The longest hold among the shard's retained manifests: the age of the oldest change after the oldest manifest's seq (§2.5). The leader exports it. Healthy: about two intervals |
+| `searchlight_bundle_floor_released_total` | counter; `index`, `shard` | Manifests the leader left out of the prune floor because their hold passed `bundle_max_hold` (1 h). Each one means an uploader was stuck |
+| `searchlight_replica_recovery_throttled_seconds_total` | counter; `direction` (`in`, `out`) | Time recovery streams waited on `recovery_budget`. It shows when the cap, not the disk or the store, sets restore time |
 | `searchlight_data_dir_free_bytes` | gauge | Free bytes on `data_dir`'s filesystem, against an `emptyDir` `sizeLimit` |
 
 **Existing metrics:**
@@ -751,6 +806,8 @@ The migration is rolling-safe, with no full stop at any point. One node is down 
 | Alert | Expression (sketch) | Why |
 |---|---|---|
 | Bundles stale | `max by (index, shard) (searchlight_bundle_age_seconds) > max(600, 5 × bundle_interval)` for 10 m | A cold start would replay far more. `sl_changes` grows |
+| Bundle hold nearing the cap | `max by (index, shard) (searchlight_bundle_hold_seconds) > 1800` for 5 m | An uploader is stuck. At 1 h its manifests stop holding the changelog, and that shard loses its bundle |
+| Bundle floor released | `increase(searchlight_bundle_floor_released_total[1h]) > 0` | A shard's manifests were released: until uploads resume, a cold start rebuilds it with `ScanShard` |
 | Restores fall back to SQL | `rate(searchlight_replica_recovery_fallbacks_total{to="sql"}[15m]) > 0` | Bundles are missing or corrupt |
 | Shards dark | `max(searchlight_cluster_dark_shards) > 0` for 5 m | Reads fail for those shards |
 | `data_dir` nearly full | `searchlight_data_dir_free_bytes / <sizeLimit> < 0.2` | The kubelet evicts at `sizeLimit` |
@@ -784,10 +841,17 @@ These run in the in-process cluster harness (`internal/cluster/harness_test.go`)
 | C10 | **Mixed versions:** a format-1 binary beside a format-2 binary | The old binary ignores `b2/`. The new one restores format-1 bundles. Migration 3 leaves the old binary working |
 | C11 | **Identity churn:** 20 replacements under new ids (Deployment style) | `sl_nodes` holds live rows plus rows younger than `node_reap_after`. Retiring rows are released within `lease_ttl` + one prune pass |
 | C12 | **Paged `ScanShard` under writes:** inserts, updates, deletes and a mapping change during the scan, on all three dialects | The copy equals brute force after replay. A mapping change restarts the scan |
+| C13 | **Stuck uploader:** uploads blocked for one shard under writes (fake clock past `bundle_max_hold`), and separately an idle shard with an hour-old manifest that then takes a write | Stuck: the floor leaves the manifest out after 1 h, `sl_changes` is pruned, the manifest is deleted, and `floor_released_total` counts it. Idle: the manifest keeps holding the floor and stays usable until the next upload |
+| C14 | **SQLite with an ephemeral `data_dir`:** a single node restarted with its `data_dir` wiped, bundles off | Every copy rebuilds via `ScanShard` and serves. Heap within §6.1's target |
 
 ### 11.2 Benchmark targets
 
 These are new `slbench` workloads: `restore` (one node, empty disk, no peers) and `coldstart` (every node wiped). They run beside `recovery` (T8) and `restart` (T9a) on the CI Linux runner, with Postgres.
+
+**T9b and T12 are release blockers** (decided 2026-10-10):
+- `bench/report/targets.go` gains `T9b` and `T12` checks beside `T8` and `T9` (`targets.go:466-520`).
+- `.github/workflows/bench.yml` fails the release run on `FAIL`, `INVALID` or `NOT MEASURED` for either.
+- The workloads run with the shipped defaults, `recovery_budget` included (see §4.3 for why that matters).
 
 | Measure | 1M docs | 10M docs | Compared with |
 |---|---|---|---|
@@ -810,22 +874,22 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 
 | ID | Task | Depends on | Estimate |
 |---|---|---|---|
-| SN-1 | Spec and docs. Main spec §1 (T9a, T9b, T12), §8, §9, §12, §17. `operations.md` (bundles, sizing, retiring retention, migration runbook). `clustering.md` (the node path) | — | 1 |
+| SN-1 | Spec and docs. Main spec §1 (T9a, T9b, T12 as release blockers), §8, §9, §12, §17. `operations.md`: <ul><li>bundles;</li><li>the database sizing note (§2.8);</li><li>`retiring_retention` and the 15m setting for kept disks;</li><li>SQLite with an ephemeral `data_dir` (§2.8);</li><li>`recovery_budget`;</li><li>`bundle_max_hold`;</li><li>migration 3's rollback consequence in "Upgrades and rolling restarts" (§2.6);</li><li>the migration runbook;</li><li>the new alerts.</li></ul> `clustering.md` (the node path) | — | 1.5 |
 | SN-2 | Migration 3: `bundle_until` and `restore_until`. `ClaimBundle`, `ClaimRestore`, `ReleaseClaims`, the renewal. Store conformance on SQLite, Postgres and MySQL | — | 2 |
 | SN-3 | Format-2 writer: naming, manifest encoding, the upload protocol with fence checks, `bundle_budget`, `bundle_concurrency`, the skip check. Crash-hook tests (C6) | SN-2 | 3–4 |
-| SN-4 | Retention, GC, repair. Leader cleanup of gone incarnations. Prune-floor integration. Format-1 retirement | SN-3 | 2 |
+| SN-4 | Retention, GC, repair. Leader cleanup of gone incarnations. Prune-floor integration with the `bundle_max_hold` release (C13). Format-1 retirement | SN-3 | 2.5 |
 | SN-5 | Format-2 restore: listing and choice, staging with reuse and hard links, parallel `Get` and `BlobStore.GetAt`, verify, install, the fallback chain, the format-1 reader kept (C3–C5) | SN-3 | 3 |
-| SN-6 | Herd control: restore-claim flow in the fetcher, waiters, the `recovery_concurrency` semaphore (in and out), `Retry-After`, the `seq` in the dark-write 503 (C1, C2, C8) | SN-2, SN-5 | 2–3 |
+| SN-6 | Herd control: restore-claim flow in the fetcher, waiters, the `recovery_concurrency` semaphore (in and out), the `recovery_budget` token buckets (in and out), `Retry-After: 5`, the `seq` in the dark-write 503 (C1, C2, C8) | SN-2, SN-5 | 3 |
 | SN-7 | Readiness: the dark-at-claim rule, quarantine as not serving (§3.3, §5.3) | — | 1 |
 | SN-8 | Identity: the reaper, `retiring_retention` 0 s default (and accepting `0s`), release on reap (C11) | — | 1–1.5 |
 | SN-9 | Bounded `ScanShard`: load buffer options, slot gating, the paged scan contract on 3 dialects, the conformance property test (C12), heap measurement | — | 3 |
 | SN-10 | Config: new settings and defaults (§12.3), validation, `-h` text | SN-3, SN-6, SN-8 | 0.5 |
 | SN-11 | Manifests: StatefulSet without PVC, Compose tmpfs, kubeconform, PDB notes, the Deployment-variant note | SN-7, SN-8 | 1 |
 | SN-12 | Observability: the metrics, logs and alerts in §10 | SN-3 to SN-8 | 1–1.5 |
-| SN-13 | Chaos suite over real processes: C1, C2, C7, C9, C10 | SN-3 to SN-9 | 3 |
-| SN-14 | Bench: `restore` and `coldstart` workloads, report targets T9b and T12, 1M and 10M runs, Elasticsearch comparisons | SN-13 | 2–3 |
+| SN-13 | Chaos suite over real processes: C1, C2, C7, C9, C10, C14 | SN-3 to SN-9 | 3 |
+| SN-14 | Bench: `restore` and `coldstart` workloads, T9b and T12 checks in `targets.go`, the release gate in `bench.yml`, 1M and 10M runs, Elasticsearch comparisons | SN-13 | 3 |
 
-**Total:** about 26–31 days.
+**Total:** about 28–32 days.
 
 **Critical path:** SN-2 → SN-3 → SN-5 → SN-6 → SN-13 → SN-14. SN-7, SN-8 and SN-9 run in parallel.
 
@@ -837,10 +901,11 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 |---|---|---|
 | R1 | **Merge write amplification.** Under heavy ingest, a large tiered merge re-uploads gigabytes, so "incremental" is still bounded by the merge rate, not by ingest | `bundle_budget`. The upload target is tied to merge bytes (§11.2). Measure at 1M and 10M before fixing the defaults |
 | R2 | **Database volume.** Uploads go through WAL or binlog, replicas and PITR archives, plus TOAST and vacuum churn | Incremental uploads cut it. Size it in operations.md (§2.8). `searchlight_bundle_upload_bytes_total` shows it |
-| R3 | **Prune floor coupling.** A stuck uploader holds `sl_changes` up to `changelog_retention` (24 h) | The bundle-age alert. The leader's per-shard `held_by` metric. See Q6 |
-| R4 | **Peer load on rolling restarts.** Every pod restart copies the whole index from peers: 1.6 GB per 1M docs | `recovery_concurrency` (outgoing). Optional `recovery_budget`. The search-p99 bench row |
+| R3 | **Prune floor coupling.** A stuck uploader would hold `sl_changes`. The cap releases it after 1 h, but then the shard has no usable bundle until uploads resume | `bundle_max_hold` (1 h). The hold-nearing-cap and floor-released alerts. The bundle-age alert |
+| R4 | **Peer load on rolling restarts.** Every pod restart copies the whole index from peers: 1.6 GB per 1M docs | `recovery_concurrency` (outgoing). `recovery_budget` on by default. The search-p99 bench row |
+| R4b | **The decided 40 MiB/s `recovery_budget` breaks release blockers.** T9b (≤ 30 s at 1M) and T8 (≤ Elasticsearch, 29.1 s at 1M) both fail at ≈ 33–43 s (E, §4.3) | Ship 80 MiB/s (≈ 24 s, E), or grade with the cap off. This needs the operator's choice (§13) |
 | R5 | **Ready during a dark start.** The PDB counts those pods ready. A drain during a cold start can evict a restorer, whose claim then lapses and restarts elsewhere | Document: no node-pool operations during a cold start. Watch `searchlight_cluster_dark_shards`. Claims make an eviction cost time, never correctness |
-| R6 | **Cold-start outage grows with index size.** Reads of a dark shard 503 for one restore (about 11 s per node-index at 1M, E). Writes stay up | Herd control, bundles every minute (short replay), parallel downloads. Stagger node-pool upgrades |
+| R6 | **Cold-start outage grows with index size.** Reads of a dark shard 503 for one restore. At 1M docs that is about 11 s per node-index uncapped, ≈ 24 s at 80 MiB/s, or ≈ 38 s at 40 MiB/s (E). Writes stay up | Herd control, bundles every minute (short replay), parallel downloads. Stagger node-pool upgrades |
 | R7 | **Large files restart from zero.** A `Put` or `Get` of a multi-GB segment interrupted mid-file starts over | `GetAt` ranges make restore downloads resumable per range. Upload resumability is left out (rounds retry), and is revisited if R1 measurements show long uploads failing |
 | R8 | **`emptyDir` eviction.** A pod over `sizeLimit` is evicted, then restores elsewhere, and can loop if mis-sized | The sizing formula (§7.1). The free-bytes metric and alert |
 | R9 | **Claims depend on lease timing.** Like copy leases, claims assume bounded clock-rate drift within `LeaseMargin` | The same margin and local-deadline discipline as copies. Restores verify everything, so a fencing bug costs a fallback, not a corrupt copy |
@@ -857,39 +922,61 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 | `bundle_concurrency` | `2` | New |
 | `bundle_gc_grace` | `1h` | New |
 | `recovery_concurrency` | `2` | New |
-| `recovery_budget` | `0` (unlimited) | New (Q5) |
+| `recovery_budget` | `40MiB` per second per node, in and out separately (`0` = unlimited) | New. The default was decided 2026-10-10. It fails T9b and T8 at 1M, and 80 MiB/s is needed (§4.3, §13) |
+| `bundle_max_hold` | `1h` | New: the longest a manifest holds the changelog's prune floor (§2.5) |
 | `restore_streams` | `4` | New |
 | `restore_stall_timeout` | `2m` | New |
 | `node_reap_after` | `1h` | New |
-| `retiring_retention` | **`0s`** (accepts `0s`) | Was `15m`, which had to be positive |
+| `retiring_retention` | **`0s`** (accepts `0s`) | Was `15m`, which had to be positive. Deployments that keep disks set `15m` |
 
-No setting is removed or renamed, so nothing goes in the removed-settings table (`config.go:237-241`). Two defaults change: `bundle_interval` and `retiring_retention`. The release notes and operations.md call them out.
+No setting is removed or renamed, so nothing goes in the removed-settings table (`config.go:237-241`). Two existing defaults change: `bundle_interval` and `retiring_retention`. The new `recovery_budget` caps something that was unlimited before. The release notes and operations.md call out all three.
 
 ---
 
-## 13. Decisions (additions to spec §17)
+## 13. Decisions (2026-10-10)
+
+### 13.1 The operator's answers
+
+The draft's open questions were answered by the operator on 2026-10-10. Each is now a decision, and the sections it touches are already updated.
+
+| # | Question | Decision | Where |
+|---|---|---|---|
+| Q1 | Readiness during a cold start | Writes stay up. Reads of a shard with no serving copy answer 503 with `Retry-After: 5` | §3.3, §4.4 |
+| Q2 | Migration 3 and rollback | Migration 3, with the claim columns `bundle_until` and `restore_until`, is accepted. A binary rollback past it needs a database restore. The upgrade docs say so, and the runbook backs up the database first | §2.6, §9, SN-1 |
+| Q3 | `retiring_retention` default | `0s`. Deployments that keep disks set `15m` | §5.2, §9, §12.3 |
+| Q4 | SQLite | Bundles stay off by default. On SQLite an ephemeral `data_dir` rebuilds via `ScanShard` at each start, which is fine for a single node, and is documented | §2.4, §2.8, C14 |
+| Q5 | Recovery bandwidth | Capped by default at 40 MB/s per node (`recovery_budget=40MiB`), like Elasticsearch's `indices.recovery.max_bytes_per_sec`. Configurable | §4.3, §12.3. See 13.3 |
+| Q6 | A stuck uploader and the prune floor | The floor leaves out manifests that have held it for more than 1 h (`bundle_max_hold`). The metrics are `searchlight_bundle_hold_seconds` and `searchlight_bundle_floor_released_total`, each with an alert | §2.5, §10, C13 |
+| Q7 | Grading of T9b and T12 | Release blockers: graded in `bench/report/targets.go`, gated in `.github/workflows/bench.yml`, with the shipped defaults | §1, §11.2, SN-14 |
+| Q8 | Where bundles live | In the database. Object storage stays a non-goal. operations.md gains a sizing note: about 1.6–2.1 GB per 1M docs, plus WAL or binlog traffic | §1 non-goals, §2.8, SN-1 |
+
+### 13.2 Design decisions (additions to spec §17)
 
 | Item | Decision |
 |---|---|
 | Node storage | Ephemeral (`emptyDir`). Reopen is kept as an optimisation when the disk survives |
 | Recovery order | Peer, then bundle reload, then `ScanShard` (bounded) |
-| Bundles | Format 2: content-addressed file blobs per shard incarnation, plus a manifest. On every 1 m by default on Postgres and MySQL. Retention 2. GC under a per-shard bundle claim |
-| Herd control | One restore claim per shard (`restore_until` on the copy row). The others wait, then copy from a peer. `recovery_concurrency` 2 |
-| Readiness | Strict, except copies dark at claim time: a cold start takes writes |
+| Bundles | Format 2: content-addressed file blobs per shard incarnation, plus a manifest. On every 1 m by default on Postgres and MySQL, off on SQLite. Retention 2. GC under a per-shard bundle claim. A manifest holds the prune floor for at most 1 h |
+| Bundle storage | The database (`sl_blobs`). Object storage is a non-goal |
+| Herd control | One restore claim per shard (`restore_until` on the copy row, migration 3). The others wait, then copy from a peer. `recovery_concurrency` 2. `recovery_budget` per node, in and out |
+| Readiness | Strict, except copies dark at claim time: a cold start takes writes, and reads of dark shards answer 503 with `Retry-After: 5` |
 | Identity | StatefulSet without a PVC recommended. Dead rows reaped after 1 h. `retiring_retention` 0 s |
 | Bundle format compatibility | N−1: format-2 binaries read format 1. The format-1 reader is removed after the next major |
+| Release blockers | T9a (as T9 today), T9b and T12 join T1–T8 |
 
----
+### 13.3 What the decisions changed in the design
 
-## 14. Open questions for the operator
-
-- **Q1. Readiness during a cold start.** This design makes pods ready while their shards are dark, so writes are accepted and reads of dark shards 503. The alternative keeps the strict rule: a total outage, writes included, until each pod's copies serve, but PDB-safe. Confirm "writes up, reads 503" is wanted.
-- **Q2. Migration 3 and rollback.** The claim columns are an additive schema migration. Under the existing rule, a binary rollback past it needs a database restore. Options:
-  - accept this, which is the design;
-  - use a schema-free alternative: elect the restorer as the lowest live node id among the shard's claimants, as the leader and today's uploader are chosen. It needs no migration, but it is weaker against a node that is alive but stuck, and it gives GC no fencing.
-- **Q3. `retiring_retention` default 0 s.** Deployments that keep their disks then rebuild from a peer after a restart longer than about two bundle intervals, instead of the old 15-minute window. Acceptable as the default, with PVC users setting `15m`?
-- **Q4. SQLite.** Bundles stay off by default on SQLite, because a single node already needs a disk for its database file. Or should a SQLite node be able to run with an ephemeral `data_dir` and bundles on by default?
-- **Q5. Recovery bandwidth default.** Unlimited (`recovery_budget=0`, fastest T8 and T9b), or an Elasticsearch-like cap such as 40 MB/s that protects search p99 on serving peers during rolling restarts?
-- **Q6. Cap on the bundle prune floor.** Should the floor ignore manifests older than some age, say 1 h, so a stuck uploader cannot hold `sl_changes` for up to 24 h? The cost is losing those manifests as restore points.
-- **Q7. The new T9b and T12 numbers.** The targets proposed are T9b ≤ Elasticsearch peer recovery and ≤ 30 s at 1M per node on CI, and T12 ≤ 1.25 × one restore. Should T9b and T12 be graded release blockers, as T1–T8 are, or reported only?
-- **Q8. Database budget.** Is about one extra copy of the index in the database (≈ 1.6–2.1 GB per 1M docs, T), plus its WAL or binlog traffic, within what the target Postgres and MySQL deployments can carry? If not, an object-storage `BlobStore` moves from non-goal to requirement.
+- **Q5 against Q7 is a conflict.**
+  - At the decided 40 MiB/s cap, T9b's 30 s bound at 1M docs fails: ≈ 33–43 s (E, §4.3).
+  - So does T8, today a pass at 11.6 s against Elasticsearch's 29.1 s (M, [bench]).
+  - Both are release blockers graded with the shipped defaults, so the decided default would block the release.
+  - Meeting T9b needs a cap of at least 64 MiB/s, and **80 MiB/s** (≈ 24 s, E) leaves headroom. This design recommends shipping `recovery_budget=80MiB`.
+  - The alternative is to keep 40 MiB/s and grade T8 and T9b with the cap off. The bench would then no longer measure what ships.
+  - The operator picks one before SN-6 lands. Until then the settings table carries the decided 40 MiB/s.
+- **Q6 is measured as hold, not as the manifest's age.**
+  - A manifest stops counting once the oldest change after its seq is more than 1 h old, not once the manifest itself is.
+  - With the literal reading, an idle shard's old manifest would stop counting on the first write after a quiet hour. The changelog could then be pruned past it before the next upload, leaving the shard briefly without a usable bundle (§2.5).
+  - The effect on a stuck uploader is the same either way.
+- **Q1 fixed `Retry-After` at 5 s for every dark-shard read.** The draft used 5 s only while a restore claim was held, and 1 s otherwise.
+- **Q4 makes a SQLite node with an ephemeral `data_dir` a supported, documented case**, with its own chaos test (C14). Its restart is a full `ScanShard`.
+- **Q2** adds a "back up the database first; this is the point of no return" step at the head of the migration runbook (§9, phase A).

@@ -439,7 +439,7 @@ func (s *Server) wrap(rt *route) http.Handler {
 			failure = e
 			if e.Status == http.StatusRequestEntityTooLarge {
 				if r.ProtoMajor == 1 {
-					sw.Header().Set("Connection", "close") // no more requests on this connection; an HTTP/2 stream ends alone
+					sw.Header().Set("Connection", "close") // no more requests on this connection
 				}
 				s.tooLarge.Add(1)
 			}

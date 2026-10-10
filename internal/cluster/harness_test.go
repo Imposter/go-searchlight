@@ -247,8 +247,14 @@ type violation struct {
 // checkServed checks the split-brain invariant on a read that tn's copy of id served
 // to a peer (began and wall are the leaseClock readings at which tn judged the copy to
 // serve it, peerAPI.target): the copy's lease held, by both clocks, and was not
-// quarantined when the read began, and no other node's copy of the same slot serves peers. A lease claimed after
-// began, or dropped since, cannot be judged.
+// quarantined when the read began, and no other node's copy of the same slot serves
+// peers. A lease claimed after began, or dropped since, cannot be judged.
+//
+// The quarantine and lapse branches check the node's own judgement, at its own
+// readings: they catch a gate that admits a read its lease or quarantine forbids, not a
+// wrong reading. The independent checks are checkServedLocal (every read, local ones
+// included, against the quarantine as it stands) and the other-node check here (no two
+// nodes' copies of a slot serving peers at once).
 func (c *cluster) checkServed(tn *tnode, id store.ShardID, began time.Duration, wall time.Time) {
 	l := tn.n.leaseFor(id)
 	if l == nil || l.claimed > began {

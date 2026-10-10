@@ -467,6 +467,10 @@ func roundAll(m map[string]time.Duration) map[string]time.Duration {
 // in the database at once, so another node steals the slot while the cut-off node's
 // local deadline is still ahead. The thief's quarantine (TTL plus margin after its
 // claim, by its own clock) keeps the two from serving at once all the same.
+//
+// Whether a node's copy serves peers is asked through the peer API's own admission
+// (peerAPI.target, stale allowed), so the served hook judges each read at the readings
+// the copy was admitted at, not at readings taken before its checks.
 func TestPartitionedNodeStopsServingBeforeSteal(t *testing.T) {
 	testtier.Heavy(t)
 	for _, stepClock := range []bool{false, true} {
@@ -500,11 +504,6 @@ func testPartition(t *testing.T, d *db, stepClock bool) {
 	if a.n.leaseFor(id) == nil {
 		t.Fatal("node-0 holds no lease")
 	}
-	// peerServes reports whether tn's copy serves peers now: what a peer's read of it
-	// gets, through the peer API's own admission (peerAPI.target), stale allowed. A read
-	// it serves is held to the serving invariant by the served hook, at the readings the
-	// copy was judged at: readings taken before the copy's checks would date a read
-	// admitted at the quarantine's end to before it.
 	peerServes := func(tn *tnode) bool {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", nil)
 		tg, err := tn.n.peer.target(req, shardRef{Index: "sb", Shard: 0, AllowStale: true})
@@ -825,6 +824,12 @@ func TestTakeoverQuarantineSurvivesAStaleViewAndAClaimBack(t *testing.T) {
 // read is admitted) the fake clock moves 5 ms on, as a busy runner's clock would
 // between two readings: the read must be reported at the later reading, the one it was
 // judged at, never one taken before the checks.
+//
+// The copy recovers first (its timers run on the fake clock), so the boundary is about
+// the quarantine alone. Node-0, cut off from the database, stops serving peers once its
+// own lease lapses by its real clock, well before the quarantine ends, which node-1's
+// fake clock reaches at once. The lease is renewed as the clock moves (from the
+// readings before each step), so only the quarantine, never the lease, decides the read.
 func TestPeerReadJudgedAtQuarantineEnd(t *testing.T) {
 	var (
 		inside   atomic.Pointer[func()]
@@ -848,8 +853,6 @@ func TestPeerReadJudgedAtQuarantineEnd(t *testing.T) {
 	id := store.ShardID{Index: "sb", Shard: 0}
 	stolen := stealSB(t, b)
 	q := stolen.quarantine
-	// The copy recovers first (its quarantine aside): the boundary is about the
-	// quarantine alone. Its tailer's timers run on the fake clock.
 	recovered := func() bool {
 		for _, lc := range b.n.LocalCopies() {
 			if lc.Info.Index == "sb" && lc.Info.Shard == 0 {
@@ -866,17 +869,12 @@ func TestPeerReadJudgedAtQuarantineEnd(t *testing.T) {
 		clk.Advance(10 * time.Millisecond)
 		time.Sleep(5 * time.Millisecond)
 	}
-	// Node-0, cut off from the database, stops serving peers once its own lease lapses
-	// by its real clock: well before the quarantine ends, which node-1's fake clock
-	// reaches at once.
 	for deadline := time.Now().Add(30 * time.Second); b.c.node(0).n.peerValid(id); {
 		if time.Now().After(deadline) {
 			t.Fatal("node-0, cut off, still serves peers")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// Renew as the clock moves (from the readings before each step), so only the
-	// quarantine, never the lease, decides the read.
 	for now := b.n.lc.Now(); now < q-time.Nanosecond; now = b.n.lc.Now() {
 		stolen.extend(now, b.n.lc.Wall())
 		clk.Advance(min(30*time.Minute, q-time.Nanosecond-now))

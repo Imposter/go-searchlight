@@ -77,7 +77,7 @@ func (t *Tailer) Wake() {
 func (t *Tailer) Pause() {
 	t.paused.Store(true)
 	t.mu.Lock()
-	t.mu.Unlock() //nolint:gocritic,staticcheck // the lock, not what it guards, is the barrier: no defer needed, the empty section is the point
+	t.mu.Unlock() //nolint:gocritic,staticcheck // an empty critical section on purpose
 }
 
 // Resume undoes Pause and wakes the tailer.

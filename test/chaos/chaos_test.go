@@ -90,8 +90,6 @@ func TestKillMidRecovery(t *testing.T) {
 	if err := os.RemoveAll(r.DataDir()); err != nil {
 		t.Fatal(err)
 	}
-	// Every recovery but the first waits while the hold file exists, so the kill lands
-	// mid-recovery however fast the first copy comes over.
 	if err := os.WriteFile(r.holdRecovery, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}

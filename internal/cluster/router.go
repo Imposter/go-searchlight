@@ -214,8 +214,9 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 }
 
 // authorize adds the cluster token and the trace context to a peer request, and the
-// caller's deadline less a reserve (peerReserve). A token sent in the clear to a peer off this machine is warned
-// about, once per peer: set tls_cert (and peer_ca_file) on a network you do not trust.
+// caller's deadline less a reserve (peerReserve). A token sent in the clear to a peer
+// off this machine is warned about, once per peer: set tls_cert (and peer_ca_file) on
+// a network you do not trust.
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)

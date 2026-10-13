@@ -141,8 +141,8 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 // countAggs counts aggs and their sub-aggregations.
 func countAggs(aggs map[string]Agg) int {
 	n := len(aggs)
-	for _, a := range aggs {
-		n += countAggs(a.Aggs)
+	for name := range aggs {
+		n += countAggs(aggs[name].Aggs)
 	}
 	return n
 }

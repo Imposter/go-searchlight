@@ -118,7 +118,8 @@ func (p *parser) node(v any) Node {
 	if !p.enter(false) {
 		return nil
 	}
-	if p.leaves++; p.leaves > MaxLeaves {
+	p.leaves++
+	if p.leaves > MaxLeaves {
 		p.exceeded = msgLeaves
 		return nil
 	}

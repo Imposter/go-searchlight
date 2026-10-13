@@ -435,7 +435,8 @@ func newSplitPlan(views []view, workers, k int) *splitPlan {
 // split percolates one document across every query segment, window by window, on
 // win.workers goroutines (this one and helpers, sc serving this one) that take the
 // windows in turn, and joins the windows' matches in order: window w's are
-// buf[lo:hi] of the scratch of the worker that took it. A canceled ctx stops the
+// buf[lo:hi] of the scratch of the worker that took it, so the helpers' scratches go
+// back to the pool only once the answer is copied out. A canceled ctx stops the
 // workers before their next window.
 func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, win *splitPlan, sc *scratch, size scratchSize) (IDs, docStats, error) {
 	if d.Fields == nil {
@@ -498,11 +499,13 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 	}
 	work(0)
 	wg.Wait()
-	for _, c := range scs[1:] {
-		if c != nil {
-			p.scratchCache.Put(c)
+	defer func() {
+		for _, c := range scs[1:] {
+			if c != nil {
+				p.scratchCache.Put(c)
+			}
 		}
-	}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, docStats{}, err
 	}

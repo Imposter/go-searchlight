@@ -481,8 +481,20 @@ func TestPeerDeadlineLeavesAReserve(t *testing.T) {
 func TestRegistryReadAfterStopForgetsNoPeerTwice(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
-	a.n.hints.send("node-gone", "127.0.0.1:1", hint{Index: "g", Shard: 0, Seq: 1})
-	a.n.hints.close()
+	ghost := store.Node{ID: "node-gone", Address: "127.0.0.1:1", BodyCodecs: store.BodyCodecs}
+	if err := a.st.Registry().Heartbeat(tctx(t), ghost); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	a.n.hints.send(ghost.ID, ghost.Address, hint{Index: "g", Shard: 0, Seq: 1})
+	if err := a.n.Stop(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.st.Registry().RemoveNode(tctx(t), ghost.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := a.n.refreshView(tctx(t)); err != nil {
 		t.Fatal(err)
 	}

@@ -250,6 +250,20 @@ func TestParseRefusesDeepQueriesCheaply(t *testing.T) {
 	}
 }
 
+// An entry of a group that is not a node still counts toward MaxNodes, so a group of
+// a million scalars stops at its entry past the bound instead of being walked whole.
+func TestParseCountsEveryGroupEntry(t *testing.T) {
+	raw := `{"any": [1` + strings.Repeat(",1", 1_000_000) + `]}`
+	_, problems := Parse([]byte(raw))
+	if len(problems) != 1 || problems[0].Loc != RootLoc || !strings.Contains(problems[0].Message, "nodes") {
+		t.Fatalf("%d problems, first %v; want the node bound alone", len(problems), problems[0])
+	}
+	_, problems = Parse([]byte(`{"any": [1, {"field": "f", "op": "eq", "value": 1}]}`))
+	if len(problems) != 1 || problems[0].Loc != "query.any.0" {
+		t.Fatalf("problems = %v, want one at query.any.0", problems)
+	}
+}
+
 // allocated is how many bytes fn allocates.
 func allocated(fn func()) uint64 {
 	var before, after runtime.MemStats

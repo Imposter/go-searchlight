@@ -62,8 +62,9 @@ func isEverything(v any) bool {
 
 // parser reads a decoded query. path holds the keys and list indexes from the root to
 // the node being read, from which a problem's loc is built only when one is recorded.
-// depth, leaves and nodes are counted while descending; exceeded is the first bound
-// passed, which stops the parse.
+// depth, leaves and nodes are counted while descending (an entry that is not a node
+// counts as one, so a group of scalars is not walked past MaxNodes); exceeded is the
+// first bound passed, which stops the parse.
 type parser struct {
 	problems problems
 	path     []string
@@ -103,7 +104,9 @@ func (p *parser) leave() { p.depth-- }
 func (p *parser) node(v any) Node {
 	m, ok := v.(map[string]any)
 	if !ok {
-		p.problems.add(p.at(), msgNode)
+		if p.enter(false) {
+			p.problems.add(p.at(), msgNode)
+		}
 		return nil
 	}
 	if _, ok := m["all"]; ok {

@@ -503,3 +503,33 @@ func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 		}
 	}
 }
+
+// TestPercolateRereadsAStaleCatalogue: a node whose cached mapping predates a field
+// another node mapped re-reads the catalogue when a percolated document names a field
+// the cache lacks, instead of dropping it (dynamic false) until its next sync, so the
+// saved queries on the field match.
+func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.CatalogInterval = time.Hour
+		}
+	})
+	a := c.start(0)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "pc", spec); err != nil {
+		t.Fatal(err)
+	}
+	b := c.start(1) // it reads the catalogue as it starts, and not again for an hour
+	waitCopies(t, a.st, "pc", 1, 2, time.Minute)
+	if _, err := a.n.PatchMapping(tctx(t), "pc", map[string]schema.FieldType{"tags": schema.KeywordList}); err != nil {
+		t.Fatal(err)
+	}
+	seq := mustWrite(t, a.n, "pc", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "tags", "op": "has", "value": "x"}`)})
+	res, err := b.n.Percolate(tctx(t), "pc", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"tags": ["x"]}`)}}, api.ReadOptions{WaitForSeq: seq})
+	if err != nil || string(res.Results[0].Queries) != `["q"]` {
+		t.Fatalf("percolating on the node with a stale catalogue: %+v, %v", res, err)
+	}
+}

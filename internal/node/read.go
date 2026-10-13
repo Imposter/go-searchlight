@@ -321,32 +321,69 @@ func firstError(errs []error) error {
 	return nil
 }
 
+// catalogRecheckEvery is the least time between two catalogue reads that percolated
+// documents naming unmapped fields make on one index.
+const catalogRecheckEvery = 100 * time.Millisecond
+
 // analyzeDocs analyzes the given documents of a percolation under the index's mapping.
 // A cluster node re-reads the catalogue once when one does not analyze (a strict
-// index refusing a field another node has since mapped).
+// index refusing a field another node has since mapped), and when one names a field
+// the mapping lacks (another node may have mapped it since this node's last sync, and
+// the copies analyze saved queries under it), at most every catalogRecheckEvery.
 func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) ([]schema.Doc, error) {
 	for attempt := 0; ; attempt++ {
 		m := idx.meta.Load().mapping
+		recheck := attempt == 0 && n.cl != nil && idx.mayRecheckCatalog(n.clock.Now())
 		docs := make([]schema.Doc, 0, len(bodies))
 		var failure error
+		unmapped := false
 		for i, body := range bodies {
-			doc, _, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
+			doc, update, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
 			if err != nil {
 				failure = docProblem(err, "docs."+strconv.Itoa(i))
 				break
 			}
+			unmapped = unmapped || (recheck && namesUnmapped(m, update, body))
 			docs = append(docs, doc)
 		}
-		if failure == nil {
+		if failure == nil && !unmapped {
 			return docs, nil
 		}
 		if attempt > 0 || n.cl == nil {
 			return nil, failure
 		}
+		if failure == nil {
+			idx.catalogRecheck.Store(n.clock.Now().UnixNano())
+		}
 		if changed, _ := n.reloadIfNewer(ctx, idx); !changed {
-			return nil, failure
+			if failure != nil {
+				return nil, failure
+			}
+			return docs, nil
 		}
 	}
+}
+
+// namesUnmapped reports whether a document analyzed under m names a field m lacks:
+// update holds the fields dynamic mapping typed, and under dynamic false (which drops
+// them) body is typed again as if dynamic were true.
+func namesUnmapped(m *schema.Mapping, update schema.MappingUpdate, body []byte) bool {
+	if !update.Empty() {
+		return true
+	}
+	if m == nil || m.Dynamic != schema.DynamicFalse {
+		return false
+	}
+	typed := *m
+	typed.Dynamic = schema.DynamicTrue
+	_, u, err := schema.Check(&typed, "_percolate", body)
+	return err == nil && !u.Empty()
+}
+
+// mayRecheckCatalog reports whether percolated documents naming unmapped fields may
+// re-read idx's catalogue at now: catalogRecheckEvery has passed since the last one.
+func (idx *index) mayRecheckCatalog(now time.Time) bool {
+	return now.UnixNano()-idx.catalogRecheck.Load() >= int64(catalogRecheckEvery)
 }
 
 // Percolate implements [api.Coordinator]. Given documents are analyzed under the

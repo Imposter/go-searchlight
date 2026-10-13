@@ -179,6 +179,9 @@ type index struct {
 	refresh     atomic.Int64
 	refreshWake chan struct{}
 	dropped     atomic.Bool
+	// catalogRecheck is when (Unix ns) percolated documents naming unmapped fields
+	// last re-read the catalogue (analyzeDocs).
+	catalogRecheck atomic.Int64
 	// runCtx is the context the index's tailers and refresher run under; cancel
 	// stops them all.
 	runCtx context.Context

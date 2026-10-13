@@ -130,7 +130,7 @@ func (sn *Snapshot) build() error {
 	if err != nil {
 		return err
 	}
-	man.UntypedMarks = legacyMarks(g.docs)
+	man.UntypedMarks, man.SeqMark = legacyMarks(g.docs), g.mark
 	raw, err := encodeManifest(man)
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -79,7 +80,7 @@ func (s *Shard) flush(ctx context.Context) (*Generation, error) {
 		s.commitMu.Unlock()
 		return nil, ErrClosed
 	}
-	if g.gen == s.durableGen && g.seq == s.committed.Load() && g.uid == s.committedUID && g.mp == s.committedMap {
+	if g.gen == s.durableGen && g.seq == s.committed.Load() && g.uid == s.committedUID && g.mp == s.committedMap && bytes.Equal(g.mark, s.committedMark) {
 		s.commitMu.Unlock()
 		return g, nil
 	}
@@ -191,7 +192,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 	if err != nil {
 		return nil, err
 	}
-	man.UntypedMarks = legacyMarks(g.docs)
+	man.UntypedMarks, man.SeqMark = legacyMarks(g.docs), g.mark
 	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	switch {
 	case err == nil:
@@ -234,9 +235,9 @@ func (s *Shard) retireDurable(g *Generation, pending []*segRef, sidecars map[str
 	s.durableSegs = keep
 
 	var obsolete []string
-	var bytes int64
+	var total int64
 	for _, size := range sidecars {
-		bytes += size
+		total += size
 	}
 	for path := range s.durableSidecars {
 		if _, ok := sidecars[path]; !ok {
@@ -252,8 +253,8 @@ func (s *Shard) retireDurable(g *Generation, pending []*segRef, sidecars map[str
 	}
 	clear(s.strays)
 	s.durableSidecars = sidecars
-	s.sidecarBytes.Store(bytes)
-	s.durableGen, s.committedUID, s.committedMap = g.gen, g.uid, g.mp
+	s.sidecarBytes.Store(total)
+	s.durableGen, s.committedUID, s.committedMap, s.committedMark = g.gen, g.uid, g.mp, g.mark
 	s.committed.Store(g.seq)
 	s.jan.removeLater(obsolete...)
 }

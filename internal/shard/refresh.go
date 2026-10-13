@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -46,15 +47,15 @@ func (s *Shard) Refresh(ctx context.Context) error {
 
 	s.mu.Lock()
 	fb := s.buf
-	seq, maxSeq, uid, mp := s.applied, s.maxChange, s.indexUID, s.mapState
+	seq, maxSeq, uid, mp, mark := s.applied, s.maxChange, s.indexUID, s.mapState, s.markAt(s.applied)
 	if fb.empty() {
 		s.mu.Unlock()
-		if seq == cur.seq && uid == cur.uid && mp == cur.mp {
+		if seq == cur.seq && uid == cur.uid && mp == cur.mp && bytes.Equal(mark, cur.mark) {
 			return nil
 		}
 		ctx, span := s.startSpan(ctx, "shard.refresh", attribute.Int64("seq", seq), attribute.Bool("seq_only", true))
 		defer span.End()
-		s.publishSeq(ctx, seq, maxSeq, uid, mp)
+		s.publishSeq(ctx, seq, maxSeq, uid, mp, mark)
 		return nil
 	}
 	s.buf = newBuffer()
@@ -65,7 +66,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	defer span.End()
 	start := s.opts.Clock.Now()
-	if err := s.refresh(ctx, fb, seq, maxSeq, uid, mp); err != nil {
+	if err := s.refresh(ctx, fb, seq, maxSeq, uid, mp, mark); err != nil {
 		if !isCrash(err) {
 			s.mu.Lock()
 			fb.absorb(s.buf)
@@ -95,7 +96,7 @@ const telemetryDuration = "duration_ms"
 
 // refresh writes a frozen buffer's segments and publishes them. When it fails, nothing
 // of fb is visible.
-func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState) error {
+func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState, mark json.RawMessage) error {
 	var built []*segRef
 	discard := func(err error) error {
 		for _, ref := range built {
@@ -146,7 +147,7 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 			queries = append(queries, st)
 		}
 	}
-	s.publish(ctx, docs, queries, built, seq, maxSeq, uid, mp)
+	s.publish(ctx, docs, queries, built, seq, maxSeq, uid, mp, mark)
 	return nil
 }
 
@@ -263,7 +264,7 @@ func (s *Shard) mask(states []segState, ids []string) []segState {
 // generation, and numbers the deletes it changed (dirty) for it: the flush that
 // persists it writes them as sidecars of that number. It writes nothing. The caller
 // holds commitMu.
-func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*segRef, seq, maxSeq int64, uid string, mp *mappingState) {
+func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*segRef, seq, maxSeq int64, uid string, mp *mappingState, mark json.RawMessage) {
 	s.gen++
 	for _, list := range [][]segState{docs, queries} {
 		for i := range list {
@@ -273,6 +274,7 @@ func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*
 		}
 	}
 	g := newGeneration(s, s.gen, seq, maxSeq, uid, mp, docs, queries)
+	g.mark = mark
 	s.unflushed = append(s.unflushed, built...)
 	if old := s.cur.Swap(g); old != nil {
 		old.Release()
@@ -283,7 +285,7 @@ func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*
 
 // publishSeq publishes the current segments as covering seq: a refresh with nothing
 // to write.
-func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState) {
+func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState, mark json.RawMessage) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	cur := s.cur.Load()
@@ -291,6 +293,7 @@ func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, m
 		return
 	}
 	g := newGeneration(s, cur.gen, seq, maxSeq, uid, mp, slices.Clone(cur.docs), slices.Clone(cur.queries))
+	g.mark = mark
 	s.cur.Store(g)
 	cur.Release()
 	s.notifyPublished()

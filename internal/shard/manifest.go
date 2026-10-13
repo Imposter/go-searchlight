@@ -59,6 +59,10 @@ type manifest struct {
 	// truncated bitmap, which segment.Reader.Untyped reads them from). A segment of the
 	// current major says so itself (segment.Reader.MarksUntyped).
 	UntypedMarks int `json:"untyped_marks,omitempty"`
+	// SeqMark is the caller's mark of the change at Seq ([Shard.SetMark]): what the
+	// changelog held there, as the tailer that applied it saw it. Absent when none
+	// was recorded (a binary from before marks reads the manifest without it).
+	SeqMark json.RawMessage `json:"seq_mark,omitempty"`
 }
 
 // untypedMarksFormat is the manifest's UntypedMarks when its previous-major segments

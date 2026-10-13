@@ -49,7 +49,7 @@ func TestChangelogRewindRebuildsTheCopy(t *testing.T) {
 				}
 				c.waitApplied(mustApply(t, st, batch...))
 
-				rewind(t, d, k)
+				rewind(context.Background(), t, d, k)
 				batch = batch[:0]
 				for i := range lost + tc.extra {
 					batch = append(batch, upsert("w", 0, fmt.Sprintf("new%d", i), docBody("new", i)))
@@ -97,10 +97,9 @@ func waitMatches(t *testing.T, c *copyRunner, st store.Store, id ShardID) {
 // rewind loses every commit after seq k, as a failover to a replica that had not
 // received them would: their changes, the documents and queries they created, and the
 // counter past k.
-func rewind(t *testing.T, d *db, k int64) {
+func rewind(ctx context.Context, t *testing.T, d *db, k int64) {
 	t.Helper()
 	raw := rawDB(t, d)
-	ctx := context.Background()
 	for _, q := range []string{
 		"DELETE FROM sl_changes WHERE seq > %d",
 		"DELETE FROM sl_documents WHERE seq > %d",
@@ -177,7 +176,7 @@ func TestRebuiltCopyReportsItsOwnSeq(t *testing.T) {
 		c.waitApplied(lost)
 		waitReported(t, st, id, func(seq int64) bool { return seq >= lost })
 
-		rewind(t, d, k)
+		rewind(context.Background(), t, d, k)
 		waitMatches(t, c, st, id)
 		got := waitReported(t, st, id, func(seq int64) bool { return seq <= k })
 		if sh := c.shard(); got != sh.CommittedSeq() {

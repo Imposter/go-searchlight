@@ -267,12 +267,22 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			return err
 		}
 	}
+	rc := markOf(sh)
 	for {
-		head, _, err := t.st.HeadSeq(ctx)
+		from := sh.AppliedSeq()
+		tip, err := t.st.Tip(ctx, rc.checkSeq(from))
 		if err != nil {
 			return err
 		}
-		changes, err := t.st.ChangesAfter(ctx, t.id, sh.AppliedSeq(), t.opts.BatchSize)
+		wait, err := t.checkRewind(ctx, &rc, from, &tip)
+		if err != nil {
+			return err
+		}
+		if wait {
+			t.pause(ctx, t.opts.PollInterval)
+			continue
+		}
+		changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
 			if fetchedFrom(source) {
 				t.fetchSpent = true // fetch no more: the peers and bundles are no better off
@@ -286,12 +296,14 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			if err := t.applyChanges(ctx, sh, changes); err != nil {
 				return err
 			}
+			recordMark(sh, &rc, changes[len(changes)-1].Mark())
 		}
 		if len(changes) < t.opts.BatchSize {
-			if head > sh.AppliedSeq() {
-				if err := sh.Advance(head); err != nil {
+			if tip.Head > sh.AppliedSeq() {
+				if err := sh.Advance(tip.Head); err != nil {
 					return err
 				}
+				recordMark(sh, &rc, tip.HeadMark)
 			}
 			break
 		}
@@ -389,6 +401,7 @@ func (t *Tailer) openShard(ctx context.Context, dir string) (*shard.Shard, error
 func (t *Tailer) swap(sh *shard.Shard) {
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
+	t.rw = markOf(sh)
 	if t.opts.OnShard != nil {
 		t.opts.OnShard(sh)
 	}
@@ -451,6 +464,7 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 	if err != nil {
 		return err
 	}
+	t.rw = markOf(sh)
 	t.lastSource, t.recoveredAt, t.minMappingVersion = sourceSQL, asOf, 0
 	t.log.InfoContext(ctx, "shard copy rebuilt from the store", slog.String("reason", reason), slog.Int64("seq", asOf),
 		slog.Float64("duration_ms", float64(t.opts.Clock.Since(start).Microseconds())/1000))
@@ -561,6 +575,9 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		return 0, fmt.Errorf("%w: %s is missing from the snapshot", ErrIndexDropped, t.id.Index)
 	}
 	t.inst.recoveryBytes.Add(ctx, res.bytes, t.inst.with(attribute.String("source", sourceSQL)))
+	if tip, err := t.st.Tip(ctx, asOf); err == nil && tip.Head >= asOf && tip.AtMark.Seq == asOf {
+		sh.SetMark(asOf, encodeMark(tip.AtMark))
+	}
 	if err := sh.Advance(asOf); err != nil {
 		return 0, err
 	}

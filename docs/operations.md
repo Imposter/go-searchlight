@@ -479,9 +479,10 @@ rebuilt.**
   are gone, and new writes reuse their seqs. Running copies detect it at their next
   poll and rebuild from the database by themselves (the log line `the changelog no
   longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
-  their shards serve again once the rebuilds finish. Wipe the `data_dir` of any node
-  that was stopped across the failover before starting it again: it cannot tell what
-  it applied.
+  their shards serve again once the rebuilds finish. Nodes stopped across the failover
+  need nothing either: each copy's manifest keeps the mark of the change it applied
+  last, which the copy checks when it starts. (A copy whose last flush predates this
+  release has no mark, and trusts what it reads at its first poll.)
 
 ## Upgrades and rolling restarts
 

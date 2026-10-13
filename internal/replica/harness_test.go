@@ -288,6 +288,8 @@ type faultStore struct {
 	// corrupt, when set, says which changes read back damaged: ChangesAfter returns
 	// the ones before the first such change with its *store.CorruptError.
 	corrupt func(c *store.Change) bool
+	// onTip, when set, may rewrite what every Tip returns (a read of a lagging server).
+	onTip func(tip *store.Tip)
 }
 
 func newFaultStore(st store.Store) *faultStore {
@@ -330,7 +332,14 @@ func (f *faultStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
 	if err := f.take("head"); err != nil {
 		return store.Tip{}, err
 	}
-	return f.Store.Tip(ctx, seq)
+	tip, err := f.Store.Tip(ctx, seq)
+	f.mu.Lock()
+	hook := f.onTip
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(&tip)
+	}
+	return tip, err
 }
 
 func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {

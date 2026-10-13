@@ -76,6 +76,12 @@ type Store interface {
 	// dialect reads from the primary (dialect.Pools.Read is the primary's).
 	HeadSeq(ctx context.Context) (seq int64, now time.Time, err error)
 
+	// Tip is HeadSeq that also reads, in the same statement, the marks of the
+	// change at the head and of the change at seq. A tailer compares the change at
+	// its applied seq with the one it applied there, to see the changelog rewound
+	// under its copy: a database failover that lost commits reissues their seqs.
+	Tip(ctx context.Context, seq int64) (Tip, error)
+
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
 	Registry() RegistryStore
 	// Blobs stores segment bundles for recovery without a peer.

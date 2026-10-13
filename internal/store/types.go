@@ -118,6 +118,42 @@ type Change struct {
 // ShardID returns the shard the change belongs to.
 func (c *Change) ShardID() ShardID { return ShardID{Index: c.Index, Shard: c.Shard} }
 
+// ChangeMark identifies one change of the changelog by what its row carries: its
+// seq, shard, kind, id and commit time. While the database keeps its commits a seq is
+// never reissued, so the change at a seq keeps its mark until it is pruned or its
+// index dropped. A failover that loses commits reissues their seqs to other changes,
+// with other marks: that is how a tailer sees the changelog rewound under its copy.
+// The zero mark (Seq 0) names no change.
+type ChangeMark struct {
+	Seq   int64
+	Index string
+	Shard int
+	Kind  Kind
+	ID    string
+	At    time.Time
+}
+
+// Mark returns the change's mark.
+func (c *Change) Mark() ChangeMark {
+	return ChangeMark{Seq: c.Seq, Index: c.Index, Shard: c.Shard, Kind: c.Kind, ID: c.ID, At: c.At}
+}
+
+// Same reports whether m and o name the same change.
+func (m ChangeMark) Same(o ChangeMark) bool {
+	return m.Seq == o.Seq && m.Index == o.Index && m.Shard == o.Shard && m.Kind == o.Kind && m.ID == o.ID && m.At.Equal(o.At)
+}
+
+// Tip is the changelog's head as a tailer polls it ([Store.Tip]).
+type Tip struct {
+	// Head is HeadSeq's seq, and Now the database clock as the head was read.
+	Head int64
+	Now  time.Time
+	// HeadMark is the change at Head, and AtMark the change at the seq Tip was
+	// asked about; each is the zero mark when that change is gone (pruned, or its
+	// index dropped) or the seq is 0.
+	HeadMark, AtMark ChangeMark
+}
+
 // QueryPayload is the payload of a saved-query upsert: the query DSL tree and
 // its opaque meta object, stored in sl_queries' query and meta columns.
 type QueryPayload struct {

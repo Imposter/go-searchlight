@@ -34,6 +34,7 @@ var changelog = dialect.Changelog{
 	LockCounter:   withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
 	ReadCounter:   "SELECT value FROM sl_counter WHERE id = 1",
 	ReadHead:      withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
+	ReadTip:       withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? WHERE c.id = 1"),
 	IndexState:    "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
 	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",

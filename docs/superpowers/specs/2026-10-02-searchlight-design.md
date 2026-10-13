@@ -338,7 +338,8 @@ The logical schema is the same in every dialect.
 | Disk lost or corrupt | Segments are checksummed. A bad segment is dropped and the copy re-recovers from a peer or SQL. It never serves a corrupt segment. |
 | Apply error | It halts that shard copy, which goes `recovering`, and re-recovers. It never skips a change. |
 | Merge interrupted | A merge writes a new file, publishes it, then flushes: until that flush swaps the manifest atomically, the old durable segment set is still valid and none of its files is removed. |
-| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. Sequence numbers are in the database, so they survive. |
+| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. With synchronous (or semi-synchronous) replication the new primary holds every acknowledged commit, and the failover is transparent. |
+| Failover that lost commits (async replication) | A point-in-time restore: the lost writes are gone, and new writes reuse their seqs. Each copy detects it at its next poll (the head behind its applied seq, or another change at that seq than the one it applied, by the row's shard, kind, id and commit time), logs it at error, counts `searchlight_changelog_rewinds_total`, and rebuilds from SQL (`ScanShard`), never from a peer or bundle. |
 | Overload | Per-request deadlines, bulk size caps, a merge I/O budget, and a search thread pool with a bounded queue (429 when full, like Elasticsearch). |
 
 ## 11. Observability

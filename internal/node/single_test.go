@@ -633,12 +633,12 @@ func TestDropDoesNotBlockOtherIndexes(t *testing.T) {
 }
 
 // flakyStore is a store whose database can be taken away: Ping and record reads fail
-// while down, and HeadSeq while headDown.
+// while down, and HeadSeq and Tip while headDown.
 type flakyStore struct {
 	store.Store
 	rr   store.RecordReader
 	down *atomic.Bool
-	// headDown, when set, fails HeadSeq too.
+	// headDown, when set, fails HeadSeq and Tip too.
 	headDown *atomic.Bool
 	// hung, when set, makes Ping and record reads wait for their deadline: a
 	// database that hangs rather than fails.
@@ -692,6 +692,13 @@ func (s flakyStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 		return 0, time.Time{}, errUnreachable
 	}
 	return s.Store.HeadSeq(ctx)
+}
+
+func (s flakyStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+	if s.headDown != nil && s.headDown.Load() {
+		return store.Tip{}, errUnreachable
+	}
+	return s.Store.Tip(ctx, seq)
 }
 
 func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {

@@ -169,8 +169,9 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			case errors.As(err, &halt):
 				t.gate = halt
 			}
-			if !aside {
-				// Whatever the rebuild left behind is wiped by the next attempt.
+			if !aside && t.needRebuild != reasonRewound {
+				// Whatever the rebuild left behind is wiped by the next attempt. A
+				// rewound copy keeps its reason, so that attempt too reads the store.
 				t.needRebuild = reasonInterrupted
 			}
 			return err
@@ -200,12 +201,13 @@ func (t *Tailer) canBuildAside(reason string) bool {
 	return asideReasons[reason] && sh.Err() == nil && sh.AppliedSeq() > 0
 }
 
-// useFetcher reports whether a rebuild should try the Fetcher first. A fetched copy
-// that made no progress before it needed rebuilding again (it was pruned past, or
-// halted at the same change) is not fetched again: the peers and bundles are no better
-// off.
-func (t *Tailer) useFetcher() bool {
-	return t.opts.Fetcher != nil && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
+// useFetcher reports whether a rebuild for reason should try the Fetcher first. A
+// fetched copy that made no progress before it needed rebuilding again (it was pruned
+// past, or halted at the same change) is not fetched again: the peers and bundles are
+// no better off. Nor is a copy the changelog rewound under: the peers and bundles may
+// hold the lost commits too, and only the store is the truth.
+func (t *Tailer) useFetcher(reason string) bool {
+	return t.opts.Fetcher != nil && reason != reasonRewound && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
 }
 
 // rebuildAside rebuilds the copy in a new directory under its root while the current
@@ -240,7 +242,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	}()
 	source := sourceSQL
 	var asOf int64
-	if t.useFetcher() {
+	if t.useFetcher(reason) {
 		dir = newCopyDir(root, t.opts.Clock.Now())
 		t.log.InfoContext(ctx, "fetching a replacement copy aside; the current copy serves meanwhile", slog.String("reason", reason), slog.String("dir", dir))
 		fetched, ok, err := t.fetchInto(ctx, reason, dir)
@@ -411,7 +413,7 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 	t.lastCatalog = t.opts.Clock.Now()
 	sh := t.Shard()
 	fresh := reason == reasonEmpty && sh.Err() == nil && sh.AppliedSeq() == 0 && !holdsData(sh)
-	useFetcher := t.useFetcher()
+	useFetcher := t.useFetcher(reason)
 	if !fresh || useFetcher {
 		dir := sh.Dir()
 		sh.Abandon()

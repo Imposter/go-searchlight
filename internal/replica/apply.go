@@ -112,6 +112,7 @@ const (
 	reasonMappingOrder  = "mapping_order"  // a change's mapping version is not the copy's
 	reasonMappingBehind = "mapping_behind" // the catalogue's mapping takes what the copy's does not
 	reasonHalted        = "halted"         // halted twice at the same change
+	reasonRewound       = "rewound"        // the changelog no longer holds what the copy applied
 )
 
 // rebuildError asks for the copy to be wiped and rebuilt.

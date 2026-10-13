@@ -17,11 +17,14 @@
 //     [Fetcher] (a serving peer, Task 11) when there is one, else from the store's
 //     ScanShard snapshot. A failed shard (shard.ErrFailed) is reopened from its
 //     directory, and rebuilt if that fails.
-//   - Tailing: HeadSeq, then ChangesAfter from the applied seq; each page is analyzed
-//     and applied, and a page shorter than its limit proves no change of the shard up
-//     to the head is missing, so the copy Advances there (seqs are global, so a shard's
-//     own have gaps). Between polls it sleeps until woken by a local write, a Postgres
-//     notification ([Hub]) or the poll interval.
+//   - Tailing: the head (store Tip), then ChangesAfter from the applied seq; each page
+//     is analyzed and applied, and a page shorter than its limit proves no change of
+//     the shard up to the head is missing, so the copy Advances there (seqs are global,
+//     so a shard's own have gaps). Between polls it sleeps until woken by a local
+//     write, a Postgres notification ([Hub]) or the poll interval. Each poll also
+//     checks that the changelog still holds what the copy applied: a head behind the
+//     applied seq, or another change at it than the one applied there, is a database
+//     that lost commits, and the copy is rebuilt from the store's snapshot.
 //   - Halted: a change the store accepted but this copy cannot apply (a body that does
 //     not analyze, a query that does not parse, one the shard refuses) is a bug, never
 //     skipped: the copy stops before it and is marked recovering in the registry.
@@ -294,6 +297,9 @@ type Tailer struct {
 	warn        rateLimitedWarn
 	lastSource  string // the source of the last rebuild
 	recoveredAt int64  // the applied seq that rebuild ended at
+	// mark is the change at the applied seq as the copy applied it, when mark.Seq
+	// is the applied seq; checkRewind compares the changelog with it.
+	mark        store.ChangeMark
 	needRebuild string // a rebuild to (re)try before tailing, by reason
 	needReopen  bool
 	// minMappingVersion is the mapping version a fetched copy must have: the
@@ -622,12 +628,17 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	if err := sh.Err(); err != nil {
 		return false, err
 	}
-	head, dbNow, err := t.st.HeadSeq(ctx)
+	from := t.Applied()
+	tip, err := t.st.Tip(ctx, from)
 	if err != nil {
 		t.pollFailed()
 		return false, err
 	}
-	from := t.Applied()
+	if err := t.checkRewind(ctx, from, &tip); err != nil {
+		t.pollOK()
+		return false, err
+	}
+	head, dbNow := tip.Head, tip.Now
 	changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 	if errors.Is(err, store.ErrPruned) {
 		t.pollOK()
@@ -656,6 +667,7 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		if err := t.applyChanges(ctx, sh, changes); err != nil {
 			return false, err
 		}
+		t.mark = changes[n-1].Mark()
 	}
 	if len(changes) >= t.opts.BatchSize {
 		return false, nil // more to read now
@@ -667,9 +679,42 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 			return false, err
 		}
 		t.applied.Store(head)
+		t.mark = tip.HeadMark
 	}
 	t.observeLag(head, t.Applied(), false, 0)
 	return true, nil
+}
+
+// checkRewind compares the changelog with what the copy applied up to from, its
+// applied seq: a head behind from, or another change at from than the one the copy
+// applied there, means the database lost commits the copy applied (a failover to a
+// replica that had not received them) and has since reissued their seqs. The copy is
+// then rebuilt from the store's snapshot, never from a peer, whose copy holds the
+// lost commits too. The mark of the change at from is learned when the copy applies
+// it or advances to it; one the copy did not learn (it was opened, fetched or
+// rebuilt at from) is taken from the first poll, and a change since pruned, or of a
+// dropped index, cannot be compared.
+func (t *Tailer) checkRewind(ctx context.Context, from int64, tip *store.Tip) error {
+	var cause error
+	switch {
+	case tip.Head < from:
+		cause = fmt.Errorf("the changelog's head %d is behind the copy's seq %d", tip.Head, from)
+	case tip.AtMark.Seq == 0:
+		return nil
+	case t.mark.Seq != from:
+		t.mark = tip.AtMark
+		return nil
+	case !t.mark.Same(tip.AtMark):
+		cause = fmt.Errorf("seq %d is now %s %q of %s/%d, the copy applied %s %q of %s/%d there", from,
+			tip.AtMark.Kind, tip.AtMark.ID, tip.AtMark.Index, tip.AtMark.Shard, t.mark.Kind, t.mark.ID, t.mark.Index, t.mark.Shard)
+	default:
+		return nil
+	}
+	t.mark = store.ChangeMark{}
+	t.inst.rewinds.Add(ctx, 1, t.inst.attrs)
+	t.log.ErrorContext(ctx, "the changelog no longer holds what this copy applied: the database lost commits; rebuilding the copy from the store",
+		slog.Int64("seq", from), slog.Int64("head", tip.Head), slog.Any("error", cause))
+	return &rebuildError{reason: reasonRewound, err: cause}
 }
 
 // housekeeping reports the durable seq, promotes a caught-up copy to serving, and

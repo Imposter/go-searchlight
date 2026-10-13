@@ -728,6 +728,13 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 	return f.Store.HeadSeq(ctx)
 }
 
+func (f *faultStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+	if f.isDown() {
+		return store.Tip{}, errPartitioned
+	}
+	return f.Store.Tip(ctx, seq)
+}
+
 func (f *faultStore) Ping(ctx context.Context) error {
 	if f.isDown() {
 		return errPartitioned

@@ -270,7 +270,8 @@ target doesn't drop below it just because one copy is being rebuilt.
 | **A node dies** (crashes, is killed, loses power) | Its heartbeat stops. After 10 s its leases expire, and the allocator on other nodes claims its shards up to the target copy count. Reads and writes against the shards it held see no client error as long as ≥ 2 copies existed. |
 | **A network partition** | The cut-off node's copies stop serving *before* another node takes over, not after: each copy tracks its own lease deadline on its own monotonic clock from just before each renewal, and stops serving (and stops its tailer) at that local deadline, independently of whether it can reach the registry to confirm it lost the lease. A node on the wrong side of a partition therefore can't keep answering reads with a stale view of "I still hold this" after another node has legitimately claimed the slot. |
 | **Postgres is down** | Writes return 503 `unavailable` (with `Retry-After`). Reads keep serving from local segments, each one marked `stale: true` and (for a single document) with no `seq`. Readiness (`/readyz`) turns false once the outage has lasted `max_lag`, so a load balancer stops sending this node traffic even though it can still answer some reads. |
-| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff; sequence numbers live in the database, so nothing about `seq` ordering is lost or has to be renegotiated. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume normally once the new primary answers. |
+| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume once the new primary answers. The failover is transparent only when the new primary holds every commit the old one acknowledged: synchronous (or semi-synchronous) replication. |
+| **A failover loses commits** (async replication) | This is a point-in-time restore. The new primary's counter is behind the old one's, so new writes take the lost seqs again, and the copies hold changes the database no longer does. Each running copy sees it at its next poll — the changelog's head behind its seq, or another change at its seq than the one it applied — logs `the changelog no longer holds what this copy applied`, counts `searchlight_changelog_rewinds_total`, and rebuilds from the database (never from a peer or a bundle, which may hold the lost commits too). A shard whose copies rebuild together has no serving copy until one finishes. The lost writes are gone. A node that was stopped across the failover cannot tell what it applied: wipe its `data_dir` before starting it, as for any restore. |
 
 ## Postgres sizing and settings
 
@@ -303,10 +304,15 @@ target doesn't drop below it just because one copy is being rebuilt.
 - **`synchronous_commit` and HA.** Searchlight has no durability of its own beyond
   Postgres's: an acknowledged write is exactly as durable as the transaction that
   committed it. Run Postgres (or MySQL) with the replication and failover setup you'd
-  use for any primary datastore — `synchronous_commit` on and synchronous replicas if
-  you need zero loss on a primary failure, async replication if you can tolerate losing
-  the last moment of commits. Searchlight's own replicas don't change this calculus: a
-  node's segments are a cache, not a copy of the database's guarantees.
+  use for any primary datastore. For a failover to be transparent, the new primary must
+  hold every acknowledged commit: synchronous replication (Postgres
+  `synchronous_commit` with `synchronous_standby_names`; MySQL semi-synchronous
+  replication waiting `AFTER_SYNC`). With async replication a failover can lose the last
+  commits, and that is a point-in-time restore: the lost writes are gone, their seqs are
+  reissued to new writes, and every copy rebuilds from the database once it sees the
+  changelog rewound (see [Failures](#failures)). Searchlight's own replicas don't change
+  this calculus: a node's segments are a cache, not a copy of the database's
+  guarantees.
 - **Backups.** Back up Postgres with its own tools (`pg_dump`, or base backups with WAL
   archiving); never back up `data_dir`. See operations.md's
   [Backups and disaster recovery](operations.md#backups-and-disaster-recovery), which

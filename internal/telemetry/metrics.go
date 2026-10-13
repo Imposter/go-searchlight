@@ -156,6 +156,7 @@ const (
 	MetricReplicaHalted           = "searchlight.replica.halted"
 	MetricReplicaPollFailing      = "searchlight.replica.poll.failing"
 	MetricReplicaWatchReconnects  = "searchlight.replica.watch.reconnects"
+	MetricChangelogRewinds        = "searchlight.changelog.rewinds"
 	MetricClusterLeaseChanges     = "searchlight.cluster.lease.changes"
 	MetricClusterAllocations      = "searchlight.cluster.allocation.changes"
 	MetricClusterNodes            = "searchlight.cluster.nodes"
@@ -228,6 +229,7 @@ var Catalog = []MetricSpec{
 	{MetricReplicaHalted, KindGauge, "1", "1 while a shard copy is halted at a change it cannot apply, else 0, by index and shard.", nil},
 	{MetricReplicaPollFailing, KindGauge, "1", "1 while a shard copy's changelog polls fail (its lag in changes is then the last known one), else 0, by index and shard.", nil},
 	{MetricReplicaWatchReconnects, KindCounter, "{reconnect}", "Changelog notification subscriptions restarted after they failed.", nil},
+	{MetricChangelogRewinds, KindCounter, "{rewind}", "Shard copies rebuilt because the changelog no longer holds what they applied (a database failover that lost commits), by index and shard.", nil},
 	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew, renew_failed, reclaim, lapse, resume, lost, release).", nil},
 	{MetricClusterAllocations, KindCounter, "{change}", "Shard copy state transitions by index and state (recovering, serving, retiring).", nil},
 	{MetricClusterNodes, KindGauge, "{node}", "Live nodes in the cluster, as this node reads the registry.", nil},

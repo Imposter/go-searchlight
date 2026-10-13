@@ -115,6 +115,10 @@ type Changelog struct {
 	ReadCounter string
 	// ReadHead: () -> value of sl_counter row 1, NOW.
 	ReadHead string
+	// ReadTip: (seq) -> value of sl_counter row 1, NOW, then index_name, shard,
+	// kind, id, at of the change at that value and of the change at seq, each
+	// NULL when there is no such change.
+	ReadTip string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
 	// DocumentSeq and QuerySeq: (index, shard, id) -> seq.

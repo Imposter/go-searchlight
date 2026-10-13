@@ -275,9 +275,9 @@ func testOptions() Options {
 var errInjected = errors.New("injected store fault")
 
 // faultStore wraps a store with injectable faults: fail[op] makes the next n calls
-// of op fail ("head", "changes", "scan", "get"), onRecord runs for every record a
-// scan hands over (its error ends the scan), and onChanges runs before every
-// ChangesAfter (its error fails the call).
+// of op fail ("head" for HeadSeq and Tip, "changes", "scan", "get"), onRecord runs
+// for every record a scan hands over (its error ends the scan), and onChanges runs
+// before every ChangesAfter (its error fails the call).
 type faultStore struct {
 	store.Store
 	mu        sync.Mutex
@@ -324,6 +324,13 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 		return 0, time.Time{}, err
 	}
 	return f.Store.HeadSeq(ctx)
+}
+
+func (f *faultStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+	if err := f.take("head"); err != nil {
+		return store.Tip{}, err
+	}
+	return f.Store.Tip(ctx, seq)
 }
 
 func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {

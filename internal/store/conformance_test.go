@@ -1553,6 +1553,50 @@ func TestHeadSeq(t *testing.T) {
 	})
 }
 
+// TestTip: Tip reads the head as HeadSeq does, with the marks of the changes at the
+// head and at the seq asked about, as ChangesAfter returns them; a seq with no change
+// (0, past the head, or pruned) has the zero mark.
+func TestTip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		tip, err := st.Tip(ctx, 0)
+		if err != nil || tip.Head != 0 || tip.HeadMark != (ChangeMark{}) || tip.AtMark != (ChangeMark{}) || time.Since(tip.Now).Abs() > time.Minute {
+			t.Fatalf("empty store tip = %+v, %v", tip, err)
+		}
+		mustCreateIndex(t, st, "t")
+		mustApply(t, st, upsert("t", 0, "a", `{}`), upsert("t", 1, "b", `{}`))
+		_, last := mustApply(t, st, upsert("t", 1, "c", `{}`))
+		changes, err := st.ChangesAfter(ctx, ShardID{Index: "t", Shard: 1}, 0, 10)
+		if err != nil || len(changes) != 2 {
+			t.Fatalf("shard 1: %v, %v", changes, err)
+		}
+		tip, err = st.Tip(ctx, changes[0].Seq)
+		if err != nil || tip.Head != last {
+			t.Fatalf("tip = %+v, %v; want head %d", tip, err, last)
+		}
+		if !tip.HeadMark.Same(changes[1].Mark()) || !tip.AtMark.Same(changes[0].Mark()) {
+			t.Fatalf("marks %+v and %+v, want %+v and %+v", tip.HeadMark, tip.AtMark, changes[1].Mark(), changes[0].Mark())
+		}
+		if tip.AtMark.Same(tip.HeadMark) {
+			t.Fatal("two changes have the same mark")
+		}
+		if tip, err = st.Tip(ctx, last+1); err != nil || tip.AtMark != (ChangeMark{}) {
+			t.Fatalf("tip past the head = %+v, %v", tip, err)
+		}
+		if err := st.Prune(ctx, ShardID{Index: "t", Shard: 1}, last); err != nil {
+			t.Fatal(err)
+		}
+		if tip, err = st.Tip(ctx, changes[0].Seq); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
+			t.Fatalf("tip at a pruned seq = %+v, %v", tip, err)
+		}
+		_ = st.Close()
+		if _, err := st.Tip(ctx, 0); !errors.Is(err, ErrClosed) {
+			t.Fatalf("tip after close: %v", err)
+		}
+	})
+}
+
 // TestGroupCommitIsolation is the reviewer's probe on every dialect: in one
 // group-commit batch, a stale IfSeq must not make a later IfAbsent on the
 // same new key fail, a genuine conflict still fails, and a missing index or

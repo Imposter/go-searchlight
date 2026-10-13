@@ -464,9 +464,19 @@ rebuilt.**
   The nodes rebuild their copies from the restored database.
 - **Losing the database** loses acknowledged writes back to your last backup. Plan its
   high availability as you would for any primary datastore. On a Postgres or MySQL
-  failover, the nodes reconnect with backoff, since the sequence numbers live in the
-  database. While it is unreachable, writes get 503 and reads serve from the segments,
-  marked `stale`, and readiness turns false after `max_lag`.
+  failover, the nodes reconnect with backoff. While it is unreachable, writes get 503
+  and reads serve from the segments, marked `stale`, and readiness turns false after
+  `max_lag`.
+- **A failover is transparent only without lost commits.** Use synchronous replication
+  (Postgres `synchronous_commit` with `synchronous_standby_names`; MySQL
+  semi-synchronous replication waiting `AFTER_SYNC`). A failover that may have lost
+  commits, as async replication can, is a restore to an earlier point: the lost writes
+  are gone, and new writes reuse their seqs. Running copies detect it at their next
+  poll and rebuild from the database by themselves (the log line `the changelog no
+  longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
+  their shards serve again once the rebuilds finish. Wipe the `data_dir` of any node
+  that was stopped across the failover before starting it again: it cannot tell what
+  it applied.
 
 ## Upgrades and rolling restarts
 
@@ -579,7 +589,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
-| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
+| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total`, `searchlight_changelog_rewinds_total` |
 | Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
 | Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`) |
 | Runtime | `go_*` and `process_*` |
@@ -592,6 +602,7 @@ Counters and histograms with no observations yet do not appear until their first
 |---|---|---|
 | Cluster red | `GET /_cluster/health` reports `red` (probe it, or alert on the next row) | a shard has no serving copy: its reads fail |
 | Copy halted | `max by (index, shard) (searchlight_replica_halted_ratio) > 0` for 5 m | a copy stopped at a change it cannot apply (see below) |
+| Changelog rewound | `increase(searchlight_changelog_rewinds_total[10m]) > 0` | the database lost commits (a failover without synchronous replication): copies rebuild from it, and the lost writes are gone |
 | Replica lag | `max by (index, shard) (searchlight_replica_lag_time_seconds) > 30` for 5 m | a copy trails the changelog; it serves no reads past `max_lag` |
 | Changelog polls failing | `max(searchlight_replica_poll_failing_ratio) > 0` for 2 m | the database is unreachable from a node |
 | Nodes missing | `max(searchlight_cluster_nodes) < 3` (your node count) for 5 m | a node died or cannot heartbeat |

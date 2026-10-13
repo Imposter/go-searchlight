@@ -915,6 +915,37 @@ func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, now time.Time, err e
 	return seq, millis(nowMs), err
 }
 
+func (s *sqlStore) Tip(ctx context.Context, seq int64) (tip Tip, err error) {
+	ctx, end := s.start(ctx, "tip")
+	defer end(&err)
+	if s.closed.Load() {
+		return tip, ErrClosed
+	}
+	var nowMs int64
+	var head, at markColumns
+	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadTip, seq).Scan(&tip.Head, &nowMs,
+		&head.index, &head.shard, &head.kind, &head.id, &head.at,
+		&at.index, &at.shard, &at.kind, &at.id, &at.at)
+	if err != nil {
+		return tip, err
+	}
+	tip.Now, tip.HeadMark, tip.AtMark = millis(nowMs), head.mark(tip.Head), at.mark(seq)
+	return tip, nil
+}
+
+// markColumns scans a change's mark from a LEFT JOIN, NULL when there is no change.
+type markColumns struct {
+	index, kind, id sql.NullString
+	shard, at       sql.NullInt64
+}
+
+func (c *markColumns) mark(seq int64) ChangeMark {
+	if !c.index.Valid {
+		return ChangeMark{}
+	}
+	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
+}
+
 // --- Pruning ---------------------------------------------------------------
 
 // pruneStep bounds the seq range one prune DELETE covers, so no single

@@ -1204,3 +1204,33 @@ func TestUnreadableCopyIsNotWiped(t *testing.T) {
 		}
 	}
 }
+
+// TestWritePercolationFailureCarriesItsCause: a write whose percolation cannot finish
+// stays committed and says why the percolation did not: Percolated false, with the
+// cause in PercolateErr for the API to report.
+func TestWritePercolationFailureCarriesItsCause(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	var fake *nodetest.Tailer
+	n := open(t, cfg, st, func(o *node.Options) {
+		o.NewTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
+			tl := nodetest.NewTailer(st, sh, id, env)
+			fake = tl.(*nodetest.Tailer) //nolint:forcetypeassert,errcheck // NewTailer returns a *Tailer
+			return tl
+		}
+	})
+	if _, err := n.CreateIndex(ctx(t), "wp", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.Pause()
+	first := mustWrite(t, n, "wp", upsert("a", `{"x": 1}`))
+	c, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	res, err := n.Write(c, "wp", []api.WriteOp{upsert("b", `{"x": 2}`)}, api.WriteOptions{Percolate: true, WaitForSeq: first.Seq})
+	if err != nil || res.Seq == 0 {
+		t.Fatalf("the write: %+v, %v", res, err)
+	}
+	if res.Percolated || !res.TimedOut || res.PercolateErr == nil {
+		t.Fatalf("percolated %v, timed out %v, cause %v: want the passed deadline", res.Percolated, res.TimedOut, res.PercolateErr)
+	}
+}

@@ -285,6 +285,10 @@ type WriteResult struct {
 	// document's Queries were filled. When it is not (a deadline passed waiting for
 	// WaitForSeq, a copy closed), the writes are committed all the same.
 	Percolated bool
+	// PercolateErr is why the percolation asked for did not finish, nil when it did:
+	// a passed deadline, a closed copy, too many matches. It is reported in the
+	// response, never as the write's error.
+	PercolateErr error
 }
 
 // ItemResult is one op's outcome.

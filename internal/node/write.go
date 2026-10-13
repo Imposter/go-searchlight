@@ -97,7 +97,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		// The write is committed: a percolation that cannot finish is reported in
 		// the result (Percolated false), never as an error that hides the seqs.
 		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq); err != nil {
-			res.Percolated = false
+			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				res.TimedOut = true
 			}

@@ -60,6 +60,13 @@ segments.
 | A shard copy's write buffer full | (backpressure) | 429 with `Retry-After` |
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
 | Query size | 4 levels of `all`/`any`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
+| Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
+| Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
+| Ranges in a `range` aggregation | 100 | 400 with `loc` |
+| `fields` in a search | 100 | 400 with `loc` `fields` |
+| Buckets in a search response, every aggregation's together | 65,536 | 400 with `loc` when one shard passes it; `"truncated": true` on the aggregations cut when only the merged shards do |
+| Documents in one `_percolate`, `docs` and `ids` together | 10,000 | 413 `too_large` |
+| Matches in one percolation, every document's together | 1,000,000 | `_percolate`: 422 `too_many_matches`; `_bulk?percolate=true`: `percolated: false`, `percolate_reason: "too_many_matches"` |
 
 ## Indexes
 
@@ -166,6 +173,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   your writes.
 - **`percolate=true`.** Each upserted document's item lists the saved queries it matches.
   This is how scrape-bot's diff engine works out its match edges (spec §16).
+  - `percolated` says whether the items carry their matches. It is false when the
+    percolation could not finish after the writes committed. The writes stay
+    committed either way.
+  - Past 1,000,000 matches, every document's together, `percolated` is false and
+    `percolate_reason` is `too_many_matches`, with no item's `queries`. Percolate
+    those documents in smaller requests.
 - **`refresh`.** As on single-document writes.
 
 ## Search and count
@@ -211,6 +224,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     compatible with scrape-bot.
 - **`sort`** takes field names, `{"field": "asc"|"desc"}` or
   `{"field": {"order": "desc"}}`. `_id` breaks ties.
+  - At most 16 keys, each field once.
+  - Nothing after `_id`: ids are unique, so no later key could break a tie.
 - **Paging.** `size` is 10 by default, at most 10,000. To page, pass the previous
   response's `next` as `search_after`. `next` is null on a short page. There is no
   `from`.
@@ -229,8 +244,27 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - `cardinality` (HyperLogLog++).
 
   A bucket aggregation may carry metric sub-aggregations one level deep. A `terms`
-  aggregation over several shards reports its error bound, as Elasticsearch does.
-- **`fields`** limits each hit's `body` to those members.
+  aggregation over several shards reports its error bound, as Elasticsearch does. On
+  one shard it is exact, and its `doc_count_error_upper_bound` is 0.
+
+  Bounds, each refused with a 400 whose `loc` names the place:
+  - At most 100 aggregations per search, sub-aggregations included (`loc` `aggs`).
+  - At most 100 `ranges` per `range` aggregation.
+  - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.
+  - At most 65,536 buckets per response, every aggregation's together (Elasticsearch's
+    `search.max_buckets`). A shard whose own buckets pass it refuses the search, at
+    the aggregation that passed it, asking for a wider interval, a lower size or a
+    narrower query. A `terms` aggregation counts its `size` there, not its
+    `shard_size` over-fetch. Shards that pass it only once merged are cut, in aggregation name
+    order, and each aggregation cut says `"truncated": true`. A cut `terms`
+    aggregation counts the documents of its cut buckets in `sum_other_doc_count`.
+  - A histogram's empty buckets (`min_doc_count` 0) are filled in only while the
+    response stays within 65,536 buckets. A histogram left without them says
+    `"truncated": true`.
+  - A value a histogram cannot place in a bucket (its bucket's key overflows a
+    float64, or a calendar interval cannot date it) refuses the search as too many
+    buckets, rather than drop a counted document from every bucket.
+- **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
   Past it, the answer holds what was found, with `timed_out: true`.
 
@@ -283,7 +317,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
   pass `wait_for_seq` to see a recent write.
-- **Limits.** Up to 10,000 of each per request.
+- **Limits.**
+  - Up to 10,000 documents per request, given and stored together. More is a 413.
+  - At most 1,000,000 matches per request, every document's together. Past it, the
+    request is refused with a 422 whose code is `too_many_matches`: percolate fewer
+    documents per request. An answer is never truncated, since a missing match is
+    a wrong answer.
 - **Server time.** `took_ms` and `took_us` are the server's time for the request, from
   its admission to the last byte of its answer encoded, in whole milliseconds and
   microseconds. The `Server-Timing` header carries the same time
@@ -347,6 +386,7 @@ Every error is RFC 9457 problem JSON (`application/problem+json`):
   - `not_found`, `index_not_found`, `document_not_found` and `query_not_found`;
   - `method_not_allowed`, `index_exists` and `conflict`;
   - `too_large` and `too_many_requests`;
+  - `too_many_matches` (422: a percolation matching more than 1,000,000 saved queries);
   - `timeout`, `request_timeout` and `client_closed_request`;
   - `unavailable` and `internal`.
 - **`problems[].loc`** is a dotted path into the request, for example

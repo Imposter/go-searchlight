@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/percolate"
 )
 
 // MaxPercolateDocs bounds the documents (given and stored) of one _percolate request.
@@ -19,6 +21,8 @@ type percolateBody struct {
 
 // percolate serves POST /indexes/{index}/_percolate: {"docs": [{...}], "ids": [...]}
 // in; for each document, given ones first, the ids of the saved queries it matches.
+// Documents matching more than percolate.MaxMatches saved queries together are
+// refused with a 422, never answered in part.
 func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) error {
 	wait, e := p.waitForSeq()
 	if e != nil {
@@ -47,8 +51,20 @@ func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) err
 	if err != nil {
 		return err
 	}
+	if matches(res.Results, func(r *PercolateResult) json.RawMessage { return r.Queries }) > percolate.MaxMatches {
+		return tooManyMatches(nil)
+	}
 	admitted := info(r.Context()).admitted
 	return writePercolate(w, res, func() time.Duration { return s.clock.Since(admitted) })
+}
+
+// matches counts the saved-query ids of every result, queries giving each one's.
+func matches[T any](results []T, queries func(*T) json.RawMessage) int {
+	n := 0
+	for i := range results {
+		n += percolate.IDs(queries(&results[i])).Len()
+	}
+	return n
 }
 
 // emptyArray is the queries of a document that matches none.

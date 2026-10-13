@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -149,5 +152,65 @@ func TestSplitStopsWhenCanceled(t *testing.T) {
 	}
 	if got, _, err := p.split(context.Background(), nil, views, &d, newSplitPlan(views, 2, 4), sc, size); err != nil || len(strs(t, got)) != len(ids) {
 		t.Fatalf("after a canceled split: %d matches, %v", len(strs(t, got)), err)
+	}
+}
+
+// Concurrent percolations of different documents over one shard copy's 40,960 saved
+// queries, each split across the workers its plan gives at the default window size,
+// each return exactly their own matches: a helper's scratch is reused by another
+// request only after this one has copied its windows out.
+func TestConcurrentSplitsKeepTheirOwnMatches(t *testing.T) {
+	const requestsPerBrand, rounds = 4, 100
+	brands := []string{"acme", "bolt", "core", "dyne"}
+	ids := make([]string, 40<<10)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("q%06d", i)
+	}
+	brandOf := func(id string) string {
+		n, _ := strconv.Atoi(id[1:])
+		return brands[n%len(brands)]
+	}
+	seg := segmentOf(t, ids, brandOf)
+	views := []view{{seg: seg, n: seg.n}}
+	p := New(Options{Threads: 8})
+	win := p.planFor(views, 1)
+	if win == nil || win.workers < 2 {
+		t.Fatalf("plan %+v: want a split across 2 or more workers", win)
+	}
+	size := scratchSize{n: seg.n, entries: seg.NumEntries(), fields: len(seg.fields)}
+	var bad atomic.Int64
+	var wg sync.WaitGroup
+	for _, brand := range brands {
+		d, _, err := schema.Analyze(testMapping(), brand, fmt.Appendf(nil, `{"brand":%q}`, brand))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var want []string
+		for _, id := range ids {
+			if brandOf(id) == brand {
+				want = append(want, id)
+			}
+		}
+		wantJSON, _ := json.Marshal(want)
+		for range requestsPerBrand {
+			wg.Go(func() {
+				sc := new(scratch)
+				sc.fit(size.n, size.entries, size.fields)
+				for range rounds {
+					got, _, err := p.split(context.Background(), nil, views, &d, win, sc, size)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if !bytes.Equal(got, wantJSON) {
+						bad.Add(1)
+					}
+				}
+			})
+		}
+	}
+	wg.Wait()
+	if n := bad.Load(); n > 0 {
+		t.Fatalf("%d of %d concurrent split answers differ from the document's own matches", n, rounds*requestsPerBrand*len(brands))
 	}
 }

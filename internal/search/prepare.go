@@ -120,7 +120,7 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		p.after = prepareAfter(r.SearchAfter, p.sorts, &ps)
 	}
 	if len(r.Fields) > MaxFields {
-		ps.add("fields", "fields names at most %d members", MaxFields)
+		ps.add("fields", "fields: at most %d names", MaxFields)
 	}
 	if n := countAggs(r.Aggs); n > MaxAggs {
 		ps.add("aggs", "a search holds at most %d aggregations, sub-aggregations included; this one holds %d", MaxAggs, n)

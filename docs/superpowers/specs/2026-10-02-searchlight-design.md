@@ -319,7 +319,7 @@ The logical schema is the same in every dialect.
 
   It's like Elasticsearch's file-based peer recovery followed by an operations replay.
 - **Writes anywhere.** Any node accepts writes. They go to SQL first, which is the commit point, and every copy applies them through its tailer.
-  - **Fast path:** the coordinator's own copies apply immediately on commit.
+  - **Fast path:** on commit the coordinator wakes its own copies' tailers, which read the new changes from SQL at once; no copy is written outside its tailer, so a copy applies changes in `seq` order only.
   - **Push hint:** the coordinator pushes a "new `seq`" hint to the peers holding the shard, which wakes their tailers. Polling still runs as the safety net (Postgres `LISTEN/NOTIFY` where available).
 - **Read routing.** The coordinator prefers local copies. Otherwise it picks the least-loaded serving copy whose lag is within `max_lag`, with adaptive replica selection by measured latency, like Elasticsearch's ARS. It retries another copy on failure, so one node failing doesn't produce a client error.
 - **Rolling restarts and upgrades.**

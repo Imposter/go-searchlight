@@ -227,3 +227,21 @@ func TestHistogramRefusesValuesItCannotBucket(t *testing.T) {
 	refusedAt(t, c, &Request{Query: &query.All{}, Aggs: map[string]Agg{"h": {Type: AggHistogram, Field: "price", Interval: 0.5}}}, "aggs.h.histogram")
 	refusedAt(t, c, &Request{Query: &query.All{}, Aggs: map[string]Agg{"d": {Type: AggDateHistogram, Field: "created", Calendar: "year"}}}, "aggs.d.date_histogram")
 }
+
+// One shard's terms are exact: its doc_count_error_upper_bound is 0 even when it cut
+// its list, as Elasticsearch reports.
+func TestSingleShardTermsHaveNoErrorBound(t *testing.T) {
+	c := newCluster(t, 1)
+	for i, brand := range []string{"a", "a", "a", "b", "b", "c"} {
+		c.upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"brand":%q}`, brand))
+	}
+	c.refreshAll()
+	resp, err := c.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{"t": {Type: AggTerms, Field: "brand", Size: 1, ShardSize: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terms := resp.Aggs["t"]
+	if terms.DocCountErrorUpperBound != 0 || terms.SumOtherDocCount != 3 || len(terms.Buckets) != 1 || terms.Buckets[0].DocCount != 3 {
+		t.Fatalf("terms %+v, buckets %+v: want one exact bucket of 3, error bound 0, 3 others", terms, terms.Buckets)
+	}
+}

@@ -159,7 +159,8 @@ func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
 }
 
 // reduceTerms merges terms lists, tracking which shards returned each term for its
-// error bound (see aggs.go).
+// error bound (see aggs.go). One shard's list is exact, so its bound is 0: no term it
+// left out has more documents than one it returned.
 func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	type acc struct {
 		b    *BucketPartial
@@ -170,7 +171,9 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	res := &AggResult{Type: AggTerms}
 	var docs int64
 	for i, p := range parts {
-		res.DocCountErrorUpperBound += p.DocCountError
+		if len(parts) > 1 {
+			res.DocCountErrorUpperBound += p.DocCountError
+		}
 		docs += p.OtherDocCount
 		for _, b := range p.Buckets {
 			docs += b.DocCount

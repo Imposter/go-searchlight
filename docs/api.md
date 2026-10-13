@@ -231,7 +231,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - `cardinality` (HyperLogLog++).
 
   A bucket aggregation may carry metric sub-aggregations one level deep. A `terms`
-  aggregation over several shards reports its error bound, as Elasticsearch does.
+  aggregation over several shards reports its error bound, as Elasticsearch does. On
+  one shard it is exact, and its `doc_count_error_upper_bound` is 0.
 
   Bounds, each refused with a 400 whose `loc` names the place:
   - At most 100 aggregations per search, sub-aggregations included (`loc` `aggs`).

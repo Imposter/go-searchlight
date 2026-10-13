@@ -622,21 +622,27 @@ func (c *histColl) collect(d uint32) {
 	}
 	key, ok := bucketKey(c.spec, v)
 	if !ok {
-		c.s.fail(tooManyBuckets(c.spec))
+		c.refuse()
 		return
 	}
 	b := c.buckets[key]
 	if b == nil {
-		if c.s.buckets == MaxBuckets {
-			c.s.fail(tooManyBuckets(c.spec))
+		if c.s.buckets.Add(1) > MaxBuckets {
+			c.refuse()
 			return
 		}
-		c.s.buckets++
 		b = &histBucket{subs: c.s.newSubs(c.spec)}
 		c.buckets[key] = b
 	}
 	b.count++
 	collectSubs(b.subs, d)
+}
+
+// refuse fails the segment as too many buckets, once.
+func (c *histColl) refuse() {
+	if c.s.err == nil {
+		c.s.fail(tooManyBuckets(c.spec))
+	}
 }
 
 // countDense counts a dense hit set (no sub-aggregations) from the point index: a walk

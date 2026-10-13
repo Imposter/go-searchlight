@@ -169,8 +169,8 @@ type segExec struct {
 
 	scanned int64
 	// buckets counts the buckets the segment's histograms hold by key, together at
-	// most MaxBuckets.
-	buckets int
+	// most MaxBuckets: shared by the forks that collect parts of the segment apart.
+	buckets *atomic.Int64
 	err     error
 }
 
@@ -232,6 +232,7 @@ func newSegExec(ctx context.Context, p *prepared, g *shard.Generation, i int) *s
 		orders:     map[*pnode][]*pnode{},
 		estimates:  map[*leafPlan]estimate{},
 		sources:    map[string]*fieldSrc{},
+		buckets:    new(atomic.Int64),
 	}
 }
 

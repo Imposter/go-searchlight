@@ -536,7 +536,18 @@ func (n *Node) refreshView(ctx context.Context) error {
 		}
 	}
 	n.inst.nodes.Store(int64(len(v.live)))
+	n.forgetPeers(v)
 	return nil
+}
+
+// forgetPeers frees the per-peer state of the nodes v does not show live: their hint
+// queues (and goroutines) and their adaptive replica selection entries. Node ids
+// default to the hostname, new on every rollout, so departed peers would otherwise
+// pile up. A peer that comes back starts afresh.
+func (n *Node) forgetPeers(v *view) {
+	live := func(id string) bool { return v.live[id] }
+	n.hints.forget(live)
+	n.ars.forget(live)
 }
 
 // viewLoop re-reads the registry every ViewInterval, for routing.

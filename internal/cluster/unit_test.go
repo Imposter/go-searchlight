@@ -391,3 +391,29 @@ func TestPeerRefusingTheTokenIsACopyFailure(t *testing.T) {
 		t.Fatalf("a refresh=true write with a peer refusing the token: %+v, %v", res, err)
 	}
 }
+
+// TestDepartedPeerStateIsFreed: a peer that is no longer live (node ids repeat rarely:
+// they default to the hostname, new on every rollout) leaves nothing behind once the
+// view is read again: no hint queue or its goroutine, no adaptive replica selection
+// entries.
+func TestDepartedPeerStateIsFreed(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	ghost := "node-gone"
+	a.n.hints.send(ghost, "127.0.0.1:1", hint{Index: "g", Shard: 0, Seq: 1})
+	a.n.ars.start(ghost, ghost+"|g/0")(false, 0.001, 0)
+	a.n.ars.suspect(ghost + "|g/1")
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	a.n.hints.mu.Lock()
+	_, queued := a.n.hints.queues[ghost]
+	a.n.hints.mu.Unlock()
+	a.n.ars.mu.Lock()
+	_, measured := a.n.ars.peers[ghost]
+	copies := len(a.n.ars.copies)
+	a.n.ars.mu.Unlock()
+	if queued || measured || copies != 0 {
+		t.Fatalf("a departed peer's state stays: hint queue %v, ARS peer %v, ARS copies %d", queued, measured, copies)
+	}
+}

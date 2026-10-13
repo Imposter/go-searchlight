@@ -712,6 +712,18 @@ func (h *hinter) run(peer string, q *hintQueue) {
 	}
 }
 
+// forget stops and drops the hint queue of every peer keep refuses.
+func (h *hinter) forget(keep func(peer string) bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for peer, q := range h.queues {
+		if !keep(peer) {
+			close(q.stop)
+			delete(h.queues, peer)
+		}
+	}
+}
+
 func (h *hinter) close() {
 	h.mu.Lock()
 	h.closed = true

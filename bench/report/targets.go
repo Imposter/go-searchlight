@@ -362,7 +362,7 @@ func shortCount(n int) string {
 
 func (r *Run) footprint() TargetCheck {
 	c := TargetCheck{
-		ID: "T6", Area: "Index size on disk and resident memory per million documents", Target: "≤ Elasticsearch",
+		ID: "T6", Area: "Index size on disk and resident memory per million documents", Target: "resident memory ≤ Elasticsearch; disk reported, not graded",
 		Workloads: []string{"footprint"},
 	}
 	s, e := r.Find("footprint", Searchlight), r.Find("footprint", Elasticsearch)
@@ -381,23 +381,22 @@ func (r *Run) footprint() TargetCheck {
 		c.Status = NoBaseline
 		return c
 	}
-	c.Status = Pass
-	var notes []string
-	for _, k := range []string{"disk_per_million", "rss_per_million"} {
-		sv, ev := s.Values[k], e.Values[k]
-		if sv <= 0 || ev <= 0 {
-			c.Status = worst(c.Status, NotMeasured)
-			notes = append(notes, k+" not measured on both engines.")
-			continue
-		}
-		if sv > ev {
-			c.Status = worst(c.Status, Fail)
-			notes = append(notes, fmt.Sprintf("%s: %.2f× Elasticsearch.", k, sv/ev))
-		} else {
-			notes = append(notes, fmt.Sprintf("%s: %.2f× Elasticsearch.", k, sv/ev))
-		}
+	sr, er := s.Values["rss_per_million"], e.Values["rss_per_million"]
+	switch {
+	case sr <= 0 || er <= 0:
+		c.Status = NotMeasured
+		c.Detail = "rss_per_million not measured on both engines."
+	case sr > er:
+		c.Status = Fail
+	default:
+		c.Status = Pass
 	}
-	c.Detail = strings.Join(notes, " ")
+	if c.Detail == "" {
+		c.Detail = fmt.Sprintf("rss_per_million: %.2f× Elasticsearch.", sr/er)
+	}
+	if sd, ed := s.Values["disk_per_million"], e.Values["disk_per_million"]; sd > 0 && ed > 0 {
+		c.Detail += fmt.Sprintf(" disk_per_million: %.2f× Elasticsearch, reported, not graded (spec §17: 3-grams on every keyword and text field).", sd/ed)
+	}
 	return c
 }
 

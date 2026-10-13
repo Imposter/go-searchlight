@@ -437,9 +437,9 @@ window, the API's request timing and its shutdown grace.
   `replica`, `cluster`, `store`, `node` and `api`.
 - **Refresh scheduling.** Refreshes run on a fixed grid of this clock (`clock.GridLoop`).
 
-## Planned, not built
+## Benchmarks
 
-- **Tuning against Elasticsearch** (plan Task 14). The benchmark harness is in `bench/`
-  (it runs the real binary, restarts and recoveries included) and the chaos suite in
-  `test/chaos`, but the tuning until every spec §1 target is met is still to come.
-  `docs/benchmarks.md` will hold the results.
+The harness in `bench/` runs the real binary against Elasticsearch 8, restarts and
+recoveries included; the chaos suite in `test/chaos` covers the failure targets.
+`docs/benchmarks.md` holds the latest 1M-document run on `main`, graded against every
+spec §1 target.

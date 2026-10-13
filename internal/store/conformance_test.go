@@ -1191,6 +1191,42 @@ func TestReportAppliedMonotonic(t *testing.T) {
 	})
 }
 
+// TestResetApplied: ResetApplied sets applied_seq to the seq given, lower or not, and
+// only for the incarnation that holds the slot.
+func TestResetApplied(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "reset")
+		reg := st.Registry()
+		shard := ShardID{Index: "reset"}
+		c, ok, err := reg.ClaimCopy(ctx, shard, "n1", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		if err := reg.ReportApplied(ctx, c, 10); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.ResetApplied(ctx, c, 4); err != nil {
+			t.Fatal(err)
+		}
+		copies, err := reg.Copies(ctx, "reset")
+		if err != nil || len(copies) != 1 || copies[0].AppliedSeq != 4 {
+			t.Fatalf("after a reset to 4: %+v %v", copies, err)
+		}
+		stale := c
+		stale.Epoch++
+		if err := reg.ResetApplied(ctx, stale, 1); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("a reset by another incarnation: %v", err)
+		}
+		bad := c
+		bad.NodeID = ""
+		if err := reg.ResetApplied(ctx, bad, 1); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("a reset with an invalid node: %v", err)
+		}
+	})
+}
+
 // TestCopyExpired checks Expired() agrees with every dialect's SQL steal
 // boundary (lease_until < now): a lease with no time left at all is not yet
 // stealable, only one that has gone negative.

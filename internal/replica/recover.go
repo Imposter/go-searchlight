@@ -176,7 +176,7 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			}
 			return err
 		}
-		t.needRebuild, t.gate, t.remapSince = "", nil, time.Time{}
+		t.needRebuild, t.gate, t.remapSince, t.rebuilt = "", nil, time.Time{}, true
 		t.rebuildWait = 0
 		t.clearHalt()
 	}

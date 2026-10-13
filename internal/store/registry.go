@@ -442,6 +442,21 @@ func (g *registry) ReportApplied(ctx context.Context, c Copy, seq int64) (err er
 	return leaseResult(res, err, &c)
 }
 
+// ResetApplied sets applied_seq to seq, lower or not.
+func (g *registry) ResetApplied(ctx context.Context, c Copy, seq int64) (err error) {
+	s := g.s
+	ctx, end := s.start(ctx, "reset_applied", copyAttrs(&c)...)
+	defer end(&err)
+	if err := validShard(c.Shard); err != nil {
+		return err
+	}
+	if err := validNode(c.NodeID); err != nil {
+		return err
+	}
+	res, err := s.w.ExecContext(ctx, s.d.Registry.ResetApplied, append([]any{seq}, fenceArgs(&c)...)...)
+	return leaseResult(res, err, &c)
+}
+
 // leaseResult turns an update that matched no row into ErrLeaseLost. Every
 // dialect reports matched rows (MySQL through CLIENT_FOUND_ROWS).
 func leaseResult(res sql.Result, err error, c *Copy) error {

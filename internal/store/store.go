@@ -159,6 +159,11 @@ type RegistryStore interface {
 	// ReportApplied records the seq a copy has applied. It returns
 	// ErrLeaseLost unless the slot still holds this incarnation.
 	ReportApplied(ctx context.Context, c Copy, seq int64) error
+	// ResetApplied records seq as the seq a copy has applied even when it is
+	// lower than the one recorded: a copy rebuilt from scratch holds only what its
+	// rebuild brought. It returns ErrLeaseLost unless the slot still holds this
+	// incarnation.
+	ResetApplied(ctx context.Context, c Copy, seq int64) error
 	// RetireCopy marks c retiring, as SetCopyState does, but only while another
 	// node's copy of the shard serves under an unexpired lease, atomically with
 	// that check; it reports whether it did. ErrLeaseLost as SetCopyState.

@@ -153,3 +153,55 @@ func rawDB(t *testing.T, d *db) *sql.DB {
 	t.Cleanup(func() { _ = raw.Close() })
 	return raw
 }
+
+// TestRebuiltCopyReportsItsOwnSeq: the registry's applied_seq is the copy's
+// CommittedSeq. A copy rebuilt from scratch holds only what its rebuild brought, so
+// once rebuilt it reports that seq even when it is lower than one reported before
+// (here, by the copy the changelog was rewound under).
+func TestRebuiltCopyReportsItsOwnSeq(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "r", testMapping)
+		id := ShardID{Index: "r", Shard: 0}
+		cp, ok, err := st.Registry().ClaimCopy(ctx, id, "node-a", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim: %v %v", ok, err)
+		}
+		opts := testOptions()
+		opts.Copy = &cp
+		c := newCopy(t, d.open(t), id, opts)
+		c.start()
+		k := mustApply(t, st, upsert("r", 0, "kept", docBody("kept", 1)))
+		lost := mustApply(t, st, upsert("r", 0, "lost0", docBody("lost", 0)), upsert("r", 0, "lost1", docBody("lost", 1)))
+		c.waitApplied(lost)
+		waitReported(t, st, id, func(seq int64) bool { return seq >= lost })
+
+		rewind(t, d, k)
+		waitMatches(t, c, st, id)
+		got := waitReported(t, st, id, func(seq int64) bool { return seq <= k })
+		if sh := c.shard(); got != sh.CommittedSeq() {
+			t.Fatalf("reported %d, the rebuilt copy committed %d", got, sh.CommittedSeq())
+		}
+	})
+}
+
+// waitReported waits until the copy's applied_seq in the registry satisfies ok, and
+// returns it.
+func waitReported(t *testing.T, st store.Store, id ShardID, ok func(int64) bool) int64 {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		copies, err := st.Registry().Copies(context.Background(), id.Index)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(copies) == 1 && ok(copies[0].AppliedSeq) {
+			return copies[0].AppliedSeq
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the registry holds %+v", copies)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

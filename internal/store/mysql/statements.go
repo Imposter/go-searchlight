@@ -114,6 +114,7 @@ AS new ON DUPLICATE KEY UPDATE
 	IndexCopies:   withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = ? ORDER BY index_name, shard, slot"),
 	SetState:      withNow("UPDATE sl_shard_copies SET state = ?" + fence + " AND lease_until >= NOW"),
 	ReportApplied: "UPDATE sl_shard_copies SET applied_seq = GREATEST(applied_seq, ?)" + fence,
+	ResetApplied:  "UPDATE sl_shard_copies SET applied_seq = ?" + fence,
 }
 
 var blobs = dialect.Blobs{

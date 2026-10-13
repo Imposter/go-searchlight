@@ -113,6 +113,7 @@ RETURNING ` + copyColumns)},
 	SetState:    withNow("UPDATE sl_shard_copies SET state = ?" + fence + " AND lease_until >= NOW"),
 	// SQLite's multi-argument MAX is the scalar function, not the aggregate.
 	ReportApplied: "UPDATE sl_shard_copies SET applied_seq = MAX(applied_seq, ?)" + fence,
+	ResetApplied:  "UPDATE sl_shard_copies SET applied_seq = ?" + fence,
 }
 
 var blobs = dialect.Blobs{

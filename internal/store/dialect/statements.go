@@ -207,6 +207,8 @@ type Registry struct {
 	// ReportApplied: (seq, fence) sets applied_seq to the larger of it and
 	// seq.
 	ReportApplied string
+	// ResetApplied: (seq, fence) sets applied_seq to seq.
+	ResetApplied string
 }
 
 // Blobs is the blob store: sl_blobs, sl_blob_uploads and sl_blob_chunks.

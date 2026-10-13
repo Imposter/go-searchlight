@@ -301,7 +301,10 @@ type Tailer struct {
 	// is the applied seq; checkRewind compares the changelog with it.
 	mark        store.ChangeMark
 	needRebuild string // a rebuild to (re)try before tailing, by reason
-	needReopen  bool
+	// rebuilt is set once a rebuild completes, until the next report resets the
+	// registry's applied seq to the rebuilt copy's.
+	rebuilt    bool
+	needReopen bool
 	// minMappingVersion is the mapping version a fetched copy must have: the
 	// remap that asked for the rebuild.
 	minMappingVersion int64
@@ -737,12 +740,20 @@ func (t *Tailer) housekeeping(ctx context.Context, caughtUp bool) error {
 }
 
 // report sends CommittedSeq to the registry when it moved, at most every
-// ReportInterval unless force.
+// ReportInterval unless force. The first report after a rebuild resets the registry's
+// seq to the rebuilt copy's, lower or not.
 func (t *Tailer) report(ctx context.Context, force bool) error {
 	if t.copy == nil {
 		return nil
 	}
 	seq := t.Shard().CommittedSeq()
+	if t.rebuilt {
+		if err := t.st.Registry().ResetApplied(ctx, *t.copy, seq); err != nil {
+			return fmt.Errorf("reset the applied seq to %d: %w", seq, err)
+		}
+		t.rebuilt, t.reported, t.lastReport = false, seq, t.opts.Clock.Now()
+		return nil
+	}
 	if seq <= t.reported || (!force && t.opts.Clock.Since(t.lastReport) < t.opts.ReportInterval) {
 		return nil
 	}

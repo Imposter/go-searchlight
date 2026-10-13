@@ -289,6 +289,7 @@ RETURNING ` + copyColumns)},
 	IndexCopies:   withNow("SELECT " + copyColumns + " FROM sl_shard_copies WHERE index_name = $1 ORDER BY index_name, shard, slot"),
 	SetState:      withNow("UPDATE sl_shard_copies SET state = $1" + fence + " AND lease_until >= NOW"),
 	ReportApplied: "UPDATE sl_shard_copies SET applied_seq = GREATEST(applied_seq, $1)" + fence,
+	ResetApplied:  "UPDATE sl_shard_copies SET applied_seq = $1" + fence,
 }
 
 var blobs = dialect.Blobs{

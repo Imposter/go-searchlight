@@ -830,6 +830,14 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 	return r.RegistryStore.ReportApplied(ctx, c, seq)
 }
 
+func (r *faultRegistry) ResetApplied(ctx context.Context, c store.Copy, seq int64) error {
+	defer r.f.timed("ResetApplied")()
+	if r.f.isDown() {
+		return errPartitioned
+	}
+	return r.RegistryStore.ResetApplied(ctx, c, seq)
+}
+
 func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, error) {
 	defer r.f.timed("RetireCopy")()
 	if r.f.isDown() {

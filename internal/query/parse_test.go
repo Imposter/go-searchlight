@@ -1,7 +1,9 @@
 package query
 
 import (
+	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -211,6 +213,50 @@ func TestParseBoundsDepth(t *testing.T) {
 	if len(problems) == 0 || !strings.Contains(problems[0].Message, "deep") {
 		t.Fatalf("over MaxDepth: problems = %v", problems)
 	}
+}
+
+// A not adds no level (spec section 4: only all and any count), as scrape-bot's
+// queries nest them: MaxDepth groups with nots between them parse.
+func TestParseBoundsDepthCountsGroupsOnly(t *testing.T) {
+	raw := leafJSON()
+	for i := 0; i < MaxDepth; i++ {
+		raw = fmt.Sprintf(`{"not": %s}`, groupJSON("all", 1, fmt.Sprintf(`{"not": %s}`, raw)))
+	}
+	if _, problems := Parse([]byte(raw)); len(problems) != 0 {
+		t.Fatalf("%d groups among nots: problems = %v", MaxDepth, problems)
+	}
+	raw = groupJSON("any", 1, raw)
+	_, problems := Parse([]byte(raw))
+	if len(problems) != 1 || problems[0].Loc != RootLoc || !strings.Contains(problems[0].Message, "deep") {
+		t.Fatalf("over MaxDepth: problems = %v", problems)
+	}
+}
+
+// A query far past the bounds is refused at the first excess, without building the
+// rest of the tree or a loc per level: a not chain as deep as encoding/json reads stops
+// at its node past MaxNodes, and costs little more than decoding it.
+func TestParseRefusesDeepQueriesCheaply(t *testing.T) {
+	const depth = 9_990
+	raw := strings.Repeat(`{"not":`, depth) + leafJSON() + strings.Repeat("}", depth)
+	var v any
+	decoded := allocated(func() { _ = json.Unmarshal([]byte(raw), &v) })
+	var problems []Problem
+	parsed := allocated(func() { _, problems = Parse([]byte(raw)) })
+	if len(problems) != 1 || problems[0].Loc != RootLoc || !strings.Contains(problems[0].Message, "nodes") {
+		t.Fatalf("problems = %v", problems)
+	}
+	if parsed > 2*decoded+1<<20 {
+		t.Fatalf("Parse allocated %d bytes; decoding alone allocates %d", parsed, decoded)
+	}
+}
+
+// allocated is how many bytes fn allocates.
+func allocated(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
 }
 
 func TestParseBoundsLeaves(t *testing.T) {

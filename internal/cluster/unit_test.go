@@ -15,6 +15,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestWireRoundTrip: a search request and a shard's result survive the peer API's JSON
@@ -327,6 +328,38 @@ func TestSingleNodeCluster(t *testing.T) {
 	for _, c := range copies {
 		if c.State != store.CopyRetiring || c.AppliedSeq == 0 {
 			t.Fatalf("a stopped node's copy is %+v, want retiring at its applied seq", c)
+		}
+	}
+}
+
+// TestStopRetiresEveryCopyBeforeClosingThem: a stopping node marks its copies retiring
+// while their leases are live, before it closes them. Closing each one here takes
+// longer than the lease (its final report hangs to its timeout), so a copy marked only
+// after the others closed would stay serving under an expired lease, to be stolen and
+// rebuilt rather than replayed when the node comes back.
+func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
+	testtier.Heavy(t)
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.LeaseTTL = 2 * time.Second })
+	a := c.start(0)
+	createIndex(t, a.n, "slow", 3, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	var last int64
+	for k := range 30 {
+		last = mustWrite(t, a.n, "slow", upsertOp(fmt.Sprintf("s%02d", k), k))
+	}
+	waitCount(t, a.n, "slow", last, 30)
+	hang := func(ctx context.Context) { <-ctx.Done() }
+	a.wrap.onReport.Store(&hang)
+	a.stop()
+	st := c.db.open(t)
+	defer st.Close()
+	copies, err := st.Registry().Copies(context.Background(), "slow")
+	if err != nil || len(copies) != 3 {
+		t.Fatalf("copies: %+v %v", copies, err)
+	}
+	for _, cp := range copies {
+		if cp.State != store.CopyRetiring {
+			t.Errorf("a stopped node's copy is %+v, want retiring", cp)
 		}
 	}
 }

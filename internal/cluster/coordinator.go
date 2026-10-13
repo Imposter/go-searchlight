@@ -605,9 +605,9 @@ func (n *Node) retire(ctx context.Context, l *lease) bool {
 }
 
 // Stop leaves the cluster as a rolling restart wants: it drains (if the API has not),
-// stops the loops, stops every copy's tailer and closes its shard (a final manifest and
-// a final applied seq), marks every copy retiring and deregisters the node, then closes
-// the engine. The copies' leases are not released: their rows stay, retiring, at their
+// stops the loops, marks every copy retiring while its lease is live, then stops every
+// copy's tailer and closes its shard (a final manifest and a final applied seq, which
+// may take a while each), deregisters the node, and closes the engine. The copies' leases are not released: their rows stay, retiring, at their
 // final applied seqs, so the changelog the node needs to replay when it comes back is
 // kept for retiring_retention, and the node claims its own slots back at the same
 // epochs. Peers place replacements meanwhile (a retiring copy does not count towards
@@ -622,14 +622,22 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.loops.Wait()
 		n.closeBackground()
 		var errs []error
-		for _, l := range n.leaseList() {
+		leases := n.leaseList()
+		for _, l := range leases {
+			if l.retired.Load() {
+				continue
+			}
+			switch err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); {
+			case err == nil:
+				n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
+			case !errors.Is(err, store.ErrLeaseLost):
+				n.log.WarnContext(ctx, "marking a stopping node's copy retiring failed; once its lease expires it is rebuilt elsewhere rather than replayed",
+					slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+			}
+		}
+		for _, l := range leases {
 			if err := n.unhostCopy(ctx, l.copy, false); err != nil {
 				errs = append(errs, err)
-			}
-			if !l.retired.Load() {
-				if err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); err == nil {
-					n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
-				}
 			}
 			n.dropLease(l)
 		}

@@ -586,6 +586,9 @@ type faultStore struct {
 	// onRetire, when set, runs at the start of every RetireCopy, before it reaches the
 	// store.
 	onRetire atomic.Pointer[func()]
+	// onReport, when set, runs at the start of every ReportApplied, before it reaches
+	// the store.
+	onReport atomic.Pointer[func(ctx context.Context)]
 	// stallTail, while set, holds every ChangesAfter until it is closed or the call's
 	// context ends: the node's tailers stay where they are, serving and current by
 	// their own measure.
@@ -826,6 +829,9 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 	defer r.f.timed("ReportApplied")()
 	if r.f.isDown() {
 		return errPartitioned
+	}
+	if fn := r.f.onReport.Load(); fn != nil {
+		(*fn)(ctx)
 	}
 	return r.RegistryStore.ReportApplied(ctx, c, seq)
 }

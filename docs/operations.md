@@ -548,6 +548,13 @@ Notes:
     `store: database schema is newer than this binary` until it runs the new image:
     finish the rollout rather than waiting on it. For the same reason a rollback means
     restoring the database, as above.
+  - **An old pod must be gone, not merely silent**, by the time `dead_after` plus
+    `lease_ttl` has passed since it last heartbeated. The fence counts a silent node as
+    gone; one that was only cut off or frozen (a network partition, a paused VM) and
+    comes back without restarting still runs the old binary, claims copies again, and
+    reads compressed rows as empty bodies (its realtime `GET`s answer empty documents,
+    and its copies halt). Terminate old pods during the rollout rather than isolating
+    them; once restarted, an old binary refuses the schema, as above.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

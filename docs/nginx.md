@@ -198,6 +198,11 @@ routing would both break. `deploy/compose.yml` already sets this correctly — e
 node's `SEARCHLIGHT_ADVERTISE_ADDRESS` is its own Compose service name
 (`searchlight-1:8780`, and so on), not the nginx service's.
 
+The shipped config also closes `/_internal/` at the proxy:
+`location /_internal/ { return 404; }`. The peer API needs the cluster token anyway,
+but no client outside the cluster has a reason to reach it, so nginx answers 404
+itself rather than pass the request to a node.
+
 ### The admin listener stays off the proxy
 
 Each node serves `/healthz` and `/readyz` on both listeners, without auth, and

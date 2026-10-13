@@ -942,8 +942,9 @@ components:
       properties:
         query: { $ref: "#/components/schemas/Query" }
         sort:
-          description: 'Field names or {"field": "asc"|"desc"}; the _id breaks ties.'
+          description: 'Field names or {"field": "asc"|"desc"}; the _id breaks ties. Each field once, and nothing after _id.'
           type: array
+          maxItems: 16
           items: {}
         size: { type: integer, minimum: 0, maximum: 10000, default: 10 }
         search_after:

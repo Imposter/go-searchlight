@@ -211,6 +211,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     compatible with scrape-bot.
 - **`sort`** takes field names, `{"field": "asc"|"desc"}` or
   `{"field": {"order": "desc"}}`. `_id` breaks ties.
+  - At most 16 keys, each field once.
+  - Nothing after `_id`: ids are unique, so no later key could break a tie.
 - **Paging.** `size` is 10 by default, at most 10,000. To page, pass the previous
   response's `next` as `search_after`. `next` is null on a short page. There is no
   `from`.

@@ -131,9 +131,24 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	return p, nil
 }
 
+// prepareSorts types the sort keys and adds the _id tie-breaker. It refuses more than
+// MaxSortKeys keys, a field sorted on twice, and any key after _id (ids are unique, so
+// nothing after one can tie).
 func prepareSorts(fields []SortField, m *schema.Mapping, ps *problems) []sortSpec {
+	if len(fields) > MaxSortKeys {
+		ps.add(fmt.Sprintf("sort.%d", MaxSortKeys), "a search sorts by at most %d keys", MaxSortKeys)
+		fields = fields[:MaxSortKeys]
+	}
 	out := make([]sortSpec, 0, len(fields)+1)
 	for i, f := range fields {
+		if i > 0 && fields[i-1].Field == IDField {
+			ps.add(fmt.Sprintf("sort.%d", i), "nothing sorts after _id: ids are unique, so no key after one can tie")
+			return out
+		}
+		if j := slices.IndexFunc(fields[:i], func(g SortField) bool { return g.Field == f.Field }); j >= 0 {
+			ps.add(fmt.Sprintf("sort.%d", i), "%q is already sort key %d: a field sorts once", f.Field, j)
+			continue
+		}
 		spec := sortSpec{field: f.Field, desc: f.Desc}
 		switch f.Field {
 		case IDField:
@@ -154,9 +169,9 @@ func prepareSorts(fields []SortField, m *schema.Mapping, ps *problems) []sortSpe
 			}
 		}
 		out = append(out, spec)
-		if spec.kind == sortID {
-			return out // ids are unique: nothing after can tie
-		}
+	}
+	if len(out) > 0 && out[len(out)-1].kind == sortID {
+		return out
 	}
 	return append(out, sortSpec{field: IDField, kind: sortID})
 }

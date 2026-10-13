@@ -47,6 +47,9 @@ const (
 	TrackTotalNone = -2
 	// MaxSize is the most hits one request returns.
 	MaxSize = 10_000
+	// MaxSortKeys is the most sort keys one request takes: each field once, and none
+	// after _id.
+	MaxSortKeys = 16
 	// MaxBuckets bounds the buckets of one response (Elasticsearch's search.max_buckets).
 	// A histogram's empty buckets are filled in only while the total stays under it.
 	MaxBuckets = 65_536

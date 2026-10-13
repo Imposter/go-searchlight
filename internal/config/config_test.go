@@ -422,8 +422,10 @@ func TestLoadRefusesAClusterStoreWithoutClusterToken(t *testing.T) {
 		{"mysql://u@db/sl", "", "true", true},
 		{sqliteURL, "", "", true},
 	} {
-		env := map[string]string{"SEARCHLIGHT_STORE_URL": tc.store, "SEARCHLIGHT_TOKENS_FILE": tokens,
-			"SEARCHLIGHT_CLUSTER_TOKEN": tc.clusterToken, insecure: tc.insecureNoAuth}
+		env := map[string]string{
+			"SEARCHLIGHT_STORE_URL": tc.store, "SEARCHLIGHT_TOKENS_FILE": tokens,
+			"SEARCHLIGHT_CLUSTER_TOKEN": tc.clusterToken, insecure: tc.insecureNoAuth,
+		}
 		_, err := Load(nil, envOf(env))
 		switch {
 		case tc.ok && err != nil:

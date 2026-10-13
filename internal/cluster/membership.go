@@ -68,6 +68,10 @@ type lease struct {
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
 
+	// gone is set once the copy is lost: the lease no longer holds, whatever its
+	// deadline.
+	gone atomic.Bool
+
 	// mu serializes the copy's transitions (pause, resume, loss).
 	mu     sync.Mutex
 	paused bool
@@ -82,7 +86,7 @@ func (l *lease) valid() bool {
 
 // validAt is valid at the leaseClock readings now and wall.
 func (l *lease) validAt(now time.Duration, wall time.Time) bool {
-	if now >= time.Duration(l.deadline.Load())-l.margin {
+	if l.gone.Load() || now >= time.Duration(l.deadline.Load())-l.margin {
 		return false
 	}
 	return wall.Sub(time.Unix(0, l.wallBefore.Load())) < l.ttl-l.margin
@@ -386,7 +390,9 @@ func (n *Node) resumeIfPaused(ctx context.Context, l *lease) {
 }
 
 // loseCopy unhosts a copy whose lease is lost for sure; the directory is kept, so a
-// later claim resumes it.
+// later claim resumes it. The lease stops counting as held at once, and the copy is
+// closed in the background: its final flush and report do not hold up the caller (a
+// routing miss under a client's read).
 func (n *Node) loseCopy(ctx context.Context, l *lease) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -394,10 +400,13 @@ func (n *Node) loseCopy(ctx context.Context, l *lease) {
 		return
 	}
 	l.lost = true
+	l.gone.Store(true)
 	n.dropLease(l)
-	if err := n.unhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
-		n.log.WarnContext(ctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
-	}
+	n.background(func(bctx context.Context) {
+		if err := n.unhostCopy(context.WithoutCancel(bctx), l.copy, false); err != nil {
+			n.log.WarnContext(bctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+		}
+	})
 }
 
 // unhostCopy unhosts a copy and forgets what the node cached of its files.

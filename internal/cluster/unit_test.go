@@ -417,3 +417,31 @@ func TestDepartedPeerStateIsFreed(t *testing.T) {
 		t.Fatalf("a departed peer's state stays: hint queue %v, ARS peer %v, ARS copies %d", queued, measured, copies)
 	}
 }
+
+// TestLosingACopyDoesNotWaitForItsClose: a copy found taken over (by a routing miss's
+// registry read, under a client's read) stops counting as held at once, and is closed
+// in the background: its final flush and report do not hold up the read that found it.
+func TestLosingACopyDoesNotWaitForItsClose(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "lc", 1, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	waitCount(t, a.n, "lc", mustWrite(t, a.n, "lc", upsertOp("x", 1)), 1)
+	hang := func(ctx context.Context) { <-ctx.Done() }
+	a.wrap.onReport.Store(&hang)
+	l := a.n.leaseList()[0]
+	start := time.Now()
+	a.n.loseCopy(tctx(t), l)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("losing a copy took %s: it waited for the copy's close", took)
+	}
+	if l.valid() {
+		t.Fatal("a lost copy's lease still counts as held")
+	}
+	eventually(t, 30*time.Second, "the lost copy is closed", func() error {
+		if _, hosted := a.n.Hosted(l.copy.Shard); hosted {
+			return errors.New("still hosted")
+		}
+		return nil
+	})
+}

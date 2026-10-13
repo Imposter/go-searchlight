@@ -463,8 +463,9 @@ func raise(v *atomic.Int64, seq int64) {
 
 // waitWritten waits, under ctx's deadline, for the written shards to have seq
 // searchable: by their next refresh (wait_for), or at once (true: once applied, the
-// copies are refreshed). That is this node's copy, and on a cluster node every other
-// serving copy of the shard as well.
+// copies are refreshed). wait_for waits on this node's copy when it hosts a serving
+// one, else (a cluster node) on the first other copy that has seq; true waits on this
+// node's copy and every other serving copy of the shard.
 func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bool, seq int64, mode api.RefreshMode) error {
 	shards := make([]int, 0, len(touched))
 	for s := range touched {

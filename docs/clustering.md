@@ -148,8 +148,10 @@ sequenceDiagram
   second). Three knobs on the request itself change this:
   - nothing special: visible everywhere within `refresh_interval` of the commit;
   - `?refresh=wait_for`: the response waits until the write is searchable on the
-    **coordinator's own copy** specifically (it never forces an early refresh, and never
-    waits for durability — refresh and flush are separate, see
+    **coordinator's own copy** specifically, or, on a node that hosts no copy of the
+    shard, on the first copy that has it; other copies may still trail (it never forces
+    an early refresh, except on an index whose refresh is disabled, and never waits for
+    durability — refresh and flush are separate, see
     [architecture.md](architecture.md#the-write-path-the-sql-changelog-is-the-wal));
   - `?refresh=true`: forces a refresh of the written shard at once, at the cost of a
     small segment per call — don't do this per document under load.

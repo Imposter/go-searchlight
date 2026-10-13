@@ -495,13 +495,19 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 	}
 }
 
-// WaitRefreshed implements node.Cluster: it waits on every serving copy of id on a
-// live peer, together. A copy whose peer cannot be reached, or that does not serve
-// now, is skipped, and suspected, so reads routed by adaptive replica selection avoid
-// it; but when no copy at all (this node's included: localDone) reached seq, the wait
-// fails.
+// WaitRefreshed implements node.Cluster. With api.RefreshTrue it waits on every
+// serving copy of id on a live peer, together, each refreshed at once. With
+// api.RefreshWaitFor it waits for none when this node's copy has seq (localDone), and
+// otherwise for the first peer copy that has it. A copy whose peer cannot be reached,
+// or that does not serve now, is skipped, and suspected, so reads routed by adaptive
+// replica selection avoid it; but when no copy at all (this node's included) reached
+// seq, the wait fails.
 func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
+	first := mode != api.RefreshTrue
+	if first && localDone {
+		return nil
+	}
 	cands := n.candidates(id)
 	if len(cands) == 0 && !localDone {
 		cands = n.routeCandidates(ctx, id)
@@ -515,15 +521,21 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 	errs := make([]error, len(cands))
 	var reached atomic.Int32
 	var wg sync.WaitGroup
+	wctx, answered := context.WithCancel(ctx)
+	defer answered()
 	for i, c := range cands {
 		wg.Go(func() {
 			msg := waitMsg{shardRef: shardRef{Index: id.Index, Shard: id.Shard}, Seq: seq, Refresh: mode == api.RefreshTrue}
-			err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
+			err := n.call(wctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
 			var pe *peerError
 			var ae *api.Error
 			switch {
 			case err == nil:
 				reached.Add(1)
+				if first {
+					answered()
+				}
+			case wctx.Err() != nil && ctx.Err() == nil:
 			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
 				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
 			default:
@@ -532,6 +544,9 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 		})
 	}
 	wg.Wait()
+	if first && reached.Load() > 0 {
+		return nil
+	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}

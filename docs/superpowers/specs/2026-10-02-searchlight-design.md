@@ -166,7 +166,7 @@ The API is in the Elasticsearch style:
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness, Prometheus |
 
 - **Consistency:**
-  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy;
+  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy, or, on a node that hosts none, on the first copy that has it;
   - any read takes `?wait_for_seq=N`;
   - by default, writes become visible within `refresh_interval` everywhere.
 - **Auth:** bearer tokens, read-only or read-write. The internal peer API uses a separate cluster token.

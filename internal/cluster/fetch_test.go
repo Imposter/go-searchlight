@@ -20,6 +20,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestPinnedFetchSurvivesRetire: a search's query phase pins a generation on a peer,
@@ -375,4 +376,62 @@ func (pp *peerProbe) RoundTrip(r *http.Request) (*http.Response, error) {
 	c := r.Clone(r.Context())
 	c.Body = io.NopCloser(bytes.NewReader(b))
 	return pp.base.RoundTrip(c)
+}
+
+// TestWaitForWaitsOnOneCopy: refresh=wait_for returns once the write is searchable on
+// the coordinator's own copy, or, on a node without one, on the first copy that has
+// it: a peer copy whose tailer lags does not hold the write to its deadline.
+func TestWaitForWaitsOnOneCopy(t *testing.T) {
+	testtier.Heavy(t)
+	c := newCluster(t, sqliteDB(t), nil)
+	nodes := []*tnode{c.start(0), c.start(1), c.start(2)}
+	a := nodes[0]
+	createIndex(t, a.n, "wf", 1, 0)
+	waitCopies(t, a.st, "wf", 1, 3, time.Minute)
+	createIndex(t, a.n, "wf1", 1, 2)
+	waitCopies(t, a.st, "wf1", 1, 2, time.Minute)
+
+	stall := func(tn *tnode) {
+		t.Helper()
+		ch := make(chan struct{})
+		t.Cleanup(func() { close(ch) })
+		tn.wrap.stallTail.Store(&ch)
+		eventually(t, 10*time.Second, tn.cfg.NodeID+"'s tailers are held", func() error {
+			if tn.wrap.stalled.Load() == 0 {
+				return errors.New("no poll held yet")
+			}
+			return nil
+		})
+	}
+	write := func(tn *tnode, index string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		res, err := tn.n.Write(ctx, index, []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: api.RefreshWaitFor})
+		if err != nil || res.TimedOut {
+			t.Fatalf("a wait_for write to %s through %s: %+v, %v after %s", index, tn.cfg.NodeID, res, err, time.Since(start))
+		}
+	}
+
+	_, holders := serving(t, a.st, store.ShardID{Index: "wf1"})
+	var coordinator, lagging *tnode
+	for _, tn := range nodes {
+		switch {
+		case !slices.Contains(holders, tn.cfg.NodeID):
+			coordinator = tn
+		case lagging == nil:
+			lagging = tn
+		}
+	}
+	if coordinator == nil || lagging == nil {
+		t.Fatalf("wf1 is served by %v", holders)
+	}
+	stall(lagging)
+	write(coordinator, "wf1")
+	writer := a
+	if writer == lagging {
+		writer = coordinator
+	}
+	write(writer, "wf")
 }

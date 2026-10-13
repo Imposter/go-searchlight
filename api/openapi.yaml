@@ -974,7 +974,8 @@ components:
           description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep. At most 100 per search, sub-aggregations included; at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
         aggregations:
           type: object
-          description: An alias of aggs.
+          maxProperties: 100
+          description: An alias of aggs, with its bounds.
         fields:
           type: array
           maxItems: 100

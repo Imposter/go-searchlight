@@ -60,6 +60,13 @@ segments.
 | A shard copy's write buffer full | (backpressure) | 429 with `Retry-After` |
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
 | Query size | 4 levels of `all`/`any`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
+| Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
+| Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
+| Ranges in a `range` aggregation | 100 | 400 with `loc` |
+| `fields` in a search | 100 | 400 with `loc` `fields` |
+| Buckets in a search response, every aggregation's together | 65,536 | 400 with `loc` when one shard passes it; `"truncated": true` on the aggregations cut when only the merged shards do |
+| Documents in one `_percolate`, `docs` and `ids` together | 10,000 | 413 `too_large` |
+| Matches in one percolation, every document's together | 1,000,000 | `_percolate`: 422 `too_many_matches`; `_bulk?percolate=true`: `percolated: false`, `percolate_reason: "too_many_matches"` |
 
 ## Indexes
 

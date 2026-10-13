@@ -56,12 +56,11 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, p params) err
 }
 
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p params) error {
-	// Reads of one document are realtime (from the system of record), so every
-	// committed seq is already visible: wait_for_seq is checked and satisfied.
-	if _, e := p.waitForSeq(); e != nil {
+	wait, e := p.waitForSeq()
+	if e != nil {
 		return e
 	}
-	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"))
+	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitForSeq: wait})
 	if err != nil {
 		return err
 	}

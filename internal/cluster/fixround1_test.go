@@ -63,7 +63,7 @@ func TestDatabaseOutageOneNodeCluster(t *testing.T) {
 			t.Fatalf("a copy past its lease is not paused: %+v", lc)
 		}
 	}
-	doc, err := a.n.GetDocument(tctx(t), "out", "b")
+	doc, err := a.n.GetDocument(tctx(t), "out", "b", api.ReadOptions{})
 	if err != nil || !doc.Stale {
 		t.Fatalf("GET during the outage: %+v %v", doc, err)
 	}

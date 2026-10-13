@@ -745,16 +745,16 @@ func TestDatabaseUnreachable(t *testing.T) {
 	if err != nil || !sr.Stale || sr.Total != 1 {
 		t.Errorf("a search with the database down: %+v %v", sr, err)
 	}
-	doc, err := n.GetDocument(ctx(t), "s", "a")
+	doc, err := n.GetDocument(ctx(t), "s", "a", api.ReadOptions{})
 	if err != nil || !doc.Stale || string(doc.Body) != `{"x": 1}` {
 		t.Errorf("GET with the database down: %+v %v", doc, err)
 	}
-	q, err := n.GetQuery(ctx(t), "s", "q")
+	q, err := n.GetQuery(ctx(t), "s", "q", api.ReadOptions{})
 	if err != nil || !q.Stale || string(q.Meta) != `{"m":1}` || !strings.Contains(string(q.Query), `"op":"eq"`) {
 		t.Errorf("GET query with the database down: %+v %s %v", q, q.Query, err)
 	}
 	var ae *api.Error
-	if _, err := n.GetDocument(ctx(t), "s", "missing"); !errors.As(err, &ae) || ae.Status != 404 || ae.Extra["stale"] != true {
+	if _, err := n.GetDocument(ctx(t), "s", "missing", api.ReadOptions{}); !errors.As(err, &ae) || ae.Status != 404 || ae.Extra["stale"] != true {
 		t.Errorf("a missing document with the database down: %v", err)
 	}
 	// A seq another node may have committed cannot be checked: retryable, not invalid.
@@ -908,7 +908,7 @@ func TestDatabaseHangs(t *testing.T) {
 	}
 	hung.Store(true)
 	start := time.Now()
-	doc, err := n.GetDocument(ctx(t), "h", "a")
+	doc, err := n.GetDocument(ctx(t), "h", "a", api.ReadOptions{})
 	if err != nil || !doc.Stale || time.Since(start) > 3*time.Second {
 		t.Fatalf("GET from a hung database: %+v %v after %v", doc, err, time.Since(start))
 	}
@@ -927,7 +927,7 @@ func TestDatabaseHangs(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	start = time.Now()
-	if doc, err := n.GetDocument(ctx(t), "h", "a"); err != nil || !doc.Stale || time.Since(start) > 200*time.Millisecond {
+	if doc, err := n.GetDocument(ctx(t), "h", "a", api.ReadOptions{}); err != nil || !doc.Stale || time.Since(start) > 200*time.Millisecond {
 		t.Errorf("GET once stale: %+v %v after %v", doc, err, time.Since(start))
 	}
 	hung.Store(false)
@@ -942,7 +942,7 @@ func TestDatabaseHangs(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if doc, err := n.GetDocument(ctx(t), "h", "a"); err != nil || doc.Stale || doc.Seq == 0 {
+	if doc, err := n.GetDocument(ctx(t), "h", "a", api.ReadOptions{}); err != nil || doc.Stale || doc.Seq == 0 {
 		t.Errorf("GET after recovery: %+v %v", doc, err)
 	}
 }
@@ -1232,5 +1232,54 @@ func TestWritePercolationFailureCarriesItsCause(t *testing.T) {
 	}
 	if res.Percolated || !res.TimedOut || res.PercolateErr == nil {
 		t.Fatalf("percolated %v, timed out %v, cause %v: want the passed deadline", res.Percolated, res.TimedOut, res.PercolateErr)
+	}
+}
+
+// TestGetHonoursWaitForSeq: GET of a document or saved query takes wait_for_seq as
+// every read does. A seq past the head is a 400. Realtime from the database every
+// committed seq is visible; from a copy (the database down) the read waits for the
+// copy to have the seq, a 504 at its deadline, rather than answering an older version.
+func TestGetHonoursWaitForSeq(t *testing.T) {
+	cfg := testConfig(t)
+	base := openStore(t, cfg)
+	down := &atomic.Bool{}
+	st := flakyStore{Store: base, rr: base.(store.RecordReader), down: down} //nolint:forcetypeassert,errcheck // every store reads records
+	var fake *nodetest.Tailer
+	n := open(t, cfg, st, func(o *node.Options) {
+		o.NewTailer = func(st store.Store, sh *shard.Shard, id store.ShardID, env node.TailerEnv) node.Tailer {
+			tl := nodetest.NewTailer(st, sh, id, env)
+			fake = tl.(*nodetest.Tailer) //nolint:forcetypeassert,errcheck // NewTailer returns a *Tailer
+			return tl
+		}
+	})
+	if _, err := n.CreateIndex(ctx(t), "g", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	first := mustWrite(t, n, "g", upsert("a", `{"v": 1}`), api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
+	if got := count(t, n, "g", &query.All{}, first.Seq); got != 1 {
+		t.Fatalf("count = %d", got)
+	}
+	fake.Pause()
+	second := mustWrite(t, n, "g", upsert("a", `{"v": 2}`))
+
+	var ae *api.Error
+	if _, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: second.Seq + 100}); !errors.As(err, &ae) || ae.Status != 400 {
+		t.Fatalf("GET with wait_for_seq past the head: %v, want a 400", err)
+	}
+	if _, err := n.GetQuery(ctx(t), "g", "q", api.ReadOptions{WaitForSeq: second.Seq + 100}); !errors.As(err, &ae) || ae.Status != 400 {
+		t.Fatalf("GET of a query with wait_for_seq past the head: %v, want a 400", err)
+	}
+	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: second.Seq}); err != nil || string(doc.Body) != `{"v": 2}` {
+		t.Fatalf("realtime GET: %+v, %v", doc, err)
+	}
+
+	down.Store(true)
+	c, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if doc, err := n.GetDocument(c, "g", "a", api.ReadOptions{WaitForSeq: second.Seq}); !errors.As(err, &ae) || ae.Status != 504 {
+		t.Fatalf("a stale GET waiting for a seq the copy lacks: %+v, %v, want a 504", doc, err)
+	}
+	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: first.Seq}); err != nil || !doc.Stale || string(doc.Body) != `{"v": 1}` {
+		t.Fatalf("a stale GET of a seq the copy has: %+v, %v", doc, err)
 	}
 }

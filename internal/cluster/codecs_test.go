@@ -89,7 +89,7 @@ func TestBodyCodecGate(t *testing.T) {
 				t.Fatalf("%s counts %d, %v", n.id, got, err)
 			}
 			for id, v := range want {
-				doc, err := n.GetDocument(ctx, "g", id)
+				doc, err := n.GetDocument(ctx, "g", id, api.ReadOptions{})
 				if err != nil {
 					t.Fatalf("%s get %s: %v", n.id, id, err)
 				}

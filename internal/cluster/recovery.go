@@ -258,7 +258,10 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 	if !anyMajor {
 		req.MinMajor = segment.FormatMajor
 	}
-	if err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"snapshots", req, &snap); err != nil {
+	sctx, cancel := context.WithTimeout(ctx, n.opts.PeerTimeout)
+	err := n.call(sctx, c.node, c.addr, http.MethodPost, peerPrefix+"snapshots", req, &snap)
+	cancel()
+	if err != nil {
 		var ae *api.Error
 		switch {
 		case errors.As(err, &ae) && ae.Code == codeOlderSegments:
@@ -496,9 +499,14 @@ func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part 
 	return k, nil
 }
 
-// download fetches a whole (small) snapshot file into memory.
+// download fetches a whole (small) snapshot file into memory, within PeerTimeout and
+// cut when idle for PeerIdleTimeout, as a stream is.
 func (f *fetcher) download(ctx context.Context, c candidate, snapID string, wf wireFile) ([]byte, error) {
 	n := f.n
+	ctx, cancel := context.WithTimeout(ctx, n.opts.PeerTimeout)
+	defer cancel()
+	timer := n.clock.AfterFunc(n.opts.PeerIdleTimeout, cancel)
+	defer timer.Stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, n.fileURL(c, snapID, wf.Name), http.NoBody)
 	if err != nil {
 		return nil, err
@@ -512,7 +520,7 @@ func (f *fetcher) download(ctx context.Context, c candidate, snapID string, wf w
 	if resp.StatusCode != http.StatusOK {
 		return nil, decodeError(resp)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, wf.Size+1))
+	b, err := io.ReadAll(io.LimitReader(&idleReader{r: resp.Body, timer: timer, idle: n.opts.PeerIdleTimeout}, wf.Size+1))
 	if err != nil {
 		return nil, &peerError{node: c.node, err: err}
 	}

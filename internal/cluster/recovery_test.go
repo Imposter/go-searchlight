@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -345,4 +346,43 @@ func TestSnapshotRefusesWhatTheRequesterCannotUse(t *testing.T) {
 		t.Fatalf("snapshot: format %d, %d files", snap.FormatMajor, len(snap.Files))
 	}
 	_ = a.n.call(tctx(t), a.n.id, a.addr, http.MethodDelete, peerPrefix+"snapshots/"+snap.ID, nil, nil)
+}
+
+// TestRecoveryFromAFrozenPeerEnds: a peer that accepts the connection and never answers
+// (frozen, not gone) fails a recovery's snapshot request and its manifest download
+// within the peer timeout, so the recovery moves on to another source.
+func TestRecoveryFromAFrozenPeerEnds(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.PeerTimeout = 500 * time.Millisecond
+	})
+	a := c.start(0)
+	release := make(chan struct{})
+	frozen := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(frozen.Close)
+	t.Cleanup(func() { close(release) })
+	id := store.ShardID{Index: "fz"}
+	cand := candidate{node: "frozen", addr: frozen.Listener.Addr().String(), shard: id}
+	for name, call := range map[string]func(ctx context.Context) error{
+		"snapshot": func(ctx context.Context) error {
+			_, err := a.n.fetch.fetchFrom(ctx, cand, id, t.TempDir(), t.TempDir(), false)
+			return err
+		},
+		"manifest": func(ctx context.Context) error {
+			_, err := a.n.fetch.download(ctx, cand, "snap", wireFile{Name: "MANIFEST", Size: 64})
+			return err
+		},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		start := time.Now()
+		err := call(ctx)
+		cancel()
+		if took := time.Since(start); err == nil || took > 10*time.Second {
+			t.Errorf("%s from a frozen peer: %v after %s", name, err, took)
+		}
+	}
 }

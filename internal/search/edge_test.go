@@ -435,6 +435,9 @@ func TestWordsCacheKeysKeepPhrases(t *testing.T) {
 	}
 }
 
+// A histogram too wide to fill comes back sparse and truncated; one with more than
+// MaxBuckets buckets is refused while its segment collects (its chunks, collected
+// apart, share the segment's budget), not only once the shard adds them up.
 func TestHistogramBucketLimit(t *testing.T) {
 	c := newCluster(t, 1)
 	for i := range 3 {
@@ -446,16 +449,17 @@ func TestHistogramBucketLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := resp.Aggs["h"]; len(h.Buckets) != 3 || h.Truncated {
-		t.Fatalf("filling past MaxBuckets: %d buckets, truncated %v", len(h.Buckets), h.Truncated)
+	if h := resp.Aggs["h"]; len(h.Buckets) != 3 || !h.Truncated {
+		t.Fatalf("filling past MaxBuckets: %d buckets, truncated %v; want 3 unfilled, truncated", len(h.Buckets), h.Truncated)
 	}
 	for i := range MaxBuckets + 1 {
 		c.upsert(fmt.Sprintf("e%d", i), fmt.Sprintf(`{"price":%d}`, i))
 	}
 	c.refreshAll()
 	var re *RequestError
-	if _, err := c.search(r); !errors.As(err, &re) {
-		t.Fatalf("more than MaxBuckets: %v, want a RequestError", err)
+	_, err = c.search(r)
+	if !errors.As(err, &re) || !strings.Contains(err.Error(), "search: segment") {
+		t.Fatalf("more than MaxBuckets: %v, want a RequestError from the segment", err)
 	}
 }
 

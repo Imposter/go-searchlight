@@ -256,7 +256,8 @@ func TestSortWalkEveryPath(t *testing.T) {
 		field := pick(rng, []string{"price", "created"})
 		sorts := []SortField{{Field: field, Desc: rng.IntN(2) == 0}}
 		if rng.IntN(3) == 0 {
-			sorts = append(sorts, SortField{Field: pick(rng, []string{"brand", "active", "price"}), Desc: rng.IntN(2) == 0})
+			second := pick(rng, slices.DeleteFunc([]string{"brand", "active", "price"}, func(f string) bool { return f == field }))
+			sorts = append(sorts, SortField{Field: second, Desc: rng.IntN(2) == 0})
 		}
 		raw := `{"all":[]}`
 		switch rng.IntN(4) {

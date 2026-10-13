@@ -18,7 +18,8 @@ import (
 // Reduce merges shard results (from ExecuteShard with the same r) into one response:
 // the best r.Size hits over every shard by the request's sort (ties: _id, then the
 // shards' order), the summed total cut at TrackTotal, and the aggregations merged and
-// finished. A nil result (a shard that failed) is skipped.
+// finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that
+// failed) is skipped.
 func Reduce(rs []*ShardResult, r *Request) *Response {
 	return ReduceContext(context.Background(), rs, r)
 }
@@ -65,15 +66,18 @@ func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response
 	}
 	if len(specs) > 0 {
 		resp.Aggs = make(map[string]*AggResult, len(specs))
-		for _, spec := range specs {
+		results := make([]*AggResult, len(specs))
+		for i, spec := range specs {
 			parts := make([]*AggPartial, 0, len(live))
 			for _, sr := range live {
 				if p := sr.Aggs[spec.name]; p != nil {
 					parts = append(parts, p)
 				}
 			}
-			resp.Aggs[spec.name] = reduceAgg(parts, spec)
+			results[i] = reduceAgg(parts, spec)
+			resp.Aggs[spec.name] = results[i]
 		}
+		boundBuckets(specs, results)
 	}
 	instruments().recordPhase(ctx, r.Index, "reduce", time.Since(start))
 	span.SetAttributes(attribute.Int64("total", resp.Total), attribute.Int("hits", len(resp.Hits)))
@@ -155,7 +159,8 @@ func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
 }
 
 // reduceTerms merges terms lists, tracking which shards returned each term for its
-// error bound (see aggs.go).
+// error bound (see aggs.go). One shard's list is exact, so its bound is 0: no term it
+// left out has more documents than one it returned.
 func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	type acc struct {
 		b    *BucketPartial
@@ -166,7 +171,9 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	res := &AggResult{Type: AggTerms}
 	var docs int64
 	for i, p := range parts {
-		res.DocCountErrorUpperBound += p.DocCountError
+		if len(parts) > 1 {
+			res.DocCountErrorUpperBound += p.DocCountError
+		}
 		docs += p.OtherDocCount
 		for _, b := range p.Buckets {
 			docs += b.DocCount
@@ -268,50 +275,73 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 	default: // histograms
 		bs := slices.Clone(p.Buckets)
 		slices.SortFunc(bs, func(a, b *BucketPartial) int { return cmpValue(a.Key, b.Key, false) })
-		if spec.minDoc <= 0 && len(bs) > 1 {
-			bs = fillHistogram(bs, spec)
-		}
 		for _, b := range bs {
-			if b.DocCount < int64(spec.minDoc) {
-				continue
+			if b.DocCount >= int64(spec.minDoc) {
+				res.Buckets = append(res.Buckets, histogramBucket(b, spec))
 			}
-			if len(res.Buckets) == MaxBuckets {
-				// Each shard refused more than MaxBuckets; together they can still pass
-				// it: keep the first MaxBuckets, and say so.
-				res.Truncated = true
-				break
-			}
-			out := finishBucket(b, spec)
-			if spec.typ == AggDateHistogram {
-				if k, ok := b.Key.(float64); ok && math.Abs(k) <= maxDateMillis {
-					out.KeyAsString = time.UnixMilli(int64(k)).UTC().Format("2006-01-02T15:04:05.000Z07:00")
-				}
-			}
-			res.Buckets = append(res.Buckets, out)
 		}
 	}
 	return res
 }
 
-// fillHistogram adds the empty buckets between the first and the last (min_doc_count
-// 0, Elasticsearch's default), unless that would pass MaxBuckets.
-func fillHistogram(bs []*BucketPartial, spec *aggSpec) []*BucketPartial {
-	first, ok1 := bs[0].Key.(float64)
-	last, ok2 := bs[len(bs)-1].Key.(float64)
+// histogramBucket finishes one histogram bucket, a date_histogram's with its key as a
+// date.
+func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
+	out := finishBucket(b, spec)
+	if spec.typ == AggDateHistogram {
+		if k, ok := b.Key.(float64); ok && math.Abs(k) <= maxDateMillis {
+			out.KeyAsString = time.UnixMilli(int64(k)).UTC().Format("2006-01-02T15:04:05.000Z07:00")
+		}
+	}
+	return out
+}
+
+// boundBuckets keeps a response's aggregations (specs, finished as results) within
+// MaxBuckets buckets together. Each shard kept its own partial within it, but merged
+// they can pass it: past it, in name order, an aggregation's buckets are cut and it is
+// marked Truncated (a terms aggregation's cut buckets join its sum_other_doc_count).
+// Then each histogram with min_doc_count 0 has its empty buckets filled in, in name
+// order, when they fit in what is left; one whose do not is marked Truncated.
+func boundBuckets(specs []*aggSpec, results []*AggResult) {
+	left := MaxBuckets
+	for _, res := range results {
+		if len(res.Buckets) > left {
+			if res.Type == AggTerms {
+				for _, b := range res.Buckets[left:] {
+					res.SumOtherDocCount += b.DocCount
+				}
+			}
+			res.Buckets, res.Truncated = res.Buckets[:left], true
+		}
+		left -= len(res.Buckets)
+	}
+	for i, spec := range specs {
+		res := results[i]
+		if (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && spec.minDoc <= 0 && !res.Truncated && len(res.Buckets) > 1 {
+			left -= fillHistogram(res, spec, left)
+		}
+	}
+}
+
+// fillHistogram adds res's empty buckets between its first and its last (min_doc_count
+// 0, Elasticsearch's default), when there are at most room of them, and returns how
+// many it added. When there are more, res stays sparse and is marked Truncated. A real
+// bucket's key off the grid (float rounding) leaves res as it is rather than lose that
+// bucket.
+func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
+	first, ok1 := res.Buckets[0].Key.(float64)
+	last, ok2 := res.Buckets[len(res.Buckets)-1].Key.(float64)
 	if !ok1 || !ok2 {
-		return bs
+		return 0
 	}
-	have := make(map[float64]*BucketPartial, len(bs))
-	for _, b := range bs {
-		k, _ := b.Key.(float64)
-		have[k] = b
-	}
+	most := len(res.Buckets) + room
 	var keys []float64
 	if spec.calendar == "" {
 		j0 := math.Round((first - spec.offset) / spec.interval)
 		j1 := math.Round((last - spec.offset) / spec.interval)
-		if j1-j0+1 > MaxBuckets {
-			return bs
+		if j1-j0+1 > float64(most) {
+			res.Truncated = true
+			return 0
 		}
 		for j := j0; j <= j1; j++ {
 			keys = append(keys, j*spec.interval+spec.offset)
@@ -320,25 +350,32 @@ func fillHistogram(bs []*BucketPartial, spec *aggSpec) []*BucketPartial {
 		t := time.UnixMilli(int64(first - spec.offset)).UTC()
 		end := time.UnixMilli(int64(last - spec.offset)).UTC()
 		for !t.After(end) {
-			if len(keys) == MaxBuckets {
-				return bs
+			if len(keys) == most {
+				res.Truncated = true
+				return 0
 			}
 			keys = append(keys, float64(t.UnixMilli())+spec.offset)
 			t = calendarNext(t, spec.calendar)
 		}
 	}
-	out := make([]*BucketPartial, 0, len(keys))
+	have := make(map[float64]*Bucket, len(res.Buckets))
+	for _, b := range res.Buckets {
+		k, _ := b.Key.(float64)
+		have[k] = b
+	}
+	out := make([]*Bucket, 0, len(keys))
 	for _, k := range keys {
 		if b := have[k]; b != nil {
 			out = append(out, b)
 			delete(have, k)
 			continue
 		}
-		out = append(out, &BucketPartial{Key: k})
+		out = append(out, histogramBucket(&BucketPartial{Key: k}, spec))
 	}
 	if len(have) > 0 {
-		// A key off the grid (float rounding): keep every real bucket rather than lose one.
-		return bs
+		return 0
 	}
-	return out
+	added := len(out) - len(res.Buckets)
+	res.Buckets = out
+	return added
 }

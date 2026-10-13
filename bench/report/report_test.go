@@ -93,6 +93,28 @@ func TestEvaluateTargets(t *testing.T) {
 	}
 }
 
+func TestFootprintGradesResidentMemoryOnly(t *testing.T) {
+	r := sampleRun()
+	for i := range r.Results {
+		res := &r.Results[i]
+		if res.Workload != "footprint" {
+			continue
+		}
+		if res.Engine == Searchlight {
+			res.Values["disk_per_million"], res.Values["rss_per_million"] = 2400<<20, 500<<20
+		} else {
+			res.Values["disk_per_million"], res.Values["rss_per_million"] = 1500<<20, 600<<20
+		}
+	}
+	got := byID(Evaluate(r))["T6"]
+	if got.Status != Pass {
+		t.Fatalf("T6 with disk above and RSS below Elasticsearch: %s (%s), want %s", got.Status, got.Detail, Pass)
+	}
+	if !strings.Contains(got.Detail, "disk_per_million: 1.60× Elasticsearch, reported, not graded") {
+		t.Errorf("T6 detail does not report disk as ungraded: %s", got.Detail)
+	}
+}
+
 func TestEvaluateWithoutBaselineOrWithMismatch(t *testing.T) {
 	r := sampleRun()
 	var sl []Result

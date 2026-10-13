@@ -2,6 +2,7 @@ package percolate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -330,5 +331,34 @@ func TestPercolateDefaultQueryIndexFallback(t *testing.T) {
 	}
 	if !slices.Equal(strs(t, got[0]), []string{"q"}) || got[1] != nil {
 		t.Fatalf("got %v", got)
+	}
+}
+
+// A percolation whose documents match more than maxMatches saved queries together is
+// refused with ErrTooManyMatches, never answered with some matches left out.
+func TestPercolateRefusesTooManyMatches(t *testing.T) {
+	defer func(n int) { maxMatches = n }(maxMatches)
+	maxMatches = 25
+	m := newShardModel(t)
+	for i := range 10 {
+		m.putQuery(fmt.Sprintf("q%d", i), `{"field":"brand","op":"eq","value":"acme"}`)
+	}
+	m.refresh()
+	docs := make([]schema.Doc, 3)
+	for i := range docs {
+		d, _, err := schema.Analyze(testMapping(), fmt.Sprintf("d%d", i), []byte(`{"brand":"acme"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs[i] = d
+	}
+	g := m.s.Acquire()
+	defer g.Release()
+	got, err := m.p.Percolate(context.Background(), g, docs[:2])
+	if err != nil || got[0].Len()+got[1].Len() != 20 {
+		t.Fatalf("20 matches: %v, %v", got, err)
+	}
+	if got, err := m.p.Percolate(context.Background(), g, docs); !errors.Is(err, ErrTooManyMatches) || got != nil {
+		t.Fatalf("30 matches: %v, %v; want ErrTooManyMatches", got, err)
 	}
 }

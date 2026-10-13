@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Imposter/go-searchlight/internal/percolate"
 )
 
 var errItemCount = errors.New("api: the coordinator answered a different number of items than ops")
@@ -42,9 +44,12 @@ type bulkResponse struct {
 	TimedOut bool  `json:"timed_out"`
 	// Percolated, with percolate=true, says whether the items carry their
 	// matching saved queries: false when the percolation could not finish after
-	// the writes committed (a deadline, a closed copy).
-	Percolated *bool      `json:"percolated,omitempty"`
-	Items      []bulkItem `json:"items"`
+	// the writes committed (a deadline, a closed copy, too many matches).
+	Percolated *bool `json:"percolated,omitempty"`
+	// PercolateReason is CodeTooManyMatches when Percolated is false because the
+	// documents match more than percolate.MaxMatches saved queries together.
+	PercolateReason string     `json:"percolate_reason,omitempty"`
+	Items           []bulkItem `json:"items"`
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
@@ -84,6 +89,10 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 		return ProblemFor(errItemCount)
 	}
 	out := bulkResponse{Seq: res.Seq, TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
+	if perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches {
+		res.Percolated = false
+		out.PercolateReason = CodeTooManyMatches
+	}
 	if perc {
 		out.Percolated = &res.Percolated
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/search"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden files in testdata")
@@ -144,7 +145,7 @@ func TestTranslateRefusals(t *testing.T) {
 var searchCases = []struct{ name, body string }{
 	{"default", `{}`},
 	{"sorted_paged", `{"query": {"field": "brand", "op": "eq", "value": "Acme"}, "sort": [{"price": "desc"}, "updated_at"], "size": 100, "search_after": [19.99, 1735689600000, "p000000001"], "track_total": true}`},
-	{"sort_by_id", `{"sort": [{"_id": "desc"}, "price"], "size": 5, "track_total": false}`},
+	{"sort_by_id", `{"sort": ["price", {"_id": "desc"}], "size": 5, "track_total": false}`},
 	{"fields_timeout", `{"fields": ["title", "price"], "timeout": "250ms", "track_total": 500, "size": 0}`},
 	{"agg_terms", `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand", "size": 20, "min_doc_count": 2}, "aggs": {"price": {"stats": {"field": "price"}}}}}}`},
 	{"agg_range", `{"size": 0, "aggs": {"prices": {"range": {"field": "price", "ranges": [{"to": 10}, {"from": 10, "to": 100, "key": "mid"}, {"from": 100}]}}}}`},
@@ -175,10 +176,16 @@ func TestTranslateSearchRefusals(t *testing.T) {
 		`{"aggs": {"x": {"terms": {"field": "description"}}}}`, // no doc values
 		`{"aggs": {"x": {"stats": {"field": "nope"}}}}`,
 		`{"size": -1}`,
+		`{"sort": [{"_id": "desc"}, "price"]}`,   // nothing after _id
+		`{"sort": ["price", {"price": "desc"}]}`, // a field twice
 	} {
 		if _, err := tr.Search([]byte(b)); err == nil {
 			t.Errorf("%s was translated; want an error", b)
 		}
+	}
+	keys := `"a"` + strings.Repeat(`, "a"`, search.MaxSortKeys)
+	if _, err := tr.Search([]byte(`{"sort": [` + keys + `]}`)); err == nil || !strings.Contains(err.Error(), "at most 16") {
+		t.Errorf("%d sort keys: %v, want the key bound", search.MaxSortKeys+1, err)
 	}
 }
 

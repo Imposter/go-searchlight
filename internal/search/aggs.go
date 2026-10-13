@@ -588,7 +588,9 @@ type histBucket struct {
 }
 
 // histColl counts documents per histogram bucket: by slot when the segment's values
-// span few enough buckets for a bucketer, else in a map by key.
+// span few enough buckets for a bucketer, else in a map by key. A value bucketKey
+// cannot place (its key overflows, or a calendar cannot date it) refuses the search
+// as too many buckets rather than leave a counted document out of every bucket.
 type histColl struct {
 	s       *segExec
 	spec    *aggSpec
@@ -620,14 +622,13 @@ func (c *histColl) collect(d uint32) {
 	}
 	key, ok := bucketKey(c.spec, v)
 	if !ok {
+		c.refuse()
 		return
 	}
 	b := c.buckets[key]
 	if b == nil {
-		if len(c.buckets) == MaxBuckets {
-			if c.s.err == nil {
-				c.s.fail(checkBuckets(&AggPartial{Buckets: make([]*BucketPartial, MaxBuckets+1)}, c.spec))
-			}
+		if c.s.buckets.Add(1) > MaxBuckets {
+			c.refuse()
 			return
 		}
 		b = &histBucket{subs: c.s.newSubs(c.spec)}
@@ -635,6 +636,13 @@ func (c *histColl) collect(d uint32) {
 	}
 	b.count++
 	collectSubs(b.subs, d)
+}
+
+// refuse fails the segment as too many buckets, once.
+func (c *histColl) refuse() {
+	if c.s.err == nil {
+		c.s.fail(tooManyBuckets(c.spec))
+	}
 }
 
 // countDense counts a dense hit set (no sub-aggregations) from the point index: a walk
@@ -1079,6 +1087,16 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 	}
 }
 
+// responseBuckets is how many of a shard partial's buckets the response can hold: a
+// terms aggregation's at most its size (the rest of its shard_size over-fetch only
+// sharpens the counts across shards), every other aggregation's all of them.
+func responseBuckets(p *AggPartial, spec *aggSpec) int {
+	if spec.typ == AggTerms {
+		return min(len(p.Buckets), spec.size)
+	}
+	return len(p.Buckets)
+}
+
 // AggResult is one aggregation's result.
 type AggResult struct {
 	Type string
@@ -1094,7 +1112,8 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
-	// Truncated is set on a histogram cut at MaxBuckets buckets.
+	// Truncated is set on a bucket aggregation cut, or a histogram left without its
+	// empty buckets, to keep the response within MaxBuckets buckets.
 	Truncated bool
 }
 
@@ -1132,10 +1151,11 @@ func (a *AggResult) MarshalJSON() ([]byte, error) {
 		}{a.Value})
 	case AggTerms:
 		return json.Marshal(struct {
-			Error   int64     `json:"doc_count_error_upper_bound"`
-			Other   int64     `json:"sum_other_doc_count"`
-			Buckets []*Bucket `json:"buckets"`
-		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets)})
+			Error     int64     `json:"doc_count_error_upper_bound"`
+			Other     int64     `json:"sum_other_doc_count"`
+			Buckets   []*Bucket `json:"buckets"`
+			Truncated bool      `json:"truncated,omitempty"`
+		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets), a.Truncated})
 	default:
 		return json.Marshal(struct {
 			Buckets   []*Bucket `json:"buckets"`

@@ -624,12 +624,11 @@ func (c *histColl) collect(d uint32) {
 	}
 	b := c.buckets[key]
 	if b == nil {
-		if len(c.buckets) == MaxBuckets {
-			if c.s.err == nil {
-				c.s.fail(checkBuckets(&AggPartial{Buckets: make([]*BucketPartial, MaxBuckets+1)}, c.spec))
-			}
+		if c.s.buckets == MaxBuckets {
+			c.s.fail(tooManyBuckets(c.spec))
 			return
 		}
+		c.s.buckets++
 		b = &histBucket{subs: c.s.newSubs(c.spec)}
 		c.buckets[key] = b
 	}
@@ -1094,7 +1093,8 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
-	// Truncated is set on a histogram cut at MaxBuckets buckets.
+	// Truncated is set on a bucket aggregation cut to keep the response within
+	// MaxBuckets buckets.
 	Truncated bool
 }
 
@@ -1132,10 +1132,11 @@ func (a *AggResult) MarshalJSON() ([]byte, error) {
 		}{a.Value})
 	case AggTerms:
 		return json.Marshal(struct {
-			Error   int64     `json:"doc_count_error_upper_bound"`
-			Other   int64     `json:"sum_other_doc_count"`
-			Buckets []*Bucket `json:"buckets"`
-		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets)})
+			Error     int64     `json:"doc_count_error_upper_bound"`
+			Other     int64     `json:"sum_other_doc_count"`
+			Buckets   []*Bucket `json:"buckets"`
+			Truncated bool      `json:"truncated,omitempty"`
+		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets), a.Truncated})
 	default:
 		return json.Marshal(struct {
 			Buckets   []*Bucket `json:"buckets"`

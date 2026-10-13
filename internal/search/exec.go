@@ -168,6 +168,9 @@ type segExec struct {
 	lazy *lazyState
 
 	scanned int64
+	// buckets counts the buckets the segment's histograms hold by key, together at
+	// most MaxBuckets.
+	buckets int
 	err     error
 }
 
@@ -469,10 +472,11 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	for spec, parts := range ordParts {
 		finishOrds(ctx, aggs[spec.name], parts, spec, g, p)
 	}
+	buckets := 0
 	for _, spec := range p.aggs {
 		cutShard(aggs[spec.name], spec)
-		if err := checkBuckets(aggs[spec.name], spec); err != nil {
-			return fail(err, "too many buckets")
+		if buckets += len(aggs[spec.name].Buckets); buckets > MaxBuckets {
+			return fail(tooManyBuckets(spec), "too many buckets")
 		}
 	}
 	res.Aggs = aggs
@@ -481,7 +485,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	executed := time.Now()
 	_, fetchSpan := tr.Start(ctx, "search.fetch")
-	hits, err := fetchTops(g, p, tops)
+	hits, err := fetchTops(parent, g, p, tops)
 	fetchSpan.SetAttributes(attribute.Int("hits", len(hits)))
 	fetchSpan.End()
 	if err != nil {
@@ -617,8 +621,9 @@ func (m *topMerge) Pop() any {
 }
 
 // fetchTops merges the segments' tops into the shard's best p.size hits and fetches
-// their bodies.
-func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error) {
+// their bodies. A canceled ctx stops the fetch; a passed deadline does not, so a search
+// that timed out still returns the hits it found.
+func fetchTops(ctx context.Context, g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error) {
 	if p.size == 0 || len(tops) == 0 {
 		return nil, nil
 	}
@@ -648,6 +653,9 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 	const perTask = 2
 	if err := runParallel((len(chosen)+perTask-1)/perTask, func(task int) {
 		for k := task * perTask; k < min(len(chosen), (task+1)*perTask); k++ {
+			if errs[k] = canceled(ctx); errs[k] != nil {
+				return
+			}
 			out[k], errs[k] = fetchHit(g, p, chosen[k])
 		}
 	}); err != nil {
@@ -704,7 +712,9 @@ var ErrStaleHit = errors.New("search: the hit's segment is not in this generatio
 
 // FetchShard fills the bodies of hits found with Request.NoBodies (each with its Ref),
 // from g, the generation the query ran on: the fetch phase of a query-then-fetch.
-// fields limits each body as Request.Fields does.
+// fields limits each body as Request.Fields does. A canceled ctx stops the fetch; a
+// passed deadline does not, so a search that timed out still gets the bodies of the
+// hits it found.
 func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []string) error {
 	_, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.fetch", trace.WithAttributes(attribute.Int("hits", len(hits))))
 	defer span.End()
@@ -714,6 +724,9 @@ func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []s
 	}
 	errs := make([]error, len(hits))
 	if err := runParallel(len(hits), func(k int) {
+		if errs[k] = canceled(ctx); errs[k] != nil {
+			return
+		}
 		h := &hits[k]
 		if h.Ref == nil {
 			errs[k] = fmt.Errorf("%w: hit %q has no ref", ErrStaleHit, h.ID)
@@ -730,6 +743,15 @@ func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []s
 	}
 	if err := errors.Join(errs...); err != nil {
 		span.RecordError(err)
+		return err
+	}
+	return nil
+}
+
+// canceled is ctx's error when ctx was canceled, nil while it is live or only past its
+// deadline.
+func canceled(ctx context.Context) error {
+	if err := ctx.Err(); errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil

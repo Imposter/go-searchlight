@@ -959,12 +959,14 @@ components:
               minimum: 1
         aggs:
           type: object
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep.'
+          maxProperties: 100
+          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep. At most 100 per search, sub-aggregations included; at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
         aggregations:
           type: object
           description: An alias of aggs.
         fields:
           type: array
+          maxItems: 100
           items: { type: string }
           description: Limit each hit's body to these members.
         timeout:
@@ -1003,6 +1005,7 @@ components:
           items: {}
         aggs:
           type: object
+          description: The aggregations by name. A bucket aggregation cut to keep the response within 65536 buckets carries truncated true.
           additionalProperties: true
     SavedQuery:
       type: object

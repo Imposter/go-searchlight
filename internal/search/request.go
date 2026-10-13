@@ -50,9 +50,18 @@ const (
 	// MaxSortKeys is the most sort keys one request takes: each field once, and none
 	// after _id.
 	MaxSortKeys = 16
-	// MaxBuckets bounds the buckets of one response (Elasticsearch's search.max_buckets).
-	// A histogram's empty buckets are filled in only while the total stays under it.
+	// MaxBuckets bounds the buckets of one response, every aggregation's together
+	// (Elasticsearch's search.max_buckets). A shard whose partial passes it refuses the
+	// search; shards that pass it only once merged are cut, in aggregation name order,
+	// each aggregation cut marked truncated. A histogram's empty buckets are filled in
+	// only while the response stays within it.
 	MaxBuckets = 65_536
+	// MaxAggs is the most aggregations one request holds, sub-aggregations included.
+	MaxAggs = 100
+	// MaxRanges is the most ranges one range aggregation holds.
+	MaxRanges = 100
+	// MaxFields is the most names Request.Fields holds.
+	MaxFields = 100
 	// DefaultTermsSize is a terms aggregation's bucket count when Size is 0.
 	DefaultTermsSize = 10
 	// DefaultPrecision is a cardinality aggregation's HyperLogLog++ precision when
@@ -144,8 +153,9 @@ type Agg struct {
 
 	// Size is how many terms buckets to return: DefaultTermsSize when 0.
 	Size int
-	// ShardSize is how many terms buckets each shard returns: Size*3/2+10 when 0.
-	// More is more exact across shards (see Response.Aggs).
+	// ShardSize is how many terms buckets each shard returns: Size*3/2+10 when 0,
+	// at least Size and at most MaxBuckets. More is more exact across shards (see
+	// Response.Aggs).
 	ShardSize int
 	// MinDocCount drops buckets with fewer documents. terms defaults to 1 (and takes
 	// at least 1); histograms default to 0, which fills the empty buckets between the

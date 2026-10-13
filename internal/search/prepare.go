@@ -119,9 +119,16 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	if len(r.SearchAfter) > 0 {
 		p.after = prepareAfter(r.SearchAfter, p.sorts, &ps)
 	}
-	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-		if s := prepareAgg(name, r.Aggs[name], m, "aggs."+name, false, &ps); s != nil {
-			p.aggs = append(p.aggs, s)
+	if len(r.Fields) > MaxFields {
+		ps.add("fields", "fields names at most %d members", MaxFields)
+	}
+	if n := countAggs(r.Aggs); n > MaxAggs {
+		ps.add("aggs", "a search holds at most %d aggregations, sub-aggregations included; this one holds %d", MaxAggs, n)
+	} else {
+		for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
+			if s := prepareAgg(name, r.Aggs[name], m, "aggs."+name, false, &ps); s != nil {
+				p.aggs = append(p.aggs, s)
+			}
 		}
 	}
 	if len(ps) > 0 {
@@ -129,6 +136,15 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	}
 	p.root = compileNode(r.Query, requestID(r))
 	return p, nil
+}
+
+// countAggs counts aggs and their sub-aggregations.
+func countAggs(aggs map[string]Agg) int {
+	n := len(aggs)
+	for _, a := range aggs {
+		n += countAggs(a.Aggs)
+	}
+	return n
 }
 
 // prepareSorts types the sort keys and adds the _id tie-breaker. It refuses more than
@@ -279,7 +295,7 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, sub bool, ps 
 		if s.shardSize <= 0 {
 			s.shardSize = s.size*3/2 + 10
 		}
-		s.shardSize = max(s.shardSize, s.size)
+		s.shardSize = min(max(s.shardSize, s.size), MaxBuckets)
 		s.minDoc = 1
 		if a.MinDocCount != nil {
 			if *a.MinDocCount < 1 {
@@ -293,6 +309,9 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, sub bool, ps 
 		}
 		if len(a.Ranges) == 0 {
 			ps.add(at+".ranges", "a range aggregation needs ranges")
+		}
+		if len(a.Ranges) > MaxRanges {
+			ps.add(at+".ranges", "a range aggregation holds at most %d ranges", MaxRanges)
 		}
 		for _, r := range a.Ranges {
 			rs := rangeSpec{key: r.Key, from: math.Inf(-1), to: math.Inf(1)}
@@ -397,14 +416,11 @@ func requestID(r *Request) uint64 {
 	return uint64(reflect.ValueOf(r).Pointer()) | 1<<63
 }
 
-// checkBuckets refuses a shard's histogram past MaxBuckets, as Elasticsearch refuses
-// a search with too many buckets.
-func checkBuckets(p *AggPartial, spec *aggSpec) error {
-	if (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && len(p.Buckets) > MaxBuckets {
-		return &RequestError{Problems: []query.Problem{{
-			Loc:     "aggs." + spec.name + "." + spec.typ,
-			Message: fmt.Sprintf("more than %d buckets: widen the interval or narrow the query", MaxBuckets),
-		}}}
-	}
-	return nil
+// tooManyBuckets refuses a search whose aggregations pass MaxBuckets buckets together
+// at spec's, as Elasticsearch refuses a search with too many buckets.
+func tooManyBuckets(spec *aggSpec) error {
+	return &RequestError{Problems: []query.Problem{{
+		Loc:     "aggs." + spec.name + "." + spec.typ,
+		Message: fmt.Sprintf("the aggregations hold more than %d buckets: widen the interval, lower a size or narrow the query", MaxBuckets),
+	}}}
 }

@@ -503,3 +503,33 @@ func TestGroupCommitHeldConflictReopens(t *testing.T) {
 		t.Fatalf("B got %+v; its conflict depended on A, which never committed", res[1])
 	}
 }
+
+// TestGroupCommitHeldConflictReopensOnAnEarlierHold: A = [x; y if_seq] and B = [x
+// if_seq] share a batch. B conflicts only because A wrote x before it, so B is held;
+// then A conflicts on y (another node wrote it meanwhile) and is held too. A never
+// commits, so B's conflict is void: B runs again, and commits.
+func TestGroupCommitHeldConflictReopensOnAnEarlierHold(t *testing.T) {
+	f := &fakeApplier{}
+	f.fail = func(batch []Change) error {
+		for i, c := range batch {
+			switch {
+			case c.ID == "B-0" && batch[0].ID == "A-0":
+				return &ConflictError{Positions: []int{i}, Current: []int64{7}}
+			case c.ID == "A-1" && len(batch) == 2:
+				return &ConflictError{Positions: []int{i}, Current: []int64{8}}
+			}
+		}
+		return nil
+	}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 3, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	res := gather(t, g, collected, nil, [][]Change{changes("A", 2), changes("B", 1)})
+	var ce *ConflictError
+	if !errors.As(res[0].err, &ce) || ce.Current[0] != 8 {
+		t.Fatalf("A got %+v, want its own conflict on y", res[0])
+	}
+	if res[1].err != nil || res[1].first != 1 {
+		t.Fatalf("B got %+v; its conflict depended on A, which never committed", res[1])
+	}
+}

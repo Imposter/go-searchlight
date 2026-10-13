@@ -85,8 +85,10 @@ automatic (spec §9, operations.md's [configuration table](operations.md#every-s
   `deploy/compose.yml`'s `SEARCHLIGHT_ADVERTISE_ADDRESS` and
   [Internal peer traffic](nginx.md#internal-peer-traffic)).
 - **`cluster_token`** authenticates the internal peer API (`/_internal/` on the public
-  listener). Without it, a cluster of more than one node cannot form: peer calls (reads,
-  push hints, recovery snapshots) are refused.
+  listener). A node on Postgres or MySQL refuses to start without it, unless
+  `insecure_no_auth` is set; every node needs the same one. A peer that refuses a node's
+  token (401) counts as a failed copy for that node: reads go to another copy, and
+  recovery falls back to a bundle or the database.
 
 On start, a node inserts or updates its row in `sl_nodes` and heartbeats every 2 s.
 Peers are discovered by reading that same table — there is no separate discovery

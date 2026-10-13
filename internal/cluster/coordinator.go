@@ -298,10 +298,12 @@ type Node struct {
 	scheme string
 	// clearWarned are the peers warned about getting the cluster token in the clear.
 	clearWarned sync.Map
-	ars         *ars
-	view        atomic.Pointer[view]
-	missMu      sync.Mutex
-	missReadAt  time.Time
+	// refusedWarned are the peers warned about refusing this node's cluster token.
+	refusedWarned sync.Map
+	ars           *ars
+	view          atomic.Pointer[view]
+	missMu        sync.Mutex
+	missReadAt    time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex

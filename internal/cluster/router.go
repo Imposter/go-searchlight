@@ -104,8 +104,9 @@ func (n *Node) candidates(id store.ShardID) []candidate {
 	return out
 }
 
-// peerError is a transport failure reaching a peer: the peer is gone, or did not
-// answer in time.
+// peerError is a transport failure reaching a peer: the peer is gone, did not answer
+// in time, or refused this node's cluster token (401, 403). Either way none of its
+// copies can serve this node.
 type peerError struct {
 	node string
 	err  error
@@ -191,6 +192,14 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 	defer resp.Body.Close()
 	n.inst.peer(ctx, path, peer, resp.StatusCode, n.clock.Since(start))
 	service, queue = reported(resp.Header)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		err := decodeError(resp)
+		if _, warned := n.refusedWarned.LoadOrStore(peer, true); !warned {
+			n.log.WarnContext(ctx, "a peer refused this node's cluster token: its copies are skipped; every node needs the same cluster_token",
+				slog.String("peer", peer), slog.Any("error", err))
+		}
+		return service, queue, &peerError{node: peer, err: err}
+	}
 	if resp.StatusCode >= 400 {
 		return service, queue, decodeError(resp)
 	}

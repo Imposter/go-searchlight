@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -361,5 +362,32 @@ func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
 		if cp.State != store.CopyRetiring {
 			t.Errorf("a stopped node's copy is %+v, want retiring", cp)
 		}
+	}
+}
+
+// TestPeerRefusingTheTokenIsACopyFailure: a peer that refuses this node's cluster token
+// (401) cannot serve it, as one that is unreachable cannot: the call is a transport
+// failure, retried on another copy, and a write's refresh=true skips that copy rather
+// than failing on it.
+func TestPeerRefusingTheTokenIsACopyFailure(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.Config.ClusterToken = "another-token"
+		}
+	})
+	a := c.start(0)
+	b := c.start(1)
+	createIndex(t, a.n, "tk", 1, 0)
+	waitCopies(t, a.st, "tk", 1, 2, time.Minute)
+
+	msg := waitMsg{shardRef: shardRef{Index: "tk"}, Seq: 1}
+	err := a.n.call(tctx(t), b.cfg.NodeID, b.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
+	var pe *peerError
+	if !errors.As(err, &pe) || !retryable(err) {
+		t.Fatalf("a peer refusing the token: %v, want a retryable transport failure", err)
+	}
+	res, err := a.n.Write(tctx(t), "tk", []api.WriteOp{upsertOp("x", 1)}, api.WriteOptions{Refresh: api.RefreshTrue})
+	if err != nil || res.TimedOut {
+		t.Fatalf("a refresh=true write with a peer refusing the token: %+v, %v", res, err)
 	}
 }

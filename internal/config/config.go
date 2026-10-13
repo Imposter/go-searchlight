@@ -692,6 +692,9 @@ func (c *Config) validate() []error {
 	case !c.InsecureNoAuth:
 		errs = append(errs, errors.New("tokens_file: is required; set insecure_no_auth=true to serve the API without auth"))
 	}
+	if c.ClusterToken == "" && !c.InsecureNoAuth && sharedStore(c.StoreURL) {
+		errs = append(errs, errors.New("cluster_token: is required on a Postgres or MySQL store, which nodes share: without it the peer API is closed; set insecure_no_auth=true to run without auth"))
+	}
 	if c.MaxBodyBytes < 1<<10 || c.MaxBodyBytes > MaxBodyLimit {
 		errs = append(errs, fmt.Errorf("max_body_bytes: want 1KiB to %d bytes, got %d", MaxBodyLimit, c.MaxBodyBytes))
 	}
@@ -732,6 +735,20 @@ func validStoreURL(raw string) error {
 		return fmt.Errorf("scheme must be one of %s, got %q", strings.Join(StoreSchemes, ", "), u.Scheme)
 	}
 	return nil
+}
+
+// sharedStore reports whether raw names a store several nodes can share (Postgres or
+// MySQL), as opposed to SQLite, which serves one node.
+func sharedStore(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql", "mysql":
+		return true
+	}
+	return false
 }
 
 // deriveAdvertise turns the listen address into one peers can dial.

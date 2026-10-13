@@ -6,9 +6,10 @@
 #   make docker
 #   docker build -f deploy/Dockerfile --build-arg VERSION=$(git describe --tags --always) -t searchlight:dev .
 #
-# Only store_url is required (SEARCHLIGHT_STORE_URL, or SEARCHLIGHT_STORE_URL_FILE for a
-# mounted secret), with tokens_file; data_dir is /var/lib/searchlight, a volume. Every
-# other setting is a SEARCHLIGHT_* variable or a --flag: see docs/operations.md.
+# store_url is required (SEARCHLIGHT_STORE_URL, or SEARCHLIGHT_STORE_URL_FILE for a
+# mounted secret), with tokens_file and, on Postgres or MySQL, cluster_token; data_dir is
+# /var/lib/searchlight, a volume. Every other setting is a SEARCHLIGHT_* variable or a
+# --flag: see docs/operations.md.
 #
 # The admin listener is :8781 here (loopback outside a container), so probes and
 # Prometheus reach it; keep that port private. The HEALTHCHECK runs the binary's own

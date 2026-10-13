@@ -360,7 +360,7 @@ The logical schema is the same in every dialect.
 
 ## 12. Configuration
 
-Only `store_url` is required. Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
+`store_url` is required, and so are `tokens_file` and, on Postgres or MySQL, `cluster_token`, unless `insecure_no_auth` is set (a laptop or a test: the API and the peer API then serve without auth). Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
 
 | Setting | Default and meaning |
 |---|---|
@@ -368,8 +368,8 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `admin_listen` | metrics and pprof |
 | `advertise_address` | the address peers use to reach this node |
 | `data_dir` | local segments |
-| `tokens_file` | API tokens |
-| `cluster_token` | auth for the internal peer API |
+| `tokens_file` | API tokens (required unless `insecure_no_auth`) |
+| `cluster_token` | auth for the internal peer API (required on Postgres and MySQL unless `insecure_no_auth`; a peer that refuses it counts as a failed copy) |
 | `peer_ca_file` | CAs that sign peers' TLS certificates (system roots by default) |
 | `lease_ttl` | 30 s on SQLite (a single node), 10 s elsewhere |
 | `prune_stall_timeout`, `retiring_retention`, `changelog_retention` | 15 min, 15 min, 24 h: the changelog's prune bounds |

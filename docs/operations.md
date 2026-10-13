@@ -167,9 +167,9 @@ kubectl apply -f deploy/k8s/
 
 ## Configuration
 
-`store_url` is required, and so is `tokens_file` unless `insecure_no_auth` is set. Every
-setting has one snake_case name, which is both the flag `--<name>` and the environment
-variable `SEARCHLIGHT_<NAME>`.
+`store_url` is required; so is `tokens_file`, and on Postgres or MySQL `cluster_token`,
+unless `insecure_no_auth` is set. Every setting has one snake_case name, which is both
+the flag `--<name>` and the environment variable `SEARCHLIGHT_<NAME>`.
 
 - **Precedence.** A flag wins over the environment, which wins over the default.
 - **Secrets from files.** `store_url` and `cluster_token` can also come from
@@ -216,7 +216,7 @@ unless `insecure_no_auth` is set.
 | `data_dir` | `data` | local segments, and recovery staging |
 | `tokens_file` | (none) | the API bearer tokens; required unless `insecure_no_auth` |
 | `insecure_no_auth` | `false` | serve the API unauthenticated when `tokens_file` is empty (logged as a warning; never on a reachable node) |
-| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required for a cluster: without it the peer API is closed |
+| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required on Postgres and MySQL (refused at start without it unless `insecure_no_auth` is set): without it the peer API is closed. A peer that refuses this node's token counts as a failed copy, and is skipped |
 | `peer_ca_file` | system roots | PEM CAs that sign peers' TLS certificates (the peer API runs over TLS when `tls_cert` is set) |
 | `tls_cert`, `tls_key` | (none) | serve the API, and the peer API, over TLS; set together. Without them, put a TLS-terminating proxy in front |
 | `lease_ttl` | `0`: 30 s on SQLite, 10 s elsewhere | how long a shard copy's lease lasts unrenewed (renewed every 2 s); at least 3 s |

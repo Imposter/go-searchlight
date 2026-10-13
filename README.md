@@ -71,7 +71,8 @@ make parity      # regenerate testdata/parity/*.json from scrape-bot (see below)
 
 ## Running
 
-`store_url` is required, and so is `tokens_file` unless `insecure_no_auth` is set:
+`store_url` is required; so is `tokens_file`, and on Postgres or MySQL `cluster_token`, unless
+`insecure_no_auth` is set:
 
 ```sh
 printf '%s write\n' "$(openssl rand -hex 24)" > tokens

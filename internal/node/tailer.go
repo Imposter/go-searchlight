@@ -59,6 +59,9 @@ type TailerEnv struct {
 	// Fetcher, when set, brings the copy's files from a serving peer when it must be
 	// rebuilt, before the store's snapshot is tried.
 	Fetcher replica.Fetcher
+	// Rewound is called when the copy finds the changelog rewound under it (a
+	// failover that lost commits), with the changelog's head as the tailer read it.
+	Rewound func(head int64)
 }
 
 // NewTailerFunc makes the tailer of one shard copy: the node's one seam for its

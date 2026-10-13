@@ -101,7 +101,7 @@ func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {
 	next := &copyState{
 		id:      c.id,
 		slot:    c.slot,
-		tailer:  n.opts.NewTailer(n.st, sh, c.id, TailerEnv{Head: n.head.Load, Fetcher: c.spec.Fetcher, Copy: &copyCopy}),
+		tailer:  n.opts.NewTailer(n.st, sh, c.id, TailerEnv{Head: n.head.Load, Fetcher: c.spec.Fetcher, Copy: &copyCopy, Rewound: n.lowerHead}),
 		startup: c.startup,
 		spec:    c.spec,
 		copy:    &copyCopy,

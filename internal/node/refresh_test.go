@@ -2,9 +2,13 @@ package node_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,5 +84,75 @@ func TestRefreshDisabledReadsRefreshOnDemand(t *testing.T) {
 	var ae *api.Error
 	if !errors.As(err, &ae) || ae.Status != http.StatusGatewayTimeout {
 		t.Fatalf("percolate past its deadline: %v, want a 504 problem", err)
+	}
+}
+
+// TestRewindLowersTheNodesHead: once a copy finds the changelog rewound (a failover
+// that lost commits), the node forgets the head it knew: a wait_for_seq past the new
+// head is a 400 at once again, not a wait to the deadline for a seq the database will
+// reissue.
+func TestRewindLowersTheNodesHead(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	n := open(t, cfg, st, nil)
+	if _, err := n.CreateIndex(ctx(t), "r", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	waitServing(t, n)
+	kept := mustWrite(t, n, "r", upsert("kept", `{"x": 1}`))
+	lost := mustWrite(t, n, "r", upsert("l1", `{"x": 2}`), upsert("l2", `{"x": 3}`), upsert("l3", `{"x": 4}`))
+	if got := count(t, n, "r", &query.All{}, lost.Seq); got != 4 {
+		t.Fatalf("count = %d", got)
+	}
+	rewindSQLite(t, cfg.StoreURL, kept.Seq)
+	fresh := mustWrite(t, n, "r", upsert("n1", `{"x": 5}`))
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		c, cancel := context.WithTimeout(context.Background(), time.Second)
+		res, err := n.Search(c, "r", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: fresh.Seq})
+		cancel()
+		if err == nil && res.Total == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the copy never rebuilt: %+v, %v", res, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := n.Search(c, "r", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitForSeq: lost.Seq})
+	var ae *api.Error
+	if !errors.As(err, &ae) || ae.Status != http.StatusBadRequest {
+		t.Fatalf("wait_for_seq %d past the rewound head %d: %v, want a 400", lost.Seq, fresh.Seq, err)
+	}
+}
+
+// rewindSQLite loses every commit after seq k from the SQLite store at storeURL, as a
+// failover that lost them would.
+func rewindSQLite(t *testing.T, storeURL string, k int64) {
+	t.Helper()
+	u, err := url.Parse(storeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := strings.TrimPrefix(u.Path, "/")
+	if _, err := os.Stat(path); err != nil {
+		path = u.Path
+	}
+	raw, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	for _, q := range []string{
+		"DELETE FROM sl_changes WHERE seq > ?",
+		"DELETE FROM sl_documents WHERE seq > ?",
+		"DELETE FROM sl_queries WHERE seq > ?",
+		"UPDATE sl_counter SET value = ? WHERE id = 1",
+	} {
+		if _, err := raw.ExecContext(context.Background(), q, k); err != nil {
+			t.Fatalf("rewind %q: %v", q, err)
+		}
 	}
 }

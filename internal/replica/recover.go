@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -219,7 +220,8 @@ func (t *Tailer) useFetcher(reason string) bool {
 // generation of the old copy keep it until they release it; the old copy's files are
 // removed once they have (or by the next OpenCopy). A failure, or a crash, leaves the
 // old copy current and serving, and the half-built directory is removed (now, or by
-// the next OpenCopy).
+// the next OpenCopy). Once CURRENT is renamed the swap stands, even when the
+// fsync of the root after it fails: the old copy is then left for the next OpenCopy.
 func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
@@ -305,13 +307,23 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			return err
 		}
 	}
-	if err := makeCurrent(root, dir); err != nil {
+	syncDir := segment.SyncDir
+	if t.opts.hooks != nil && t.opts.hooks.syncRoot != nil {
+		syncDir = t.opts.hooks.syncRoot
+	}
+	renamed, err := makeCurrent(root, dir, syncDir)
+	if !renamed {
 		return fmt.Errorf("replica: making %s current: %w", dir, err)
 	}
 	swapped = true
 	t.swap(sh)
 	old.Abandon()
-	removeCopy(root, old.Dir())
+	if err != nil {
+		t.log.WarnContext(ctx, "syncing the copy's root after the swap failed; the replaced copy stays until the next open, in case a crash undoes the swap",
+			slog.String("dir", dir), slog.Any("error", err))
+	} else {
+		removeCopy(root, old.Dir())
+	}
 	t.lastSource, t.recoveredAt, t.minMappingVersion = source, asOf, 0
 	t.log.InfoContext(ctx, "shard copy rebuilt aside and swapped in", slog.String("reason", reason), slog.String("source", source),
 		slog.Int64("seq", sh.AppliedSeq()), slog.Float64("duration_ms", float64(t.opts.Clock.Since(start).Microseconds())/1000))

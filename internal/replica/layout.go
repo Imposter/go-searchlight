@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
-	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
@@ -100,23 +99,24 @@ func newCopyDir(root string, now time.Time) string {
 }
 
 // makeCurrent makes dir root's current copy: a temp file renamed over CURRENT, then the
-// root synced, so the swap is durable once it returns.
-func makeCurrent(root, dir string) error {
+// root synced (by syncDir), so the swap is durable once it returns. renamed reports
+// that CURRENT names dir, whether or not the sync that follows failed.
+func makeCurrent(root, dir string, syncDir func(string) error) (renamed bool, err error) {
 	tmp := filepath.Join(root, currentFile+".tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, werr := f.WriteString(filepath.Base(dir) + "\n")
 	serr := f.Sync()
 	cerr := f.Close()
 	if err := errors.Join(werr, serr, cerr); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(tmp, filepath.Join(root, currentFile)); err != nil {
-		return err
+		return false, err
 	}
-	return segment.SyncDir(root)
+	return true, syncDir(root)
 }
 
 // collectCopies removes what root holds besides its current copy, dir: other copy

@@ -167,6 +167,9 @@ type testHooks struct {
 	// beforeApply runs before every Apply or Load of a batch into sh; an error is taken
 	// as the shard's answer instead (shard.ErrBackpressure: a full buffer).
 	beforeApply func(sh *shard.Shard) error
+	// syncRoot replaces the fsync of a copy's root once an aside rebuild has renamed
+	// CURRENT.
+	syncRoot func(root string) error
 }
 
 func (o *Options) resolve() {

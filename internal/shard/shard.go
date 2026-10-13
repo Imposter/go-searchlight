@@ -436,7 +436,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		shutdownDone: make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
-	s.inst.observeResident(opts.Meter, s)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
 	mp, err := man.mappingState(dir, m)
@@ -498,6 +497,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.cur.Store(g)
 	s.recordGeneration(ctx, g)
+	s.inst.observeResident(opts.Meter, s)
 
 	s.bg, s.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	s.jan.start()

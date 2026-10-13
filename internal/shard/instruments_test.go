@@ -6,10 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/embedded"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -133,5 +137,59 @@ func TestRateLimitedWarn(t *testing.T) {
 	clk.Advance(time.Nanosecond)
 	if n, ok := w.allow(); !ok || n != 5 {
 		t.Fatalf("after the interval: allow() = %d, %v; want 5, true", n, ok)
+	}
+}
+
+// countingMeter counts the metric callbacks registered and not yet unregistered.
+type countingMeter struct {
+	metricnoop.Meter
+	live atomic.Int32
+}
+
+func (m *countingMeter) RegisterCallback(metric.Callback, ...metric.Observable) (metric.Registration, error) {
+	m.live.Add(1)
+	return countedRegistration{m: m}, nil
+}
+
+type countedRegistration struct {
+	embedded.Registration
+	m *countingMeter
+}
+
+func (r countedRegistration) Unregister() error {
+	r.m.live.Add(-1)
+	return nil
+}
+
+// TestFailedOpenUnregistersItsMetrics: a shard whose files do not open leaves no
+// metric callback behind (one pinning the half-opened shard per attempt).
+func TestFailedOpenUnregistersItsMetrics(t *testing.T) {
+	h := newHarness(t, testOptions())
+	h.upsert("a", "b")
+	h.commit()
+	if err := h.s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h.s = nil
+	entries, err := os.ReadDir(h.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() && e.Name() != manifestName {
+			if err := os.Truncate(filepath.Join(h.dir, e.Name()), 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	m := &countingMeter{}
+	opts := testOptions()
+	opts.Meter = m
+	if s, err := Open(context.Background(), h.dir, testMapping, opts); err == nil {
+		s.shutdown()
+		t.Fatal("a shard with damaged segments opened")
+	}
+	if n := m.live.Load(); n != 0 {
+		t.Fatalf("%d metric callbacks left registered by a failed open", n)
 	}
 }

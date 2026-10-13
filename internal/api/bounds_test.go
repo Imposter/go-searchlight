@@ -5,8 +5,10 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 )
 
@@ -45,12 +47,13 @@ func TestSearchBounds(t *testing.T) {
 // One percolation answers at most percolate.MaxMatches matches, every document's
 // together, whether one copy or the merge of several passes it: _percolate past it is
 // a 422 too_many_matches, never a truncated answer; _bulk?percolate=true keeps its
-// writes and says percolated false, with the reason.
+// writes and says percolated false, with the reason. A million matches take a while
+// under -race, so requests get two minutes.
 func TestPercolateMatchesAreBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("percolates a million matches")
 	}
-	e := newEnv(t, envOpts{})
+	e := newEnv(t, envOpts{cfg: func(c *config.Config) { c.RequestTimeout = 2 * time.Minute }})
 	queries := percolate.MaxMatches/api.MaxPercolateDocs + 1
 	docs := make([]string, api.MaxPercolateDocs)
 	for i := range docs {

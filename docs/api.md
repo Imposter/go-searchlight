@@ -302,7 +302,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
   pass `wait_for_seq` to see a recent write.
-- **Limits.** Up to 10,000 of each per request.
+- **Limits.** Up to 10,000 documents per request, given and stored together. More is
+  a 413.
 - **Server time.** `took_ms` and `took_us` are the server's time for the request, from
   its admission to the last byte of its answer encoded, in whole milliseconds and
   microseconds. The `Server-Timing` header carries the same time

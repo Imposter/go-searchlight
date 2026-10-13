@@ -593,7 +593,7 @@ paths:
       tags: [percolate]
       operationId: percolate
       summary: The saved queries each document matches.
-      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order.
+      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it).
       parameters:
         - $ref: "#/components/parameters/WaitForSeq"
       requestBody:
@@ -607,10 +607,12 @@ paths:
                 docs:
                   type: array
                   maxItems: 10000
+                  description: At most 10000 together with ids.
                   items: { $ref: "#/components/schemas/DocumentBody" }
                 ids:
                   type: array
                   maxItems: 10000
+                  description: At most 10000 together with docs.
                   items: { type: string }
       responses:
         "200":

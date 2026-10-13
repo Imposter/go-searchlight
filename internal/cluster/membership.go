@@ -390,9 +390,7 @@ func (n *Node) resumeIfPaused(ctx context.Context, l *lease) {
 }
 
 // loseCopy unhosts a copy whose lease is lost for sure; the directory is kept, so a
-// later claim resumes it. The lease stops counting as held at once, and the copy is
-// closed in the background: its final flush and report do not hold up the caller (a
-// routing miss under a client's read).
+// later claim resumes it.
 func (n *Node) loseCopy(ctx context.Context, l *lease) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -402,11 +400,25 @@ func (n *Node) loseCopy(ctx context.Context, l *lease) {
 	l.lost = true
 	l.gone.Store(true)
 	n.dropLease(l)
-	n.background(func(bctx context.Context) {
-		if err := n.unhostCopy(context.WithoutCancel(bctx), l.copy, false); err != nil {
-			n.log.WarnContext(bctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+	if err := n.unhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
+		n.log.WarnContext(ctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+	}
+}
+
+// loseTakenOver drops the copies v shows another holder of. Each lease stops counting
+// as held at once, so no read routed by v falls back to its copy, and the copy is lost
+// in the background: v may come from a routing miss's registry read under a client's
+// read, which a copy's final flush and report must not hold up.
+func (n *Node) loseTakenOver(ctx context.Context, v *view) {
+	for _, l := range n.leaseList() {
+		if !v.takenOver(l) {
+			continue
 		}
-	})
+		n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
+		n.inst.lease(ctx, "lost")
+		l.gone.Store(true)
+		n.background(func(bctx context.Context) { n.loseCopy(bctx, l) })
+	}
 }
 
 // unhostCopy unhosts a copy and forgets what the node cached of its files.
@@ -526,15 +538,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	for i := range copies {
 		v.copies[copies[i].Shard] = append(v.copies[copies[i].Shard], copies[i])
 	}
-	// A copy the registry shows another holder of is dropped before the view is
-	// published: no read routed by this view can fall back to it.
-	for _, l := range n.leaseList() {
-		if v.takenOver(l) {
-			n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
-			n.inst.lease(ctx, "lost")
-			n.loseCopy(ctx, l)
-		}
-	}
+	n.loseTakenOver(ctx, v)
 	for {
 		cur := n.view.Load()
 		if cur != nil && cur.readBegan > v.readBegan {

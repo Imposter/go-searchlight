@@ -431,8 +431,14 @@ func TestLosingACopyDoesNotWaitForItsClose(t *testing.T) {
 	hang := func(ctx context.Context) { <-ctx.Done() }
 	a.wrap.onReport.Store(&hang)
 	l := a.n.leaseList()[0]
+	v := &view{at: a.n.clock.Now(), readBegan: a.n.lc.Now() + 1, copies: map[store.ShardID][]store.Copy{
+		l.copy.Shard: {{Shard: l.copy.Shard, Slot: l.copy.Slot, NodeID: "node-9", Epoch: l.copy.Epoch + 1}},
+	}}
+	if !v.takenOver(l) {
+		t.Fatal("the view does not show the copy taken over")
+	}
 	start := time.Now()
-	a.n.loseCopy(tctx(t), l)
+	a.n.loseTakenOver(tctx(t), v)
 	if took := time.Since(start); took > time.Second {
 		t.Fatalf("losing a copy took %s: it waited for the copy's close", took)
 	}

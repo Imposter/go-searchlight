@@ -480,16 +480,28 @@ func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	return body, nil
 }
 
+// sort translates sort keys, refusing what Searchlight refuses: more than
+// search.MaxSortKeys keys, a field sorted on twice, and any key after _id. The id
+// tie-breaker is added unless the last key is _id.
 func (t *Translator) sort(fields []search.SortField) ([]any, error) {
+	if len(fields) > search.MaxSortKeys {
+		return nil, fmt.Errorf("es: a search sorts by at most %d keys", search.MaxSortKeys)
+	}
 	out := make([]any, 0, len(fields)+1)
-	for _, s := range fields {
+	for i, s := range fields {
+		if i > 0 && fields[i-1].Field == search.IDField {
+			return nil, fmt.Errorf("es: sort key %d follows _id: nothing sorts after it", i)
+		}
+		if slices.ContainsFunc(fields[:i], func(f search.SortField) bool { return f.Field == s.Field }) {
+			return nil, fmt.Errorf("es: sort key %d sorts on %q again", i, s.Field)
+		}
 		order := "asc"
 		if s.Desc {
 			order = "desc"
 		}
 		if s.Field == search.IDField {
 			out = append(out, map[string]any{IDField: map[string]any{"order": order}})
-			return out, nil // the id is total: Searchlight's sort ends there too
+			continue
 		}
 		f, ok := t.fields[s.Field]
 		if !ok {
@@ -499,6 +511,9 @@ func (t *Translator) sort(fields []search.SortField) ([]any, error) {
 			return nil, fmt.Errorf("es: sort on %s needs doc values in the Elasticsearch mapping", s.Field)
 		}
 		out = append(out, map[string]any{s.Field: map[string]any{"order": order, "missing": "_last"}})
+	}
+	if len(fields) > 0 && fields[len(fields)-1].Field == search.IDField {
+		return out, nil
 	}
 	return append(out, map[string]any{IDField: map[string]any{"order": "asc"}}), nil
 }

@@ -429,7 +429,8 @@ func (n *Node) unhostCopy(ctx context.Context, cp store.Copy, wipe bool) error {
 
 // leaseWatchdog pauses every copy whose lease lapses by the local clocks, at once (its
 // peers already stopped reading it: lease.valid), and drops the copies the registry
-// shows another holder of.
+// shows another holder of. A lease already lost (gone, its copy closing in the
+// background) is left alone.
 func (n *Node) leaseWatchdog(ctx context.Context) {
 	period := min(50*time.Millisecond, max(time.Millisecond, n.opts.LeaseMargin/2))
 	t := n.clock.NewTicker(period)
@@ -442,6 +443,9 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 		}
 		v := n.view.Load()
 		for _, l := range n.leaseList() {
+			if l.gone.Load() {
+				continue
+			}
 			if v.takenOver(l) {
 				n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
 				n.inst.lease(ctx, "lost")

@@ -544,3 +544,18 @@ func TestRegistryReadAfterStopForgetsNoPeerTwice(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestWatchdogLeavesAGoneLeaseAlone: a lease marked gone (lost, its copy closing in the
+// background) is not the lease watchdog's: it pauses nothing and counts no second loss.
+func TestWatchdogLeavesAGoneLeaseAlone(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "gl", 1, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	l := a.n.leaseList()[0]
+	l.gone.Store(true)
+	time.Sleep(10 * a.n.opts.LeaseMargin)
+	if a.n.Paused(l.copy.Shard) {
+		t.Fatal("the watchdog paused a copy whose lease is gone")
+	}
+}

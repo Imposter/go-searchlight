@@ -1106,8 +1106,8 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
-	// Truncated is set on a bucket aggregation cut to keep the response within
-	// MaxBuckets buckets.
+	// Truncated is set on a bucket aggregation cut, or a histogram left without its
+	// empty buckets, to keep the response within MaxBuckets buckets.
 	Truncated bool
 }
 

@@ -301,7 +301,7 @@ func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
 // they can pass it: past it, in name order, an aggregation's buckets are cut and it is
 // marked Truncated (a terms aggregation's cut buckets join its sum_other_doc_count).
 // Then each histogram with min_doc_count 0 has its empty buckets filled in, in name
-// order, when they fit in what is left.
+// order, when they fit in what is left; one whose do not is marked Truncated.
 func boundBuckets(specs []*aggSpec, results []*AggResult) {
 	left := MaxBuckets
 	for _, res := range results {
@@ -325,8 +325,9 @@ func boundBuckets(specs []*aggSpec, results []*AggResult) {
 
 // fillHistogram adds res's empty buckets between its first and its last (min_doc_count
 // 0, Elasticsearch's default), when there are at most room of them, and returns how
-// many it added. A real bucket's key off the grid (float rounding) leaves res as it is
-// rather than lose that bucket.
+// many it added. When there are more, res stays sparse and is marked Truncated. A real
+// bucket's key off the grid (float rounding) leaves res as it is rather than lose that
+// bucket.
 func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 	first, ok1 := res.Buckets[0].Key.(float64)
 	last, ok2 := res.Buckets[len(res.Buckets)-1].Key.(float64)
@@ -339,6 +340,7 @@ func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 		j0 := math.Round((first - spec.offset) / spec.interval)
 		j1 := math.Round((last - spec.offset) / spec.interval)
 		if j1-j0+1 > float64(most) {
+			res.Truncated = true
 			return 0
 		}
 		for j := j0; j <= j1; j++ {
@@ -349,6 +351,7 @@ func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 		end := time.UnixMilli(int64(last - spec.offset)).UTC()
 		for !t.After(end) {
 			if len(keys) == most {
+				res.Truncated = true
 				return 0
 			}
 			keys = append(keys, float64(t.UnixMilli())+spec.offset)

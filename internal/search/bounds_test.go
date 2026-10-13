@@ -127,7 +127,8 @@ func bucketsOf(resp *Response) (buckets int, truncated []string) {
 // MaxBuckets bounds the buckets of the whole response, every aggregation together: a
 // shard whose partial passes it refuses the search; merged shards past it are cut in
 // aggregation name order, each cut aggregation marked truncated; and a histogram's
-// empty buckets are filled in only while the response stays within it.
+// empty buckets are filled in only while the response stays within it, one left
+// unfilled marked truncated too.
 func TestBucketsBoundTheWholeResponse(t *testing.T) {
 	t.Run("shard", func(t *testing.T) {
 		c := newCluster(t, 1)
@@ -183,8 +184,8 @@ func TestBucketsBoundTheWholeResponse(t *testing.T) {
 			t.Fatal(err)
 		}
 		buckets, truncated := bucketsOf(resp)
-		if buckets > MaxBuckets || len(truncated) > 0 {
-			t.Fatalf("%d histograms: %d buckets, truncated %v; want at most %d, none truncated", MaxAggs, buckets, truncated, MaxBuckets)
+		if buckets > MaxBuckets || len(truncated) != MaxAggs {
+			t.Fatalf("%d histograms: %d buckets, %d truncated; want at most %d, every one unfilled and truncated", MaxAggs, buckets, len(truncated), MaxBuckets)
 		}
 		for name, a := range resp.Aggs {
 			var docs int64

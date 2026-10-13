@@ -1016,7 +1016,7 @@ components:
           items: {}
         aggs:
           type: object
-          description: The aggregations by name. A bucket aggregation cut to keep the response within 65536 buckets carries truncated true.
+          description: The aggregations by name. A bucket aggregation cut, or a histogram left without its empty buckets, to keep the response within 65536 buckets carries truncated true.
           additionalProperties: true
     SavedQuery:
       type: object

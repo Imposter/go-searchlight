@@ -54,7 +54,7 @@ const (
 	// (Elasticsearch's search.max_buckets). A shard whose partial passes it refuses the
 	// search (a terms aggregation counting its size, not its shard_size over-fetch); shards that pass it only once merged are cut, in aggregation name order,
 	// each aggregation cut marked truncated. A histogram's empty buckets are filled in
-	// only while the response stays within it.
+	// only while the response stays within it; one left unfilled is marked truncated.
 	MaxBuckets = 65_536
 	// MaxAggs is the most aggregations one request holds, sub-aggregations included.
 	MaxAggs = 100

@@ -446,8 +446,8 @@ func TestHistogramBucketLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h := resp.Aggs["h"]; len(h.Buckets) != 3 || h.Truncated {
-		t.Fatalf("filling past MaxBuckets: %d buckets, truncated %v", len(h.Buckets), h.Truncated)
+	if h := resp.Aggs["h"]; len(h.Buckets) != 3 || !h.Truncated {
+		t.Fatalf("filling past MaxBuckets: %d buckets, truncated %v; want 3 unfilled, truncated", len(h.Buckets), h.Truncated)
 	}
 	for i := range MaxBuckets + 1 {
 		c.upsert(fmt.Sprintf("e%d", i), fmt.Sprintf(`{"price":%d}`, i))

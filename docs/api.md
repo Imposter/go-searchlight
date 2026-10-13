@@ -245,6 +245,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     aggregation counts the documents of its cut buckets in `sum_other_doc_count`.
   - A histogram's empty buckets (`min_doc_count` 0) are filled in only while the
     response stays within 65,536 buckets.
+  - A value a histogram cannot place in a bucket (its bucket's key overflows a
+    float64, or a calendar interval cannot date it) refuses the search as too many
+    buckets, rather than drop a counted document from every bucket.
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
   Past it, the answer holds what was found, with `timed_out: true`.

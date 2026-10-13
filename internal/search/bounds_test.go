@@ -216,3 +216,14 @@ func TestFetchStopsWhenCanceled(t *testing.T) {
 		t.Fatalf("fetch under a canceled context: %v", err)
 	}
 }
+
+// A histogram value whose bucket key overflows (or a date a calendar interval cannot
+// place) is refused as too many buckets, not left out of every bucket.
+func TestHistogramRefusesValuesItCannotBucket(t *testing.T) {
+	c := newCluster(t, 1)
+	c.upsert("small", `{"price":1,"created":0}`)
+	c.upsert("huge", `{"price":1e308,"created":9e15}`)
+	c.refreshAll()
+	refusedAt(t, c, &Request{Query: &query.All{}, Aggs: map[string]Agg{"h": {Type: AggHistogram, Field: "price", Interval: 0.5}}}, "aggs.h.histogram")
+	refusedAt(t, c, &Request{Query: &query.All{}, Aggs: map[string]Agg{"d": {Type: AggDateHistogram, Field: "created", Calendar: "year"}}}, "aggs.d.date_histogram")
+}

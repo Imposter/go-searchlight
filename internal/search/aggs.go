@@ -588,7 +588,9 @@ type histBucket struct {
 }
 
 // histColl counts documents per histogram bucket: by slot when the segment's values
-// span few enough buckets for a bucketer, else in a map by key.
+// span few enough buckets for a bucketer, else in a map by key. A value bucketKey
+// cannot place (its key overflows, or a calendar cannot date it) refuses the search
+// as too many buckets rather than leave a counted document out of every bucket.
 type histColl struct {
 	s       *segExec
 	spec    *aggSpec
@@ -620,6 +622,7 @@ func (c *histColl) collect(d uint32) {
 	}
 	key, ok := bucketKey(c.spec, v)
 	if !ok {
+		c.s.fail(tooManyBuckets(c.spec))
 		return
 	}
 	b := c.buckets[key]

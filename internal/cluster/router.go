@@ -720,10 +720,14 @@ func (h *hinter) run(peer string, q *hintQueue) {
 	}
 }
 
-// forget stops and drops the hint queue of every peer keep refuses.
+// forget stops and drops the hint queue of every peer keep refuses. Once the hinter
+// is closed it does nothing: close stopped every queue.
 func (h *hinter) forget(keep func(peer string) bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
 	for peer, q := range h.queues {
 		if !keep(peer) {
 			close(q.stop)

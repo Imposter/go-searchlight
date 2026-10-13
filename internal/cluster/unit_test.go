@@ -474,3 +474,16 @@ func TestPeerDeadlineLeavesAReserve(t *testing.T) {
 		t.Fatalf("a peer is given %s of a caller's 2s", got)
 	}
 }
+
+// TestRegistryReadAfterStopForgetsNoPeerTwice: a registry read still under way once the
+// node stopped (a routing miss, an allocation) frees no per-peer state again: the hint
+// queues were closed with the node.
+func TestRegistryReadAfterStopForgetsNoPeerTwice(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	a.n.hints.send("node-gone", "127.0.0.1:1", hint{Index: "g", Shard: 0, Seq: 1})
+	a.n.hints.close()
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+}

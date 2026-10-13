@@ -251,6 +251,10 @@ func (c *copyState) startedUp() bool {
 	return false
 }
 
+// refreshDisabled reports whether idx's copies refresh only on demand
+// (refresh_interval -1): a read or write that waits for a seq refreshes them itself.
+func (idx *index) refreshDisabled() bool { return idx.refresh.Load() <= 0 }
+
 // copies returns the copies of idx this node hosts, by shard.
 func (idx *index) copies() []*copyState {
 	out := make([]*copyState, 0, len(idx.shards))

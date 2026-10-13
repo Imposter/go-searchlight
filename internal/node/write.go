@@ -475,7 +475,7 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 		sl := idx.shards[s]
 		localDone := false
 		if c := sl.local.Load(); c != nil && (n.cl == nil || c.peerServing() == nil) {
-			if err := n.waitLocal(ctx, c, seq, mode); err != nil {
+			if err := n.waitLocal(ctx, idx, c, seq, mode); err != nil {
 				return err
 			}
 			localDone = true
@@ -489,20 +489,28 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 	return nil
 }
 
-// waitLocal waits until copy c has seq searchable: by its next refresh (wait_for), or
-// at once (true: once applied, the copy is refreshed).
-func (n *Single) waitLocal(ctx context.Context, c *copyState, seq int64, mode api.RefreshMode) error {
-	if mode == api.RefreshTrue {
-		if err := n.waitApplied(ctx, c, seq); err != nil {
+// waitLocal waits until copy c of idx has seq searchable: by its next refresh
+// (wait_for), or at once (true, or any wait on an index whose refresh is disabled:
+// once applied, the copy is refreshed).
+func (n *Single) waitLocal(ctx context.Context, idx *index, c *copyState, seq int64, mode api.RefreshMode) error {
+	if mode == api.RefreshTrue || idx.refreshDisabled() {
+		if err := n.refreshApplied(ctx, c, seq); err != nil {
 			return err
-		}
-		if sh := c.shard(); sh != nil && sh.RefreshedSeq() < seq {
-			if err := sh.Refresh(ctx); err != nil {
-				return err
-			}
 		}
 	}
 	return c.waitRefreshed(ctx, seq)
+}
+
+// refreshApplied waits until copy c has applied seq, then refreshes it unless a
+// refresh has published seq already.
+func (n *Single) refreshApplied(ctx context.Context, c *copyState, seq int64) error {
+	if err := n.waitApplied(ctx, c, seq); err != nil {
+		return err
+	}
+	if sh := c.shard(); sh != nil && sh.RefreshedSeq() < seq {
+		return sh.Refresh(ctx)
+	}
+	return nil
 }
 
 // WaitLocal waits, under ctx, until this node's copy of shard s of index has seq
@@ -524,7 +532,7 @@ func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, 
 		return err
 	}
 	c.tailer.Wake()
-	return n.waitLocal(ctx, c, seq, mode)
+	return n.waitLocal(ctx, idx, c, seq, mode)
 }
 
 // waitApplied polls until the copy has applied seq.

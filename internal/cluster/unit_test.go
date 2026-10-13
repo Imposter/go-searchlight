@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -444,4 +445,26 @@ func TestLosingACopyDoesNotWaitForItsClose(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestPeerDeadlineLeavesAReserve: a peer is given the caller's remaining time less a
+// reserve, so a search that runs out of time on a peer answers timed_out with partial
+// results while the coordinator still has time to take the reply and fetch the hits.
+func TestPeerDeadlineLeavesAReserve(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:1/_internal/search", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.n.authorize(req)
+	ms, err := strconv.ParseInt(req.Header.Get(headerDeadline), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Duration(ms) * time.Millisecond; got > 1700*time.Millisecond || got < 1200*time.Millisecond {
+		t.Fatalf("a peer is given %s of a caller's 2s", got)
+	}
 }

@@ -214,7 +214,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 }
 
 // authorize adds the cluster token and the trace context to a peer request, and the
-// caller's deadline. A token sent in the clear to a peer off this machine is warned
+// caller's deadline less a reserve (peerReserve). A token sent in the clear to a peer off this machine is warned
 // about, once per peer: set tls_cert (and peer_ca_file) on a network you do not trust.
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
@@ -227,10 +227,17 @@ func (n *Node) authorize(req *http.Request) {
 		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
-		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10)) //nolint:forbidigo // a context deadline is by the process clock
+		left := time.Until(dl) //nolint:forbidigo // a context deadline is by the process clock
+		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, (left-peerReserve(left)).Milliseconds()), 10))
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 }
+
+// peerReserve is the part of a caller's remaining time a peer is not given: the
+// reply's way back and, for a search, the fetch phase after it. A peer that runs out
+// of its time answers (a search with partial results, timed_out) while the caller can
+// still use the answer.
+func peerReserve(left time.Duration) time.Duration { return min(left/5, 2*time.Second) }
 
 // loopback reports whether host names this machine.
 func loopback(host string) bool {

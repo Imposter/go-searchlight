@@ -52,7 +52,7 @@ const (
 	MaxSortKeys = 16
 	// MaxBuckets bounds the buckets of one response, every aggregation's together
 	// (Elasticsearch's search.max_buckets). A shard whose partial passes it refuses the
-	// search; shards that pass it only once merged are cut, in aggregation name order,
+	// search (a terms aggregation counting its size, not its shard_size over-fetch); shards that pass it only once merged are cut, in aggregation name order,
 	// each aggregation cut marked truncated. A histogram's empty buckets are filled in
 	// only while the response stays within it.
 	MaxBuckets = 65_536

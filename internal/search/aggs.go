@@ -1081,6 +1081,16 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 	}
 }
 
+// responseBuckets is how many of a shard partial's buckets the response can hold: a
+// terms aggregation's at most its size (the rest of its shard_size over-fetch only
+// sharpens the counts across shards), every other aggregation's all of them.
+func responseBuckets(p *AggPartial, spec *aggSpec) int {
+	if spec.typ == AggTerms {
+		return min(len(p.Buckets), spec.size)
+	}
+	return len(p.Buckets)
+}
+
 // AggResult is one aggregation's result.
 type AggResult struct {
 	Type string

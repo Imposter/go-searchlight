@@ -475,7 +475,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	buckets := 0
 	for _, spec := range p.aggs {
 		cutShard(aggs[spec.name], spec)
-		if buckets += len(aggs[spec.name].Buckets); buckets > MaxBuckets {
+		if buckets += responseBuckets(aggs[spec.name], spec); buckets > MaxBuckets {
 			return fail(tooManyBuckets(spec), "too many buckets")
 		}
 	}

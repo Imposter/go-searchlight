@@ -247,7 +247,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - At most 65,536 buckets per response, every aggregation's together (Elasticsearch's
     `search.max_buckets`). A shard whose own buckets pass it refuses the search, at
     the aggregation that passed it, asking for a wider interval, a lower size or a
-    narrower query. Shards that pass it only once merged are cut, in aggregation name
+    narrower query. A `terms` aggregation counts its `size` there, not its
+    `shard_size` over-fetch. Shards that pass it only once merged are cut, in aggregation name
     order, and each aggregation cut says `"truncated": true`. A cut `terms`
     aggregation counts the documents of its cut buckets in `sum_other_doc_count`.
   - A histogram's empty buckets (`min_doc_count` 0) are filled in only while the

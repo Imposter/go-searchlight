@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/query"
@@ -195,6 +196,34 @@ func TestBucketsBoundTheWholeResponse(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A shard charges a terms aggregation the buckets the response can hold (its size),
+// not its shard_size over-fetch: two terms aggregations of size 30,000 over 34,000
+// terms fit a 65,536-bucket response, and are answered.
+func TestShardChargesTermsTheirSize(t *testing.T) {
+	c := newCluster(t, 1)
+	for d := range 1000 {
+		tags := make([]string, 34)
+		for i := range tags {
+			tags[i] = fmt.Sprintf("%q", fmt.Sprintf("t%05d", d*34+i))
+		}
+		c.upsert(fmt.Sprintf("d%04d", d), `{"tags":[`+strings.Join(tags, ",")+`]}`)
+	}
+	c.refreshAll()
+	const size = 30_000
+	resp, err := c.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{
+		"t1": {Type: AggTerms, Field: "tags", Size: size},
+		"t2": {Type: AggTerms, Field: "tags", Size: size},
+	}})
+	if err != nil {
+		t.Fatalf("two terms of size %d: %v", size, err)
+	}
+	for _, name := range []string{"t1", "t2"} {
+		if a := resp.Aggs[name]; len(a.Buckets) != size || a.Truncated || a.SumOtherDocCount != 4000 {
+			t.Fatalf("%s: %d buckets, truncated %v, %d others; want %d, false, 4000", name, len(a.Buckets), a.Truncated, a.SumOtherDocCount, size)
+		}
+	}
 }
 
 // A fetch whose context is done stops and returns the context's error.

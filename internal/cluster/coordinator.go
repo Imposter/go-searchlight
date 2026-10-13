@@ -606,14 +606,16 @@ func (n *Node) retire(ctx context.Context, l *lease) bool {
 	return true
 }
 
-// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not),
-// stops the loops, marks every copy retiring while its lease is live, then stops every
-// copy's tailer and closes its shard (a final manifest and a final applied seq, which
-// may take a while each), deregisters the node, and closes the engine. The copies' leases are not released: their rows stay, retiring, at their
-// final applied seqs, so the changelog the node needs to replay when it comes back is
-// kept for retiring_retention, and the node claims its own slots back at the same
-// epochs. Peers place replacements meanwhile (a retiring copy does not count towards
-// its target). It does not close the store. It is idempotent; Close is the same.
+// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not)
+// and stops the loops; it stops every copy's tailer, all together (each makes a final
+// flush and a final applied-seq report), marks every copy retiring while its lease is
+// live and no tailer is left to write its state, then closes the shards, deregisters
+// the node and closes the engine. The copies' leases are not released: their rows stay,
+// retiring, at their final applied seqs, so the changelog the node needs to replay when
+// it comes back is kept for retiring_retention, and the node claims its own slots back
+// at the same epochs. Peers place replacements meanwhile (a retiring copy does not
+// count towards its target). It does not close the store. It is idempotent; Close is
+// the same.
 func (n *Node) Stop(ctx context.Context) error {
 	n.stopOnce.Do(func() {
 		n.stopped.Store(true)
@@ -625,6 +627,11 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.closeBackground()
 		var errs []error
 		leases := n.leaseList()
+		var tailers sync.WaitGroup
+		for _, l := range leases {
+			tailers.Go(func() { n.StopTailer(l.copy) })
+		}
+		tailers.Wait()
 		for _, l := range leases {
 			if l.retired.Load() {
 				continue

@@ -498,8 +498,9 @@ Restart or upgrade **one node at a time**:
    2. The API keeps serving for `shutdown_grace`, while load balancers take the node
       out.
    3. The listener stops accepting, and requests in flight finish, within T/4.
-   4. The node stops its remaining copies, writes their final manifests, marks them
-      `retiring` in the registry and deregisters. It has until T/10 before the deadline,
+   4. The node stops its remaining copies' tailers, all together, each writing its
+      final manifest and applied seq; then it marks the copies `retiring` in the
+      registry, closes them and deregisters. It has until T/10 before the deadline,
       which is at least 0.4 T.
    5. In the last T/10, it closes the database and the admin listener, and flushes
       telemetry.

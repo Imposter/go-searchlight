@@ -355,7 +355,9 @@ On SIGTERM, a node:
    tailer and marks it `retiring`, and the database checks atomically that another copy
    still serves, so nodes draining together never retire a shard's last serving copy;
 3. keeps serving for `shutdown_grace`, then drains its listener;
-4. stops its remaining copies, writing their final manifests;
+4. stops its remaining copies' tailers together, each writing its final manifest and
+   applied seq, then marks those copies `retiring` (no tailer is left to change their
+   state) and closes them;
 5. deregisters.
 
 The leases are not released: the rows stay `retiring` at their final applied seqs.
@@ -407,7 +409,7 @@ sequenceDiagram
   Note over M: SIGINT / SIGTERM fixes deadline D = now + shutdown_grace + T
   M->>Api: readiness false; Drain retires covered copies (T/4); serve for shutdown_grace
   M->>Api: stop accepting, finish in-flight requests (T/4)
-  M->>N: Stop: final manifests, rows retiring, deregister (until D - T/10)
+  M->>N: Stop: tailers stopped (final manifests), rows retiring, copies closed, deregister (until D - T/10)
   M->>St: close
   M->>Adm: close
   M->>M: telemetry flush, exit 0

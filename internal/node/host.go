@@ -82,6 +82,20 @@ func (n *Single) PauseCopy(ctx context.Context, cp store.Copy) error {
 	return nil
 }
 
+// StopTailer stops the tailer of this node's copy cp (at its epoch) and waits for its
+// Run to return, its final flush and report included; the copy stays hosted until
+// UnhostCopy closes it. A stopping node stops every copy's tailer this way, together,
+// before it marks the copies retiring, so no tailer writes their state after that.
+func (n *Single) StopTailer(cp store.Copy) {
+	c, _, unlock := n.lockCopy(cp)
+	if c == nil {
+		return
+	}
+	defer unlock()
+	c.cancel()
+	<-c.done
+}
+
 // ResumeCopy starts a paused copy again under cp (its lease re-claimed at the same
 // epoch): a new tailer over the open shard catches it up, reporting under cp.
 func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {

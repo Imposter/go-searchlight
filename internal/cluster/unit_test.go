@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -341,7 +342,7 @@ func TestSingleNodeCluster(t *testing.T) {
 // rebuilt rather than replayed when the node comes back.
 func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
 	testtier.Heavy(t)
-	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.LeaseTTL = 2 * time.Second })
+	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	createIndex(t, a.n, "slow", 3, 0)
 	c.waitHealth(t, api.StatusGreen, 30*time.Second)
@@ -363,6 +364,50 @@ func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
 		if cp.State != store.CopyRetiring {
 			t.Errorf("a stopped node's copy is %+v, want retiring", cp)
 		}
+	}
+}
+
+// TestStopStopsTheTailersBeforeMarkingRetiring: a stopping node stops every copy's
+// tailer (each makes its final flush and report) before it marks any copy retiring, so
+// no tailer can mark a copy serving or recovering over the retiring mark.
+func TestStopStopsTheTailersBeforeMarkingRetiring(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "order", 3, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	var last int64
+	for k := range 30 {
+		last = mustWrite(t, a.n, "order", upsertOp(fmt.Sprintf("o%02d", k), k))
+	}
+	waitCount(t, a.n, "order", last, 30)
+	var mu sync.Mutex
+	var events []string
+	report := func(context.Context) {
+		mu.Lock()
+		events = append(events, "report")
+		mu.Unlock()
+	}
+	setState := func(_ store.Copy, state store.CopyState) {
+		mu.Lock()
+		events = append(events, string(state))
+		mu.Unlock()
+	}
+	a.wrap.onReport.Store(&report)
+	a.wrap.onSetState.Store(&setState)
+	a.stop()
+	mu.Lock()
+	defer mu.Unlock()
+	retired := false
+	for _, e := range events {
+		switch {
+		case e == string(store.CopyRetiring):
+			retired = true
+		case retired:
+			t.Fatalf("%q after a copy was marked retiring: %v", e, events)
+		}
+	}
+	if !retired {
+		t.Fatalf("no copy was marked retiring: %v", events)
 	}
 }
 

@@ -589,6 +589,9 @@ type faultStore struct {
 	// onReport, when set, runs at the start of every ReportApplied, before it reaches
 	// the store.
 	onReport atomic.Pointer[func(ctx context.Context)]
+	// onSetState, when set, runs at the start of every SetCopyState, before it
+	// reaches the store.
+	onSetState atomic.Pointer[func(c store.Copy, state store.CopyState)]
 	// stallTail, while set, holds every ChangesAfter until it is closed or the call's
 	// context ends: the node's tailers stay where they are, serving and current by
 	// their own measure.
@@ -821,6 +824,9 @@ func (r *faultRegistry) SetCopyState(ctx context.Context, c store.Copy, state st
 	defer r.f.timed("SetCopyState")()
 	if r.f.isDown() {
 		return errPartitioned
+	}
+	if fn := r.f.onSetState.Load(); fn != nil {
+		(*fn)(c, state)
 	}
 	return r.RegistryStore.SetCopyState(ctx, c, state)
 }

@@ -761,7 +761,7 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 			}
 		}
 		if ce != nil {
-			t.scanFrom = ce.Seq // another document's damaged change: look past it
+			t.scanFrom = ce.Seq
 			continue
 		}
 		if err != nil {

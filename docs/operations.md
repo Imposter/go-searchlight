@@ -528,6 +528,14 @@ Notes:
   so a long query on the table holds the table's other queries behind the migration for
   at most that second; one that times out is retried, up to 40 times over about three
   minutes, half a second to five seconds apart.
+- **Upgrading to a release that requires `cluster_token`.** A node on Postgres or MySQL
+  now refuses to start without `cluster_token` (`cluster_token: set cluster_token ...`),
+  unless `insecure_no_auth` is set. A cluster of several nodes has one already: without
+  it the peer API was closed, and reads of another node's shards failed. **A single node
+  on Postgres or MySQL may not**: set `cluster_token` (any shared secret, through
+  `SEARCHLIGHT_CLUSTER_TOKEN` or `SEARCHLIGHT_CLUSTER_TOKEN_FILE`) before you upgrade
+  it. Otherwise the upgraded pod crash-loops: an outage under a Recreate strategy or a
+  single replica, and a stalled rollout under RollingUpdate.
 - **Upgrading to compressed bodies** (schema migration 2) is a rolling upgrade. The
   migration only adds columns and a table, which takes milliseconds whatever the
   database holds: `body_z` beside `sl_documents.body` and `payload_z` beside

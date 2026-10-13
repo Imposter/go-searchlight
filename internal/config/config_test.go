@@ -430,8 +430,10 @@ func TestLoadRefusesAClusterStoreWithoutClusterToken(t *testing.T) {
 		switch {
 		case tc.ok && err != nil:
 			t.Errorf("%+v: %v", tc, err)
-		case !tc.ok && (err == nil || !strings.Contains(err.Error(), "cluster_token")):
-			t.Errorf("%+v: err = %v, want one naming cluster_token", tc, err)
+		case !tc.ok && (err == nil || !strings.Contains(err.Error(), "set cluster_token")):
+			t.Errorf("%+v: err = %v, want one asking to set cluster_token", tc, err)
+		case !tc.ok && strings.Index(err.Error(), "insecure_no_auth") < strings.Index(err.Error(), "set cluster_token"):
+			t.Errorf("%+v: err = %v, want cluster_token offered before insecure_no_auth", tc, err)
 		}
 	}
 }

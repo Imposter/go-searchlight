@@ -693,7 +693,7 @@ func (c *Config) validate() []error {
 		errs = append(errs, errors.New("tokens_file: is required; set insecure_no_auth=true to serve the API without auth"))
 	}
 	if c.ClusterToken == "" && !c.InsecureNoAuth && sharedStore(c.StoreURL) {
-		errs = append(errs, errors.New("cluster_token: is required on a Postgres or MySQL store, which nodes share: without it the peer API is closed; set insecure_no_auth=true to run without auth"))
+		errs = append(errs, errors.New("cluster_token: set cluster_token (any shared secret, the same on every node) on a Postgres or MySQL store, which nodes share: without it the peer API is closed. insecure_no_auth=true runs without it, but then the peer API under /_internal/ on the public listener, like the API, takes requests without any auth"))
 	}
 	if c.MaxBodyBytes < 1<<10 || c.MaxBodyBytes > MaxBodyLimit {
 		errs = append(errs, fmt.Errorf("max_body_bytes: want 1KiB to %d bytes, got %d", MaxBodyLimit, c.MaxBodyBytes))

@@ -465,7 +465,10 @@ func raise(v *atomic.Int64, seq int64) {
 // searchable: by their next refresh (wait_for), or at once (true: once applied, the
 // copies are refreshed). wait_for waits on this node's copy when it hosts a serving
 // one, else (a cluster node) on the first other copy that has seq; true waits on this
-// node's copy and every other serving copy of the shard.
+// node's copy and every other serving copy of the shard. A copy of this node being
+// rebuilt aside applies nothing until its replacement is swapped in: a cluster node
+// waits on the other copies instead, and on the replacement only when none of them
+// reaches seq.
 func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bool, seq int64, mode api.RefreshMode) error {
 	shards := make([]int, 0, len(touched))
 	for s := range touched {
@@ -474,8 +477,22 @@ func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bo
 	slices.Sort(shards)
 	for _, s := range shards {
 		sl := idx.shards[s]
+		c := sl.local.Load()
+		if c != nil && n.cl != nil && c.peerServing() != nil {
+			c = nil
+		}
+		if c != nil && n.cl != nil && c.rebuilding() {
+			err := n.cl.WaitRefreshed(ctx, sl.id, seq, mode, false)
+			if isUnavailable(err) {
+				err = n.waitLocal(ctx, idx, c, seq, mode)
+			}
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		localDone := false
-		if c := sl.local.Load(); c != nil && (n.cl == nil || c.peerServing() == nil) {
+		if c != nil {
 			if err := n.waitLocal(ctx, idx, c, seq, mode); err != nil {
 				return err
 			}
@@ -516,7 +533,8 @@ func (n *Single) refreshApplied(ctx context.Context, c *copyState, seq int64) er
 
 // WaitLocal waits, under ctx, until this node's copy of shard s of index has seq
 // searchable, as a write's refresh asks (the peer API serves other nodes' waits
-// with it). It fails (503) when the node hosts no serving copy of the shard.
+// with it). It fails (503) when the node hosts no serving copy of the shard, or one
+// being rebuilt aside, which applies nothing until its replacement is swapped in.
 func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, mode api.RefreshMode) error {
 	idx, err := n.lookup(ctx, index)
 	if err != nil {
@@ -531,6 +549,9 @@ func (n *Single) WaitLocal(ctx context.Context, index string, s int, seq int64, 
 	}
 	if err := c.peerServing(); err != nil {
 		return err
+	}
+	if c.rebuilding() {
+		return api.Unavailable(errors.New(StateRebuilding), "this node's copy of shard %d of index %q is being rebuilt aside and applies nothing until it is swapped in", s, index)
 	}
 	c.tailer.Wake()
 	return n.waitLocal(ctx, idx, c, seq, mode)

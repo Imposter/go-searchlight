@@ -18,6 +18,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/testtier"
@@ -434,4 +435,71 @@ func TestWaitForWaitsOnOneCopy(t *testing.T) {
 		writer = coordinator
 	}
 	write(writer, "wf")
+}
+
+// TestWritesDoNotWaitOnACopyRebuiltAside: a copy being rebuilt aside serves its old data
+// and applies nothing until its replacement is swapped in, so a refresh=wait_for or
+// refresh=true write through its node waits on a copy that applies (the peer's) rather
+// than on it, and answers within its deadline.
+func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
+	testtier.Heavy(t)
+	release := make(chan struct{})
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.HoldRecovery = func(ctx context.Context) error {
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	a := c.start(0)
+	b := c.start(1)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "rb", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, a.st, "rb", 1, 2, time.Minute)
+	last := mustWrite(t, a.n, "rb", api.WriteOp{Kind: api.OpUpsert, ID: "r", Body: json.RawMessage(`{"title": "x", "colour": "red"}`)})
+	waitCount(t, b.n, "rb", last, 1)
+	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
+		t.Fatal(err)
+	}
+	copyOf := func(tn *tnode) api.ShardInfo {
+		shards, err := tn.n.Shards(tctx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range shards {
+			if s.Index == "rb" && s.Node == tn.cfg.NodeID {
+				return s
+			}
+		}
+		return api.ShardInfo{}
+	}
+	eventually(t, time.Minute, "node-1's copy is held mid-rebuild and node-0's is rebuilt", func() error {
+		if s := copyOf(b); !s.Rebuilding {
+			return fmt.Errorf("node-1's copy: %+v", s)
+		}
+		if s := copyOf(a); s.Rebuilding || s.State != api.ShardServing {
+			return fmt.Errorf("node-0's copy: %+v", s)
+		}
+		return nil
+	})
+	for _, mode := range []api.RefreshMode{api.RefreshWaitFor, api.RefreshTrue} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		start := time.Now()
+		res, err := b.n.Write(ctx, "rb", []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: mode})
+		cancel()
+		if err != nil || res.TimedOut {
+			t.Fatalf("a %v write through the node rebuilding its copy: %+v, %v after %s", mode, res, err, time.Since(start))
+		}
+	}
 }

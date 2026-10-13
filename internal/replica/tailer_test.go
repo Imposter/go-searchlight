@@ -1094,3 +1094,48 @@ func TestFetcherRebuildsAside(t *testing.T) {
 		}
 	})
 }
+
+// TestFetchedCopyPrunedPastIsNotFetchedAgain: an aside rebuild whose fetched copy the
+// changelog was pruned past before it moved does not fetch again (the peers are no
+// better off): the next attempt rebuilds from the store's snapshot.
+func TestFetchedCopyPrunedPastIsNotFetchedAgain(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "fp", testMapping)
+		id := ShardID{Index: "fp", Shard: 0}
+		c := newCopy(t, d.open(t), id, testOptions())
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("fp", 0, "a", docBody("a", 1))))
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		seed := newCopy(t, d.open(t), id, testOptions())
+		seed.start()
+		seed.waitApplied(mustApply(t, st, upsert("fp", 0, "b", docBody("b", 2))))
+		if err := seed.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mustApply(t, st, upsert("fp", 0, "c", docBody("c", 3)))
+		head := mustApply(t, st, upsert("fp", 0, "d", docBody("d", 4)))
+		if err := st.Prune(ctx, id, head); err != nil { // past both copies
+			t.Fatal(err)
+		}
+		f := &dirFetcher{from: seed.dir}
+		c.opts.Fetcher = f
+		c.start()
+		sh := c.waitApplied(head)
+		if f.calls != 1 {
+			t.Fatalf("fetched %d times, want once", f.calls)
+		}
+		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+			t.Fatalf("rebuilt copy differs:\n%s", dd)
+		}
+	})
+}

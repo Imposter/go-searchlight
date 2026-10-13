@@ -177,7 +177,7 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			}
 			return err
 		}
-		t.needRebuild, t.gate, t.remapSince, t.rebuilt = "", nil, time.Time{}, true
+		t.needRebuild, t.gate, t.remapSince, t.rebuilt, t.fetchSpent = "", nil, time.Time{}, true, false
 		t.rebuildWait = 0
 		t.clearHalt()
 	}
@@ -208,7 +208,7 @@ func (t *Tailer) canBuildAside(reason string) bool {
 // no better off. Nor is a copy the changelog rewound under: the peers and bundles may
 // hold the lost commits too, and only the store is the truth.
 func (t *Tailer) useFetcher(reason string) bool {
-	return t.opts.Fetcher != nil && reason != reasonRewound && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
+	return t.opts.Fetcher != nil && reason != reasonRewound && !t.fetchSpent && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
 }
 
 // rebuildAside rebuilds the copy in a new directory under its root while the current
@@ -275,7 +275,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 		changes, err := t.st.ChangesAfter(ctx, t.id, sh.AppliedSeq(), t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
 			if fetchedFrom(source) {
-				t.lastSource, t.recoveredAt = source, asOf // fetch no more: the peers and bundles are no better off
+				t.fetchSpent = true // fetch no more: the peers and bundles are no better off
 			}
 			return &rebuildError{reason: reasonPruned, err: err}
 		}

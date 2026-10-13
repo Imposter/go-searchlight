@@ -300,6 +300,9 @@ type Tailer struct {
 	warn        rateLimitedWarn
 	lastSource  string // the source of the last rebuild
 	recoveredAt int64  // the applied seq that rebuild ended at
+	// fetchSpent is set when a fetched replacement needed rebuilding again before it
+	// moved: the next rebuild reads the store, and completing it clears the flag.
+	fetchSpent bool
 	// mark is the change at the applied seq as the copy applied it, when mark.Seq
 	// is the applied seq; checkRewind compares the changelog with it.
 	mark        store.ChangeMark

@@ -24,7 +24,7 @@ front of it as the load balancer, see [nginx.md](nginx.md).
 | Port | Listener | Serves |
 |---|---|---|
 | 8780 (`listen`) | public | the API, and the internal peer API under `/_internal/` (cluster_token auth) |
-| 8781 (`admin_listen`) | admin | `GET /healthz`, `GET /readyz`, `GET /metrics` (no auth), `/debug/pprof/*` when `pprof` is on |
+| 8781 (`admin_listen`) | admin | `GET /healthz`, `GET /readyz`, `GET /metrics` (no auth), `/debug/pprof/*` when `pprof` is on (not `cmdline`, which could show secrets passed as flags) |
 
 - **Admin listener.** It binds to loopback, `127.0.0.1:8781`, by default. The image and
   the Kubernetes ConfigMap set `:8781` explicitly, so probes and Prometheus can reach it.

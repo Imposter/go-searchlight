@@ -171,6 +171,9 @@ func (s *docStats) add(o *docStats) {
 // verify_ms: per-document probe and verify time summed over every worker (busy time,
 // which exceeds the wall time when documents run in parallel).
 //
+// The documents' matches together are at most MaxMatches: past it, the call stops and
+// returns ErrTooManyMatches.
+//
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match, and each
 // candidate's program decides as the matcher does.
@@ -211,7 +214,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	var total docStats
 	var mu sync.Mutex
 	var firstErr error
-	var next atomic.Int64
+	var next, matches atomic.Int64
 	work := func() {
 		sc, _ := p.scratchCache.Get().(*scratch)
 		if sc == nil {
@@ -251,6 +254,13 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 			}
 			out[i] = ids
 			local.add(&st)
+			if matches.Add(int64(st.matched)) > int64(maxMatches) {
+				mu.Lock()
+				firstErr = cmpErr(firstErr, ErrTooManyMatches)
+				mu.Unlock()
+				next.Store(int64(len(docs)))
+				break
+			}
 		}
 		p.scratchCache.Put(sc)
 		mu.Lock()
@@ -339,6 +349,18 @@ type scratchSize struct {
 	n, entries uint32
 	fields     int
 }
+
+// MaxMatches bounds the matches one percolation answers, every document's together.
+// Past it, Percolate stops and returns ErrTooManyMatches rather than answer with
+// matches left out: an answer is complete or refused (spec section 7).
+const MaxMatches = 1_000_000
+
+// maxMatches is MaxMatches, a variable so tests can lower it.
+var maxMatches = MaxMatches
+
+// ErrTooManyMatches is a percolation refused because its documents match more than
+// MaxMatches saved queries together.
+var ErrTooManyMatches = fmt.Errorf("percolate: the documents match more than %d saved queries together", MaxMatches)
 
 // Splitting one document: minWindowQueries is the fewest saved queries per worker
 // (a variable so tests can force splits), windowsPerWorker how many windows each

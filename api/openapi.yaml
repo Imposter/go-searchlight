@@ -593,7 +593,7 @@ paths:
       tags: [percolate]
       operationId: percolate
       summary: The saved queries each document matches.
-      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it).
+      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it), and at most 1000000 matches, every document's together (422 too_many_matches past it; an answer is never truncated).
       parameters:
         - $ref: "#/components/parameters/WaitForSeq"
       requestBody:
@@ -638,6 +638,11 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
+        "422":
+          description: The documents match more than 1000000 saved queries together (code too_many_matches); percolate fewer per request.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "429": { $ref: "#/components/responses/TooMany" }
         "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
@@ -804,8 +809,8 @@ components:
         code:
           type: string
           enum: [invalid_request, unauthorized, forbidden, not_found, index_not_found, document_not_found, query_not_found,
-            method_not_allowed, index_exists, conflict, too_large, too_many_requests, timeout, request_timeout,
-            client_closed_request, unavailable, internal]
+            method_not_allowed, index_exists, conflict, too_large, too_many_requests, too_many_matches, timeout,
+            request_timeout, client_closed_request, unavailable, internal]
         detail: { type: string }
         request_id: { type: string }
         current_seq: { type: integer, description: A failed if_seq's current seq. }
@@ -895,6 +900,10 @@ components:
         percolated:
           type: boolean
           description: With percolate=true, whether the items carry their matching saved queries (false when the percolation could not finish after the writes committed).
+        percolate_reason:
+          type: string
+          enum: [too_many_matches]
+          description: Why percolated is false when the documents match more than 1000000 saved queries together; the writes stay committed.
         items:
           type: array
           items:

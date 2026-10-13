@@ -166,6 +166,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   your writes.
 - **`percolate=true`.** Each upserted document's item lists the saved queries it matches.
   This is how scrape-bot's diff engine works out its match edges (spec §16).
+  - `percolated` says whether the items carry their matches. It is false when the
+    percolation could not finish after the writes committed. The writes stay
+    committed either way.
+  - Past 1,000,000 matches, every document's together, `percolated` is false and
+    `percolate_reason` is `too_many_matches`, with no item's `queries`. Percolate
+    those documents in smaller requests.
 - **`refresh`.** As on single-document writes.
 
 ## Search and count
@@ -302,8 +308,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
   pass `wait_for_seq` to see a recent write.
-- **Limits.** Up to 10,000 documents per request, given and stored together. More is
-  a 413.
+- **Limits.**
+  - Up to 10,000 documents per request, given and stored together. More is a 413.
+  - At most 1,000,000 matches per request, every document's together. Past it, the
+    request is refused with a 422 whose code is `too_many_matches`: percolate fewer
+    documents per request. An answer is never truncated, since a missing match is
+    a wrong answer.
 - **Server time.** `took_ms` and `took_us` are the server's time for the request, from
   its admission to the last byte of its answer encoded, in whole milliseconds and
   microseconds. The `Server-Timing` header carries the same time
@@ -367,6 +377,7 @@ Every error is RFC 9457 problem JSON (`application/problem+json`):
   - `not_found`, `index_not_found`, `document_not_found` and `query_not_found`;
   - `method_not_allowed`, `index_exists` and `conflict`;
   - `too_large` and `too_many_requests`;
+  - `too_many_matches` (422: a percolation matching more than 1,000,000 saved queries);
   - `timeout`, `request_timeout` and `client_closed_request`;
   - `unavailable` and `internal`.
 - **`problems[].loc`** is a dotted path into the request, for example

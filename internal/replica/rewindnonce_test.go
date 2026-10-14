@@ -12,7 +12,9 @@ import (
 // its seq afterwards names the same document, of the same kind, in the same
 // millisecond, with another body: only its nonce tells it apart, and the copy rebuilds
 // and serves the new body. A reissue written by a node from before nonces (no nonce)
-// is told apart by its identity, as before.
+// is told apart by its identity, as before. The rewind and the reissue commit
+// together, so the copy never sees a head behind its seq: only the comparison of the
+// change at its seq can find the rewind.
 func TestIdenticalReissueIsARewind(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -52,18 +54,11 @@ func TestIdenticalReissueIsARewind(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				rewind(ctx, t, d, k)
-				raw := rawDB(t, d)
-				for _, q := range []string{
+				rewind(ctx, t, d, k,
 					fmt.Sprintf("INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version, nonce) VALUES (%d, 'w', 0, 'upsert', '%s', '%s', %d, '%s', %d, %s)",
 						lc.Seq, tc.id, body, lc.At.UnixMilli(), lc.IndexUID, lc.MappingVersion, tc.nonce),
 					fmt.Sprintf("INSERT INTO sl_documents (index_name, shard, id, body, seq) VALUES ('w', 0, '%s', '%s', %d)", tc.id, body, lc.Seq),
-					fmt.Sprintf("UPDATE sl_counter SET value = %d WHERE id = 1", lc.Seq),
-				} {
-					if _, err := raw.ExecContext(ctx, q); err != nil {
-						t.Fatalf("reissue %q: %v", q, err)
-					}
-				}
+					fmt.Sprintf("UPDATE sl_counter SET value = %d WHERE id = 1", lc.Seq))
 				if tc.restart {
 					c.start()
 				}

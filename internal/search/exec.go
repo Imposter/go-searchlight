@@ -295,6 +295,11 @@ type segResult struct {
 // variable so tests can make it small).
 var countChunk = 4096
 
+// runSegment searches segment i of g. Aggregations and exact totals need every match,
+// so every candidate is verified, in batches. Otherwise verification runs in two
+// phases: only the candidates that could enter the top hits, then as many more as the
+// total needs, counted in batches sized from the match rate so far to what is still
+// needed (twice over), at least countChunk: few round trips, little overshoot.
 func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (out segResult) {
 	s := newSegExec(ctx, p, g, i)
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.segment", trace.WithAttributes(
@@ -323,17 +328,12 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 	case s.err != nil:
 	case a.maybe.IsEmpty():
 	case len(p.aggs) > 0 || p.need < 0:
-		// Aggregations and exact totals need every match: verify all, in batches.
 		hits = roaring.Or(a.sure, s.resolve(p.root, a.maybe))
 	default:
-		// Two phases: verify only the candidates that could enter the top hits, then
-		// as many more as the total needs.
 		s.lazy = &lazyState{maybe: a.maybe, checked: roaring.New()}
 		p.confirmed.Add(card(a.sure))
 		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size)
 		rest := roaring.AndNot(a.maybe, s.lazy.checked)
-		// Count in batches sized from the match rate so far to what is still needed
-		// (twice over), at least countChunk: few round trips, little overshoot.
 		var tried, matched int64
 		for !rest.IsEmpty() && p.confirmed.Load() < p.need && !s.checkCtx() {
 			size := int64(countChunk)
@@ -536,7 +536,8 @@ type warnLimiter struct {
 var timeoutWarnings = &warnLimiter{interval: 10 * time.Second, last: map[string]time.Time{}, dropped: map[string]int{}}
 
 // allow reports whether a warning for key may be logged now, and how many were
-// dropped since the last one.
+// dropped since the last one. Past 1024 keys it forgets them all: memory stays
+// bounded, and many indexes just log a little more often.
 func (w *warnLimiter) allow(key string) (int, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -546,7 +547,7 @@ func (w *warnLimiter) allow(key string) (int, bool) {
 		return 0, false
 	}
 	if len(w.last) > 1024 {
-		clear(w.last) // bounded: many indexes just log a little more often
+		clear(w.last)
 		clear(w.dropped)
 	}
 	w.last[key] = now
@@ -623,7 +624,9 @@ func (m *topMerge) Pop() any {
 
 // fetchTops merges the segments' tops into the shard's best p.size hits and fetches
 // their bodies. A canceled ctx stops the fetch; a passed deadline does not, so a search
-// that timed out still returns the hits it found.
+// that timed out still returns the hits it found. The hits are chosen first, reading
+// ids only where they break a tie; then the chosen records are fetched in parallel: a
+// stored block's decompression is most of a small search.
 func fetchTops(ctx context.Context, g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error) {
 	if p.size == 0 || len(tops) == 0 {
 		return nil, nil
@@ -633,8 +636,6 @@ func fetchTops(ctx context.Context, g *shard.Generation, p *prepared, tops [][]s
 		m.order = append(m.order, i)
 	}
 	heap.Init(m)
-	// Choose first, reading ids only where they break a tie; then fetch the chosen
-	// records in parallel: a stored block's decompression is most of a small search.
 	var chosen []*segHit
 	for len(chosen) < p.size && m.Len() > 0 && m.err == nil {
 		i := m.order[0]
@@ -759,7 +760,8 @@ func canceled(ctx context.Context) error {
 }
 
 // filterBody keeps the members of a stored JSON object named in fields, in fields'
-// order (a repeated member: its last value, as everywhere else).
+// order (a repeated member: its last value, as everywhere else). A field listed twice
+// is written once.
 func filterBody(body []byte, fields []string) (json.RawMessage, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(body, &members); err != nil {
@@ -772,7 +774,7 @@ func filterBody(body []byte, fields []string) (json.RawMessage, error) {
 		if !ok {
 			continue
 		}
-		delete(members, f) // a field listed twice is written once
+		delete(members, f)
 		if !first {
 			out = append(out, ',')
 		}

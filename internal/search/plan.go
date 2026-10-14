@@ -230,11 +230,12 @@ const (
 
 var leafUsage usageSketch
 
-// seen counts key once for request req and reports whether an earlier request saw it.
+// seen counts key once for request req and reports whether an earlier request saw it;
+// a request that counted the key already is not counted again.
 func (u *usageSketch) seen(key string, req uint64) bool {
 	slot := &u.slots[hashString(key)%usageSlots]
 	if slot.last.Swap(req) == req {
-		return slot.count.Load() >= 2 // this request counted it already
+		return slot.count.Load() >= 2
 	}
 	n := slot.count.Add(1)
 	if u.ticks.Add(1)%usageHalfLife == 0 {
@@ -301,9 +302,10 @@ func (s *segExec) estimateLeaf(lp *leafPlan) estimate {
 	return e
 }
 
+// estimateLeafUncached estimates a leaf's matches from the segment's index. A bitmap
+// the filter cache holds is exact and costs nothing more to use.
 func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 	if lp.useCache {
-		// A cached bitmap is exact and costs nothing more to use.
 		if bm, ok := s.cacheGet(lp); ok {
 			return estimate{card: bm.GetCardinality()}
 		}
@@ -526,7 +528,8 @@ func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 }
 
 // approximateLeaf is a leaf's approx over scope: its candidates, or the filter
-// cache's exact bitmap. Only a fully verified bitmap is ever cached.
+// cache's exact bitmap. Only a fully verified bitmap is ever cached: when most of the
+// segment is in question anyway, all of it is verified once, and cached.
 func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	if lp.never {
 		return emptyApprox
@@ -547,7 +550,6 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 		return approx{sure: s.within(c.sure, scope), maybe: roaring.New()}
 	}
 	if lp.useCache && 2*scope.GetCardinality() >= uint64(s.n) {
-		// Most of the segment is in question anyway: verify all of it once, and cache.
 		full := c.sure.Clone()
 		s.verify(lp, roaring.AndNot(c.maybe, c.sure), full)
 		if s.err != nil {

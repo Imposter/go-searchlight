@@ -342,10 +342,11 @@ func floatOf(raw json.RawMessage) (float64, bool) {
 	return f, true
 }
 
+// parseSort reads a request's sort: a list of sort keys, or a single one, as
+// Elasticsearch also takes it.
 func parseSort(raw json.RawMessage, ps *problems) []SortField {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
-		// A single sort key, as Elasticsearch also takes it.
 		items = []json.RawMessage{raw}
 	}
 	out := make([]SortField, 0, len(items))

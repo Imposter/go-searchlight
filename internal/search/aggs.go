@@ -248,7 +248,7 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		return &termsColl{s: s, spec: spec, src: src}
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
-	default: // histograms
+	default:
 		c := &histColl{s: s, spec: spec, src: src}
 		if src.kind == srcNumber {
 			c.b = newBucketer(spec, src.nc.Stats())
@@ -391,7 +391,7 @@ func (fs *fieldSrc) denseCounts(notHit *roaring.Bitmap) []int64 {
 	}
 }
 
-// termsColl counts documents per value.
+// termsColl counts documents per value; -0 and 0 are one value, in one bucket.
 type termsColl struct {
 	s    *segExec
 	spec *aggSpec
@@ -450,9 +450,7 @@ func (c *termsColl) collect(d uint32) {
 		}
 	case srcNumber:
 		if v, ok := c.src.nc.Value(d); ok {
-			if v == 0 {
-				v = 0 // one bucket for -0 and 0
-			}
+			v = positiveZero(v)
 			if c.numbers == nil {
 				c.numbers = map[float64]*histBucket{}
 			}
@@ -807,7 +805,7 @@ func calendarFloor(t time.Time, unit string) time.Time {
 		return time.Date(y, m, 1, 0, 0, 0, 0, time.UTC)
 	case "quarter":
 		return time.Date(y, ((m-1)/3)*3+1, 1, 0, 0, 0, 0, time.UTC)
-	default: // year
+	default:
 		return time.Date(y, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
 }
@@ -838,7 +836,8 @@ type denseCounter interface {
 	countDense(notHit *roaring.Bitmap) bool
 }
 
-// aggregate collects every aggregation over a segment's hits.
+// aggregate collects every aggregation over a segment's hits. A stats aggregation over
+// every document of a segment with no deletes is the number column's own stats.
 func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 	if len(s.p.aggs) == 0 {
 		return nil
@@ -859,7 +858,6 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 			}
 		}
 		if sc, ok := c.(*statsColl); ok && s.sv.Deletes.IsEmpty() && hits.GetCardinality() == uint64(s.n) && sc.src.kind == srcNumber {
-			// Every document matched: the column's own stats are the answer.
 			st := sc.src.nc.Stats()
 			if st.Count > 0 {
 				sc.st = StatsPartial{Count: int64(st.Count), Sum: st.Sum, Min: st.Min, Max: st.Max}

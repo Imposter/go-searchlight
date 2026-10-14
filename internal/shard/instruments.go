@@ -107,7 +107,8 @@ func (i *instruments) recordBacklog(ctx context.Context, segments int) {
 }
 
 // observeResident reports, at each collection, how much of the current generation's
-// segment mappings is resident in memory (where the platform can say).
+// segment mappings is resident in memory (where the platform can say: nothing is
+// reported where it cannot, or once a segment is closed).
 func (i *instruments) observeResident(meter metric.Meter, s *Shard) {
 	if meter == nil {
 		return
@@ -122,7 +123,7 @@ func (i *instruments) observeResident(meter metric.Meter, s *Shard) {
 		for _, sv := range g.Segments {
 			n, err := sv.Reader.ResidentBytes()
 			if err != nil {
-				return nil // unsupported here, or closed: nothing to report
+				return nil
 			}
 			total += n
 		}

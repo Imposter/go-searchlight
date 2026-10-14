@@ -150,13 +150,14 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 	return nil
 }
 
-// buildDocSegment writes docs as a new segment and opens it.
+// buildDocSegment writes docs as a new segment and opens it. It uses a build thread
+// per docsPerBuildThread documents, up to RefreshThreads: each Build worker keeps its
+// own per-term structures for its range of documents, so a small refresh split many
+// ways mostly multiplies that overhead.
 func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef, error) {
 	_, span := s.startSpan(ctx, "shard.build_segment", attribute.Int("documents", len(docs)))
 	defer span.End()
 	name := newSegmentName()
-	// Each Build worker keeps its own per-term structures for its range of documents,
-	// so a small refresh split many ways mostly multiplies that overhead.
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
 	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true, MarksUntyped: true})
 	if err != nil {
@@ -330,11 +331,12 @@ func manifestEntry(st *segState) manifestSegment {
 }
 
 // newSegmentName returns a segment name unique for the shard's life (and any other's):
-// 128 random bits, hex-encoded.
+// 128 random bits, hex-encoded. It panics when crypto/rand fails, which means the OS's
+// random number generator is broken.
 func newSegmentName() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand failing means the OS's RNG is broken
+		panic(err)
 	}
 	return hex.EncodeToString(b[:])
 }

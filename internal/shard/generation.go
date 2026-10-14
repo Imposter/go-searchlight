@@ -381,7 +381,8 @@ func (g *Generation) LookupQuery(id string) (seg int, ord uint32, ok bool) {
 	return 0, 0, false
 }
 
-// openGeneration opens every segment the manifest lists, checking each against it.
+// openGeneration opens every segment the manifest lists, checking each against it. The
+// generation it returns holds the segments' references: newGeneration took them.
 func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, error) {
 	legacy := man.UntypedMarks == untypedMarksFormat
 	var docs, queries []segState
@@ -426,7 +427,6 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 	}
 	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, mp, docs, queries)
 	g.marks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
-	// newGeneration took the generation's references; the opener's are not needed.
 	return g, nil
 }
 

@@ -103,7 +103,8 @@ func (c *MergeCandidate) deletedPct() float64 {
 }
 
 // FindMerges returns the merges to run now, as lists of segment IDs, none sharing a
-// segment. It never returns a merge of a Merging segment.
+// segment. It never returns a merge of a Merging segment, nor of one too big to merge
+// further and not deleted enough to rewrite.
 func (p TieredPolicy) FindMerges(segs []MergeCandidate) [][]string {
 	p = p.normalized()
 	var eligible []*MergeCandidate
@@ -116,7 +117,7 @@ func (p TieredPolicy) FindMerges(segs []MergeCandidate) [][]string {
 		}
 		size := c.size()
 		if size > p.MaxMergedBytes/2 && c.deletedPct() <= p.DeletesPctAllowed {
-			continue // too big to merge further, and not deleted enough to rewrite
+			continue
 		}
 		eligible = append(eligible, c)
 		total += size
@@ -208,7 +209,8 @@ func (p TieredPolicy) bestMerge(eligible []*MergeCandidate) []*MergeCandidate {
 	return best
 }
 
-// score is a merge's cost: lower is better.
+// score is a merge's cost: lower is better. A merge that would reach the size cap is
+// as good as a perfectly balanced one.
 func (p TieredPolicy) score(cand []*MergeCandidate, hitTooLarge bool) float64 {
 	var before, after, floored, maxFloored float64
 	for _, c := range cand {
@@ -221,7 +223,6 @@ func (p TieredPolicy) score(cand []*MergeCandidate, hitTooLarge bool) float64 {
 	}
 	skew := maxFloored / floored
 	if hitTooLarge {
-		// A merge that would reach the cap is as good as a perfectly balanced one.
 		skew = 1 / float64(p.MaxMergeAtOnce)
 	}
 	score := skew * math.Pow(max(after, 1), 0.05)

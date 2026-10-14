@@ -77,8 +77,8 @@ func TestChangeMarkSameByNonce(t *testing.T) {
 }
 
 // TestMigrateChangeNonce: a database at schema v2, holding changes, migrates to v3:
-// the old changes read with no nonce, new ones get one, and a v2 binary's insert,
-// which names no nonce column, still writes (a NULL nonce).
+// the old changes read with no nonce, new ones get one, and an older binary's insert
+// (the v1 one), which names no nonce column, still writes (a NULL nonce).
 func TestMigrateChangeNonce(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
@@ -103,7 +103,7 @@ func TestMigrateChangeNonce(t *testing.T) {
 		}
 		_, last := mustApply(t, st, upsert("old", 0, "new", `{}`))
 		if _, err := s.w.ExecContext(ctx, rebind(s, old.change), last+1, "old", "late", `{}`, meta.UID); err != nil {
-			t.Fatalf("a v2 binary's insert after the migration: %v", err)
+			t.Fatalf("a v1 binary's insert after the migration: %v", err)
 		}
 		if _, err := s.w.ExecContext(ctx, rebind(s, "UPDATE sl_counter SET value = ? WHERE id = 1"), last+1); err != nil {
 			t.Fatal(err)

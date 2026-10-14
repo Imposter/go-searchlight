@@ -290,7 +290,7 @@ The logical schema is the same in every dialect.
 | `sl_indexes` | name, mapping, settings |
 | `sl_documents` | index, shard, id, body, body_z, seq |
 | `sl_queries` | index, shard, id, query, meta, seq |
-| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at; index on (index, shard, seq) |
+| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at, nonce (a random BIGINT, migration 3; NULL on older rows); index on (index, shard, seq) |
 | `sl_counter` | the sequence row, locked per `Apply` |
 | `sl_nodes` | node_id, address, version, heartbeat_at, capacity, body_codecs |
 | `sl_features` | name, enabled_at: cluster features turned on for good (`zstd_bodies`) |

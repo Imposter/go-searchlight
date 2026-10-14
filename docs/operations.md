@@ -572,10 +572,10 @@ Notes:
   on the old binary keep reading and writing as before: they never touch the new column,
   and the changes they write have no nonce.
   - Upgraded nodes give every change they write a random nonce. A copy checking that the
-    changelog still holds what it applied compares nonces when both sides have one, and
-    the change's seq, shard, kind, id and commit time otherwise, as before. So a change
-    a failover lost, reissued to the same document in the same millisecond, is told
-    apart from the one that took its seq.
+    changelog still holds what it applied compares the change's seq, index, shard, kind,
+    id and commit time, as before, and, when both sides have one, the nonce too. So a
+    change a failover lost, reissued to the same document in the same millisecond, is
+    told apart from the one that took its seq.
   - Once the first node has migrated, an old binary refuses to start (the schema is newer
     than it knows), so **an old pod that crashes or restarts mid-rollout crash-loops** on
     `store: database schema is newer than this binary` until it runs the new image:

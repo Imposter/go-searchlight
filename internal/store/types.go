@@ -125,9 +125,9 @@ type Change struct {
 // ShardID returns the shard the change belongs to.
 func (c *Change) ShardID() ShardID { return ShardID{Index: c.Index, Shard: c.Shard} }
 
-// ChangeMark identifies one change of the changelog by what its row carries: its
-// seq, shard, kind, id, commit time and nonce. While the database keeps its commits a seq is
-// never reissued, so the change at a seq keeps its mark until it is pruned or its
+// ChangeMark identifies one change of the changelog by what its row carries: its seq,
+// shard, kind, id, commit time and nonce. While the database keeps its commits a seq
+// is never reissued, so the change at a seq keeps its mark until it is pruned or its
 // index dropped. A failover that loses commits reissues their seqs to other changes,
 // with other marks: that is how a tailer sees the changelog rewound under its copy.
 // The zero mark (Seq 0) names no change.

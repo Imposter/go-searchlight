@@ -81,7 +81,7 @@ SELECT pg_notify('` + notifyChannel + `', payload) FROM unnest($30::text[]) AS p
 // limits is the engine's: one write statement carries at most 64 MB of
 // payload, well below the 1 GB a single array value (and a protocol message)
 // may hold. A batch beyond it is written in several statements of the same
-// text. Bind parameters never limit it: writeSQL always takes 30.
+// text. Bind parameters never limit it: writeSQL always takes 31.
 var limits = dialect.Limits{Bytes: 64 << 20}
 
 // write spells w in parts of about l.Bytes payload bytes: one, unless the
@@ -213,7 +213,7 @@ func (a *writeArgs) queries(rows []dialect.QueryRow) {
 	}
 }
 
-// args returns writeSQL's 30 arguments. Every array is non-nil: pgx sends a
+// args returns writeSQL's 31 arguments. Every array is non-nil: pgx sends a
 // nil slice as NULL, and unnest(NULL) is no rows too, but an empty array says
 // what is meant.
 func (a *writeArgs) args(counter int64, notify []string) []any {

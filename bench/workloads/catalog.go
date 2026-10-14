@@ -29,10 +29,12 @@ func cond(field, op string, value any) q { return q{"field": field, "op": op, "v
 func allOf(children ...any) q            { return q{"all": children} }
 func notOf(child any) q                  { return q{"not": child} }
 
+// body marshals a workload body. Bodies are maps of JSON values only, so a failure
+// panics.
 func body(v map[string]any) []byte {
 	b, err := json.Marshal(v)
 	if err != nil {
-		panic(err) // maps of JSON values only
+		panic(err)
 	}
 	return b
 }
@@ -58,6 +60,10 @@ func needle(r *rand.Rand) string {
 }
 
 // SearchSpecs returns the search workloads, each with variants bodies, under seed.
+// filter_contains_description is the one contains workload on the long text field
+// (about 60 Zipfian words, versus title's handful): every other targets title, so a
+// regression specific to long-text residuals (format 4's trigram prefilter over a much
+// longer value) went unseen until it was added.
 func SearchSpecs(seed uint64, variants, pageDepth int) []SearchSpec {
 	r := rand.New(rand.NewPCG(seed, 0x5eed)) //nolint:gosec // reproducible workload values
 	gen := func(f func(i int) map[string]any) [][]byte {
@@ -99,10 +105,6 @@ func SearchSpecs(seed uint64, variants, pageDepth int) []SearchSpec {
 		{Name: "filter_contains", Group: report.GroupFilter, Description: "title contains (substring)", Bodies: gen(func(int) map[string]any {
 			return q{"query": cond("title", "contains", needle(r)), "size": 10}
 		})},
-		// description is the long text field (about 60 Zipfian words, versus title's
-		// handful); every other contains workload targets title, so a regression
-		// specific to long-text residuals (format 4's trigram prefilter over a much
-		// longer value) went unseen until this one was added.
 		{Name: "filter_contains_description", Group: report.GroupFilter, Description: "description contains (substring, long text)", Bodies: gen(func(int) map[string]any {
 			return q{"query": cond("description", "contains", datasets.Word(200+rank(r, 3000))), "size": 10}
 		})},

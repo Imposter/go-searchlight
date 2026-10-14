@@ -91,7 +91,8 @@ func ipath(index string, rest ...string) string {
 	return p
 }
 
-// Info implements Engine.
+// Info implements Engine. The node list is {"nodes": [...]} or a bare list, depending
+// on the coordinator.
 func (s *Searchlight) Info(ctx context.Context) (report.EngineInfo, error) {
 	info := report.EngineInfo{Name: s.Name(), URL: s.opts.URL, Config: map[string]string{}}
 	for k, v := range s.opts.Config {
@@ -107,7 +108,6 @@ func (s *Searchlight) Info(ctx context.Context) (report.EngineInfo, error) {
 	if err := s.c.json(ctx, http.MethodGet, "/_cluster/nodes", nil, &raw); err != nil {
 		return info, err
 	}
-	// The node list is {"nodes": [...]} or a bare list, depending on the coordinator.
 	if json.Unmarshal(raw, &nodes) != nil || len(nodes.Nodes) == 0 {
 		_ = json.Unmarshal(raw, &nodes.Nodes)
 	}
@@ -128,13 +128,13 @@ func (s *Searchlight) Ready(ctx context.Context) error {
 	})
 }
 
-// CreateIndex implements Engine.
+// CreateIndex implements Engine. An index being dropped may still hold its name for a
+// moment, so a conflict is retried for up to a minute.
 func (s *Searchlight) CreateIndex(ctx context.Context, index string, fields []datasets.Field, shards int) error {
 	if err := s.DeleteIndex(ctx, index); err != nil {
 		return err
 	}
 	body := datasets.SearchlightMapping(fields, shards, "1s")
-	// An index being dropped may still hold its name for a moment.
 	deadline := time.Now().Add(time.Minute)
 	for {
 		err := s.c.json(ctx, http.MethodPut, ipath(index), body, nil)
@@ -451,7 +451,8 @@ func (s *Searchlight) StoreBytes(context.Context) (int64, string, error) {
 	return n, "du " + strings.Join(s.opts.StorePaths, " + "), nil
 }
 
-// dirSize sums the sizes of the regular files under root (or root itself).
+// dirSize sums the sizes of the regular files under root (or root itself). A file
+// removed while it walks (a merged segment) counts for nothing.
 func dirSize(root string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
@@ -465,7 +466,7 @@ func dirSize(root string) (int64, error) {
 			info, err := d.Info()
 			if err != nil {
 				if errors.Is(err, fs.ErrNotExist) {
-					return nil // removed while walking (a merged segment)
+					return nil
 				}
 				return err
 			}

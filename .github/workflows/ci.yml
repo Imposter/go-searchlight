@@ -22,15 +22,15 @@ jobs:
     name: vet and lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: go.mod and go.sum are tidy
         run: go mod tidy -diff
       - name: go vet
         run: go vet ./...
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13.2
 
@@ -79,8 +79,8 @@ jobs:
       SEARCHLIGHT_TEST_PG_URL: postgres://searchlight:searchlight@127.0.0.1:5432/searchlight?sslmode=disable
       SEARCHLIGHT_TEST_MYSQL_URL: mysql://searchlight:searchlight@127.0.0.1:3306/searchlight
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: build
@@ -92,8 +92,8 @@ jobs:
     name: build, test -short, smoke and NTFS heavy (Windows, SQLite)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: build
@@ -114,7 +114,7 @@ jobs:
     name: image, compose and Kubernetes manifests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: compose files are valid
         run: docker compose -f deploy/compose.yml config --quiet
       - name: the compose samples and deploy/.env.example agree
@@ -147,6 +147,18 @@ jobs:
           test "$(docker image inspect -f '{{.Config.User}}' searchlight:dev)" = "65532:65532"
           docker image inspect -f '{{json .Config.Healthcheck.Test}}' searchlight:dev | grep -q '"healthcheck"'
           if docker run --rm searchlight:dev healthcheck; then echo "healthcheck passed with no node running"; exit 1; fi
+      - name: the image is built with go.mod's toolchain, and carries the licences
+        # A Dependabot bump of the golang image's digest to another Go release fails here
+        # until go.mod's toolchain line follows it: the release binaries use that line.
+        run: |
+          toolchain=$(sed -n 's/^toolchain //p' go.mod)
+          docker run --rm searchlight:dev version | grep -F "($toolchain, linux/amd64)"
+          docker create --name licences searchlight:dev > /dev/null
+          docker cp licences:/usr/share/doc/searchlight "$RUNNER_TEMP/doc"
+          docker rm licences > /dev/null
+          cmp LICENSE "$RUNNER_TEMP/doc/LICENSE"
+          grep -q "^Go $toolchain, its runtime and standard library" "$RUNNER_TEMP/doc/THIRD_PARTY_NOTICES"
+          grep -q "^github.com/jackc/pgx/v5 " "$RUNNER_TEMP/doc/THIRD_PARTY_NOTICES"
       - name: start the compose cluster (the command docs/operations.md gives)
         run: docker compose -f deploy/compose.yml up --build -d
       - name: the compose cluster serves

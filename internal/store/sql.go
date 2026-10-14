@@ -849,7 +849,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	// below it are read first, in the same snapshot as the rows.
 	var mc markColumns
 	var own shardMarkColumns
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, shard.Index, shard.Shard).Scan(&pt.Seq,
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, s.customPlan(shard.Index, shard.Shard)...).Scan(&pt.Seq,
 		&mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
 		return pt, err
 	}
@@ -928,14 +928,17 @@ func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
 	if s.closed.Load() {
 		return tip, ErrClosed
 	}
+	return s.readTip(ctx, s.r, q)
+}
+
+// readTip runs the per-poll statement (Changelog.ReadTip) on db.
+func (s *sqlStore) readTip(ctx context.Context, db queryer, q TipQuery) (tip Tip, err error) {
 	var nowMs int64
 	var head, at markColumns
 	var own shardMarkColumns
 	var horizon sql.NullInt64
 	var uid sql.NullString
-	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadTip,
-		q.Shard.Index, q.Shard.Shard, q.Shard.Index, q.At, q.Shard.Index, q.Shard.Shard, q.UpTo,
-	).Scan(&tip.Head, &nowMs,
+	err = db.QueryRowContext(ctx, s.d.Changelog.ReadTip, s.tipArgs(q)...).Scan(&tip.Head, &nowMs,
 		&head.index, &head.shard, &head.kind, &head.id, &head.at, &head.nonce,
 		&at.index, &at.shard, &at.kind, &at.id, &at.at, &at.nonce,
 		&own.seq, &own.kind, &own.id, &own.at, &own.nonce, &horizon, &uid)
@@ -945,6 +948,17 @@ func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
 	tip.Now, tip.HeadMark, tip.AtMark = millis(nowMs), head.mark(tip.Head), at.mark(q.At)
 	tip.ShardMark, tip.Horizon, tip.IndexUID = own.mark(q.Shard), horizon.Int64, uid.String
 	return tip, nil
+}
+
+// tipArgs returns Changelog.ReadTip's arguments for q.
+func (s *sqlStore) tipArgs(q TipQuery) []any {
+	return s.customPlan(q.Shard.Index, q.Shard.Shard, q.Shard.Index, q.At, q.Shard.Index, q.Shard.Shard, q.UpTo)
+}
+
+// customPlan returns the arguments of a statement the engine must plan for their
+// values at every run (dialect.Dialect.CustomPlan).
+func (s *sqlStore) customPlan(args ...any) []any {
+	return append(slices.Clip(s.d.CustomPlan), args...)
 }
 
 // shardMarkColumns scans the mark of a known shard's change from a LEFT JOIN, NULL

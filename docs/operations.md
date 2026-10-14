@@ -479,11 +479,18 @@ rebuilt.**
   are gone, and new writes reuse their seqs. Running copies detect it at their next
   poll and rebuild from the database by themselves (the log line `the changelog no
   longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
-  their shards serve again once the rebuilds finish. Nodes stopped across the failover,
-  however long, need nothing either: each copy's manifest keeps what it applied of its
-  own shard and the marks of the changes it applied last, which the copy checks when it
-  starts. (A copy whose last flush predates these marks has none until it flushes
-  again, and trusts what it reads at its first poll: only once, at the upgrade.)
+  their shards serve again once the rebuilds finish. Nodes stopped across the failover
+  need nothing either while their copies still hold the changelog's prune floor: each
+  copy's manifest keeps what it applied of its own shard and the marks of the changes it
+  applied last, which the copy checks when it starts. A stopped node's copy holds the
+  floor until the node is found dead or the copy's lease runs out (seconds), or, when a
+  clean stop retired it, for `retiring_retention` (15 min) after its lease ran out; and
+  changes older than `changelog_retention` are pruned whatever copy needs them. A node
+  back later may find its shards pruned without it: a copy pruned past its seq rebuilds,
+  but in one pruned short of it, a rewind whose reissued changes of the copy's shard
+  were all pruned may go unseen. (A copy whose last flush
+  predates these marks has none until it flushes again, and trusts what it reads at its
+  first poll: only once, at the upgrade.)
 
 ## Upgrades and rolling restarts
 

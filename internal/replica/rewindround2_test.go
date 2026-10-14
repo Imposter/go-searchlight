@@ -256,3 +256,56 @@ func TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy(t *testing.T) 
 		}
 	})
 }
+
+// TestStoppedAcrossARewindAfterIdleAdvancesRebuildsTheCopy: the copy's own shard is
+// idle while another shard writes over several polls, so the copy only advances past
+// its last own change. It is then stopped across a lossy failover whose reissued seqs
+// land on its own shard above that change, and the other shard prunes its rows before
+// the copy starts again. The own-shard check followed the idle advances, so it covers
+// the reissued own changes, and the copy rebuilds.
+func TestStoppedAcrossARewindAfterIdleAdvancesRebuildsTheCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		createIndex(t, st, "x", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		opts, reader := meteredOptions()
+		c := newCopy(t, d.open(t), id, opts)
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("w", 0, "a", docBody("a", 1))))
+		time.Sleep(100 * time.Millisecond)
+		var k int64
+		for i := range 10 {
+			last := mustApply(t, st, upsert("x", 0, fmt.Sprintf("x%d", i), docBody("x", i)))
+			if i == 4 {
+				k = last
+			}
+			c.current().Wake()
+			c.waitApplied(last)
+			time.Sleep(30 * time.Millisecond)
+		}
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rewind(ctx, t, d, k)
+		mustApply(t, st, upsert("x", 0, "nx1", docBody("nx", 1)))
+		mustApply(t, st, upsert("w", 0, "new0", docBody("new", 0)), upsert("w", 0, "new1", docBody("new", 1)))
+		var batch []store.Change
+		for i := range 4 {
+			batch = append(batch, upsert("x", 0, fmt.Sprintf("nx%d", i+2), docBody("nx", i)))
+		}
+		head := mustApply(t, st, batch...)
+		if err := st.Prune(ctx, store.ShardID{Index: "x", Shard: 0}, head+1); err != nil {
+			t.Fatal(err)
+		}
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
+		}
+	})
+}

@@ -185,6 +185,7 @@ type Generation struct {
 	uid     string
 	mapping *schema.Mapping
 	mp      *mappingState // mapping, with its version
+	marks   marks
 
 	// Segments are the document segments, in base-ordinal order.
 	Segments []SegmentView
@@ -424,6 +425,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, mp, docs, queries)
+	g.marks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
 	// newGeneration took the generation's references; the opener's are not needed.
 	return g, nil
 }

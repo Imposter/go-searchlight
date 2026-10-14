@@ -219,7 +219,7 @@ func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq in
 	}
 	c := sl.local.Load()
 	if c != nil && (n.cl == nil || (c.notServing() == nil && !n.copyStale(c))) {
-		t, err := n.localTarget(ctx, c, waitSeq, queryWait)
+		t, err := n.localTarget(ctx, idx, c, waitSeq, queryWait)
 		if err == nil || n.cl == nil || ctx.Err() != nil {
 			return t, err
 		}
@@ -236,11 +236,11 @@ func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq in
 		rt, err := n.cl.Remote(ctx, sl.id, max(waitSeq, queryWait))
 		switch {
 		case err == nil && c != nil:
-			return &fallbackTarget{primary: rt, fallback: func() (ShardTarget, error) { return n.localTarget(ctx, c, waitSeq, queryWait) }}, nil
+			return &fallbackTarget{primary: rt, fallback: func() (ShardTarget, error) { return n.localTarget(ctx, idx, c, waitSeq, queryWait) }}, nil
 		case err == nil:
 			return rt, nil
 		case c != nil:
-			return n.localTarget(ctx, c, waitSeq, queryWait)
+			return n.localTarget(ctx, idx, c, waitSeq, queryWait)
 		}
 		return nil, err
 	}
@@ -271,7 +271,7 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 			return nil, err
 		}
 	}
-	t, err := n.localTarget(ctx, c, waitSeq, 0)
+	t, err := n.localTarget(ctx, idx, c, waitSeq, 0)
 	if err == nil && c.lapsed() {
 		// The lease lapsed while the read waited: no peer may use the copy now.
 		t.Release()
@@ -280,23 +280,20 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 	return t, err
 }
 
-// localTarget holds a generation of copy c once it has waitSeq searchable (a 504 at the
-// deadline) and queryWait refreshed.
-func (n *Single) localTarget(ctx context.Context, c *copyState, waitSeq, queryWait int64) (ShardTarget, error) {
+// localTarget holds a generation of copy c of idx once it has waitSeq searchable and
+// queryWait refreshed (a 504 at the deadline).
+func (n *Single) localTarget(ctx context.Context, idx *index, c *copyState, waitSeq, queryWait int64) (ShardTarget, error) {
 	if waitSeq > 0 {
 		if err := c.notServing(); err != nil {
 			return nil, err
 		}
-		if err := n.waitCopy(ctx, c, waitSeq); err != nil {
+		if err := n.waitCopy(ctx, idx, c, waitSeq); err != nil {
 			return nil, err
 		}
 	}
 	if queryWait > 0 {
-		if sh := c.shard(); sh != nil && sh.RefreshedSeq() < queryWait {
-			c.tailer.Wake()
-			if err := c.waitRefreshed(ctx, queryWait); err != nil {
-				return nil, err
-			}
+		if err := n.waitCopy(ctx, idx, c, queryWait); err != nil {
+			return nil, err
 		}
 	}
 	g, err := c.acquire()
@@ -306,14 +303,22 @@ func (n *Single) localTarget(ctx context.Context, c *copyState, waitSeq, queryWa
 	return &localTarget{c: c, g: g, stale: n.copyStale(c)}, nil
 }
 
-// waitCopy waits, under ctx's deadline, until copy c has seq searchable: a 504 when the
-// deadline passes first, a 503 when the copy halts.
-func (n *Single) waitCopy(ctx context.Context, c *copyState, seq int64) error {
+// waitCopy waits, under ctx's deadline, until copy c of idx has seq searchable: a 504
+// when the deadline passes first, a 503 when the copy halts. On an index whose refresh
+// is disabled nothing refreshes by itself, so the copy is refreshed on demand once it
+// has applied seq.
+func (n *Single) waitCopy(ctx context.Context, idx *index, c *copyState, seq int64) error {
 	if sh := c.shard(); sh != nil && sh.RefreshedSeq() >= seq {
 		return nil
 	}
 	c.tailer.Wake()
-	err := c.waitRefreshed(ctx, seq)
+	var err error
+	if idx.refreshDisabled() {
+		err = n.refreshApplied(ctx, c, seq)
+	}
+	if err == nil {
+		err = c.waitRefreshed(ctx, seq)
+	}
 	if err == nil {
 		return nil
 	}

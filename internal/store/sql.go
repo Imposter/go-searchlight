@@ -829,24 +829,29 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	return out, nil
 }
 
-func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOf int64, err error) {
+func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (pt ScanPoint, err error) {
 	ctx, end := s.start(ctx, "scan_shard", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
 	if s.closed.Load() {
-		return 0, ErrClosed
+		return pt, ErrClosed
 	}
 	if err := validShard(shard); err != nil {
-		return 0, err
+		return pt, err
 	}
 	tx, err := s.r.BeginTx(ctx, s.d.SnapshotTx)
 	if err != nil {
-		return 0, err
+		return pt, err
 	}
 	defer rollback(tx)
-	// The counter is read first, in the same snapshot as the rows.
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounter).Scan(&asOf); err != nil {
-		return 0, err
+	// The counter, the mark of the change at it and the shard's newest change at or
+	// below it are read first, in the same snapshot as the rows.
+	var mc markColumns
+	var own shardMarkColumns
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, s.customPlan(shard.Index, shard.Shard)...).Scan(&pt.Seq,
+		&mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &own.seq, &own.kind, &own.id, &own.at); err != nil {
+		return pt, err
 	}
+	pt.Mark, pt.ShardMark = mc.mark(pt.Seq), own.mark(shard)
 	// The index's current incarnation and mapping, read once in this scan's
 	// snapshot: the mapping is the first record, and the incarnation and
 	// mapping version are stamped on every record.
@@ -856,11 +861,11 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	switch err := tx.QueryRowContext(ctx, s.d.Changelog.IndexState, shard.Index).Scan(&uid, &mv, &mapping); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
-		return 0, err
+		return pt, err
 	default:
 		r := Record{Kind: RecordMapping, Index: shard.Index, Shard: shard.Shard, Body: mapping, IndexUID: uid, MappingVersion: mv}
 		if err := fn(r); err != nil {
-			return 0, err
+			return pt, err
 		}
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanDocuments, shard, func(rows *sql.Rows) (Record, error) {
@@ -875,15 +880,15 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 		}
 		return r, nil
 	}, fn); err != nil {
-		return 0, err
+		return pt, err
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanQueries, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
 	}, fn); err != nil {
-		return 0, err
+		return pt, err
 	}
-	return asOf, tx.Commit()
+	return pt, tx.Commit()
 }
 
 func scanRows(ctx context.Context, tx *sql.Tx, q string, shard ShardID, scan func(*sql.Rows) (Record, error), fn func(Record) error) error {
@@ -913,6 +918,72 @@ func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, now time.Time, err e
 	var nowMs int64
 	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadHead).Scan(&seq, &nowMs)
 	return seq, millis(nowMs), err
+}
+
+func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
+	ctx, end := s.start(ctx, "tip")
+	defer end(&err)
+	if s.closed.Load() {
+		return tip, ErrClosed
+	}
+	return s.readTip(ctx, s.r, q)
+}
+
+// readTip runs the per-poll statement (Changelog.ReadTip) on db.
+func (s *sqlStore) readTip(ctx context.Context, db queryer, q TipQuery) (tip Tip, err error) {
+	var nowMs int64
+	var head, at markColumns
+	var own shardMarkColumns
+	var horizon sql.NullInt64
+	var uid sql.NullString
+	err = db.QueryRowContext(ctx, s.d.Changelog.ReadTip, s.tipArgs(q)...).Scan(&tip.Head, &nowMs,
+		&head.index, &head.shard, &head.kind, &head.id, &head.at,
+		&at.index, &at.shard, &at.kind, &at.id, &at.at,
+		&own.seq, &own.kind, &own.id, &own.at, &horizon, &uid)
+	if err != nil {
+		return tip, err
+	}
+	tip.Now, tip.HeadMark, tip.AtMark = millis(nowMs), head.mark(tip.Head), at.mark(q.At)
+	tip.ShardMark, tip.Horizon, tip.IndexUID = own.mark(q.Shard), horizon.Int64, uid.String
+	return tip, nil
+}
+
+// tipArgs returns Changelog.ReadTip's arguments for q.
+func (s *sqlStore) tipArgs(q TipQuery) []any {
+	return s.customPlan(q.Shard.Index, q.Shard.Shard, q.Shard.Index, q.At, q.Shard.Index, q.Shard.Shard, q.UpTo)
+}
+
+// customPlan returns the arguments of a statement the engine must plan for their
+// values at every run (dialect.Dialect.CustomPlan).
+func (s *sqlStore) customPlan(args ...any) []any {
+	return append(slices.Clip(s.d.CustomPlan), args...)
+}
+
+// shardMarkColumns scans the mark of a known shard's change from a LEFT JOIN, NULL
+// when there is none.
+type shardMarkColumns struct {
+	kind, id sql.NullString
+	seq, at  sql.NullInt64
+}
+
+func (c *shardMarkColumns) mark(shard ShardID) ChangeMark {
+	if !c.seq.Valid {
+		return ChangeMark{}
+	}
+	return ChangeMark{Seq: c.seq.Int64, Index: shard.Index, Shard: shard.Shard, Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
+}
+
+// markColumns scans a change's mark from a LEFT JOIN, NULL when there is no change.
+type markColumns struct {
+	index, kind, id sql.NullString
+	shard, at       sql.NullInt64
+}
+
+func (c *markColumns) mark(seq int64) ChangeMark {
+	if !c.index.Valid {
+		return ChangeMark{}
+	}
+	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
 }
 
 // --- Pruning ---------------------------------------------------------------

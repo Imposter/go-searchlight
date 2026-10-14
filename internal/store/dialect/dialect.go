@@ -97,6 +97,15 @@ type Dialect struct {
 	// engine, may simply be run again. Nil means none are.
 	Retryable func(error) bool
 
+	// CustomPlan, when set, goes before the arguments of the statements that must be
+	// planned for their arguments' values at every run: the changelog reads that find
+	// a shard's newest change at or below a seq (Changelog.ReadTip, run at every
+	// poll, and ReadCounterMark). A plan made once for any shard may not use the
+	// shard's index, and then walks the changelog down from the seq past every newer
+	// change of every other shard. PostgreSQL makes such a generic plan for a
+	// prepared statement after five runs.
+	CustomPlan []any
+
 	// Listen, when set, subscribes conn to the commit notifications that
 	// Changelog.Write sends with Write.Notify, calls ready (when not nil) once
 	// it is subscribed, and calls fn with each payload until ctx ends. It is

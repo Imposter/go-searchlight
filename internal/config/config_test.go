@@ -404,3 +404,36 @@ func TestParseBytes(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadRefusesAClusterStoreWithoutClusterToken: on Postgres or MySQL, a store nodes
+// share, the peer API needs cluster_token; only insecure_no_auth starts without it.
+func TestLoadRefusesAClusterStoreWithoutClusterToken(t *testing.T) {
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	if err := os.WriteFile(tokens, []byte("t0ken write\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		store, clusterToken, insecureNoAuth string
+		ok                                  bool
+	}{
+		{"postgres://u@db/sl", "", "", false},
+		{"mysql://u@db/sl", "", "", false},
+		{"postgres://u@db/sl", "secret", "", true},
+		{"mysql://u@db/sl", "", "true", true},
+		{sqliteURL, "", "", true},
+	} {
+		env := map[string]string{
+			"SEARCHLIGHT_STORE_URL": tc.store, "SEARCHLIGHT_TOKENS_FILE": tokens,
+			"SEARCHLIGHT_CLUSTER_TOKEN": tc.clusterToken, insecure: tc.insecureNoAuth,
+		}
+		_, err := Load(nil, envOf(env))
+		switch {
+		case tc.ok && err != nil:
+			t.Errorf("%+v: %v", tc, err)
+		case !tc.ok && (err == nil || !strings.Contains(err.Error(), "set cluster_token")):
+			t.Errorf("%+v: err = %v, want one asking to set cluster_token", tc, err)
+		case !tc.ok && strings.Index(err.Error(), "insecure_no_auth") < strings.Index(err.Error(), "set cluster_token"):
+			t.Errorf("%+v: err = %v, want cluster_token offered before insecure_no_auth", tc, err)
+		}
+	}
+}

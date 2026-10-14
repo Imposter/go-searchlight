@@ -47,10 +47,12 @@ type Coordinator interface {
 	// error is returned only when nothing could be written. Write may release the
 	// ops' bodies once it holds its own copies.
 	Write(ctx context.Context, index string, ops []WriteOp, opts WriteOptions) (*WriteResult, error)
-	// GetDocument reads a document's current version (realtime).
-	GetDocument(ctx context.Context, index, id string) (*Document, error)
-	// GetQuery reads a saved query's current version (realtime).
-	GetQuery(ctx context.Context, index, id string) (*SavedQuery, error)
+	// GetDocument reads a document's current version (realtime), with every change up
+	// to opts.WaitForSeq in it.
+	GetDocument(ctx context.Context, index, id string, opts ReadOptions) (*Document, error)
+	// GetQuery reads a saved query's current version (realtime), with every change up
+	// to opts.WaitForSeq in it.
+	GetQuery(ctx context.Context, index, id string, opts ReadOptions) (*SavedQuery, error)
 	// ListQueries pages an index's saved queries by id: up to size of them with ids
 	// above after.
 	ListQueries(ctx context.Context, index, after string, size int) ([]*SavedQuery, error)
@@ -285,6 +287,10 @@ type WriteResult struct {
 	// document's Queries were filled. When it is not (a deadline passed waiting for
 	// WaitForSeq, a copy closed), the writes are committed all the same.
 	Percolated bool
+	// PercolateErr is why the percolation asked for did not finish, nil when it did:
+	// a passed deadline, a closed copy, too many matches. It is reported in the
+	// response, never as the write's error.
+	PercolateErr error
 }
 
 // ItemResult is one op's outcome.

@@ -72,3 +72,40 @@ func TestCorruptHalts(t *testing.T) {
 		})
 	}
 }
+
+// TestSupersededLooksPastAnotherCorruptRow: a copy halted at a damaged change looks for
+// a later change of the same document to get past it; another document's damaged
+// change on the way is skipped, not taken as a failure to retry forever.
+func TestSupersededLooksPastAnotherCorruptRow(t *testing.T) {
+	const damaged, alsoDamaged = `{"title":"damaged"}`, `{"title":"also damaged"}`
+	forEachDialect(t, func(t *testing.T, d *db) {
+		st := d.open(t)
+		createIndex(t, st, "c", testMapping)
+		id := ShardID{Index: "c", Shard: 0}
+		fs := newFaultStore(d.open(t))
+		fs.corrupt = func(c *store.Change) bool { return string(c.Payload) == damaged || string(c.Payload) == alsoDamaged }
+		fs.onRecord = func(_ context.Context, _ int, r store.Record) error {
+			if string(r.Body) == damaged {
+				return &store.CorruptError{Shard: id, Seq: r.Seq, ID: r.ID, Err: errInjected}
+			}
+			return nil
+		}
+		opts, _ := meteredOptions()
+		opts.HaltRetryBase, opts.HaltRetryCap = 20*time.Millisecond, 50*time.Millisecond
+		c := newCopy(t, fs, id, opts)
+		c.withFakeClock(opts.HaltRetryCap)
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("c", 0, "ok1", docBody("ok1", 1))))
+		mustApply(t, st, upsert("c", 0, "bad", damaged), upsert("c", 0, "bad2", alsoDamaged))
+		c.until("the copy halts", func() bool { return c.current().Halt() != nil })
+
+		head := mustApply(t, st, upsert("c", 0, "bad", docBody("bad", 3)))
+		sh := c.waitApplied(head)
+		if h := c.current().Halt(); h != nil {
+			t.Fatalf("still halted: %+v", h)
+		}
+		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+			t.Fatalf("recovered copy differs:\n%s", dd)
+		}
+	})
+}

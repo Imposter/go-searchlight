@@ -56,6 +56,7 @@ func ReplicaTailers(cfg config.Config, hub *replica.Hub, clk clock.Clock, log *s
 		return replicaTailer{replica.NewTailer(st, sh, id, replica.Options{
 			Copy:            env.Copy,
 			Fetcher:         env.Fetcher,
+			OnRewind:        env.Rewound,
 			PollInterval:    cfg.ChangelogPollInterval,
 			MaxLag:          cfg.MaxLag,
 			RemapDebounce:   remap,

@@ -298,10 +298,12 @@ type Node struct {
 	scheme string
 	// clearWarned are the peers warned about getting the cluster token in the clear.
 	clearWarned sync.Map
-	ars         *ars
-	view        atomic.Pointer[view]
-	missMu      sync.Mutex
-	missReadAt  time.Time
+	// refusedWarned are the peers warned about refusing this node's cluster token.
+	refusedWarned sync.Map
+	ars           *ars
+	view          atomic.Pointer[view]
+	missMu        sync.Mutex
+	missReadAt    time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
@@ -604,14 +606,16 @@ func (n *Node) retire(ctx context.Context, l *lease) bool {
 	return true
 }
 
-// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not),
-// stops the loops, stops every copy's tailer and closes its shard (a final manifest and
-// a final applied seq), marks every copy retiring and deregisters the node, then closes
-// the engine. The copies' leases are not released: their rows stay, retiring, at their
-// final applied seqs, so the changelog the node needs to replay when it comes back is
-// kept for retiring_retention, and the node claims its own slots back at the same
-// epochs. Peers place replacements meanwhile (a retiring copy does not count towards
-// its target). It does not close the store. It is idempotent; Close is the same.
+// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not)
+// and stops the loops; it stops every copy's tailer, all together (each makes a final
+// flush and a final applied-seq report), marks every copy retiring while its lease is
+// live and no tailer is left to write its state, then closes the shards, deregisters
+// the node and closes the engine. The copies' leases are not released: their rows stay,
+// retiring, at their final applied seqs, so the changelog the node needs to replay when
+// it comes back is kept for retiring_retention, and the node claims its own slots back
+// at the same epochs. Peers place replacements meanwhile (a retiring copy does not
+// count towards its target). It does not close the store. It is idempotent; Close is
+// the same.
 func (n *Node) Stop(ctx context.Context) error {
 	n.stopOnce.Do(func() {
 		n.stopped.Store(true)
@@ -622,14 +626,27 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.loops.Wait()
 		n.closeBackground()
 		var errs []error
-		for _, l := range n.leaseList() {
+		leases := n.leaseList()
+		var tailers sync.WaitGroup
+		for _, l := range leases {
+			tailers.Go(func() { n.StopTailer(l.copy) })
+		}
+		tailers.Wait()
+		for _, l := range leases {
+			if l.retired.Load() {
+				continue
+			}
+			switch err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); {
+			case err == nil:
+				n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
+			case !errors.Is(err, store.ErrLeaseLost):
+				n.log.WarnContext(ctx, "marking a stopping node's copy retiring failed; once its lease expires it is rebuilt elsewhere rather than replayed",
+					slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+			}
+		}
+		for _, l := range leases {
 			if err := n.unhostCopy(ctx, l.copy, false); err != nil {
 				errs = append(errs, err)
-			}
-			if !l.retired.Load() {
-				if err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); err == nil {
-					n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
-				}
 			}
 			n.dropLease(l)
 		}

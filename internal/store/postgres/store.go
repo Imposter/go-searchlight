@@ -6,7 +6,9 @@
 // statement whose rows travel as arrays (see writeSQL). Writes that are read
 // back use RETURNING. Migrations run in one transaction under a
 // transaction-scoped advisory lock. Committed changes are announced with
-// NOTIFY, which Listen turns into tailer wake-ups.
+// NOTIFY, which Listen turns into tailer wake-ups. The changelog reads that find a
+// shard's newest change run as unnamed statements (pgx.QueryExecModeExec), which
+// PostgreSQL plans for their values at every run (dialect.Dialect.CustomPlan).
 package postgres
 
 import (
@@ -45,6 +47,7 @@ func Dialect() *dialect.Dialect {
 		ApplyTx:     &sql.TxOptions{Isolation: sql.LevelReadCommitted},
 		SnapshotTx:  &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
 		Retryable:   retryable,
+		CustomPlan:  []any{pgx.QueryExecModeExec},
 		Listen:      listen,
 		Changelog:   changelog,
 		Records:     records,

@@ -18,8 +18,10 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestPinnedFetchSurvivesRetire: a search's query phase pins a generation on a peer,
@@ -375,4 +377,159 @@ func (pp *peerProbe) RoundTrip(r *http.Request) (*http.Response, error) {
 	c := r.Clone(r.Context())
 	c.Body = io.NopCloser(bytes.NewReader(b))
 	return pp.base.RoundTrip(c)
+}
+
+// TestWaitForWaitsOnOneCopy: refresh=wait_for returns once the write is searchable on
+// the coordinator's own copy, or, on a node without one, on the first copy that has
+// it: a peer copy whose tailer lags does not hold the write to its deadline.
+func TestWaitForWaitsOnOneCopy(t *testing.T) {
+	testtier.Heavy(t)
+	c := newCluster(t, sqliteDB(t), nil)
+	nodes := []*tnode{c.start(0), c.start(1), c.start(2)}
+	a := nodes[0]
+	createIndex(t, a.n, "wf", 1, 0)
+	waitCopies(t, a.st, "wf", 1, 3, time.Minute)
+	createIndex(t, a.n, "wf1", 1, 2)
+	waitCopies(t, a.st, "wf1", 1, 2, time.Minute)
+
+	stall := func(tn *tnode) {
+		t.Helper()
+		ch := make(chan struct{})
+		t.Cleanup(func() { close(ch) })
+		tn.wrap.stallTail.Store(&ch)
+		eventually(t, 10*time.Second, tn.cfg.NodeID+"'s tailers are held", func() error {
+			if tn.wrap.stalled.Load() == 0 {
+				return errors.New("no poll held yet")
+			}
+			return nil
+		})
+	}
+	write := func(tn *tnode, index string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		res, err := tn.n.Write(ctx, index, []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: api.RefreshWaitFor})
+		if err != nil || res.TimedOut {
+			t.Fatalf("a wait_for write to %s through %s: %+v, %v after %s", index, tn.cfg.NodeID, res, err, time.Since(start))
+		}
+	}
+
+	_, holders := serving(t, a.st, store.ShardID{Index: "wf1"})
+	var coordinator, lagging *tnode
+	for _, tn := range nodes {
+		switch {
+		case !slices.Contains(holders, tn.cfg.NodeID):
+			coordinator = tn
+		case lagging == nil:
+			lagging = tn
+		}
+	}
+	if coordinator == nil || lagging == nil {
+		t.Fatalf("wf1 is served by %v", holders)
+	}
+	stall(lagging)
+	write(coordinator, "wf1")
+	writer := a
+	if writer == lagging {
+		writer = coordinator
+	}
+	write(writer, "wf")
+}
+
+// TestWritesDoNotWaitOnACopyRebuiltAside: a copy being rebuilt aside serves its old data
+// and applies nothing until its replacement is swapped in, so a refresh=wait_for or
+// refresh=true write through its node waits on a copy that applies (the peer's) rather
+// than on it, and answers within its deadline.
+func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
+	testtier.Heavy(t)
+	release := make(chan struct{})
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.HoldRecovery = func(ctx context.Context) error {
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	a := c.start(0)
+	b := c.start(1)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "rb", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, a.st, "rb", 1, 2, time.Minute)
+	last := mustWrite(t, a.n, "rb", api.WriteOp{Kind: api.OpUpsert, ID: "r", Body: json.RawMessage(`{"title": "x", "colour": "red"}`)})
+	waitCount(t, b.n, "rb", last, 1)
+	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
+		t.Fatal(err)
+	}
+	copyOf := func(tn *tnode) api.ShardInfo {
+		shards, err := tn.n.Shards(tctx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range shards {
+			if s.Index == "rb" && s.Node == tn.cfg.NodeID {
+				return s
+			}
+		}
+		return api.ShardInfo{}
+	}
+	eventually(t, time.Minute, "node-1's copy is held mid-rebuild and node-0's is rebuilt", func() error {
+		if s := copyOf(b); !s.Rebuilding {
+			return fmt.Errorf("node-1's copy: %+v", s)
+		}
+		if s := copyOf(a); s.Rebuilding || s.State != api.ShardServing {
+			return fmt.Errorf("node-0's copy: %+v", s)
+		}
+		return nil
+	})
+	for _, mode := range []api.RefreshMode{api.RefreshWaitFor, api.RefreshTrue} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		start := time.Now()
+		res, err := b.n.Write(ctx, "rb", []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: mode})
+		cancel()
+		if err != nil || res.TimedOut {
+			t.Fatalf("a %v write through the node rebuilding its copy: %+v, %v after %s", mode, res, err, time.Since(start))
+		}
+	}
+}
+
+// TestPercolateRereadsAStaleCatalogue: a node whose cached mapping predates a field
+// another node mapped re-reads the catalogue when a percolated document names a field
+// the cache lacks, instead of dropping it (dynamic false) until its next sync, so the
+// saved queries on the field match.
+func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.CatalogInterval = time.Hour
+		}
+	})
+	a := c.start(0)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "pc", spec); err != nil {
+		t.Fatal(err)
+	}
+	b := c.start(1) // it reads the catalogue as it starts, and not again for an hour
+	waitCopies(t, a.st, "pc", 1, 2, time.Minute)
+	if _, err := a.n.PatchMapping(tctx(t), "pc", map[string]schema.FieldType{"tags": schema.KeywordList}); err != nil {
+		t.Fatal(err)
+	}
+	seq := mustWrite(t, a.n, "pc", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "tags", "op": "has", "value": "x"}`)})
+	res, err := b.n.Percolate(tctx(t), "pc", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"tags": ["x"]}`)}}, api.ReadOptions{WaitForSeq: seq})
+	if err != nil || string(res.Results[0].Queries) != `["q"]` {
+		t.Fatalf("percolating on the node with a stale catalogue: %+v, %v", res, err)
+	}
 }

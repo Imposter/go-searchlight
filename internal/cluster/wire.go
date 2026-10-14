@@ -19,8 +19,9 @@ const peerPrefix = "/_internal/"
 
 // Headers of the peer API.
 const (
-	// headerDeadline carries the caller's remaining deadline in milliseconds: the
-	// peer works under it, so a search past it answers timed_out as a local one does.
+	// headerDeadline carries the caller's remaining deadline, less a reserve
+	// (peerReserve), in milliseconds: the peer works under it, so a search past it
+	// answers timed_out as a local one does, in time for the caller to use it.
 	headerDeadline = "X-Searchlight-Deadline-Ms"
 	// headerServiceTime and headerQueue carry the peer's service time (seconds) and
 	// its peer requests in flight, for adaptive replica selection.

@@ -166,7 +166,7 @@ The API is in the Elasticsearch style:
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness, Prometheus |
 
 - **Consistency:**
-  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy;
+  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy, or, on a node that hosts none, on the first copy that has it;
   - any read takes `?wait_for_seq=N`;
   - by default, writes become visible within `refresh_interval` everywhere.
 - **Auth:** bearer tokens, read-only or read-write. The internal peer API uses a separate cluster token.
@@ -319,7 +319,7 @@ The logical schema is the same in every dialect.
 
   It's like Elasticsearch's file-based peer recovery followed by an operations replay.
 - **Writes anywhere.** Any node accepts writes. They go to SQL first, which is the commit point, and every copy applies them through its tailer.
-  - **Fast path:** the coordinator's own copies apply immediately on commit.
+  - **Fast path:** on commit the coordinator wakes its own copies' tailers, which read the new changes from SQL at once; no copy is written outside its tailer, so a copy applies changes in `seq` order only.
   - **Push hint:** the coordinator pushes a "new `seq`" hint to the peers holding the shard, which wakes their tailers. Polling still runs as the safety net (Postgres `LISTEN/NOTIFY` where available).
 - **Read routing.** The coordinator prefers local copies. Otherwise it picks the least-loaded serving copy whose lag is within `max_lag`, with adaptive replica selection by measured latency, like Elasticsearch's ARS. It retries another copy on failure, so one node failing doesn't produce a client error.
 - **Rolling restarts and upgrades.**
@@ -338,7 +338,8 @@ The logical schema is the same in every dialect.
 | Disk lost or corrupt | Segments are checksummed. A bad segment is dropped and the copy re-recovers from a peer or SQL. It never serves a corrupt segment. |
 | Apply error | It halts that shard copy, which goes `recovering`, and re-recovers. It never skips a change. |
 | Merge interrupted | A merge writes a new file, publishes it, then flushes: until that flush swaps the manifest atomically, the old durable segment set is still valid and none of its files is removed. |
-| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. Sequence numbers are in the database, so they survive. |
+| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. With synchronous (or semi-synchronous) replication the new primary holds every acknowledged commit, and the failover is transparent. |
+| Failover that lost commits (async replication) | A point-in-time restore: the lost writes are gone, and new writes reuse their seqs. Each copy detects it at a poll (another change at the seq of one it applied, by the row's shard, kind, id and commit time; or the head behind its applied seq on two polls in a row), logs it at error, counts `searchlight_changelog_rewinds_total`, and rebuilds from SQL (`ScanShard`), never from a peer or bundle. Each poll also checks the copy's own shard, in the same statement: its newest change at or below the seq the copy last checked must be the last one the copy applied there; a change of the shard the copy never applied, another change at that seq, or that change gone while the shard's prune horizon is at or below it, is a rewind. The copy's manifest keeps its own-shard state (`own_mark`), the mark of the last change it checked (`anchor_mark`) and of the change at its seq (`seq_mark`); a mark is trusted only once a later poll checked the one before it, and a snapshot load takes its marks from the snapshot itself. So a copy restarted while it still holds the changelog's prune floor, fetched, restored, loaded or rebuilt aside across the failover detects it too, with no operator step. A stopped node's copy holds the floor until the node is found dead or the copy's lease runs out, or, when a clean stop retired it, for `retiring_retention` after its lease ran out; changes older than `changelog_retention` are pruned whatever copy needs them. Not detected: a copy with no marks yet (its last flush predates them: once, at the upgrade); a lost change reissued to the same document, of the same kind, in the same millisecond; and possibly, for a copy back after its shard was pruned without it to short of its seq, a rewind whose reissued changes of its shard were all pruned (pruned past its seq, the copy rebuilds). |
 | Overload | Per-request deadlines, bulk size caps, a merge I/O budget, and a search thread pool with a bounded queue (429 when full, like Elasticsearch). |
 
 ## 11. Observability
@@ -359,7 +360,7 @@ The logical schema is the same in every dialect.
 
 ## 12. Configuration
 
-Only `store_url` is required. Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
+`store_url` is required, and so are `tokens_file` and, on Postgres or MySQL, `cluster_token`, unless `insecure_no_auth` is set (a laptop or a test: the API and the peer API then serve without auth). Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
 
 | Setting | Default and meaning |
 |---|---|
@@ -367,8 +368,8 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `admin_listen` | metrics and pprof |
 | `advertise_address` | the address peers use to reach this node |
 | `data_dir` | local segments |
-| `tokens_file` | API tokens |
-| `cluster_token` | auth for the internal peer API |
+| `tokens_file` | API tokens (required unless `insecure_no_auth`) |
+| `cluster_token` | auth for the internal peer API (required on Postgres and MySQL unless `insecure_no_auth`; a peer that refuses it counts as a failed copy) |
 | `peer_ca_file` | CAs that sign peers' TLS certificates (system roots by default) |
 | `lease_ttl` | 30 s on SQLite (a single node), 10 s elsewhere |
 | `prune_stall_timeout`, `retiring_retention`, `changelog_retention` | 15 min, 15 min, 24 h: the changelog's prune bounds |

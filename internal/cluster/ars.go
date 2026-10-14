@@ -3,6 +3,7 @@ package cluster
 import (
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,28 @@ func (a *ars) start(id, key string) func(failed bool, service float64, queue flo
 		}
 		if queue >= 0 {
 			p.queue = ewma(p.queue, queue)
+		}
+	}
+}
+
+// forget drops what is known of every peer keep refuses, and of its copies. A peer
+// with reads in flight is kept until they end.
+func (a *ars) forget(keep func(id string) bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	held := map[string]bool{}
+	for id, p := range a.peers {
+		switch {
+		case keep(id) || p.outstanding > 0:
+			held[id] = true
+		default:
+			delete(a.peers, id)
+		}
+	}
+	for key := range a.copies {
+		node, _, _ := strings.Cut(key, "|")
+		if !held[node] && !keep(node) {
+			delete(a.copies, key)
 		}
 	}
 }

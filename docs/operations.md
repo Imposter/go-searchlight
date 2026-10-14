@@ -167,9 +167,9 @@ kubectl apply -f deploy/k8s/
 
 ## Configuration
 
-`store_url` is required, and so is `tokens_file` unless `insecure_no_auth` is set. Every
-setting has one snake_case name, which is both the flag `--<name>` and the environment
-variable `SEARCHLIGHT_<NAME>`.
+`store_url` is required; so is `tokens_file`, and on Postgres or MySQL `cluster_token`,
+unless `insecure_no_auth` is set. Every setting has one snake_case name, which is both
+the flag `--<name>` and the environment variable `SEARCHLIGHT_<NAME>`.
 
 - **Precedence.** A flag wins over the environment, which wins over the default.
 - **Secrets from files.** `store_url` and `cluster_token` can also come from
@@ -216,7 +216,7 @@ unless `insecure_no_auth` is set.
 | `data_dir` | `data` | local segments, and recovery staging |
 | `tokens_file` | (none) | the API bearer tokens; required unless `insecure_no_auth` |
 | `insecure_no_auth` | `false` | serve the API unauthenticated when `tokens_file` is empty (logged as a warning; never on a reachable node) |
-| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required for a cluster: without it the peer API is closed |
+| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required on Postgres and MySQL (refused at start without it unless `insecure_no_auth` is set): without it the peer API is closed. A peer that refuses this node's token counts as a failed copy, and is skipped |
 | `peer_ca_file` | system roots | PEM CAs that sign peers' TLS certificates (the peer API runs over TLS when `tls_cert` is set) |
 | `tls_cert`, `tls_key` | (none) | serve the API, and the peer API, over TLS; set together. Without them, put a TLS-terminating proxy in front |
 | `lease_ttl` | `0`: 30 s on SQLite, 10 s elsewhere | how long a shard copy's lease lasts unrenewed (renewed every 2 s); at least 3 s |
@@ -268,6 +268,11 @@ unless `insecure_no_auth` is set.
   last flush.
 - **Tuning.** Raise `flush_interval` to fsync less often, at the price of a longer
   replay after a crash. A clean shutdown always flushes.
+- **Refresh on demand.** An index whose `refresh_interval` is `-1` never refreshes on a
+  timer. A request that waits for a seq refreshes the copy itself once the copy has
+  applied it: a read's `wait_for_seq`, a write's `refresh=wait_for` or `true`, and a
+  percolation, which waits for the saved queries written through its node. Without such
+  a wait, writes stay invisible until one comes.
 
 ### Recovery bundles
 
@@ -464,9 +469,28 @@ rebuilt.**
   The nodes rebuild their copies from the restored database.
 - **Losing the database** loses acknowledged writes back to your last backup. Plan its
   high availability as you would for any primary datastore. On a Postgres or MySQL
-  failover, the nodes reconnect with backoff, since the sequence numbers live in the
-  database. While it is unreachable, writes get 503 and reads serve from the segments,
-  marked `stale`, and readiness turns false after `max_lag`.
+  failover, the nodes reconnect with backoff. While it is unreachable, writes get 503
+  and reads serve from the segments, marked `stale`, and readiness turns false after
+  `max_lag`.
+- **A failover is transparent only without lost commits.** Use synchronous replication
+  (Postgres `synchronous_commit` with `synchronous_standby_names`; MySQL
+  semi-synchronous replication waiting `AFTER_SYNC`). A failover that may have lost
+  commits, as async replication can, is a restore to an earlier point: the lost writes
+  are gone, and new writes reuse their seqs. Running copies detect it at their next
+  poll and rebuild from the database by themselves (the log line `the changelog no
+  longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
+  their shards serve again once the rebuilds finish. Nodes stopped across the failover
+  need nothing either while their copies still hold the changelog's prune floor: each
+  copy's manifest keeps what it applied of its own shard and the marks of the changes it
+  applied last, which the copy checks when it starts. A stopped node's copy holds the
+  floor until the node is found dead or the copy's lease runs out (seconds), or, when a
+  clean stop retired it, for `retiring_retention` (15 min) after its lease ran out; and
+  changes older than `changelog_retention` are pruned whatever copy needs them. A node
+  back later may find its shards pruned without it: a copy pruned past its seq rebuilds,
+  but in one pruned short of it, a rewind whose reissued changes of the copy's shard
+  were all pruned may go unseen. (A copy whose last flush
+  predates these marks has none until it flushes again, and trusts what it reads at its
+  first poll: only once, at the upgrade.)
 
 ## Upgrades and rolling restarts
 
@@ -482,8 +506,9 @@ Restart or upgrade **one node at a time**:
    2. The API keeps serving for `shutdown_grace`, while load balancers take the node
       out.
    3. The listener stops accepting, and requests in flight finish, within T/4.
-   4. The node stops its remaining copies, writes their final manifests, marks them
-      `retiring` in the registry and deregisters. It has until T/10 before the deadline,
+   4. The node stops its remaining copies' tailers, all together, each writing its
+      final manifest and applied seq; then it marks the copies `retiring` in the
+      registry, closes them and deregisters. It has until T/10 before the deadline,
       which is at least 0.4 T.
    5. In the last T/10, it closes the database and the admin listener, and flushes
       telemetry.
@@ -512,6 +537,14 @@ Notes:
   so a long query on the table holds the table's other queries behind the migration for
   at most that second; one that times out is retried, up to 40 times over about three
   minutes, half a second to five seconds apart.
+- **Upgrading to a release that requires `cluster_token`.** A node on Postgres or MySQL
+  now refuses to start without `cluster_token` (`cluster_token: set cluster_token ...`),
+  unless `insecure_no_auth` is set. A cluster of several nodes has one already: without
+  it the peer API was closed, and reads of another node's shards failed. **A single node
+  on Postgres or MySQL may not**: set `cluster_token` (any shared secret, through
+  `SEARCHLIGHT_CLUSTER_TOKEN` or `SEARCHLIGHT_CLUSTER_TOKEN_FILE`) before you upgrade
+  it. Otherwise the upgraded pod crash-loops: an outage under a Recreate strategy or a
+  single replica, and a stalled rollout under RollingUpdate.
 - **Upgrading to compressed bodies** (schema migration 2) is a rolling upgrade. The
   migration only adds columns and a table, which takes milliseconds whatever the
   database holds: `body_z` beside `sl_documents.body` and `payload_z` beside
@@ -533,6 +566,13 @@ Notes:
     `store: database schema is newer than this binary` until it runs the new image:
     finish the rollout rather than waiting on it. For the same reason a rollback means
     restoring the database, as above.
+  - **An old pod must be gone, not merely silent**, by the time `dead_after` plus
+    `lease_ttl` has passed since it last heartbeated. The fence counts a silent node as
+    gone; one that was only cut off or frozen (a network partition, a paused VM) and
+    comes back without restarting still runs the old binary, claims copies again, and
+    reads compressed rows as empty bodies (its realtime `GET`s answer empty documents,
+    and its copies halt). Terminate old pods during the rollout rather than isolating
+    them; once restarted, an old binary refuses the schema, as above.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and
@@ -579,7 +619,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
-| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
+| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total`, `searchlight_changelog_rewinds_total` |
 | Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
 | Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`) |
 | Runtime | `go_*` and `process_*` |
@@ -592,6 +632,7 @@ Counters and histograms with no observations yet do not appear until their first
 |---|---|---|
 | Cluster red | `GET /_cluster/health` reports `red` (probe it, or alert on the next row) | a shard has no serving copy: its reads fail |
 | Copy halted | `max by (index, shard) (searchlight_replica_halted_ratio) > 0` for 5 m | a copy stopped at a change it cannot apply (see below) |
+| Changelog rewound | `increase(searchlight_changelog_rewinds_total[10m]) > 0` | the database lost commits (a failover without synchronous replication): copies rebuild from it, and the lost writes are gone |
 | Replica lag | `max by (index, shard) (searchlight_replica_lag_time_seconds) > 30` for 5 m | a copy trails the changelog; it serves no reads past `max_lag` |
 | Changelog polls failing | `max(searchlight_replica_poll_failing_ratio) > 0` for 2 m | the database is unreachable from a node |
 | Nodes missing | `max(searchlight_cluster_nodes) < 3` (your node count) for 5 m | a node died or cannot heartbeat |

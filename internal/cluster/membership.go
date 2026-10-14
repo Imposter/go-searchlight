@@ -68,6 +68,10 @@ type lease struct {
 	// retired is set once the copy is marked retiring.
 	retired atomic.Bool
 
+	// gone is set once the copy is lost: the lease no longer holds, whatever its
+	// deadline.
+	gone atomic.Bool
+
 	// mu serializes the copy's transitions (pause, resume, loss).
 	mu     sync.Mutex
 	paused bool
@@ -82,7 +86,7 @@ func (l *lease) valid() bool {
 
 // validAt is valid at the leaseClock readings now and wall.
 func (l *lease) validAt(now time.Duration, wall time.Time) bool {
-	if now >= time.Duration(l.deadline.Load())-l.margin {
+	if l.gone.Load() || now >= time.Duration(l.deadline.Load())-l.margin {
 		return false
 	}
 	return wall.Sub(time.Unix(0, l.wallBefore.Load())) < l.ttl-l.margin
@@ -394,9 +398,26 @@ func (n *Node) loseCopy(ctx context.Context, l *lease) {
 		return
 	}
 	l.lost = true
+	l.gone.Store(true)
 	n.dropLease(l)
 	if err := n.unhostCopy(context.WithoutCancel(ctx), l.copy, false); err != nil {
 		n.log.WarnContext(ctx, "closing a copy whose lease was lost failed", slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+	}
+}
+
+// loseTakenOver drops the copies v shows another holder of. Each lease stops counting
+// as held at once, so no read routed by v falls back to its copy, and the copy is lost
+// in the background: v may come from a routing miss's registry read under a client's
+// read, which a copy's final flush and report must not hold up.
+func (n *Node) loseTakenOver(ctx context.Context, v *view) {
+	for _, l := range n.leaseList() {
+		if !v.takenOver(l) {
+			continue
+		}
+		n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
+		n.inst.lease(ctx, "lost")
+		l.gone.Store(true)
+		n.background(func(bctx context.Context) { n.loseCopy(bctx, l) })
 	}
 }
 
@@ -408,7 +429,8 @@ func (n *Node) unhostCopy(ctx context.Context, cp store.Copy, wipe bool) error {
 
 // leaseWatchdog pauses every copy whose lease lapses by the local clocks, at once (its
 // peers already stopped reading it: lease.valid), and drops the copies the registry
-// shows another holder of.
+// shows another holder of. A lease already lost (gone, its copy closing in the
+// background) is left alone.
 func (n *Node) leaseWatchdog(ctx context.Context) {
 	period := min(50*time.Millisecond, max(time.Millisecond, n.opts.LeaseMargin/2))
 	t := n.clock.NewTicker(period)
@@ -421,6 +443,9 @@ func (n *Node) leaseWatchdog(ctx context.Context) {
 		}
 		v := n.view.Load()
 		for _, l := range n.leaseList() {
+			if l.gone.Load() {
+				continue
+			}
 			if v.takenOver(l) {
 				n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
 				n.inst.lease(ctx, "lost")
@@ -517,15 +542,7 @@ func (n *Node) refreshView(ctx context.Context) error {
 	for i := range copies {
 		v.copies[copies[i].Shard] = append(v.copies[copies[i].Shard], copies[i])
 	}
-	// A copy the registry shows another holder of is dropped before the view is
-	// published: no read routed by this view can fall back to it.
-	for _, l := range n.leaseList() {
-		if v.takenOver(l) {
-			n.log.WarnContext(ctx, "the registry shows another holder of a copy's slot; dropping the copy", slog.String("shard", l.copy.Shard.String()))
-			n.inst.lease(ctx, "lost")
-			n.loseCopy(ctx, l)
-		}
-	}
+	n.loseTakenOver(ctx, v)
 	for {
 		cur := n.view.Load()
 		if cur != nil && cur.readBegan > v.readBegan {
@@ -536,7 +553,18 @@ func (n *Node) refreshView(ctx context.Context) error {
 		}
 	}
 	n.inst.nodes.Store(int64(len(v.live)))
+	n.forgetPeers(v)
 	return nil
+}
+
+// forgetPeers frees the per-peer state of the nodes v does not show live: their hint
+// queues (and goroutines) and their adaptive replica selection entries. Node ids
+// default to the hostname, new on every rollout, so departed peers would otherwise
+// pile up. A peer that comes back starts afresh.
+func (n *Node) forgetPeers(v *view) {
+	live := func(id string) bool { return v.live[id] }
+	n.hints.forget(live)
+	n.ars.forget(live)
 }
 
 // viewLoop re-reads the registry every ViewInterval, for routing.

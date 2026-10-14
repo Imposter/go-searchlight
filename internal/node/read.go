@@ -321,32 +321,69 @@ func firstError(errs []error) error {
 	return nil
 }
 
+// catalogRecheckEvery is the least time between two catalogue reads that percolated
+// documents naming unmapped fields make on one index.
+const catalogRecheckEvery = 100 * time.Millisecond
+
 // analyzeDocs analyzes the given documents of a percolation under the index's mapping.
 // A cluster node re-reads the catalogue once when one does not analyze (a strict
-// index refusing a field another node has since mapped).
+// index refusing a field another node has since mapped), and when one names a field
+// the mapping lacks (another node may have mapped it since this node's last sync, and
+// the copies analyze saved queries under it), at most every catalogRecheckEvery.
 func (n *Single) analyzeDocs(ctx context.Context, idx *index, bodies [][]byte) ([]schema.Doc, error) {
 	for attempt := 0; ; attempt++ {
 		m := idx.meta.Load().mapping
+		recheck := attempt == 0 && n.cl != nil && idx.mayRecheckCatalog(n.clock.Now())
 		docs := make([]schema.Doc, 0, len(bodies))
 		var failure error
+		unmapped := false
 		for i, body := range bodies {
-			doc, _, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
+			doc, update, err := schema.AnalyzeForMatch(m, "_percolate_"+strconv.Itoa(i), body)
 			if err != nil {
 				failure = docProblem(err, "docs."+strconv.Itoa(i))
 				break
 			}
+			unmapped = unmapped || (recheck && namesUnmapped(m, update, body))
 			docs = append(docs, doc)
 		}
-		if failure == nil {
+		if failure == nil && !unmapped {
 			return docs, nil
 		}
 		if attempt > 0 || n.cl == nil {
 			return nil, failure
 		}
+		if failure == nil {
+			idx.catalogRecheck.Store(n.clock.Now().UnixNano())
+		}
 		if changed, _ := n.reloadIfNewer(ctx, idx); !changed {
-			return nil, failure
+			if failure != nil {
+				return nil, failure
+			}
+			return docs, nil
 		}
 	}
+}
+
+// namesUnmapped reports whether a document analyzed under m names a field m lacks:
+// update holds the fields dynamic mapping typed, and under dynamic false (which drops
+// them) body is typed again as if dynamic were true.
+func namesUnmapped(m *schema.Mapping, update schema.MappingUpdate, body []byte) bool {
+	if !update.Empty() {
+		return true
+	}
+	if m == nil || m.Dynamic != schema.DynamicFalse {
+		return false
+	}
+	typed := *m
+	typed.Dynamic = schema.DynamicTrue
+	_, u, err := schema.Check(&typed, "_percolate", body)
+	return err == nil && !u.Empty()
+}
+
+// mayRecheckCatalog reports whether percolated documents naming unmapped fields may
+// re-read idx's catalogue at now: catalogRecheckEvery has passed since the last one.
+func (idx *index) mayRecheckCatalog(now time.Time) bool {
+	return now.UnixNano()-idx.catalogRecheck.Load() >= int64(catalogRecheckEvery)
 }
 
 // Percolate implements [api.Coordinator]. Given documents are analyzed under the
@@ -469,22 +506,29 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 	return cat, nil
 }
 
-// GetDocument implements [api.Coordinator]: read from the store, so realtime. While
-// the database cannot be reached, or when it does not answer within max_lag, it is
-// read from a copy instead, marked stale.
-func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Document, error) {
-	idx, err := n.lookupForRead(ctx, name, 0)
+// GetDocument implements [api.Coordinator]: read from the store, so realtime, and so
+// with every committed seq in it (a wait_for_seq past the head is a 400, as on every
+// read). While the database cannot be reached, or when it does not answer within
+// max_lag, it is read from a copy instead, marked stale, once the copy has
+// opts.WaitForSeq searchable.
+func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.ReadOptions) (*api.Document, error) {
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
+	if opts.WaitForSeq > 0 {
+		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+			return nil, err
+		}
+	}
 	if n.stale() {
-		return n.staleDocument(ctx, idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
+		return n.staleDocument(ctx, idx, id, opts.WaitForSeq, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
 	}
 	rctx, cancel := context.WithTimeout(ctx, n.recordTimeout())
 	defer cancel()
 	r, err := n.getRecord(rctx, idx, store.RecordDocument, id)
 	if isUnreachable(err) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return n.staleDocument(ctx, idx, id, err)
+		return n.staleDocument(ctx, idx, id, opts.WaitForSeq, err)
 	}
 	if err != nil {
 		return nil, err
@@ -493,20 +537,26 @@ func (n *Single) GetDocument(ctx context.Context, name, id string) (*api.Documen
 }
 
 // GetQuery implements [api.Coordinator]: read from the store, so realtime; from a
-// copy, marked stale, while the database cannot be reached.
-func (n *Single) GetQuery(ctx context.Context, name, id string) (*api.SavedQuery, error) {
-	idx, err := n.lookupForRead(ctx, name, 0)
+// copy, marked stale, while the database cannot be reached. opts.WaitForSeq is
+// honoured as GetDocument honours it.
+func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOptions) (*api.SavedQuery, error) {
+	idx, err := n.lookupForRead(ctx, name, opts.WaitForSeq)
 	if err != nil {
 		return nil, err
 	}
+	if opts.WaitForSeq > 0 {
+		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+			return nil, err
+		}
+	}
 	if n.stale() {
-		return n.staleQuery(ctx, idx, id, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
+		return n.staleQuery(ctx, idx, id, opts.WaitForSeq, api.Unavailable(store.ErrClosed, "the database cannot be reached"))
 	}
 	rctx, cancel := context.WithTimeout(ctx, n.recordTimeout())
 	defer cancel()
 	r, err := n.getRecord(rctx, idx, store.RecordQuery, id)
 	if isUnreachable(err) || (errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil) {
-		return n.staleQuery(ctx, idx, id, err)
+		return n.staleQuery(ctx, idx, id, opts.WaitForSeq, err)
 	}
 	if err != nil {
 		return nil, err
@@ -530,19 +580,26 @@ func isUnreachable(err error) bool {
 	return errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable
 }
 
-// staleTarget returns a read target for the shard id routes to, for a stale read.
-func (n *Single) staleTarget(ctx context.Context, idx *index, id string) (ShardTarget, error) {
+// staleTarget returns a read target for the shard id routes to, for a stale read, once
+// it has waitSeq searchable. It fails with cause, unless the wait for waitSeq passed
+// its deadline (a 504).
+func (n *Single) staleTarget(ctx context.Context, idx *index, id string, waitSeq int64, cause error) (ShardTarget, error) {
 	if err := schema.ValidateID(id); err != nil {
 		return nil, docProblem(err, "id")
 	}
-	return n.acquireShard(ctx, idx, ShardFor(id, len(idx.shards)), 0, false)
+	t, err := n.acquireShard(ctx, idx, ShardFor(id, len(idx.shards)), waitSeq, false)
+	var ae *api.Error
+	if err != nil && (!errors.As(err, &ae) || ae.Status != http.StatusGatewayTimeout) {
+		return nil, cause
+	}
+	return t, err
 }
 
-// staleDocument reads a document from a copy.
-func (n *Single) staleDocument(ctx context.Context, idx *index, id string, cause error) (*api.Document, error) {
-	t, err := n.staleTarget(ctx, idx, id)
+// staleDocument reads a document from a copy that has waitSeq searchable.
+func (n *Single) staleDocument(ctx context.Context, idx *index, id string, waitSeq int64, cause error) (*api.Document, error) {
+	t, err := n.staleTarget(ctx, idx, id, waitSeq, cause)
 	if err != nil {
-		return nil, cause
+		return nil, err
 	}
 	defer t.Release()
 	body, ok, err := t.Get(ctx, id)
@@ -557,11 +614,11 @@ func (n *Single) staleDocument(ctx context.Context, idx *index, id string, cause
 	return &api.Document{ID: id, Body: body, Stale: true}, nil
 }
 
-// staleQuery reads a saved query from a copy.
-func (n *Single) staleQuery(ctx context.Context, idx *index, id string, cause error) (*api.SavedQuery, error) {
-	t, err := n.staleTarget(ctx, idx, id)
+// staleQuery reads a saved query from a copy that has waitSeq searchable.
+func (n *Single) staleQuery(ctx context.Context, idx *index, id string, waitSeq int64, cause error) (*api.SavedQuery, error) {
+	t, err := n.staleTarget(ctx, idx, id, waitSeq, cause)
 	if err != nil {
-		return nil, cause
+		return nil, err
 	}
 	defer t.Release()
 	q, ok, err := t.GetQuery(ctx, id)

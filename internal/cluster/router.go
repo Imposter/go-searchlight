@@ -104,8 +104,9 @@ func (n *Node) candidates(id store.ShardID) []candidate {
 	return out
 }
 
-// peerError is a transport failure reaching a peer: the peer is gone, or did not
-// answer in time.
+// peerError is a transport failure reaching a peer: the peer is gone, did not answer
+// in time, or refused this node's cluster token (401, 403). Either way none of its
+// copies can serve this node.
 type peerError struct {
 	node string
 	err  error
@@ -191,6 +192,14 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 	defer resp.Body.Close()
 	n.inst.peer(ctx, path, peer, resp.StatusCode, n.clock.Since(start))
 	service, queue = reported(resp.Header)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		err := decodeError(resp)
+		if _, warned := n.refusedWarned.LoadOrStore(peer, true); !warned {
+			n.log.WarnContext(ctx, "a peer refused this node's cluster token: its copies are skipped; every node needs the same cluster_token",
+				slog.String("peer", peer), slog.Any("error", err))
+		}
+		return service, queue, &peerError{node: peer, err: err}
+	}
 	if resp.StatusCode >= 400 {
 		return service, queue, decodeError(resp)
 	}
@@ -205,8 +214,9 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 }
 
 // authorize adds the cluster token and the trace context to a peer request, and the
-// caller's deadline. A token sent in the clear to a peer off this machine is warned
-// about, once per peer: set tls_cert (and peer_ca_file) on a network you do not trust.
+// caller's deadline less a reserve (peerReserve). A token sent in the clear to a peer
+// off this machine is warned about, once per peer: set tls_cert (and peer_ca_file) on
+// a network you do not trust.
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)
@@ -218,10 +228,17 @@ func (n *Node) authorize(req *http.Request) {
 		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
-		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10)) //nolint:forbidigo // a context deadline is by the process clock
+		left := time.Until(dl) //nolint:forbidigo // a context deadline is by the process clock
+		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, (left-peerReserve(left)).Milliseconds()), 10))
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 }
+
+// peerReserve is the part of a caller's remaining time a peer is not given: the
+// reply's way back and, for a search, the fetch phase after it. A peer that runs out
+// of its time answers (a search with partial results, timed_out) while the caller can
+// still use the answer.
+func peerReserve(left time.Duration) time.Duration { return min(left/5, 2*time.Second) }
 
 // loopback reports whether host names this machine.
 func loopback(host string) bool {
@@ -495,13 +512,19 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 	}
 }
 
-// WaitRefreshed implements node.Cluster: it waits on every serving copy of id on a
-// live peer, together. A copy whose peer cannot be reached, or that does not serve
-// now, is skipped, and suspected, so reads routed by adaptive replica selection avoid
-// it; but when no copy at all (this node's included: localDone) reached seq, the wait
-// fails.
+// WaitRefreshed implements node.Cluster. With api.RefreshTrue it waits on every
+// serving copy of id on a live peer, together, each refreshed at once. With
+// api.RefreshWaitFor it waits for none when this node's copy has seq (localDone), and
+// otherwise for the first peer copy that has it. A copy whose peer cannot be reached,
+// or that does not serve now, is skipped, and suspected, so reads routed by adaptive
+// replica selection avoid it; but when no copy at all (this node's included) reached
+// seq, the wait fails.
 func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
+	first := mode != api.RefreshTrue
+	if first && localDone {
+		return nil
+	}
 	cands := n.candidates(id)
 	if len(cands) == 0 && !localDone {
 		cands = n.routeCandidates(ctx, id)
@@ -515,15 +538,21 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 	errs := make([]error, len(cands))
 	var reached atomic.Int32
 	var wg sync.WaitGroup
+	wctx, answered := context.WithCancel(ctx)
+	defer answered()
 	for i, c := range cands {
 		wg.Go(func() {
 			msg := waitMsg{shardRef: shardRef{Index: id.Index, Shard: id.Shard}, Seq: seq, Refresh: mode == api.RefreshTrue}
-			err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
+			err := n.call(wctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
 			var pe *peerError
 			var ae *api.Error
 			switch {
 			case err == nil:
 				reached.Add(1)
+				if first {
+					answered()
+				}
+			case wctx.Err() != nil && ctx.Err() == nil:
 			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
 				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
 			default:
@@ -532,6 +561,9 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 		})
 	}
 	wg.Wait()
+	if first && reached.Load() > 0 {
+		return nil
+	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
@@ -685,6 +717,22 @@ func (h *hinter) run(peer string, q *hintQueue) {
 			h.n.log.Debug("a push hint was not delivered; the peer's poll picks the change up", slog.String("peer", peer), slog.Any("error", err))
 		}
 		cancel()
+	}
+}
+
+// forget stops and drops the hint queue of every peer keep refuses. Once the hinter
+// is closed it does nothing: close stopped every queue.
+func (h *hinter) forget(keep func(peer string) bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	for peer, q := range h.queues {
+		if !keep(peer) {
+			close(q.stop)
+			delete(h.queues, peer)
+		}
 	}
 }
 

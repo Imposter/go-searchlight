@@ -528,7 +528,7 @@ func TestScanShardSnapshot(t *testing.T) {
 		}
 		var lateSeq int64
 		var ids []string
-		asOf, err := st.ScanShard(ctx, shard, func(r Record) error {
+		pt, err := st.ScanShard(ctx, shard, func(r Record) error {
 			if r.Kind == RecordMapping {
 				return nil
 			}
@@ -549,11 +549,20 @@ func TestScanShardSnapshot(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		asOf, mark := pt.Seq, pt.Mark
+		if !pt.ShardMark.Same(mark) {
+			t.Fatalf("the shard's newest change at the snapshot %+v, want the change at its seq %+v", pt.ShardMark, mark)
+		}
 		if asOf != 5 || lateSeq != 6 {
 			t.Fatalf("asOf %d, late seq %d; want 5 and 6", asOf, lateSeq)
 		}
 		if fmt.Sprint(ids) != "[d0 d1 d2 d3 d4]" {
 			t.Fatalf("scan saw %v", ids)
+		}
+		// The mark is of the change at asOf, as the snapshot holds it.
+		before, err := st.ChangesAfter(ctx, shard, asOf-1, 1)
+		if err != nil || len(before) != 1 || !mark.Same(before[0].Mark()) {
+			t.Fatalf("the snapshot's mark %+v, the change at %d %v (%v)", mark, asOf, before, err)
 		}
 		// Replaying ChangesAfter(asOf) on the snapshot gives the present.
 		rest, err := st.ChangesAfter(ctx, shard, asOf, 0)
@@ -1191,6 +1200,42 @@ func TestReportAppliedMonotonic(t *testing.T) {
 	})
 }
 
+// TestResetApplied: ResetApplied sets applied_seq to the seq given, lower or not, and
+// only for the incarnation that holds the slot.
+func TestResetApplied(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateIndex(t, st, "reset")
+		reg := st.Registry()
+		shard := ShardID{Index: "reset"}
+		c, ok, err := reg.ClaimCopy(ctx, shard, "n1", 1, time.Minute)
+		if err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+		if err := reg.ReportApplied(ctx, c, 10); err != nil {
+			t.Fatal(err)
+		}
+		if err := reg.ResetApplied(ctx, c, 4); err != nil {
+			t.Fatal(err)
+		}
+		copies, err := reg.Copies(ctx, "reset")
+		if err != nil || len(copies) != 1 || copies[0].AppliedSeq != 4 {
+			t.Fatalf("after a reset to 4: %+v %v", copies, err)
+		}
+		stale := c
+		stale.Epoch++
+		if err := reg.ResetApplied(ctx, stale, 1); !errors.Is(err, ErrLeaseLost) {
+			t.Fatalf("a reset by another incarnation: %v", err)
+		}
+		bad := c
+		bad.NodeID = ""
+		if err := reg.ResetApplied(ctx, bad, 1); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("a reset with an invalid node: %v", err)
+		}
+	})
+}
+
 // TestCopyExpired checks Expired() agrees with every dialect's SQL steal
 // boundary (lease_until < now): a lease with no time left at all is not yet
 // stealable, only one that has gone negative.
@@ -1549,6 +1594,70 @@ func TestHeadSeq(t *testing.T) {
 		_ = st.Close()
 		if _, _, err := st.HeadSeq(ctx); !errors.Is(err, ErrClosed) {
 			t.Fatalf("head after close: %v", err)
+		}
+	})
+}
+
+// TestTip: Tip reads the head as HeadSeq does, with the marks of the changes at the
+// head and at the seq asked about, as ChangesAfter returns them; a seq with no change
+// (0, past the head, or pruned) has the zero mark.
+func TestTip(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		tip, err := st.Tip(ctx, TipQuery{})
+		if err != nil || tip.Head != 0 || tip.HeadMark != (ChangeMark{}) || tip.AtMark != (ChangeMark{}) || time.Since(tip.Now).Abs() > time.Minute {
+			t.Fatalf("empty store tip = %+v, %v", tip, err)
+		}
+		mustCreateIndex(t, st, "t")
+		mustApply(t, st, upsert("t", 0, "a", `{}`), upsert("t", 1, "b", `{}`))
+		_, last := mustApply(t, st, upsert("t", 1, "c", `{}`))
+		changes, err := st.ChangesAfter(ctx, ShardID{Index: "t", Shard: 1}, 0, 10)
+		if err != nil || len(changes) != 2 {
+			t.Fatalf("shard 1: %v, %v", changes, err)
+		}
+		tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq})
+		if err != nil || tip.Head != last {
+			t.Fatalf("tip = %+v, %v; want head %d", tip, err, last)
+		}
+		if !tip.HeadMark.Same(changes[1].Mark()) || !tip.AtMark.Same(changes[0].Mark()) {
+			t.Fatalf("marks %+v and %+v, want %+v and %+v", tip.HeadMark, tip.AtMark, changes[1].Mark(), changes[0].Mark())
+		}
+		if tip.AtMark.Same(tip.HeadMark) {
+			t.Fatal("two changes have the same mark")
+		}
+		if tip, err = st.Tip(ctx, TipQuery{At: last + 1}); err != nil || tip.AtMark != (ChangeMark{}) {
+			t.Fatalf("tip past the head = %+v, %v", tip, err)
+		}
+		meta, err := st.Indexes().Get(ctx, "t")
+		if err != nil {
+			t.Fatal(err)
+		}
+		shard1 := ShardID{Index: "t", Shard: 1}
+		for _, tc := range []struct {
+			upTo int64
+			want ChangeMark
+		}{{last, changes[1].Mark()}, {last - 1, changes[0].Mark()}, {changes[0].Seq - 1, ChangeMark{}}} {
+			tip, err = st.Tip(ctx, TipQuery{Shard: shard1, UpTo: tc.upTo})
+			if err != nil || !tip.ShardMark.Same(tc.want) || tip.ShardMark.Seq != tc.want.Seq || tip.Horizon != 0 || tip.IndexUID != meta.UID {
+				t.Fatalf("shard 1 up to %d: %+v, %v; want %+v, no horizon, uid %s", tc.upTo, tip, err, tc.want, meta.UID)
+			}
+		}
+		if tip, err = st.Tip(ctx, TipQuery{Shard: ShardID{Index: "gone", Shard: 0}, UpTo: last}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.IndexUID != "" {
+			t.Fatalf("a missing index's tip: %+v, %v", tip, err)
+		}
+		if err := st.Prune(ctx, shard1, last); err != nil {
+			t.Fatal(err)
+		}
+		if tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq}); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
+			t.Fatalf("tip at a pruned seq = %+v, %v", tip, err)
+		}
+		if tip, err = st.Tip(ctx, TipQuery{Shard: shard1, UpTo: last - 1}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.Horizon != last {
+			t.Fatalf("shard 1 after a prune: %+v, %v; want no change and horizon %d", tip, err, last)
+		}
+		_ = st.Close()
+		if _, err := st.Tip(ctx, TipQuery{}); !errors.Is(err, ErrClosed) {
+			t.Fatalf("tip after close: %v", err)
 		}
 	})
 }

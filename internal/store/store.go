@@ -61,9 +61,12 @@ type Store interface {
 	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
 	// the index does not exist), then every document and every saved query of
 	// shard, from one consistent snapshot, and returns the seq that snapshot
-	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact. A
-	// document whose body does not decode ends the scan with a *CorruptError.
-	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
+	// reflects (replaying ChangesAfter on top of it from that seq is exact), with
+	// the marks of the change at that seq and of the shard's newest change at or
+	// below it as the snapshot holds them, so a copy loaded from it knows what the
+	// changelog held where it stands. A document whose body does not decode ends
+	// the scan with a *CorruptError.
+	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (ScanPoint, error)
 
 	// HeadSeq returns the newest committed seq across every shard (0 before
 	// the first change), and the database clock's time as it read it. Every
@@ -75,6 +78,13 @@ type Store interface {
 	// (the primary): a read replica lagging the primary would break it. Every
 	// dialect reads from the primary (dialect.Pools.Read is the primary's).
 	HeadSeq(ctx context.Context) (seq int64, now time.Time, err error)
+
+	// Tip is HeadSeq that also reads, in the same statement, the marks of the
+	// change at the head and of the change at q.At, and q.Shard's newest change at
+	// or below q.UpTo, its prune horizon and its index's incarnation. A tailer
+	// compares them with what it applied, to see the changelog rewound under its
+	// copy: a database failover that lost commits reissues their seqs.
+	Tip(ctx context.Context, q TipQuery) (Tip, error)
 
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
 	Registry() RegistryStore
@@ -153,6 +163,11 @@ type RegistryStore interface {
 	// ReportApplied records the seq a copy has applied. It returns
 	// ErrLeaseLost unless the slot still holds this incarnation.
 	ReportApplied(ctx context.Context, c Copy, seq int64) error
+	// ResetApplied records seq as the seq a copy has applied even when it is
+	// lower than the one recorded: a copy rebuilt from scratch holds only what its
+	// rebuild brought. It returns ErrLeaseLost unless the slot still holds this
+	// incarnation.
+	ResetApplied(ctx context.Context, c Copy, seq int64) error
 	// RetireCopy marks c retiring, as SetCopyState does, but only while another
 	// node's copy of the shard serves under an unexpired lease, atomically with
 	// that check; it reports whether it did. ErrLeaseLost as SetCopyState.

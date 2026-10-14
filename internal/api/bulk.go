@@ -89,8 +89,11 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 		return ProblemFor(errItemCount)
 	}
 	out := bulkResponse{Seq: res.Seq, TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
-	if perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches {
+	switch {
+	case perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches:
 		res.Percolated = false
+		out.PercolateReason = CodeTooManyMatches
+	case perc && res.PercolateErr != nil && ProblemFor(res.PercolateErr).Code == CodeTooManyMatches:
 		out.PercolateReason = CodeTooManyMatches
 	}
 	if perc {

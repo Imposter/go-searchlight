@@ -346,9 +346,16 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 			}
 		case errors.As(err, &ce):
 			// Only the first conflict is certain; hold it until everything
-			// before it is settled and retry the rest.
+			// before it is settled and retry the rest. Requests held after it
+			// are retried too: their conflicts may have depended on it.
 			parts := splitPositions(reqs, ce.Positions, ce.Current)
 			k := minKey(parts)
+			for j := live[k] + 1; j < len(batch); j++ {
+				if state[j] == gcHeld {
+					state[j] = gcActive
+					held[j] = nil
+				}
+			}
 			state[live[k]] = gcHeld
 			held[live[k]] = parts[k]
 		default:

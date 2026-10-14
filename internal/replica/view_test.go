@@ -127,7 +127,7 @@ func mappingString(m *schema.Mapping) string {
 func truthOf(t testing.TB, st store.Store, id ShardID) view {
 	t.Helper()
 	v := view{docs: map[string]string{}, queries: map[string]string{}}
-	asOf, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
+	pt, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
 		switch r.Kind {
 		case store.RecordDocument:
 			v.docs[r.ID] = string(r.Body)
@@ -143,7 +143,7 @@ func truthOf(t testing.TB, st store.Store, id ShardID) view {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v.seq = asOf
+	v.seq = pt.Seq
 	meta, err := st.Indexes().Get(context.Background(), id.Index)
 	if err != nil {
 		t.Fatal(err)

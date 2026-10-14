@@ -85,8 +85,10 @@ automatic (spec §9, operations.md's [configuration table](operations.md#every-s
   `deploy/compose.yml`'s `SEARCHLIGHT_ADVERTISE_ADDRESS` and
   [Internal peer traffic](nginx.md#internal-peer-traffic)).
 - **`cluster_token`** authenticates the internal peer API (`/_internal/` on the public
-  listener). Without it, a cluster of more than one node cannot form: peer calls (reads,
-  push hints, recovery snapshots) are refused.
+  listener). A node on Postgres or MySQL refuses to start without it, unless
+  `insecure_no_auth` is set; every node needs the same one. A peer that refuses a node's
+  token (401) counts as a failed copy for that node: reads go to another copy, and
+  recovery falls back to a bundle or the database.
 
 On start, a node inserts or updates its row in `sl_nodes` and heartbeats every 2 s.
 Peers are discovered by reading that same table — there is no separate discovery
@@ -148,8 +150,10 @@ sequenceDiagram
   second). Three knobs on the request itself change this:
   - nothing special: visible everywhere within `refresh_interval` of the commit;
   - `?refresh=wait_for`: the response waits until the write is searchable on the
-    **coordinator's own copy** specifically (it never forces an early refresh, and never
-    waits for durability — refresh and flush are separate, see
+    **coordinator's own copy** specifically, or, on a node that hosts no copy of the
+    shard, on the first copy that has it; other copies may still trail (it never forces
+    an early refresh, except on an index whose refresh is disabled, and never waits for
+    durability — refresh and flush are separate, see
     [architecture.md](architecture.md#the-write-path-the-sql-changelog-is-the-wal));
   - `?refresh=true`: forces a refresh of the written shard at once, at the cost of a
     small segment per call — don't do this per document under load.
@@ -270,7 +274,8 @@ target doesn't drop below it just because one copy is being rebuilt.
 | **A node dies** (crashes, is killed, loses power) | Its heartbeat stops. After 10 s its leases expire, and the allocator on other nodes claims its shards up to the target copy count. Reads and writes against the shards it held see no client error as long as ≥ 2 copies existed. |
 | **A network partition** | The cut-off node's copies stop serving *before* another node takes over, not after: each copy tracks its own lease deadline on its own monotonic clock from just before each renewal, and stops serving (and stops its tailer) at that local deadline, independently of whether it can reach the registry to confirm it lost the lease. A node on the wrong side of a partition therefore can't keep answering reads with a stale view of "I still hold this" after another node has legitimately claimed the slot. |
 | **Postgres is down** | Writes return 503 `unavailable` (with `Retry-After`). Reads keep serving from local segments, each one marked `stale: true` and (for a single document) with no `seq`. Readiness (`/readyz`) turns false once the outage has lasted `max_lag`, so a load balancer stops sending this node traffic even though it can still answer some reads. |
-| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff; sequence numbers live in the database, so nothing about `seq` ordering is lost or has to be renegotiated. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume normally once the new primary answers. |
+| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume once the new primary answers. The failover is transparent only when the new primary holds every commit the old one acknowledged: synchronous (or semi-synchronous) replication. |
+| **A failover loses commits** (async replication) | This is a point-in-time restore. The new primary's counter is behind the old one's, so new writes take the lost seqs again, and the copies hold changes the database no longer does. Each running copy sees it at its next poll — the changelog's head behind its seq, or another change at its seq than the one it applied — logs `the changelog no longer holds what this copy applied`, counts `searchlight_changelog_rewinds_total`, and rebuilds from the database (never from a peer or a bundle, which may hold the lost commits too). A shard whose copies rebuild together has no serving copy until one finishes. The lost writes are gone. No operator step is needed. Each copy checks two things at every poll. Its own shard: the newest change of the shard at or below the seq it last checked must be the last one it applied there (a change of its shard it never applied, another change at that seq, or that change gone though the shard was not pruned past it, is a rewind). And a mark of a change it applied, which may be another shard's (the head it advanced to). Both are kept in its manifest (`own_mark`, `anchor_mark`, `seq_mark`), so a node stopped across the failover (back while its copies still hold the changelog's prune floor), a copy fetched from a peer or restored from a bundle, a copy rebuilt aside while it happened, and a copy loaded from the database's snapshot (whose marks come from that same snapshot) all check at their first polls, and rebuild too. A mark is trusted only once a later poll has checked the one before it, so a page read across the failover is caught too. A head behind a copy's seq counts only when two polls in a row see it, so one read that reached a lagging server rebuilds nothing. What remains: a copy whose last flush predates these marks has none until it flushes again, and trusts what it reads at its first poll (once, at the upgrade); a lost change reissued to the same document, of the same kind, in the same millisecond, looks the same and goes unseen; and a node may come back after its shards were pruned without it. A stopped node's copy holds its shard's prune floor until the node is found dead or the copy's lease runs out (seconds), or, when a clean stop retired it, for `retiring_retention` (15 min) after its lease ran out; and changes older than `changelog_retention` are pruned whatever copy needs them. Pruned past its seq, a copy rebuilds; pruned short of it, a rewind whose reissued changes of the copy's shard were all pruned may go unseen. |
 
 ## Postgres sizing and settings
 
@@ -303,10 +308,15 @@ target doesn't drop below it just because one copy is being rebuilt.
 - **`synchronous_commit` and HA.** Searchlight has no durability of its own beyond
   Postgres's: an acknowledged write is exactly as durable as the transaction that
   committed it. Run Postgres (or MySQL) with the replication and failover setup you'd
-  use for any primary datastore — `synchronous_commit` on and synchronous replicas if
-  you need zero loss on a primary failure, async replication if you can tolerate losing
-  the last moment of commits. Searchlight's own replicas don't change this calculus: a
-  node's segments are a cache, not a copy of the database's guarantees.
+  use for any primary datastore. For a failover to be transparent, the new primary must
+  hold every acknowledged commit: synchronous replication (Postgres
+  `synchronous_commit` with `synchronous_standby_names`; MySQL semi-synchronous
+  replication waiting `AFTER_SYNC`). With async replication a failover can lose the last
+  commits, and that is a point-in-time restore: the lost writes are gone, their seqs are
+  reissued to new writes, and every copy rebuilds from the database once it sees the
+  changelog rewound (see [Failures](#failures)). Searchlight's own replicas don't change
+  this calculus: a node's segments are a cache, not a copy of the database's
+  guarantees.
 - **Backups.** Back up Postgres with its own tools (`pg_dump`, or base backups with WAL
   archiving); never back up `data_dir`. See operations.md's
   [Backups and disaster recovery](operations.md#backups-and-disaster-recovery), which

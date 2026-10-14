@@ -1,6 +1,8 @@
 package api_test
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -85,5 +87,40 @@ func TestPercolateMatchesAreBounded(t *testing.T) {
 		if q, ok := it.(map[string]any)["queries"]; ok { //nolint:forcetypeassert,errcheck // the shape
 			t.Fatalf("an item carries queries %v past the bound", q)
 		}
+	}
+}
+
+// A _bulk?percolate=true whose percolation a copy refused past the match bound
+// (percolate.ErrTooManyMatches here, or a peer's too_many_matches problem) keeps its
+// writes and answers percolated false with percolate_reason too_many_matches; another
+// failure (a deadline) gives no reason.
+func TestBulkPercolateReasonFromTheCoordinator(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		reason any
+	}{
+		{"local refusal", fmt.Errorf("percolate shard 0: %w", percolate.ErrTooManyMatches), api.CodeTooManyMatches},
+		{"peer refusal", &api.Error{Status: http.StatusUnprocessableEntity, Code: api.CodeTooManyMatches, Detail: "too many"}, api.CodeTooManyMatches},
+		{"deadline", context.DeadlineExceeded, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &stub{write: func(context.Context) (*api.WriteResult, error) {
+				return &api.WriteResult{Seq: 7, Items: []api.ItemResult{{Seq: 7}}, PercolateErr: tc.err}, nil
+			}}
+			url := stubServer(t, c, nil)
+			resp, err := http.Post(url+"/indexes/b/_bulk?percolate=true", "application/x-ndjson", strings.NewReader(ndjson(`{"upsert": {"id": "a"}}`, `{"n": 1}`)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			var r map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || r["percolated"] != false || r["percolate_reason"] != tc.reason {
+				t.Fatalf("HTTP %d: percolated %v, percolate_reason %v; want reason %v", resp.StatusCode, r["percolated"], r["percolate_reason"], tc.reason)
+			}
+		})
 	}
 }

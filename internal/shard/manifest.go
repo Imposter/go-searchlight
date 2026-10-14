@@ -59,6 +59,26 @@ type manifest struct {
 	// truncated bitmap, which segment.Reader.Untyped reads them from). A segment of the
 	// current major says so itself (segment.Reader.MarksUntyped).
 	UntypedMarks int `json:"untyped_marks,omitempty"`
+	// SeqMark is the caller's mark of the change at Seq ([Shard.SetMark]): what the
+	// changelog held there, as the tailer that applied it saw it. Absent when none
+	// was recorded (a binary from before marks reads the manifest without it).
+	SeqMark json.RawMessage `json:"seq_mark,omitempty"`
+	// AnchorMark is the caller's anchor mark ([Shard.SetAnchorMark]), which holds
+	// whatever Seq is: the last change the caller verified the changelog still holds.
+	AnchorMark json.RawMessage `json:"anchor_mark,omitempty"`
+	// OwnMark is the caller's mark of the copy's own shard ([Shard.SetOwnMark]),
+	// which holds whatever Seq is.
+	OwnMark json.RawMessage `json:"own_mark,omitempty"`
+}
+
+// marks are the caller's marks a generation carries and a flush persists: the mark of
+// the change at the generation's seq, the anchor mark and the own mark.
+type marks struct {
+	seq, anchor, own json.RawMessage
+}
+
+func (m marks) equal(o marks) bool {
+	return bytes.Equal(m.seq, o.seq) && bytes.Equal(m.anchor, o.anchor) && bytes.Equal(m.own, o.own)
 }
 
 // untypedMarksFormat is the manifest's UntypedMarks when its previous-major segments

@@ -112,6 +112,7 @@ const (
 	reasonMappingOrder  = "mapping_order"  // a change's mapping version is not the copy's
 	reasonMappingBehind = "mapping_behind" // the catalogue's mapping takes what the copy's does not
 	reasonHalted        = "halted"         // halted twice at the same change
+	reasonRewound       = "rewound"        // the changelog no longer holds what the copy applied
 )
 
 // rebuildError asks for the copy to be wiped and rebuilt.
@@ -735,7 +736,8 @@ func (t *Tailer) clearHalt() {
 
 // superseded reports whether the changelog holds a change of h's document or query
 // (or mapping) after h's seq: the bad row is then no longer current, and a rebuild
-// from a snapshot gets past it. The search resumes where the last one for h stopped.
+// from a snapshot gets past it. The search resumes where the last one for h stopped. A
+// damaged change of another document on the way is looked past.
 // Once the changelog is pruned past h the changes are gone, and the record (or the
 // index's mapping) itself decides ([Tailer.recordMoved]); a tailing copy pruned past
 // is rebuilt by its next read anyway (reasonPruned).
@@ -757,6 +759,10 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 			if c.ID == h.ID && (h.class == "" || classOfStoreKind(c.Kind) == h.class) {
 				return true, nil
 			}
+		}
+		if ce != nil {
+			t.scanFrom = ce.Seq
+			continue
 		}
 		if err != nil {
 			return false, err

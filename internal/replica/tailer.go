@@ -17,11 +17,15 @@
 //     [Fetcher] (a serving peer, Task 11) when there is one, else from the store's
 //     ScanShard snapshot. A failed shard (shard.ErrFailed) is reopened from its
 //     directory, and rebuilt if that fails.
-//   - Tailing: HeadSeq, then ChangesAfter from the applied seq; each page is analyzed
-//     and applied, and a page shorter than its limit proves no change of the shard up
-//     to the head is missing, so the copy Advances there (seqs are global, so a shard's
-//     own have gaps). Between polls it sleeps until woken by a local write, a Postgres
-//     notification ([Hub]) or the poll interval.
+//   - Tailing: the head (store Tip), then ChangesAfter from the applied seq; each page
+//     is analyzed and applied, and a page shorter than its limit proves no change of
+//     the shard up to the head is missing, so the copy Advances there (seqs are global,
+//     so a shard's own have gaps). Between polls it sleeps until woken by a local
+//     write, a Postgres notification ([Hub]) or the poll interval. Each poll also
+//     checks that the changelog still holds what the copy applied (rewind.go): a
+//     change the copy applied, replaced at its seq, or a head behind the copy's seq
+//     on two polls, is a database that lost commits, and the copy is rebuilt from the
+//     store's snapshot. The copy's mark of what it applied is kept in its manifest.
 //   - Halted: a change the store accepted but this copy cannot apply (a body that does
 //     not analyze, a query that does not parse, one the shard refuses) is a bug, never
 //     skipped: the copy stops before it and is marked recovering in the registry.
@@ -130,6 +134,10 @@ type Options struct {
 	// while new mapping versions keep arriving, up to five times over. 0 means
 	// DefaultRemapDebounce; negative means no wait.
 	RemapDebounce time.Duration
+	// OnRewind, when set, is called from Run when the copy finds the changelog
+	// rewound under it (a failover that lost commits), with the changelog's head as
+	// the poll read it.
+	OnRewind func(head int64)
 	// Hub delivers store notifications (Postgres): share one per node, run by the
 	// node. Nil means the tailer only polls, woken early by Wake.
 	Hub *Hub
@@ -164,6 +172,9 @@ type testHooks struct {
 	// beforeApply runs before every Apply or Load of a batch into sh; an error is taken
 	// as the shard's answer instead (shard.ErrBackpressure: a full buffer).
 	beforeApply func(sh *shard.Shard) error
+	// syncRoot replaces the fsync of a copy's root once an aside rebuild has renamed
+	// CURRENT.
+	syncRoot func(root string) error
 }
 
 func (o *Options) resolve() {
@@ -294,8 +305,16 @@ type Tailer struct {
 	warn        rateLimitedWarn
 	lastSource  string // the source of the last rebuild
 	recoveredAt int64  // the applied seq that rebuild ended at
+	// fetchSpent is set when a fetched replacement needed rebuilding again before it
+	// moved: the next rebuild reads the store, and completing it clears the flag.
+	fetchSpent bool
+	// rw is what the copy knows to tell a rewound changelog (checkRewind).
+	rw          rewindCheck
 	needRebuild string // a rebuild to (re)try before tailing, by reason
-	needReopen  bool
+	// rebuilt is set once a rebuild completes, until the next report resets the
+	// registry's applied seq to the rebuilt copy's.
+	rebuilt    bool
+	needReopen bool
 	// minMappingVersion is the mapping version a fetched copy must have: the
 	// remap that asked for the rebuild.
 	minMappingVersion int64
@@ -350,6 +369,7 @@ func NewTailer(st store.Store, sh *shard.Shard, id ShardID, opts Options) *Taile
 	t.lag.lastOK = t.opts.Clock.Now()
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
+	t.rw = markOf(sh)
 	if opts.Copy != nil {
 		c := *opts.Copy
 		t.copy = &c
@@ -555,6 +575,9 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.lastCatalog = time.Time{}
 		t.backoff(ctx)
 		return nil
+	case errors.Is(err, errHeadBehind):
+		t.backoff(ctx)
+		return nil
 	case errors.Is(err, store.ErrLeaseLost), errors.Is(err, shard.ErrClosed),
 		errors.Is(err, store.ErrClosed), errors.Is(err, store.ErrInvalid):
 		return err
@@ -622,12 +645,19 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	if err := sh.Err(); err != nil {
 		return false, err
 	}
-	head, dbNow, err := t.st.HeadSeq(ctx)
+	from := t.Applied()
+	tip, err := t.st.Tip(ctx, t.rw.query(t.id, from))
 	if err != nil {
 		t.pollFailed()
 		return false, err
 	}
-	from := t.Applied()
+	t.pollOK()
+	if wait, err := t.checkRewind(ctx, sh, &t.rw, from, &tip); err != nil {
+		return false, err
+	} else if wait {
+		return false, errHeadBehind
+	}
+	head, dbNow := tip.Head, tip.Now
 	changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 	if errors.Is(err, store.ErrPruned) {
 		t.pollOK()
@@ -656,17 +686,19 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		if err := t.applyChanges(ctx, sh, changes); err != nil {
 			return false, err
 		}
+		noteApplied(sh, &t.rw, changes[n-1].Mark())
 	}
 	if len(changes) >= t.opts.BatchSize {
 		return false, nil // more to read now
 	}
 	// The head was read before the page: every change at or below it had
 	// committed, and the page holds all of this shard's after from.
-	if head > t.Applied() {
+	if prev := t.Applied(); head > prev {
 		if err := sh.Advance(head); err != nil {
 			return false, err
 		}
 		t.applied.Store(head)
+		noteAdvanced(sh, &t.rw, prev, head, tip.HeadMark)
 	}
 	t.observeLag(head, t.Applied(), false, 0)
 	return true, nil
@@ -692,12 +724,20 @@ func (t *Tailer) housekeeping(ctx context.Context, caughtUp bool) error {
 }
 
 // report sends CommittedSeq to the registry when it moved, at most every
-// ReportInterval unless force.
+// ReportInterval unless force. The first report after a rebuild resets the registry's
+// seq to the rebuilt copy's, lower or not.
 func (t *Tailer) report(ctx context.Context, force bool) error {
 	if t.copy == nil {
 		return nil
 	}
 	seq := t.Shard().CommittedSeq()
+	if t.rebuilt {
+		if err := t.st.Registry().ResetApplied(ctx, *t.copy, seq); err != nil {
+			return fmt.Errorf("reset the applied seq to %d: %w", seq, err)
+		}
+		t.rebuilt, t.reported, t.lastReport = false, seq, t.opts.Clock.Now()
+		return nil
+	}
 	if seq <= t.reported || (!force && t.opts.Clock.Since(t.lastReport) < t.opts.ReportInterval) {
 		return nil
 	}

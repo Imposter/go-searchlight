@@ -179,6 +179,9 @@ type index struct {
 	refresh     atomic.Int64
 	refreshWake chan struct{}
 	dropped     atomic.Bool
+	// catalogRecheck is when (Unix ns) percolated documents naming unmapped fields
+	// last re-read the catalogue (analyzeDocs).
+	catalogRecheck atomic.Int64
 	// runCtx is the context the index's tailers and refresher run under; cancel
 	// stops them all.
 	runCtx context.Context
@@ -250,6 +253,10 @@ func (c *copyState) startedUp() bool {
 	}
 	return false
 }
+
+// refreshDisabled reports whether idx's copies refresh only on demand
+// (refresh_interval -1): a read or write that waits for a seq refreshes them itself.
+func (idx *index) refreshDisabled() bool { return idx.refresh.Load() <= 0 }
 
 // copies returns the copies of idx this node hosts, by shard.
 func (idx *index) copies() []*copyState {
@@ -671,7 +678,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
 	n.noteHead(sh.AppliedSeq())
-	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher}
+	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead}
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -782,6 +789,18 @@ func (n *Single) noteHead(seq int64) {
 	for {
 		cur := n.head.Load()
 		if seq <= cur || n.head.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
+}
+
+// lowerHead lowers the node's known head to head, when it is higher: a copy found the
+// changelog rewound (a failover that lost commits), so seqs past head are not
+// committed any more, and a wait_for_seq past it must be checked with the store again.
+func (n *Single) lowerHead(head int64) {
+	for {
+		cur := n.head.Load()
+		if head >= cur || n.head.CompareAndSwap(cur, head) {
 			return
 		}
 	}

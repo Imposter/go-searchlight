@@ -537,3 +537,68 @@ func TestRemapDebounce(t *testing.T) {
 		}
 	})
 }
+
+// TestAsideSwapKeepsTheCurrentCopyOnAFailedRootSync: an aside rebuild whose rename of
+// CURRENT succeeded but whose fsync of the root failed has swapped all the same: the
+// directory CURRENT names is the copy's and is never removed, so a node that stops
+// right after reopens the copy from it.
+func TestAsideSwapKeepsTheCurrentCopyOnAFailedRootSync(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		st := d.open(t)
+		createIndex(t, st, "sy", testMapping)
+		id := ShardID{Index: "sy", Shard: 0}
+		c := newCopy(t, d.open(t), id, testOptions())
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("sy", 0, "a", docBody("a", 1))))
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		head := mustApply(t, st, upsert("sy", 0, "b", docBody("b", 2)))
+		if err := st.Prune(context.Background(), id, head+1); err != nil { // past the copy: rebuilt aside
+			t.Fatal(err)
+		}
+		failed := make(chan struct{})
+		var once sync.Once
+		c.opts.hooks = &testHooks{syncRoot: func(string) error {
+			once.Do(func() { close(failed) })
+			return errors.New("injected directory fsync failure")
+		}}
+		c.start()
+		select {
+		case <-failed:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the aside rebuild never synced the root")
+		}
+		for deadline := time.Now().Add(5 * time.Second); c.current().State() != StateTailing && time.Now().Before(deadline); {
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		cur, err := CopyDir(c.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(cur); err != nil {
+			t.Fatalf("the directory CURRENT names is gone: %v", err)
+		}
+		if sh := c.shard(); sh.Dir() != cur {
+			t.Fatalf("the copy ran in %s, CURRENT names %s", sh.Dir(), cur)
+		}
+		if err := c.shard().Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		c.opts.hooks = nil
+		c.start()
+		sh := c.waitApplied(head)
+		if sh.Dir() != cur {
+			t.Fatalf("reopened in %s, want %s", sh.Dir(), cur)
+		}
+		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+			t.Fatalf("the reopened copy differs:\n%s", dd)
+		}
+	})
+}

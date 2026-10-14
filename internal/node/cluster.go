@@ -25,10 +25,11 @@ type Cluster interface {
 	// written shard to the newest seq it took): it sends push hints to the peers
 	// holding copies of them. It must not block.
 	Committed(index string, shards map[int]int64)
-	// WaitRefreshed waits, under ctx, until every serving copy of id on another node
-	// has seq searchable; with api.RefreshTrue the copies refresh at once once they
-	// have applied it. localDone says this node's copy has it: when it has not and no
-	// other copy reached seq either, the wait fails.
+	// WaitRefreshed waits, under ctx, until copies of id on other nodes have seq
+	// searchable: with api.RefreshTrue every serving one, each refreshed at once once
+	// it has applied seq; with api.RefreshWaitFor none when localDone (this node's
+	// copy has it), else the first that has it. When neither this node's copy nor any
+	// other reached seq, the wait fails.
 	WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error
 	// Allocate claims and hosts this node's copies of index now, so a new index
 	// serves when CreateIndex answers.

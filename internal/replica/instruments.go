@@ -30,6 +30,7 @@ type instruments struct {
 	recoveryBytes metric.Int64Counter
 	backpressure  metric.Int64Counter
 	halts         metric.Int64Counter
+	rewinds       metric.Int64Counter
 
 	base  []attribute.KeyValue
 	attrs metric.MeasurementOption
@@ -56,6 +57,7 @@ func newInstruments(meter metric.Meter, id ShardID, log *slog.Logger) *instrumen
 		recoveryBytes: in.Counter(telemetry.MetricReplicaRecoveryBytes),
 		backpressure:  in.Counter(telemetry.MetricReplicaBackpressure),
 		halts:         in.Counter(telemetry.MetricReplicaHalts),
+		rewinds:       in.Counter(telemetry.MetricChangelogRewinds),
 		base:          base,
 		attrs:         metric.WithAttributeSet(attribute.NewSet(base...)),
 	}

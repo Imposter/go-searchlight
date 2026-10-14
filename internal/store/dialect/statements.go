@@ -111,10 +111,19 @@ type Changelog struct {
 	// until the transaction ends ("" FOR UPDATE where the transaction already
 	// holds the database's write lock).
 	LockCounter string
-	// ReadCounter: () -> value of sl_counter row 1, without a lock.
-	ReadCounter string
+	// ReadCounterMark: (index, shard) -> value of sl_counter row 1, without a lock,
+	// then index_name, shard, kind, id, at of the change at that value, then seq,
+	// kind, id, at of the shard's newest change at or below it; NULL when there is
+	// no such change.
+	ReadCounterMark string
 	// ReadHead: () -> value of sl_counter row 1, NOW.
 	ReadHead string
+	// ReadTip: (index, shard, index, seq, index, shard, upto) -> value of sl_counter
+	// row 1, NOW, then index_name, shard, kind, id, at of the change at that value
+	// and of the change at seq, then seq, kind, id, at of the shard's newest change
+	// at or below upto (each NULL when there is no such change), then the shard's
+	// below_seq in sl_pruned and the index's uid (NULL when there is none).
+	ReadTip string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
 	// DocumentSeq and QuerySeq: (index, shard, id) -> seq.
@@ -203,6 +212,8 @@ type Registry struct {
 	// ReportApplied: (seq, fence) sets applied_seq to the larger of it and
 	// seq.
 	ReportApplied string
+	// ResetApplied: (seq, fence) sets applied_seq to seq.
+	ResetApplied string
 }
 
 // Blobs is the blob store: sl_blobs, sl_blob_uploads and sl_blob_chunks.

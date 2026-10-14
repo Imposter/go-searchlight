@@ -275,9 +275,9 @@ func testOptions() Options {
 var errInjected = errors.New("injected store fault")
 
 // faultStore wraps a store with injectable faults: fail[op] makes the next n calls
-// of op fail ("head", "changes", "scan", "get"), onRecord runs for every record a
-// scan hands over (its error ends the scan), and onChanges runs before every
-// ChangesAfter (its error fails the call).
+// of op fail ("head" for HeadSeq and Tip, "changes", "scan", "get"), onRecord runs
+// for every record a scan hands over (its error ends the scan), and onChanges runs
+// before every ChangesAfter (its error fails the call).
 type faultStore struct {
 	store.Store
 	mu        sync.Mutex
@@ -288,6 +288,11 @@ type faultStore struct {
 	// corrupt, when set, says which changes read back damaged: ChangesAfter returns
 	// the ones before the first such change with its *store.CorruptError.
 	corrupt func(c *store.Change) bool
+	// onTip, when set, may rewrite what every Tip returns (a read of a lagging server).
+	onTip func(tip *store.Tip)
+	// afterScan, when set, runs once a ScanShard has returned, before its caller
+	// sees the result.
+	afterScan func(ctx context.Context)
 }
 
 func newFaultStore(st store.Store) *faultStore {
@@ -326,6 +331,20 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 	return f.Store.HeadSeq(ctx)
 }
 
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
+	if err := f.take("head"); err != nil {
+		return store.Tip{}, err
+	}
+	tip, err := f.Store.Tip(ctx, q)
+	f.mu.Lock()
+	hook := f.onTip
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(&tip)
+	}
+	return tip, err
+}
+
 func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {
 	if err := f.take("changes"); err != nil {
 		return nil, err
@@ -350,15 +369,15 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return page, err
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if err := f.take("scan"); err != nil {
-		return 0, err
+		return store.ScanPoint{}, err
 	}
 	f.mu.Lock()
-	hook := f.onRecord
+	hook, after := f.onRecord, f.afterScan
 	f.mu.Unlock()
 	n := 0
-	return f.Store.ScanShard(ctx, id, func(r store.Record) error {
+	pt, err := f.Store.ScanShard(ctx, id, func(r store.Record) error {
 		n++
 		if hook != nil {
 			if err := hook(ctx, n, r); err != nil {
@@ -367,6 +386,10 @@ func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(st
 		}
 		return fn(r)
 	})
+	if after != nil {
+		after(ctx)
+	}
+	return pt, err
 }
 
 func (f *faultStore) Indexes() store.IndexStore {

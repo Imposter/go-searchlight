@@ -586,6 +586,12 @@ type faultStore struct {
 	// onRetire, when set, runs at the start of every RetireCopy, before it reaches the
 	// store.
 	onRetire atomic.Pointer[func()]
+	// onReport, when set, runs at the start of every ReportApplied, before it reaches
+	// the store.
+	onReport atomic.Pointer[func(ctx context.Context)]
+	// onSetState, when set, runs at the start of every SetCopyState, before it
+	// reaches the store.
+	onSetState atomic.Pointer[func(c store.Copy, state store.CopyState)]
 	// stallTail, while set, holds every ChangesAfter until it is closed or the call's
 	// context ends: the node's tailers stay where they are, serving and current by
 	// their own measure.
@@ -641,9 +647,9 @@ func (f *faultStore) Indexes() store.IndexStore {
 	return &faultIndexes{IndexStore: f.Store.Indexes(), f: f}
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if f.isDown() {
-		return 0, errPartitioned
+		return store.ScanPoint{}, errPartitioned
 	}
 	return f.Store.ScanShard(ctx, id, fn)
 }
@@ -726,6 +732,13 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 		return 0, time.Time{}, errPartitioned
 	}
 	return f.Store.HeadSeq(ctx)
+}
+
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
+	if f.isDown() {
+		return store.Tip{}, errPartitioned
+	}
+	return f.Store.Tip(ctx, q)
 }
 
 func (f *faultStore) Ping(ctx context.Context) error {
@@ -812,6 +825,9 @@ func (r *faultRegistry) SetCopyState(ctx context.Context, c store.Copy, state st
 	if r.f.isDown() {
 		return errPartitioned
 	}
+	if fn := r.f.onSetState.Load(); fn != nil {
+		(*fn)(c, state)
+	}
 	return r.RegistryStore.SetCopyState(ctx, c, state)
 }
 
@@ -820,7 +836,18 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 	if r.f.isDown() {
 		return errPartitioned
 	}
+	if fn := r.f.onReport.Load(); fn != nil {
+		(*fn)(ctx)
+	}
 	return r.RegistryStore.ReportApplied(ctx, c, seq)
+}
+
+func (r *faultRegistry) ResetApplied(ctx context.Context, c store.Copy, seq int64) error {
+	defer r.f.timed("ResetApplied")()
+	if r.f.isDown() {
+		return errPartitioned
+	}
+	return r.RegistryStore.ResetApplied(ctx, c, seq)
 }
 
 func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, error) {

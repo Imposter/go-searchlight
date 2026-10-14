@@ -34,10 +34,11 @@ func (s *Server) deleteQuery(w http.ResponseWriter, r *http.Request, p params) e
 }
 
 func (s *Server) getQuery(w http.ResponseWriter, r *http.Request, p params) error {
-	if _, e := p.waitForSeq(); e != nil {
+	wait, e := p.waitForSeq()
+	if e != nil {
 		return e
 	}
-	q, err := s.c.GetQuery(r.Context(), r.PathValue("index"), r.PathValue("id"))
+	q, err := s.c.GetQuery(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitForSeq: wait})
 	if err != nil {
 		return err
 	}

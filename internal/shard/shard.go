@@ -36,6 +36,7 @@ package shard
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -338,6 +339,12 @@ type Shard struct {
 	indexUID  string
 	mapState  *mappingState // the mapping as of applied
 	closing   bool
+	// markSeq and mark are the last SetMark: the mark is applied's when markSeq is.
+	// anchor and own are the last SetAnchorMark and SetOwnMark, whatever applied is.
+	markSeq int64
+	mark    json.RawMessage
+	anchor  json.RawMessage
+	own     json.RawMessage
 
 	// failed is set once the shard cannot vouch for its durable state.
 	failed atomic.Pointer[error]
@@ -367,6 +374,7 @@ type Shard struct {
 	durableGen      uint64
 	committedUID    string
 	committedMap    *mappingState
+	committedMarks  marks
 	durableSegs     map[*segRef]bool
 	durableSidecars map[string]int64
 	strays          map[string]bool
@@ -436,7 +444,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		shutdownDone: make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
-	s.inst.observeResident(opts.Meter, s)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
 	mp, err := man.mappingState(dir, m)
@@ -489,6 +496,8 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.sidecarBytes.Store(sidecarBytes)
 	s.applied = man.Seq
+	s.markSeq, s.mark, s.anchor, s.own = man.Seq, man.SeqMark, man.AnchorMark, man.OwnMark
+	s.committedMarks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
 	s.committedUID = man.IndexUID
@@ -498,6 +507,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.cur.Store(g)
 	s.recordGeneration(ctx, g)
+	s.inst.observeResident(opts.Meter, s)
 
 	s.bg, s.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	s.jan.start()
@@ -561,6 +571,64 @@ func (s *Shard) SetMapping(m *schema.Mapping) {
 // changelog from here. It trails RefreshedSeq until the next flush
 // (Options.FlushInterval): a refresh publishes without making anything durable.
 func (s *Shard) CommittedSeq() int64 { return s.committed.Load() }
+
+// SetMark records mark, an opaque JSON value, as the mark of the change at seq: what
+// the changelog held there when the caller applied it. It is the shard's mark once the
+// shard has applied or advanced to seq (set it before), and stays so until the shard
+// moves past seq; refreshes publish it with their seq, flushes write it to the
+// manifest (seq_mark), and an opened copy, a snapshot's included, carries it.
+func (s *Shard) SetMark(seq int64, mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markSeq, s.mark = seq, mark
+}
+
+// SeqMark returns the mark of the change at AppliedSeq, nil when none was recorded.
+func (s *Shard) SeqMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markAt(s.applied)
+}
+
+// SetAnchorMark records mark, an opaque JSON value, as the anchor mark: unlike the seq
+// mark it holds whatever the applied seq is. Refreshes publish it, flushes write it to
+// the manifest (anchor_mark), and an opened copy, a snapshot's included, carries it.
+func (s *Shard) SetAnchorMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.anchor = mark
+}
+
+// AnchorMark returns the anchor mark, nil when none was recorded.
+func (s *Shard) AnchorMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.anchor
+}
+
+// SetOwnMark records mark, an opaque JSON value, as the own mark: like the anchor mark
+// it holds whatever the applied seq is, and is published, flushed (own_mark) and
+// carried as it is.
+func (s *Shard) SetOwnMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.own = mark
+}
+
+// OwnMark returns the own mark, nil when none was recorded.
+func (s *Shard) OwnMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.own
+}
+
+// markAt is the mark recorded for seq, or nil. The caller holds mu.
+func (s *Shard) markAt(seq int64) json.RawMessage {
+	if seq != s.markSeq {
+		return nil
+	}
+	return s.mark
+}
 
 // AppliedSeq returns the highest seq applied (or advanced to), refreshed or not.
 func (s *Shard) AppliedSeq() int64 {

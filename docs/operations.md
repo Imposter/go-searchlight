@@ -95,7 +95,7 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
     misconfigured store, a SQLite store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
 - **`searchlight version`** (or `--version`) prints the version it was built as, with its
-  Go version and platform: `searchlight v1.0.0 (go1.25.0, linux/amd64)`.
+  Go version and platform: `searchlight v1.0.0 (go1.25.14, linux/amd64)`.
 - **`searchlight healthcheck [--live]`** probes the node on this host, for container
   healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
   where an empty or unspecified host means `127.0.0.1`. It waits at most 2 s, and exits 0

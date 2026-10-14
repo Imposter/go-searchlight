@@ -131,7 +131,6 @@ func (t *Tailer) CatchUp(ctx context.Context) error {
 			if err := t.apply(ctx, changes); err != nil {
 				return err
 			}
-			// Past the page, mapping changes (applied as nothing) included.
 			if err := t.sh.Advance(changes[len(changes)-1].Seq); err != nil {
 				return err
 			}
@@ -149,8 +148,10 @@ func (t *Tailer) CatchUp(ctx context.Context) error {
 	return nil
 }
 
-// apply converts changes under the stored mapping and applies them, waiting out
-// backpressure with a refresh.
+// apply converts changes and applies them, waiting out backpressure with a refresh.
+// Documents are analyzed under the catalogue's newest mapping, and every mapping change
+// becomes a Remap to it, which this stand-in allows itself: the replica tailer adopts
+// each mapping as of its seq.
 func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 	meta, err := t.st.Indexes().Get(ctx, t.id.Index)
 	if err != nil {
@@ -160,17 +161,13 @@ func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 	if err := json.Unmarshal(meta.Mapping, m); err != nil {
 		return fmt.Errorf("%w: mapping: %w", ErrHalted, err)
 	}
-	t.sh.SetMapping(m)
 	out := make([]shard.Change, 0, len(changes))
 	for i := range changes {
 		c := &changes[i]
 		sc := shard.Change{Seq: c.Seq, IndexUID: c.IndexUID}
 		switch c.Kind {
 		case store.KindMapping:
-			// The catalogue's mapping, read above, already holds it: documents are
-			// analyzed under the newest mapping, which this stand-in allows itself
-			// (the replica tailer adopts each mapping at its seq).
-			continue
+			sc.Kind, sc.Mapping, sc.MappingVersion = shard.Remap, m, c.MappingVersion
 		case store.KindUpsert:
 			doc, _, err := schema.Analyze(m, c.ID, c.Payload)
 			if err != nil {
@@ -199,9 +196,6 @@ func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 			return fmt.Errorf("%w: seq %d: kind %q", ErrHalted, c.Seq, c.Kind)
 		}
 		out = append(out, sc)
-	}
-	if len(out) == 0 {
-		return nil // only mapping changes: CatchUp advances past them
 	}
 	for {
 		err := t.sh.Apply(ctx, out)

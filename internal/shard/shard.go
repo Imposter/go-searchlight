@@ -402,7 +402,7 @@ type Shard struct {
 // reopens and verifies every segment it lists with its deletes, removes every file the
 // manifest does not reference, and starts the background refresh and merges. A
 // directory with no manifest is an empty shard. m is the index's mapping (see
-// [Shard.SetMapping]); it may be nil.
+// [Shard.Mapping]); it may be nil.
 func Open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Shard, error) {
 	opts.resolve()
 	ctx, span := opts.Tracer.Start(ctx, "shard.open", trace.WithAttributes(
@@ -544,26 +544,15 @@ func (s *Shard) IndexUID() string {
 }
 
 // Mapping returns the index mapping as of the applied seq: the last Remap applied,
-// the manifest's at Open, or the one Open or SetMapping was given.
+// the manifest's at Open, or the one Open was given.
 func (s *Shard) Mapping() *schema.Mapping { return s.mapping.Load() }
 
 // MappingVersion returns the version of Mapping: the last Remap's, the manifest's at
-// Open, and 0 for a mapping only Open or SetMapping gave.
+// Open, and 0 for a mapping only Open gave.
 func (s *Shard) MappingVersion() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mapState.version
-}
-
-// SetMapping replaces the index mapping, keeping its version; the next refresh
-// publishes it, and the flush after persists it. A copy that tails the changelog takes
-// its mappings from Remap changes instead, so the mapping is recorded with the seq it
-// holds from.
-func (s *Shard) SetMapping(m *schema.Mapping) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mapState = &mappingState{m: m, version: s.mapState.version}
-	s.mapping.Store(m)
 }
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change

@@ -297,7 +297,7 @@ func (g *Generation) MaxSeq() int64 { return g.maxSeq }
 // seen).
 func (g *Generation) IndexUID() string { return g.uid }
 
-// MappingVersion is the version of Mapping (0 when it came from Open or SetMapping).
+// MappingVersion is the version of Mapping (0 when it came from Open).
 func (g *Generation) MappingVersion() int64 { return g.mp.version }
 
 // Mapping is the index mapping as of the generation's seq.

@@ -42,6 +42,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -56,7 +57,8 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// version is set at build time with -ldflags "-X main.version=...".
+// version is set at build time with -ldflags "-X main.version=..."; without it, main
+// takes the module version "go install" records (moduleVersion).
 var version = "dev"
 
 var _ api.Mounter = (*cluster.Node)(nil)
@@ -69,6 +71,7 @@ const (
 )
 
 func main() {
+	version = moduleVersion(version, debug.ReadBuildInfo)
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "healthcheck":
@@ -374,6 +377,16 @@ func healthcheck(args []string, getenv func(string) string, stderr io.Writer) in
 		return 1
 	}
 	return 0
+}
+
+func moduleVersion(stamped string, buildInfo func() (*debug.BuildInfo, bool)) string {
+	if stamped != "dev" {
+		return stamped
+	}
+	if info, ok := buildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return stamped
 }
 
 func printVersion(args []string, stdout, stderr io.Writer) int {

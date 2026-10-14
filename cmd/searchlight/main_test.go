@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,29 @@ func TestPrintVersion(t *testing.T) {
 		out.Reset()
 		if code := printVersion(args, &out, io.Discard); code != 1 || out.Len() != 0 {
 			t.Errorf("printVersion %v = %d, wrote %q; want 1 and nothing", args, code, out.String())
+		}
+	}
+}
+
+func TestModuleVersion(t *testing.T) {
+	info := func(v string, ok bool) func() (*debug.BuildInfo, bool) {
+		return func() (*debug.BuildInfo, bool) {
+			return &debug.BuildInfo{Main: debug.Module{Path: "github.com/Imposter/go-searchlight", Version: v}}, ok
+		}
+	}
+	for _, c := range []struct {
+		name, stamped string
+		info          func() (*debug.BuildInfo, bool)
+		want          string
+	}{
+		{"ldflags win", "v1.0.0", info("v0.9.0", true), "v1.0.0"},
+		{"go install", "dev", info("v1.0.0", true), "v1.0.0"},
+		{"source tree", "dev", info("(devel)", true), "dev"},
+		{"no module version", "dev", info("", true), "dev"},
+		{"no build info", "dev", info("v1.0.0", false), "dev"},
+	} {
+		if got := moduleVersion(c.stamped, c.info); got != c.want {
+			t.Errorf("%s: moduleVersion = %q, want %q", c.name, got, c.want)
 		}
 	}
 }

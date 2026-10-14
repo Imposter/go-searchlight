@@ -9,19 +9,6 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 )
 
-// DefaultSize is a search's size when the request gives none, as Elasticsearch's.
-const DefaultSize = 10
-
-// hasKey reports whether the JSON object body has a top-level key.
-func hasKey(body []byte, key string) bool {
-	var top map[string]json.RawMessage
-	if json.Unmarshal(body, &top) != nil {
-		return false
-	}
-	_, ok := top[key]
-	return ok
-}
-
 // searchResponse answers POST _search.
 type searchResponse struct {
 	TookMS   int64                        `json:"took_ms"`
@@ -67,9 +54,6 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	req, problems := search.ParseRequest(body)
 	if len(problems) > 0 {
 		return Invalid("the search request is invalid", problems...)
-	}
-	if !hasKey(body, "size") {
-		req.Size = DefaultSize
 	}
 	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
 	if err != nil {

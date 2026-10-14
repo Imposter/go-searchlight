@@ -430,26 +430,17 @@ func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	if len(ps) > 0 {
 		return nil, &InvalidError{Problems: ps}
 	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return nil, err
-	}
 	q, err := t.Query(req.Query)
 	if err != nil {
 		return nil, err
 	}
-	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}}
-	size := req.Size
-	if _, given := top["size"]; !given {
-		size = 10 // the API's DefaultSize
-	}
-	body["size"] = size
+	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}, "size": req.Size}
 
 	sorts, err := t.sort(req.Sort)
 	if err != nil {
 		return nil, err
 	}
-	if size > 0 || len(req.SearchAfter) > 0 {
+	if req.Size > 0 || len(req.SearchAfter) > 0 {
 		body["sort"] = sorts
 	}
 	if len(req.SearchAfter) > 0 {

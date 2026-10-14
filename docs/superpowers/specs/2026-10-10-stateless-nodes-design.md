@@ -287,14 +287,14 @@ Both depend on GC and upload never running concurrently for one shard, which the
 
 Both claims are **columns on the copy's own row in `sl_shard_copies`**. A claim is therefore bound to one copy incarnation (node and epoch). It is fenced by the same arguments as `SetCopyState`, and it ends when the copy's slot changes hands.
 
-**Schema migration 3** (all three dialects, additive):
+**Schema migration 4** (all three dialects, additive):
 
 ```sql
 ALTER TABLE sl_shard_copies ADD COLUMN bundle_until  BIGINT NOT NULL DEFAULT 0;  -- db-clock ms; 0: none
 ALTER TABLE sl_shard_copies ADD COLUMN restore_until BIGINT NOT NULL DEFAULT 0;
 ```
 
-**Why the migration is safe for old binaries.** They select explicit columns (`copyColumns`, `internal/store/postgres/statements.go:271`), so they keep working against the migrated schema. **Rollback consequence (accepted by the operator, 2026-10-10).** Like every migration, it makes a binary rollback past it a database restore. A binary from before migration 3 refuses to start against the migrated schema (`store: database schema is newer than this binary`). An old pod that restarts mid-rollout therefore crash-loops until it runs the new image. SN-1 writes this into operations.md "Upgrades and rolling restarts", in the same place and words as the existing note for migration 2 (operations.md:531-535), and into the release notes.
+**Why the migration is safe for old binaries.** They select explicit columns (`copyColumns`, `internal/store/postgres/statements.go:271`), so they keep working against the migrated schema. **Rollback consequence (accepted by the operator, 2026-10-10).** Like every migration, it makes a binary rollback past it a database restore. A binary from before migration 4 refuses to start against the migrated schema (`store: database schema is newer than this binary`). An old pod that restarts mid-rollout therefore crash-loops until it runs the new image. SN-1 writes this into operations.md "Upgrades and rolling restarts", in the same place and words as the existing note for migration 2 (operations.md:531-535), and into the release notes.
 
 **`RegistryStore` additions:**
 
@@ -721,9 +721,9 @@ Drop the `data-1..3` named volumes, and mount a tmpfs at the data directory. A C
 The migration is rolling-safe, with no full stop at any point. One node is down at a time (PDB `maxUnavailable: 1`), and readiness gates each step (spec §9, operations.md "Upgrades").
 
 **Phase A: upgrade the binary, PVCs still attached.**
-1. **Back up the database first.** Once migration 3 runs, rolling the binary back means restoring that backup (§2.6). An old pod that restarts mid-rollout crash-loops on `store: database schema is newer than this binary` until it runs the new image, so finish the rollout rather than wait on it.
+1. **Back up the database first.** Once migration 4 runs, rolling the binary back means restoring that backup (§2.6). An old pod that restarts mid-rollout crash-loops on `store: database schema is newer than this binary` until it runs the new image, so finish the rollout rather than wait on it.
 2. Roll the new image as usual.
-   - The first upgraded node runs migration 3 (two additive columns, milliseconds; nodes on the old binary keep working).
+   - The first upgraded node runs migration 4 (two additive columns, milliseconds; nodes on the old binary keep working).
    - Format-2 uploads start on every upgraded node, every minute.
    - Format-1 bundles remain readable and are deleted as format-2 manifests pass them (§2.7).
 3. `retiring_retention` is now 0 s. During this phase, a node that restarts after more than about two minutes rebuilds from a peer rather than replaying. Set `retiring_retention=15m` for the phase to keep the old window.
@@ -749,7 +749,7 @@ The migration is rolling-safe, with no full stop at any point. One node is down 
 
 **Rollback:**
 - From phase B or C, delete the StatefulSet with `--cascade=orphan` again, and apply the old manifest. While the PVCs still exist, pods reattach them and reopen, or rebuild if pruned past.
-- A **binary** rollback past migration 3 needs a database restore, as for every migration. The operator accepted this on 2026-10-10. Phase A is therefore the point of no return for the binary, and the runbook says so before its first step (§2.6, "Rollback consequence").
+- A **binary** rollback past migration 4 needs a database restore, as for every migration. The operator accepted this on 2026-10-10. Phase A is therefore the point of no return for the binary, and the runbook says so before its first step (§2.6, "Rollback consequence").
 
 **Docker Compose, one node at a time:**
 1. Edit the service to use the tmpfs.
@@ -839,7 +839,7 @@ These run in the in-process cluster harness (`internal/cluster/harness_test.go`)
 | C7 | **Uploader handoff mid-round:** the holder is paused past its lease, and another node claims and GCs | The stale holder's manifest commit is fenced (`uploads_total{result="fenced"}`). No dangling manifest |
 | C8 | **Restorer killed mid-restore** in a cold start | The claim lapses within `lease_ttl`. Another node restores. Waiters do not scan |
 | C9 | **Rolling restart with empty disks** under bulk load | Strict readiness holds each step. No client error with ≥ 2 copies |
-| C10 | **Mixed versions:** a format-1 binary beside a format-2 binary | The old binary ignores `b2/`. The new one restores format-1 bundles. Migration 3 leaves the old binary working |
+| C10 | **Mixed versions:** a format-1 binary beside a format-2 binary | The old binary ignores `b2/`. The new one restores format-1 bundles. Migration 4 leaves the old binary working |
 | C11 | **Identity churn:** 20 replacements under new ids (Deployment style) | `sl_nodes` holds live rows plus rows younger than `node_reap_after`. Retiring rows are released within `lease_ttl` + one prune pass |
 | C12 | **Paged `ScanShard` under writes:** inserts, updates, deletes and a mapping change during the scan, on all three dialects | The copy equals brute force after replay. A mapping change restarts the scan |
 | C13 | **Stuck uploader:** uploads blocked for one shard under writes (fake clock past `bundle_max_hold`), and separately an idle shard with an hour-old manifest that then takes a write | Stuck: the floor leaves the manifest out after 1 h, `sl_changes` is pruned, the manifest is deleted, and `floor_released_total` counts it. Idle: the manifest keeps holding the floor and stays usable until the next upload |
@@ -875,8 +875,8 @@ Each task is one reviewable PR with its tests. Estimates are in working days. Th
 
 | ID | Task | Depends on | Estimate |
 |---|---|---|---|
-| SN-1 | Spec and docs. Main spec §1 (T9a, T9b, T12 as release blockers), §8, §9, §12, §17. `operations.md`: <ul><li>bundles;</li><li>the database sizing note (§2.8);</li><li>`retiring_retention` and the 15m setting for kept disks;</li><li>SQLite with an ephemeral `data_dir` (§2.8);</li><li>`recovery_budget`;</li><li>`bundle_max_hold`;</li><li>migration 3's rollback consequence in "Upgrades and rolling restarts" (§2.6);</li><li>the migration runbook;</li><li>the new alerts.</li></ul> `clustering.md` (the node path) | — | 1.5 |
-| SN-2 | Migration 3: `bundle_until` and `restore_until`. `ClaimBundle`, `ClaimRestore`, `ReleaseClaims`, the renewal. Store conformance on SQLite, Postgres and MySQL | — | 2 |
+| SN-1 | Spec and docs. Main spec §1 (T9a, T9b, T12 as release blockers), §8, §9, §12, §17. `operations.md`: <ul><li>bundles;</li><li>the database sizing note (§2.8);</li><li>`retiring_retention` and the 15m setting for kept disks;</li><li>SQLite with an ephemeral `data_dir` (§2.8);</li><li>`recovery_budget`;</li><li>`bundle_max_hold`;</li><li>migration 4's rollback consequence in "Upgrades and rolling restarts" (§2.6);</li><li>the migration runbook;</li><li>the new alerts.</li></ul> `clustering.md` (the node path) | — | 1.5 |
+| SN-2 | Migration 4: `bundle_until` and `restore_until`. `ClaimBundle`, `ClaimRestore`, `ReleaseClaims`, the renewal. Store conformance on SQLite, Postgres and MySQL | — | 2 |
 | SN-3 | Format-2 writer: naming, manifest encoding, the upload protocol with fence checks, `bundle_budget`, `bundle_concurrency`, the skip check. Crash-hook tests (C6) | SN-2 | 3–4 |
 | SN-4 | Retention, GC, repair. Leader cleanup of gone incarnations. Prune-floor integration with the `bundle_max_hold` release (C13). Format-1 retirement | SN-3 | 2.5 |
 | SN-5 | Format-2 restore: listing and choice, staging with reuse and hard links, parallel `Get` and `BlobStore.GetAt`, verify, install, the fallback chain, the format-1 reader kept (C3–C5) | SN-3 | 3 |
@@ -943,7 +943,7 @@ The draft's open questions were answered by the operator on 2026-10-10. Each is 
 | # | Question | Decision | Where |
 |---|---|---|---|
 | Q1 | Readiness during a cold start | Writes stay up. Reads of a shard with no serving copy answer 503 with `Retry-After: 5` | §3.3, §4.4 |
-| Q2 | Migration 3 and rollback | Migration 3, with the claim columns `bundle_until` and `restore_until`, is accepted. A binary rollback past it needs a database restore. The upgrade docs say so, and the runbook backs up the database first | §2.6, §9, SN-1 |
+| Q2 | Migration 4 and rollback | Migration 4, with the claim columns `bundle_until` and `restore_until`, is accepted. A binary rollback past it needs a database restore. The upgrade docs say so, and the runbook backs up the database first | §2.6, §9, SN-1 |
 | Q3 | `retiring_retention` default | `0s`. Deployments that keep disks set `15m` | §5.2, §9, §12.3 |
 | Q4 | SQLite | Bundles stay off by default. On SQLite an ephemeral `data_dir` rebuilds via `ScanShard` at each start, which is fine for a single node, and is documented | §2.4, §2.8, C14 |
 | Q5 | Recovery bandwidth | Capped by default and configurable, like Elasticsearch's `indices.recovery.max_bytes_per_sec`. The default is **80 MiB/s** per node (`recovery_budget=80MiB`), per the coordinator's ruling in 13.3 | §4.3, §12.3, 13.3 |
@@ -959,11 +959,13 @@ The draft's open questions were answered by the operator on 2026-10-10. Each is 
 | Recovery order | Peer, then bundle reload, then `ScanShard` (bounded) |
 | Bundles | Format 2: content-addressed file blobs per shard incarnation, plus a manifest. On every 1 m by default on Postgres and MySQL, off on SQLite. Retention 2. GC under a per-shard bundle claim. A manifest holds the prune floor for at most 1 h |
 | Bundle storage | The database (`sl_blobs`). Object storage is a non-goal |
-| Herd control | One restore claim per shard (`restore_until` on the copy row, migration 3). The others wait, then copy from a peer. `recovery_concurrency` 2. `recovery_budget` per node, in and out |
+| Herd control | One restore claim per shard (`restore_until` on the copy row, migration 4). The others wait, then copy from a peer. `recovery_concurrency` 2. `recovery_budget` per node, in and out |
 | Readiness | Strict, except copies dark at claim time: a cold start takes writes, and reads of dark shards answer 503 with `Retry-After: 5` |
 | Identity | StatefulSet without a PVC recommended. Dead rows reaped after 1 h. `retiring_retention` 0 s |
 | Bundle format compatibility | N−1: format-2 binaries read format 1. The format-1 reader is removed after the next major |
 | Release blockers | T9a (as T9 today), T9b and T12 join T1–T8 |
+
+**Renumbered 2026-10-13.** The claim columns were migration 3 when the operator accepted them (Q2). Migration 3 now adds `sl_changes.nonce`, which the v1 review fix for changelog rewinds needs, so the claim columns are migration 4. Nothing else about them changed.
 
 ### 13.3 What the decisions changed in the design
 

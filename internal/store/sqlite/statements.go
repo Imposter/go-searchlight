@@ -26,14 +26,14 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 // statement here needs FOR UPDATE.
 var changelog = dialect.Changelog{
 	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? WHERE c.id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
 	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	Write:           write,
-	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
 	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
@@ -46,7 +46,7 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 		r := &w.Changes[i]
 		out = append(out, dialect.Stmt{
 			What: "insert changes", SQL: insertChange,
-			Args: []any{r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, dialect.Blob(r.PayloadZ), r.At, r.IndexUID, r.MappingVersion},
+			Args: []any{r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, dialect.Blob(r.PayloadZ), r.At, r.IndexUID, r.MappingVersion, r.Nonce},
 		})
 	}
 	for i := range w.Documents {
@@ -71,7 +71,7 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 }
 
 const (
-	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	upsertDocument = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq"
 	upsertQuery    = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq"
 	deleteDocument = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"

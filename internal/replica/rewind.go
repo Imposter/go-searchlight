@@ -70,13 +70,14 @@ type markJSON struct {
 	Kind  string `json:"kind"`
 	ID    string `json:"id"`
 	At    int64  `json:"at"` // Unix ms, by the database clock
+	Nonce int64  `json:"nonce,omitempty"`
 }
 
 func encodeMark(m store.ChangeMark) json.RawMessage {
 	if m.Seq <= 0 {
 		return nil
 	}
-	raw, err := json.Marshal(markJSON{Seq: m.Seq, Index: m.Index, Shard: m.Shard, Kind: string(m.Kind), ID: m.ID, At: m.At.UnixMilli()})
+	raw, err := json.Marshal(markJSON{Seq: m.Seq, Index: m.Index, Shard: m.Shard, Kind: string(m.Kind), ID: m.ID, At: m.At.UnixMilli(), Nonce: m.Nonce})
 	if err != nil {
 		return nil
 	}
@@ -88,7 +89,7 @@ func decodeMark(raw json.RawMessage) store.ChangeMark {
 	if len(raw) == 0 || json.Unmarshal(raw, &j) != nil || j.Seq <= 0 {
 		return store.ChangeMark{}
 	}
-	return store.ChangeMark{Seq: j.Seq, Index: j.Index, Shard: j.Shard, Kind: store.Kind(j.Kind), ID: j.ID, At: time.UnixMilli(j.At).UTC()}
+	return store.ChangeMark{Seq: j.Seq, Index: j.Index, Shard: j.Shard, Kind: store.Kind(j.Kind), ID: j.ID, At: time.UnixMilli(j.At).UTC(), Nonce: j.Nonce}
 }
 
 // markOf returns the check state sh keeps: its anchor mark, and the mark of its

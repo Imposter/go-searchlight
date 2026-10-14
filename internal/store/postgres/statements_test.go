@@ -4,25 +4,34 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
-// writeSQL takes 30 arguments, numbered once each.
+// writeSQL takes 31 arguments, each used once (the nonces, added last, are $31).
 func TestWriteSQLPlaceholders(t *testing.T) {
-	got := regexp.MustCompile(`\$\d+`).FindAllString(writeSQL, -1)
-	want := make([]string, 30)
+	var got []int
+	for _, p := range regexp.MustCompile(`\$(\d+)`).FindAllStringSubmatch(writeSQL, -1) {
+		n, err := strconv.Atoi(p[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	slices.Sort(got)
+	want := make([]int, 31)
 	for i := range want {
-		want[i] = fmt.Sprintf("$%d", i+1)
+		want[i] = i + 1
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("placeholders %v", got)
 	}
 	w := &dialect.Write{Counter: 7}
 	st := write(w, limits)
-	if len(st) != 1 || len(st[0].Args) != 30 {
+	if len(st) != 1 || len(st[0].Args) != 31 {
 		t.Fatalf("an empty write: %d statements, %d args", len(st), len(st[0].Args))
 	}
 	for i, a := range st[0].Args {

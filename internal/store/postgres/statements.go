@@ -29,15 +29,15 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 
 var changelog = dialect.Changelog{
 	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
-	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $1 WHERE c.id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $1 WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = $1",
 	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
 	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
 	Write:           write,
 	Limits:          limits,
-	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
+	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 ORDER BY id",
 	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = $1 AND shard = $2 ORDER BY id",
@@ -57,8 +57,8 @@ var changelog = dialect.Changelog{
 // delete of the same key would both "succeed" and the upsert would silently
 // win; only two upserts of one key fail ("cannot affect row a second time").
 const writeSQL = `WITH changes AS (
-	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version)
-	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bytea[], $8::bigint[], $9::text[], $10::bigint[])
+	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce)
+	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bytea[], $8::bigint[], $9::text[], $10::bigint[], $31::bigint[])
 ), documents AS (
 	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq)
 	SELECT * FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[])
@@ -164,18 +164,18 @@ func keys(groups []dialect.DeleteGroup) keyColumns {
 }
 
 type writeArgs struct {
-	cSeq, cAt, cMV        []int64
-	cKind, cPayload, cUID []string
-	cPayloadZ             [][]byte
-	c                     keyColumns
-	d                     keyColumns
-	dBody                 []string
-	dBodyZ                [][]byte
-	dSeq                  []int64
-	q                     keyColumns
-	qQuery, qMeta         []string
-	qSeq                  []int64
-	dDel, qDel            keyColumns
+	cSeq, cAt, cMV, cNonce []int64
+	cKind, cPayload, cUID  []string
+	cPayloadZ              [][]byte
+	c                      keyColumns
+	d                      keyColumns
+	dBody                  []string
+	dBodyZ                 [][]byte
+	dSeq                   []int64
+	q                      keyColumns
+	qQuery, qMeta          []string
+	qSeq                   []int64
+	dDel, qDel             keyColumns
 }
 
 func (a *writeArgs) changes(rows []dialect.ChangeRow) {
@@ -189,6 +189,7 @@ func (a *writeArgs) changes(rows []dialect.ChangeRow) {
 		a.cAt = append(a.cAt, r.At)
 		a.cUID = append(a.cUID, r.IndexUID)
 		a.cMV = append(a.cMV, r.MappingVersion)
+		a.cNonce = append(a.cNonce, r.Nonce)
 	}
 }
 
@@ -224,6 +225,7 @@ func (a *writeArgs) args(counter int64, notify []string) []any {
 		strs(a.qDel.index), ints(a.qDel.shard), strs(a.qDel.id),
 		counter,
 		strs(notify),
+		ints64(a.cNonce),
 	}
 }
 

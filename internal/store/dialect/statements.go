@@ -51,6 +51,9 @@ type ChangeRow struct {
 	At             int64
 	IndexUID       string
 	MappingVersion int64
+	// Nonce is the change's random nonce (never 0): with its seq it tells this
+	// change apart from any other that ever takes the seq.
+	Nonce int64
 }
 
 // Blob is b as a statement argument: NULL when b is nil.
@@ -112,14 +115,14 @@ type Changelog struct {
 	// holds the database's write lock).
 	LockCounter string
 	// ReadCounterMark: () -> value of sl_counter row 1, without a lock, then
-	// index_name, shard, kind, id, at of the change at that value, NULL when there
-	// is none.
+	// index_name, shard, kind, id, at, nonce of the change at that value, NULL when
+	// there is none.
 	ReadCounterMark string
 	// ReadHead: () -> value of sl_counter row 1, NOW.
 	ReadHead string
 	// ReadTip: (seq) -> value of sl_counter row 1, NOW, then index_name, shard,
-	// kind, id, at of the change at that value and of the change at seq, each
-	// NULL when there is no such change.
+	// kind, id, at, nonce of the change at that value and of the change at seq,
+	// each NULL when there is no such change.
 	ReadTip string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
@@ -136,8 +139,8 @@ type Changelog struct {
 	// shrink them to drive the split paths on a real server.
 	Limits Limits
 	// ChangesAfter: (index, shard, seq, limit) -> seq, kind, id, payload,
-	// payload_z, at, index_uid, mapping_version of the shard's changes after seq,
-	// by seq.
+	// payload_z, at, index_uid, mapping_version, nonce (NULL before schema v3) of
+	// the shard's changes after seq, by seq.
 	ChangesAfter string
 	// Horizon: (index, shard) -> below_seq of sl_pruned.
 	Horizon string

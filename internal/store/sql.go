@@ -510,7 +510,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		st := idx[c.Index]
 		w.Changes[i] = dialect.ChangeRow{
 			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID,
-			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion,
+			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion, Nonce: newNonce(),
 		}
 	}
 	netState(w, batch, p, first)
@@ -788,9 +788,11 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		var kind string
 		var payload, payloadZ []byte
 		var at int64
-		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &payloadZ, &at, &c.IndexUID, &c.MappingVersion); err != nil {
+		var nonce sql.NullInt64
+		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &payloadZ, &at, &c.IndexUID, &c.MappingVersion, &nonce); err != nil {
 			return nil, err
 		}
+		c.Nonce = nonce.Int64
 		c.Kind = Kind(kind)
 		var derr error
 		if c.Payload, derr = readBody(payload, payloadZ); derr != nil {
@@ -846,7 +848,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	// The counter and the mark of the change at it are read first, in the same
 	// snapshot as the rows.
 	var mc markColumns
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark).Scan(&asOf, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at); err != nil {
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark).Scan(&asOf, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce); err != nil {
 		return 0, mark, err
 	}
 	mark = mc.mark(asOf)
@@ -927,8 +929,8 @@ func (s *sqlStore) Tip(ctx context.Context, seq int64) (tip Tip, err error) {
 	var nowMs int64
 	var head, at markColumns
 	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadTip, seq).Scan(&tip.Head, &nowMs,
-		&head.index, &head.shard, &head.kind, &head.id, &head.at,
-		&at.index, &at.shard, &at.kind, &at.id, &at.at)
+		&head.index, &head.shard, &head.kind, &head.id, &head.at, &head.nonce,
+		&at.index, &at.shard, &at.kind, &at.id, &at.at, &at.nonce)
 	if err != nil {
 		return tip, err
 	}
@@ -938,15 +940,15 @@ func (s *sqlStore) Tip(ctx context.Context, seq int64) (tip Tip, err error) {
 
 // markColumns scans a change's mark from a LEFT JOIN, NULL when there is no change.
 type markColumns struct {
-	index, kind, id sql.NullString
-	shard, at       sql.NullInt64
+	index, kind, id  sql.NullString
+	shard, at, nonce sql.NullInt64
 }
 
 func (c *markColumns) mark(seq int64) ChangeMark {
 	if !c.index.Valid {
 		return ChangeMark{}
 	}
-	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
+	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
 }
 
 // --- Pruning ---------------------------------------------------------------

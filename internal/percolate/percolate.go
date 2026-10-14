@@ -116,14 +116,6 @@ func New(opts Options) *Percolator {
 	return p
 }
 
-var defaultPercolator = sync.OnceValue(func() *Percolator { return New(Options{}) })
-
-// Percolate is [Percolator.Percolate] on a process-wide Percolator with default
-// options.
-func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
-	return defaultPercolator().Percolate(ctx, g, docs)
-}
-
 // view is one query segment of a generation, as percolation reads it.
 type view struct {
 	seg     *Segment           // nil: not the percolator's format (checked by brute force)

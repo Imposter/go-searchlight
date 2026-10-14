@@ -111,8 +111,10 @@ type Changelog struct {
 	// until the transaction ends ("" FOR UPDATE where the transaction already
 	// holds the database's write lock).
 	LockCounter string
-	// ReadCounter: () -> value of sl_counter row 1, without a lock.
-	ReadCounter string
+	// ReadCounterMark: () -> value of sl_counter row 1, without a lock, then
+	// index_name, shard, kind, id, at of the change at that value, NULL when there
+	// is none.
+	ReadCounterMark string
 	// ReadHead: () -> value of sl_counter row 1, NOW.
 	ReadHead string
 	// ReadTip: (seq) -> value of sl_counter row 1, NOW, then index_name, shard,

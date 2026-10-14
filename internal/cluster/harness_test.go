@@ -647,9 +647,9 @@ func (f *faultStore) Indexes() store.IndexStore {
 	return &faultIndexes{IndexStore: f.Store.Indexes(), f: f}
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, store.ChangeMark, error) {
 	if f.isDown() {
-		return 0, errPartitioned
+		return 0, store.ChangeMark{}, errPartitioned
 	}
 	return f.Store.ScanShard(ctx, id, fn)
 }

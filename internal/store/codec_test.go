@@ -359,7 +359,7 @@ func TestCorruptBody(t *testing.T) {
 			t.Fatalf("ChangesAfter: %d changes, %v", len(page), err)
 		}
 		seq := ce.Seq
-		if _, err := st.ScanShard(ctx, shard, func(Record) error { return nil }); !errors.As(err, &ce) || ce.ID != "b" || ce.Seq != seq {
+		if _, _, err := st.ScanShard(ctx, shard, func(Record) error { return nil }); !errors.As(err, &ce) || ce.ID != "b" || ce.Seq != seq {
 			t.Fatalf("ScanShard: %v", err)
 		}
 		if _, err := st.(RecordReader).GetRecord(ctx, RecordDocument, shard, "b"); !errors.As(err, &ce) || ce.ID != "b" || ce.Seq != seq { //nolint:errcheck // every store reads records

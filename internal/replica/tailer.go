@@ -652,7 +652,7 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	t.pollOK()
-	if wait, err := t.checkRewind(ctx, &t.rw, from, &tip); err != nil {
+	if wait, err := t.checkRewind(ctx, sh, &t.rw, from, &tip); err != nil {
 		return false, err
 	} else if wait {
 		return false, errHeadBehind

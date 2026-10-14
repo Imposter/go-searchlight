@@ -56,3 +56,35 @@ func TestSeqMarkIsDurable(t *testing.T) {
 		t.Fatalf("a mark set after its seq was published: after a reopen SeqMark = %s, want %s", got, late)
 	}
 }
+
+// TestAnchorMarkIsDurable: the anchor mark, unlike the seq mark, holds whatever the
+// applied seq: it is published, flushed (anchor_mark), reopened and in a snapshot's
+// manifest, beside the seq mark.
+func TestAnchorMarkIsDurable(t *testing.T) {
+	h := newHarness(t, testOptions())
+	anchor := json.RawMessage(`{"seq":1}`)
+	h.upsert("a")
+	h.s.SetAnchorMark(anchor)
+	h.upsert("b", "c")
+	h.commit()
+	h.reopen()
+	if got := h.s.AnchorMark(); string(got) != string(anchor) {
+		t.Fatalf("after a reopen AnchorMark = %s, want %s", got, anchor)
+	}
+	moved := json.RawMessage(`{"seq":3}`)
+	h.s.SetAnchorMark(moved)
+	h.commit()
+	sn, err := h.s.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Release()
+	raw := sn.mem[manifestName]
+	var man manifest
+	if err := json.Unmarshal(raw[bytes.IndexByte(raw, '\n')+1:], &man); err != nil {
+		t.Fatal(err)
+	}
+	if string(man.AnchorMark) != string(moved) {
+		t.Fatalf("the snapshot's manifest carries anchor %s, want %s", man.AnchorMark, moved)
+	}
+}

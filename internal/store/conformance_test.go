@@ -528,7 +528,7 @@ func TestScanShardSnapshot(t *testing.T) {
 		}
 		var lateSeq int64
 		var ids []string
-		asOf, err := st.ScanShard(ctx, shard, func(r Record) error {
+		asOf, mark, err := st.ScanShard(ctx, shard, func(r Record) error {
 			if r.Kind == RecordMapping {
 				return nil
 			}
@@ -555,6 +555,11 @@ func TestScanShardSnapshot(t *testing.T) {
 		if fmt.Sprint(ids) != "[d0 d1 d2 d3 d4]" {
 			t.Fatalf("scan saw %v", ids)
 		}
+		// The mark is of the change at asOf, as the snapshot holds it.
+		before, err := st.ChangesAfter(ctx, shard, asOf-1, 1)
+		if err != nil || len(before) != 1 || !mark.Same(before[0].Mark()) {
+			t.Fatalf("the snapshot's mark %+v, the change at %d %v (%v)", mark, asOf, before, err)
+		}
 		// Replaying ChangesAfter(asOf) on the snapshot gives the present.
 		rest, err := st.ChangesAfter(ctx, shard, asOf, 0)
 		if err != nil || len(rest) != 2 || rest[0].ID != "d9" {
@@ -562,7 +567,7 @@ func TestScanShardSnapshot(t *testing.T) {
 		}
 		// A callback error stops the scan and is returned.
 		boom := errors.New("boom")
-		if _, err := st.ScanShard(ctx, shard, func(Record) error { return boom }); !errors.Is(err, boom) {
+		if _, _, err := st.ScanShard(ctx, shard, func(Record) error { return boom }); !errors.Is(err, boom) {
 			t.Fatalf("scan error %v", err)
 		}
 	})
@@ -632,7 +637,7 @@ func TestCancellation(t *testing.T) {
 		if _, err := st.ChangesAfter(done, shard, 0, 10); !errors.Is(err, context.Canceled) {
 			t.Fatalf("changes with a cancelled context: %v", err)
 		}
-		if _, err := st.ScanShard(done, shard, func(Record) error { return nil }); !errors.Is(err, context.Canceled) {
+		if _, _, err := st.ScanShard(done, shard, func(Record) error { return nil }); !errors.Is(err, context.Canceled) {
 			t.Fatalf("scan with a cancelled context: %v", err)
 		}
 
@@ -2075,7 +2080,7 @@ func TestMappingChanges(t *testing.T) {
 			t.Fatalf("changes %+v", changes)
 		}
 		var mapping []Record
-		_, err = st.ScanShard(ctx, ShardID{Index: "mc", Shard: 1}, func(r Record) error {
+		_, _, err = st.ScanShard(ctx, ShardID{Index: "mc", Shard: 1}, func(r Record) error {
 			if r.Kind == RecordMapping {
 				mapping = append(mapping, r)
 			} else if r.MappingVersion != 2 {

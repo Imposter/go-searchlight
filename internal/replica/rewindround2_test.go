@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -61,6 +62,141 @@ func TestHeadBehindOnceKeepsAHaltedCopyHalted(t *testing.T) {
 		}
 		if polls.Load() < 2 {
 			t.Fatalf("only %d polls in two seconds", polls.Load())
+		}
+	})
+}
+
+// TestRewindOnTheAsideCatchUpsLastPageRebuildsTheCopy: the changelog is rewound between
+// the aside catch-up's last Tip and its last page, which then holds the new history.
+// The replacement's mark of that page is unverified: it is carried into the tailer as
+// pending, not trusted, and the next poll's check of the verified anchor finds the
+// rewind.
+func TestRewindOnTheAsideCatchUpsLastPageRebuildsTheCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		fs := newFaultStore(d.open(t))
+		opts, reader := meteredOptions()
+		c := newCopy(t, fs, id, opts)
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("w", 0, "a", docBody("a", 1))))
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		k := mustApply(t, st, upsert("w", 0, "kept", docBody("kept", 1)))
+		if err := st.Prune(ctx, id, k+1); err != nil { // past the copy: rebuilt aside
+			t.Fatal(err)
+		}
+		lost := writeDocs(ctx, t, st, "w", "lost", 5)
+		var once sync.Once
+		fs.mu.Lock()
+		fs.onChanges = func(cctx context.Context, seq int64) error {
+			if seq == lost {
+				once.Do(func() {
+					rewind(context.WithoutCancel(cctx), t, d, k)
+					writeDocs(context.WithoutCancel(cctx), t, st, "w", "new", 8)
+				})
+			}
+			return nil
+		}
+		fs.mu.Unlock()
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
+		}
+	})
+}
+
+// TestRewindBetweenTipAndPageThenRestartRebuildsTheCopy: a poll's page is read across a
+// rewind (after its Tip checked the anchor), and the copy stops before the next poll.
+// Its manifest keeps the verified anchor beside the unverified mark of that page, so
+// the restarted copy checks the anchor first, finds the rewind, and rebuilds.
+func TestRewindBetweenTipAndPageThenRestartRebuildsTheCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		fs := newFaultStore(d.open(t))
+		opts, reader := meteredOptions()
+		opts.PollInterval, opts.WatchedPollInterval = time.Hour, time.Hour
+		c := newCopy(t, fs, id, opts)
+		c.start()
+		k := mustApply(t, st, upsert("w", 0, "kept", docBody("kept", 1)))
+		lost := writeDocs(ctx, t, st, "w", "lost", 5)
+		c.waitApplied(lost)
+		c.current().Wake() // one more poll: the copy's anchor is lost4's mark
+		time.Sleep(200 * time.Millisecond)
+		var done atomic.Bool
+		fs.mu.Lock()
+		fs.onChanges = func(cctx context.Context, seq int64) error {
+			if seq == lost && !done.Swap(true) {
+				rewind(context.WithoutCancel(cctx), t, d, k)
+				writeDocs(context.WithoutCancel(cctx), t, st, "w", "new", 8)
+			}
+			return nil
+		}
+		fs.mu.Unlock()
+		c.current().Wake()
+		for deadline := time.Now().Add(30 * time.Second); !done.Load(); {
+			if time.Now().After(deadline) {
+				t.Fatal("the poll never read its page")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		fs.mu.Lock()
+		fs.onChanges = nil
+		fs.mu.Unlock()
+		c.opts.PollInterval, c.opts.WatchedPollInterval = 10*time.Millisecond, 200*time.Millisecond
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
+		}
+	})
+}
+
+// TestRewindRightAfterASnapshotLoadRebuildsTheCopy: the changelog is rewound right after
+// a rebuild's snapshot scan, and new writes pass the snapshot's seq. The mark the copy
+// keeps comes from the scan's own snapshot, so it is the lost change's, and the first
+// poll finds the rewind.
+func TestRewindRightAfterASnapshotLoadRebuildsTheCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		fs := newFaultStore(d.open(t))
+		k := mustApply(t, st, upsert("w", 0, "kept", docBody("kept", 1)))
+		writeDocs(ctx, t, st, "w", "lost", 5)
+		var once sync.Once
+		fs.mu.Lock()
+		fs.afterScan = func(sctx context.Context) {
+			once.Do(func() {
+				rewind(context.WithoutCancel(sctx), t, d, k)
+				writeDocs(context.WithoutCancel(sctx), t, st, "w", "new", 8)
+			})
+		}
+		fs.mu.Unlock()
+		opts, reader := meteredOptions()
+		c := newCopy(t, fs, id, opts)
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
 		}
 	})
 }

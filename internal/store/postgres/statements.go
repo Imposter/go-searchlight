@@ -28,19 +28,19 @@ const fence = " WHERE index_name = $2 AND shard = $3 AND slot = $4 AND node_id =
 const indexColumns = "mapping, settings, version, created_at, uid, mapping_version"
 
 var changelog = dialect.Changelog{
-	LockCounter:   withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
-	ReadCounter:   "SELECT value FROM sl_counter WHERE id = 1",
-	ReadHead:      withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:       withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $1 WHERE c.id = 1"),
-	IndexState:    "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = $1",
-	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
-	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
-	Write:         write,
-	Limits:        limits,
-	ChangesAfter:  "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
-	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2",
-	ScanDocuments: "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 ORDER BY id",
-	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = $1 AND shard = $2 ORDER BY id",
+	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
+	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $1 WHERE c.id = 1"),
+	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = $1",
+	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
+	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	Write:           write,
+	Limits:          limits,
+	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
+	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2",
+	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 ORDER BY id",
+	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = $1 AND shard = $2 ORDER BY id",
 }
 
 // writeSQL is the whole of an Apply's (or a mapping change's) write as one

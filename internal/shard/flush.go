@@ -1,7 +1,6 @@
 package shard
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -80,7 +79,7 @@ func (s *Shard) flush(ctx context.Context) (*Generation, error) {
 		s.commitMu.Unlock()
 		return nil, ErrClosed
 	}
-	if g.gen == s.durableGen && g.seq == s.committed.Load() && g.uid == s.committedUID && g.mp == s.committedMap && bytes.Equal(g.mark, s.committedMark) {
+	if g.gen == s.durableGen && g.seq == s.committed.Load() && g.uid == s.committedUID && g.mp == s.committedMap && g.marks.equal(s.committedMarks) {
 		s.commitMu.Unlock()
 		return g, nil
 	}
@@ -192,7 +191,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 	if err != nil {
 		return nil, err
 	}
-	man.UntypedMarks, man.SeqMark = legacyMarks(g.docs), g.mark
+	man.UntypedMarks, man.SeqMark, man.AnchorMark = legacyMarks(g.docs), g.marks.seq, g.marks.anchor
 	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	switch {
 	case err == nil:
@@ -254,7 +253,7 @@ func (s *Shard) retireDurable(g *Generation, pending []*segRef, sidecars map[str
 	clear(s.strays)
 	s.durableSidecars = sidecars
 	s.sidecarBytes.Store(total)
-	s.durableGen, s.committedUID, s.committedMap, s.committedMark = g.gen, g.uid, g.mp, g.mark
+	s.durableGen, s.committedUID, s.committedMap, s.committedMarks = g.gen, g.uid, g.mp, g.marks
 	s.committed.Store(g.seq)
 	s.jan.removeLater(obsolete...)
 }

@@ -129,7 +129,7 @@ func TestRewindLowersTheNodesHead(t *testing.T) {
 }
 
 // rewindSQLite loses every commit after seq k from the SQLite store at storeURL, as a
-// failover that lost them would.
+// failover that lost them would, all at once.
 func rewindSQLite(t *testing.T, storeURL string, k int64) {
 	t.Helper()
 	u, err := url.Parse(storeURL)
@@ -145,14 +145,22 @@ func rewindSQLite(t *testing.T, storeURL string, k int64) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
+	tx, err := raw.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, q := range []string{
 		"DELETE FROM sl_changes WHERE seq > ?",
 		"DELETE FROM sl_documents WHERE seq > ?",
 		"DELETE FROM sl_queries WHERE seq > ?",
 		"UPDATE sl_counter SET value = ? WHERE id = 1",
 	} {
-		if _, err := raw.ExecContext(context.Background(), q, k); err != nil {
+		if _, err := tx.ExecContext(context.Background(), q, k); err != nil {
 			t.Fatalf("rewind %q: %v", q, err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("rewind: %v", err)
 	}
 }

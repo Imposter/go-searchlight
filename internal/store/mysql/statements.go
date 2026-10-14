@@ -31,19 +31,19 @@ const fence = " WHERE index_name = ? AND shard = ? AND slot = ? AND node_id = ? 
 const indexColumns = "mapping, settings, version, created_at, uid, mapping_version"
 
 var changelog = dialect.Changelog{
-	LockCounter:   withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
-	ReadCounter:   "SELECT value FROM sl_counter WHERE id = 1",
-	ReadHead:      withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:       withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? WHERE c.id = 1"),
-	IndexState:    "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
-	DocumentSeq:   "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	QuerySeq:      "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	Write:         write,
-	Limits:        limits,
-	ChangesAfter:  "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
-	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
-	ScanDocuments: "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
-	ScanQueries:   "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
+	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
+	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? WHERE c.id = 1"),
+	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
+	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	Write:           write,
+	Limits:          limits,
+	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
+	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
 // write spells w as multi-row INSERTs as large as l allows, upserts with ON

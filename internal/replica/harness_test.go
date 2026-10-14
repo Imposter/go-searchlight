@@ -290,6 +290,9 @@ type faultStore struct {
 	corrupt func(c *store.Change) bool
 	// onTip, when set, may rewrite what every Tip returns (a read of a lagging server).
 	onTip func(tip *store.Tip)
+	// afterScan, when set, runs once a ScanShard has returned, before its caller
+	// sees the result.
+	afterScan func(ctx context.Context)
 }
 
 func newFaultStore(st store.Store) *faultStore {
@@ -366,15 +369,15 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return page, err
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, store.ChangeMark, error) {
 	if err := f.take("scan"); err != nil {
-		return 0, err
+		return 0, store.ChangeMark{}, err
 	}
 	f.mu.Lock()
-	hook := f.onRecord
+	hook, after := f.onRecord, f.afterScan
 	f.mu.Unlock()
 	n := 0
-	return f.Store.ScanShard(ctx, id, func(r store.Record) error {
+	asOf, mark, err := f.Store.ScanShard(ctx, id, func(r store.Record) error {
 		n++
 		if hook != nil {
 			if err := hook(ctx, n, r); err != nil {
@@ -383,6 +386,10 @@ func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(st
 		}
 		return fn(r)
 	})
+	if after != nil {
+		after(ctx)
+	}
+	return asOf, mark, err
 }
 
 func (f *faultStore) Indexes() store.IndexStore {

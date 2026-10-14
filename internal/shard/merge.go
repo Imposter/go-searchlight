@@ -350,7 +350,7 @@ func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap
 	if out != nil {
 		built = []*segRef{out}
 	}
-	s.publish(ctx, docs, queries, built, cur.seq, cur.maxSeq, cur.uid, cur.mp, cur.mark)
+	s.publish(ctx, docs, queries, built, cur.seq, cur.maxSeq, cur.uid, cur.mp, cur.marks)
 	if out != nil && s.forceEligible != nil {
 		// A merge of only segments a ForceMerge is responsible for (a background merge
 		// in flight when it started, whose inputs all existed then, or its own) makes a

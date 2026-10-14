@@ -1,7 +1,6 @@
 package shard
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -186,7 +185,7 @@ type Generation struct {
 	uid     string
 	mapping *schema.Mapping
 	mp      *mappingState // mapping, with its version
-	mark    json.RawMessage
+	marks   marks
 
 	// Segments are the document segments, in base-ordinal order.
 	Segments []SegmentView
@@ -426,7 +425,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, mp, docs, queries)
-	g.mark = man.SeqMark
+	g.marks = marks{seq: man.SeqMark, anchor: man.AnchorMark}
 	// newGeneration took the generation's references; the opener's are not needed.
 	return g, nil
 }

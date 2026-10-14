@@ -61,9 +61,12 @@ type Store interface {
 	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
 	// the index does not exist), then every document and every saved query of
 	// shard, from one consistent snapshot, and returns the seq that snapshot
-	// reflects: replaying ChangesAfter(asOfSeq) on top of it is exact. A
-	// document whose body does not decode ends the scan with a *CorruptError.
-	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
+	// reflects (replaying ChangesAfter(asOfSeq) on top of it is exact) and the
+	// mark of the change at that seq as the snapshot holds it (the zero mark when
+	// it is gone), so a copy loaded from it knows what the changelog held where
+	// it stands. A document whose body does not decode ends the scan with a
+	// *CorruptError.
+	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, mark ChangeMark, err error)
 
 	// HeadSeq returns the newest committed seq across every shard (0 before
 	// the first change), and the database clock's time as it read it. Every

@@ -340,8 +340,10 @@ type Shard struct {
 	mapState  *mappingState // the mapping as of applied
 	closing   bool
 	// markSeq and mark are the last SetMark: the mark is applied's when markSeq is.
+	// anchor is the last SetAnchorMark, whatever applied is.
 	markSeq int64
 	mark    json.RawMessage
+	anchor  json.RawMessage
 
 	// failed is set once the shard cannot vouch for its durable state.
 	failed atomic.Pointer[error]
@@ -371,7 +373,7 @@ type Shard struct {
 	durableGen      uint64
 	committedUID    string
 	committedMap    *mappingState
-	committedMark   json.RawMessage
+	committedMarks  marks
 	durableSegs     map[*segRef]bool
 	durableSidecars map[string]int64
 	strays          map[string]bool
@@ -493,7 +495,8 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.sidecarBytes.Store(sidecarBytes)
 	s.applied = man.Seq
-	s.markSeq, s.mark, s.committedMark = man.Seq, man.SeqMark, man.SeqMark
+	s.markSeq, s.mark, s.anchor = man.Seq, man.SeqMark, man.AnchorMark
+	s.committedMarks = marks{seq: man.SeqMark, anchor: man.AnchorMark}
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
 	s.committedUID = man.IndexUID
@@ -584,6 +587,22 @@ func (s *Shard) SeqMark() json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.markAt(s.applied)
+}
+
+// SetAnchorMark records mark, an opaque JSON value, as the anchor mark: unlike the seq
+// mark it holds whatever the applied seq is. Refreshes publish it, flushes write it to
+// the manifest (anchor_mark), and an opened copy, a snapshot's included, carries it.
+func (s *Shard) SetAnchorMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.anchor = mark
+}
+
+// AnchorMark returns the anchor mark, nil when none was recorded.
+func (s *Shard) AnchorMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.anchor
 }
 
 // markAt is the mark recorded for seq, or nil. The caller holds mu.

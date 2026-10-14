@@ -28,7 +28,7 @@ import (
 func truth(t testing.TB, st store.Store, id store.ShardID) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	if _, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
+	if _, _, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
 		if r.Kind == store.RecordDocument {
 			out[r.ID] = string(r.Body)
 		}

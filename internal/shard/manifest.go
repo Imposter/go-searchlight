@@ -63,6 +63,19 @@ type manifest struct {
 	// changelog held there, as the tailer that applied it saw it. Absent when none
 	// was recorded (a binary from before marks reads the manifest without it).
 	SeqMark json.RawMessage `json:"seq_mark,omitempty"`
+	// AnchorMark is the caller's anchor mark ([Shard.SetAnchorMark]), which holds
+	// whatever Seq is: the last change the caller verified the changelog still holds.
+	AnchorMark json.RawMessage `json:"anchor_mark,omitempty"`
+}
+
+// marks are the caller's marks a generation carries and a flush persists: the mark of
+// the change at the generation's seq, and the anchor mark.
+type marks struct {
+	seq, anchor json.RawMessage
+}
+
+func (m marks) equal(o marks) bool {
+	return bytes.Equal(m.seq, o.seq) && bytes.Equal(m.anchor, o.anchor)
 }
 
 // untypedMarksFormat is the manifest's UntypedMarks when its previous-major segments

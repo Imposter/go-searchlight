@@ -274,7 +274,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 		if err != nil {
 			return err
 		}
-		wait, err := t.checkRewind(ctx, &rc, from, &tip)
+		wait, err := t.checkRewind(ctx, sh, &rc, from, &tip)
 		if err != nil {
 			return err
 		}
@@ -329,6 +329,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	}
 	swapped = true
 	t.swap(sh)
+	t.rw = rc
 	old.Abandon()
 	if err != nil {
 		t.log.WarnContext(ctx, "syncing the copy's root after the swap failed; the replaced copy stays until the next open, in case a crash undoes the swap",
@@ -551,7 +552,7 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		}
 		done <- r
 	}()
-	asOf, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
+	asOf, mark, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
 		select {
 		case records <- r:
 			return nil
@@ -575,8 +576,8 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		return 0, fmt.Errorf("%w: %s is missing from the snapshot", ErrIndexDropped, t.id.Index)
 	}
 	t.inst.recoveryBytes.Add(ctx, res.bytes, t.inst.with(attribute.String("source", sourceSQL)))
-	if tip, err := t.st.Tip(ctx, asOf); err == nil && tip.Head >= asOf && tip.AtMark.Seq == asOf {
-		sh.SetMark(asOf, encodeMark(tip.AtMark))
+	if mark.Seq == asOf {
+		sh.SetMark(asOf, encodeMark(mark))
 	}
 	if err := sh.Advance(asOf); err != nil {
 		return 0, err

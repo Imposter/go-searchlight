@@ -829,24 +829,27 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	return out, nil
 }
 
-func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOf int64, err error) {
+func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOf int64, mark ChangeMark, err error) {
 	ctx, end := s.start(ctx, "scan_shard", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
 	if s.closed.Load() {
-		return 0, ErrClosed
+		return 0, mark, ErrClosed
 	}
 	if err := validShard(shard); err != nil {
-		return 0, err
+		return 0, mark, err
 	}
 	tx, err := s.r.BeginTx(ctx, s.d.SnapshotTx)
 	if err != nil {
-		return 0, err
+		return 0, mark, err
 	}
 	defer rollback(tx)
-	// The counter is read first, in the same snapshot as the rows.
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounter).Scan(&asOf); err != nil {
-		return 0, err
+	// The counter and the mark of the change at it are read first, in the same
+	// snapshot as the rows.
+	var mc markColumns
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark).Scan(&asOf, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at); err != nil {
+		return 0, mark, err
 	}
+	mark = mc.mark(asOf)
 	// The index's current incarnation and mapping, read once in this scan's
 	// snapshot: the mapping is the first record, and the incarnation and
 	// mapping version are stamped on every record.
@@ -856,11 +859,11 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	switch err := tx.QueryRowContext(ctx, s.d.Changelog.IndexState, shard.Index).Scan(&uid, &mv, &mapping); {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
-		return 0, err
+		return 0, mark, err
 	default:
 		r := Record{Kind: RecordMapping, Index: shard.Index, Shard: shard.Shard, Body: mapping, IndexUID: uid, MappingVersion: mv}
 		if err := fn(r); err != nil {
-			return 0, err
+			return 0, mark, err
 		}
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanDocuments, shard, func(rows *sql.Rows) (Record, error) {
@@ -875,15 +878,15 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 		}
 		return r, nil
 	}, fn); err != nil {
-		return 0, err
+		return 0, mark, err
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanQueries, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
 		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
 	}, fn); err != nil {
-		return 0, err
+		return 0, mark, err
 	}
-	return asOf, tx.Commit()
+	return asOf, mark, tx.Commit()
 }
 
 func scanRows(ctx context.Context, tx *sql.Tx, q string, shard ShardID, scan func(*sql.Rows) (Record, error), fn func(Record) error) error {

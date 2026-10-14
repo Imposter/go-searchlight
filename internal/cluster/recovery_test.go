@@ -156,8 +156,8 @@ func biggestSegment(t testing.TB, tn *tnode, id store.ShardID) (string, int64) {
 }
 
 // snapshotBytes is the size of a snapshot of id on tn, its manifest left out: each
-// snapshot writes its manifest anew, and the marks in it (with their random nonces)
-// make its length vary from one snapshot to the next.
+// snapshot writes its manifest anew, and the rewind marks in it (their seqs, times,
+// ids and random nonces) make its length vary from one snapshot to the next.
 func snapshotBytes(t testing.TB, tn *tnode, id store.ShardID) int64 {
 	t.Helper()
 	sn, err := tn.n.Snapshot(context.Background(), id)

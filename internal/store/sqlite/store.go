@@ -55,19 +55,20 @@ const JournalSizeLimit = 4 << 20
 // lock before failing with SQLITE_BUSY, unless the URL sets _busy_timeout.
 const DefaultBusyTimeoutMS = 30000
 
-// Dialect returns the SQLite dialect.
+// Dialect returns the SQLite dialect. It panics only if the binary lacks its embedded
+// migrations directory. The writer's automatic checkpoints are off (DSNs): a PASSIVE
+// checkpoint on a read connection keeps the log short instead, off every commit's
+// path.
 func Dialect() *dialect.Dialect {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
-		panic(err) // the embedded directory always exists
+		panic(err)
 	}
 	return &dialect.Dialect{
-		Name:       "sqlite",
-		Open:       open,
-		Migrations: sub,
-		Retryable:  retryable,
-		// The writer's automatic checkpoints are off (DSNs): a PASSIVE checkpoint on
-		// a read connection keeps the log short instead, off every commit's path.
+		Name:               "sqlite",
+		Open:               open,
+		Migrations:         sub,
+		Retryable:          retryable,
 		Checkpoint:         "PRAGMA wal_checkpoint(PASSIVE)",
 		TruncateCheckpoint: "PRAGMA wal_checkpoint(TRUNCATE)",
 		TruncateAbove:      4 * JournalSizeLimit,
@@ -109,7 +110,8 @@ func retryable(err error) bool {
 
 // Path extracts the database file path from a sqlite URL:
 // sqlite:///abs/path.db, sqlite:///C:/dir/x.db (Windows), sqlite://rel/x.db
-// or sqlite:rel.db.
+// or sqlite:rel.db. On Windows the URL's path holds the drive after a slash, which is
+// dropped.
 func Path(u *url.URL) (string, error) {
 	var p string
 	switch {
@@ -117,7 +119,6 @@ func Path(u *url.URL) (string, error) {
 		p = u.Opaque
 	default:
 		p = u.Host + u.Path
-		// On Windows the URL's path holds the drive after a slash; drop it.
 		if len(p) >= 3 && p[0] == '/' && p[2] == ':' && isLetter(p[1]) {
 			p = p[1:]
 		}
@@ -135,8 +136,9 @@ func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 
 
 // DSNs returns the driver DSNs for the writer and reader pools. Parameters in
 // the URL are passed through; journal mode, transaction locking and
-// (unless given) the busy timeout and synchronous level are set here. The store
-// checkpoints the write-ahead log itself, off the write connection, reading its
+// (unless given) the busy timeout and synchronous level are set here: synchronous is
+// FULL by default, so a write is acknowledged only once it is durable (spec §8). The
+// store checkpoints the write-ahead log itself, off the write connection, reading its
 // progress from the shared wal-index: the URL may not set the locking mode (an
 // exclusive one has no wal-index), automatic checkpoints or the journal size limit.
 func DSNs(u *url.URL) (write, read string, err error) {
@@ -163,7 +165,6 @@ func DSNs(u *url.URL) (write, read string, err error) {
 		q.Set("_busy_timeout", fmt.Sprint(DefaultBusyTimeoutMS))
 	}
 	if !q.Has("_synchronous") && !q.Has("_sync") {
-		// FULL: a write is acknowledged only once it is durable (spec §8).
 		q.Set("_synchronous", "FULL")
 	}
 	q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", JournalSizeLimit))
@@ -183,6 +184,9 @@ func cloneValues(v url.Values) url.Values {
 	return out
 }
 
+// open opens the writer and reader pools. The writer pool holds one connection, so
+// writers in this process queue in the pool instead of spinning in SQLite's busy
+// handler.
 func open(u *url.URL) (dialect.Pools, error) {
 	wdsn, rdsn, err := DSNs(u)
 	if err != nil {
@@ -192,8 +196,6 @@ func open(u *url.URL) (dialect.Pools, error) {
 	if err != nil {
 		return dialect.Pools{}, err
 	}
-	// One writer connection: writers in this process queue in the pool
-	// instead of spinning in SQLite's busy handler.
 	w.SetMaxOpenConns(1)
 	w.SetMaxIdleConns(1)
 	r, err := sql.Open("sqlite", rdsn)

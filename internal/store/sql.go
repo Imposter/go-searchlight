@@ -161,6 +161,9 @@ func (s *sqlStore) Blobs() BlobStore { return s.blobs }
 
 func (s *sqlStore) Indexes() IndexStore { return s.idx }
 
+// Ping implements [Store]. With one write connection (SQLite), it pings a read
+// connection: a long commit holds the writer, which says nothing about whether the
+// database answers.
 func (s *sqlStore) Ping(ctx context.Context) (err error) {
 	ctx, end := s.start(ctx, "ping")
 	defer end(&err)
@@ -168,8 +171,6 @@ func (s *sqlStore) Ping(ctx context.Context) (err error) {
 		return ErrClosed
 	}
 	if s.w.g != nil {
-		// One write connection (SQLite): a long commit holds it, which says nothing
-		// about whether the database answers. A read connection does.
 		return s.r.PingContext(ctx)
 	}
 	if err := s.w.PingContext(ctx); err != nil {
@@ -447,6 +448,12 @@ func keyOf(c *Change) recKey {
 	return recKey{query: c.Kind.isQuery(), index: c.Index, shard: c.Shard, id: c.ID}
 }
 
+// applyOnce runs one attempt of Apply. The counter row lock serializes every Apply, so
+// seqs commit in order. IfExists misses are dropped inside the transaction, and the
+// rest takes contiguous seqs (keptAt maps them back to their positions in the batch;
+// nil when all are kept). Each changelog row carries the uid of its index's
+// incarnation as of this Apply, so a tailer can tell a drop-and-recreate apart from a
+// continuing index without an extra query per batch.
 func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (first, last int64, err error) {
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
@@ -459,7 +466,6 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		}
 	}()
 
-	// The counter row lock serializes every Apply, so seqs commit in order.
 	var counter, nowMs int64
 	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return 0, 0, fmt.Errorf("lock counter: %w", err)
@@ -468,7 +474,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		batch[i].Seq = 0
 	}
 	all := batch
-	var keptAt []int // the kept changes' positions in all; nil when all are kept
+	var keptAt []int
 
 	idx, err := s.checkIndexes(ctx, tx, batch)
 	if err != nil {
@@ -480,8 +486,6 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 			return 0, 0, err
 		}
 		if skip != nil {
-			// IfExists misses are dropped here, inside the transaction: the
-			// rest takes contiguous seqs.
 			kept := make([]Change, 0, len(batch))
 			kp := &prepared{conditional: true}
 			keptAt = make([]int, 0, len(batch))
@@ -498,12 +502,9 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	}
 	first, last = counter+1, counter+int64(len(batch))
 	if len(batch) == 0 {
-		return first, last, nil // nothing to write: every change was skipped
+		return first, last, nil
 	}
 
-	// The changelog. Each row carries the uid of the incarnation of its
-	// index as of this Apply, so a tailer can tell a drop-and-recreate apart
-	// from a continuing index without an extra query per batch.
 	w := &dialect.Write{Changes: make([]dialect.ChangeRow, len(batch)), Counter: last}
 	for i := range batch {
 		c := &batch[i]
@@ -543,7 +544,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 // is prepared once for the run.
 func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) error {
 	stmts := s.d.Changelog.Write(w, s.d.Changelog.Limits)
-	var run *sql.Stmt // prepared for stmts[i].SQL while it repeats
+	var run *sql.Stmt
 	defer func() {
 		if run != nil {
 			run.Close()
@@ -584,7 +585,8 @@ type indexState struct {
 
 // checkIndexes fails with an *IndexNotFoundError naming every change whose
 // index does not exist, and otherwise returns each named index's current
-// incarnation and mapping version, so the changelog row can carry them.
+// incarnation and mapping version, so the changelog row can carry them. A change
+// meant for an incarnation that was dropped finds its index missing.
 func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) (map[string]indexState, error) {
 	states := make(map[string]indexState, 1)
 	var missing *IndexNotFoundError
@@ -611,8 +613,6 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 			}
 		}
 		if want := batch[i].IndexUID; uid != "" && want != "" && want != uid {
-			// The caller meant an incarnation that was dropped: for it, the
-			// index is missing.
 			if missing == nil {
 				missing = &IndexNotFoundError{}
 			}
@@ -636,7 +636,7 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 // change before that passed its condition applied, and fails with a
 // *ConflictError listing every failure. An IfExists change whose target is
 // missing is not a failure: it is reported in skip, and treated as not
-// applied by the changes after it.
+// applied by the changes after it, as a change whose condition failed is.
 func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) (skip []bool, err error) {
 	cur := make(map[recKey]int64)
 	var conflict *ConflictError
@@ -671,7 +671,7 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 				}
 				conflict.Positions = append(conflict.Positions, i)
 				conflict.Current = append(conflict.Current, seq)
-				continue // a failed change does not apply
+				continue
 			}
 		}
 		if c.Kind.isUpsert() {
@@ -698,7 +698,7 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 		index string
 		shard int
 	}
-	deletes := make(map[group]int) // the group's position in its delete list
+	deleteListAt := make(map[group]int)
 	for i := range batch {
 		c := &batch[i]
 		k := keyOf(c)
@@ -719,10 +719,10 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 				groups = &w.QueryDeletes
 			}
 			g := group{query: k.query, index: c.Index, shard: c.Shard}
-			at, ok := deletes[g]
+			at, ok := deleteListAt[g]
 			if !ok {
 				at = len(*groups)
-				deletes[g] = at
+				deleteListAt[g] = at
 				*groups = append(*groups, dialect.DeleteGroup{Index: c.Index, Shard: c.Shard})
 			}
 			(*groups)[at].IDs = append((*groups)[at].IDs, c.ID)
@@ -765,6 +765,10 @@ type notification struct {
 
 // --- Reads ----------------------------------------------------------------
 
+// ChangesAfter implements [Store]. It reads the prune horizon after the changes: a
+// prune that committed before the changes were read is visible then, and one that
+// commits later removed nothing they returned. A range pruned past is ErrPruned even
+// when a row is damaged, since the changes read may already lack some before it.
 func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, limit int) (out []Change, err error) {
 	ctx, end := s.start(ctx, "changes_after", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
@@ -811,9 +815,6 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	// Read the prune horizon after the changes: a prune that committed
-	// before the read above is visible here, and one that commits later did
-	// not remove anything that read returned.
 	var below int64
 	err = s.r.QueryRowContext(ctx, s.d.Changelog.Horizon, shard.Index, shard.Shard).Scan(&below)
 	switch {
@@ -821,8 +822,6 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	case err != nil:
 		return nil, err
 	case seq < below-1:
-		// Pruned past, which a damaged row does not change: the changes read may
-		// already lack some of those before them.
 		return nil, fmt.Errorf("%s after seq %d (pruned below %d): %w", shard, seq, below, ErrPruned)
 	}
 	if corrupt != nil {
@@ -831,6 +830,10 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 	return out, nil
 }
 
+// ScanShard implements [Store]. In the same snapshot as the rows, it reads first the
+// counter, the mark of the change at it and the shard's newest change at or below it,
+// then the index's current incarnation and mapping: the mapping is the first record,
+// and the incarnation and mapping version are stamped on every record.
 func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (pt ScanPoint, err error) {
 	ctx, end := s.start(ctx, "scan_shard", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
@@ -845,8 +848,6 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 		return pt, err
 	}
 	defer rollback(tx)
-	// The counter, the mark of the change at it and the shard's newest change at or
-	// below it are read first, in the same snapshot as the rows.
 	var mc markColumns
 	var own shardMarkColumns
 	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, s.customPlan(shard.Index, shard.Shard)...).Scan(&pt.Seq,
@@ -854,9 +855,6 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 		return pt, err
 	}
 	pt.Mark, pt.ShardMark = mc.mark(pt.Seq), own.mark(shard)
-	// The index's current incarnation and mapping, read once in this scan's
-	// snapshot: the mapping is the first record, and the incarnation and
-	// mapping version are stamped on every record.
 	var uid string
 	var mv int64
 	var mapping []byte
@@ -994,6 +992,8 @@ func (c *markColumns) mark(seq int64) ChangeMark {
 // statement (or SQLite write lock) runs long.
 const pruneStep = 5000
 
+// Prune implements [Store]. Once the horizon is published, ChangesAfter refuses the
+// range, which is then deleted in short statements.
 func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (err error) {
 	ctx, end := s.start(ctx, "prune", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
@@ -1010,8 +1010,6 @@ func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (er
 	if err != nil {
 		return err
 	}
-	// The horizon is published, so ChangesAfter already refuses the range;
-	// delete it in short statements.
 	m := &s.d.Maintenance
 	for {
 		var lo sql.NullInt64

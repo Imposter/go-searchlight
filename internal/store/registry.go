@@ -148,6 +148,12 @@ func (g *registry) ClaimCopy(ctx context.Context, shard ShardID, nodeID string, 
 	}
 }
 
+// claimOnce runs one attempt of ClaimCopy. A node holds at most one copy of a shard, so a
+// node that has one re-claims it. A new owner takes a fresh fencing token; a node
+// renewing its own slot keeps the epoch it has. Each claim locks the slot row and reads
+// back who holds the slot now (no row: the slot was left to its live owner), and a
+// claim of a slot another node held, its lease expired, records whom it was taken
+// from.
 func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, target int, ttlMs int64) (Copy, bool, error) {
 	s := g.s
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
@@ -182,7 +188,6 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		return Copy{}, false, err
 	}
 
-	// A node holds at most one copy of a shard: re-claim it if it has one.
 	var candidates []int
 	live := 0
 	taken := make(map[int]bool, len(existing))
@@ -208,15 +213,11 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		}
 	}
 
-	// A fresh fencing token for a new owner; a node renewing its own slot
-	// keeps the epoch it has.
 	epoch, err := g.nextEpoch(ctx, tx)
 	if err != nil {
 		return Copy{}, false, err
 	}
 	for _, slot := range candidates {
-		// The claim locks the slot row; what it reads back is who holds the
-		// slot now (no row: the slot was left to its live owner).
 		row, err := returningRow(ctx, tx, s.d.Registry.Claim,
 			[]any{shard.Index, shard.Shard, slot, nodeID, ttlMs, epoch}, []any{shard.Index, shard.Shard, slot})
 		if err != nil {
@@ -231,7 +232,7 @@ func (g *registry) claimOnce(ctx context.Context, shard ShardID, nodeID string, 
 		case c.NodeID == nodeID:
 			for i := range existing {
 				if prev := &existing[i]; prev.Slot == slot && prev.NodeID != nodeID {
-					c.TakenFrom = prev.NodeID // stolen: its lease had expired
+					c.TakenFrom = prev.NodeID
 				}
 			}
 			return c, true, tx.Commit()
@@ -255,6 +256,8 @@ func (g *registry) nextEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
 	return epoch, nil
 }
 
+// RenewLeases implements [RegistryStore]. A renewal that reads back in its own statement is
+// atomic as it is; a write and a separate read take a transaction.
 func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Duration) (out []ShardID, err error) {
 	s := g.s
 	ctx, end := s.start(ctx, "renew_leases", attribute.String("node_id", nodeID))
@@ -267,8 +270,6 @@ func (g *registry) RenewLeases(ctx context.Context, nodeID string, ttl time.Dura
 	if err != nil {
 		return nil, err
 	}
-	// A renewal that reads back in its own statement is atomic as it is;
-	// a write and a separate read take a transaction.
 	var q queryer = s.w
 	var tx *sql.Tx
 	if s.d.Registry.Renew.Write != "" {
@@ -387,6 +388,8 @@ func (g *registry) RetireCopy(ctx context.Context, c Copy) (retired bool, err er
 	}
 }
 
+// retireOnce runs one attempt of RetireCopy. It takes the epoch counter's lock, which
+// claims take too.
 func (g *registry) retireOnce(ctx context.Context, c Copy) (bool, error) {
 	s := g.s
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
@@ -394,7 +397,7 @@ func (g *registry) retireOnce(ctx context.Context, c Copy) (bool, error) {
 		return false, err
 	}
 	defer rollback(tx)
-	if _, err := g.nextEpoch(ctx, tx); err != nil { // the lock claims take too
+	if _, err := g.nextEpoch(ctx, tx); err != nil {
 		return false, err
 	}
 	rows, err := tx.QueryContext(ctx, s.d.Registry.Slots, c.Shard.Index, c.Shard.Shard)

@@ -34,11 +34,12 @@ var migrations embed.FS
 // migrateLockKey is the advisory lock key migrations hold ("searchlight").
 const migrateLockKey = 0x5345415243484c54
 
-// Dialect returns the PostgreSQL dialect.
+// Dialect returns the PostgreSQL dialect. It panics only if the binary lacks its
+// embedded migrations directory.
 func Dialect() *dialect.Dialect {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
-		panic(err) // the embedded directory always exists
+		panic(err)
 	}
 	return &dialect.Dialect{
 		Name:        "postgres",
@@ -72,13 +73,13 @@ func lockTimedOut(err error) bool {
 
 // Config parses a postgres:// or postgresql:// store URL into a pgx
 // connection config. Query parameters are libpq's (sslmode, ...) or runtime
-// parameters such as search_path.
+// parameters such as search_path. Its error never quotes the URL: pgx's can echo the
+// connection string, password included.
 func Config(u *url.URL) (*pgx.ConnConfig, error) {
 	c := *u
 	c.Scheme = "postgres"
 	cfg, err := pgx.ParseConfig(c.String())
 	if err != nil {
-		// pgx errors can echo the connection string, password included.
 		return nil, errors.New("invalid postgres store URL")
 	}
 	return cfg, nil
@@ -104,7 +105,11 @@ const (
 
 // listen runs LISTEN on conn and calls fn for each notification until ctx
 // ends. The connection is discarded afterwards rather than returned to the
-// pool, because it stays subscribed.
+// pool, because it stays subscribed: the raw call either failed (and database/sql may
+// keep the connection) or ended with ctx, and closing the pgx connection makes
+// database/sql drop it. While no notification comes it pings the server every
+// listenPingEvery: a half-open socket (the server or the network gone without a reset)
+// would otherwise wait forever.
 func listen(ctx context.Context, conn *sql.Conn, ready func(), fn func(payload string)) error {
 	err := conn.Raw(func(dc any) error {
 		sc, ok := dc.(*stdlib.Conn)
@@ -119,8 +124,6 @@ func listen(ctx context.Context, conn *sql.Conn, ready func(), fn func(payload s
 			ready()
 		}
 		for {
-			// Wake now and then to ping: a half-open socket (the server or
-			// the network gone without a reset) would otherwise wait forever.
 			wctx, cancel := context.WithTimeout(ctx, listenPingEvery)
 			n, err := pc.WaitForNotification(wctx)
 			cancel()
@@ -139,9 +142,6 @@ func listen(ctx context.Context, conn *sql.Conn, ready func(), fn func(payload s
 			fn(n.Payload)
 		}
 	})
-	// A subscribed connection must never be reused; the raw call either
-	// failed (and database/sql may keep the conn) or ended with ctx. Closing
-	// the pgx connection makes database/sql drop it.
 	_ = conn.Raw(func(dc any) error {
 		if sc, ok := dc.(*stdlib.Conn); ok {
 			_ = sc.Close()

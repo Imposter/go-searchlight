@@ -77,7 +77,8 @@ func in(what, head string, fixed []any, ids []string, l dialect.Limits) []dialec
 func over(limit, n int) bool { return limit > 0 && n > limit }
 
 // escapedSize is about how many bytes args take interpolated: strings and
-// bytes escaped (at most doubled) and quoted, numbers in decimal.
+// bytes escaped (at most doubled) and quoted (bytes as _binary'...'), numbers in
+// decimal.
 func escapedSize(args []any) int {
 	n := 0
 	for _, a := range args {
@@ -85,7 +86,7 @@ func escapedSize(args []any) int {
 		case string:
 			n += 2*len(v) + 3
 		case []byte:
-			n += 2*len(v) + 10 // _binary'...'
+			n += 2*len(v) + 10
 		default:
 			n += 20
 		}

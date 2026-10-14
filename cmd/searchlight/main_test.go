@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -102,6 +104,25 @@ func TestHealthcheck(t *testing.T) {
 	srv.Close()
 	if got := healthcheck(nil, unspecified, io.Discard); got != 1 {
 		t.Errorf("stopped: healthcheck = %d, want 1", got)
+	}
+}
+
+func TestPrintVersion(t *testing.T) {
+	prev := version
+	version = "v9.8.7"
+	t.Cleanup(func() { version = prev })
+	var out bytes.Buffer
+	if code := printVersion(nil, &out, io.Discard); code != 0 {
+		t.Fatalf("printVersion = %d, want 0", code)
+	}
+	if got, want := out.String(), "searchlight v9.8.7 ("+runtime.Version()+", "+runtime.GOOS+"/"+runtime.GOARCH+")\n"; got != want {
+		t.Errorf("printVersion wrote %q, want %q", got, want)
+	}
+	for _, args := range [][]string{{"extra"}, {"--bogus"}} {
+		out.Reset()
+		if code := printVersion(args, &out, io.Discard); code != 1 || out.Len() != 0 {
+			t.Errorf("printVersion %v = %d, wrote %q; want 1 and nothing", args, code, out.String())
+		}
 	}
 }
 

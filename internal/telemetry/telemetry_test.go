@@ -372,3 +372,7 @@ func get(t *testing.T, url string) (int, http.Header, string) {
 	}
 	return resp.StatusCode, resp.Header, string(b)
 }
+
+// withEnv replaces os.Getenv for the OTEL_* selection; the exporters themselves always
+// read the process environment.
+func withEnv(getenv func(string) string) Option { return func(o *options) { o.getenv = getenv } }

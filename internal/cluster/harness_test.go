@@ -476,6 +476,28 @@ func (tn *tnode) kill() {
 	_ = tn.wrap.Close()
 }
 
+// kill stops the node as a crash would: no drain, no final commit, no lease
+// released, no deregistration. The shards are abandoned with what they had not
+// committed.
+func (n *Node) kill() {
+	n.stopOnce.Do(func() {
+		n.stopped.Store(true)
+		n.draining.Store(true)
+		n.loopCancel()
+		n.loops.Wait()
+		n.closeBackground()
+		ctx := context.Background()
+		for _, l := range n.leaseList() {
+			_ = n.AbandonCopy(ctx, l.copy)
+			n.dropLease(l)
+		}
+		n.hints.close()
+		n.pins.closeAll()
+		n.snaps.closeAll()
+		_ = n.Single.Close(ctx)
+	})
+}
+
 func (c *cluster) close() {
 	for _, tn := range c.live() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -669,25 +669,3 @@ func (n *Node) Stop(ctx context.Context) error {
 
 // Close implements [api.Coordinator]: [Node.Stop].
 func (n *Node) Close(ctx context.Context) error { return n.Stop(ctx) }
-
-// kill stops the node as a crash would (tests): no drain, no final commit, no lease
-// released, no deregistration. The shards are abandoned with what they had not
-// committed.
-func (n *Node) kill() {
-	n.stopOnce.Do(func() {
-		n.stopped.Store(true)
-		n.draining.Store(true)
-		n.loopCancel()
-		n.loops.Wait()
-		n.closeBackground()
-		ctx := context.Background()
-		for _, l := range n.leaseList() {
-			_ = n.AbandonCopy(ctx, l.copy)
-			n.dropLease(l)
-		}
-		n.hints.close()
-		n.pins.closeAll()
-		n.snaps.closeAll()
-		_ = n.Single.Close(ctx)
-	})
-}

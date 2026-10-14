@@ -481,8 +481,9 @@ rebuilt.**
   longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
   their shards serve again once the rebuilds finish. Nodes stopped across the failover
   need nothing either: each copy's manifest keeps the mark of the change it applied
-  last, which the copy checks when it starts. (A copy whose last flush predates this
-  release has no mark, and trusts what it reads at its first poll.)
+  last, which the copy checks when it starts. (A copy whose last flush predates marks
+  has none until it flushes again, and trusts what it reads at its first poll: only
+  once, at the upgrade.)
 
 ## Upgrades and rolling restarts
 

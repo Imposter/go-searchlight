@@ -694,11 +694,11 @@ func (s flakyStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 	return s.Store.HeadSeq(ctx)
 }
 
-func (s flakyStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+func (s flakyStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
 	if s.headDown != nil && s.headDown.Load() {
 		return store.Tip{}, errUnreachable
 	}
-	return s.Store.Tip(ctx, seq)
+	return s.Store.Tip(ctx, q)
 }
 
 func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {

@@ -42,13 +42,14 @@ func TestChangeNonces(t *testing.T) {
 			seen[c.Nonce] = true
 		}
 		last := changes[len(changes)-1]
-		tip, err := st.Tip(ctx, changes[0].Seq)
-		if err != nil || tip.HeadMark.Nonce != last.Nonce || tip.AtMark.Nonce != changes[0].Nonce {
-			t.Fatalf("tip marks %+v and %+v, want nonces %d and %d (%v)", tip.HeadMark, tip.AtMark, last.Nonce, changes[0].Nonce, err)
+		tip, err := st.Tip(ctx, TipQuery{At: changes[0].Seq, Shard: ShardID{Index: "n"}, UpTo: changes[1].Seq})
+		if err != nil || tip.HeadMark.Nonce != last.Nonce || tip.AtMark.Nonce != changes[0].Nonce || tip.ShardMark.Nonce != changes[1].Nonce {
+			t.Fatalf("tip marks %+v, %+v and %+v, want nonces %d, %d and %d (%v)", tip.HeadMark, tip.AtMark, tip.ShardMark,
+				last.Nonce, changes[0].Nonce, changes[1].Nonce, err)
 		}
-		_, mark, err := st.ScanShard(ctx, ShardID{Index: "n"}, func(Record) error { return nil })
-		if err != nil || mark.Nonce != last.Nonce {
-			t.Fatalf("the snapshot's mark %+v, want nonce %d (%v)", mark, last.Nonce, err)
+		pt, err := st.ScanShard(ctx, ShardID{Index: "n"}, func(Record) error { return nil })
+		if err != nil || pt.Mark.Nonce != last.Nonce || pt.ShardMark.Nonce != last.Nonce {
+			t.Fatalf("the snapshot's marks %+v and %+v, want nonce %d (%v)", pt.Mark, pt.ShardMark, last.Nonce, err)
 		}
 	})
 }

@@ -61,12 +61,12 @@ type Store interface {
 	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
 	// the index does not exist), then every document and every saved query of
 	// shard, from one consistent snapshot, and returns the seq that snapshot
-	// reflects (replaying ChangesAfter(asOfSeq) on top of it is exact) and the
-	// mark of the change at that seq as the snapshot holds it (the zero mark when
-	// it is gone), so a copy loaded from it knows what the changelog held where
-	// it stands. A document whose body does not decode ends the scan with a
-	// *CorruptError.
-	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (asOfSeq int64, mark ChangeMark, err error)
+	// reflects (replaying ChangesAfter on top of it from that seq is exact), with
+	// the marks of the change at that seq and of the shard's newest change at or
+	// below it as the snapshot holds them, so a copy loaded from it knows what the
+	// changelog held where it stands. A document whose body does not decode ends
+	// the scan with a *CorruptError.
+	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (ScanPoint, error)
 
 	// HeadSeq returns the newest committed seq across every shard (0 before
 	// the first change), and the database clock's time as it read it. Every
@@ -80,10 +80,11 @@ type Store interface {
 	HeadSeq(ctx context.Context) (seq int64, now time.Time, err error)
 
 	// Tip is HeadSeq that also reads, in the same statement, the marks of the
-	// change at the head and of the change at seq. A tailer compares the change at
-	// its applied seq with the one it applied there, to see the changelog rewound
-	// under its copy: a database failover that lost commits reissues their seqs.
-	Tip(ctx context.Context, seq int64) (Tip, error)
+	// change at the head and of the change at q.At, and q.Shard's newest change at
+	// or below q.UpTo, its prune horizon and its index's incarnation. A tailer
+	// compares them with what it applied, to see the changelog rewound under its
+	// copy: a database failover that lost commits reissues their seqs.
+	Tip(ctx context.Context, q TipQuery) (Tip, error)
 
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
 	Registry() RegistryStore

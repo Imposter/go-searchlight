@@ -88,3 +88,31 @@ func TestAnchorMarkIsDurable(t *testing.T) {
 		t.Fatalf("the snapshot's manifest carries anchor %s, want %s", man.AnchorMark, moved)
 	}
 }
+
+// TestOwnMarkIsDurable: the own mark, like the anchor mark, holds whatever the applied
+// seq is: it is published, flushed (own_mark), reopened and in a snapshot's manifest.
+func TestOwnMarkIsDurable(t *testing.T) {
+	h := newHarness(t, testOptions())
+	own := json.RawMessage(`{"verified":{"up_to":1}}`)
+	h.upsert("a")
+	h.s.SetOwnMark(own)
+	h.upsert("b")
+	h.commit()
+	h.reopen()
+	if got := h.s.OwnMark(); string(got) != string(own) {
+		t.Fatalf("after a reopen OwnMark = %s, want %s", got, own)
+	}
+	sn, err := h.s.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Release()
+	raw := sn.mem[manifestName]
+	var man manifest
+	if err := json.Unmarshal(raw[bytes.IndexByte(raw, '\n')+1:], &man); err != nil {
+		t.Fatal(err)
+	}
+	if string(man.OwnMark) != string(own) {
+		t.Fatalf("the snapshot's manifest carries own %s, want %s", man.OwnMark, own)
+	}
+}

@@ -29,9 +29,9 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 
 var changelog = dialect.Changelog{
 	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
-	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value WHERE c.id = 1",
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq <= c.value) WHERE c.id = 1",
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $1 WHERE c.id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2), (SELECT uid FROM sl_indexes WHERE name = $3) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $4 LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $5 AND shard = $6 AND seq <= $7) WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = $1",
 	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
 	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",

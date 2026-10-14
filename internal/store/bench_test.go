@@ -212,7 +212,7 @@ func BenchmarkScanShard(b *testing.B) {
 		read := 0
 		for b.Loop() {
 			n := 0
-			if _, _, err := st.ScanShard(ctx, shard, func(Record) error { n++; return nil }); err != nil {
+			if _, err := st.ScanShard(ctx, shard, func(Record) error { n++; return nil }); err != nil {
 				b.Fatal(err)
 			}
 			read += n

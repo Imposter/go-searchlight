@@ -331,11 +331,11 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 	return f.Store.HeadSeq(ctx)
 }
 
-func (f *faultStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
 	if err := f.take("head"); err != nil {
 		return store.Tip{}, err
 	}
-	tip, err := f.Store.Tip(ctx, seq)
+	tip, err := f.Store.Tip(ctx, q)
 	f.mu.Lock()
 	hook := f.onTip
 	f.mu.Unlock()
@@ -369,15 +369,15 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return page, err
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, store.ChangeMark, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if err := f.take("scan"); err != nil {
-		return 0, store.ChangeMark{}, err
+		return store.ScanPoint{}, err
 	}
 	f.mu.Lock()
 	hook, after := f.onRecord, f.afterScan
 	f.mu.Unlock()
 	n := 0
-	asOf, mark, err := f.Store.ScanShard(ctx, id, func(r store.Record) error {
+	pt, err := f.Store.ScanShard(ctx, id, func(r store.Record) error {
 		n++
 		if hook != nil {
 			if err := hook(ctx, n, r); err != nil {
@@ -389,7 +389,7 @@ func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(st
 	if after != nil {
 		after(ctx)
 	}
-	return asOf, mark, err
+	return pt, err
 }
 
 func (f *faultStore) Indexes() store.IndexStore {

@@ -340,10 +340,11 @@ type Shard struct {
 	mapState  *mappingState // the mapping as of applied
 	closing   bool
 	// markSeq and mark are the last SetMark: the mark is applied's when markSeq is.
-	// anchor is the last SetAnchorMark, whatever applied is.
+	// anchor and own are the last SetAnchorMark and SetOwnMark, whatever applied is.
 	markSeq int64
 	mark    json.RawMessage
 	anchor  json.RawMessage
+	own     json.RawMessage
 
 	// failed is set once the shard cannot vouch for its durable state.
 	failed atomic.Pointer[error]
@@ -495,8 +496,8 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.sidecarBytes.Store(sidecarBytes)
 	s.applied = man.Seq
-	s.markSeq, s.mark, s.anchor = man.Seq, man.SeqMark, man.AnchorMark
-	s.committedMarks = marks{seq: man.SeqMark, anchor: man.AnchorMark}
+	s.markSeq, s.mark, s.anchor, s.own = man.Seq, man.SeqMark, man.AnchorMark, man.OwnMark
+	s.committedMarks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
 	s.committedUID = man.IndexUID
@@ -603,6 +604,22 @@ func (s *Shard) AnchorMark() json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.anchor
+}
+
+// SetOwnMark records mark, an opaque JSON value, as the own mark: like the anchor mark
+// it holds whatever the applied seq is, and is published, flushed (own_mark) and
+// carried as it is.
+func (s *Shard) SetOwnMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.own = mark
+}
+
+// OwnMark returns the own mark, nil when none was recorded.
+func (s *Shard) OwnMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.own
 }
 
 // markAt is the mark recorded for seq, or nil. The caller holds mu.

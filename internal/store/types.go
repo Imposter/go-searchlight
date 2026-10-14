@@ -178,6 +178,29 @@ type Tip struct {
 	// asked about; each is the zero mark when that change is gone (pruned, or its
 	// index dropped) or the seq is 0.
 	HeadMark, AtMark ChangeMark
+	// ShardMark is the mark of the queried shard's newest change at or below
+	// TipQuery.UpTo, the zero mark when there is none. Horizon is the shard's prune
+	// horizon (its changes below it are pruned; 0 when it was never pruned), and
+	// IndexUID the incarnation of its index ("" when the index does not exist).
+	ShardMark ChangeMark
+	Horizon   int64
+	IndexUID  string
+}
+
+// TipQuery is what a tailer reads the changelog's tip for: the change at At, and
+// what Shard (its own) holds at or below UpTo.
+type TipQuery struct {
+	At    int64
+	Shard ShardID
+	UpTo  int64
+}
+
+// ScanPoint is where a ScanShard snapshot stands: the seq it reflects, the mark of
+// the change at that seq (the zero mark when it is gone), and the mark of the
+// shard's newest change at or below it (the zero mark when there is none).
+type ScanPoint struct {
+	Seq             int64
+	Mark, ShardMark ChangeMark
 }
 
 // QueryPayload is the payload of a saved-query upsert: the query DSL tree and

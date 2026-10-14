@@ -321,7 +321,7 @@ func scanAll(t *testing.T, st Store, shard ShardID) (map[string]Record, int64) {
 	t.Helper()
 	out := make(map[string]Record)
 	first := true
-	asOf, _, err := st.ScanShard(context.Background(), shard, func(r Record) error {
+	pt, err := st.ScanShard(context.Background(), shard, func(r Record) error {
 		isFirst := first
 		first = false
 		if r.Kind == RecordMapping {
@@ -340,15 +340,16 @@ func scanAll(t *testing.T, st Store, shard ShardID) (map[string]Record, int64) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	return out, asOf
+	return out, pt.Seq
 }
 
 func counterValue(t *testing.T, st Store) int64 {
 	t.Helper()
 	var v int64
 	var mc markColumns
+	var own shardMarkColumns
 	s := engine(st)
-	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounterMark).Scan(&v, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce); err != nil {
+	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounterMark, "", 0).Scan(&v, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
 		t.Fatal(err)
 	}
 	return v

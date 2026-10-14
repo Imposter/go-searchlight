@@ -270,7 +270,7 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	rc := markOf(sh)
 	for {
 		from := sh.AppliedSeq()
-		tip, err := t.st.Tip(ctx, rc.checkSeq(from))
+		tip, err := t.st.Tip(ctx, rc.query(t.id, from))
 		if err != nil {
 			return err
 		}
@@ -296,14 +296,14 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			if err := t.applyChanges(ctx, sh, changes); err != nil {
 				return err
 			}
-			recordMark(sh, &rc, changes[len(changes)-1].Mark())
+			noteApplied(sh, &rc, changes[len(changes)-1].Mark())
 		}
 		if len(changes) < t.opts.BatchSize {
-			if tip.Head > sh.AppliedSeq() {
+			if prev := sh.AppliedSeq(); tip.Head > prev {
 				if err := sh.Advance(tip.Head); err != nil {
 					return err
 				}
-				recordMark(sh, &rc, tip.HeadMark)
+				noteAdvanced(sh, &rc, prev, tip.Head, tip.HeadMark)
 			}
 			break
 		}
@@ -552,7 +552,7 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		}
 		done <- r
 	}()
-	asOf, mark, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
+	pt, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
 		select {
 		case records <- r:
 			return nil
@@ -576,9 +576,11 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		return 0, fmt.Errorf("%w: %s is missing from the snapshot", ErrIndexDropped, t.id.Index)
 	}
 	t.inst.recoveryBytes.Add(ctx, res.bytes, t.inst.with(attribute.String("source", sourceSQL)))
-	if mark.Seq == asOf {
-		sh.SetMark(asOf, encodeMark(mark))
+	asOf := pt.Seq
+	if pt.Mark.Seq == asOf {
+		sh.SetMark(asOf, encodeMark(pt.Mark))
 	}
+	sh.SetOwnMark(encodeOwn(ownCheck{}, ownCheck{last: pt.ShardMark, upTo: asOf}))
 	if err := sh.Advance(asOf); err != nil {
 		return 0, err
 	}

@@ -191,7 +191,7 @@ func (s *Shard) persist(ctx context.Context, g *Generation) (map[string]int64, e
 	if err != nil {
 		return nil, err
 	}
-	man.UntypedMarks, man.SeqMark, man.AnchorMark = legacyMarks(g.docs), g.marks.seq, g.marks.anchor
+	man.UntypedMarks, man.SeqMark, man.AnchorMark, man.OwnMark = legacyMarks(g.docs), g.marks.seq, g.marks.anchor, g.marks.own
 	manBytes, renamed, err := writeManifest(s.dir, man, s.hook, s.jan.forget, s.log)
 	switch {
 	case err == nil:

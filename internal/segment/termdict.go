@@ -191,7 +191,11 @@ type termDict struct {
 	checked []atomic.Uint64
 }
 
-// openDict parses the dictionary whose index starts at the absolute position off.
+// openDict parses the dictionary whose index starts at the absolute position off. The
+// block count is checked in uint64: numTerms+blockTerms-1 wraps in uint32 for numTerms
+// near 2^32, which would let a huge numTerms pass with no blocks and send termAt past
+// blockOffs. The checked-terms bitset takes one bit per term: at most an eighth of the
+// bytes the dictionary itself takes.
 func openDict(data []byte, off uint64) (*termDict, error) {
 	if off > uint64(len(data)) {
 		return nil, errShort
@@ -210,8 +214,6 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
-	// In uint64: numTerms+blockTerms-1 wraps in uint32 for numTerms near 2^32, which
-	// would let a huge numTerms pass with no blocks and send termAt past blockOffs.
 	if uint64(t.numBlocks) != (uint64(t.numTerms)+blockTerms-1)/blockTerms {
 		return nil, errShort
 	}
@@ -221,7 +223,6 @@ func openDict(data []byte, off uint64) (*termDict, error) {
 			return nil, errShort
 		}
 	}
-	// One bit per term: at most an eighth of the bytes the dictionary itself takes.
 	t.checked = make([]atomic.Uint64, (uint64(t.numTerms)+63)/64)
 	return t, nil
 }
@@ -333,8 +334,13 @@ func (c *blockCursor) next() (shared int, suffix []byte, ok bool) {
 }
 
 // lookup finds term without building any term: it tracks how many leading bytes of
-// term the previous entry matched, which with each entry's shared prefix decides
-// whether the entry sorts before, at or after term.
+// term the previous entry matched (the previous entry equals term in its first matched
+// bytes, and sorts before it), which with each entry's shared prefix decides whether
+// the entry sorts before, at or after term. An entry that shares less with the
+// previous one than matched leaves it at a byte where that one matched term, with a
+// greater byte (entries ascend), so it sorts after term. One that shares more still
+// differs from term where the previous entry did, and one that is a proper prefix of
+// term sorts before it.
 func (t *termDict) lookup(term []byte) (termInfo, bool) {
 	if t == nil {
 		return termInfo{}, false
@@ -344,7 +350,7 @@ func (t *termDict) lookup(term []byte) (termInfo, bool) {
 		return termInfo{}, false
 	}
 	c := t.cursor(block)
-	matched := 0 // the previous entry equals term in its first matched bytes, and sorts before it
+	matched := 0
 	for {
 		shared, suffix, ok := c.next()
 		if !ok {
@@ -352,11 +358,9 @@ func (t *termDict) lookup(term []byte) (termInfo, bool) {
 		}
 		switch {
 		case shared < matched:
-			// This entry leaves the previous one at a byte where that one matched term,
-			// with a greater byte (entries ascend): it sorts after term.
 			return termInfo{}, false
 		case shared > matched:
-			continue // still differs from term where the previous entry did: before term
+			continue
 		}
 		n := commonPrefix(suffix, term[matched:])
 		matched += n
@@ -364,7 +368,7 @@ func (t *termDict) lookup(term []byte) (termInfo, bool) {
 		case n == len(suffix) && matched == len(term):
 			return c.entry, true
 		case n == len(suffix):
-			continue // a proper prefix of term: before it
+			continue
 		case matched == len(term) || suffix[n] > term[matched]:
 			return termInfo{}, false
 		}

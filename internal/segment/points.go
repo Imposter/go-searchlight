@@ -37,16 +37,17 @@ type pointPair struct {
 
 // writeSortedPoints writes pairs - a number column's (key, doc) pairs, already sorted
 // by (key, doc) ascending - and returns the index's offset.
+//
+// Every block offset is relative to the index's own start (off), never to w's: w.off
+// happens to be 0 when the index is first in a private per-field buffer, but a field's
+// point index is not guaranteed to be first in its buffer, and openPoints adds the
+// index's absolute start back.
 func writeSortedPoints(w *fileWriter, numDocs uint32, pairs []pointPair) uint64 {
 	n := len(pairs)
 	numBlocks := (n + pointsBlockSize - 1) / pointsBlockSize
 	docWidth := packedWidth(bitsFor(uint64(numDocs)))
 
 	off := w.off
-	// blocksStart, and so every blockOffset written below, is relative to this index's
-	// own start (off), never to w's: w.off happens to be 0 when the index is first in
-	// a private per-field buffer, but a field's point index is not guaranteed to be
-	// first in its buffer, and openPoints adds the index's absolute start back.
 	blocksStart := pointsHeaderLen(FormatMajor) + uint64(numBlocks)*pointsEntryLen
 
 	var h encoder
@@ -97,7 +98,12 @@ type points struct {
 	table      []byte // numBlocks table entries
 }
 
-// openPoints opens the point index at off of col, in a file of the given major.
+// openPoints opens the point index at off of col, in a file of the given major. The
+// block count is checked in uint64, so a numEntries near 2^32 cannot wrap into a small
+// one. Every block but the last must hold pointsBlockSize entries, as both formats'
+// writers lay them out, together exactly numEntries, with its packed data inside
+// data: rangeDocs slices them unchecked, and a block's first entry is its index times
+// pointsBlockSize.
 func openPoints(data []byte, off uint64, col *numberColumn, major uint16) (*points, error) {
 	if off > uint64(len(data)) {
 		return nil, errShort
@@ -117,14 +123,9 @@ func openPoints(data []byte, off uint64, col *numberColumn, major uint16) (*poin
 	if (p.keyWidth > 56 && p.keyWidth != 64) || (p.docWidth > 56 && p.docWidth != 64) {
 		return nil, errShort
 	}
-	// In uint64, so numEntries near 2^32 cannot wrap into a small block count.
 	if uint64(p.numBlocks) != (uint64(p.numEntries)+pointsBlockSize-1)/pointsBlockSize {
 		return nil, errShort
 	}
-	// Every block but the last holds pointsBlockSize entries, as both formats' writers
-	// lay them out, together exactly numEntries, with its packed data inside data:
-	// rangeDocs slices them unchecked, and a block's first entry is its index times
-	// pointsBlockSize.
 	var total uint64
 	room := uint64(len(data)) - off
 	for i := range p.numBlocks {

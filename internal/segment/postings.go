@@ -34,14 +34,14 @@ func newPostingsEncoder() *postingsEncoder {
 }
 
 // encode returns docs (sorted, distinct, at least two) serialized; the result is valid
-// until the next call.
+// until the next call. Writing to a bytes.Buffer cannot fail, so a failure panics.
 func (e *postingsEncoder) encode(docs []uint32) []byte {
 	e.rb.Clear()
 	e.rb.AddMany(docs)
 	e.rb.RunOptimize()
 	e.buf.Reset()
 	if _, err := e.rb.WriteTo(&e.buf); err != nil {
-		panic(err) // writing to a bytes.Buffer cannot fail
+		panic(err)
 	}
 	return e.buf.Bytes()
 }

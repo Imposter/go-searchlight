@@ -3,8 +3,7 @@
 This is how Searchlight is built, as the code stands. The design and its reasons are in
 [the spec](superpowers/specs/2026-10-02-searchlight-design.md), and the order the work is
 built in is in [the plan](superpowers/plans/2026-10-02-searchlight.md).
-[Planned, not built](#planned-not-built) lists what the spec promises that is not in the
-code yet.
+[Known gaps](#known-gaps) lists what the spec promises that is not in the code yet.
 
 ## In one paragraph
 
@@ -443,3 +442,14 @@ The harness in `bench/` runs the real binary against Elasticsearch 8, restarts a
 recoveries included; the chaos suite in `test/chaos` covers the failure targets.
 `docs/benchmarks.md` holds the latest 1M-document run on `main`, graded against every
 spec §1 target.
+
+## Known gaps
+
+- **Background scrub** ([#36](https://github.com/Imposter/go-searchlight/issues/36)):
+  a segment is checksum-verified when its copy opens, so bit rot after open is served
+  until the copy is next opened.
+- **Reading the previous segment format**
+  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): an upgrade that changes
+  the segment format's major version rebuilds copies instead of reopening them.
+- **Scale beyond RAM and many nodes** (spec T11): designed for (memory-mapped segments,
+  shards across nodes) but not benchmarked yet.

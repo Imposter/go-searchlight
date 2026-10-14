@@ -8,11 +8,48 @@ SQLite store). The design is in
 [docs/superpowers/specs/2026-10-02-searchlight-design.md](docs/superpowers/specs/2026-10-02-searchlight-design.md)
 and the build plan is in [docs/superpowers/plans/2026-10-02-searchlight.md](docs/superpowers/plans/2026-10-02-searchlight.md).
 
-> **Status:** the engine, the HTTP API and the cluster are built, and the binary runs
-> them. The benchmark harness against Elasticsearch (`bench/`) and the chaos suite
-> (`test/chaos`) are in place; the tuning to the spec's targets is still to come.
-> [docs/architecture.md](docs/architecture.md#planned-not-built) lists what is planned but
-> not built.
+> **Status:** v1 is built and tuned. Every graded target in the spec's §1 passes against
+> Elasticsearch 8 on the same host, 1M documents
+> ([docs/benchmarks.md](docs/benchmarks.md)).
+> [docs/architecture.md](docs/architecture.md#known-gaps) lists what is known to be missing.
+
+| Target | Searchlight | Elasticsearch 8 |
+| --- | --- | --- |
+| Bulk indexing, acknowledged = durable (T1) | 13.5k docs/s | 7.3k docs/s |
+| Filter, sort and aggregation latency (T2–T4) | p50 0.5–2.9 ms, p99 1.1–15 ms | p50 1.9–140 ms, p99 4.7 ms–2.2 s |
+| Percolation, 100k saved queries (T5) | 3,187 docs/s, server p99 783 µs per doc | 12.6 docs/s |
+| Resident memory per million docs (T6) | 2.42 GiB | 4.15 GiB |
+| Write to visible, p99 (T7) | 999 ms | 998 ms |
+| New replica to serving (T8) | 6.0 s | 28.5 s |
+| Node restart to serving (T9) | 1.1 s | — |
+
+Disk per million documents is 2.33 GiB against Elasticsearch's 1.5 GiB: 3-grams on every
+keyword and text field, a deliberate trade-off for substring search. The bench runs on
+SQLite; write throughput on Postgres and MySQL is not measured yet
+([#69](https://github.com/Imposter/go-searchlight/issues/69)).
+
+## What it is, and what it is not
+
+- **The database is the write path.** A write is acknowledged once its SQL transaction
+  commits; that transaction is the write-ahead log, so there is no queue or second copy to
+  keep in sync. Every node also tails that changelog, so write throughput is bounded by
+  the database: scale the database for writes.
+- **Search scales with nodes.** Matching, sorting, aggregations and percolation run in the
+  nodes, on memory-mapped segments on local disk; the database does no text work. Add
+  nodes for read and percolation load; each node opens up to 64 pooled database
+  connections (plus one for `LISTEN` on Postgres).
+- **Near-real-time, not instant.** A write is searchable within the refresh interval (1 s
+  by default). `refresh=wait_for` or `wait_for_seq` gives read-your-writes.
+- **Boolean matching, no relevance scoring.** Queries match or do not; results sort by
+  field. Text matching folds case and Unicode (NFKC), and offers words and phrases,
+  substrings (`contains`, backed by 3-grams), prefixes and trigram similarity (`similar`)
+  for typo-tolerant lookups. BM25 ranking, stemming, synonyms and phonetic matching are
+  not in v1.
+- **SQLite is one node.** A cluster needs Postgres or MySQL, and there is no
+  SQLite-to-Postgres migration tool yet: moving means re-indexing from the source
+  ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
+- **One pure-Go binary.** No cgo, no JVM; it builds and runs on Linux and Windows. Memory
+  is bounded by request and buffer budgets ([Sizing](docs/operations.md#sizing)).
 
 ## Documentation
 

@@ -12,3 +12,5 @@ deploy
 tools
 **/*.test
 **/*.out
+!tools/notices.sh
+!tools/notices.tpl

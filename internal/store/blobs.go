@@ -77,8 +77,8 @@ func newUploadID() (string, error) {
 
 func (b *blobStore) crashAt(point string) bool { return b.crash != nil && b.crash(point) }
 
-// Put implements [BlobStore]. A failure before switchTo's transaction makes upload the
-// live one leaves upload this call's own, abandoned attempt, which it removes. From
+// Put implements [BlobStore]. Until switchTo's transaction makes upload the live one,
+// a failure leaves upload this call's own, abandoned attempt, which Put removes. From
 // the switch on, upload's chunks are never removed here, however Put goes on to fail (a
 // cancelled context, a transient error, a test's injected failure). An ambiguous
 // switch counts as made: upload may be live, and the upload it replaced may or may not

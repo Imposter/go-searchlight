@@ -560,7 +560,7 @@ func (n *Node) Drain(ctx context.Context) {
 	retired := 0
 	for _, l := range n.leaseList() {
 		if v.servingElsewhere(l.copy.Shard, n.id) == 0 {
-			continue // the only serving copy: it serves until Stop
+			continue
 		}
 		if n.retire(ctx, l) {
 			retired++

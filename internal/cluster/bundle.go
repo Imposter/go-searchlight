@@ -369,7 +369,9 @@ func (f *fetcher) restoreBundle(ctx context.Context, id store.ShardID, dir strin
 }
 
 // restoreFrom stages bundle b, checks it whole, then installs it in dir: its files
-// moved in, the manifest written last. It returns the bundle's size.
+// moved in, the manifest written last. It returns the bundle's size. The blob's own
+// SHA-256 is checked once its last byte is read, so the bundle is installed only after
+// that.
 func (f *fetcher) restoreFrom(ctx context.Context, b bundleRef, uid, dir string) (int64, error) {
 	n := f.n
 	staging := filepath.Join(n.stagingDir(b.id), "bundle")
@@ -404,8 +406,6 @@ func (f *fetcher) restoreFrom(ctx context.Context, b bundleRef, uid, dir string)
 	if err != nil {
 		return 0, err
 	}
-	// The blob's own SHA-256 is checked once its last byte is read: the bundle is
-	// installed only after that.
 	if rest, err := io.ReadAll(r); err != nil {
 		return 0, err
 	} else if len(rest) > 0 {

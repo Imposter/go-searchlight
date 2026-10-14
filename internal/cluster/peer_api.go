@@ -536,7 +536,8 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 
 // leaseWriter streams a snapshot file: before each write it moves the write deadline
 // on (a big file outlasts the listener's write timeout, a stalled reader does not
-// outlast the bound), and it aborts the stream once the copy no longer serves peers.
+// outlast the bound), and it aborts the stream, dropping the connection, once the
+// copy's lease lapses and it no longer serves peers.
 type leaseWriter struct {
 	http.ResponseWriter
 	rc    *http.ResponseController
@@ -545,7 +546,7 @@ type leaseWriter struct {
 
 func (w *leaseWriter) Write(b []byte) (int, error) {
 	if !w.valid() {
-		panic(http.ErrAbortHandler) // the copy's lease lapsed: drop the connection
+		panic(http.ErrAbortHandler)
 	}
 	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	return w.ResponseWriter.Write(b)

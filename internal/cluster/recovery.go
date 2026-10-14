@@ -184,7 +184,9 @@ func (f *fetcher) Fetch(ctx context.Context, id store.ShardID, dir string) (stri
 }
 
 // fetchPeers fills dir with a serving peer's copy of id, trying the peers best first,
-// and those whose segments are in an older format major after every other.
+// and those whose segments are in an older format major after every other. A peer
+// with nothing to fetch, or one that cannot serve the request, is passed over for the
+// next; when no peer has anything this build can use, it is errEmptySource.
 func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, progress *atomic.Int64) error {
 	n := f.n
 	cands := n.candidates(id)
@@ -224,20 +226,20 @@ func (f *fetcher) fetchPeers(ctx context.Context, id store.ShardID, dir string, 
 			}
 			errs = append(errs, err)
 			if errors.Is(err, errEmptySource) || errors.Is(err, errNewerMajor) {
-				break // nothing to fetch from this peer: try the next
+				break
 			}
 			n.log.WarnContext(ctx, "a peer recovery attempt failed", slog.String("shard", id.String()), slog.String("peer", c.node),
 				slog.Int("attempt", attempt), slog.Any("error", err))
 			var ae *api.Error
 			if errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusGone && ae.Status != http.StatusTooManyRequests {
-				break // the peer cannot serve this: try the next
+				break
 			}
 			_ = n.clock.Sleep(ctx, delay)
 			delay *= 2
 		}
 	}
 	if !slices.ContainsFunc(errs, func(err error) bool { return !errors.Is(err, replica.ErrNoSource) }) {
-		return errEmptySource // no peer has anything this build can use
+		return errEmptySource
 	}
 	return fmt.Errorf("cluster: peer recovery of %s failed: %w", id, errors.Join(errs...))
 }
@@ -250,7 +252,10 @@ func (n *Node) stagingDir(id store.ShardID) string {
 
 // fetchFrom recovers id from one peer into dir, through staging. It returns the bytes
 // it fetched. Unless anyMajor, a snapshot whose segments are in an older format major
-// is refused with errOlderMajor before anything is fetched.
+// is refused with errOlderMajor before anything is fetched. A copy at seq 0 holds
+// nothing the store's snapshot would not give as well, so it is errEmptySource. Once
+// every file is staged and checked, the files are moved in and their names made
+// durable, and only then is the manifest committed.
 func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, dir, staging string, anyMajor bool) (int64, error) {
 	n := f.n
 	var snap snapshotReply
@@ -277,7 +282,6 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 		_ = n.call(bctx, c.node, c.addr, http.MethodDelete, peerPrefix+"snapshots/"+snap.ID, nil, nil)
 	})
 	if snap.Seq <= 0 {
-		// A copy at seq 0 holds nothing the store's snapshot would not give as well.
 		return 0, errEmptySource
 	}
 	if !anyMajor && snap.FormatMajor < segment.FormatMajor {
@@ -314,8 +318,6 @@ func (f *fetcher) fetchFrom(ctx context.Context, c candidate, id store.ShardID, 
 	if sum := sha256.Sum256(man); hex.EncodeToString(sum[:]) != manifest.SHA256 {
 		return fetched, fmt.Errorf("cluster: the manifest of %s from %s fails its checksum", id, c.node)
 	}
-	// Every file is staged and checked: move them in, make their names durable, then
-	// commit the manifest.
 	for _, wf := range files {
 		if err := os.Rename(filepath.Join(staging, wf.Name), filepath.Join(dir, wf.Name)); err != nil {
 			return fetched, err
@@ -379,7 +381,7 @@ func (f *fetcher) stage(ctx context.Context, c candidate, snapID, staging string
 					return fetched, ctx.Err()
 				}
 				last = err
-				continue // resume from what arrived
+				continue
 			}
 		}
 		ok, err := matches(part, wf)
@@ -449,7 +451,7 @@ func (r *idleReader) Read(p []byte) (int, error) {
 
 // streamTo appends a snapshot file's bytes from off to part, and fsyncs it. It returns
 // the bytes it wrote. A stream idle for PeerIdleTimeout is cut (and resumed by the
-// caller).
+// caller). A peer that answers a resumed request with the whole file starts it over.
 func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part string, off int64) (int64, error) {
 	n := f.n
 	ctx, cancel := context.WithCancel(ctx)
@@ -472,7 +474,7 @@ func (f *fetcher) streamTo(ctx context.Context, c candidate, snapID, name, part 
 	switch {
 	case resp.StatusCode == http.StatusPartialContent && off > 0:
 	case resp.StatusCode == http.StatusOK:
-		off = 0 // the whole file: start over
+		off = 0
 	default:
 		return 0, decodeError(resp)
 	}

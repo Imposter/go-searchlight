@@ -144,7 +144,8 @@ func (n *Node) call(ctx context.Context, peer, addr, method, path string, in, ou
 }
 
 // readCall is call for a read of copy c: its outcome feeds adaptive replica selection.
-// A copy that answered stale is remembered as stale, not suspected.
+// A copy that answered stale is remembered as stale, not suspected, and an error that
+// is the request's own fault, not the copy's, does not count against the copy.
 func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out any) error {
 	done := n.ars.start(c.node, c.key())
 	service, queue, err := n.do(ctx, c.node, c.addr, http.MethodPost, path, in, out)
@@ -156,14 +157,15 @@ func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out a
 		done(false, service, queue)
 		n.ars.noteStale(c.key(), true)
 	case errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusTooManyRequests:
-		done(false, service, queue) // the request's own fault, not the copy's
+		done(false, service, queue)
 	default:
 		done(true, -1, -1)
 	}
 	return err
 }
 
-// do runs a peer request and returns what the peer reported of its load.
+// do runs a peer request and returns what the peer reported of its load. addr is a
+// peer's advertise address from the registry: peers are trusted.
 func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out any) (service, queue float64, err error) {
 	service, queue = -1, -1
 	var body io.Reader
@@ -174,8 +176,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 		}
 		body = bytes.NewReader(b)
 	}
-	// addr is a peer's advertise address from the registry: peers are trusted.
-	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // see above
+	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // addr is a trusted peer's, from the registry: see the doc comment
 	if err != nil {
 		return service, queue, err
 	}
@@ -545,7 +546,7 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 				}
 			case wctx.Err() != nil && ctx.Err() == nil:
 			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
-				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
+				n.ars.suspect(c.key())
 			default:
 				errs[i] = err
 			}

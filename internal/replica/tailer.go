@@ -575,6 +575,9 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.lastCatalog = time.Time{}
 		t.backoff(ctx)
 		return nil
+	case errors.Is(err, errHeadBehind):
+		t.backoff(ctx)
+		return nil
 	case errors.Is(err, store.ErrLeaseLost), errors.Is(err, shard.ErrClosed),
 		errors.Is(err, store.ErrClosed), errors.Is(err, store.ErrInvalid):
 		return err
@@ -649,8 +652,10 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	t.pollOK()
-	if wait, err := t.checkRewind(ctx, &t.rw, from, &tip); err != nil || wait {
-		return wait, err
+	if wait, err := t.checkRewind(ctx, &t.rw, from, &tip); err != nil {
+		return false, err
+	} else if wait {
+		return false, errHeadBehind
 	}
 	head, dbNow := tip.Head, tip.Now
 	changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)

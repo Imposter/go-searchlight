@@ -3,6 +3,7 @@ package replica
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -141,3 +142,8 @@ func (t *Tailer) checkRewind(ctx context.Context, rc *rewindCheck, from int64, t
 	}
 	return false, &rebuildError{reason: reasonRewound, err: cause}
 }
+
+// errHeadBehind is a poll that read a head behind the copy's seq for the first time:
+// not caught up, nor a failure; Run polls again after a short pause, and only a head
+// still behind then is a rewind.
+var errHeadBehind = errors.New("replica: the changelog's head is behind the copy's seq; polling again")

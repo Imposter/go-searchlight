@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -97,6 +99,62 @@ func TestTipOnPostgresReadsFewChangelogRows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTipPlanOnMySQL: MySQL plans the per-poll statement, as the store sends it (its
+// arguments interpolated, so planned for their values at every run), with a lookup of
+// at most a few rows for each changelog row it joins, never a scan, for a busy, a quiet
+// and an empty shard.
+func TestTipPlanOnMySQL(t *testing.T) {
+	base := os.Getenv(envMySQL)
+	if base == "" {
+		t.Skip(envMySQL + " is not set")
+	}
+	ctx := context.Background()
+	st := mysqlHarness(t, base).open(t)
+	s := engine(st)
+	digits := "(SELECT 0 d UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9)"
+	from := fmt.Sprintf("SELECT 1 + d0.d + 10*d1.d + 100*d2.d + 1000*d3.d + 10000*d4.d + 100000*d5.d AS n FROM %[1]s d0, %[1]s d1, %[1]s d2, %[1]s d3, %[1]s d4, %[1]s d5 WHERE 1 + d0.d + 10*d1.d + 100*d2.d + 1000*d3.d + 10000*d4.d + 100000*d5.d <= %[2]d", digits, planChanges)
+	seedPlanChangelog(t, st, from, "ANALYZE TABLE sl_changes")
+	for _, c := range tipPlanCases() {
+		t.Run(c.name, func(t *testing.T) {
+			var plan string
+			if err := s.r.QueryRowContext(ctx, "EXPLAIN FORMAT=JSON "+s.d.Changelog.ReadTip, s.tipArgs(c.q)...).Scan(&plan); err != nil {
+				t.Fatal(err)
+			}
+			var tree any
+			if err := json.Unmarshal([]byte(plan), &tree); err != nil {
+				t.Fatalf("%v\n%s", err, plan)
+			}
+			if bad := scansOf(tree); len(bad) > 0 {
+				t.Fatalf("the plan scans: %s\n%s", strings.Join(bad, "; "), plan)
+			}
+		})
+	}
+}
+
+// scansOf returns the tables an EXPLAIN FORMAT=JSON plan reads by a scan (a full
+// table or index scan), or by a lookup it expects to examine more than a few rows in.
+func scansOf(node any) []string {
+	var out []string
+	switch n := node.(type) {
+	case map[string]any:
+		if name, ok := n["table_name"].(string); ok {
+			access, _ := n["access_type"].(string)
+			rows, _ := n["rows_examined_per_scan"].(float64)
+			if access == "ALL" || access == "index" || rows > 10 {
+				out = append(out, fmt.Sprintf("%s (%s, %v rows)", name, access, rows))
+			}
+		}
+		for _, v := range n {
+			out = append(out, scansOf(v)...)
+		}
+	case []any:
+		for _, v := range n {
+			out = append(out, scansOf(v)...)
+		}
+	}
+	return out
 }
 
 // tipReader runs the per-poll statement on a connection of the caller's choosing. The

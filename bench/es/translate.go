@@ -424,11 +424,15 @@ func (t *Translator) similar(f datasets.Field, a *query.Arg) (map[string]any, er
 // Search translates a Searchlight search request body into an Elasticsearch _search
 // body: the query in filter context (no scoring: Searchlight does not score), the
 // same size, sort with the id tie-breaker, search_after, track_total_hits,
-// aggregations, _source filtering and timeout.
+// aggregations, _source filtering and timeout. A body holding anything after its
+// JSON object is refused, as the API refuses it.
 func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	req, ps := search.ParseRequest(raw)
 	if len(ps) > 0 {
 		return nil, &InvalidError{Problems: ps}
+	}
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("es: the search body is not one JSON object")
 	}
 	q, err := t.Query(req.Query)
 	if err != nil {

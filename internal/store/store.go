@@ -276,9 +276,6 @@ func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l 
 // clock.Real).
 func WithClock(c clock.Clock) Option { return func(o *options) { o.clock = c } }
 
-// WithBlobChunkSize sets the blob chunk size in bytes.
-func WithBlobChunkSize(n int) Option { return func(o *options) { o.blobChunk = n } }
-
 // Dialects maps each store_url scheme to its dialect.
 func dialectFor(scheme string) (*dialect.Dialect, error) {
 	switch strings.ToLower(scheme) {

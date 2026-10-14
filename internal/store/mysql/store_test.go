@@ -45,17 +45,21 @@ func TestConfigTimeZoneMerged(t *testing.T) {
 	if cfg.Params["time_zone"] != "'+00:00'" || cfg.Params["sql_mode"] != "'ANSI_QUOTES'" {
 		t.Fatalf("params %v", cfg.Params)
 	}
-	dsn, err := DSN(mustParse(t, "mysql://u@db/x"))
-	if err != nil || !strings.Contains(dsn, "time_zone=%27%2B00%3A00%27") {
-		t.Fatalf("dsn %q %v", dsn, err)
+	cfg, err = Config(mustParse(t, "mysql://u@db/x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dsn := cfg.FormatDSN(); !strings.Contains(dsn, "time_zone=%27%2B00%3A00%27") {
+		t.Fatalf("dsn %q", dsn)
 	}
 }
 
 func TestDSNRoundTrip(t *testing.T) {
-	dsn, err := DSN(mustParse(t, "mysql://u%40x:p%40ss%3Aw%2Frd@db.example:3307/my%2Ddb?timeout=5s&tls=skip-verify"))
+	built, err := Config(mustParse(t, "mysql://u%40x:p%40ss%3Aw%2Frd@db.example:3307/my%2Ddb?timeout=5s&tls=skip-verify"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	dsn := built.FormatDSN()
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		t.Fatalf("parse %q: %v", dsn, err)

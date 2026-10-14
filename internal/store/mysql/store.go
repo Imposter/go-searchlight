@@ -121,15 +121,6 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	return cfg, nil
 }
 
-// DSN returns the go-sql-driver DSN for a mysql:// store URL.
-func DSN(u *url.URL) (string, error) {
-	cfg, err := Config(u)
-	if err != nil {
-		return "", err
-	}
-	return cfg.FormatDSN(), nil
-}
-
 func open(u *url.URL) (dialect.Pools, error) {
 	cfg, err := Config(u)
 	if err != nil {

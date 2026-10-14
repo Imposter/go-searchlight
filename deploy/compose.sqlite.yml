@@ -1,0 +1,65 @@
+# One Searchlight node on SQLite, from the published image (ghcr.io/imposter/searchlight).
+# SQLite serves one node only; for a cluster use compose.postgres.yml. This file ships in
+# each release's searchlight-deploy-<version>.tar.gz with .env.example, and needs no
+# checkout. Create the API tokens file beside it first (one "<token> write" or
+# "<token> read" per line), then start the node:
+#
+#   printf '%s write\n' "$(openssl rand -hex 24)" > tokens
+#   cp .env.example .env              # optional: the defaults are the example's values
+#   docker compose -f compose.sqlite.yml up -d
+#   curl -H "Authorization: Bearer $(cut -d' ' -f1 tokens)" http://127.0.0.1:8780/indexes
+#
+# The database and the segments live in one volume, "data", at /var/lib/searchlight:
+# back it up as docs/operations.md#backups-and-disaster-recovery describes for SQLite.
+# The tokens file is mounted as the Compose secret "tokens"; it must be readable by the
+# image's user (uid 65532), as a file created with the default umask is.
+#
+# Ports: the API on SEARCHLIGHT_BIND:SEARCHLIGHT_API_PORT (127.0.0.1:8780 by default), and
+# the admin listener (/healthz, /readyz, /metrics) on 127.0.0.1:SEARCHLIGHT_ADMIN_PORT
+# (8781). Serve other hosts only behind a TLS-terminating proxy (docs/nginx.md#tls), or
+# with tls_cert and tls_key.
+#
+# Upgrade: set SEARCHLIGHT_VERSION to the new release and run "up -d" again; read the
+# release's notes (CHANGELOG.md) first. The node stops within shutdown_grace plus
+# shutdown_timeout, and its replacement reopens its segments and migrates the schema.
+
+name: searchlight-sqlite
+
+services:
+  searchlight:
+    image: ghcr.io/imposter/searchlight:${SEARCHLIGHT_VERSION:-1.0.0}
+    restart: unless-stopped
+    hostname: searchlight
+    environment:
+      SEARCHLIGHT_NODE_ID: searchlight
+      SEARCHLIGHT_STORE_URL: sqlite:///var/lib/searchlight/searchlight.db
+      SEARCHLIGHT_TOKENS_FILE: /run/secrets/tokens
+      SEARCHLIGHT_SHUTDOWN_GRACE: 2s
+      SEARCHLIGHT_SHUTDOWN_TIMEOUT: 60s
+      SEARCHLIGHT_LOG_LEVEL: ${SEARCHLIGHT_LOG_LEVEL:-info}
+      SEARCHLIGHT_CHANGELOG_RETENTION: ${SEARCHLIGHT_CHANGELOG_RETENTION:-24h}
+      SEARCHLIGHT_RETIRING_RETENTION: ${SEARCHLIGHT_RETIRING_RETENTION:-15m}
+      SEARCHLIGHT_BUNDLE_INTERVAL: ${SEARCHLIGHT_BUNDLE_INTERVAL:-0s}
+      SEARCHLIGHT_BUNDLE_RETENTION: ${SEARCHLIGHT_BUNDLE_RETENTION:-2}
+    secrets:
+      - tokens
+    ports:
+      - ${SEARCHLIGHT_BIND:-127.0.0.1}:${SEARCHLIGHT_API_PORT:-8780}:8780
+      - 127.0.0.1:${SEARCHLIGHT_ADMIN_PORT:-8781}:8781
+    volumes:
+      - data:/var/lib/searchlight
+    # shutdown_grace (2 s) plus shutdown_timeout (60 s), plus 10 s.
+    stop_grace_period: 72s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/searchlight", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2m
+
+secrets:
+  tokens:
+    file: ./tokens
+
+volumes:
+  data:

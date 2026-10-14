@@ -1,7 +1,10 @@
-# A three-node Searchlight cluster on Postgres 17, for trying a cluster out on one
-# machine. From the repository root:
+# A three-node Searchlight cluster on Postgres 17, built from this checkout, for trying
+# a change out as a cluster on one machine. From the repository root:
 #
 #   docker compose -f deploy/compose.yml up --build -d
+#
+# compose.postgres.yml is the same cluster on the published image, the sample to deploy
+# from; the two repeat each other's services, so change both together.
 #
 # The secrets are generated on the first start, into the "secrets" volume, by the
 # one-shot "secrets" service: a Postgres password and the store_url built from it, a

@@ -526,11 +526,10 @@ Notes:
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
   are three: the initial schema, compressed bodies, and change nonces (both below). Each
-  migration's DDL waits
-  at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
-  so a long query on the table holds the table's other queries behind the migration for
-  at most that second; one that times out is retried, up to 40 times over about three
-  minutes, half a second to five seconds apart.
+  migration's DDL waits at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL
+  `lock_wait_timeout`), so a long query on the table holds the table's other queries
+  behind the migration for at most that second; one that times out is retried, up to 40
+  times over about three minutes, half a second to five seconds apart.
 - **Upgrading to a release that requires `cluster_token`.** A node on Postgres or MySQL
   now refuses to start without `cluster_token` (`cluster_token: set cluster_token ...`),
   unless `insecure_no_auth` is set. A cluster of several nodes has one already: without

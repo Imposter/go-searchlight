@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,14 +115,19 @@ type Change struct {
 	// KindMapping change it is the version that change introduces. Callers leave
 	// it zero.
 	MappingVersion int64
+	// Nonce is a random number the store gave the change when it wrote it (never
+	// 0): with Seq it tells this change apart from any other that ever takes the
+	// seq. 0 for a change written before schema v3, or by a node from before it.
+	// Callers leave it zero.
+	Nonce int64
 }
 
 // ShardID returns the shard the change belongs to.
 func (c *Change) ShardID() ShardID { return ShardID{Index: c.Index, Shard: c.Shard} }
 
-// ChangeMark identifies one change of the changelog by what its row carries: its
-// seq, shard, kind, id and commit time. While the database keeps its commits a seq is
-// never reissued, so the change at a seq keeps its mark until it is pruned or its
+// ChangeMark identifies one change of the changelog by what its row carries: its seq,
+// shard, kind, id, commit time and nonce. While the database keeps its commits a seq
+// is never reissued, so the change at a seq keeps its mark until it is pruned or its
 // index dropped. A failover that loses commits reissues their seqs to other changes,
 // with other marks: that is how a tailer sees the changelog rewound under its copy.
 // The zero mark (Seq 0) names no change.
@@ -131,16 +138,35 @@ type ChangeMark struct {
 	Kind  Kind
 	ID    string
 	At    time.Time
+	// Nonce is the change's nonce, 0 when it has none (written before nonces).
+	Nonce int64
 }
 
 // Mark returns the change's mark.
 func (c *Change) Mark() ChangeMark {
-	return ChangeMark{Seq: c.Seq, Index: c.Index, Shard: c.Shard, Kind: c.Kind, ID: c.ID, At: c.At}
+	return ChangeMark{Seq: c.Seq, Index: c.Index, Shard: c.Shard, Kind: c.Kind, ID: c.ID, At: c.At, Nonce: c.Nonce}
 }
 
-// Same reports whether m and o name the same change.
+// Same reports whether m and o name the same change: the same identity and, when
+// both have a nonce, the same nonce. A reissue to the same document, of the same
+// kind, in the same millisecond differs only by its nonce; a change written before
+// nonces is compared by its identity alone.
 func (m ChangeMark) Same(o ChangeMark) bool {
+	if m.Nonce != 0 && o.Nonce != 0 && m.Nonce != o.Nonce {
+		return false
+	}
 	return m.Seq == o.Seq && m.Index == o.Index && m.Shard == o.Shard && m.Kind == o.Kind && m.ID == o.ID && m.At.Equal(o.At)
+}
+
+// newNonce returns a random change nonce, never 0.
+func newNonce() int64 {
+	for {
+		var b [8]byte
+		_, _ = rand.Read(b[:])
+		if n := int64(binary.LittleEndian.Uint64(b[:])); n != 0 { //nolint:gosec // any 64 random bits will do
+			return n
+		}
+	}
 }
 
 // Tip is the changelog's head as a tailer polls it ([Store.Tip]).

@@ -349,7 +349,7 @@ func counterValue(t *testing.T, st Store) int64 {
 	var mc markColumns
 	var own shardMarkColumns
 	s := engine(st)
-	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounterMark, "", 0).Scan(&v, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &own.seq, &own.kind, &own.id, &own.at); err != nil {
+	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounterMark, "", 0).Scan(&v, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
 		t.Fatal(err)
 	}
 	return v

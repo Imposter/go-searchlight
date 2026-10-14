@@ -510,7 +510,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		st := idx[c.Index]
 		w.Changes[i] = dialect.ChangeRow{
 			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID,
-			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion,
+			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion, Nonce: newNonce(),
 		}
 	}
 	netState(w, batch, p, first)
@@ -788,9 +788,11 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 		var kind string
 		var payload, payloadZ []byte
 		var at int64
-		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &payloadZ, &at, &c.IndexUID, &c.MappingVersion); err != nil {
+		var nonce sql.NullInt64
+		if err := rows.Scan(&c.Seq, &kind, &c.ID, &payload, &payloadZ, &at, &c.IndexUID, &c.MappingVersion, &nonce); err != nil {
 			return nil, err
 		}
+		c.Nonce = nonce.Int64
 		c.Kind = Kind(kind)
 		var derr error
 		if c.Payload, derr = readBody(payload, payloadZ); derr != nil {
@@ -848,7 +850,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	var mc markColumns
 	var own shardMarkColumns
 	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, s.customPlan(shard.Index, shard.Shard)...).Scan(&pt.Seq,
-		&mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &own.seq, &own.kind, &own.id, &own.at); err != nil {
+		&mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
 		return pt, err
 	}
 	pt.Mark, pt.ShardMark = mc.mark(pt.Seq), own.mark(shard)
@@ -937,9 +939,9 @@ func (s *sqlStore) readTip(ctx context.Context, db queryer, q TipQuery) (tip Tip
 	var horizon sql.NullInt64
 	var uid sql.NullString
 	err = db.QueryRowContext(ctx, s.d.Changelog.ReadTip, s.tipArgs(q)...).Scan(&tip.Head, &nowMs,
-		&head.index, &head.shard, &head.kind, &head.id, &head.at,
-		&at.index, &at.shard, &at.kind, &at.id, &at.at,
-		&own.seq, &own.kind, &own.id, &own.at, &horizon, &uid)
+		&head.index, &head.shard, &head.kind, &head.id, &head.at, &head.nonce,
+		&at.index, &at.shard, &at.kind, &at.id, &at.at, &at.nonce,
+		&own.seq, &own.kind, &own.id, &own.at, &own.nonce, &horizon, &uid)
 	if err != nil {
 		return tip, err
 	}
@@ -962,28 +964,28 @@ func (s *sqlStore) customPlan(args ...any) []any {
 // shardMarkColumns scans the mark of a known shard's change from a LEFT JOIN, NULL
 // when there is none.
 type shardMarkColumns struct {
-	kind, id sql.NullString
-	seq, at  sql.NullInt64
+	kind, id       sql.NullString
+	seq, at, nonce sql.NullInt64
 }
 
 func (c *shardMarkColumns) mark(shard ShardID) ChangeMark {
 	if !c.seq.Valid {
 		return ChangeMark{}
 	}
-	return ChangeMark{Seq: c.seq.Int64, Index: shard.Index, Shard: shard.Shard, Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
+	return ChangeMark{Seq: c.seq.Int64, Index: shard.Index, Shard: shard.Shard, Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
 }
 
 // markColumns scans a change's mark from a LEFT JOIN, NULL when there is no change.
 type markColumns struct {
-	index, kind, id sql.NullString
-	shard, at       sql.NullInt64
+	index, kind, id  sql.NullString
+	shard, at, nonce sql.NullInt64
 }
 
 func (c *markColumns) mark(seq int64) ChangeMark {
 	if !c.index.Valid {
 		return ChangeMark{}
 	}
-	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64)}
+	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
 }
 
 // --- Pruning ---------------------------------------------------------------

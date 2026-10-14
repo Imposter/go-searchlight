@@ -97,7 +97,9 @@ func waitMatches(t *testing.T, c *copyRunner, st store.Store, id ShardID) {
 // rewind loses every commit after seq k, as a failover to a replica that had not
 // received them would: their changes, the documents and queries they created, and the
 // counter past k, all at once (one transaction), as a promoted replica shows them.
-func rewind(ctx context.Context, t *testing.T, d *db, k int64) {
+// then are statements run after it in the same transaction: the writes the new
+// primary took before any copy could look.
+func rewind(ctx context.Context, t *testing.T, d *db, k int64, then ...string) {
 	t.Helper()
 	raw := rawDB(t, d)
 	tx, err := raw.BeginTx(ctx, nil)
@@ -113,6 +115,11 @@ func rewind(ctx context.Context, t *testing.T, d *db, k int64) {
 	} {
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(q, k)); err != nil {
 			t.Fatalf("rewind %q: %v", q, err)
+		}
+	}
+	for _, q := range then {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			t.Fatalf("after the rewind %q: %v", q, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

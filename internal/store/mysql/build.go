@@ -96,16 +96,16 @@ func escapedSize(args []any) int {
 // Column lists of the batch-written tables, in the order of the args
 // functions below.
 const (
-	changeColumns   = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version"
+	changeColumns   = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce"
 	documentColumns = "index_name, shard, id, body, body_z, seq"
 	queryColumns    = "index_name, shard, id, query, meta, seq"
 )
 
 func changeArgs(rows []dialect.ChangeRow) []any {
-	args := make([]any, 0, len(rows)*10)
+	args := make([]any, 0, len(rows)*11)
 	for i := range rows {
 		r := &rows[i]
-		args = append(args, r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, dialect.Blob(r.PayloadZ), r.At, r.IndexUID, r.MappingVersion)
+		args = append(args, r.Seq, r.Index, r.Shard, r.Kind, r.ID, r.Payload, dialect.Blob(r.PayloadZ), r.At, r.IndexUID, r.MappingVersion, r.Nonce)
 	}
 	return args
 }

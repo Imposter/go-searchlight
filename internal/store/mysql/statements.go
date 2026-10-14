@@ -32,15 +32,15 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 
 var changelog = dialect.Changelog{
 	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
-	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, o.seq, o.kind, o.id, o.at FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= c.value) WHERE c.id = 1",
+	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= c.value) WHERE c.id = 1",
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, a.index_name, a.shard, a.kind, a.id, a.at, o.seq, o.kind, o.id, o.at, (SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?), (SELECT uid FROM sl_indexes WHERE name = ?) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE c.id = 1"),
+	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?), (SELECT uid FROM sl_indexes WHERE name = ?) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
 	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
 	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
 	Write:           write,
 	Limits:          limits,
-	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
 	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
@@ -50,7 +50,7 @@ var changelog = dialect.Changelog{
 // DUPLICATE KEY UPDATE through a row alias, and IN-list deletes.
 func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 	out := values("insert changes", "INSERT INTO sl_changes ("+changeColumns+") VALUES ", "",
-		10, l, changeArgs(w.Changes))
+		11, l, changeArgs(w.Changes))
 	out = append(out, values("upsert documents", "INSERT INTO sl_documents ("+documentColumns+") VALUES ",
 		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq",
 		6, l, documentArgs(w.Documents))...)

@@ -57,8 +57,9 @@ Each [release](https://github.com/Imposter/go-searchlight/releases) publishes bi
 container image and deployment samples. [CHANGELOG.md](CHANGELOG.md) has its notes.
 
 - **Binaries** for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and
-  windows/amd64, each archived with this README and
-  [docs/operations.md](docs/operations.md), and checked by `SHA256SUMS`:
+  windows/amd64, each archived with this README,
+  [docs/operations.md](docs/operations.md), the licence and the third-party notices, and
+  checked by `SHA256SUMS`:
 
   ```sh
   base=https://github.com/Imposter/go-searchlight/releases/download/v1.0.0
@@ -67,6 +68,11 @@ container image and deployment samples. [CHANGELOG.md](CHANGELOG.md) has its not
   tar -xzf searchlight-1.0.0-linux-amd64.tar.gz
   ./searchlight-1.0.0-linux-amd64/searchlight version
   ```
+
+  The macOS binaries are not signed: one downloaded with a browser needs
+  `xattr -d com.apple.quarantine searchlight` (or Finder's right-click, **Open**) before it
+  runs ([docs/operations.md](docs/operations.md#the-binary)).
+  `go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0` builds it too.
 
 - **The image**, for linux/amd64 and linux/arm64, tagged `1.0.0`, `1.0`, `1` and
   `latest`:

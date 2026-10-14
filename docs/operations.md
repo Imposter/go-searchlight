@@ -57,7 +57,22 @@ tar -xzf searchlight-1.0.0-linux-amd64.tar.gz
 install searchlight-1.0.0-linux-amd64/searchlight /usr/local/bin/
 ```
 
-Or build it from a checkout, then run it:
+Each archive also holds `LICENSE` and `THIRD_PARTY_NOTICES`, the licences of Go and of
+every dependency linked into the binary.
+
+**macOS.** The darwin binaries are not signed or notarised. Downloaded with `curl` they
+run as they are; downloaded with a browser, macOS quarantines them and Gatekeeper refuses
+to open "searchlight". Clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine searchlight
+```
+
+or, in Finder, right-click (or Control-click) `searchlight`, choose **Open**, and confirm
+**Open** in the dialog; macOS remembers the choice.
+
+Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0`
+also works, and reports its version), then run it:
 
 ```sh
 make build                       # bin/searchlight, version from git describe
@@ -104,8 +119,11 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 ### Docker
 
 Each release publishes `ghcr.io/imposter/searchlight`, for linux/amd64 and linux/arm64,
-tagged with its version (`1.0.0`), its minor (`1.0`) and major (`1`) lines, and `latest`.
-Pin the full version in production; the shorter tags move with each release.
+tagged with its version (`1.0.0`). Its minor (`1.0`) and major (`1`) lines, and `latest`,
+point at the newest stable release of each: they only move forward, so a patch to an
+older line moves its own `<major>.<minor>` tag and nothing else. Pin the full version in
+production. The `sha-<commit>` tags are where the release workflow stages an image
+before it is tested; do not deploy them.
 
 ```sh
 docker pull ghcr.io/imposter/searchlight:1.0.0
@@ -121,6 +139,7 @@ docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
 - **Defaults.** `SEARCHLIGHT_LISTEN=:8780`, `SEARCHLIGHT_ADMIN_LISTEN=:8781` and
   `SEARCHLIGHT_DATA_DIR=/var/lib/searchlight`, which is a volume.
 - **Labels.** It carries the OCI labels (version, revision, created, source).
+- **Licences.** `/usr/share/doc/searchlight` holds `LICENSE` and `THIRD_PARTY_NOTICES`.
 - **Provenance.** The published image carries a SLSA provenance attestation and an SBOM:
   `docker buildx imagetools inspect ghcr.io/imposter/searchlight:1.0.0 --format '{{json .Provenance}}'`
   (or `.SBOM`).

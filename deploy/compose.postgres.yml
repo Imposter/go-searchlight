@@ -94,6 +94,9 @@ services:
 
   postgres:
     image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    # Docker gives a container 64 MB of /dev/shm; Postgres keeps its parallel queries' shared
+    # memory there, and runs out under load ("could not resize shared memory segment").
+    shm_size: 256mb
     # Each node may hold 64 connections plus one for LISTEN.
     command:
       - postgres

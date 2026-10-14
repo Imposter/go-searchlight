@@ -41,10 +41,11 @@ under the [MIT License](LICENSE).
   Prometheus `/metrics` on a separate admin listener; JSON logs, OpenTelemetry traces
   and metrics; `searchlight healthcheck` for container probes and `searchlight version`.
 - **Releases**: binaries for linux/amd64, linux/arm64, windows/amd64, darwin/amd64 and
-  darwin/arm64 with SHA256SUMS; a multi-arch image, `ghcr.io/imposter/searchlight`
-  (linux/amd64 and linux/arm64, distroless, non-root, with provenance and an SBOM); and
-  deploy samples: a three-node Postgres cluster behind nginx and a single SQLite node for
-  Docker Compose, and Kubernetes manifests.
+  darwin/arm64, built with Go 1.25.14, with SHA256SUMS; a multi-arch image,
+  `ghcr.io/imposter/searchlight` (linux/amd64 and linux/arm64, distroless, non-root, with
+  provenance and an SBOM), each carrying the licence and third-party notices; and deploy
+  samples: a three-node Postgres cluster behind nginx and a single SQLite node for Docker
+  Compose, and Kubernetes manifests.
 
 ### Performance
 

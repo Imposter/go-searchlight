@@ -1,0 +1,100 @@
+# Changelog
+
+Searchlight's releases. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/). The release workflow
+publishes each version's section here as its GitHub release notes (RELEASING.md).
+
+## [1.0.0] - 2026-10-14
+
+The first release: a search engine that behaves like Elasticsearch for filtering,
+sorting, aggregations and percolation, and keeps its durable state in SQL.
+
+### Added
+
+- **The HTTP API** ([docs/api.md](docs/api.md), contract in
+  [api/openapi.yaml](api/openapi.yaml)), with bearer-token auth (read and write scopes):
+  - indexes with typed mappings (`keyword`, `text`, `keyword_list`, `number`, `bool`,
+    `date`; dynamic, non-indexing or strict), additive mapping changes, and shards and
+    `refresh_interval` per index;
+  - documents (`PUT`, `GET`, `DELETE`) with optimistic concurrency (`if_seq`) and
+    `op_type=create`, and `_bulk`, every operation of a request in one commit;
+  - search and count: boolean queries with words, phrases, substrings (`contains`, on
+    3-grams), prefixes and trigram similarity, case and Unicode (NFKC) folding;
+    sorting, `search_after` paging, and terms, range, histogram and stats
+    aggregations;
+  - read-your-writes through `refresh=wait_for` and `wait_for_seq`;
+  - saved queries and percolation (`_percolate`) of given and stored documents;
+  - a field catalogue, and `_cluster/health`, `_cluster/nodes` and `_cluster/shards`.
+- **Clustering** on Postgres or MySQL ([docs/clustering.md](docs/clustering.md)): every
+  node is the same binary and takes any request. Nodes register in the database and
+  find each other there; leases decide which node holds which shard copy; a new or
+  restarted copy recovers from a peer's segments, a recovery bundle in the database, or
+  the database's documents. Reads pick replicas adaptively and retry; a rolling restart
+  hands its copies over before the node stops. `replicas_per_shard` sets copies per
+  shard.
+- **Three SQL dialects**: Postgres, MySQL 8.0.19 or later, and SQLite (one node). The
+  database's changelog is the write-ahead log: a write is acknowledged once its
+  transaction commits.
+- **Operations**: one static, pure-Go binary for Linux, Windows and macOS; settings as
+  flags or `SEARCHLIGHT_*` variables, secrets from `*_FILE`; `/healthz`, `/readyz` and
+  Prometheus `/metrics` on a separate admin listener; JSON logs, OpenTelemetry traces
+  and metrics; `searchlight healthcheck` for container probes and `searchlight version`.
+- **Releases**: binaries for linux/amd64, linux/arm64, windows/amd64, darwin/amd64 and
+  darwin/arm64 with SHA256SUMS; a multi-arch image, `ghcr.io/imposter/searchlight`
+  (linux/amd64 and linux/arm64, distroless, non-root, with provenance and an SBOM); and
+  deploy samples: a three-node Postgres cluster behind nginx and a single SQLite node for
+  Docker Compose, and Kubernetes manifests.
+
+### Performance
+
+Against Elasticsearch 8.15.3 on the same 4-vCPU CI host, 1,000,000 documents, Searchlight
+on SQLite ([docs/benchmarks.md](docs/benchmarks.md)); every graded target passes:
+
+| Target | Searchlight | Elasticsearch 8 |
+| --- | --- | --- |
+| Bulk indexing, acknowledged = durable (T1) | 13.5k docs/s | 7.3k docs/s |
+| Filter, sort and aggregation latency (T2–T4) | p50 0.5–2.9 ms, p99 1.1–15 ms | p50 1.9–140 ms, p99 4.7 ms–2.2 s |
+| Percolation, 100k saved queries (T5) | 3,187 docs/s, server p99 783 µs per doc | 12.6 docs/s |
+| Resident memory per million docs (T6) | 2.42 GiB | 4.15 GiB |
+| Write to visible, p99 (T7) | 999 ms | 998 ms |
+| New replica to serving (T8) | 6.0 s | 28.5 s |
+| Node restart to serving (T9) | 1.1 s | — |
+
+Disk per million documents is 2.33 GiB against 1.5 GiB, for 3-grams on every keyword and
+text field. Replica failure (T10) is checked by the chaos suite rather than measured, and
+scale beyond RAM (T11) is not measured yet; nor is write throughput on Postgres and
+MySQL ([#69](https://github.com/Imposter/go-searchlight/issues/69)).
+
+### Upgrade notes
+
+For databases created by builds of `main` before this release
+([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)):
+
+- **Schema migrations 1–3** run at start, on the first node to start: 1, the initial
+  schema; 2, compressed bodies (`body_z`, `payload_z`, `sl_nodes.body_codecs`,
+  `sl_features`; zstd compression turns on once every node reads it); 3, change nonces
+  (`sl_changes.nonce`). Each only adds columns and tables, in milliseconds, and nodes
+  already running an older build keep working beside it. A binary refuses a schema newer than it knows, so
+  rolling back means restoring the database.
+- **`cluster_token` is required on Postgres and MySQL**: a node there refuses to start
+  without it unless `insecure_no_auth` is set. A cluster of several nodes has one
+  already; set one on a single node before upgrading it.
+- **Segment format 4** is read from format 3 as it is; merges rewrite segments as they
+  go.
+
+### Known gaps
+
+From [docs/architecture.md](docs/architecture.md#known-gaps):
+
+- **Background scrub** ([#36](https://github.com/Imposter/go-searchlight/issues/36)): a
+  segment is checksum-verified when its copy opens, so bit rot after open is served until
+  the copy is next opened.
+- **Reading the previous segment format**
+  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): an upgrade that changes
+  the segment format's major version rebuilds copies instead of reopening them.
+- **Scale beyond RAM and many nodes** (T11): designed for (memory-mapped segments, shards
+  across nodes) but not benchmarked yet.
+- No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
+  SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
+
+[1.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.0.0

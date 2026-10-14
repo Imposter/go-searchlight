@@ -93,7 +93,9 @@ func NewHub(st store.Store, opts HubOptions) *Hub {
 func (h *Hub) Watching() bool { return h != nil && h.watching.Load() }
 
 // Run keeps the subscription up until ctx ends (it returns nil then) or the store is
-// closed (store.ErrClosed).
+// closed (store.ErrClosed). While it restarts a subscription, every tailer is woken to
+// take up its poll interval. Restarts back off, from scratch again once a subscription
+// has stayed up for a minute.
 func (h *Hub) Run(ctx context.Context) error {
 	var retry time.Duration
 	for {
@@ -112,10 +114,9 @@ func (h *Hub) Run(ctx context.Context) error {
 		if suppressed, ok := h.warn.allow(); ok {
 			h.log.WarnContext(ctx, "change notifications stopped; restarting them", slog.Any("error", err), slog.Int("suppressed", suppressed))
 		}
-		// Back to polling meanwhile: wake every tailer to take up its poll interval.
 		h.wakeAll()
 		if h.clock.Since(started) > time.Minute {
-			retry = 0 // it was healthy for a while: this is a fresh failure
+			retry = 0
 		}
 		if retry == 0 {
 			retry = h.retryBase

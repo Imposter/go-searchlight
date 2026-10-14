@@ -260,17 +260,18 @@ func normalizeMeta(meta []byte) []byte {
 // holds shows as that field's presence. view is the mapping as analysisView makes it;
 // dynamic is its real mode. unmapped reports fields a dynamic or strict mapping should
 // have mapped: a writer that broke its contract.
+//
+// Only typeable content is marked untyped: a value dynamic inference types, so that
+// mapping the field would analyze it differently. A value inference does not type (an
+// empty list, an object) analyzes as presence alone whatever the field's type, and is
+// not marked. Segments keep the marks in a bitmap of their own
+// (segment.Reader.Untyped, shard.SegmentView.MarksUntyped).
 func analyzeDoc(view *schema.Mapping, dynamic schema.DynamicMode, id string, body []byte) (doc schema.Doc, unmapped bool, err error) {
 	doc, upd, err := schema.Analyze(view, id, body)
 	if err != nil {
 		return doc, false, err
 	}
 	for f := range upd.Fields {
-		// Typeable content: dynamic inference types this value, so mapping the
-		// field would analyze it differently. A value inference does not type
-		// (an empty list, an object) analyzes as presence alone whatever the
-		// field's type, and is not marked. Segments keep the marks in a bitmap of
-		// their own (segment.Reader.Untyped, shard.SegmentView.MarksUntyped).
 		doc.Fields[f] = schema.Value{Present: true, Untyped: true}
 	}
 	return doc, !upd.Empty() && dynamic != schema.DynamicFalse, nil
@@ -462,15 +463,15 @@ func (t *Tailer) applyChanges(ctx context.Context, sh *shard.Shard, changes []st
 // stops before a change whose mapping version is not the copy's (a rebuild), before a
 // Remap that would re-analyze a live document (a rebuild), and before an item that
 // cannot be applied (the guard decides: a rebuild, or a halt). Whatever precedes the
-// stop is applied, and in tailing the applied seq moves past it.
+// stop is applied, and in tailing the applied seq moves past it. A Remap's
+// re-analysis check runs once everything before it is applied, since it must see it.
 func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, load bool) error {
 	m, version := sh.Mapping(), sh.MappingVersion()
 	view := analysisView(m)
 	views := make([]*schema.Mapping, len(items))
 	dynamic := make([]schema.DynamicMode, len(items))
 	runStart := 0
-	// flush applies items[runStart:end].
-	flush := func(end int) error {
+	applyRunTo := func(end int) error {
 		if end <= runStart {
 			return nil
 		}
@@ -493,18 +494,16 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 		it := &items[i]
 		switch {
 		case it.bad != nil:
-			// convert stops here; the guard decides.
 		case it.kind == shard.Remap:
 			if !load {
 				if it.version != version+1 {
-					if err := flush(i); err != nil {
+					if err := applyRunTo(i); err != nil {
 						return err
 					}
 					return &rebuildError{reason: reasonMappingOrder, err: fmt.Errorf("seq %d is mapping version %d, the copy is at %d", it.seq, it.version, version)}
 				}
 				if fields := changedFields(m, it.mapping); len(fields) > 0 {
-					// Everything before the remap goes in first: the check must see it.
-					if err := flush(i); err != nil {
+					if err := applyRunTo(i); err != nil {
 						return err
 					}
 					rebuild, err := t.remapReanalyzes(ctx, sh, m, fields)
@@ -520,7 +519,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 			m, version = it.mapping, it.version
 			view = analysisView(m)
 		case it.version != version:
-			if err := flush(i); err != nil {
+			if err := applyRunTo(i); err != nil {
 				return err
 			}
 			return &rebuildError{reason: reasonMappingOrder, err: fmt.Errorf("seq %d was written under mapping version %d, the copy is at %d", it.seq, it.version, version)}
@@ -531,7 +530,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 			}
 		}
 	}
-	return flush(len(items))
+	return applyRunTo(len(items))
 }
 
 // remapReanalyzes reports whether a live document of the copy would analyze
@@ -605,8 +604,9 @@ func (t *Tailer) guard(ctx context.Context, sh *shard.Shard, it *item, reason st
 
 // applyBatch applies (or, with load, loads) changes, waiting out backpressure: on a
 // full buffer it refreshes and retries, never giving up. It returns how many changes
-// were applied: all of them, or, when the shard refuses one, those before it, and a
-// *HaltError for that one.
+// were applied: all of them, or, when the shard refuses one, exactly those before it,
+// and a *HaltError for that one. A closed, failed or cancelled shard's error is
+// returned as it is.
 func (t *Tailer) applyBatch(ctx context.Context, sh *shard.Shard, changes []shard.Change, load bool) (int, error) {
 	if len(changes) == 0 {
 		return 0, nil
@@ -636,12 +636,11 @@ func (t *Tailer) applyBatch(ctx context.Context, sh *shard.Shard, changes []shar
 		}
 		var ce *shard.ChangeError
 		if !errors.As(err, &ce) {
-			return 0, err // closed, failed, cancelled
+			return 0, err
 		}
 		if errors.Is(err, shard.ErrIndexUID) {
 			return 0, &rebuildError{reason: reasonIncarnation, err: err}
 		}
-		// Stop exactly before the refused change: apply those before it.
 		n, perr := t.applyBatch(ctx, sh, changes[:ce.Pos], load)
 		if perr != nil {
 			return n, perr
@@ -737,7 +736,8 @@ func (t *Tailer) clearHalt() {
 // superseded reports whether the changelog holds a change of h's document or query
 // (or mapping) after h's seq: the bad row is then no longer current, and a rebuild
 // from a snapshot gets past it. The search resumes where the last one for h stopped. A
-// damaged change of another document on the way is looked past.
+// damaged change of another document on the way is looked past, and a damaged later
+// write of h's own document supersedes it as any other would.
 // Once the changelog is pruned past h the changes are gone, and the record (or the
 // index's mapping) itself decides ([Tailer.recordMoved]); a tailing copy pruned past
 // is rebuilt by its next read anyway (reasonPruned).
@@ -752,7 +752,7 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 		}
 		var ce *store.CorruptError
 		if errors.As(err, &ce) && ce.ID == h.ID && (h.class == "" || h.class == classDocument) {
-			return true, nil // a later write of the same document, damaged itself
+			return true, nil
 		}
 		for i := range page {
 			c := &page[i]
@@ -779,14 +779,15 @@ func (t *Tailer) superseded(ctx context.Context, h *HaltError) (bool, error) {
 
 // recordMoved reports whether h's document or saved query is no longer the row h
 // halted at (deleted, or written again since), or for a mapping halt whether the
-// index's mapping has moved past the version h was written under. A store that
-// cannot read records never reports a record moved.
+// index's mapping has moved past the version h was written under (a dropped index has:
+// the copy's next start finds out). A record still damaged has moved only if it was
+// written again. A store that cannot read records never reports a record moved.
 func (t *Tailer) recordMoved(ctx context.Context, h *HaltError) (bool, error) {
 	if h.class == classMapping {
 		meta, err := t.st.Indexes().Get(ctx, t.id.Index)
 		switch {
 		case errors.Is(err, store.ErrNotFound):
-			return true, nil // dropped: the copy's next start finds out
+			return true, nil
 		case err != nil:
 			return false, err
 		}
@@ -811,7 +812,7 @@ func (t *Tailer) recordMoved(ctx context.Context, h *HaltError) (bool, error) {
 	case errors.Is(err, store.ErrNotFound):
 		return true, nil
 	case errors.As(err, &ce):
-		return ce.Seq != h.Seq, nil // still damaged: moved only if written again
+		return ce.Seq != h.Seq, nil
 	case err != nil:
 		return false, err
 	}

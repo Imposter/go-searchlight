@@ -525,7 +525,8 @@ Notes:
   brings a migration cannot be rolled back by downgrading the binary: restore the
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
-  are two: the initial schema, and compressed bodies (below). Each migration's DDL waits
+  are three: the initial schema, compressed bodies, and change nonces (both below). Each
+  migration's DDL waits
   at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
   so a long query on the table holds the table's other queries behind the migration for
   at most that second; one that times out is retried, up to 40 times over about three
@@ -566,6 +567,21 @@ Notes:
     reads compressed rows as empty bodies (its realtime `GET`s answer empty documents,
     and its copies halt). Terminate old pods during the rollout rather than isolating
     them; once restarted, an old binary refuses the schema, as above.
+- **Upgrading to change nonces** (schema migration 3) is a rolling upgrade. The migration
+  only adds a column, which takes milliseconds whatever the database holds:
+  `sl_changes.nonce` (a BIGINT, NULL until used). Nothing is rewritten, and nodes still
+  on the old binary keep reading and writing as before: they never touch the new column,
+  and the changes they write have no nonce.
+  - Upgraded nodes give every change they write a random nonce. A copy checking that the
+    changelog still holds what it applied compares nonces when both sides have one, and
+    the change's seq, shard, kind, id and commit time otherwise, as before. So a change
+    a failover lost, reissued to the same document in the same millisecond, is told
+    apart from the one that took its seq.
+  - Once the first node has migrated, an old binary refuses to start (the schema is newer
+    than it knows), so **an old pod that crashes or restarts mid-rollout crash-loops** on
+    `store: database schema is newer than this binary` until it runs the new image:
+    finish the rollout rather than waiting on it. For the same reason a rollback means
+    restoring the database, as above.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

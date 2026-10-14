@@ -167,6 +167,7 @@ jobs:
             mkdir -p "build/$name/docs"
             CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
               go build -trimpath -ldflags "-s -w -X main.version=$TAG" -o "build/$name/$exe" ./cmd/searchlight
+            chmod 0755 "build/$name/$exe"
             cp README.md "build/$name/"
             cp docs/operations.md "build/$name/docs/"
             if [ -f LICENSE ]; then cp LICENSE "build/$name/"; fi

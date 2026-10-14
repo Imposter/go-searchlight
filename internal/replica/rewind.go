@@ -165,8 +165,13 @@ func (t *Tailer) checkRewind(ctx context.Context, sh *shard.Shard, rc *rewindChe
 }
 
 // differs describes a change the copy applied at a seq that the changelog now holds
-// another change at.
+// another change at, with each change's commit time and nonce, which may be all that
+// tells them apart.
 func differs(applied, now store.ChangeMark) error {
-	return fmt.Errorf("seq %d is now %s %q of %s/%d, the copy applied %s %q of %s/%d there", applied.Seq,
-		now.Kind, now.ID, now.Index, now.Shard, applied.Kind, applied.ID, applied.Index, applied.Shard)
+	return fmt.Errorf("seq %d is now %s, the copy applied %s there", applied.Seq, describeMark(now), describeMark(applied))
+}
+
+// describeMark is a mark as a log line says it.
+func describeMark(m store.ChangeMark) string {
+	return fmt.Sprintf("%s %q of %s/%d at %d ms, nonce %d", m.Kind, m.ID, m.Index, m.Shard, m.At.UnixMilli(), m.Nonce)
 }

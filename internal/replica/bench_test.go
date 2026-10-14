@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -101,9 +102,14 @@ func BenchmarkRecoverSnapshot(b *testing.B) {
 		sh := openShard(b, filepath.Join(b.TempDir(), fmt.Sprint(i)), benchShardOptions())
 		b.StartTimer()
 		start := time.Now()
-		seq, err := Recover(context.Background(), sh, st, id)
+		tl := NewTailer(st, sh, id, Options{})
+		var rb *rebuildError
+		if err := tl.start(context.Background()); !errors.As(err, &rb) || rb.reason != reasonEmpty {
+			b.Fatalf("start = %v; want a rebuild of an empty copy", err)
+		}
+		seq, err := tl.loadSnapshot(context.Background(), sh)
 		if err != nil || seq != head {
-			b.Fatalf("Recover = %d, %v", seq, err)
+			b.Fatalf("loadSnapshot = %d, %v", seq, err)
 		}
 		if err := sh.WaitRefreshed(context.Background(), head); err != nil {
 			b.Fatal(err)

@@ -53,38 +53,6 @@ const (
 
 func fetchedFrom(source string) bool { return source == SourcePeer || source == SourceBlob }
 
-// ErrWipeNeeded is returned by [Recover] for a copy it cannot resume: one whose index
-// was dropped and recreated since, or one a rebuild left half-loaded. Close it, remove
-// its directory, open it again empty and recover that.
-var ErrWipeNeeded = errors.New("replica: the shard copy must be wiped and rebuilt")
-
-// Recover readies sh, a shard copy opened from its directory, to tail the changelog of
-// shard id, and returns the seq to tail from. A copy that has applied changes resumes
-// from its seq (CommittedSeq at Open): the changelog is replayed from there. An empty
-// copy is loaded from st's ScanShard snapshot, mapping included, and resumes from the
-// snapshot's seq. A copy of another incarnation of the index, or one an earlier load
-// left half done, is [ErrWipeNeeded]. A [Tailer] does all of this itself; Recover is
-// for callers that manage the copy's directory on their own.
-func Recover(ctx context.Context, sh *shard.Shard, st store.Store, id ShardID) (int64, error) {
-	t := NewTailer(st, sh, id, Options{})
-	if err := t.cat.load(ctx, id.Shard); err != nil {
-		return 0, err
-	}
-	if err := sh.Err(); err != nil {
-		return 0, err
-	}
-	if uid := sh.IndexUID(); uid != "" && uid != t.cat.meta.UID {
-		return 0, fmt.Errorf("%w: the copy holds incarnation %s of index %q, which is now %s", ErrWipeNeeded, uid, id.Index, t.cat.meta.UID)
-	}
-	if seq := sh.AppliedSeq(); seq > 0 {
-		return seq, nil
-	}
-	if holdsData(sh) {
-		return 0, fmt.Errorf("%w: an earlier load did not finish", ErrWipeNeeded)
-	}
-	return t.loadSnapshot(ctx, sh)
-}
-
 // holdsData reports whether sh's current generation has any segment.
 func holdsData(sh *shard.Shard) bool {
 	g := sh.Acquire()

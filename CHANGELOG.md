@@ -90,9 +90,11 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - **Background scrub** ([#36](https://github.com/Imposter/go-searchlight/issues/36)): a
   segment is checksum-verified when its copy opens, so bit rot after open is served until
   the copy is next opened.
-- **Reading the previous segment format**
-  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): an upgrade that changes
-  the segment format's major version rebuilds copies instead of reopening them.
+- **A percolator format change rebuilds the whole copy**
+  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): document segments one
+  major version old are read as they are (format 4 reads format 3), but a change to the
+  saved-query segments' format (`percolate/N`) wipes the shard copy, documents included,
+  and rebuilds it, rather than rebuilding only its query segments.
 - **Scale beyond RAM and many nodes** (T11): designed for (memory-mapped segments, shards
   across nodes) but not benchmarked yet.
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no

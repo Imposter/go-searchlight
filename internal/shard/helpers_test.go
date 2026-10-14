@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -265,4 +266,46 @@ func referencedFiles(t testing.TB, dir string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// pendingFiles returns the files still waiting to be removed.
+func (j *janitor) pendingFiles() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]string, 0, len(j.pending))
+	for p := range j.pending {
+		out = append(out, p)
+	}
+	return out
+}
+
+// syncStats are fsyncs counted through segment.ObserveSyncs: of files and of directories.
+type syncStats struct{ Files, Dirs int64 }
+
+// syncCounter counts every fsync segment.SyncFile and segment.SyncDir make while it is
+// installed, whoever asks for them.
+type syncCounter struct{ files, dirs atomic.Int64 }
+
+// countSyncs installs a syncCounter until stop is called.
+func countSyncs() (c *syncCounter, stop func()) {
+	c = &syncCounter{}
+	return c, segment.ObserveSyncs(func(_ string, dir bool) {
+		if dir {
+			c.dirs.Add(1)
+		} else {
+			c.files.Add(1)
+		}
+	})
+}
+
+func (c *syncCounter) stats() syncStats {
+	return syncStats{Files: c.files.Load(), Dirs: c.dirs.Load()}
+}
+
+// syncsDuring returns the fsyncs made while f ran.
+func syncsDuring(f func()) syncStats {
+	c, stop := countSyncs()
+	f()
+	stop()
+	return c.stats()
 }

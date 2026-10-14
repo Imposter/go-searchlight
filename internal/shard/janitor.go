@@ -204,17 +204,6 @@ func (j *janitor) removeOne(p string, stopped bool) {
 	j.mu.Unlock()
 }
 
-// pendingFiles returns the files still waiting to be removed (for tests).
-func (j *janitor) pendingFiles() []string {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	out := make([]string, 0, len(j.pending))
-	for p := range j.pending {
-		out = append(out, p)
-	}
-	return out
-}
-
 // segmentFiles lists every file of segment id in dir: its segment or query files and
 // its deletes sidecars, all named id + "." + something.
 func segmentFiles(dir, id string) []string {

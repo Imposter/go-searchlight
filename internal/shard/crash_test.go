@@ -66,7 +66,7 @@ func TestCrashAtKillPoints(t *testing.T) {
 				var armed atomic.Bool
 				var syncedMu sync.Mutex
 				synced := map[string]bool{}
-				t.Cleanup(segment.ObserveSyncs(func(name string) {
+				t.Cleanup(segment.ObserveSyncs(func(name string, _ bool) {
 					syncedMu.Lock()
 					synced[filepath.Clean(strings.TrimSuffix(name, ".tmp"))] = true
 					syncedMu.Unlock()

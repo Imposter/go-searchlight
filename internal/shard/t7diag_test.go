@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
@@ -120,13 +119,13 @@ func TestT7RefreshPhases(t *testing.T) {
 			mu.Lock()
 			clear(marks)
 			mu.Unlock()
-			before := segment.SyncCounts().Files
 			t0 := time.Now()
-			if err := s.Refresh(ctx); err != nil {
-				t.Fatal(err)
-			}
+			syncs += syncsDuring(func() {
+				if err := s.Refresh(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}).Files
 			end := time.Now()
-			syncs += segment.SyncCounts().Files - before
 			mu.Lock()
 			built := marks[pointRefreshBuilt]
 			mu.Unlock()

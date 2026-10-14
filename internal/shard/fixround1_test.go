@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
-	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 // I1: a sidecar a crash left behind, which garbage collection could not remove at
@@ -255,14 +254,6 @@ func TestCloseWaitsForForceMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.s = nil
-}
-
-// syncsDuring returns the fsyncs f asked for.
-func syncsDuring(f func()) segment.SyncStats {
-	before := segment.SyncCounts()
-	f()
-	after := segment.SyncCounts()
-	return segment.SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
 }
 
 // A refresh fsyncs nothing, a seq-only one included, and publishes at once:

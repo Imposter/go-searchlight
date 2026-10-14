@@ -495,7 +495,8 @@ func newExtractor(stats TermStats) *extractor {
 //     cheaper, the pairs of two children made only of value, bool, entry and word atoms
 //     (each holds, so the document has an atom of each: Pairs, at most 16 per
 //     group); only when no child is anchorable is the group Always. Cost is the
-//     estimated fraction of documents holding the anchor (a pair's, the product).
+//     estimated fraction of documents holding the anchor (a pair's, the product: the
+//     two are assumed independent).
 //   - any: the union of its children; one Always child makes the group Always. An any
 //     with no child (never true) is the empty set.
 //   - not: Always, but not(not x) is x. ne, exists:false, empty, and the root
@@ -505,7 +506,7 @@ func (e *extractor) node(n query.Node) aset {
 	switch x := n.(type) {
 	case *query.All:
 		if x == nil || len(x.Children) == 0 {
-			return always // {"all": []} holds for every document
+			return always
 		}
 		best := always
 		var pairable []aset
@@ -518,8 +519,6 @@ func (e *extractor) node(n query.Node) aset {
 				pairable = append(pairable, c)
 			}
 		}
-		// Two children hold together, so a document holds an atom of each: a pair of
-		// them anchors the group, as selective as both (assumed independent).
 		for i := range pairable {
 			for j := i + 1; j < len(pairable); j++ {
 				a, b := &pairable[i], &pairable[j]
@@ -550,7 +549,7 @@ func (e *extractor) node(n query.Node) aset {
 			return always
 		}
 		if inner, ok := x.Child.(*query.Not); ok && inner != nil {
-			return e.node(inner.Child) // not(not x) holds exactly when x does
+			return e.node(inner.Child)
 		}
 		return always
 	case *query.Leaf:
@@ -625,6 +624,10 @@ func cheapest(sets []aset) aset {
 	return best
 }
 
+// leaf returns a condition's anchors, by the rules [extractor.node] lists. A between
+// whose bounds are reversed never holds, and Always is merely wasteful for it. exists
+// anchors on presence unless its value is false, as the matcher's `value is not
+// False`.
 func (e *extractor) leaf(l *query.Leaf) aset {
 	a := l.Decoded()
 	f := l.Field
@@ -649,11 +652,11 @@ func (e *extractor) leaf(l *query.Leaf) aset {
 		}
 		lo, hi := a.List[0].Number, a.List[1].Number
 		if lo > hi {
-			return always // never holds; Always is merely wasteful
+			return always
 		}
 		return e.rangeSet(f, lo, hi)
 	case query.OpExists:
-		if a.Kind != query.ArgBool || a.Scalar.Bool { // the matcher's `value is not False`
+		if a.Kind != query.ArgBool || a.Scalar.Bool {
 			return e.term(AtomPresent, f, "")
 		}
 		return always
@@ -688,7 +691,7 @@ func (e *extractor) leaf(l *query.Leaf) aset {
 		return e.words(f, &a, l.Op == query.OpWordsAll)
 	case query.OpSimilar:
 		return e.similar(f, &a)
-	default: // ne, empty, an unknown op
+	default:
 		return always
 	}
 }
@@ -741,6 +744,9 @@ func (e *extractor) eq(f string, a *query.Arg) aset {
 	}
 }
 
+// in anchors an in condition on the union of its values. The matcher drops a number no
+// float64 holds, which equals nothing, and with no value the matcher can read an in
+// never holds: the empty set.
 func (e *extractor) in(f string, a *query.Arg) aset {
 	if a.Kind != query.ArgList {
 		return always
@@ -754,12 +760,12 @@ func (e *extractor) in(f string, a *query.Arg) aset {
 		case query.ArgBool:
 			out = union(out, e.term(AtomBool, f, boolTerm(s.Bool)))
 		case query.ArgNumber:
-			if s.Finite { // the matcher drops a number no float64 holds: it equals nothing
+			if s.Finite {
 				out = union(out, e.rangeSet(f, s.Number, s.Number))
 			}
 		}
 	}
-	return out // with no value the matcher can read, in never holds: the empty set
+	return out
 }
 
 func boolTerm(b bool) string {
@@ -788,15 +794,18 @@ func (e *extractor) needle(f, norm string) aset {
 // words anchors words_all and words_any. A phrase's words string (" a b ") is a
 // substring of a document's only if each of its words is one of the document's words,
 // so a phrase anchors on the pair of its two rarest distinct words, or on its word.
+// Words are taken from the text as written, as the matcher takes them. A phrase with
+// no word matches nothing: words_any passes over it, and words_all never holds, for
+// which Always is merely wasteful.
 func (e *extractor) words(f string, a *query.Arg, every bool) aset {
 	var sets []aset
 	for _, t := range texts(a) {
-		w := analysis.Words(t.Text) // the matcher takes words from the text as written
+		w := analysis.Words(t.Text)
 		if w == analysis.NoWords {
 			if every {
-				return always // never holds; Always is merely wasteful
+				return always
 			}
-			continue // a phrase with no word matches nothing
+			continue
 		}
 		var best, second aset
 		analysis.EachWord(w, func(word string) {

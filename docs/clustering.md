@@ -252,9 +252,9 @@ by the slower of disk and network, since whole segments are streamed) plus howev
 changelog has to be replayed since the snapshot's seq (normally small off a healthy
 peer; much larger off `ScanShard`, which starts from scratch). The benchmark harness
 (`bench/`) measures recovery time against Elasticsearch's peer recovery as one of its
-workloads, but the tuning pass to hit the spec's targets is still ahead of this doc (see
-[architecture.md's "Planned, not built"](architecture.md#planned-not-built)) — don't
-take a number from here, watch the actual run instead:
+workloads: a new replica of 1M documents served in 6.0 s against Elasticsearch's 28.5 s
+([benchmarks.md](benchmarks.md)). Your own numbers depend on disk, network and changelog
+backlog, so watch the actual run:
 `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recovery_bytes_total`
 (by `source`: `peer`, `blob`, `sql`) and `searchlight_replica_recovery_duration_seconds`
 (operations.md's [Monitoring](operations.md#monitoring)).

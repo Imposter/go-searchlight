@@ -44,7 +44,7 @@ LABEL org.opencontainers.image.title="searchlight" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.licenses="Proprietary"
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /out/searchlight /usr/local/bin/searchlight
 COPY --from=build --chown=65532:65532 /out/data /var/lib/searchlight
 ENV SEARCHLIGHT_LISTEN=:8780 \

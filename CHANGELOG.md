@@ -7,7 +7,8 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 ## [1.0.0] - 2026-10-14
 
 The first release: a search engine that behaves like Elasticsearch for filtering,
-sorting, aggregations and percolation, and keeps its durable state in SQL.
+sorting, aggregations and percolation, and keeps its durable state in SQL. Licensed
+under the [MIT License](LICENSE).
 
 ### Added
 

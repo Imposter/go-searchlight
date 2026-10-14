@@ -170,12 +170,12 @@ jobs:
             chmod 0755 "build/$name/$exe"
             cp README.md "build/$name/"
             cp docs/operations.md "build/$name/docs/"
-            if [ -f LICENSE ]; then cp LICENSE "build/$name/"; fi
+            cp LICENSE "build/$name/"
             pack "$name"
           done
           bundle=searchlight-deploy-$VERSION
           mkdir -p "build/$bundle"
-          cp deploy/compose.postgres.yml deploy/compose.sqlite.yml deploy/.env.example "build/$bundle/"
+          cp LICENSE deploy/compose.postgres.yml deploy/compose.sqlite.yml deploy/.env.example "build/$bundle/"
           cp -R deploy/nginx deploy/k8s "build/$bundle/"
           pack "$bundle"
           (cd dist && sha256sum -- * > SHA256SUMS)
@@ -304,7 +304,7 @@ jobs:
             org.opencontainers.image.title=searchlight
             org.opencontainers.image.description=A search engine that behaves like Elasticsearch and keeps its durable state in SQL.
             org.opencontainers.image.documentation=https://github.com/Imposter/go-searchlight/blob/main/docs/operations.md
-            org.opencontainers.image.licenses=Proprietary
+            org.opencontainers.image.licenses=MIT
           annotations: |
             org.opencontainers.image.description=A search engine that behaves like Elasticsearch and keeps its durable state in SQL.
       - name: build arguments

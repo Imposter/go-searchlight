@@ -201,3 +201,7 @@ of three). All are described in [docs/operations.md](docs/operations.md#deploy).
   - `OTEL_EXPORTER_OTLP_PROTOCOL` picks `http/protobuf` (the default) or `grpc`.
   - `OTEL_SDK_DISABLED=true` turns all export off.
   - `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override the resource.
+
+## License
+
+Searchlight is released under the [MIT License](LICENSE).

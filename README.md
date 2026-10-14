@@ -48,8 +48,47 @@ SQLite; write throughput on Postgres and MySQL is not measured yet
 - **SQLite is one node.** A cluster needs Postgres or MySQL, and there is no
   SQLite-to-Postgres migration tool yet: moving means re-indexing from the source
   ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
-- **One pure-Go binary.** No cgo, no JVM; it builds and runs on Linux and Windows. Memory
-  is bounded by request and buffer budgets ([Sizing](docs/operations.md#sizing)).
+- **One pure-Go binary.** No cgo, no JVM; it builds and runs on Linux, macOS and Windows.
+  Memory is bounded by request and buffer budgets ([Sizing](docs/operations.md#sizing)).
+
+## Install
+
+Each [release](https://github.com/Imposter/go-searchlight/releases) publishes binaries, a
+container image and deployment samples. [CHANGELOG.md](CHANGELOG.md) has its notes.
+
+- **Binaries** for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and
+  windows/amd64, each archived with this README and
+  [docs/operations.md](docs/operations.md), and checked by `SHA256SUMS`:
+
+  ```sh
+  base=https://github.com/Imposter/go-searchlight/releases/download/v1.0.0
+  curl -fsSLO "$base/searchlight-1.0.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
+  sha256sum --ignore-missing -c SHA256SUMS
+  tar -xzf searchlight-1.0.0-linux-amd64.tar.gz
+  ./searchlight-1.0.0-linux-amd64/searchlight version
+  ```
+
+- **The image**, for linux/amd64 and linux/arm64, tagged `1.0.0`, `1.0`, `1` and
+  `latest`:
+
+  ```sh
+  docker pull ghcr.io/imposter/searchlight:1.0.0
+  ```
+
+- **Docker Compose samples** in `searchlight-deploy-1.0.0.tar.gz`, which needs no
+  checkout: a three-node cluster on Postgres 17 behind nginx (`compose.postgres.yml`), a
+  single node on SQLite (`compose.sqlite.yml`), their `.env.example`, and the Kubernetes
+  manifests (`k8s/`):
+
+  ```sh
+  curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.0.0/searchlight-deploy-1.0.0.tar.gz | tar -xz
+  cd searchlight-deploy-1.0.0
+  docker compose -f compose.postgres.yml up -d                              # nginx on 127.0.0.1:8080
+  docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens  # the API tokens
+  ```
+
+  The same files are in [deploy/](deploy). Upgrade by setting `SEARCHLIGHT_VERSION` in
+  `.env` and running `up -d` again ([docs/operations.md](docs/operations.md#docker-compose)).
 
 ## Documentation
 
@@ -64,6 +103,8 @@ SQLite; write throughput on Postgres and MySQL is not measured yet
 - [docs/nginx.md](docs/nginx.md): putting nginx in front of the cluster as the load
   balancer for queries and writes, with a working config at
   [deploy/nginx/searchlight.conf](deploy/nginx/searchlight.conf).
+- [CHANGELOG.md](CHANGELOG.md): what each release changed, with its upgrade notes;
+  [RELEASING.md](RELEASING.md): how to cut a release.
 
 ## Building
 
@@ -118,7 +159,8 @@ SEARCHLIGHT_STORE_URL=sqlite:///var/lib/searchlight/searchlight.db SEARCHLIGHT_T
 ./bin/searchlight --store_url=postgres://searchlight:secret@db:5432/searchlight --insecure_no_auth
 ```
 
-`searchlight -h` lists every setting with its environment variable and default.
+`searchlight -h` lists every setting with its environment variable and default, and
+`searchlight version` prints the version.
 
 - **Setting names:** each setting has one snake_case name. It is the flag `--<name>` and
   the environment variable `SEARCHLIGHT_<NAME>`.
@@ -134,14 +176,15 @@ The settings, with their defaults, are listed in
 SIGINT or SIGTERM: readiness turns false, the listener drains, and the node writes its
 shards' final manifests and leaves the cluster.
 
-To run a three-node cluster on Postgres:
+To run a three-node cluster on Postgres built from this checkout:
 
 ```sh
 docker compose -f deploy/compose.yml up --build -d
 ```
 
-`deploy/k8s/` has Kubernetes manifests (a StatefulSet of three). Both are described in
-[docs/operations.md](docs/operations.md#deploy).
+`deploy/compose.postgres.yml` and `deploy/compose.sqlite.yml` run the published image
+instead ([Install](#install)), and `deploy/k8s/` has Kubernetes manifests (a StatefulSet
+of three). All are described in [docs/operations.md](docs/operations.md#deploy).
 
 ## Telemetry
 

@@ -173,7 +173,7 @@ certificate) and run `deploy/compose.yml`'s nodes in plain HTTP behind it, the s
 way the compose file already runs the peer API in plain HTTP on its private network
 (and logs a warning that `cluster_token` crosses it in the clear — see
 [clustering.md](clustering.md#postgres-sizing-and-settings) and
-operations.md's [Compose](operations.md#docker-compose-a-three-node-cluster) section
+operations.md's [Compose](operations.md#docker-compose) section
 for that trade-off). Client `Authorization` headers pass through nginx unchanged —
 nothing in the shipped conf hides, rewrites or strips them, and nothing should: don't
 add `proxy_hide_header Authorization` or a `proxy_set_header Authorization ...` of
@@ -217,8 +217,10 @@ healthchecks and the Kubernetes probes do (operations.md's
 
 ## Compose
 
-`deploy/compose.yml` adds an `nginx` service as the front door: it publishes one port
-(`8080`) and mounts `deploy/nginx/searchlight.conf` read-only, following the file's
+`deploy/compose.yml` (built from a checkout) and `deploy/compose.postgres.yml` (the
+published image, also in each release's deploy bundle) add an `nginx` service as the
+front door: it publishes one port (`8080`; the sample's `SEARCHLIGHT_HTTP_PORT`) and
+mounts `deploy/nginx/searchlight.conf` read-only, following the file's
 existing conventions (an image pinned by digest, a healthcheck, `depends_on` on the
 nodes' own healthchecks). Bring the cluster up exactly as before and go through nginx
 instead of a single node's published port:

@@ -15,17 +15,12 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// Reduce merges shard results (from ExecuteShard with the same r) into one response:
-// the best r.Size hits over every shard by the request's sort (ties: _id, then the
-// shards' order), the summed total cut at TrackTotal, and the aggregations merged and
-// finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that
-// failed) is skipped.
-func Reduce(rs []*ShardResult, r *Request) *Response {
-	return ReduceContext(context.Background(), rs, r)
-}
-
-// ReduceContext is Reduce under ctx's trace: its span is a child of the request's.
-func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response {
+// Reduce merges shard results (from ExecuteShard with the same r) into one response,
+// under ctx's trace (its span is a child of the request's): the best r.Size hits over
+// every shard by the request's sort (ties: _id, then the shards' order), the summed
+// total cut at TrackTotal, and the aggregations merged and finished within MaxBuckets
+// buckets (see boundBuckets). A nil result (a shard that failed) is skipped.
+func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	start := time.Now()
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.reduce", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, r.Index), attribute.Int("shards", len(rs))))

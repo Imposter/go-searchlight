@@ -151,7 +151,7 @@ func TestTimeoutReturnsPartialResults(t *testing.T) {
 	if !res.TimedOut || res.TotalRelation != RelationGte {
 		t.Fatalf("timed out %v, relation %s", res.TimedOut, res.TotalRelation)
 	}
-	resp := Reduce([]*ShardResult{res}, &Request{Size: 10})
+	resp := Reduce(context.Background(), []*ShardResult{res}, &Request{Size: 10})
 	if !resp.TimedOut || resp.TotalRelation != RelationGte {
 		t.Fatalf("reduced: timed out %v, relation %s", resp.TimedOut, resp.TotalRelation)
 	}
@@ -381,6 +381,13 @@ func put(t *testing.T, s *shard.Shard, m *schema.Mapping, seq int64, id, body st
 	}
 }
 
+func remap(t *testing.T, s *shard.Shard, seq int64, m *schema.Mapping) {
+	t.Helper()
+	if err := s.Apply(context.Background(), []shard.Change{{Seq: seq, Kind: shard.Remap, Mapping: m, MappingVersion: s.MappingVersion() + 1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func searchIDs(t *testing.T, s *shard.Shard, raw string) []string {
 	t.Helper()
 	g := s.Acquire()
@@ -402,8 +409,8 @@ func TestPhraseResidualIgnoresMappingDrift(t *testing.T) {
 		s := openShard(t, indexed)
 		put(t, s, indexed, 1, "a", `{"notes":"Red blue green"}`)
 		put(t, s, indexed, 2, "b", `{"notes":"blue red"}`)
-		s.SetMapping(&schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"other": schema.Text}})
-		put(t, s, indexed, 3, "c", `{"other":"x"}`) // a new generation, with the new mapping
+		remap(t, s, 3, &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"other": schema.Text}})
+		put(t, s, indexed, 4, "c", `{"other":"x"}`) // a new generation, with the new mapping
 		if got := searchIDs(t, s, phrase); !slices.Equal(got, []string{"a"}) {
 			t.Fatalf("phrase: %q, want [a]", got)
 		}
@@ -414,8 +421,8 @@ func TestPhraseResidualIgnoresMappingDrift(t *testing.T) {
 		put(t, s, indexed, 1, "a", `{"notes":"red blue","extra":"e"}`)
 		put(t, s, indexed, 2, "b", `{"notes":"red  , blue!","extra":"e"}`)
 		put(t, s, indexed, 3, "c", `{"notes":"blue red","extra":"e"}`)
-		s.SetMapping(&schema.Mapping{Dynamic: schema.DynamicStrict, Fields: map[string]schema.FieldType{"notes": schema.Text}})
-		put(t, s, indexed, 4, "d", `{"notes":"x"}`)
+		remap(t, s, 4, &schema.Mapping{Dynamic: schema.DynamicStrict, Fields: map[string]schema.FieldType{"notes": schema.Text}})
+		put(t, s, indexed, 5, "d", `{"notes":"x"}`)
 		if got := searchIDs(t, s, phrase); !slices.Equal(got, []string{"a", "b"}) {
 			t.Fatalf("phrase: %q, want [a b]", got)
 		}

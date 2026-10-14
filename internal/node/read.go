@@ -189,7 +189,7 @@ func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Reques
 		if err != nil {
 			return nil, err
 		}
-		return search.ReduceContext(ctx, []*search.ShardResult{sr}, r), nil
+		return search.Reduce(ctx, []*search.ShardResult{sr}, r), nil
 	}
 	began := n.clock.Now()
 	q := *r
@@ -200,7 +200,7 @@ func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Reques
 	}
 	bodies := make([]map[search.HitRef]json.RawMessage, len(ts))
 	for round := 0; ; round++ {
-		resp := search.ReduceContext(ctx, results, &q)
+		resp := search.Reduce(ctx, results, &q)
 		lost, err := fetchHits(ctx, ts, resp, r.Fields, bodies)
 		if err != nil {
 			return nil, err

@@ -175,7 +175,7 @@ func (c *cluster) search(r *Request) (*Response, error) {
 		}
 		parts = append(parts, res)
 	}
-	return Reduce(parts, r), nil
+	return Reduce(context.Background(), parts, r), nil
 }
 
 // brute returns the visible documents q matches, in r's order.
@@ -534,4 +534,12 @@ var sortChoices = [][]SortField{
 
 func floatEq(a, b float64) bool {
 	return a == b || math.Abs(a-b) <= 1e-9*math.Max(math.Abs(a), math.Abs(b))
+}
+
+// reset forgets every count, for tests that need a leaf unseen.
+func (u *usageSketch) reset() {
+	for i := range u.slots {
+		u.slots[i].count.Store(0)
+		u.slots[i].last.Store(0)
+	}
 }

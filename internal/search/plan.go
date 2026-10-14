@@ -243,14 +243,6 @@ func (u *usageSketch) seen(key string, req uint64) bool {
 	return n >= 2
 }
 
-// reset forgets every count (tests that need a leaf unseen).
-func (u *usageSketch) reset() {
-	for i := range u.slots {
-		u.slots[i].count.Store(0)
-		u.slots[i].last.Store(0)
-	}
-}
-
 func (u *usageSketch) halve() {
 	for i := range u.slots {
 		c := &u.slots[i].count

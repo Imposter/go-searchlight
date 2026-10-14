@@ -88,8 +88,8 @@ func TestWireRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(rb, &wired); err != nil {
 		t.Fatal(err)
 	}
-	direct, _ := json.Marshal(search.Reduce([]*search.ShardResult{res}, r))
-	via, _ := json.Marshal(search.Reduce([]*search.ShardResult{wired.Result}, r2))
+	direct, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{res}, r))
+	via, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{wired.Result}, r2))
 	if !bytes.Equal(direct, via) {
 		t.Fatalf("the reduce differs after the wire:\n%s\n%s", direct, via)
 	}

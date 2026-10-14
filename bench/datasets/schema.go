@@ -9,8 +9,6 @@
 // percolation sample, a write's new body) without reading the file.
 package datasets
 
-import "slices"
-
 // FieldType is a Searchlight field type (spec section 3).
 type FieldType string
 
@@ -58,24 +56,6 @@ var Products = []Field{
 	{Name: "on_sale", Type: Bool},
 	{Name: "first_seen", Type: Date},
 	{Name: "updated_at", Type: Date},
-}
-
-// FieldByName returns the field named name in fields.
-func FieldByName(fields []Field, name string) (Field, bool) {
-	i := slices.IndexFunc(fields, func(f Field) bool { return f.Name == name })
-	if i < 0 {
-		return Field{}, false
-	}
-	return fields[i], true
-}
-
-// Types returns each field's type by name.
-func Types(fields []Field) map[string]FieldType {
-	out := make(map[string]FieldType, len(fields))
-	for _, f := range fields {
-		out[f.Name] = f.Type
-	}
-	return out
 }
 
 // SearchlightMapping returns the body of PUT /indexes/{i}: the mapping, strict, and the

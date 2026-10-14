@@ -104,9 +104,6 @@ func (h *Histogram) Min() int64 {
 	return h.min
 }
 
-// Max is the largest value recorded (0 when empty).
-func (h *Histogram) Max() int64 { return h.max }
-
 // Mean is the values' mean (0 when empty).
 func (h *Histogram) Mean() float64 {
 	if h.total == 0 {

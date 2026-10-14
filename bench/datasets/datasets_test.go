@@ -135,7 +135,7 @@ func TestProductsAnalyzeUnderStrictMapping(t *testing.T) {
 func TestZipfIsSkewed(t *testing.T) {
 	z := NewZipf(1000, 1.0)
 	r := rand.New(rand.NewPCG(1, 1))
-	counts := make([]int, z.N())
+	counts := make([]int, len(z.cdf))
 	for range 200_000 {
 		counts[z.Sample(r)]++
 	}

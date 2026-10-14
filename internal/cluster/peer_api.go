@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,13 +86,12 @@ func (p *peerAPI) authorized(r *http.Request) *api.Error {
 		}
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "cluster_token is not set on this node: the peer API is closed"}
 	}
-	scheme, presented, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
+	presented, ok := api.BearerToken(r)
+	if !ok {
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "the cluster token is required"}
 	}
-	want := sha256.Sum256([]byte(token))
-	got := sha256.Sum256([]byte(strings.TrimSpace(presented)))
-	if subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+	want, got := api.SumToken(token), api.SumToken(presented)
+	if want.Match(&got) != 1 {
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "the cluster token is not valid"}
 	}
 	return nil
@@ -539,7 +536,8 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 
 // leaseWriter streams a snapshot file: before each write it moves the write deadline
 // on (a big file outlasts the listener's write timeout, a stalled reader does not
-// outlast the bound), and it aborts the stream once the copy no longer serves peers.
+// outlast the bound), and it aborts the stream, dropping the connection, once the
+// copy's lease lapses and it no longer serves peers.
 type leaseWriter struct {
 	http.ResponseWriter
 	rc    *http.ResponseController
@@ -548,7 +546,7 @@ type leaseWriter struct {
 
 func (w *leaseWriter) Write(b []byte) (int, error) {
 	if !w.valid() {
-		panic(http.ErrAbortHandler) // the copy's lease lapsed: drop the connection
+		panic(http.ErrAbortHandler)
 	}
 	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	return w.ResponseWriter.Write(b)

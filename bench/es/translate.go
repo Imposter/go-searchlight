@@ -424,32 +424,27 @@ func (t *Translator) similar(f datasets.Field, a *query.Arg) (map[string]any, er
 // Search translates a Searchlight search request body into an Elasticsearch _search
 // body: the query in filter context (no scoring: Searchlight does not score), the
 // same size, sort with the id tie-breaker, search_after, track_total_hits,
-// aggregations, _source filtering and timeout.
+// aggregations, _source filtering and timeout. A body holding anything after its
+// JSON object is refused, as the API refuses it.
 func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	req, ps := search.ParseRequest(raw)
 	if len(ps) > 0 {
 		return nil, &InvalidError{Problems: ps}
 	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return nil, err
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("es: the search body is not one JSON object")
 	}
 	q, err := t.Query(req.Query)
 	if err != nil {
 		return nil, err
 	}
-	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}}
-	size := req.Size
-	if _, given := top["size"]; !given {
-		size = 10 // the API's DefaultSize
-	}
-	body["size"] = size
+	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}, "size": req.Size}
 
 	sorts, err := t.sort(req.Sort)
 	if err != nil {
 		return nil, err
 	}
-	if size > 0 || len(req.SearchAfter) > 0 {
+	if req.Size > 0 || len(req.SearchAfter) > 0 {
 		body["sort"] = sorts
 	}
 	if len(req.SearchAfter) > 0 {

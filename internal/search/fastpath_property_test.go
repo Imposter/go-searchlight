@@ -585,7 +585,7 @@ func TestOrdinalsConcurrent(t *testing.T) {
 					}
 					parts = append(parts, res)
 				}
-				Reduce(parts, &Request{Aggs: map[string]Agg{"x": aggs[(w+k)%len(aggs)]}})
+				Reduce(context.Background(), parts, &Request{Aggs: map[string]Agg{"x": aggs[(w+k)%len(aggs)]}})
 			}
 		})
 	}

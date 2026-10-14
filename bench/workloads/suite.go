@@ -44,12 +44,17 @@ type Config struct {
 	// Search is how the search workloads run.
 	Search   RunOptions
 	Variants int
-	// PageDepth is how deep paging walks go; PageWalks how many are measured.
+	// PageDepth is how deep paging walks go; PageWalks how many are measured. The
+	// default 10 walks at the default PageDepth/pageSize (100) gives 1000 measured
+	// pages, minSamples(0.99): fewer walks left paging_search_after's p99 INSUFFICIENT
+	// SAMPLES (target T3).
 	PageDepth, PageWalks int
 
 	PercolateBatch, PercolateConcurrency int
 	// PercolateIterations batches and PercolateSingle single-document requests are
-	// measured per saved-search set.
+	// measured per saved-search set. PercolateSingle's default 1000 is
+	// minSamples(0.99): target T5's p99-per-document-at-100k bound needs a trusted p99,
+	// and fewer samples left it INSUFFICIENT SAMPLES.
 	PercolateIterations, PercolateSingle int
 	BulkPercolateIterations              int
 
@@ -112,15 +117,10 @@ func (c *Config) defaults() {
 	set(&c.Search.Concurrency, 1)
 	set(&c.Variants, 64)
 	set(&c.PageDepth, 10_000)
-	// PageWalks 10 at the default PageDepth/pageSize (100) gives 1000 measured pages,
-	// minSamples(0.99): fewer walks left paging_search_after's p99 INSUFFICIENT SAMPLES
-	// (target T3).
 	set(&c.PageWalks, 10)
 	set(&c.PercolateBatch, 100)
 	set(&c.PercolateConcurrency, 4)
 	set(&c.PercolateIterations, 50)
-	// PercolateSingle 1000 is minSamples(0.99): target T5's p99-per-document-at-100k
-	// bound needs a trusted p99, and fewer samples left it INSUFFICIENT SAMPLES.
 	set(&c.PercolateSingle, 1000)
 	set(&c.BulkPercolateIterations, 20)
 	set(&c.VisibleIterations, 1000)
@@ -250,21 +250,21 @@ func RunSuite(ctx context.Context, cfg Config, engines []Engine) (*report.Run, e
 	if cfg.LoadOnly {
 		steps = steps[:1]
 	}
-	const crossCheckStep = 1 // s.crossCheckSearches, above
+	const crossCheckSearchesStep = 1
 	var stepErr error
 	for i, step := range steps {
 		if err := step(ctx); err != nil {
 			stepErr = err
 			break
 		}
-		if i == crossCheckStep && cfg.StopOnMismatch && s.run.CrossCheck.Failed() {
+		if i == crossCheckSearchesStep && cfg.StopOnMismatch && s.run.CrossCheck.Failed() {
 			s.run.Notes = append(s.run.Notes, "Stopped after the cross-check found an unresolved mismatch (--stop-on-mismatch): "+
 				"further timing workloads would compare answers that are already known to disagree.")
 			break
 		}
 	}
 	if stopSampler != nil {
-		stopSampler() // blocks until the last sample is folded in
+		stopSampler()
 		s.mergeFootprintPeak(sampler)
 	}
 	s.run.FinishedAt = time.Now().UTC()
@@ -508,6 +508,11 @@ func (s *suite) mergeFootprintPeak(sampler *footprintSampler) {
 	}
 }
 
+// bulkLoad loads the dataset into eng in concurrent _bulk batches. The first worker
+// failure is logged as soon as it happens and stops the load: once it cancels the
+// reader, the reader's own ctx.Err() ("context canceled") would otherwise be the only
+// error anyone sees, hiding the real cause (a 429, a 503, a timeout). For the same
+// reason a worker's failure wins over the reader's error.
 func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, error) {
 	f, err := os.Open(s.cfg.DataFile)
 	if err != nil {
@@ -532,10 +537,6 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 					m.Errors++
 					if m.FirstErr == nil {
 						m.FirstErr = err
-						// Logged as soon as it happens, and not just returned at the end: once
-						// cancel wakes the reader loop below, its own ctx.Err() ("context
-						// canceled") would otherwise be the only error anyone sees, hiding the
-						// real cause (a 429, a 503, a timeout, ...).
 						s.logf("  %s: bulk failed, stopping the load: %v", eng.Name(), err)
 						cancel()
 					}
@@ -580,9 +581,6 @@ func (s *suite) bulkLoad(ctx context.Context, eng Engine) (*Measurement, int64, 
 	close(batches)
 	wg.Wait()
 	m.Elapsed = time.Since(t0)
-	// m.FirstErr (a worker's real failure) wins over readErr: once a worker's error
-	// calls cancel, the reader above gets ctx.Err() ("context canceled") from its own
-	// batches<- select, which would otherwise mask the actual cause.
 	switch {
 	case m.FirstErr != nil:
 		return m, n, m.FirstErr
@@ -818,6 +816,8 @@ func withCV(res report.Result, cv float64) report.Result {
 	return res
 }
 
+// searchWorkload measures one search workload on eng. A paging workload runs
+// sequential walks, each iteration one page.
 func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec) (report.Result, error) {
 	prepared := make([]Prepared, len(spec.Bodies))
 	for i, b := range spec.Bodies {
@@ -836,7 +836,6 @@ func (s *suite) searchWorkload(ctx context.Context, eng Engine, spec SearchSpec)
 		m, cv := s.runRepeated(ctx, o, op)
 		return withCV(s.result(spec.Name, spec.Group, spec.Description, eng, o, m), cv), nil
 	}
-	// Paging: sequential walks; each iteration is one page.
 	const pageSize = 100
 	perWalk := max(spec.PageDepth/pageSize, 1)
 	var cursor []any
@@ -921,6 +920,11 @@ func sleepJitter(ctx context.Context, d time.Duration) error {
 // Each measured write sleeps a random, unmeasured delay first (writeJitter): a real
 // client does not write in lockstep right after the engine's previous refresh, which
 // a closed loop at concurrency 1 would otherwise do every iteration.
+//
+// Under refresh=wait_for only the write is timed: its latency is the write's own, and
+// the confirming search is an untimed correctness check (it fails the iteration if the
+// write was not visible on return, but its own latency is not part of what T7
+// measures). The jitter runs before the timing starts, so it is never timed either.
 func (s *suite) visibility(ctx context.Context) error {
 	for _, w := range []string{"refresh_visible", "refresh_wait_for"} {
 		if !s.cfg.wants(w, report.GroupVisibility) {
@@ -941,11 +945,6 @@ func (s *suite) visibility(ctx context.Context) error {
 					return 0, 0, err
 				}
 				if w == "refresh_wait_for" {
-					// Only the write is timed: refresh=wait_for's latency is the write's
-					// own, and the confirming search is an untimed correctness check
-					// (it fails the iteration if the write was not visible on return,
-					// but its own latency is not part of what T7 measures). The jitter
-					// above ran before t0, so it is never part of timed either.
 					t0 := now()
 					bulkErr := eng.Bulk(ctx, s.cfg.Index, []Doc{doc}, "wait_for")
 					timed := now().Sub(t0)
@@ -1070,6 +1069,13 @@ func (s *suite) readSearches(n int) ([]datasets.SavedSearch, error) {
 // percolation loads each saved-search set in turn (a prefix of the file, so each set
 // adds to the last) and measures batch and single-document percolation against it,
 // then _bulk?percolate at the largest set.
+//
+// Single-document percolation also collects the engine's own reported server time:
+// target T5's p99-per-document clause is judged on it, like Elasticsearch's "took",
+// beside the measured end-to-end latency (still the result's main latency, kept for
+// information). Warmup calls are left out the same way Run's own measured-phase
+// histogram leaves them out (iteration numbers continue from the warmup across repeats
+// too: see runRepeated).
 func (s *suite) percolation(ctx context.Context) error {
 	if len(s.cfg.SearchSets) == 0 || s.cfg.SearchFile == "" || !s.cfg.wants("percolate", report.GroupPercolate) {
 		return nil
@@ -1124,12 +1130,6 @@ func (s *suite) percolation(ctx context.Context) error {
 			name = fmt.Sprintf("percolate_single_%d", n)
 			if s.cfg.wants(name, report.GroupPercolate) {
 				o := RunOptions{Warmup: max(s.cfg.PercolateSingle/10, 5), Iterations: s.cfg.PercolateSingle, Concurrency: 1}
-				// serverHist collects the engine's own reported server time (target T5's
-				// p99-per-document clause is judged on this, like Elasticsearch's "took"),
-				// alongside the measured op's end-to-end latency (still the Result's main
-				// Latency, kept for information). i >= o.Warmup excludes warmup calls the
-				// same way Run's own measured-phase histogram does (iteration numbers
-				// continue from the warmup across repeats too: see runRepeated).
 				serverHist := NewHistogram()
 				var serverMu sync.Mutex
 				op := func(ctx context.Context, i int) (int, time.Duration, error) {

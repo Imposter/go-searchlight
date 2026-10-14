@@ -178,6 +178,8 @@ func TestTranslateSearchRefusals(t *testing.T) {
 		`{"size": -1}`,
 		`{"sort": [{"_id": "desc"}, "price"]}`,   // nothing after _id
 		`{"sort": ["price", {"price": "desc"}]}`, // a field twice
+		`{"size": 1} {"size": 2}`,                // a second value after the object
+		`{"size": 1} x`,                          // bytes after the object
 	} {
 		if _, err := tr.Search([]byte(b)); err == nil {
 			t.Errorf("%s was translated; want an error", b)

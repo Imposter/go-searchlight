@@ -175,14 +175,15 @@ func fnv1a(b []byte) uint64 {
 //
 // A term's first document is kept in its group alone (lastDoc), and moves to the slab
 // with its second: most terms of a value or id field occur once, and a slab block for
-// each would cost slabBlockSize ordinals apiece.
+// each would cost slabBlockSize ordinals apiece. The same term again in the same
+// document adds nothing.
 func (t *termPairs) add(term []byte, doc uint32) {
 	idx := t.findOrCreate(term)
 	g := &t.groups[idx]
 	switch {
 	case !g.hasDoc:
 	case g.lastDoc == doc:
-		return // the same term occurring again in the same document: nothing new
+		return
 	case g.head < 0:
 		g.head, g.tail = t.slab.append(g.head, g.tail, g.lastDoc)
 		fallthrough
@@ -345,6 +346,13 @@ type docOrd struct{ doc, ord uint32 }
 // term, in ascending ordinal order, with its combined docs. It stops early once w has
 // failed. Returns the dictionary's offset
 // (0 if every source is empty) and how many distinct terms it holds.
+//
+// The smallest current term is tracked by which source holds it (minSrc), never by
+// whether minTerm is nil: "" is a real term, and a source whose arena holds nothing
+// but "" hands it back as a nil slice, which a nil-means-unset check would mistake for
+// "no minimum yet" and let a later source's term beat it. The sources that held the
+// term advance only once it is written, since advancing one may overwrite the term
+// minTerm points into.
 func writeMergedDict(w *fileWriter, srcs []termSource, onTerm func(ord uint32, docs []uint32)) (uint64, uint32) {
 	live := make([]bool, len(srcs))
 	anyLeft := false
@@ -361,10 +369,6 @@ func writeMergedDict(w *fileWriter, srcs []termSource, onTerm func(ord uint32, d
 	docBuf := make([]uint32, 0, 64)
 	matched := make([]int, 0, len(srcs))
 	for anyLeft && (ord%failCheckTerms != 0 || !w.aborted()) {
-		// The smallest current term is tracked by which source holds it (minSrc), never
-		// by whether minTerm is nil: "" is a real term, and a source whose arena holds
-		// nothing but "" hands it back as a nil slice, which a nil-means-unset check
-		// would mistake for "no minimum yet" and let a later source's term beat it.
 		var minTerm []byte
 		minSrc := -1
 		for i, src := range srcs {
@@ -384,7 +388,6 @@ func writeMergedDict(w *fileWriter, srcs []termSource, onTerm func(ord uint32, d
 			onTerm(ord, docBuf)
 		}
 		ord++
-		// Only now: advancing a source may overwrite the term minTerm points into.
 		anyLeft = false
 		for _, i := range matched {
 			live[i] = srcs[i].next()
@@ -634,11 +637,13 @@ func writeMeta(w *fileWriter, numDocs, flags uint32, storedIndexOff uint64, name
 	}
 }
 
+// serializeBitmap returns rb run-optimized and serialized. MarshalBinary over an
+// in-memory bitmap cannot fail, so a failure panics.
 func serializeBitmap(rb *roaring.Bitmap) []byte {
 	rb.RunOptimize()
 	data, err := rb.MarshalBinary()
 	if err != nil {
-		panic(err) // MarshalBinary over an in-memory bitmap cannot fail
+		panic(err)
 	}
 	return data
 }

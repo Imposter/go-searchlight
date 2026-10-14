@@ -37,36 +37,37 @@ func ccc(r rune) uint8 {
 // nfkcSafe reports whether x/text's NFKC can be trusted with s: no supplementary character
 // is a non-starter, decomposes, or is followed by a non-starter.
 func nfkcSafe(s string) bool {
-	after := false // the previous rune was supplementary
+	afterSupplementary := false
 	for _, r := range s {
 		if r < 0x10000 {
-			if after && r >= 0x300 && ccc(r) != 0 {
+			if afterSupplementary && r >= 0x300 && ccc(r) != 0 {
 				return false
 			}
-			after = false
+			afterSupplementary = false
 			continue
 		}
-		if after && ccc(r) != 0 {
+		if afterSupplementary && ccc(r) != 0 {
 			return false
 		}
 		p := properties(norm.NFKD, r)
 		if p.CCC() != 0 || p.Decomposition() != nil {
 			return false
 		}
-		after = true
+		afterSupplementary = true
 	}
 	return true
 }
 
 // compose applies canonical composition to a decomposed, canonically ordered rune
 // sequence, in place: each character composes with the last starter unless something
-// between them blocks it (a starter, or a mark of the same or a higher class).
+// between them blocks it (a starter, or a mark of the same or a higher class). last is
+// the class of the last rune kept, 256 before the first starter.
 func compose(rs []rune) []rune {
 	if len(rs) == 0 {
 		return rs
 	}
 	starter := -1
-	last := 256 // the class of the last rune kept; 256: no starter yet
+	last := 256
 	if ccc(rs[0]) == 0 {
 		starter, last = 0, 0
 	}

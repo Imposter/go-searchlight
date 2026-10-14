@@ -434,17 +434,16 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	return n, nil
 }
 
-// loopbackAddress reports whether addr (a host:port, or a bare host) resolves to the
-// loopback interface: a plain-http cluster_token never leaves the machine then.
-// A host that is not a literal IP (a hostname) is treated as non-loopback, since it may
-// resolve to a reachable address depending on DNS.
+// loopbackAddress reports whether addr (a host:port, or a bare host) is a loopback IP
+// ([config.LoopbackIP]): a plain-http cluster_token never leaves the machine then. A
+// host name is treated as non-loopback, since it may resolve to a reachable address
+// depending on DNS.
 func loopbackAddress(addr string) bool {
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return config.LoopbackIP(host)
 }
 
 // ID is the node's id.
@@ -561,7 +560,7 @@ func (n *Node) Drain(ctx context.Context) {
 	retired := 0
 	for _, l := range n.leaseList() {
 		if v.servingElsewhere(l.copy.Shard, n.id) == 0 {
-			continue // the only serving copy: it serves until Stop
+			continue
 		}
 		if n.retire(ctx, l) {
 			retired++
@@ -669,25 +668,3 @@ func (n *Node) Stop(ctx context.Context) error {
 
 // Close implements [api.Coordinator]: [Node.Stop].
 func (n *Node) Close(ctx context.Context) error { return n.Stop(ctx) }
-
-// kill stops the node as a crash would (tests): no drain, no final commit, no lease
-// released, no deregistration. The shards are abandoned with what they had not
-// committed.
-func (n *Node) kill() {
-	n.stopOnce.Do(func() {
-		n.stopped.Store(true)
-		n.draining.Store(true)
-		n.loopCancel()
-		n.loops.Wait()
-		n.closeBackground()
-		ctx := context.Background()
-		for _, l := range n.leaseList() {
-			_ = n.AbandonCopy(ctx, l.copy)
-			n.dropLease(l)
-		}
-		n.hints.close()
-		n.pins.closeAll()
-		n.snaps.closeAll()
-		_ = n.Single.Close(ctx)
-	})
-}

@@ -77,11 +77,12 @@ type Meta struct {
 	NumDocs uint32
 }
 
-// genName returns a random segment name: a 16-byte identifier, hex-encoded.
+// genName returns a random segment name: a 16-byte identifier, hex-encoded. It panics
+// when crypto/rand fails, which means the OS's random number generator is broken.
 func genName() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand failing means the OS's RNG is broken
+		panic(err)
 	}
 	return hex.EncodeToString(b[:])
 }
@@ -341,7 +342,8 @@ func runParallel(n, threads int, work func(i int)) {
 // segment's directory), written through throttle like the segment itself. So a write
 // holds at most spillAt bytes for each contribution running or waiting its turn, and
 // needs up to about one section's size of extra disk while they wait. Once a write
-// fails, no further contribution starts and the first error is returned.
+// fails, no further contribution starts and the first error is returned. Held
+// contributions are placed, under mu, as soon as their turn comes.
 func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int) error, n, threads int, writeOne func(fw *fileWriter, i int), fixup func(i int, base uint64)) error {
 	sectionStart := w.off
 	var mu sync.Mutex
@@ -350,8 +352,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 	failed := false
 	held := make([]*spillBuffer, n)
 	errs := make([]error, n)
-	// place lands every held field whose turn has come; mu must be held.
-	place := func() {
+	placeHeldLocked := func() {
 		for next < n && held[next] != nil && !direct && !failed {
 			fixup(next, w.off-sectionStart)
 			if err := held[next].copyTo(w); err != nil {
@@ -383,7 +384,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 				errs[i], failed = fw.err, true
 			}
 			next++
-			place()
+			placeHeldLocked()
 			mu.Unlock()
 			return
 		}
@@ -406,7 +407,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 			return
 		}
 		held[i] = buf
-		place()
+		placeHeldLocked()
 	})
 	for _, b := range held {
 		if b != nil {
@@ -511,6 +512,11 @@ func (b *spillBuffer) discard() {
 // parallelism the writing phase itself (as opposed to parts, accumulation's) uses.
 // throttle, when not nil, is called before every chunk written to the file
 // ([MergeOptions.Throttle]).
+//
+// The rename is durable only once the directory entry itself is fsynced: without
+// that, a crash can leave the directory pointing at the old file (or nothing), even
+// though the new file's own bytes were fsynced. A caller that syncs the directory
+// itself, once for many files, passes syncDir false.
 func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts []map[string]*fieldBuilder, dicts dictSources, stored storedSource, ids idSource, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
@@ -649,10 +655,6 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	if err := os.Rename(tmp, path); err != nil {
 		return Meta{}, err
 	}
-	// The rename is only durable once the directory entry itself is fsynced: without
-	// this, a crash can leave the directory pointing at the old file (or nothing),
-	// even though the new file's own bytes were already fsynced above. A caller that
-	// syncs the directory itself, once for many files, skips this one.
 	if syncDir {
 		if err := SyncDir(filepath.Dir(path)); err != nil {
 			return Meta{}, err

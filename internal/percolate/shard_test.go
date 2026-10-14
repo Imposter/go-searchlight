@@ -325,7 +325,7 @@ func TestPercolateDefaultQueryIndexFallback(t *testing.T) {
 	}
 	g := s.Acquire()
 	defer g.Release()
-	got, err := Percolate(context.Background(), g, []schema.Doc{{ID: "a", Body: []byte(`{"brand":"ACME"}`)}, {ID: "b", Body: []byte(`{}`)}})
+	got, err := New(Options{}).Percolate(context.Background(), g, []schema.Doc{{ID: "a", Body: []byte(`{"brand":"ACME"}`)}, {ID: "b", Body: []byte(`{}`)}})
 	if err != nil {
 		t.Fatal(err)
 	}

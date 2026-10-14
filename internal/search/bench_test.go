@@ -273,7 +273,7 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp := Reduce([]*ShardResult{res}, r)
+		resp := Reduce(context.Background(), []*ShardResult{res}, r)
 		lat = append(lat, time.Duration(nanotime()-start))
 		total += resp.Total
 		verified += res.Scanned

@@ -440,7 +440,10 @@ func TestWaitForWaitsOnOneCopy(t *testing.T) {
 // TestWritesDoNotWaitOnACopyRebuiltAside: a copy being rebuilt aside serves its old data
 // and applies nothing until its replacement is swapped in, so a refresh=wait_for or
 // refresh=true write through its node waits on a copy that applies (the peer's) rather
-// than on it, and answers within its deadline.
+// than on it, and answers within its deadline. The mapping change rebuilds both copies,
+// in either order, so node-0's copy counts as rebuilt only once it has applied past the
+// change: before it has seen it, it is serving and not rebuilding too, and would start
+// its own rebuild under the write.
 func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 	testtier.Heavy(t)
 	release := make(chan struct{})
@@ -472,6 +475,10 @@ func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
 		t.Fatal(err)
 	}
+	remapped, _, err := a.st.HeadSeq(tctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	copyOf := func(tn *tnode) api.ShardInfo {
 		shards, err := tn.n.Shards(tctx(t))
 		if err != nil {
@@ -488,8 +495,8 @@ func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 		if s := copyOf(b); !s.Rebuilding {
 			return fmt.Errorf("node-1's copy: %+v", s)
 		}
-		if s := copyOf(a); s.Rebuilding || s.State != api.ShardServing {
-			return fmt.Errorf("node-0's copy: %+v", s)
+		if s := copyOf(a); s.Rebuilding || s.State != api.ShardServing || s.AppliedSeq < remapped {
+			return fmt.Errorf("node-0's copy: %+v (the mapping change is seq %d)", s, remapped)
 		}
 		return nil
 	})

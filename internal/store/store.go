@@ -276,9 +276,6 @@ func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l 
 // clock.Real).
 func WithClock(c clock.Clock) Option { return func(o *options) { o.clock = c } }
 
-// WithBlobChunkSize sets the blob chunk size in bytes.
-func WithBlobChunkSize(n int) Option { return func(o *options) { o.blobChunk = n } }
-
 // Dialects maps each store_url scheme to its dialect.
 func dialectFor(scheme string) (*dialect.Dialect, error) {
 	switch strings.ToLower(scheme) {
@@ -298,6 +295,8 @@ func dialectFor(scheme string) (*dialect.Dialect, error) {
 //	postgres://user:pass@host:5432/db?sslmode=disable (or postgresql://)
 //	mysql://user:pass@host:3306/db
 //	sqlite:///var/lib/searchlight/searchlight.db
+//
+// An unparsable URL is reported without quoting it, since it may hold a password.
 func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	o := options{blobChunk: DefaultBlobChunkSize}
 	for _, opt := range opts {
@@ -320,7 +319,6 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		// url.Error repeats the URL, which may hold a password.
 		return nil, fmt.Errorf("%w: store URL is not a valid URL", ErrInvalid)
 	}
 	d, err := dialectFor(u.Scheme)

@@ -69,14 +69,11 @@ func WithLogOutput(w io.Writer) Option { return func(o *options) { o.logOutput =
 // WithVersion sets the service.version resource attribute.
 func WithVersion(v string) Option { return func(o *options) { o.version = v } }
 
-// withEnv replaces os.Getenv for the OTEL_* selection (tests only; the
-// exporters themselves always read the process environment).
-func withEnv(getenv func(string) string) Option { return func(o *options) { o.getenv = getenv } }
-
 // Setup builds the logger, the tracer and meter providers with their
 // exporters, and the admin handler, and installs them as the slog and OTel
 // globals along with the W3C trace-context and baggage propagators. Call
-// Shutdown to flush the exporters.
+// Shutdown to flush the exporters. OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES win
+// over the resource attributes it sets.
 func Setup(ctx context.Context, cfg config.Config, opts ...Option) (*T, error) {
 	o := options{logOutput: os.Stderr, version: "dev", getenv: os.Getenv}
 	for _, opt := range opts {
@@ -92,7 +89,7 @@ func Setup(ctx context.Context, cfg config.Config, opts ...Option) (*T, error) {
 			semconv.ServiceVersion(o.version),
 			semconv.ServiceInstanceID(cfg.NodeID),
 		),
-		resource.WithFromEnv(), // OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES win
+		resource.WithFromEnv(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("telemetry resource: %w", err)

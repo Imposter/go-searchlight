@@ -46,6 +46,9 @@ func validMeta(m *IndexMeta) error {
 	return err
 }
 
+// Create implements [IndexStore]. An insert that returns its row in the same statement
+// answers with that row; a failed insert is told apart from an existing index by
+// looking the name up, since a key violation looks different on every dialect.
 func (x *indexStore) Create(ctx context.Context, m IndexMeta) (out IndexMeta, err error) {
 	s := x.s
 	ctx, end := s.start(ctx, "index_create", attribute.String("index", m.Name))
@@ -62,11 +65,9 @@ func (x *indexStore) Create(ctx context.Context, m IndexMeta) (out IndexMeta, er
 	if err == nil {
 		out, err = scanIndex(row, m.Name)
 		if err == nil || create.Write != "" {
-			return out, err // the insert is done; this is the read's outcome
+			return out, err
 		}
 	}
-	// The insert failed. A key violation looks different on every dialect;
-	// look instead.
 	if _, gerr := x.get(ctx, m.Name); gerr == nil {
 		return IndexMeta{}, fmt.Errorf("index %q: %w", m.Name, ErrExists)
 	}
@@ -140,7 +141,9 @@ func (x *indexStore) Update(ctx context.Context, m IndexMeta) (out IndexMeta, er
 
 // updateOnce runs one attempt of Update. It takes the counter lock, like Apply,
 // so a mapping change commits wholly before or after any Apply: every change
-// committed after it carries its mapping version and follows it in the log.
+// committed after it carries its mapping version and follows it in the log. The shard
+// count is fixed at creation (spec section 2): documents are placed by it, so changing
+// it would orphan them.
 func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	s := x.s
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
@@ -166,8 +169,6 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	if version != m.Version {
 		return fmt.Errorf("index %q version %d: %w", m.Name, m.Version, ErrConflict)
 	}
-	// The shard count is fixed at creation (spec section 2): documents are placed
-	// by it, so changing it would orphan them.
 	oldShards, err := settingsShards(oldSettings)
 	if err != nil {
 		return err
@@ -208,6 +209,8 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	return tx.Commit()
 }
 
+// Drop implements [IndexStore]. It takes the counter lock, which orders the drop with
+// Apply: no change for the index commits after it.
 func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	s := x.s
 	ctx, end := s.start(ctx, "index_drop", attribute.String("index", name))
@@ -220,8 +223,6 @@ func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 		return err
 	}
 	defer rollback(tx)
-	// Taking the counter lock orders the drop with Apply: no change for the
-	// index commits after it.
 	var counter, nowMs int64
 	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
 		return err

@@ -143,7 +143,8 @@ func (s *Shard) unreserve(p mergePlan) {
 }
 
 // runMerge merges p's inputs and commits the result, which it returns (nil when the
-// inputs were wholly deleted). p is reserved; runMerge releases it.
+// inputs were wholly deleted). p is reserved; runMerge releases it. bases holds each
+// input's first ordinal in the merged segment.
 func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err error) {
 	defer s.unreserve(p)
 	ctx, span := s.startSpan(ctx, "shard.merge",
@@ -182,7 +183,7 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 		list = g.queries
 	}
 	snap := make([]*roaring.Bitmap, len(p.inputs))
-	bases := make([]uint64, len(p.inputs)) // each input's first ordinal in the merged segment
+	bases := make([]uint64, len(p.inputs))
 	var live uint64
 	for i, ref := range p.inputs {
 		j := slices.IndexFunc(list, func(st segState) bool { return st.ref == ref })
@@ -235,7 +236,8 @@ func (s *Shard) runMerge(ctx context.Context, p mergePlan) (merged *segRef, err 
 }
 
 // writeMerged writes p's live documents or queries, as of the snapshot deletes, as one
-// new segment, with threads goroutines (the budget tokens the merge holds).
+// new segment, with threads goroutines (the budget tokens the merge holds). It leaves
+// the directory's fsync to the flush.
 func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bitmap, g *Generation, threads int) (*segRef, int64, error) {
 	if p.kind == kindQueries {
 		var queries []StoredQuery
@@ -269,7 +271,7 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 	meta, err := segment.Merge(s.dir, readers, snap, segment.MergeOptions{
 		Name:         name,
 		Threads:      threads,
-		NoDirSync:    true, // the flush syncs the directory
+		NoDirSync:    true,
 		MarksUntyped: marks,
 		Throttle: func(n int) error {
 			written += int64(n)
@@ -291,6 +293,13 @@ func (s *Shard) writeMerged(ctx context.Context, p mergePlan, snap []*roaring.Bi
 
 // publishMerge replaces p's inputs with out (nil: they were wholly deleted), carrying
 // over the deletes made since snap. When it fails, nothing is published.
+//
+// The merged segment holds the documents refreshes deleted since the snapshot (they
+// were live in it), so they are deleted there too. A merge of only segments a
+// ForceMerge is responsible for (a background merge in flight when it started, whose
+// inputs all existed then, or its own) makes a segment it is responsible for; one that
+// also took a segment refreshed since does not, or ForceMerge would keep adopting new
+// writes.
 func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap []*roaring.Bitmap, bases []uint64) error {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
@@ -324,8 +333,6 @@ func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap
 		if out == nil {
 			continue
 		}
-		// Deletes refreshes added since the snapshot: the merged segment holds those
-		// documents (they were live in the snapshot), so they are deleted there too.
 		it := roaring.AndNot(st.deletes, snap[i]).Iterator()
 		for it.HasNext() {
 			ord := it.Next()
@@ -352,10 +359,6 @@ func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap
 	}
 	s.publish(ctx, docs, queries, built, cur.seq, cur.maxSeq, cur.uid, cur.mp, cur.marks)
 	if out != nil && s.forceEligible != nil {
-		// A merge of only segments a ForceMerge is responsible for (a background merge
-		// in flight when it started, whose inputs all existed then, or its own) makes a
-		// segment it is responsible for. One that also took a segment refreshed since
-		// does not: ForceMerge would otherwise keep adopting new writes.
 		all := true
 		for _, ref := range p.inputs {
 			if !s.forceEligible[ref] {
@@ -378,15 +381,18 @@ func (s *Shard) publishMerge(ctx context.Context, p mergePlan, out *segRef, snap
 // it starts included); segments refreshes add meanwhile are left to the merge policy.
 // Each segment is rewritten for its deletes at most once, so a steady stream of
 // deletes cannot keep it going. It waits for background merges in flight, ignores
-// DisableMerges, and runs one at a time. Close cancels it and waits for it to return;
-// after Close it returns ErrClosed.
+// DisableMerges, and runs one at a time: waiting for another ends with ctx or the
+// shard. Close cancels it and waits for it to return (it joins the shard's wait group
+// before closing is set, so before shutdown waits on it); after Close it returns
+// ErrClosed. The segments it is responsible for are kept in s.forceEligible, under
+// commitMu, so commitMerge adds every merge's output of them.
 func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
 		return ErrClosed
 	}
-	s.wg.Add(1) // before closing is set, so before shutdown's wg.Wait
+	s.wg.Add(1)
 	s.mu.Unlock()
 	defer s.wg.Done()
 	ctx, cancel := context.WithCancel(ctx)
@@ -396,7 +402,6 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 	ctx, span := s.startSpan(ctx, "shard.force_merge", attribute.Int("max_segments", maxSegments))
 	defer span.End()
 	maxSegments = max(1, maxSegments)
-	// One ForceMerge at a time; waiting for another ends with ctx or the shard.
 	select {
 	case s.forceSem <- struct{}{}:
 	case <-ctx.Done():
@@ -405,10 +410,7 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 		return ErrClosed
 	}
 	defer func() { <-s.forceSem }()
-	// s.forceEligible: the segments ForceMerge is responsible for (see above), kept
-	// under commitMu so commitMerge adds every merge's output of them.
-	// rewritten: segments already rewritten for their deletes, never again.
-	rewritten := map[*segRef]bool{}
+	rewrittenForDeletes := map[*segRef]bool{}
 	s.commitMu.Lock()
 	eligible := map[*segRef]bool{}
 	if cur := s.cur.Load(); cur != nil {
@@ -445,8 +447,8 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 				return ctx.Err()
 			}
 		}
-		plans := forcePlans(kindDocs, onlyEligible(cur.docs, eligible), maxSegments, rewritten)
-		plans = append(plans, forcePlans(kindQueries, onlyEligible(cur.queries, eligible), maxSegments, rewritten)...)
+		plans := forcePlans(kindDocs, onlyEligible(cur.docs, eligible), maxSegments, rewrittenForDeletes)
+		plans = append(plans, forcePlans(kindQueries, onlyEligible(cur.queries, eligible), maxSegments, rewrittenForDeletes)...)
 		for _, p := range plans {
 			s.reserve(p)
 		}
@@ -465,7 +467,7 @@ func (s *Shard) ForceMerge(ctx context.Context, maxSegments int) error {
 				return err
 			}
 			if out != nil && len(p.inputs) == 1 {
-				rewritten[out] = true
+				rewrittenForDeletes[out] = true
 			}
 		}
 	}

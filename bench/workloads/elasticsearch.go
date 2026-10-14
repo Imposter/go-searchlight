@@ -352,7 +352,9 @@ const percolatePage = 10_000
 // when more queries match than one page holds. server sums every page's own "took"
 // (milliseconds, Elasticsearch's standard search-response field): a percolation
 // fitting in one page, as every single-document call does unless it matches more
-// than percolatePage saved searches, is exactly that one page's took.
+// than percolatePage saved searches, is exactly that one page's took. When more
+// queries match than a page holds, it starts over in query id order to page through
+// them.
 func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json.RawMessage) ([][]string, time.Duration, bool, error) {
 	out := make([][]string, len(docs))
 	body := es.PercolateBody(docs, percolatePage)
@@ -392,7 +394,6 @@ func (e *Elasticsearch) Percolate(ctx context.Context, index string, docs []json
 		server += time.Duration(res.TookMillis) * time.Millisecond
 		hits := res.Hits.Hits
 		if after == nil && int64(len(hits)) < res.Hits.Total.Value {
-			// More matches than a page: start over in qid order to page through them.
 			out = make([][]string, len(docs))
 			after = []any{""}
 			continue
@@ -428,6 +429,11 @@ const minPlausibleJVMRSS = 64 << 20
 // inflates T6's numbers), and _local (this connected node, es1, not the whole
 // cluster: with a second node, /_nodes/stats answers for both, and picking one of a
 // map's entries would be an arbitrary, non-deterministic choice of which).
+//
+// An --es-pid that names a live process with implausibly little RSS for a JVM (seen in
+// practice: the image's entrypoint not exec'ing into java, so the PID was a lightweight
+// wrapper, not the server; run 37399767772 read 1.35 MiB this way for the whole run)
+// falls through to the cgroup estimate, a far smaller error than reporting that.
 func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Resources, error) {
 	var r report.Resources
 	var stats struct {
@@ -450,11 +456,6 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 		r.RSSBytes, r.RSSSource = rss, fmt.Sprintf("/proc/%d/status VmRSS (the JVM)", e.opts.PID)
 		return r, nil
 	} else if rss > 0 {
-		// --es-pid named a real, live process, but one with implausibly little RSS
-		// for a JVM (seen in practice: the image's entrypoint not exec'ing into java,
-		// so the PID was a lightweight wrapper, not the server -- run 37399767772
-		// read 1.35 MiB this way for the whole run). Falling through to the cgroup
-		// estimate below is a far smaller error than reporting that.
 		fmt.Fprintf(e.c.log, "elasticsearch: --es-pid %d has %s RSS, implausible for a JVM; falling back to the cgroup estimate\n", e.opts.PID, report.FormatBytes(float64(rss)))
 	}
 	var ns struct {
@@ -499,12 +500,13 @@ func (e *Elasticsearch) Resources(ctx context.Context, index string) (report.Res
 // equivalent of). There is no analog of Searchlight's "ids" or "meta" sections:
 // Elasticsearch's _id lives inside its inverted index and stored fields already
 // counted above.
+//
+// In the response, only "inverted_index" nests (total_in_bytes inside it);
+// stored_fields, doc_values, points, norms, term_vectors and knn_vectors are each a
+// flat "<name>_in_bytes" sibling of a human-readable "<name>" string, not an object of
+// their own. That is confirmed against a real Elasticsearch 8.15.3 response (a first
+// guess at "stored_fields" nesting the same way failed to decode it).
 func (e *Elasticsearch) SectionSizes(ctx context.Context, index string) (map[string]int64, error) {
-	// Only "inverted_index" nests (total_in_bytes inside it); stored_fields,
-	// doc_values, points, norms, term_vectors and knn_vectors are each a flat
-	// "<name>_in_bytes" sibling of a human-readable "<name>" string, not an object
-	// of their own. Confirmed against a real Elasticsearch 8.15.3 response (a
-	// first guess at "stored_fields" nesting the same way failed to decode it).
 	var res map[string]struct {
 		AllFields struct {
 			InvertedIndex struct {

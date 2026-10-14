@@ -41,6 +41,8 @@ const (
 	tagLeaf
 )
 
+// appendNode appends n's canonical encoding to buf; a nil node, typed or not, is
+// tagNil.
 func appendNode(buf []byte, n Node) []byte {
 	switch x := n.(type) {
 	case *All:
@@ -64,7 +66,7 @@ func appendNode(buf []byte, n Node) []byte {
 			return append(buf, tagNil)
 		}
 		return appendLeaf(buf, x)
-	default: // nil
+	default:
 		return append(buf, tagNil)
 	}
 }
@@ -102,11 +104,12 @@ const (
 	valNever // a condition that never holds
 )
 
+// appendLeafValue appends a leaf's value, canonically: {exists} and {exists: true}
+// mean the same thing, so an exists leaf's value is the bool wanted, exactly as
+// compileLeaf derives it.
 func appendLeafValue(buf []byte, l *Leaf) []byte {
 	a := l.arg()
 	if l.Op == OpExists {
-		// {exists} and {exists: true} mean the same thing: canonicalize to the bool
-		// wanted, exactly as compileLeaf derives it.
 		want := a.Kind != ArgBool || a.Scalar.Bool
 		return appendScalar(buf, Scalar{Kind: ArgBool, Bool: want})
 	}
@@ -120,7 +123,7 @@ func appendLeafValue(buf []byte, l *Leaf) []byte {
 		return appendList(buf, a.List, unorderedList(l.Op))
 	case ArgObject:
 		return appendObject(buf, a.Object)
-	default: // ArgNone
+	default:
 		return append(buf, valNone)
 	}
 }
@@ -137,6 +140,8 @@ func unorderedList(op string) bool {
 	}
 }
 
+// appendScalar appends a scalar value. Every number no float64 holds behaves alike
+// (it never equals anything), so all of them encode the same.
 func appendScalar(buf []byte, s Scalar) []byte {
 	switch s.Kind {
 	case ArgBool:
@@ -148,7 +153,7 @@ func appendScalar(buf []byte, s Scalar) []byte {
 	case ArgNumber:
 		buf = append(buf, valNumber)
 		if !s.Finite {
-			return append(buf, 0) // every such number behaves alike: never equal
+			return append(buf, 0)
 		}
 		buf = append(buf, 1)
 		var bits [8]byte

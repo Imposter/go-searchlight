@@ -151,6 +151,9 @@ func readManifest(dir string, log *slog.Logger) (*manifest, error) {
 	return readManifestFile(filepath.Join(dir, manifestName), log)
 }
 
+// readManifestFile reads and checks the manifest at path. Segment ids become file
+// names, so only the names the shard itself gives are accepted: a damaged or crafted
+// manifest can never point outside the directory.
 func readManifestFile(path string, log *slog.Logger) (*manifest, error) {
 	var data []byte
 	err := retryIO(log, "open", path, func() error {
@@ -206,8 +209,6 @@ func readManifestFile(path string, log *slog.Logger) (*manifest, error) {
 	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, bad(err.Error())
 	}
-	// Ids become file names: only the names the shard itself gives are accepted, so a
-	// damaged or crafted manifest can never point outside the directory.
 	seen := map[string]bool{}
 	for _, list := range [][]manifestSegment{m.Segments, m.QuerySegments} {
 		for _, ms := range list {

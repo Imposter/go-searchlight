@@ -167,9 +167,11 @@ func compileNode(n Node) cnode {
 
 // compileGroup folds constant children away (all: a false child is false, true children
 // drop out; any the other way round), keeps a lone child as itself, and orders the rest
-// cheapest first, so the matcher settles on the cheap conditions before the costly.
+// cheapest first, so the matcher settles on the cheap conditions before the costly. A
+// group whose every child dropped out holds what its empty form does: {"all": []}
+// holds, {"any": []} does not.
 func compileGroup(kind nodeKind, nodes []Node) cnode {
-	decided, dropped := kindFalse, kindTrue // all: false decides, true drops out
+	decided, dropped := kindFalse, kindTrue
 	if kind == kindAny {
 		decided, dropped = kindTrue, kindFalse
 	}
@@ -186,7 +188,7 @@ func compileGroup(kind nodeKind, nodes []Node) cnode {
 	}
 	switch len(children) {
 	case 0:
-		return cnode{kind: dropped} // every child dropped out: {"all": []} holds, {"any": []} not
+		return cnode{kind: dropped}
 	case 1:
 		return children[0]
 	}
@@ -230,6 +232,10 @@ type cleaf struct {
 	minimum         float64  // similar
 }
 
+// compileLeaf compiles one condition. exists wants presence unless its value is false,
+// as the matcher's `value is not False`. When nothing can equal the value (a list, an
+// object, 1e400), eq never holds and ne always does. A similar whose text has no
+// trigram has similarity 0, below any minimum, and never holds.
 func compileLeaf(l *Leaf) cnode {
 	code := opCodes[l.Op]
 	a := l.arg()
@@ -237,11 +243,10 @@ func compileLeaf(l *Leaf) cnode {
 	cost := costCompare
 	switch code {
 	case opExists:
-		c.want = a.Kind != ArgBool || a.Scalar.Bool // `value is not False`
+		c.want = a.Kind != ArgBool || a.Scalar.Bool
 	case opEmpty, opNonempty:
 	case opEq, opNe:
 		if !c.setEq(&a) {
-			// Nothing equals the value (a list, an object, 1e400): eq never holds, ne always.
 			if code == opEq {
 				return never
 			}
@@ -294,7 +299,7 @@ func compileLeaf(l *Leaf) cnode {
 		text := a.Object["text"]
 		c.keys = analysis.TrigramKeys(text.Norm)
 		if len(c.keys) == 0 {
-			return never // similarity 0, below any minimum
+			return never
 		}
 		c.minimum = minimum
 		cost = costSimilar
@@ -377,7 +382,8 @@ func (c *cleaf) setIn(a *Arg) bool {
 }
 
 // setWords keeps the words of each phrase (scrape-bot's wanted_words); false when the
-// condition can never hold: no phrase, or, for words_all, a phrase with no word.
+// condition can never hold: no phrase, or, for words_all, a phrase with no word (which
+// words_any passes over: it matches nothing).
 func (c *cleaf) setWords(a *Arg) bool {
 	for _, s := range a.texts() {
 		words := analysis.Words(s.Text)
@@ -385,7 +391,7 @@ func (c *cleaf) setWords(a *Arg) bool {
 			if c.every {
 				return false
 			}
-			continue // a phrase with no word matches nothing
+			continue
 		}
 		c.texts = append(c.texts, words)
 	}

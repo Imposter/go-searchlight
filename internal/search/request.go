@@ -47,6 +47,9 @@ const (
 	TrackTotalNone = -2
 	// MaxSize is the most hits one request returns.
 	MaxSize = 10_000
+	// DefaultSize is the size ParseRequest gives a request that names none, as
+	// Elasticsearch's.
+	DefaultSize = 10
 	// MaxSortKeys is the most sort keys one request takes: each field once, and none
 	// after _id.
 	MaxSortKeys = 16
@@ -218,7 +221,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}};
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
 //
-// A missing query matches every document. It returns every problem found, each with
+// A missing query matches every document, and a missing size is DefaultSize. It
+// returns every problem found, each with
 // its loc ("sort.1", "aggs.by_brand.terms.size"); the query's are [query.Parse]'s.
 // Fields, sort and aggregation types are checked against the mapping by ExecuteShard.
 func ParseRequest(raw []byte) (*Request, []query.Problem) {
@@ -228,7 +232,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 	if err := dec.Decode(&top); err != nil {
 		return nil, []query.Problem{{Loc: "body", Message: "the request is not a JSON object: " + err.Error()}}
 	}
-	r := &Request{Query: &query.All{}, serial: requestSerials.Add(1)}
+	r := &Request{Query: &query.All{}, Size: DefaultSize, serial: requestSerials.Add(1)}
 	var ps problems
 	for _, key := range slices.Sorted(maps.Keys(top)) {
 		val := top[key]
@@ -338,10 +342,11 @@ func floatOf(raw json.RawMessage) (float64, bool) {
 	return f, true
 }
 
+// parseSort reads a request's sort: a list of sort keys, or a single one, as
+// Elasticsearch also takes it.
 func parseSort(raw json.RawMessage, ps *problems) []SortField {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
-		// A single sort key, as Elasticsearch also takes it.
 		items = []json.RawMessage{raw}
 	}
 	out := make([]SortField, 0, len(items))

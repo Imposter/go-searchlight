@@ -52,7 +52,8 @@ const acquireTries = 4
 // before and after: a tailer marks a copy recovering and then swaps in the shard it
 // rebuilds, so a reader that read the state before the mark and the shard after the
 // swap would hold an empty shard. After the Acquire the copy must still serve, from
-// the very shard acquired; otherwise the generation is released and it tries again.
+// the very shard acquired; otherwise the generation is released and it tries again, as
+// it does when the shard closed under it because a rebuild swapped it.
 func (c *copyState) acquire() (*shard.Generation, error) {
 	for range acquireTries {
 		if err := c.notServing(); err != nil {
@@ -65,7 +66,7 @@ func (c *copyState) acquire() (*shard.Generation, error) {
 		g := sh.Acquire()
 		if g == nil {
 			if c.shard() != sh {
-				continue // swapped: the old shard closed under the reader
+				continue
 			}
 			return nil, api.Unavailable(shard.ErrClosed, "shard %d of index %q is closed", c.id.Shard, c.id.Index)
 		}
@@ -189,7 +190,7 @@ func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Reques
 		if err != nil {
 			return nil, err
 		}
-		return search.ReduceContext(ctx, []*search.ShardResult{sr}, r), nil
+		return search.Reduce(ctx, []*search.ShardResult{sr}, r), nil
 	}
 	began := n.clock.Now()
 	q := *r
@@ -200,7 +201,7 @@ func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Reques
 	}
 	bodies := make([]map[search.HitRef]json.RawMessage, len(ts))
 	for round := 0; ; round++ {
-		resp := search.ReduceContext(ctx, results, &q)
+		resp := search.Reduce(ctx, results, &q)
 		lost, err := fetchHits(ctx, ts, resp, r.Fields, bodies)
 		if err != nil {
 			return nil, err
@@ -388,7 +389,8 @@ func (idx *index) mayRecheckCatalog(now time.Time) bool {
 
 // Percolate implements [api.Coordinator]. Given documents are analyzed under the
 // index's mapping (their new fields are not added to it: no saved query can name a
-// field the mapping lacks); stored ones are read from the copies a search would read.
+// field the mapping lacks); stored ones are read from the copies a search would read,
+// not realtime from the database as GET reads them: pass wait_for_seq to see a write.
 func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateRequest, opts api.ReadOptions) (res *api.PercolateResponse, err error) {
 	ctx, span := n.readSpan(ctx, "node.percolate", name)
 	defer func() { endSpan(span, err) }()
@@ -408,15 +410,13 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 	for range req.Docs {
 		out = append(out, api.PercolateResult{Found: true})
 	}
-	// Stored documents are read from the copies (as searches are), not realtime from
-	// the database as GET is: pass wait_for_seq to see a write.
 	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, true)
 	if err != nil {
 		return nil, err
 	}
 	defer ts.release()
 	m := idx.meta.Load().mapping
-	stored := make([]int, 0, len(req.IDs)) // out positions of found stored docs
+	storedPositions := make([]int, 0, len(req.IDs))
 	for i, id := range req.IDs {
 		loc := "ids." + strconv.Itoa(i)
 		if err := schema.ValidateID(id); err != nil {
@@ -434,7 +434,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			}
 			res.Found = true
 			docs = append(docs, doc)
-			stored = append(stored, len(out))
+			storedPositions = append(storedPositions, len(out))
 		}
 		out = append(out, res)
 	}
@@ -445,7 +445,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 	for i := range req.Docs {
 		out[i].Queries = json.RawMessage(matches[i])
 	}
-	for k, p := range stored {
+	for k, p := range storedPositions {
 		out[p].Queries = json.RawMessage(matches[len(req.Docs)+k])
 	}
 	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil

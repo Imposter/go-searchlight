@@ -16,7 +16,13 @@ import (
 	"github.com/Imposter/go-searchlight/internal/store"
 )
 
-// CreateIndex implements [api.Coordinator].
+// CreateIndex implements [api.Coordinator]. The name is reserved under the node lock,
+// and the catalogue write and the opening of the copies happen outside it, so other
+// indexes are served meanwhile. An index that fails to open is dropped again: none the
+// node cannot serve is left behind. A cluster node claims the new copies at once,
+// rather than at the allocator's next pass, and the call returns once they serve (a
+// new copy recovers from an empty snapshot first), so the client's next request finds
+// them serving.
 func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpec) (*api.IndexInfo, error) {
 	if e := api.ValidIndexName(name); e != nil {
 		return nil, e
@@ -43,8 +49,6 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	if err != nil {
 		return nil, err
 	}
-	// The name is reserved under the node lock; the catalogue write and opening
-	// the copies happen outside it, so other indexes are served meanwhile.
 	n.mu.Lock()
 	switch {
 	case n.closed:
@@ -72,7 +76,6 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	}
 	idx, err := n.openIndex(ctx, meta)
 	if err != nil {
-		// Leave no index the node cannot serve behind.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), n.dropTimeout())
 		defer cancel()
 		if derr := n.st.Indexes().Drop(dctx, name); derr != nil {
@@ -89,13 +92,10 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	n.indexes[name] = idx
 	n.mu.Unlock()
 	if n.cl != nil {
-		// This node claims its copies now, rather than at the allocator's next pass.
 		if err := n.cl.Allocate(ctx, name); err != nil {
 			n.log.WarnContext(ctx, "allocating a new index's copies failed; the allocator retries", slog.String("index", name), slog.Any("error", err))
 		}
 	}
-	// A new copy recovers (from an empty snapshot) before it serves: answer once
-	// it does, so the client's next request finds it serving.
 	if err := n.waitServing(ctx, idx); err != nil {
 		n.log.WarnContext(ctx, "a new index's copies are not serving yet", slog.String("index", name), slog.Any("error", err))
 	}
@@ -205,6 +205,13 @@ func (n *Single) describe(ctx context.Context, idx *index) *api.IndexInfo {
 
 // DeleteIndex implements [api.Coordinator]: the index is dropped from the store with
 // its documents, saved queries and changes, then its copies are closed and removed.
+//
+// The index is marked dropped first, so a tailer that sees the drop before it is
+// stopped is not taken for a halted copy, and taken out of the map, so it answers 404
+// while the store deletes it. The delete runs outside the node lock, under its own
+// deadline (drop_timeout), so a big index neither blocks other indexes nor fails at
+// the request's deadline. Files a reader still maps (Windows refuses to remove them)
+// are left for the next start to remove.
 func (n *Single) DeleteIndex(ctx context.Context, name string) error {
 	n.mu.Lock()
 	idx := n.indexes[name]
@@ -216,11 +223,6 @@ func (n *Single) DeleteIndex(ctx context.Context, name string) error {
 		n.mu.Unlock()
 		return indexNotFound(name)
 	}
-	// Marked first, so a tailer that sees the drop before it is stopped is not
-	// taken for a halted copy, and out of the map, so the index answers 404 while
-	// the store deletes it; the delete itself runs outside the node lock, under
-	// its own deadline (drop_timeout), so a big index neither blocks other
-	// indexes nor fails at the request's deadline.
 	idx.dropped.Store(true)
 	delete(n.indexes, name)
 	n.reserved[name] = true
@@ -246,8 +248,6 @@ func (n *Single) DeleteIndex(ctx context.Context, name string) error {
 		n.log.WarnContext(ctx, "closing a dropped index's copies failed", slog.String("index", name), slog.Any("error", err))
 	}
 	if err := os.RemoveAll(idx.dir); err != nil {
-		// Readers may still map a segment (Windows refuses to remove it): the next
-		// start removes what is left.
 		n.log.WarnContext(ctx, "removing a dropped index's copies failed", slog.String("index", name), slog.Any("error", err))
 	}
 	n.log.InfoContext(ctx, "index dropped", slog.String("index", name))
@@ -259,7 +259,8 @@ const maxCatalogTries = 8
 
 // updateCatalog applies change to the index's catalogue entry under its lock, with
 // the store's version check, re-reading the entry and retrying when another writer got
-// there first. change returns the new mapping and settings, or an error to give up.
+// there first. change returns the new mapping and settings (a nil mapping: nothing to
+// change), or an error to give up.
 func (n *Single) updateCatalog(ctx context.Context, idx *index, change func(st *indexState) (*schema.Mapping, api.IndexSettings, error)) (*indexState, error) {
 	if err := idx.catalog.lock(ctx); err != nil {
 		return nil, err
@@ -272,7 +273,7 @@ func (n *Single) updateCatalog(ctx context.Context, idx *index, change func(st *
 			return nil, err
 		}
 		if m == nil {
-			return cur, nil // nothing to change
+			return cur, nil
 		}
 		next, err := n.storeCatalogLocked(ctx, idx, cur, m, settings)
 		if errors.Is(err, store.ErrConflict) {
@@ -293,9 +294,11 @@ func (n *Single) updateCatalog(ctx context.Context, idx *index, change func(st *
 // the store's version check, and adopts the result. A version conflict is returned as
 // it is (store.ErrConflict), for the caller to re-read and retry. The catalogue lock
 // is held.
+//
+// An unchanged mapping (m is cur's) keeps its stored bytes exactly: the store logs a
+// mapping change, and copies may rebuild, whenever the bytes differ. The only setting
+// the store refuses to change is the shard count, reported at settings.shards.
 func (n *Single) storeCatalogLocked(ctx context.Context, idx *index, cur *indexState, m *schema.Mapping, settings api.IndexSettings) (*indexState, error) {
-	// An unchanged mapping keeps its stored bytes exactly: the store logs a
-	// mapping change (and copies may rebuild) whenever the bytes differ.
 	mapping := cur.meta.Mapping
 	if m != cur.mapping {
 		var err error
@@ -314,13 +317,11 @@ func (n *Single) storeCatalogLocked(ctx context.Context, idx *index, cur *indexS
 		return nil, err
 	}
 	if errors.Is(err, store.ErrInvalid) {
-		// The only settings the store refuses to change: the shard count.
 		return nil, api.InvalidAt("settings.shards", "%v", err)
 	}
 	if err != nil {
 		return nil, storeError(err, idx.name)
 	}
-	// The entry as stored, with its new version and mapping version.
 	next := &indexState{meta: updated, mapping: m, settings: settings}
 	idx.meta.Store(next)
 	return next, nil

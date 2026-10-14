@@ -278,7 +278,8 @@ func (n *Single) pingInterval() time.Duration {
 	return min(time.Second, max(50*time.Millisecond, n.cfg.MaxLag/4))
 }
 
-// pingLoop checks the database until ctx ends.
+// pingLoop checks the database until ctx ends. A database slower than max_lag/2 to
+// answer a ping is as good as gone for reads that must not trail by more than max_lag.
 func (n *Single) pingLoop(ctx context.Context) {
 	t := n.clock.NewTicker(n.pingInterval())
 	defer t.Stop()
@@ -288,8 +289,6 @@ func (n *Single) pingLoop(ctx context.Context) {
 			return
 		case <-t.C():
 		}
-		// A database slower than max_lag/2 to answer a ping is as good as gone
-		// for reads that must not trail by more than max_lag.
 		pctx, cancel := context.WithTimeout(ctx, n.pingTimeout())
 		err := n.st.Ping(pctx)
 		cancel()
@@ -373,12 +372,16 @@ func (c *copyState) trailing(maxLag time.Duration) bool {
 // its lease may be lost (a cluster node), it has halted, or it is recovering (being
 // opened, reopened or rebuilt: the shard a tailer exposes then may be empty or partly
 // loaded, so it is never read).
+//
+// A paused copy serves this node's last-resort reads, stale (lapsed). A copy rebuilding
+// aside serves, stale, until its replacement is swapped in. A copy resumed from a
+// warm shard serves while its new tailer starts up over the shard that served.
 func (c *copyState) notServing() error {
 	if c.spec.Quarantined != nil && c.spec.Quarantined() {
 		return api.Unavailable(store.ErrLeaseLost, "shard %d of index %q was taken over from another node and serves nothing yet", c.id.Shard, c.id.Index)
 	}
 	if c.paused.Load() {
-		return nil // it serves this node's last-resort reads, stale (lapsed)
+		return nil
 	}
 	if h := c.halted.Load(); h != nil {
 		return api.Unavailable(*h, "shard %d of index %q has halted", c.id.Shard, c.id.Index)
@@ -391,13 +394,11 @@ func (c *copyState) notServing() error {
 	if sr, ok := c.tailer.(StateReporter); ok {
 		switch sr.StateName() {
 		case StateTailing, StateRebuilding:
-			// Rebuilding aside: the current copy serves (stale) until its
-			// replacement is swapped in.
 		case StateHalted:
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q has halted", c.id.Shard, c.id.Index)
 		default:
 			if c.warm != nil && c.shard() == c.warm {
-				return nil // resumed: its new tailer starts up over the shard that served
+				return nil
 			}
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q is recovering", c.id.Shard, c.id.Index)
 		}
@@ -431,6 +432,11 @@ func (c *copyState) shard() *shard.Shard { return c.tailer.Shard() }
 // NewSingle opens every index in the store's catalogue and, on a single node, a copy of
 // every shard with its tailer, and starts them. Copies of indexes no longer in the
 // catalogue are removed from data_dir.
+//
+// Without Options.NewTailer, every tailer shares the node's one Hub, or polls and is
+// woken by writes when the store pushes no notifications (SQLite, MySQL). The
+// wait_for_seq bound and every copy's saved-query wait start at the store's head, so
+// nothing committed before a restart is missed.
 func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Store == nil {
 		return nil, errors.New("node: Options.Store is required")
@@ -464,8 +470,6 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		o.GroupCommit.Meter = o.Meter
 	}
 	if o.NewTailer == nil {
-		// One Hub per node, shared by every tailer; nil (no notifications, as on
-		// SQLite and MySQL) means the tailers poll and are woken by writes.
 		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter, Clock: o.Clock})
 		if hub != nil {
 			o.Background = append(o.Background, hub.Run)
@@ -513,8 +517,6 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		return nil, fmt.Errorf("node: list indexes: %w", err)
 	}
 	n.noteDB(nil)
-	// The wait_for_seq bound and every copy's saved-query wait start at the
-	// store's head, so nothing committed before a restart is missed.
 	if head, _, err := o.Store.HeadSeq(ctx); err == nil {
 		n.noteHead(head)
 	} else {
@@ -587,7 +589,9 @@ func (n *Single) resolvedRefresh(s api.IndexSettings) time.Duration {
 }
 
 // openIndex opens an index and starts its refresher. A single node hosts every shard's
-// copy at once; a cluster node hosts the copies the cluster gives it (HostCopy).
+// copy at once; a cluster node hosts the copies the cluster gives it (HostCopy). A
+// percolation waits until a copy has every change up to the head as of its opening
+// (its saved queries among them), then only for queries saved since.
 func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, error) {
 	state, err := parseState(m)
 	if err != nil {
@@ -599,9 +603,6 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	for s := range state.settings.Shards {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
-		// A percolation waits until the copy has every change up to the head as of
-		// its opening (its saved queries among them), then only for queries saved
-		// since.
 		sl.querySeq.Store(n.head.Load())
 		idx.shards = append(idx.shards, sl)
 	}
@@ -619,7 +620,17 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 }
 
 // hostCopy opens this node's copy of shard s of idx and starts its tailer, unless it
-// hosts one already.
+// hosts one already. The node's refresher drives the copy's refreshes, so the interval
+// can change.
+//
+// A copy rebuilt aside lives in a subdirectory its root names: the current one is
+// opened (and what a crash or a swap left behind collected). The directory is a cache
+// of the store: one whose data is damaged or of a format this build no longer reads
+// (segment.Rebuildable) is wiped, and the copy, opened empty, is rebuilt from a peer or
+// the store, never served (spec section 10). One written in a newer format is refused
+// and left as it is (spec section 9: a binary rolled back must not destroy its
+// successor's copy), and any other failure (I/O, permissions, resources) is returned
+// for the allocator to retry.
 func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec) error {
 	sl := idx.shards[s]
 	sl.host.Lock()
@@ -634,7 +645,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	opts := shard.Options{
 		Index:           idx.name,
 		Shard:           s,
-		RefreshInterval: -1, // the node's refresher drives refreshes, so the interval can change
+		RefreshInterval: -1,
 		FlushInterval:   n.cfg.FlushInterval,
 		MergeBudget:     n.budget,
 		FilterCache:     n.cache,
@@ -647,14 +658,6 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	if n.opts.ShardOptions != nil {
 		n.opts.ShardOptions(&opts)
 	}
-	// A copy rebuilt aside lives in a subdirectory its root names: open the
-	// current one (and collect what a crash or a swap left behind). The directory is a
-	// cache of the store: one whose data is damaged or of a format this build no longer
-	// reads (segment.Rebuildable) is wiped, and the copy, opened empty, is rebuilt from a
-	// peer or the store, never served (spec section 10). One written in a newer format is
-	// refused and left as it is (spec section 9: a binary rolled back must not destroy
-	// its successor's copy), and any other failure (I/O, permissions, resources) is
-	// returned for the allocator to retry.
 	root := idx.copyRoot(s)
 	sh, err := replica.OpenCopy(ctx, root, state.mapping, opts)
 	if err != nil && ctx.Err() == nil {

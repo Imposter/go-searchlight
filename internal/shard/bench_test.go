@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/schema"
-	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
 var (
@@ -206,7 +205,8 @@ func BenchmarkRefreshKinds(b *testing.B) {
 	run := func(b *testing.B, prepare func(s *Shard, i int, seq int64) int64) {
 		s, seq := setup(b)
 		ctx := context.Background()
-		before := segment.SyncCounts()
+		syncs, stop := countSyncs()
+		defer stop()
 		b.ResetTimer()
 		for i := range b.N {
 			b.StopTimer()
@@ -217,9 +217,9 @@ func BenchmarkRefreshKinds(b *testing.B) {
 			}
 		}
 		b.StopTimer()
-		after := segment.SyncCounts()
-		b.ReportMetric(float64(after.Files-before.Files)/float64(b.N), "filesyncs/op")
-		b.ReportMetric(float64(after.Dirs-before.Dirs)/float64(b.N), "dirsyncs/op")
+		got := syncs.stats()
+		b.ReportMetric(float64(got.Files)/float64(b.N), "filesyncs/op")
+		b.ReportMetric(float64(got.Dirs)/float64(b.N), "dirsyncs/op")
 	}
 	b.Run("new-1k", func(b *testing.B) {
 		run(b, func(s *Shard, i int, seq int64) int64 {

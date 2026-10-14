@@ -12,6 +12,24 @@ import (
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
+// Anchors are a query's anchors as the tests read them: an aset with Always spelled out.
+type Anchors struct {
+	Always bool
+	Terms  []Term
+	Ranges []Range
+	Pairs  [][2]Term
+	Cost   float64
+}
+
+// Extract returns n's anchors as a query segment builds them, under stats.
+func Extract(n query.Node, stats TermStats) Anchors {
+	set := newExtractor(stats).node(n)
+	if !set.ok {
+		return Anchors{Always: true, Cost: 1}
+	}
+	return Anchors{Terms: set.terms, Ranges: set.ranges, Pairs: set.pairs, Cost: set.cost}
+}
+
 // describe renders anchors compactly: "always", or the sorted atoms.
 func describe(a Anchors) string {
 	if a.Always {

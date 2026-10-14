@@ -30,9 +30,6 @@ func NewZipf(n int, s float64) *Zipf {
 	return &Zipf{cdf: cdf}
 }
 
-// N is how many ranks z samples.
-func (z *Zipf) N() int { return len(z.cdf) }
-
 // Sample returns a rank drawn from r.
 func (z *Zipf) Sample(r *rand.Rand) int {
 	u := r.Float64()

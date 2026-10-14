@@ -461,7 +461,7 @@ func (t *Tailer) setState(s State) { t.state.Store(int32(s)) }
 // the index or the shard is dropped ([ErrIndexDropped]), the shard is closed under
 // it (shard.ErrClosed), or the store is (store.ErrClosed). A halted copy does not
 // stop Run: it is retried with backoff ([Tailer.Halt] says where it is stuck). Only
-// one Run may run at a time.
+// one Run may run at a time. The copy's lag is judged from the moment Run starts.
 func (t *Tailer) Run(ctx context.Context) (err error) {
 	if !t.running.CompareAndSwap(false, true) {
 		return ErrRunning
@@ -476,7 +476,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		defer hub.subscribe(t)()
 	}
 	defer t.inst.observe(t)()
-	t.pollOK() // the lag is judged from now
+	t.pollOK()
 
 	t.log.InfoContext(ctx, "tailer started", slog.Int64("seq", t.Applied()))
 	err = t.loop(runCtx, hub)
@@ -491,11 +491,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 	return err
 }
 
-// loop is Run's body.
+// loop is Run's body. Nothing is known until the catalogue has been read: it retries
+// the start until the start decides, never treating an unread catalogue as a changed
+// incarnation.
 func (t *Tailer) loop(ctx context.Context, hub *Hub) error {
 	t.setState(StateRecovering)
-	// Nothing is known until the catalogue has been read: retry until the start
-	// decides, never treating an unread catalogue as a changed incarnation.
 	for {
 		err := t.start(ctx)
 		if err == nil {
@@ -540,7 +540,12 @@ func (t *Tailer) loop(ctx context.Context, hub *Hub) error {
 }
 
 // handle classifies a failure: it returns the error Run must stop with, or nil after
-// arranging the retry (a rebuild, a reopen, or a backoff).
+// arranging the retry (a rebuild, a reopen, or a backoff). A rebuild that asks for
+// another backs off rather than spin. A drop followed at once by a create is a new
+// incarnation, not the end: only an index the catalogue lacks at every read for a
+// whole CatalogInterval stops the copy, and since the catalogue is read again at every
+// retry (RetryBase to RetryCap apart), any moment it holds the index ends the grace.
+// Any other failure is transient (the database, or a refresh) and backs off.
 func (t *Tailer) handle(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -555,7 +560,7 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.needRebuild = rb.reason
 		t.log.InfoContext(ctx, "shard copy must be rebuilt", slog.String("reason", rb.reason), slog.Any("error", rb.err))
 		if again {
-			t.backoffRebuild(ctx) // a rebuild asked for another: do not spin
+			t.backoffRebuild(ctx)
 		}
 		return nil
 	case errors.Is(err, shard.ErrFailed):
@@ -563,11 +568,6 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.log.WarnContext(ctx, "shard copy failed; reopening it", slog.Any("error", err))
 		return nil
 	case errors.Is(err, ErrIndexDropped):
-		// A drop followed at once by a create is a new incarnation, not the end:
-		// only an index the catalogue lacks at every read for a whole
-		// CatalogInterval stops the copy.
-		// The catalogue is read again at every retry (RetryBase to RetryCap
-		// apart), so any moment it holds the index ends the grace.
 		if !t.cat.missingSince.IsZero() && t.opts.Clock.Since(t.cat.missingSince) >= t.opts.CatalogInterval {
 			return err
 		}
@@ -582,7 +582,6 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		errors.Is(err, store.ErrClosed), errors.Is(err, store.ErrInvalid):
 		return err
 	}
-	// Transient: the database, or a refresh.
 	t.pollFailed()
 	if suppressed, ok := t.warn.allow(); ok {
 		t.log.WarnContext(ctx, "tailer retrying after a failure", slog.Any("error", err), slog.Int("suppressed", suppressed))
@@ -639,7 +638,11 @@ func (t *Tailer) sleep(ctx context.Context, hub *Hub) {
 
 // step polls once: it reads the head, then the shard's changes after the applied seq,
 // applies them, and when the page proves nothing more is pending, advances to the
-// head. caughtUp reports that.
+// head. caughtUp reports that: a full page means more to read now. The head is read
+// before the page, so every change at or below it had committed, and a short page
+// holds all of this shard's changes after the applied seq. At a damaged change it
+// applies the changes before it, then halts there: retrying would read the same
+// bytes, and a later write of the document gets past it.
 func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	sh := t.Shard()
 	if err := sh.Err(); err != nil {
@@ -665,8 +668,6 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	}
 	var ce *store.CorruptError
 	if errors.As(err, &ce) {
-		// Apply the changes before the damaged one, then halt at it: retrying would
-		// read the same bytes. A later write of the document gets past it.
 		t.pollOK()
 		if len(changes) > 0 {
 			if err := t.applyChanges(ctx, sh, changes); err != nil {
@@ -689,10 +690,8 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		noteApplied(sh, &t.rw, changes[n-1].Mark())
 	}
 	if len(changes) >= t.opts.BatchSize {
-		return false, nil // more to read now
+		return false, nil
 	}
-	// The head was read before the page: every change at or below it had
-	// committed, and the page holds all of this shard's after from.
 	if prev := t.Applied(); head > prev {
 		if err := sh.Advance(head); err != nil {
 			return false, err

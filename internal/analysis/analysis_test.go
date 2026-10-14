@@ -184,15 +184,15 @@ func TestTrigramsAndSimilarity(t *testing.T) {
 	if got := Trigrams("!!"); got != nil {
 		t.Errorf("Trigrams(!!) = %q, want none", got)
 	}
-	if got := Similarity("word", "word"); got != 1 {
-		t.Errorf("Similarity(same) = %v", got)
+	if got := similarity("word", "word"); got != 1 {
+		t.Errorf("similarity(same) = %v", got)
 	}
-	if got := Similarity("word", ""); got != 0 {
-		t.Errorf("Similarity(word, empty) = %v", got)
+	if got := similarity("word", ""); got != 0 {
+		t.Errorf("similarity(word, empty) = %v", got)
 	}
 	// pg_trgm: "word" has 5 trigrams, "words" 6, and they share 4: 4/7 as a float32.
-	if got := Similarity("word", "words"); got != float64(float32(4.0/7.0)) {
-		t.Errorf("Similarity(word, words) = %v", got)
+	if got := similarity("word", "words"); got != float64(float32(4.0/7.0)) {
+		t.Errorf("similarity(word, words) = %v", got)
 	}
 }
 
@@ -339,6 +339,6 @@ func BenchmarkWords(b *testing.B) {
 
 func BenchmarkSimilarity(b *testing.B) {
 	for b.Loop() {
-		_ = Similarity("nike air max 90", "nike air max 270")
+		_ = similarity("nike air max 90", "nike air max 270")
 	}
 }

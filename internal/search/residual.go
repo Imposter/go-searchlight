@@ -171,8 +171,12 @@ func (s *segExec) parallelChunks(n int, fn func(lo, hi int) error) error {
 
 // verifyTexts checks candidates by their keyword column value, once per distinct
 // value, in parallel chunks of the candidates' sorted ordinals: a dense chunk walks its
-// stretch of the dictionary once, a sparse one looks each ordinal up; neither
-// allocates per value.
+// stretch of the dictionary once, a sparse one walks each dictionary block once,
+// serving every wanted ordinal in it, so no lookup re-decodes the block from its start;
+// neither allocates per value. The matcher reads a term's text only during the call,
+// so the text is a view of the dictionary. An ordinal past the dictionary (damage) is
+// passed over. A document with no text (the field missing, or present with another
+// type) gets the matcher's verdict for its presence, asked once per presence.
 func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 	kc := s.r.Keywords(lp.field)
 	present := s.r.Present(lp.field)
@@ -194,7 +198,6 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 		var text string
 		doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: true, Text: &text}}}
 		check := func(k int, term []byte) {
-			// The matcher only reads the text during the call.
 			text = unsafe.String(unsafe.SliceData(term), len(term))
 			hit[k] = lp.match.Match(&doc)
 		}
@@ -209,8 +212,6 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 			})
 			return nil
 		}
-		// Sparse: one walk per dictionary block, serving every wanted ordinal in it, so
-		// no lookup re-decodes the block from its start.
 		for k := lo; k < hi; {
 			end := (list[k]/segment.TermsPerBlock + 1) * segment.TermsPerBlock
 			from := k
@@ -222,7 +223,7 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 				return k < hi && list[k] < end
 			})
 			if k == from {
-				k++ // an ordinal past the dictionary (damage): nothing to check
+				k++
 			}
 		}
 		return nil
@@ -239,21 +240,18 @@ func (s *segExec) verifyTexts(lp *leafPlan, cand, out *roaring.Bitmap) {
 			matched.Add(o)
 		}
 	}
-	// Documents with no text: the field missing, or present with another type.
-	var noText [2]int8 // by presence: 0 unknown, 1 no match, 2 match
+	var noTextByPresence [2]struct{ known, matches bool }
 	matchNoText := func(p bool) bool {
 		i := 0
 		if p {
 			i = 1
 		}
-		if noText[i] == 0 {
+		v := &noTextByPresence[i]
+		if !v.known {
 			doc := schema.Doc{Fields: map[string]schema.Value{lp.field: {Present: p}}}
-			noText[i] = 1
-			if lp.match.Match(&doc) {
-				noText[i] = 2
-			}
+			v.known, v.matches = true, lp.match.Match(&doc)
 		}
-		return noText[i] == 2
+		return v.matches
 	}
 	keep := make([]uint32, 0, len(docs))
 	for i, d := range docs {
@@ -340,7 +338,9 @@ func (s *segExec) similarCandidates(lp *leafPlan) *roaring.Bitmap {
 }
 
 // similarGrams returns the grams similar's prefilter unions, false when it cannot
-// prefilter (and every document is a candidate).
+// prefilter (and every document is a candidate). Similarity is rounded to a float32,
+// so a ratio a hair under the minimum may still pass: the prefilter requires a little
+// less than the minimum.
 func similarGrams(a *query.Arg) ([]string, bool) {
 	if a.Kind != query.ArgObject {
 		return nil, false
@@ -363,8 +363,6 @@ func similarGrams(a *query.Arg) ([]string, bool) {
 		}
 		interior = append(interior, k)
 	}
-	// Similarity is rounded to a float32, so a ratio a hair under min may still pass:
-	// require a little less than min.
 	lower := m.Number * (1 - 1e-6)
 	needed := math.Ceil(lower*float64(len(keys)) - 1e-9)
 	if needed <= float64(len(keys)-len(interior)) {

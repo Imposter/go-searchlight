@@ -179,13 +179,13 @@ func (ts targets) stale() bool {
 
 // acquireTargets returns a read target for every shard of idx, each with every change
 // up to waitSeq searchable and, forQueries, every saved query committed through this
-// node to its shard. Release them when done.
+// node to its shard. Release them when done. Every copy is woken first, so idle ones
+// advance to waitSeq together.
 func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, forQueries bool) (targets, error) {
 	if waitSeq > 0 {
 		if err := n.checkHead(ctx, waitSeq); err != nil {
 			return nil, err
 		}
-		// Wake every copy first, so idle ones advance to the seq together.
 		for _, c := range idx.copies() {
 			c.tailer.Wake()
 		}
@@ -250,7 +250,8 @@ func (n *Single) acquireShard(ctx context.Context, idx *index, s int, waitSeq in
 // LocalTarget returns a read target on this node's own copy of shard s of index, once
 // it has every change up to waitSeq searchable (under ctx). It fails (503) when this
 // node hosts no serving copy of the shard, or holds its lease not surely (lapsed): the
-// peer API serves remote reads with it.
+// peer API serves remote reads with it. A lease that lapsed while the read waited
+// fails it too: no peer may use the copy then.
 func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq int64) (ShardTarget, error) {
 	idx, err := n.lookup(ctx, index)
 	if err != nil {
@@ -273,7 +274,6 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 	}
 	t, err := n.localTarget(ctx, idx, c, waitSeq, 0)
 	if err == nil && c.lapsed() {
-		// The lease lapsed while the read waited: no peer may use the copy now.
 		t.Release()
 		return nil, c.peerServing()
 	}

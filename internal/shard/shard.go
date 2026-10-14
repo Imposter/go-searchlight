@@ -402,7 +402,7 @@ type Shard struct {
 // reopens and verifies every segment it lists with its deletes, removes every file the
 // manifest does not reference, and starts the background refresh and merges. A
 // directory with no manifest is an empty shard. m is the index's mapping (see
-// [Shard.SetMapping]); it may be nil.
+// [Shard.Mapping]); it may be nil.
 func Open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Shard, error) {
 	opts.resolve()
 	ctx, span := opts.Tracer.Start(ctx, "shard.open", trace.WithAttributes(
@@ -418,6 +418,9 @@ func Open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	return s, nil
 }
 
+// open is Open's body. It never reuses a generation a crash left a sidecar of (I1):
+// that sidecar may still be pending removal, or be removed later by a janitor that
+// could not remove it then.
 func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Shard, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("shard: %w", err)
@@ -464,8 +467,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		s.jan.drain()
 		return nil, err
 	}
-	// Never reuse a generation a crash left a sidecar of (I1): its file may still be
-	// pending removal, or be removed later by a janitor that could not remove it now.
 	topGen, err := maxSidecarGen(dir)
 	if err != nil {
 		g.retireAll()
@@ -544,26 +545,15 @@ func (s *Shard) IndexUID() string {
 }
 
 // Mapping returns the index mapping as of the applied seq: the last Remap applied,
-// the manifest's at Open, or the one Open or SetMapping was given.
+// the manifest's at Open, or the one Open was given.
 func (s *Shard) Mapping() *schema.Mapping { return s.mapping.Load() }
 
 // MappingVersion returns the version of Mapping: the last Remap's, the manifest's at
-// Open, and 0 for a mapping only Open or SetMapping gave.
+// Open, and 0 for a mapping only Open gave.
 func (s *Shard) MappingVersion() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mapState.version
-}
-
-// SetMapping replaces the index mapping, keeping its version; the next refresh
-// publishes it, and the flush after persists it. A copy that tails the changelog takes
-// its mappings from Remap changes instead, so the mapping is recorded with the seq it
-// holds from.
-func (s *Shard) SetMapping(m *schema.Mapping) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mapState = &mappingState{m: m, version: s.mapState.version}
-	s.mapping.Store(m)
 }
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change
@@ -654,10 +644,12 @@ func (s *Shard) Err() error {
 	return nil
 }
 
+// fail marks the shard failed with err, once. A failed shard never refreshes again, so
+// WaitRefreshed's waiters are woken to see the failure.
 func (s *Shard) fail(err error) {
 	wrapped := fmt.Errorf("%w: %w", ErrFailed, err)
 	if s.failed.CompareAndSwap(nil, &wrapped) {
-		s.notifyPublished() // a failed shard never refreshes: wake WaitRefreshed
+		s.notifyPublished()
 	}
 }
 
@@ -722,7 +714,7 @@ func (s *Shard) Load(ctx context.Context, changes []Change) error {
 
 // apply checks and buffers changes, returning the buffer's size after. load is Load's
 // variant: seqs in any order, into a shard that has applied nothing, and AppliedSeq
-// left as it is.
+// left as it is. A load's Remap is the snapshot's mapping, not a changelog entry.
 func (s *Shard) apply(changes []Change, load bool) (int, error) {
 	for i := range changes {
 		if err := s.check(&changes[i]); err != nil {
@@ -761,7 +753,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 			}
 			mp = &mappingState{m: c.Mapping, version: c.MappingVersion}
 			if load {
-				continue // a snapshot's mapping is not a changelog entry
+				continue
 			}
 		}
 		switch {
@@ -904,7 +896,9 @@ func (s *Shard) Advance(seq int64) error {
 
 // Acquire returns the current generation, with a reference the caller must drop with
 // [Generation.Release]. It takes no lock and allocates nothing. It returns nil once
-// the shard is closed.
+// the shard is closed. A generation retired between the load and the reference is
+// tried again: the shard drops its own reference only after publishing the
+// generation's successor, so the next load sees that (or nil).
 func (s *Shard) Acquire() *Generation {
 	for {
 		g := s.cur.Load()
@@ -914,8 +908,6 @@ func (s *Shard) Acquire() *Generation {
 		if g.tryRef() {
 			return g
 		}
-		// g was retired between the Load and tryRef: the shard drops its own reference
-		// only after publishing g's successor, so the next Load sees that (or nil).
 	}
 }
 
@@ -970,7 +962,6 @@ func (s *Shard) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		// Another Close (or a shutdown) is under way: return once it has finished.
 		select {
 		case <-s.shutdownDone:
 			return nil
@@ -1011,7 +1002,8 @@ func (s *Shard) Abandon() { s.shutdown() }
 func (s *Shard) Options() Options { return s.opts }
 
 // shutdown stops the background goroutines and drops the shard's generation, without
-// any further flush.
+// any further flush. Taking the locks orders it after any flush, refresh or merge
+// publish in flight.
 func (s *Shard) shutdown() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -1019,8 +1011,6 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
-		// Taking the locks orders this after any flush, refresh or merge publish in
-		// flight.
 		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()

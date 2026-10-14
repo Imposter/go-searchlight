@@ -7,8 +7,8 @@
 //   - [Words] is words_of: NFKC, Normalize, runs of non-\w folded to one space, padded;
 //   - [Entries] is list_entries: split on ", ", stripped, blanks dropped;
 //   - [Number] and [AsText] are number and as_text over JSON values;
-//   - [Trigrams] and [Similarity] are pg_trgm's trigrams and similarity, as
-//     trigram_similarity computes them;
+//   - [Trigrams] and [SimilarityKeys] (over [TrigramKeys]) are pg_trgm's trigrams and
+//     similarity, as trigram_similarity computes them;
 //   - [Clean] is clean_text: a NUL becomes U+FFFD.
 //
 // Python's whitespace set, its \w class, str.casefold and str.lower differ from Go's

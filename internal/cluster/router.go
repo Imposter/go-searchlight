@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -144,7 +144,8 @@ func (n *Node) call(ctx context.Context, peer, addr, method, path string, in, ou
 }
 
 // readCall is call for a read of copy c: its outcome feeds adaptive replica selection.
-// A copy that answered stale is remembered as stale, not suspected.
+// A copy that answered stale is remembered as stale, not suspected, and an error that
+// is the request's own fault, not the copy's, does not count against the copy.
 func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out any) error {
 	done := n.ars.start(c.node, c.key())
 	service, queue, err := n.do(ctx, c.node, c.addr, http.MethodPost, path, in, out)
@@ -156,14 +157,15 @@ func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out a
 		done(false, service, queue)
 		n.ars.noteStale(c.key(), true)
 	case errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusTooManyRequests:
-		done(false, service, queue) // the request's own fault, not the copy's
+		done(false, service, queue)
 	default:
 		done(true, -1, -1)
 	}
 	return err
 }
 
-// do runs a peer request and returns what the peer reported of its load.
+// do runs a peer request and returns what the peer reported of its load. addr is a
+// peer's advertise address from the registry: peers are trusted.
 func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out any) (service, queue float64, err error) {
 	service, queue = -1, -1
 	var body io.Reader
@@ -174,8 +176,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 		}
 		body = bytes.NewReader(b)
 	}
-	// addr is a peer's advertise address from the registry: peers are trusted.
-	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // see above
+	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // addr is a trusted peer's, from the registry: see the doc comment
 	if err != nil {
 		return service, queue, err
 	}
@@ -220,7 +221,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)
-		if req.URL.Scheme == "http" && !loopback(req.URL.Hostname()) {
+		if req.URL.Scheme == "http" && !config.LoopbackHost(req.URL.Hostname()) {
 			if _, warned := n.clearWarned.LoadOrStore(req.URL.Host, true); !warned {
 				n.log.WarnContext(req.Context(), "the cluster token goes to a peer over plain HTTP: serve the peer API over TLS (tls_cert, peer_ca_file)",
 					slog.String("peer", req.URL.Host))
@@ -239,15 +240,6 @@ func (n *Node) authorize(req *http.Request) {
 // of its time answers (a search with partial results, timed_out) while the caller can
 // still use the answer.
 func peerReserve(left time.Duration) time.Duration { return min(left/5, 2*time.Second) }
-
-// loopback reports whether host names this machine.
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
 
 // reported reads the service time and queue a peer reported (-1 when it did not).
 func reported(h http.Header) (service, queue float64) {
@@ -554,7 +546,7 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 				}
 			case wctx.Err() != nil && ctx.Err() == nil:
 			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
-				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
+				n.ars.suspect(c.key())
 			default:
 				errs[i] = err
 			}

@@ -299,7 +299,8 @@ func decodeArg(v any, op string, at func(sub ...string) string, ps *problems) Ar
 	}
 }
 
-// scalar decodes one bool, number or string; false for anything else.
+// scalar decodes one bool, number or string; false for anything else. A Go number, as
+// a tree built by hand holds, is a number too.
 func scalar(v any) (Scalar, bool) {
 	switch x := v.(type) {
 	case bool:
@@ -310,7 +311,7 @@ func scalar(v any) (Scalar, bool) {
 	case string:
 		return Scalar{Kind: ArgString, Text: x, Norm: analysis.Clean(analysis.Normalize(x))}, true
 	default:
-		if n, ok := analysis.Number(v); ok { // a Go number, in a tree built by hand
+		if n, ok := analysis.Number(v); ok {
 			return Scalar{Kind: ArgNumber, Number: n, Finite: true}, true
 		}
 		return Scalar{}, false
@@ -325,13 +326,14 @@ func (s *Scalar) problem() string {
 	return textProblem(s.Text)
 }
 
-// encodeValue writes a decoded value back as compact JSON (numbers as written).
+// encodeValue writes a decoded value back as compact JSON (numbers as written). v came
+// from encoding/json, so encoding it cannot fail; nil stands for the failure anyway.
 func encodeValue(v any) json.RawMessage {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(v); err != nil {
-		return nil // unreachable: v came from encoding/json
+		return nil
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
 }

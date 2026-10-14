@@ -15,17 +15,14 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// Reduce merges shard results (from ExecuteShard with the same r) into one response:
-// the best r.Size hits over every shard by the request's sort (ties: _id, then the
-// shards' order), the summed total cut at TrackTotal, and the aggregations merged and
-// finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that
-// failed) is skipped.
-func Reduce(rs []*ShardResult, r *Request) *Response {
-	return ReduceContext(context.Background(), rs, r)
-}
-
-// ReduceContext is Reduce under ctx's trace: its span is a child of the request's.
-func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response {
+// Reduce merges shard results (from ExecuteShard with the same r) into one response,
+// under ctx's trace (its span is a child of the request's): the best r.Size hits over
+// every shard by the request's sort (ties: _id, then the shards' order), the summed
+// total cut at TrackTotal, and the aggregations merged and finished within MaxBuckets
+// buckets (see boundBuckets). A nil result (a shard that failed) is skipped. With
+// track_total false there is no bound to cut the total at: it is what the shards
+// confirmed.
+func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	start := time.Now()
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.reduce", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, r.Index), attribute.Int("shards", len(rs))))
@@ -55,7 +52,7 @@ func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response
 	case 0:
 		track = DefaultTrackTotal
 	case TrackTotalNone:
-		track = -1 // no bound to cut at: the total is what the shards confirmed
+		track = -1
 	}
 	if track >= 0 && resp.Total > track {
 		resp.Total, resp.TotalRelation = track, RelationGte
@@ -272,7 +269,7 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 		}
 	case AggTerms:
 		return reduceTerms([]*AggPartial{p}, spec)
-	default: // histograms
+	default:
 		bs := slices.Clone(p.Buckets)
 		slices.SortFunc(bs, func(a, b *BucketPartial) int { return cmpValue(a.Key, b.Key, false) })
 		for _, b := range bs {

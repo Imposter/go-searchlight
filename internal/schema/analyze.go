@@ -142,6 +142,9 @@ const (
 	modeTypes                    // the fields' types alone
 )
 
+// analyze is Analyze, AnalyzeForMatch and Check, by mode. Member names that coincide
+// once NUL-cleaned resolve by document order, which a map loses, so a body with such
+// names is decoded member by member.
 func analyze(m *Mapping, id string, body []byte, mode analyzeMode) (Doc, MappingUpdate, error) {
 	if err := ValidateID(id); err != nil {
 		return Doc{}, MappingUpdate{}, err
@@ -168,7 +171,6 @@ func analyze(m *Mapping, id string, body []byte, mode analyzeMode) (Doc, Mapping
 		a.doc.Fields[IDField] = textValue(Keyword, id, false)
 	}
 	if hasNULName(object) {
-		// Names that coincide once cleaned resolve by document order, which a map loses.
 		members, err := decodeMembers(body)
 		if err != nil {
 			return Doc{}, MappingUpdate{}, err
@@ -203,13 +205,16 @@ type analyzer struct {
 	unmapped  string          // the smallest unmapped name, under DynamicStrict
 }
 
+// member analyzes one top-level member. A name that is empty once cleaned, or longer
+// than MaxFieldChars, is passed over, as scrape-bot's index passes it over: no
+// condition can name it.
 func (a *analyzer) member(name string, value any) error {
 	if name == IDField {
 		return &ValidationError{Field: name, Message: "is reserved for the document id"}
 	}
 	name = analysis.Clean(name)
 	if name == "" || utf8.RuneCountInString(name) > MaxFieldChars {
-		return nil // as scrape-bot's index: no condition can name it
+		return nil
 	}
 	if value == nil {
 		return nil
@@ -330,7 +335,7 @@ func decodeMembers(body []byte) ([]member, error) {
 		}
 		members = append(members, member{name: name, value: value})
 	}
-	if _, err := dec.Token(); err != nil { // the closing brace
+	if _, err := dec.Token(); err != nil {
 		return nil, invalid(err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
@@ -339,14 +344,15 @@ func decodeMembers(body []byte) ([]member, error) {
 	return dedupe(members), nil
 }
 
-// dedupe keeps each repeated key at its first position with its last value.
+// dedupe keeps each repeated key at its first position with its last value. Below
+// linearMembers members a scan beats building a map.
 func dedupe(members []member) []member {
-	const linear = 16 // below this, a scan beats building a map
+	const linearMembers = 16
 	var index map[string]int
 	out := members[:0]
 	for _, mem := range members {
 		at := -1
-		if len(members) > linear {
+		if len(members) > linearMembers {
 			if index == nil {
 				index = make(map[string]int, len(members))
 			}
@@ -411,8 +417,9 @@ func analyzeValue(t FieldType, value any, grams bool) Value {
 	return Value{Present: true}
 }
 
-// textValue is a keyword or text field's value: its text, (text only) words, and, when
-// grams is set, whether its grams are indexed.
+// textValue is a keyword or text field's value: its text, (text only) words (a NUL is
+// no word character, so the words never hold one), and, when grams is set, whether its
+// grams are indexed.
 func textValue(t FieldType, value any, grams bool) Value {
 	text, ok := analysis.AsText(value)
 	if !ok {
@@ -426,7 +433,7 @@ func textValue(t FieldType, value any, grams bool) Value {
 		v.Grams = n >= 3 && !v.GramsTruncated
 	}
 	if s, isString := value.(string); isString && t == Text {
-		v.Words = analysis.Words(s) // a NUL is no word character, so Words never holds one
+		v.Words = analysis.Words(s)
 	}
 	return v
 }

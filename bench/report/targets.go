@@ -80,7 +80,9 @@ func (r *Run) workloadsIn(group string) []string {
 	return out
 }
 
-// Evaluate checks every spec section 1 target against the run's results.
+// Evaluate checks every spec section 1 target against the run's results. When the
+// cross-check failed, every comparison of the engines is invalid; the absolute targets
+// (T7, T9) compare no answers and stand.
 func Evaluate(r *Run) []TargetCheck {
 	checks := []TargetCheck{
 		r.higherIsBetter("T1", "Bulk indexing throughput (docs/s per node)", "≥ Elasticsearch, at equal durability (acknowledged = durable)", GroupIndexing, 1),
@@ -105,7 +107,7 @@ func Evaluate(r *Run) []TargetCheck {
 		for i := range checks {
 			if checks[i].Status == Pass || checks[i].Status == Fail || checks[i].Status == InsufficientSamples {
 				if checks[i].ID == "T7" || checks[i].ID == "T9" {
-					continue // absolute targets do not compare answers
+					continue
 				}
 				checks[i].Status = Invalid
 				checks[i].Detail = "The engines returned different answers (see the cross-check); a comparison of different answers is meaningless. " + checks[i].Detail

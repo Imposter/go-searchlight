@@ -154,7 +154,9 @@ func verifyFile(path string, data []byte) (parsedFooter, error) {
 }
 
 // verifyFileSections is [verifyFile], but only the sections named in required must be
-// present; a sidecar file (such as a deletes file) holds just one of them.
+// present; a sidecar file (such as a deletes file) holds just one of them. A section
+// running outside the file while the whole-file checksum fails means the table itself
+// is damaged, which is reported as the checksum mismatch.
 func verifyFileSections(path string, data []byte, required []sectionKind) (parsedFooter, error) {
 	corrupt := func(section, format string, args ...any) error {
 		return &CorruptError{Path: path, Section: section, Reason: fmt.Sprintf(format, args...)}
@@ -193,7 +195,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 		}
 		if s.off < headerSize || s.off > tableStart || s.n > tableStart-s.off {
 			if got != want {
-				break // the table itself is damaged; reported below
+				break
 			}
 			return parsedFooter{}, corrupt(s.kind.String(), "section runs outside the file")
 		}

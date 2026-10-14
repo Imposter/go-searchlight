@@ -294,16 +294,11 @@ func boundAdvertise(advertise string, bound net.Addr) string {
 	return net.JoinHostPort(host, boundPort)
 }
 
+// loopback reports whether addr, a host:port, listens on this machine's loopback
+// interface only.
 func loopback(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return err == nil && config.LoopbackHost(host)
 }
 
 func newAdminServer(tel *telemetry.T, public *atomic.Pointer[api.Server]) *http.Server {

@@ -120,7 +120,8 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	}
 }
 
-// migrateOnce applies the pending migrations under the migration lock.
+// migrateOnce applies the pending migrations under the migration lock. A connection
+// whose lock timeout cannot be reset is not put back into the pool.
 func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
 	m := &s.d.Maintenance
 	if m.MigrateInTx {
@@ -167,7 +168,7 @@ func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
 		}
 		defer func() {
 			if _, err := conn.ExecContext(context.WithoutCancel(ctx), m.MigrateLockReset); err != nil {
-				_ = conn.Raw(func(any) error { return driver.ErrBadConn }) // not back into the pool
+				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			}
 		}()
 	}

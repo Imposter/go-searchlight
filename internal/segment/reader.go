@@ -111,7 +111,17 @@ func openData(path string, data []byte) (*Reader, error) {
 // why most of them are section-relative"), so this is the one place that adds each
 // section's absolute start (from footer, the just-verified footer) - once per offset -
 // to get the absolute mmap position openDict/openKeywordColumn/.../openStoredIndex
-// each take.
+// each take. Each offset is stored as (section-relative offset) + 1, 0 meaning absent
+// (fieldOutput's doc comment in fields.go says why): resolving one subtracts the 1
+// back out, then adds the section's own absolute start, in that order.
+//
+// Present, Truncated and Untyped hand out unchecked zero-copy views of their bitmaps on
+// every call, so the bitmaps are checked once, here ([checkBitmap]). The presence
+// bitmap is always written; the others only when they hold a document (length 0:
+// none). Every number column is written with a point index (writeFieldPoints), so a
+// column without one is damage; refusing it here means Range always works from the
+// index, whose size the file bounds, never from a scan of however many documents a
+// damaged META claims.
 func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	corrupt := func() error { return &CorruptError{Path: r.path, Section: "meta", Reason: "truncated or malformed"} }
 	termsBase := footer.sections[sectionTerms].off
@@ -133,11 +143,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	for range numFields {
 		name := string(d.bytes(d.uvarint()))
 		fi := &fieldInfo{}
-		// Every offset read here (presOff/truncOff/dictOffs/keywordColOff/...) is
-		// stored as (section-relative offset) + 1, 0 meaning absent - see
-		// fieldOutput's doc comment in fields.go for why. Resolving one to the
-		// absolute mmap position openDict and friends take is "subtract the 1 back
-		// out, then add the section's own absolute start", in that order.
 		presOff, presLen := d.u64(), d.u64()
 		truncOff, truncLen := d.u64(), d.u64()
 		var untypedOff, untypedLen uint64
@@ -173,10 +178,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 		if d.err != nil {
 			return corrupt()
 		}
-		// Present, Truncated and Untyped hand these out as unchecked zero-copy views on
-		// every call, so they are checked once, here, instead ([checkBitmap]). The
-		// presence bitmap is always written; the others only when they hold a document
-		// (length 0: none).
 		if !r.validBitmap(fi.presRegion) || (truncLen > 0 && !r.validBitmap(fi.truncRegion)) ||
 			(untypedLen > 0 && !r.validBitmap(fi.untypedRegion)) {
 			return &CorruptError{Path: r.path, Section: "presence", Reason: "malformed bitmap"}
@@ -211,10 +212,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "docvalues", Reason: err.Error()}
 			}
-			// Every number column is written with a point index (writeFieldPoints), so a
-			// column without one is damage - and refusing it here means Range always
-			// works from the index, whose size the file bounds, never from a scan of
-			// however many documents a damaged META claims.
 			if pointsOff == 0 {
 				return &CorruptError{Path: r.path, Section: "points", Reason: "number column without a point index"}
 			}
@@ -536,6 +533,9 @@ func (r *Reader) storedRecord(ord uint32) (string, []byte, error) {
 // bring the mapping's reference count to zero is a use-after-close on r itself, not
 // something Retain can rescue: incrementing a reference count after the mapping was
 // already unmapped does not re-map it.
+//
+// A second zstd decoder failing to allocate is as unexpected as it is harmless to
+// ignore: the new handle then shares the original's cache.
 func (r *Reader) Retain() *Reader {
 	if r.m != nil {
 		r.m.retain()
@@ -557,8 +557,6 @@ func (r *Reader) Retain() *Reader {
 		nr.cache = cache
 		nr.ownsCache = true
 	} else {
-		// A second zstd decoder failing to allocate is as unexpected as it is
-		// harmless to ignore: fall back to sharing the original's cache.
 		nr.cache = r.cache
 		nr.ownsCache = false
 	}
@@ -571,7 +569,7 @@ func (r *Reader) Closed() bool { return r.closed.Load() }
 
 // Close unmaps the segment, once every handle from [Reader.Retain] (and the one Open
 // returned) has also been closed. Idempotent, and safe to call concurrently with any
-// other method.
+// other method. A Reader opened over caller-owned data maps nothing to unmap.
 func (r *Reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
@@ -580,7 +578,7 @@ func (r *Reader) Close() error {
 		r.cache.close()
 	}
 	if r.m == nil {
-		return nil // openData's Reader: the caller owns data
+		return nil
 	}
 	return r.m.release()
 }

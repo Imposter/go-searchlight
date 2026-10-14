@@ -62,7 +62,7 @@ real-time tests in any case.
 
 Elsewhere a test may call `t.Parallel()` when it is independent. Some state is
 process-wide, and a test that changes it stays serial: `GOMAXPROCS`, the default `slog`
-logger, the OpenTelemetry global providers (`telemetry.Setup`), `segment.SyncCounts`, the
+logger, the OpenTelemetry global providers (`telemetry.Setup`), `segment.ObserveSyncs`, the
 shard package's default merge budget and filter cache, `search.SetThreads`, package-level
 tuning variables, and environment variables.
 

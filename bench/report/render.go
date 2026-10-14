@@ -50,13 +50,13 @@ func FormatRate(v float64) string {
 
 // minSamples is the fewest recorded values needed to trust quantile q with reasonable
 // confidence, roughly 1/(1-q)×10: p50 needs 20, p90 needs 100, p99 needs 1,000, p999
-// needs 10,000. Below it, the quantile is noise, not a measurement.
+// needs 10,000. Below it, the quantile is noise, not a measurement. A small epsilon
+// absorbs float64 rounding (1-0.9 is 0.09999999999999998, not 0.1), so a q meant to
+// land on a whole number does, rather than ceiling up one.
 func minSamples(q float64) int64 {
 	if q >= 1 {
 		return math.MaxInt64
 	}
-	// A small epsilon absorbs float64 rounding (1-0.9 is 0.09999999999999998, not
-	// 0.1), so a q meant to land on a whole number does, rather than ceiling up one.
 	return int64(math.Ceil(10/(1-q) - 1e-9))
 }
 

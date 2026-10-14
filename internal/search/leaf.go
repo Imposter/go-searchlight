@@ -29,7 +29,9 @@ const maxPrefixTerms = 4096
 // missing or mistyped value does. A field's type is read from the segment's own
 // structures: a keyword column means text (its KindValue terms are texts), a number
 // column numbers, an entry dictionary list entries, and KindValue terms without a
-// keyword column a bool's true and false.
+// keyword column a bool's true and false. A one-word phrase's postings are exact, as
+// Words pads every word with spaces; a longer phrase's candidates are its words'
+// documents, checked afterwards for the words being consecutive.
 func (s *segExec) candidates(lp *leafPlan) cands {
 	r, f, a := s.r, lp.field, &lp.arg
 	empty := cands{sure: roaring.New()}
@@ -128,11 +130,9 @@ func (s *segExec) candidates(lp *leafPlan) cands {
 		out := make([]cands, len(lp.phrases))
 		for i, words := range lp.phrases {
 			if len(words) == 1 {
-				// One word: its postings are exact, as Words pads every word with spaces.
 				out[i] = cands{sure: r.Postings(f, kindWord, words[0])}
 				continue
 			}
-			// A phrase: its words' documents, then a check that they are consecutive.
 			out[i] = cands{sure: roaring.New(), maybe: s.intersectTerms(f, kindWord, words)}
 		}
 		return combine(out, lp.every)

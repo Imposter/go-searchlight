@@ -338,10 +338,12 @@ func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard
 	return b.encode(queries, byID, offsets, records)
 }
 
-// add anchors the query at rank, src its stored JSON.
+// add anchors the query at rank, src its stored JSON. Anchors and the class come from
+// the stored JSON parsed back, the very tree verification compiles, so the two can
+// never disagree. Each half of a pair is a member of its field (postings: every query
+// it is half of); the pair itself is stored once, under one of its halves (see
+// encode).
 func (b *segmentBuilder) add(rank uint32, src []byte) error {
-	// Anchors and the class come from the stored JSON parsed back, the very tree
-	// verification compiles, so the two can never disagree.
 	stored, problems := query.Parse(src)
 	if len(problems) > 0 {
 		return fmt.Errorf("query does not round-trip: %s: %s", problems[0].Loc, problems[0].Message)
@@ -388,8 +390,6 @@ func (b *segmentBuilder) add(rank uint32, src []byte) error {
 		}
 	}
 	for _, p := range set.pairs {
-		// Each half is a member of its field (postings: every query it is half of);
-		// the pair itself is stored once, under one of its halves (see encode).
 		var k [2]string
 		for i, t := range p {
 			fi := b.field(t.Field)
@@ -450,10 +450,15 @@ type treeNode struct {
 	start, count uint32
 }
 
+// encode serializes the segment: the dictionary, in key order (so a build is
+// deterministic), and its hash table; the pairs; the fields and their interval trees.
+// Each pair is stored once, under its owner, with its partner and postings. The owner
+// is the half with fewer pairs (then the rarer, then the smaller key), so a frequent
+// atom paired with many rare ones (a store with every model) keeps a short partner
+// list, and a document walks about one record per member it holds.
 func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offsets []uint64, records []byte) ([]byte, error) {
 	n := len(queries)
 
-	// The dictionary, in key order (so a build is deterministic), and its hash table.
 	keys := make([]string, 0, len(b.dict))
 	for k := range b.dict {
 		keys = append(keys, k)
@@ -506,10 +511,6 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 		}
 	}
 
-	// Pairs, each stored once under its owner, with its partner and postings. The
-	// owner is the half with fewer pairs (then the rarer, then the smaller key), so a
-	// frequent atom paired with many rare ones (a store with every model) keeps a short
-	// partner list, and a document walks about one record per member it holds.
 	entryOf := make(map[string]uint32, len(keys))
 	for i, k := range keys {
 		entryOf[k] = count32(i)
@@ -542,7 +543,6 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 		numPairs += len(list)
 	}
 
-	// Fields and their interval trees.
 	var fields []byte
 	var nodes []treeNode
 	var byLo, byHi []interval
@@ -950,7 +950,7 @@ func (s *Segment) checkRecords() error {
 
 // checkRanks checks the classes and their programs (each class's once, at its
 // first rank; the others must hold the same), the always-check list and the tree
-// records.
+// records. A NaN bound fails lo <= hi.
 func (s *Segment) checkRanks() error {
 	numFields := uint32(len(s.fields)) //nolint:gosec // bounded by a u32 count
 	for r := range s.n {
@@ -986,7 +986,7 @@ func (s *Segment) checkRanks() error {
 	for _, recs := range [][]byte{s.byLo, s.byHi} {
 		for i := 0; i < len(recs); i += recordSize {
 			lo, hi := f64(recs, i), f64(recs, i+8)
-			if !(lo <= hi) || u32(recs, i+16) >= s.n { // NaN fails lo <= hi
+			if !(lo <= hi) || u32(recs, i+16) >= s.n {
 				return errors.New("interval records: a bad interval or rank")
 			}
 		}
@@ -995,7 +995,8 @@ func (s *Segment) checkRanks() error {
 }
 
 // checkDictionary checks every entry's term and postings (at least one, plain or
-// filtered), and every slot.
+// filtered), its partners (only a member lists any), every pair (it names a member
+// entry as its partner, with valid postings), and every slot.
 func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 	for i := range numEntries {
 		e := int(i) * entrySize
@@ -1018,13 +1019,11 @@ func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 			filtN > 0 && (kind == AtomMember || !s.validFiltered(filtOff, filtN, numFields)) {
 			return fmt.Errorf("entry %d: postings out of range or order", i)
 		}
-		// Partners: only a member lists any.
 		pOff, pN := uint64(u32(s.partners, int(i)*8)), uint64(u32(s.partners, int(i)*8+4))
 		if pOff+pN > uint64(len(s.pairs)/pairSize) || pN > 0 && kind != AtomMember {
 			return fmt.Errorf("entry %d: partners out of range", i)
 		}
 	}
-	// Each pair names a member entry as its partner, with valid postings.
 	for r := 0; r < len(s.pairs); r += pairSize {
 		partner := u32(s.pairs, r)
 		if partner >= numEntries || AtomKind(u32(s.entries, int(partner)*entrySize+4)&0xff) != AtomMember ||
@@ -1042,11 +1041,11 @@ func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 
 // parseFields reads the fields section, checking each field's tree: its nodes lie in
 // its own range, every child follows its parent (so a walk ends), and every node's
-// records lie in the field's record range.
+// records lie in the field's record range. Each field takes at least minFieldSize
+// bytes (a length byte and six u32s), which bounds the count by the section before
+// anything is allocated for it.
 func (s *Segment) parseFields(b []byte, numFields, numNodes, numRecs uint32) error {
 	r := byteReader{b: b}
-	// Each field takes at least 25 bytes (a length byte and six u32s): bound the count
-	// by the section before allocating for it.
 	if uint64(numFields)*minFieldSize > uint64(len(b)) {
 		return errors.New("fields: count out of range")
 	}
@@ -1287,7 +1286,8 @@ func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint6
 	return -1
 }
 
-// lookupKey is lookup of an AtomSimKey term.
+// lookupKey is lookup of an AtomSimKey term, whose 8 bytes the segment's check
+// validated.
 func (s *Segment) lookupKey(field uint32, key uint64) int {
 	h := hashKey(field, key)
 	fk := field<<8 | uint32(AtomSimKey)
@@ -1300,7 +1300,7 @@ func (s *Segment) lookupKey(field uint32, key uint64) int {
 		if u32(s.entries, o) != hi32(h) || u32(s.entries, o+4) != fk {
 			continue
 		}
-		off := u32(s.entries, o+8) // validated: 8 bytes
+		off := u32(s.entries, o+8)
 		if binary.BigEndian.Uint64(s.terms[off:]) == key {
 			return o
 		}

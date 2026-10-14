@@ -722,13 +722,14 @@ func (c *Config) validate() []error {
 	return errs
 }
 
+// validStoreURL checks store_url's shape. An unparsable URL is reported without
+// quoting it, since it may hold a password.
 func validStoreURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("is required (--store_url, %sSTORE_URL or %sSTORE_URL_FILE)", EnvPrefix, EnvPrefix)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		// url.Error repeats the URL, which may hold a password.
 		return errors.New("is not a valid URL")
 	}
 	if !slices.Contains(StoreSchemes, strings.ToLower(u.Scheme)) {
@@ -761,6 +762,17 @@ func deriveAdvertise(listen string) string {
 		host = hostname()
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// LoopbackHost reports whether host, a host name or IP literal with no port, is this
+// machine's loopback interface: localhost, or a loopback IP.
+func LoopbackHost(host string) bool { return host == "localhost" || LoopbackIP(host) }
+
+// LoopbackIP reports whether host, with no port, is a loopback IP literal. A host name,
+// localhost included, is not one: what it resolves to depends on DNS.
+func LoopbackIP(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // LogValue renders the configuration for logs with its secrets redacted.

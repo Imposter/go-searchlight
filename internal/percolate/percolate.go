@@ -116,14 +116,6 @@ func New(opts Options) *Percolator {
 	return p
 }
 
-var defaultPercolator = sync.OnceValue(func() *Percolator { return New(Options{}) })
-
-// Percolate is [Percolator.Percolate] on a process-wide Percolator with default
-// options.
-func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
-	return defaultPercolator().Percolate(ctx, g, docs)
-}
-
 // view is one query segment of a generation, as percolation reads it.
 type view struct {
 	seg     *Segment           // nil: not the percolator's format (checked by brute force)
@@ -172,7 +164,7 @@ func (s *docStats) add(o *docStats) {
 // which exceeds the wall time when documents run in parallel).
 //
 // The documents' matches together are at most MaxMatches: past it, the call stops and
-// returns ErrTooManyMatches.
+// returns ErrTooManyMatches. A document that fails stops the other workers too.
 //
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match, and each
@@ -249,7 +241,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 				mu.Lock()
 				firstErr = cmpErr(firstErr, fmt.Errorf("percolate: document %d (%q): %w", i, docs[i].ID, err))
 				mu.Unlock()
-				next.Store(int64(len(docs))) // stop the others
+				next.Store(int64(len(docs)))
 				break
 			}
 			out[i] = ids
@@ -283,8 +275,6 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	if total.verifiedMiss > 0 {
 		p.verified.Add(ctx, int64(total.verifiedMiss), p.missSet)
 	}
-	// probe_ms and verify_ms are per-document time summed over every worker: with
-	// several workers they exceed the call's wall time.
 	span.SetAttributes(attribute.Int("candidates", total.candidates), attribute.Int("verified", total.verifiedMatch+total.verifiedMiss),
 		attribute.Int("matches", total.matched), attribute.Int("always_check", always),
 		attribute.Float64("probe_ms", float64(total.probe.Microseconds())/1000), attribute.Float64("verify_ms", float64(total.verify.Microseconds())/1000))

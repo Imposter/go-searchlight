@@ -146,7 +146,9 @@ func (j *janitor) loop() {
 }
 
 // drain closes every retired segment, queues the files of obsolete ones, and tries
-// every pending removal once. After stop nothing stays pending.
+// every pending removal once. After stop nothing stays pending. A segment's own name
+// is unique for the directory's life (and no manifest lists an obsolete one again),
+// so its files are safe to remove whenever this runs.
 func (j *janitor) drain() {
 	j.mu.Lock()
 	retired := j.retired
@@ -159,9 +161,6 @@ func (j *janitor) drain() {
 		j.s.opts.FilterCache.DropSegment(ref.id)
 		ref.closed.Store(true)
 		if ref.obsolete.Load() {
-			// A segment's own name is unique for the directory's life (and no
-			// manifest lists an obsolete one again), so its files are safe to remove
-			// whenever this runs.
 			files := segmentFiles(j.s.dir, ref.id)
 			j.mu.Lock()
 			for _, p := range files {
@@ -183,8 +182,9 @@ func (j *janitor) drain() {
 	}
 }
 
-// removeOne removes p if it is still pending; on failure it stays pending, unless the
-// janitor has stopped.
+// removeOne removes p if it is still pending (not forgotten because it is about to be
+// written again, nor removed by another drain); on failure it stays pending, unless
+// the janitor has stopped.
 func (j *janitor) removeOne(p string, stopped bool) {
 	j.removeMu.Lock()
 	defer j.removeMu.Unlock()
@@ -192,7 +192,7 @@ func (j *janitor) removeOne(p string, stopped bool) {
 	still := j.pending[p]
 	j.mu.Unlock()
 	if !still {
-		return // forgotten (about to be written again), or removed by another drain
+		return
 	}
 	err := j.remove(p)
 	if err != nil && !errors.Is(err, os.ErrNotExist) && !stopped {
@@ -202,17 +202,6 @@ func (j *janitor) removeOne(p string, stopped bool) {
 	j.mu.Lock()
 	delete(j.pending, p)
 	j.mu.Unlock()
-}
-
-// pendingFiles returns the files still waiting to be removed (for tests).
-func (j *janitor) pendingFiles() []string {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	out := make([]string, 0, len(j.pending))
-	for p := range j.pending {
-		out = append(out, p)
-	}
-	return out
 }
 
 // segmentFiles lists every file of segment id in dir: its segment or query files and

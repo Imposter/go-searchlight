@@ -35,11 +35,12 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Dialect returns the MySQL dialect.
+// Dialect returns the MySQL dialect. It panics only if the binary lacks its embedded
+// migrations directory.
 func Dialect() *dialect.Dialect {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
-		panic(err) // the embedded directory always exists
+		panic(err)
 	}
 	return &dialect.Dialect{
 		Name:        "mysql",
@@ -82,7 +83,9 @@ func alreadyApplied(err error) bool {
 // session variables. The store always interpolates parameters client-side
 // (one round trip per statement), reports matched rather than changed rows,
 // and talks UTC: the session time_zone is +00:00, so the database clock
-// (UNIX_TIMESTAMP(NOW(3))) is never ambiguous across a DST change.
+// (UNIX_TIMESTAMP(NOW(3))) is never ambiguous across a DST change. It reads
+// max_allowed_packet from the server, so a statement the server would take is never
+// refused, or interpolated past it, client-side.
 func Config(u *url.URL) (*mysql.Config, error) {
 	host := u.Host
 	if host == "" {
@@ -109,8 +112,6 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.InterpolateParams = true
 	cfg.ClientFoundRows = true
-	// Read max_allowed_packet from the server, so a statement the server
-	// would take is never refused, or interpolated past it, client-side.
 	cfg.MaxAllowedPacket = 0
 	cfg.MultiStatements = false
 	cfg.Loc = time.UTC
@@ -119,15 +120,6 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.Params["time_zone"] = "'+00:00'"
 	return cfg, nil
-}
-
-// DSN returns the go-sql-driver DSN for a mysql:// store URL.
-func DSN(u *url.URL) (string, error) {
-	cfg, err := Config(u)
-	if err != nil {
-		return "", err
-	}
-	return cfg.FormatDSN(), nil
 }
 
 func open(u *url.URL) (dialect.Pools, error) {

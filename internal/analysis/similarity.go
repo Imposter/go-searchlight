@@ -1,18 +1,14 @@
 package analysis
 
-// Similarity returns how alike a and b are, as Postgres pg_trgm's similarity measures
-// it and scrape-bot's trigram_similarity computes it: the trigrams the two texts share
-// over the trigrams either has (0 when either has none), rounded to a float32 as pg_trgm
-// returns it. See [Trigrams] for how a text's trigrams are taken.
+// SimilarityKeys returns how alike two texts are, given their [TrigramKeys] (sorted and
+// distinct), as Postgres pg_trgm's similarity measures it and scrape-bot's
+// trigram_similarity computes it: the trigrams the two texts share over the trigrams
+// either has (0 when either has none), rounded to a float32 as pg_trgm returns it. See
+// [Trigrams] for how a text's trigrams are taken. It is a merge count of the shared
+// keys, with no allocation.
 //
 // That is pg_trgm exactly for ASCII text. Beyond ASCII it follows Python (Unicode
 // lowercase, \w letters), where Postgres would follow its locale.
-func Similarity(a, b string) float64 {
-	return SimilarityKeys(TrigramKeys(a), TrigramKeys(b))
-}
-
-// SimilarityKeys is [Similarity] over two texts' [TrigramKeys] (sorted and distinct), with
-// no allocation: a merge count of the shared keys.
 func SimilarityKeys(a, b []uint64) float64 {
 	if len(a) == 0 || len(b) == 0 {
 		return 0

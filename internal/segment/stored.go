@@ -383,6 +383,9 @@ func openStoredIndex(data []byte, off, base, sectionLen uint64, numDocs uint32, 
 
 func validWidth(w uint8) bool { return w <= 56 || w == 64 }
 
+// openStoredIndexV3 opens a format-3 stored-field index: its blocks must cover the
+// ordinals 0 to numDocs contiguously, each starting at the ordinal the one before it
+// ended at.
 func openStoredIndexV3(data []byte, off, base, sectionLen uint64, numDocs uint32) (storedIndex, error) {
 	d := decoder{b: data, pos: int(off)} //nolint:gosec // bounded by len(data)
 	n := uint64(d.u32())
@@ -390,20 +393,20 @@ func openStoredIndexV3(data []byte, off, base, sectionLen uint64, numDocs uint32
 		return storedIndex{}, errShort
 	}
 	blocks := make([]storedBlockInfo, n)
-	var next uint64 // the ordinal the next block must start at
+	var nextFirstOrd uint64
 	for i := range blocks {
 		rel, clen, rawLen := d.u64(), d.u32(), d.u32()
 		firstOrd, count := d.u32(), d.u32()
 		switch {
 		case rel > sectionLen || uint64(clen) > sectionLen-rel,
-			count == 0 || uint64(firstOrd) != next,
+			count == 0 || uint64(firstOrd) != nextFirstOrd,
 			rawLen > maxStoredBlockRaw || uint64(rawLen) < 2*uint64(count):
 			return storedIndex{}, errShort
 		}
-		next += uint64(count)
+		nextFirstOrd += uint64(count)
 		blocks[i] = storedBlockInfo{off: base + rel, clen: clen, rawLen: rawLen, firstOrd: firstOrd, count: count}
 	}
-	if d.err != nil || next != uint64(numDocs) {
+	if d.err != nil || nextFirstOrd != uint64(numDocs) {
 		return storedIndex{}, errShort
 	}
 	return storedIndex{data: data, v3: blocks, numDocs: numDocs}, nil

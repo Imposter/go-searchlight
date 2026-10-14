@@ -268,10 +268,9 @@ func (n *Node) allocLoop(ctx context.Context) {
 // renew extends every lease this node holds. The local deadlines move to the clocks'
 // readings before the call plus the TTL. A lease the store did not renew (it expired
 // by the database's clock) is claimed again: the same slot at the same epoch resumes
-// the copy, anything else is a confirmed loss.
+// the copy, anything else is a confirmed loss. Only the copies held before the renewal
+// ran are judged by its result: one claimed meanwhile is not among them.
 func (n *Node) renew(ctx context.Context) {
-	// Only the copies held before the renewal ran are judged by its result: one
-	// claimed meanwhile is not in this list.
 	leases := n.leaseList()
 	if len(leases) == 0 {
 		return
@@ -309,7 +308,8 @@ func (n *Node) renew(ctx context.Context) {
 // other node took it meanwhile) holds again, and a paused copy resumes; anything else
 // is a confirmed loss, and a slot the claim took over at a new epoch keeps its
 // quarantine for the allocator's claim back. A failure to reach the store leaves the
-// lease as it is.
+// lease as it is. A slot the claim did get (another one) is the allocator's to host:
+// its next pass claims it again and finds this node already holds it.
 func (n *Node) reclaim(ctx context.Context, l *lease) {
 	before, wall := n.lc.Now(), n.lc.Wall()
 	c, ok, err := n.reg.ClaimCopy(ctx, l.copy.Shard, n.id, n.claimTarget(l.copy.Shard), n.opts.LeaseTTL)
@@ -329,8 +329,6 @@ func (n *Node) reclaim(ctx context.Context, l *lease) {
 		slog.String("shard", l.copy.Shard.String()), slog.Bool("claimed", ok), slog.Any("error", err))
 	n.inst.lease(ctx, "lost")
 	n.loseCopy(ctx, l)
-	// A slot the claim did get (another one) is the allocator's to host: its next
-	// pass claims it again and finds this node already holds it.
 }
 
 // claimTarget is the target a claim of id may fill: the index's copy target (every

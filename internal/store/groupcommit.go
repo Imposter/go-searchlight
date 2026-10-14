@@ -142,7 +142,8 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 
 // Apply commits batch as part of a group-commit transaction and returns its
 // seq range, setting each applied change's Seq, like Store.Apply (a request
-// whose every change was a skipped IfExists gets 0, 0).
+// whose every change was a skipped IfExists gets 0, 0). The batch is validated and
+// compressed in the caller's goroutine, so a bad change fails only this caller.
 func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last int64, err error) {
 	if len(batch) == 0 {
 		return 0, 0, nil
@@ -150,8 +151,6 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last
 	if err := ctx.Err(); err != nil {
 		return 0, 0, err
 	}
-	// Validate (and compress) here, in the caller's goroutine, so a bad change
-	// fails only this caller.
 	var p *prepared
 	if pa, ok := g.st.(preparedApplier); ok {
 		p, err = pa.prepare(batch)
@@ -188,6 +187,9 @@ func (g *GroupCommitter) Close() error {
 // Flushes is the number of transactions committed or attempted so far.
 func (g *GroupCommitter) Flushes() int64 { return g.flushes.Load() }
 
+// run collects requests into transactions until the committer closes. It takes whoever
+// is already waiting before looking at the clock, so a backlog is never flushed one
+// request at a time.
 func (g *GroupCommitter) run() {
 	defer close(g.done)
 	var carry *gcRequest
@@ -208,8 +210,6 @@ func (g *GroupCommitter) run() {
 		var timer clock.Timer
 	collect:
 		for n < g.maxChanges && size < g.maxBytes {
-			// Take whoever is already waiting before looking at the clock,
-			// so a backlog is never flushed one request at a time.
 			var r *gcRequest
 			select {
 			case r = <-g.reqs:
@@ -259,12 +259,21 @@ const (
 )
 
 // flush commits batch's requests in as few transactions as it takes to
-// answer each one on its own merits.
+// answer each one on its own merits. Callers that have gone are dropped before every
+// attempt.
+//
+// After a commit, each request's changes get their seqs back (a skipped IfExists
+// change keeps 0), and its range spans the ones applied. A missing index does not
+// depend on the other requests: every request naming one is answered for good, each
+// naming only the indexes its own changes refer to (not the whole batch's). Only the
+// first conflict is certain: that request is held until everything before it is
+// settled, and the rest retried. Answering a request makes the ones held after it
+// active again, since their conflicts may have depended on it; once nothing is left to
+// retry, held requests get their conflicts (everything before them is settled), and on
+// any other error every request left gets that error.
 func (g *GroupCommitter) flush(batch []*gcRequest) {
 	state := make([]int, len(batch))
 	held := make([]*ConflictError, len(batch))
-	// answer finishes request i; requests held after it are re-evaluated,
-	// since their conflicts may have depended on it.
 	answer := func(i int, res gcResult) {
 		state[i] = gcDone
 		batch[i].result <- res
@@ -275,8 +284,6 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 			}
 		}
 	}
-	// finish answers everyone left: held requests with their conflicts when
-	// err is nil (everything before them is settled), all others with err.
 	finish := func(err error) {
 		for i := range batch {
 			switch {
@@ -289,7 +296,6 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 		}
 	}
 	for {
-		// Callers that have gone are dropped before every attempt.
 		for i, r := range batch {
 			if state[i] != gcDone && r.ctx.Err() != nil {
 				answer(i, gcResult{err: r.ctx.Err()})
@@ -315,8 +321,6 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 		var nf *IndexNotFoundError
 		switch {
 		case err == nil:
-			// Each request's changes get their seqs back (a skipped IfExists
-			// change keeps 0), and its range spans the ones applied.
 			off := 0
 			for _, i := range live {
 				var res gcResult
@@ -338,16 +342,10 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 			finish(nil)
 			return
 		case errors.As(err, &nf):
-			// A missing index does not depend on the other requests: every
-			// request naming one is answered for good, each naming only the
-			// indexes its own changes refer to (not the whole batch's).
 			for k, e := range splitPositions(reqs, nf.Positions, nil) {
 				answer(live[k], gcResult{err: &IndexNotFoundError{Indexes: ownIndexes(reqs[k], e.Positions), Positions: e.Positions}})
 			}
 		case errors.As(err, &ce):
-			// Only the first conflict is certain; hold it until everything
-			// before it is settled and retry the rest. Requests held after it
-			// are retried too: their conflicts may have depended on it.
 			parts := splitPositions(reqs, ce.Positions, ce.Current)
 			k := minKey(parts)
 			for j := live[k] + 1; j < len(batch); j++ {
@@ -366,7 +364,9 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 }
 
 // commit runs one transaction for reqs and returns the combined batch, each applied
-// change's Seq set.
+// change's Seq set. The transaction runs until it finishes or every caller has gone.
+// An Applier that does not report each change's Seq applied them all, in order, as
+// first..last.
 func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 	total := 0
 	links := make([]trace.Link, 0, len(reqs))
@@ -383,7 +383,6 @@ func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 		prep.append(r.prep)
 	}
 
-	// The transaction runs until it finishes or every caller has gone.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var waiting atomic.Int64
@@ -419,8 +418,6 @@ func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 		span.SetStatus(codes.Error, err.Error())
 		return changes, err
 	}
-	// An Applier that does not report each change's Seq applied them all, in
-	// order, as first..last.
 	if last-first+1 == int64(len(changes)) && len(changes) > 0 && changes[0].Seq == 0 {
 		for i := range changes {
 			changes[i].Seq = first + int64(i)

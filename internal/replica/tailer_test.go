@@ -877,9 +877,10 @@ func TestLagMetrics(t *testing.T) {
 	})
 }
 
-// TestRecover covers the standalone Recover: an empty copy loads the snapshot, a copy
-// with changes resumes, and a half-loaded or stale one must be wiped.
-func TestRecover(t *testing.T) {
+// TestTailerStart covers how a tailer's start sorts the copy it was given: an empty
+// copy asks for a rebuild and loads the snapshot, a copy with changes resumes, and a
+// half-loaded or stale one asks for a rebuild.
+func TestTailerStart(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		ctx := context.Background()
 		st := d.open(t)
@@ -890,9 +891,11 @@ func TestRecover(t *testing.T) {
 		head := mustApply(t, st, del("rc", 0, "b"), upsert("rc", 1, "z", `{}`))
 		dir := t.TempDir()
 		sh := openShard(t, dir, testShardOptions(id))
-		seq, err := Recover(ctx, sh, st, id)
+		tl := NewTailer(st, sh, id, Options{})
+		wantRebuild(t, tl.start(ctx), reasonEmpty)
+		seq, err := tl.loadSnapshot(ctx, sh)
 		if err != nil || seq != head {
-			t.Fatalf("Recover = %d, %v; want %d", seq, err, head)
+			t.Fatalf("loadSnapshot = %d, %v; want %d", seq, err, head)
 		}
 		if err := sh.WaitRefreshed(ctx, head); err != nil {
 			t.Fatal(err)
@@ -900,14 +903,14 @@ func TestRecover(t *testing.T) {
 		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
 			t.Fatalf("recovered copy differs:\n%s", dd)
 		}
-		if seq, err := Recover(ctx, sh, st, id); err != nil || seq != head {
-			t.Fatalf("Recover of a loaded copy = %d, %v", seq, err)
+		loaded := NewTailer(st, sh, id, Options{})
+		if err := loaded.start(ctx); err != nil || loaded.Applied() != head {
+			t.Fatalf("start of a loaded copy = %v, applied %d; want nil, %d", err, loaded.Applied(), head)
 		}
 		if err := sh.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
 
-		// Half loaded: segments committed at seq 0.
 		half := openShard(t, t.TempDir(), testShardOptions(id))
 		defer half.Close(ctx)
 		doc := upsertChange(t, "x", 5)
@@ -917,21 +920,24 @@ func TestRecover(t *testing.T) {
 		if err := half.Refresh(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Recover(ctx, half, st, id); !errors.Is(err, ErrWipeNeeded) {
-			t.Fatalf("Recover of a half-loaded copy: %v", err)
-		}
+		wantRebuild(t, NewTailer(st, half, id, Options{}).start(ctx), reasonInterrupted)
 
-		// Another incarnation.
 		old := openShard(t, dir, testShardOptions(id))
 		defer old.Close(ctx)
 		if err := st.Indexes().Drop(ctx, "rc"); err != nil {
 			t.Fatal(err)
 		}
 		createIndex(t, st, "rc", testMapping)
-		if _, err := Recover(ctx, old, st, id); !errors.Is(err, ErrWipeNeeded) {
-			t.Fatalf("Recover of a stale incarnation: %v", err)
-		}
+		wantRebuild(t, NewTailer(st, old, id, Options{}).start(ctx), reasonIncarnation)
 	})
+}
+
+func wantRebuild(t *testing.T, err error, reason string) {
+	t.Helper()
+	var rb *rebuildError
+	if !errors.As(err, &rb) || rb.reason != reason {
+		t.Fatalf("start = %v; want a rebuild for %q", err, reason)
+	}
 }
 
 func upsertChange(t testing.TB, id string, seq int64) shard.Change {

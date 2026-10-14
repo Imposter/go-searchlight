@@ -1,8 +1,8 @@
 // Package percolate is Searchlight's percolator (spec section 7): it answers "which saved
 // queries match this document?" by reverse-indexing the saved queries.
 //
-// Each saved query is reduced to its anchors ([Extract]): a set of atoms, at least one of
-// which every document the query matches must hold. A query segment ([Index]) maps each
+// Each saved query is reduced to its anchors: a set of atoms, at least one of which
+// every document the query matches must hold. A query segment ([Index]) maps each
 // atom to the queries anchored on it (a hash dictionary of terms to postings of queries,
 // some with a filter on another field, and an interval tree per numeric field), and
 // keeps an always-check list of the queries no atom can anchor. Percolating a document
@@ -57,7 +57,7 @@ const (
 	AtomText
 	// AtomNonempty is a keyword_list field with an entry, the term "": nonempty.
 	AtomNonempty
-	// AtomMember is an atom that is one half of a pair anchor (see [Anchors].Pairs), its
+	// AtomMember is an atom that is one half of a pair anchor (a conjunctive one), its
 	// term the atom's kind byte then its term. Its postings are every query with a pair
 	// it is half of, and it lists its partners (see the format notes in index.go).
 	AtomMember
@@ -100,64 +100,9 @@ type Range struct {
 	Lo, Hi float64
 }
 
-// Anchors are what [Extract] makes of a query: either Always (no atom implies it, so it
-// is checked against every document) or a set of atoms such that every document the
-// query matches holds at least one of them. An empty set (not Always, no term, no
-// range) is a query that matches nothing.
-type Anchors struct {
-	Always bool
-	Terms  []Term
-	Ranges []Range
-	// Pairs are conjunctive anchors: a document holding both atoms of a pair (each of a
-	// pairable kind: AtomValue, AtomBool, AtomEntry or AtomWord).
-	Pairs [][2]Term
-	// Cost estimates the fraction of documents the query is a candidate for, from the
-	// term statistics: the sum over its atoms. It decides which child of an all group
-	// anchors the group, and nothing else.
-	Cost float64
-}
-
 // TermStats are document statistics for choosing anchors: the shard's
 // ([shard.Generation] implements it).
 type TermStats = shard.TermStats
-
-// Extract returns n's anchors (spec section 7), choosing among alternatives with stats
-// (nil: fixed priors by atom kind).
-//
-// The rules, each sound against [query.Compiled.Match]:
-//
-//   - eq, in: a string is an AtomValue of its normalized text (the _id pseudo-field
-//     included), a bool an AtomBool, a finite number a point Range. An in is the union
-//     of its values.
-//   - lt, lte, gt, gte, between: a Range.
-//   - has, has_any: the union of AtomEntry; has_all: its rarest entry.
-//   - words_any: the union over phrases of each phrase's anchor, the pair of its two
-//     rarest distinct words (one word: that word); words_all: the cheapest phrase's
-//     (every phrase must appear, so each of its words).
-//   - contains, contains_any, starts_with: per needle, its rarest 3-rune window
-//     (AtomGram), or AtomText for a needle of fewer than three runes; the union over
-//     needles; contains_all: the rarest needle's.
-//   - similar with a minimum above 0: the union of its text's AtomSimKey (a similarity
-//     above 0 needs a shared trigram); otherwise AtomText.
-//   - exists (true): AtomPresent; nonempty: AtomNonempty.
-//   - all: the cheapest anchorable child (every child holds, so its atoms do), or, when
-//     cheaper, the pairs of two children made only of value, bool, entry and word atoms
-//     (each holds, so the document has an atom of each: Pairs, at most 16 per
-//     group); only when no child is anchorable is the group Always. Cost is the
-//     estimated fraction of documents holding the anchor (a pair's, the product).
-//   - any: the union of its children; one Always child makes the group Always. An any
-//     with no child (never true) is the empty set.
-//   - not: Always, but not(not x) is x. ne, exists:false, empty, and the root
-//     {"all": []} are Always, as is anything this list does not name (an unknown op, a
-//     value the op cannot read, a nil node): when in doubt, Always.
-func Extract(n query.Node, stats TermStats) Anchors {
-	e := newExtractor(stats)
-	set := e.node(n)
-	if !set.ok {
-		return Anchors{Always: true, Cost: 1}
-	}
-	return Anchors{Terms: set.terms, Ranges: set.ranges, Pairs: set.pairs, Cost: set.cost}
-}
 
 // postFilter is a cheap condition stored with a query's term postings: a document
 // holding the term is a candidate only if its value of field passes too. It is a
@@ -467,7 +412,14 @@ func (f fact) implies(c conjunct) bool {
 	return false
 }
 
-// aset is an anchor set under construction; ok false is Always.
+// aset is a query's anchors: either Always (ok false: no atom implies the query, so it
+// is checked against every document) or a set of atoms such that every document the
+// query matches holds at least one of them. An empty set (ok, no term, no range) is a
+// query that matches nothing. pairs are conjunctive anchors: a document holding both
+// atoms of a pair (each of a pairable kind: AtomValue, AtomBool, AtomEntry or
+// AtomWord). cost estimates the fraction of documents the query is a candidate for,
+// from the term statistics: the sum over its atoms. It decides which child of an all
+// group anchors the group, and nothing else.
 type aset struct {
 	ok     bool
 	terms  []Term
@@ -520,11 +472,41 @@ func newExtractor(stats TermStats) *extractor {
 	return e
 }
 
+// node returns n's anchors (spec section 7), choosing among alternatives with the
+// extractor's statistics (none: fixed priors by atom kind).
+//
+// The rules, each sound against [query.Compiled.Match]:
+//
+//   - eq, in: a string is an AtomValue of its normalized text (the _id pseudo-field
+//     included), a bool an AtomBool, a finite number a point Range. An in is the union
+//     of its values.
+//   - lt, lte, gt, gte, between: a Range.
+//   - has, has_any: the union of AtomEntry; has_all: its rarest entry.
+//   - words_any: the union over phrases of each phrase's anchor, the pair of its two
+//     rarest distinct words (one word: that word); words_all: the cheapest phrase's
+//     (every phrase must appear, so each of its words).
+//   - contains, contains_any, starts_with: per needle, its rarest 3-rune window
+//     (AtomGram), or AtomText for a needle of fewer than three runes; the union over
+//     needles; contains_all: the rarest needle's.
+//   - similar with a minimum above 0: the union of its text's AtomSimKey (a similarity
+//     above 0 needs a shared trigram); otherwise AtomText.
+//   - exists (true): AtomPresent; nonempty: AtomNonempty.
+//   - all: the cheapest anchorable child (every child holds, so its atoms do), or, when
+//     cheaper, the pairs of two children made only of value, bool, entry and word atoms
+//     (each holds, so the document has an atom of each: Pairs, at most 16 per
+//     group); only when no child is anchorable is the group Always. Cost is the
+//     estimated fraction of documents holding the anchor (a pair's, the product: the
+//     two are assumed independent).
+//   - any: the union of its children; one Always child makes the group Always. An any
+//     with no child (never true) is the empty set.
+//   - not: Always, but not(not x) is x. ne, exists:false, empty, and the root
+//     {"all": []} are Always, as is anything this list does not name (an unknown op, a
+//     value the op cannot read, a nil node): when in doubt, Always.
 func (e *extractor) node(n query.Node) aset {
 	switch x := n.(type) {
 	case *query.All:
 		if x == nil || len(x.Children) == 0 {
-			return always // {"all": []} holds for every document
+			return always
 		}
 		best := always
 		var pairable []aset
@@ -537,8 +519,6 @@ func (e *extractor) node(n query.Node) aset {
 				pairable = append(pairable, c)
 			}
 		}
-		// Two children hold together, so a document holds an atom of each: a pair of
-		// them anchors the group, as selective as both (assumed independent).
 		for i := range pairable {
 			for j := i + 1; j < len(pairable); j++ {
 				a, b := &pairable[i], &pairable[j]
@@ -569,7 +549,7 @@ func (e *extractor) node(n query.Node) aset {
 			return always
 		}
 		if inner, ok := x.Child.(*query.Not); ok && inner != nil {
-			return e.node(inner.Child) // not(not x) holds exactly when x does
+			return e.node(inner.Child)
 		}
 		return always
 	case *query.Leaf:
@@ -644,6 +624,10 @@ func cheapest(sets []aset) aset {
 	return best
 }
 
+// leaf returns a condition's anchors, by the rules [extractor.node] lists. A between
+// whose bounds are reversed never holds, and Always is merely wasteful for it. exists
+// anchors on presence unless its value is false, as the matcher's `value is not
+// False`.
 func (e *extractor) leaf(l *query.Leaf) aset {
 	a := l.Decoded()
 	f := l.Field
@@ -668,11 +652,11 @@ func (e *extractor) leaf(l *query.Leaf) aset {
 		}
 		lo, hi := a.List[0].Number, a.List[1].Number
 		if lo > hi {
-			return always // never holds; Always is merely wasteful
+			return always
 		}
 		return e.rangeSet(f, lo, hi)
 	case query.OpExists:
-		if a.Kind != query.ArgBool || a.Scalar.Bool { // the matcher's `value is not False`
+		if a.Kind != query.ArgBool || a.Scalar.Bool {
 			return e.term(AtomPresent, f, "")
 		}
 		return always
@@ -707,7 +691,7 @@ func (e *extractor) leaf(l *query.Leaf) aset {
 		return e.words(f, &a, l.Op == query.OpWordsAll)
 	case query.OpSimilar:
 		return e.similar(f, &a)
-	default: // ne, empty, an unknown op
+	default:
 		return always
 	}
 }
@@ -760,6 +744,9 @@ func (e *extractor) eq(f string, a *query.Arg) aset {
 	}
 }
 
+// in anchors an in condition on the union of its values. The matcher drops a number no
+// float64 holds, which equals nothing, and with no value the matcher can read an in
+// never holds: the empty set.
 func (e *extractor) in(f string, a *query.Arg) aset {
 	if a.Kind != query.ArgList {
 		return always
@@ -773,12 +760,12 @@ func (e *extractor) in(f string, a *query.Arg) aset {
 		case query.ArgBool:
 			out = union(out, e.term(AtomBool, f, boolTerm(s.Bool)))
 		case query.ArgNumber:
-			if s.Finite { // the matcher drops a number no float64 holds: it equals nothing
+			if s.Finite {
 				out = union(out, e.rangeSet(f, s.Number, s.Number))
 			}
 		}
 	}
-	return out // with no value the matcher can read, in never holds: the empty set
+	return out
 }
 
 func boolTerm(b bool) string {
@@ -807,15 +794,18 @@ func (e *extractor) needle(f, norm string) aset {
 // words anchors words_all and words_any. A phrase's words string (" a b ") is a
 // substring of a document's only if each of its words is one of the document's words,
 // so a phrase anchors on the pair of its two rarest distinct words, or on its word.
+// Words are taken from the text as written, as the matcher takes them. A phrase with
+// no word matches nothing: words_any passes over it, and words_all never holds, for
+// which Always is merely wasteful.
 func (e *extractor) words(f string, a *query.Arg, every bool) aset {
 	var sets []aset
 	for _, t := range texts(a) {
-		w := analysis.Words(t.Text) // the matcher takes words from the text as written
+		w := analysis.Words(t.Text)
 		if w == analysis.NoWords {
 			if every {
-				return always // never holds; Always is merely wasteful
+				return always
 			}
-			continue // a phrase with no word matches nothing
+			continue
 		}
 		var best, second aset
 		analysis.EachWord(w, func(word string) {

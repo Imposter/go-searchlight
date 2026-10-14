@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -1170,14 +1171,8 @@ func TestDuplicateIDsRefused(t *testing.T) {
 func TestNoDirSync(t *testing.T) {
 	docs := testDocs(t)
 	dir := t.TempDir()
-	count := func(f func()) SyncStats {
-		before := SyncCounts()
-		f()
-		after := SyncCounts()
-		return SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
-	}
 	var meta Meta
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		var err error
 		if meta, err = Build(dir, docs, BuildOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
@@ -1185,7 +1180,7 @@ func TestNoDirSync(t *testing.T) {
 	}); got.Files < 1 || got.Dirs != 0 {
 		t.Fatalf("Build with NoDirSync: %+v syncs, want the file's and no directory's", got)
 	}
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if _, err := Build(dir, docs, BuildOptions{}); err != nil {
 			t.Fatal(err)
 		}
@@ -1197,14 +1192,14 @@ func TestNoDirSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if _, err := Merge(dir, []*Reader{r}, nil, MergeOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
 		}
 	}); got.Files < 1 || got.Dirs != 0 {
 		t.Fatalf("Merge with NoDirSync: %+v syncs", got)
 	}
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if err := WriteDeletes(dir, meta.ID, 1, roaring.BitmapOf(1), DeletesOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -1246,4 +1241,35 @@ func TestNumTermsAndResidentBytes(t *testing.T) {
 	if _, err := r.ResidentBytes(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("ResidentBytes after Close = %v", err)
 	}
+}
+
+// syncStats are fsyncs counted through ObserveSyncs: of files and of directories.
+type syncStats struct{ Files, Dirs int64 }
+
+// syncCounter counts every fsync SyncFile and SyncDir make while it is
+// installed, whoever asks for them.
+type syncCounter struct{ files, dirs atomic.Int64 }
+
+// countSyncs installs a syncCounter until stop is called.
+func countSyncs() (c *syncCounter, stop func()) {
+	c = &syncCounter{}
+	return c, ObserveSyncs(func(_ string, dir bool) {
+		if dir {
+			c.dirs.Add(1)
+		} else {
+			c.files.Add(1)
+		}
+	})
+}
+
+func (c *syncCounter) stats() syncStats {
+	return syncStats{Files: c.files.Load(), Dirs: c.dirs.Load()}
+}
+
+// syncsDuring returns the fsyncs made while f ran.
+func syncsDuring(f func()) syncStats {
+	c, stop := countSyncs()
+	f()
+	stop()
+	return c.stats()
 }

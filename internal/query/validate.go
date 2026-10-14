@@ -14,7 +14,8 @@ import (
 const maxNamedFields = 20
 
 // Validate reports every problem with n as a query of an index with mapping m (nil: no
-// field but the pseudo-field [schema.IDField]):
+// field but the pseudo-field [schema.IDField]). The root {"all": []}, every document,
+// has none. It checks:
 //
 //   - each condition's field is mapped (or is _id, a keyword);
 //   - its op is one the field's type takes (spec section 3, [OpsFor]);
@@ -36,7 +37,7 @@ func Validate(n Node, m *schema.Mapping) []Problem {
 		return ps
 	}
 	if root, ok := n.(*All); ok && len(root.Children) == 0 {
-		return nil // {"all": []}: every document
+		return nil
 	}
 	if msg := boundsProblem(n); msg != "" {
 		ps.add(RootLoc, msg)

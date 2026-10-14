@@ -647,9 +647,9 @@ func (f *faultStore) Indexes() store.IndexStore {
 	return &faultIndexes{IndexStore: f.Store.Indexes(), f: f}
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, store.ChangeMark, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if f.isDown() {
-		return 0, store.ChangeMark{}, errPartitioned
+		return store.ScanPoint{}, errPartitioned
 	}
 	return f.Store.ScanShard(ctx, id, fn)
 }
@@ -734,11 +734,11 @@ func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
 	return f.Store.HeadSeq(ctx)
 }
 
-func (f *faultStore) Tip(ctx context.Context, seq int64) (store.Tip, error) {
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
 	if f.isDown() {
 		return store.Tip{}, errPartitioned
 	}
-	return f.Store.Tip(ctx, seq)
+	return f.Store.Tip(ctx, q)
 }
 
 func (f *faultStore) Ping(ctx context.Context) error {

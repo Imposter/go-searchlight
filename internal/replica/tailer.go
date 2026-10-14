@@ -646,7 +646,7 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		return false, err
 	}
 	from := t.Applied()
-	tip, err := t.st.Tip(ctx, t.rw.checkSeq(from))
+	tip, err := t.st.Tip(ctx, t.rw.query(t.id, from))
 	if err != nil {
 		t.pollFailed()
 		return false, err
@@ -686,19 +686,19 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		if err := t.applyChanges(ctx, sh, changes); err != nil {
 			return false, err
 		}
-		recordMark(sh, &t.rw, changes[n-1].Mark())
+		noteApplied(sh, &t.rw, changes[n-1].Mark())
 	}
 	if len(changes) >= t.opts.BatchSize {
 		return false, nil // more to read now
 	}
 	// The head was read before the page: every change at or below it had
 	// committed, and the page holds all of this shard's after from.
-	if head > t.Applied() {
+	if prev := t.Applied(); head > prev {
 		if err := sh.Advance(head); err != nil {
 			return false, err
 		}
 		t.applied.Store(head)
-		recordMark(sh, &t.rw, tip.HeadMark)
+		noteAdvanced(sh, &t.rw, prev, head, tip.HeadMark)
 	}
 	t.observeLag(head, t.Applied(), false, 0)
 	return true, nil

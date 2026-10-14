@@ -66,16 +66,19 @@ type manifest struct {
 	// AnchorMark is the caller's anchor mark ([Shard.SetAnchorMark]), which holds
 	// whatever Seq is: the last change the caller verified the changelog still holds.
 	AnchorMark json.RawMessage `json:"anchor_mark,omitempty"`
+	// OwnMark is the caller's mark of the copy's own shard ([Shard.SetOwnMark]),
+	// which holds whatever Seq is.
+	OwnMark json.RawMessage `json:"own_mark,omitempty"`
 }
 
 // marks are the caller's marks a generation carries and a flush persists: the mark of
-// the change at the generation's seq, and the anchor mark.
+// the change at the generation's seq, the anchor mark and the own mark.
 type marks struct {
-	seq, anchor json.RawMessage
+	seq, anchor, own json.RawMessage
 }
 
 func (m marks) equal(o marks) bool {
-	return bytes.Equal(m.seq, o.seq) && bytes.Equal(m.anchor, o.anchor)
+	return bytes.Equal(m.seq, o.seq) && bytes.Equal(m.anchor, o.anchor) && bytes.Equal(m.own, o.own)
 }
 
 // untypedMarksFormat is the manifest's UntypedMarks when its previous-major segments

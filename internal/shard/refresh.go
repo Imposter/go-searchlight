@@ -46,7 +46,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 
 	s.mu.Lock()
 	fb := s.buf
-	seq, maxSeq, uid, mp, mk := s.applied, s.maxChange, s.indexUID, s.mapState, marks{seq: s.markAt(s.applied), anchor: s.anchor}
+	seq, maxSeq, uid, mp, mk := s.applied, s.maxChange, s.indexUID, s.mapState, marks{seq: s.markAt(s.applied), anchor: s.anchor, own: s.own}
 	if fb.empty() {
 		s.mu.Unlock()
 		if seq == cur.seq && uid == cur.uid && mp == cur.mp && mk.equal(cur.marks) {

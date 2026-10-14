@@ -2,6 +2,7 @@ package replica
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -193,6 +194,61 @@ func TestRewindRightAfterASnapshotLoadRebuildsTheCopy(t *testing.T) {
 		fs.mu.Unlock()
 		opts, reader := meteredOptions()
 		c := newCopy(t, fs, id, opts)
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
+		}
+	})
+}
+
+// TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy: a copy whose marks
+// name another shard's row (the head it advanced to) is stopped across a lossy
+// failover. The lost seqs are reissued, two to the copy's own shard and the rest to
+// the other shard, which then prunes them all (its copies applied them) before the
+// copy starts again: no row is left at its marks' seqs. The copy's own shard shows
+// the rewind all the same (a change of its shard it never applied, at or below the
+// seq it checked), and the copy rebuilds.
+func TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		createIndex(t, st, "x", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		opts, reader := meteredOptions()
+		c := newCopy(t, d.open(t), id, opts)
+		c.start()
+		k := mustApply(t, st, upsert("w", 0, "kept", docBody("kept", 1)))
+		mustApply(t, st, upsert("w", 0, "lost0", docBody("lost", 0)))
+		var last int64
+		for i := range 4 {
+			last = mustApply(t, st, upsert("x", 0, fmt.Sprintf("xl%d", i), docBody("xl", i)))
+		}
+		c.waitApplied(last)
+		for range 3 { // polls check and promote the marks, the last an x/0 row
+			c.current().Wake()
+			time.Sleep(100 * time.Millisecond)
+		}
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rewind(ctx, t, d, k)
+		var batch []store.Change
+		for i := range 6 {
+			index := "x"
+			if i < 2 {
+				index = "w"
+			}
+			batch = append(batch, upsert(index, 0, fmt.Sprintf("new%d", i), docBody("new", i)))
+		}
+		head := mustApply(t, st, batch...)
+		if err := st.Prune(ctx, store.ShardID{Index: "x", Shard: 0}, head+1); err != nil {
+			t.Fatal(err)
+		}
 		c.start()
 		waitMatches(t, c, st, id)
 		if n := rewindCount(t, reader, "w"); n < 1 {

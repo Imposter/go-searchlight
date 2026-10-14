@@ -528,7 +528,7 @@ func TestScanShardSnapshot(t *testing.T) {
 		}
 		var lateSeq int64
 		var ids []string
-		asOf, mark, err := st.ScanShard(ctx, shard, func(r Record) error {
+		pt, err := st.ScanShard(ctx, shard, func(r Record) error {
 			if r.Kind == RecordMapping {
 				return nil
 			}
@@ -549,6 +549,10 @@ func TestScanShardSnapshot(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		asOf, mark := pt.Seq, pt.Mark
+		if !pt.ShardMark.Same(mark) {
+			t.Fatalf("the shard's newest change at the snapshot %+v, want the change at its seq %+v", pt.ShardMark, mark)
+		}
 		if asOf != 5 || lateSeq != 6 {
 			t.Fatalf("asOf %d, late seq %d; want 5 and 6", asOf, lateSeq)
 		}
@@ -567,7 +571,7 @@ func TestScanShardSnapshot(t *testing.T) {
 		}
 		// A callback error stops the scan and is returned.
 		boom := errors.New("boom")
-		if _, _, err := st.ScanShard(ctx, shard, func(Record) error { return boom }); !errors.Is(err, boom) {
+		if _, err := st.ScanShard(ctx, shard, func(Record) error { return boom }); !errors.Is(err, boom) {
 			t.Fatalf("scan error %v", err)
 		}
 	})
@@ -637,7 +641,7 @@ func TestCancellation(t *testing.T) {
 		if _, err := st.ChangesAfter(done, shard, 0, 10); !errors.Is(err, context.Canceled) {
 			t.Fatalf("changes with a cancelled context: %v", err)
 		}
-		if _, _, err := st.ScanShard(done, shard, func(Record) error { return nil }); !errors.Is(err, context.Canceled) {
+		if _, err := st.ScanShard(done, shard, func(Record) error { return nil }); !errors.Is(err, context.Canceled) {
 			t.Fatalf("scan with a cancelled context: %v", err)
 		}
 
@@ -1601,7 +1605,7 @@ func TestTip(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		tip, err := st.Tip(ctx, 0)
+		tip, err := st.Tip(ctx, TipQuery{})
 		if err != nil || tip.Head != 0 || tip.HeadMark != (ChangeMark{}) || tip.AtMark != (ChangeMark{}) || time.Since(tip.Now).Abs() > time.Minute {
 			t.Fatalf("empty store tip = %+v, %v", tip, err)
 		}
@@ -1612,7 +1616,7 @@ func TestTip(t *testing.T) {
 		if err != nil || len(changes) != 2 {
 			t.Fatalf("shard 1: %v, %v", changes, err)
 		}
-		tip, err = st.Tip(ctx, changes[0].Seq)
+		tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq})
 		if err != nil || tip.Head != last {
 			t.Fatalf("tip = %+v, %v; want head %d", tip, err, last)
 		}
@@ -1622,17 +1626,37 @@ func TestTip(t *testing.T) {
 		if tip.AtMark.Same(tip.HeadMark) {
 			t.Fatal("two changes have the same mark")
 		}
-		if tip, err = st.Tip(ctx, last+1); err != nil || tip.AtMark != (ChangeMark{}) {
+		if tip, err = st.Tip(ctx, TipQuery{At: last + 1}); err != nil || tip.AtMark != (ChangeMark{}) {
 			t.Fatalf("tip past the head = %+v, %v", tip, err)
 		}
-		if err := st.Prune(ctx, ShardID{Index: "t", Shard: 1}, last); err != nil {
+		meta, err := st.Indexes().Get(ctx, "t")
+		if err != nil {
 			t.Fatal(err)
 		}
-		if tip, err = st.Tip(ctx, changes[0].Seq); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
+		shard1 := ShardID{Index: "t", Shard: 1}
+		for _, tc := range []struct {
+			upTo int64
+			want ChangeMark
+		}{{last, changes[1].Mark()}, {last - 1, changes[0].Mark()}, {changes[0].Seq - 1, ChangeMark{}}} {
+			tip, err = st.Tip(ctx, TipQuery{Shard: shard1, UpTo: tc.upTo})
+			if err != nil || !tip.ShardMark.Same(tc.want) || tip.ShardMark.Seq != tc.want.Seq || tip.Horizon != 0 || tip.IndexUID != meta.UID {
+				t.Fatalf("shard 1 up to %d: %+v, %v; want %+v, no horizon, uid %s", tc.upTo, tip, err, tc.want, meta.UID)
+			}
+		}
+		if tip, err = st.Tip(ctx, TipQuery{Shard: ShardID{Index: "gone", Shard: 0}, UpTo: last}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.IndexUID != "" {
+			t.Fatalf("a missing index's tip: %+v, %v", tip, err)
+		}
+		if err := st.Prune(ctx, shard1, last); err != nil {
+			t.Fatal(err)
+		}
+		if tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq}); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
 			t.Fatalf("tip at a pruned seq = %+v, %v", tip, err)
 		}
+		if tip, err = st.Tip(ctx, TipQuery{Shard: shard1, UpTo: last - 1}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.Horizon != last {
+			t.Fatalf("shard 1 after a prune: %+v, %v; want no change and horizon %d", tip, err, last)
+		}
 		_ = st.Close()
-		if _, err := st.Tip(ctx, 0); !errors.Is(err, ErrClosed) {
+		if _, err := st.Tip(ctx, TipQuery{}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("tip after close: %v", err)
 		}
 	})
@@ -2080,7 +2104,7 @@ func TestMappingChanges(t *testing.T) {
 			t.Fatalf("changes %+v", changes)
 		}
 		var mapping []Record
-		_, _, err = st.ScanShard(ctx, ShardID{Index: "mc", Shard: 1}, func(r Record) error {
+		_, err = st.ScanShard(ctx, ShardID{Index: "mc", Shard: 1}, func(r Record) error {
 			if r.Kind == RecordMapping {
 				mapping = append(mapping, r)
 			} else if r.MappingVersion != 2 {

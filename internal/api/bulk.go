@@ -121,7 +121,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 }
 
 // parseBulk reads the NDJSON body into ops, bounded by max_bulk_ops and, per line,
-// max_doc_bytes.
+// max_doc_bytes. Blank lines, a blank last line included, are skipped.
 func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 	br := bufio.NewReaderSize(body, 64<<10)
 	var ops []WriteOp
@@ -140,7 +140,7 @@ func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 				return b, true, nil
 			}
 			if errors.Is(err, io.EOF) {
-				return nil, false, nil // a blank last line
+				return nil, false, nil
 			}
 		}
 	}
@@ -204,7 +204,10 @@ func (s *Server) readLine(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
-// parseAction reads an action line.
+// parseAction reads an action line. An id must be valid UTF-8 as its JSON spells it:
+// decoding would replace invalid UTF-8 with U+FFFD, silently writing another id, and an
+// escape that is no character (a lone surrogate, "\ud800") decodes to U+FFFD too, so
+// an id holding one its JSON did not spell is refused.
 func parseAction(raw []byte, line int) (WriteOp, *Error) {
 	loc := fmt.Sprintf("line.%d", line)
 	var obj map[string]json.RawMessage
@@ -240,16 +243,12 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 	case meta.ID == nil:
 		return WriteOp{}, InvalidAt(loc+".id", "an action needs an id")
 	}
-	// Decoding would replace invalid UTF-8 with U+FFFD, silently writing another
-	// id: refuse it instead.
 	if !utf8.Valid(idRaw) {
 		return WriteOp{}, InvalidAt(loc+".id", "an id must be valid UTF-8")
 	}
 	if err := json.Unmarshal(idRaw, &op.ID); err != nil {
 		return WriteOp{}, InvalidAt(loc+".id", "an id is a string")
 	}
-	// An escape that is no character (a lone surrogate, "\ud800") decodes to
-	// U+FFFD: refuse an id holding one its JSON did not spell.
 	if strings.ContainsRune(op.ID, utf8.RuneError) && !spellsReplacement(idRaw) {
 		return WriteOp{}, InvalidAt(loc+".id", "an id must be valid UTF-8 (a lone surrogate escape is not)")
 	}

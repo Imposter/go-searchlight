@@ -722,13 +722,14 @@ func (c *Config) validate() []error {
 	return errs
 }
 
+// validStoreURL checks store_url's shape. An unparsable URL is reported without
+// quoting it, since it may hold a password.
 func validStoreURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("is required (--store_url, %sSTORE_URL or %sSTORE_URL_FILE)", EnvPrefix, EnvPrefix)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		// url.Error repeats the URL, which may hold a password.
 		return errors.New("is not a valid URL")
 	}
 	if !slices.Contains(StoreSchemes, strings.ToLower(u.Scheme)) {

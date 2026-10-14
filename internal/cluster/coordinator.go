@@ -434,17 +434,16 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	return n, nil
 }
 
-// loopbackAddress reports whether addr (a host:port, or a bare host) resolves to the
-// loopback interface: a plain-http cluster_token never leaves the machine then.
-// A host that is not a literal IP (a hostname) is treated as non-loopback, since it may
-// resolve to a reachable address depending on DNS.
+// loopbackAddress reports whether addr (a host:port, or a bare host) is a loopback IP
+// ([config.LoopbackIP]): a plain-http cluster_token never leaves the machine then. A
+// host name is treated as non-loopback, since it may resolve to a reachable address
+// depending on DNS.
 func loopbackAddress(addr string) bool {
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return config.LoopbackIP(host)
 }
 
 // ID is the node's id.

@@ -437,3 +437,14 @@ func TestLoadRefusesAClusterStoreWithoutClusterToken(t *testing.T) {
 		}
 	}
 }
+
+func TestLoopback(t *testing.T) {
+	for host, want := range map[string][2]bool{
+		"127.0.0.1": {true, true}, "::1": {true, true}, "localhost": {true, false},
+		"0.0.0.0": {false, false}, "10.0.0.7": {false, false}, "node-a": {false, false}, "": {false, false},
+	} {
+		if got := [2]bool{LoopbackHost(host), LoopbackIP(host)}; got != want {
+			t.Errorf("LoopbackHost, LoopbackIP(%q) = %v, want %v", host, got, want)
+		}
+	}
+}

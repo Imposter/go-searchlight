@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -220,7 +220,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)
-		if req.URL.Scheme == "http" && !loopback(req.URL.Hostname()) {
+		if req.URL.Scheme == "http" && !config.LoopbackHost(req.URL.Hostname()) {
 			if _, warned := n.clearWarned.LoadOrStore(req.URL.Host, true); !warned {
 				n.log.WarnContext(req.Context(), "the cluster token goes to a peer over plain HTTP: serve the peer API over TLS (tls_cert, peer_ca_file)",
 					slog.String("peer", req.URL.Host))
@@ -239,15 +239,6 @@ func (n *Node) authorize(req *http.Request) {
 // of its time answers (a search with partial results, timed_out) while the caller can
 // still use the answer.
 func peerReserve(left time.Duration) time.Duration { return min(left/5, 2*time.Second) }
-
-// loopback reports whether host names this machine.
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
 
 // reported reads the service time and queue a peer reported (-1 when it did not).
 func reported(h http.Header) (service, queue float64) {

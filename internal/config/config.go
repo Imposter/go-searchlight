@@ -763,6 +763,17 @@ func deriveAdvertise(listen string) string {
 	return net.JoinHostPort(host, port)
 }
 
+// LoopbackHost reports whether host, a host name or IP literal with no port, is this
+// machine's loopback interface: localhost, or a loopback IP.
+func LoopbackHost(host string) bool { return host == "localhost" || LoopbackIP(host) }
+
+// LoopbackIP reports whether host, with no port, is a loopback IP literal. A host name,
+// localhost included, is not one: what it resolves to depends on DNS.
+func LoopbackIP(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // LogValue renders the configuration for logs with its secrets redacted.
 func (c Config) LogValue() slog.Value {
 	attrs := make([]slog.Attr, 0, len(settings))

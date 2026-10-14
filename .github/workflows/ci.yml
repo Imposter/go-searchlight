@@ -5,12 +5,16 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # release.yml runs these checks as its gate.
+  workflow_call:
 
 permissions:
   contents: read
 
+# github.workflow is the caller's name when release.yml calls this file, so the gate of a
+# release never cancels, or is cancelled by, a CI run on the same ref.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -111,8 +115,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: compose file is valid
+      - name: compose files are valid
         run: docker compose -f deploy/compose.yml config --quiet
+      - name: the compose samples and deploy/.env.example agree
+        # .env.example names every variable the samples read, and its values are their
+        # defaults: each sample reads the same with it as without it.
+        working-directory: deploy
+        run: |
+          touch tokens
+          for f in compose.postgres.yml compose.sqlite.yml; do
+            docker compose -f "$f" config --quiet
+            diff <(docker compose -f "$f" config) <(docker compose --env-file .env.example -f "$f" config)
+          done
+          rm tokens
+          diff <(grep -ohE '\$\{[A-Z_]+' compose.postgres.yml compose.sqlite.yml | cut -c3- | sort -u) \
+            <(grep -oE '^[A-Z_]+=' .env.example | tr -d = | sort -u)
       # Dependabot does not track an image pinned inside a run step: bump this one by hand
       # from https://github.com/yannh/kubeconform/releases, digest included
       # (docker buildx imagetools inspect ghcr.io/yannh/kubeconform:<tag>).
@@ -126,6 +143,7 @@ jobs:
       - name: the image runs as non-root, with its healthcheck
         run: |
           docker run --rm searchlight:dev -h > /dev/null
+          docker run --rm searchlight:dev version | grep '^searchlight '
           test "$(docker image inspect -f '{{.Config.User}}' searchlight:dev)" = "65532:65532"
           docker image inspect -f '{{json .Config.Healthcheck.Test}}' searchlight:dev | grep -q '"healthcheck"'
           if docker run --rm searchlight:dev healthcheck; then echo "healthcheck passed with no node running"; exit 1; fi
@@ -166,3 +184,43 @@ jobs:
       - name: compose down
         if: always()
         run: docker compose -f deploy/compose.yml down -v || true
+      # The samples run the published image; here they run this commit's, tagged as the
+      # version "ci" so Compose finds it locally instead of pulling.
+      - name: the Postgres sample serves, through nginx
+        env:
+          SEARCHLIGHT_VERSION: ci
+        run: |
+          docker tag searchlight:dev ghcr.io/imposter/searchlight:ci
+          compose="docker compose -f deploy/compose.postgres.yml"
+          $compose up -d
+          token=$($compose run --rm --no-deps -T secrets sh -c 'grep " write$" /secrets/tokens | cut -d" " -f1')
+          SMOKE_TOKEN=$token .github/scripts/smoke.sh http://127.0.0.1:8080 http://127.0.0.1:8080
+          curl -fsS -H "Authorization: Bearer $token" http://127.0.0.1:8080/_cluster/health | jq -e '.nodes == 3'
+      - name: Postgres sample logs
+        if: always()
+        env:
+          SEARCHLIGHT_VERSION: ci
+        run: docker compose -f deploy/compose.postgres.yml logs --no-color --tail 200 || true
+      - name: Postgres sample down
+        if: always()
+        env:
+          SEARCHLIGHT_VERSION: ci
+        run: docker compose -f deploy/compose.postgres.yml down -v || true
+      - name: the SQLite sample serves, and stops cleanly
+        env:
+          SEARCHLIGHT_VERSION: ci
+        run: |
+          token=$(openssl rand -hex 24)
+          printf '%s write\n' "$token" > deploy/tokens
+          compose="docker compose -f deploy/compose.sqlite.yml"
+          $compose up -d
+          SMOKE_TOKEN=$token .github/scripts/smoke.sh http://127.0.0.1:8780 http://127.0.0.1:8781
+          $compose stop
+          test "$(docker inspect -f '{{.State.ExitCode}}' searchlight-sqlite-searchlight-1)" = 0
+      - name: SQLite sample logs and down
+        if: always()
+        env:
+          SEARCHLIGHT_VERSION: ci
+        run: |
+          docker compose -f deploy/compose.sqlite.yml logs --no-color --tail 200 || true
+          docker compose -f deploy/compose.sqlite.yml down -v || true

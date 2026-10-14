@@ -18,7 +18,7 @@ func TestGoDirective(t *testing.T) {
 	if len(m) < 2 || string(m[1]) != "1.25.0" {
 		t.Fatalf("go.mod go directive is %q, want 1.25.0", m)
 	}
-	if tc := regexp.MustCompile(`(?m)^toolchain (\S+)$`).FindSubmatch(b); tc != nil &&
+	if tc := regexp.MustCompile(`(?m)^toolchain (\S+)$`).FindSubmatch(b); len(tc) == 2 &&
 		!regexp.MustCompile(`^go1\.25\.\d+$`).Match(tc[1]) {
 		t.Fatalf("go.mod toolchain is %s, want a Go 1.25 release", tc[1])
 	}

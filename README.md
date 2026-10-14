@@ -70,7 +70,8 @@ container image and deployment samples. [CHANGELOG.md](CHANGELOG.md) has its not
   ```
 
   The macOS binaries are not signed: one downloaded with a browser needs
-  `xattr -d com.apple.quarantine searchlight` (or Finder's right-click, **Open**) before it
+  `xattr -d com.apple.quarantine searchlight` (or **Open Anyway** in System Settings ›
+  Privacy & Security) before it
   runs ([docs/operations.md](docs/operations.md#the-binary)).
   `go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0` builds it too.
 

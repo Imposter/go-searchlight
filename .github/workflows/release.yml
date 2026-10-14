@@ -24,7 +24,8 @@ name: release
 # A pushed v*.*.* tag publishes once everything before it passes. workflow_dispatch with
 # dry_run (the default) builds and tests the same things and writes nothing to the
 # registry or the releases; publishing needs a tag, so dry_run=false is refused on a
-# branch. One release runs at a time, so two never race for the moving tags.
+# branch. One publishing run at a time, so two never race for the moving tags; dry runs
+# queue in their own group, so dispatching one never cancels a waiting tag run.
 on:
   push:
     tags: ["v*.*.*"]
@@ -38,7 +39,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: release
+  group: ${{ (github.event_name == 'push' || !inputs.dry_run) && 'release' || 'release-dry-run' }}
   cancel-in-progress: false
 
 env:

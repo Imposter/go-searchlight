@@ -68,8 +68,9 @@ to open "searchlight". Clear the quarantine flag:
 xattr -d com.apple.quarantine searchlight
 ```
 
-or, in Finder, right-click (or Control-click) `searchlight`, choose **Open**, and confirm
-**Open** in the dialog; macOS remembers the choice.
+or, after macOS refuses to run it once, choose **Open Anyway** in System Settings ›
+Privacy & Security (on macOS 14 and earlier, Finder's right-click **Open** also works);
+macOS remembers the choice.
 
 Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0`
 also works, and reports its version), then run it:

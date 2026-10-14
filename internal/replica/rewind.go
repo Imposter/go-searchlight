@@ -155,12 +155,18 @@ func noteApplied(sh *shard.Shard, rc *rewindCheck, last store.ChangeMark) {
 }
 
 // noteAdvanced records that sh advanced from from to head, with no change of its shard
-// between them; headMark is the change at head.
+// between them; headMark is the change at head. The own-shard state as of from, pending
+// or (once a poll promoted it) checked, then holds up to head, as pending.
 func noteAdvanced(sh *shard.Shard, rc *rewindCheck, from, head int64, headMark store.ChangeMark) {
 	recordMark(sh, rc, headMark)
-	if rc.ownPending.upTo == from && from > 0 {
+	switch {
+	case from <= 0:
+		rc.ownPending = ownCheck{}
+	case rc.ownPending.upTo == from:
 		rc.ownPending.upTo = head
-	} else {
+	case rc.ownPending.upTo == 0 && rc.own.upTo == from:
+		rc.ownPending = ownCheck{last: rc.own.last, upTo: head}
+	default:
 		rc.ownPending = ownCheck{}
 	}
 	sh.SetOwnMark(encodeOwn(rc.own, rc.ownPending))

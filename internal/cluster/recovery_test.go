@@ -17,6 +17,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/segment"
+	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
@@ -154,6 +155,9 @@ func biggestSegment(t testing.TB, tn *tnode, id store.ShardID) (string, int64) {
 	return name, size
 }
 
+// snapshotBytes is the size of a snapshot of id on tn, its manifest left out: each
+// snapshot writes its manifest anew, and the marks in it (with their random nonces)
+// make its length vary from one snapshot to the next.
 func snapshotBytes(t testing.TB, tn *tnode, id store.ShardID) int64 {
 	t.Helper()
 	sn, err := tn.n.Snapshot(context.Background(), id)
@@ -163,7 +167,9 @@ func snapshotBytes(t testing.TB, tn *tnode, id store.ShardID) int64 {
 	defer sn.Release()
 	var total int64
 	for _, f := range sn.Files() {
-		total += f.Size
+		if f.Name != shard.ManifestName {
+			total += f.Size
+		}
 	}
 	return total
 }

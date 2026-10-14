@@ -16,6 +16,10 @@
 # probe, "searchlight healthcheck", against /readyz; Kubernetes probes the admin port
 # with httpGet instead.
 #
+# /usr/share/doc/searchlight holds LICENSE and THIRD_PARTY_NOTICES, the licences of Go and
+# of every dependency linked into the binary (tools/notices.sh, which the release
+# archives carry too).
+#
 # The base images are pinned by digest; Dependabot (.github/dependabot.yml) bumps them.
 
 FROM --platform=$BUILDPLATFORM golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS build
@@ -31,6 +35,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/searchlight ./cmd/searchlight \
  && mkdir -p /out/data
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH sh tools/notices.sh /out/THIRD_PARTY_NOTICES
 
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG VERSION=dev
@@ -44,8 +51,9 @@ LABEL org.opencontainers.image.title="searchlight" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.licenses="Proprietary"
+      org.opencontainers.image.licenses="MIT"
 COPY --from=build /out/searchlight /usr/local/bin/searchlight
+COPY --from=build /src/LICENSE /out/THIRD_PARTY_NOTICES /usr/share/doc/searchlight/
 COPY --from=build --chown=65532:65532 /out/data /var/lib/searchlight
 ENV SEARCHLIGHT_LISTEN=:8780 \
     SEARCHLIGHT_ADMIN_LISTEN=:8781 \

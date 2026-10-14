@@ -47,6 +47,12 @@ func TestSmokeBinary(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("go build: %v\n%s", err, out)
 	}
+	for _, arg := range []string{"version", "--version"} {
+		out, err := exec.CommandContext(t.Context(), bin, arg).Output()
+		if err != nil || !strings.HasPrefix(string(out), "searchlight smoke (") {
+			t.Errorf("searchlight %s: %v, %q; want \"searchlight smoke (...)\"", arg, err, out)
+		}
+	}
 
 	token := "smoke-token-0123456789abcdef"
 	tokens := filepath.Join(dir, "tokens")

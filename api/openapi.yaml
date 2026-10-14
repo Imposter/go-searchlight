@@ -27,7 +27,8 @@ info:
     **Auth.** Bearer tokens from `tokens_file`, read-only or read-write. `/healthz` and
     `/readyz` need none.
   license:
-    name: Proprietary
+    name: MIT
+    identifier: MIT
 servers:
   - url: http://localhost:8780
 security:

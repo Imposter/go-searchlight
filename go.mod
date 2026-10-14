@@ -2,6 +2,8 @@ module github.com/Imposter/go-searchlight
 
 go 1.25.0
 
+toolchain go1.25.14
+
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.29.0
 	github.com/getkin/kin-openapi v0.149.0

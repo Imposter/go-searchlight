@@ -25,6 +25,9 @@
 // "searchlight healthcheck [--live]" probes a node on this host for container
 // healthchecks: it GETs /readyz (/healthz with --live) on SEARCHLIGHT_ADMIN_LISTEN and
 // exits 0 when it answers 200, else 1.
+//
+// "searchlight version" (or "searchlight --version") prints the version the binary was
+// built as, with its Go version and platform, and exits 0.
 package main
 
 import (
@@ -38,6 +41,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -52,7 +57,8 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// version is set at build time with -ldflags "-X main.version=...".
+// version is set at build time with -ldflags "-X main.version=..."; without it, main
+// takes the module version "go install" records (moduleVersion).
 var version = "dev"
 
 var _ api.Mounter = (*cluster.Node)(nil)
@@ -65,8 +71,14 @@ const (
 )
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		os.Exit(healthcheck(os.Args[2:], os.Getenv, os.Stderr))
+	version = moduleVersion(version, debug.ReadBuildInfo)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "healthcheck":
+			os.Exit(healthcheck(os.Args[2:], os.Getenv, os.Stderr))
+		case "version", "--version", "-version":
+			os.Exit(printVersion(os.Args[2:], os.Stdout, os.Stderr))
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -79,6 +91,7 @@ func main() {
 	case errors.Is(err, flag.ErrHelp):
 		config.Usage(os.Stdout)
 		fmt.Fprintln(os.Stdout, "\nsearchlight healthcheck [--live]: exit 0 if this host's node is ready (live), else 1")
+		fmt.Fprintln(os.Stdout, "searchlight version (or --version): print the version and exit")
 	case err != nil:
 		fmt.Fprintln(os.Stderr, "searchlight:", oneLine(err))
 		os.Exit(1)
@@ -363,6 +376,30 @@ func healthcheck(args []string, getenv func(string) string, stderr io.Writer) in
 		fmt.Fprintf(stderr, "searchlight healthcheck: %s: HTTP %d %s\n", url, resp.StatusCode, strings.TrimSpace(string(body)))
 		return 1
 	}
+	return 0
+}
+
+func moduleVersion(stamped string, buildInfo func() (*debug.BuildInfo, bool)) string {
+	if stamped != "dev" {
+		return stamped
+	}
+	if info, ok := buildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return stamped
+}
+
+func printVersion(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("searchlight version", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "searchlight version: takes no arguments, got %q\n", fs.Args())
+		return 1
+	}
+	fmt.Fprintf(stdout, "searchlight %s (%s, %s/%s)\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	return 0
 }
 

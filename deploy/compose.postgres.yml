@@ -1,0 +1,192 @@
+# A three-node Searchlight cluster on Postgres 17, behind nginx, from the published
+# image (ghcr.io/imposter/searchlight). Unlike compose.yml, which builds the image from a
+# checkout for development, this file needs no checkout: it ships in each release's
+# searchlight-deploy-<version>.tar.gz with .env.example and nginx/searchlight.conf, and
+# every path in it is relative to this file.
+#
+#   tar -xzf searchlight-deploy-1.0.0.tar.gz && cd searchlight-deploy-1.0.0
+#   cp .env.example .env              # optional: the defaults are the example's values
+#   docker compose -f compose.postgres.yml up -d
+#   docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens
+#   curl -H "Authorization: Bearer <write token>" http://127.0.0.1:8080/_cluster/health
+#
+# From a checkout, the same works as "docker compose -f deploy/compose.postgres.yml ...";
+# Compose then reads deploy/.env.
+#
+# Settings: .env (from .env.example) sets the image tag (SEARCHLIGHT_VERSION), the
+# published address and port, Postgres's database, user and sizing, the log level and
+# the changelog retention knobs. Every other node setting is a SEARCHLIGHT_* variable:
+# add it under x-searchlight-env below (docs/operations.md#every-setting).
+#
+# Upgrade: set SEARCHLIGHT_VERSION to the new release and run "up -d" again. Compose
+# recreates the nodes, and a schema migration runs on the first one to start; read the
+# release's notes (CHANGELOG.md) first. For no downtime, recreate one node at a time:
+# "up -d --no-deps searchlight-1", wait until it is healthy, then the next
+# (docs/operations.md#upgrades-and-rolling-restarts).
+#
+# Secrets are generated on the first start, into the "secrets" volume, by the one-shot
+# "secrets" service: a Postgres password and the store_url built from it, a
+# cluster_token, and a tokens file with one read-write and one read-only API token.
+# Nothing secret is written in this file or in .env. The store_url is built once, so
+# changing POSTGRES_USER or POSTGRES_DB later needs a fresh "secrets" and "pgdata"
+# volume ("down -v" deletes every volume, the data included).
+#
+# Ports: nginx serves the API for all three nodes on SEARCHLIGHT_BIND:SEARCHLIGHT_HTTP_PORT
+# (127.0.0.1:8080 by default; set SEARCHLIGHT_BIND=0.0.0.0 to serve other hosts, behind
+# TLS: docs/nginx.md#tls). Each node's own API (8780, 8782, 8784) and admin listener
+# (/healthz, /readyz, /metrics on 8781, 8783, 8785) stay on 127.0.0.1, for debugging and a
+# Prometheus on this host; keep the admin ports private.
+#
+# The peer API runs over plain HTTP on the compose network (the nodes log that the
+# cluster_token is sent in the clear): set tls_cert, tls_key and peer_ca_file when the
+# nodes span hosts.
+#
+# compose.yml keeps the same services for the from-source cluster. Compose's include and
+# extends cannot swap one service's build for an image without restating it, so the two
+# files repeat each other: change both together.
+
+name: searchlight
+
+x-searchlight: &searchlight
+  image: ghcr.io/imposter/searchlight:${SEARCHLIGHT_VERSION:-1.0.0}
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  # shutdown_grace (5 s) plus shutdown_timeout (60 s), plus 10 s.
+  stop_grace_period: 75s
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/searchlight", "healthcheck"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 2m
+
+x-searchlight-env: &searchlight-env
+  SEARCHLIGHT_STORE_URL_FILE: /run/secrets/searchlight/store_url
+  SEARCHLIGHT_CLUSTER_TOKEN_FILE: /run/secrets/searchlight/cluster_token
+  SEARCHLIGHT_TOKENS_FILE: /run/secrets/searchlight/tokens
+  SEARCHLIGHT_SHUTDOWN_GRACE: 5s
+  SEARCHLIGHT_SHUTDOWN_TIMEOUT: 60s
+  SEARCHLIGHT_LOG_LEVEL: ${SEARCHLIGHT_LOG_LEVEL:-info}
+  SEARCHLIGHT_CHANGELOG_RETENTION: ${SEARCHLIGHT_CHANGELOG_RETENTION:-24h}
+  SEARCHLIGHT_RETIRING_RETENTION: ${SEARCHLIGHT_RETIRING_RETENTION:-15m}
+  SEARCHLIGHT_BUNDLE_INTERVAL: ${SEARCHLIGHT_BUNDLE_INTERVAL:-0s}
+  SEARCHLIGHT_BUNDLE_RETENTION: ${SEARCHLIGHT_BUNDLE_RETENTION:-2}
+
+services:
+  secrets:
+    image: busybox:1.38-musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
+    restart: "no"
+    volumes:
+      - secrets:/secrets
+    command:
+      - sh
+      - -euc
+      - |
+        cd /secrets
+        gen() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+        [ -s postgres_password ] || gen > postgres_password
+        [ -s store_url ] || printf 'postgres://%s:%s@postgres:5432/%s?sslmode=disable' '${POSTGRES_USER:-searchlight}' "$$(cat postgres_password)" '${POSTGRES_DB:-searchlight}' > store_url
+        [ -s cluster_token ] || gen > cluster_token
+        [ -s tokens ] || printf '# <token> write | <token> read\n%s write\n%s read\n' "$$(gen)" "$$(gen)" > tokens
+        chmod 0444 postgres_password store_url cluster_token tokens
+
+  postgres:
+    image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    # Docker gives a container 64 MB of /dev/shm; Postgres keeps its parallel queries' shared
+    # memory there, and runs out under load ("could not resize shared memory segment").
+    shm_size: 256mb
+    # Each node may hold 64 connections plus one for LISTEN.
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-300}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+    restart: unless-stopped
+    depends_on:
+      secrets:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-searchlight}
+      POSTGRES_DB: ${POSTGRES_DB:-searchlight}
+      POSTGRES_PASSWORD_FILE: /run/secrets/searchlight/postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - secrets:/run/secrets/searchlight:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "${POSTGRES_USER:-searchlight}", "-d", "${POSTGRES_DB:-searchlight}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  searchlight-1:
+    <<: *searchlight
+    hostname: searchlight-1
+    environment:
+      <<: *searchlight-env
+      SEARCHLIGHT_NODE_ID: searchlight-1
+      SEARCHLIGHT_ADVERTISE_ADDRESS: searchlight-1:8780
+    ports:
+      - 127.0.0.1:8780:8780
+      - 127.0.0.1:8781:8781
+    volumes:
+      - data-1:/var/lib/searchlight
+      - secrets:/run/secrets/searchlight:ro
+
+  searchlight-2:
+    <<: *searchlight
+    hostname: searchlight-2
+    environment:
+      <<: *searchlight-env
+      SEARCHLIGHT_NODE_ID: searchlight-2
+      SEARCHLIGHT_ADVERTISE_ADDRESS: searchlight-2:8780
+    ports:
+      - 127.0.0.1:8782:8780
+      - 127.0.0.1:8783:8781
+    volumes:
+      - data-2:/var/lib/searchlight
+      - secrets:/run/secrets/searchlight:ro
+
+  searchlight-3:
+    <<: *searchlight
+    hostname: searchlight-3
+    environment:
+      <<: *searchlight-env
+      SEARCHLIGHT_NODE_ID: searchlight-3
+      SEARCHLIGHT_ADVERTISE_ADDRESS: searchlight-3:8780
+    ports:
+      - 127.0.0.1:8784:8780
+      - 127.0.0.1:8785:8781
+    volumes:
+      - data-3:/var/lib/searchlight
+      - secrets:/run/secrets/searchlight:ro
+
+  nginx:
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    restart: unless-stopped
+    depends_on:
+      searchlight-1:
+        condition: service_healthy
+      searchlight-2:
+        condition: service_healthy
+      searchlight-3:
+        condition: service_healthy
+    ports:
+      - ${SEARCHLIGHT_BIND:-127.0.0.1}:${SEARCHLIGHT_HTTP_PORT:-8080}:8080
+    volumes:
+      - ./nginx/searchlight.conf:/etc/nginx/conf.d/searchlight.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  secrets:
+  pgdata:
+  data-1:
+  data-2:
+  data-3:

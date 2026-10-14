@@ -32,7 +32,48 @@ front of it as the load balancer, see [nginx.md](nginx.md).
   with `pprof=true` on a non-loopback `admin_listen` logs a warning at start.
 - **Peers** reach each other on the public port, at `advertise_address`.
 
+Each [release](https://github.com/Imposter/go-searchlight/releases) publishes what a
+deployment needs, none of which needs a checkout of the repository:
+
+- binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and windows/amd64
+  (`searchlight-<version>-<os>-<arch>.tar.gz`, `.zip` on Windows), with `SHA256SUMS`;
+- the image `ghcr.io/imposter/searchlight:<version>`, for linux/amd64 and linux/arm64
+  ([Docker](#docker));
+- `searchlight-deploy-<version>.tar.gz`: the Compose samples with their `.env.example`,
+  nginx's config and the Kubernetes manifests ([Docker Compose](#docker-compose),
+  [Kubernetes](#kubernetes)).
+
+[CHANGELOG.md](../CHANGELOG.md) has each release's notes; read them before an upgrade.
+
 ### The binary
+
+From a release:
+
+```sh
+base=https://github.com/Imposter/go-searchlight/releases/download/v1.0.0
+curl -fsSLO "$base/searchlight-1.0.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf searchlight-1.0.0-linux-amd64.tar.gz
+install searchlight-1.0.0-linux-amd64/searchlight /usr/local/bin/
+```
+
+Each archive also holds `LICENSE` and `THIRD_PARTY_NOTICES`, the licences of Go and of
+every dependency linked into the binary.
+
+**macOS.** The darwin binaries are not signed or notarised. Downloaded with `curl` they
+run as they are; downloaded with a browser, macOS quarantines them and Gatekeeper refuses
+to open "searchlight". Clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine searchlight
+```
+
+or, after macOS refuses to run it once, choose **Open Anyway** in System Settings ›
+Privacy & Security (on macOS 14 and earlier, Finder's right-click **Open** also works);
+macOS remembers the choice.
+
+Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0`
+also works, and reports its version), then run it:
 
 ```sh
 make build                       # bin/searchlight, version from git describe
@@ -69,6 +110,8 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
   - 1, with one line on standard error, when it cannot start (a bad setting, a
     misconfigured store, a SQLite store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
+- **`searchlight version`** (or `--version`) prints the version it was built as, with its
+  Go version and platform: `searchlight v1.0.0 (go1.25.14, linux/amd64)`.
 - **`searchlight healthcheck [--live]`** probes the node on this host, for container
   healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
   where an empty or unspecified host means `127.0.0.1`. It waits at most 2 s, and exits 0
@@ -76,64 +119,139 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 
 ### Docker
 
-[`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
-`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`. The base images are
-pinned by digest. Dependabot (`.github/dependabot.yml`) proposes updates for them, for
-the compose images, for the Go modules and for the CI actions. The one exception is the
-kubeconform image that CI runs inside a `run:` step: Dependabot cannot see it, so it is
-bumped by hand, as the comment beside it says.
+Each release publishes `ghcr.io/imposter/searchlight`, for linux/amd64 and linux/arm64,
+tagged with its version (`1.0.0`). Its minor (`1.0`) and major (`1`) lines, and `latest`,
+point at the newest stable release of each: they only move forward, so a patch to an
+older line moves its own `<major>.<minor>` tag and nothing else. Pin the full version in
+production. The `sha-<commit>` tags are where the release workflow stages an image
+before it is tested; do not deploy them.
 
 ```sh
-make docker                                  # searchlight:dev; IMAGE=... to rename
+docker pull ghcr.io/imposter/searchlight:1.0.0
 docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
   -v searchlight-data:/var/lib/searchlight \
   -v "$PWD/secrets:/run/secrets/searchlight:ro" \
   -e SEARCHLIGHT_STORE_URL_FILE=/run/secrets/searchlight/store_url \
   -e SEARCHLIGHT_TOKENS_FILE=/run/secrets/searchlight/tokens \
-  searchlight:dev
+  ghcr.io/imposter/searchlight:1.0.0
 ```
 
 - **User.** It runs as uid/gid 65532.
 - **Defaults.** `SEARCHLIGHT_LISTEN=:8780`, `SEARCHLIGHT_ADMIN_LISTEN=:8781` and
   `SEARCHLIGHT_DATA_DIR=/var/lib/searchlight`, which is a volume.
 - **Labels.** It carries the OCI labels (version, revision, created, source).
+- **Licences.** `/usr/share/doc/searchlight` holds `LICENSE` and `THIRD_PARTY_NOTICES`.
+- **Provenance.** The published image carries a SLSA provenance attestation and an SBOM:
+  `docker buildx imagetools inspect ghcr.io/imposter/searchlight:1.0.0 --format '{{json .Provenance}}'`
+  (or `.SBOM`).
 - **`HEALTHCHECK`.** It runs `searchlight healthcheck` (readiness) every 5 s, with a
   2-minute start period. The image has no shell, so the binary probes itself.
 
-### Docker Compose: a three-node cluster
-
-[`deploy/compose.yml`](../deploy/compose.yml) runs three nodes on Postgres 17:
+To build the image from a checkout instead,
+[`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
+`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`:
 
 ```sh
-docker compose -f deploy/compose.yml up --build -d
-docker compose -f deploy/compose.yml run --rm secrets cat /secrets/tokens    # the API tokens
-curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
+make docker                                  # searchlight:dev; IMAGE=... to rename
 ```
 
-- **Secrets.** A one-shot `secrets` service generates them on the first start, into a
-  volume: the Postgres password, the `store_url` built from it, the `cluster_token`, and
-  a tokens file with one read-write and one read-only token. The nodes read them through
-  `SEARCHLIGHT_*_FILE` and `tokens_file`. The compose file holds no secret.
-- **Ports.** The nodes serve the API on `127.0.0.1:8780`, `:8782` and `:8784`, and
-  their admin listeners on `:8781`, `:8783` and `:8785`.
-- **Addresses.** Each node's `advertise_address` is its service name.
+The base images are pinned by digest. Dependabot (`.github/dependabot.yml`) proposes
+updates for them, for the compose images, for the Go modules and for the CI actions. The
+one exception is the kubeconform image that CI runs inside a `run:` step: Dependabot
+cannot see it, so it is bumped by hand, as the comment beside it says.
+
+### Docker Compose
+
+Two samples run the published image, from a release's
+`searchlight-deploy-<version>.tar.gz` (or [`deploy/`](../deploy) in a checkout), with
+every path relative to the compose file:
+
+- [`compose.postgres.yml`](../deploy/compose.postgres.yml): three nodes on Postgres 17,
+  behind nginx;
+- [`compose.sqlite.yml`](../deploy/compose.sqlite.yml): one node on SQLite.
+
+```sh
+curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.0.0/searchlight-deploy-1.0.0.tar.gz | tar -xz
+cd searchlight-deploy-1.0.0
+cp .env.example .env                                                       # optional
+docker compose -f compose.postgres.yml up -d
+docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens   # the API tokens
+curl -H "Authorization: Bearer <write token>" 127.0.0.1:8080/_cluster/health
+```
+
+The SQLite sample reads its API tokens from a `tokens` file beside it, mounted as a
+Compose secret:
+
+```sh
+printf '%s write\n' "$(openssl rand -hex 24)" > tokens
+docker compose -f compose.sqlite.yml up -d
+curl -H "Authorization: Bearer $(cut -d' ' -f1 tokens)" 127.0.0.1:8780/indexes
+```
+
+- **Settings.** [`.env.example`](../deploy/.env.example) lists what the samples read:
+  the image tag (`SEARCHLIGHT_VERSION`), the published address and ports, Postgres's user,
+  database, `max_connections` and `shared_buffers`, the log level, and the changelog and
+  recovery-bundle retention. Copy it to `.env` beside the compose file; its values are
+  the defaults. Any other setting is a `SEARCHLIGHT_*` variable in the compose file.
+- **Secrets.** In the Postgres sample, a one-shot `secrets` service generates them on the
+  first start, into a volume: the Postgres password, the `store_url` built from it, the
+  `cluster_token`, and a tokens file with one read-write and one read-only token. The
+  nodes read them through `SEARCHLIGHT_*_FILE` and `tokens_file`. Neither the compose
+  file nor `.env` holds a secret. The `store_url` is built once: changing
+  `POSTGRES_USER` or `POSTGRES_DB` later needs fresh `secrets` and `pgdata` volumes.
+- **Ports.** nginx serves the cluster's API on `SEARCHLIGHT_BIND:SEARCHLIGHT_HTTP_PORT`,
+  `127.0.0.1:8080` by default; the SQLite node on `SEARCHLIGHT_BIND:SEARCHLIGHT_API_PORT`,
+  `127.0.0.1:8780`. Set `SEARCHLIGHT_BIND=0.0.0.0` to serve other hosts, behind TLS
+  ([nginx.md](nginx.md#tls)). The cluster's nodes keep their own API on `127.0.0.1:8780`,
+  `:8782` and `:8784`, and every admin listener stays on `127.0.0.1` (`:8781`, `:8783`
+  and `:8785`).
+- **Addresses.** Each node's `node_id` and `advertise_address` is its service name, so it
+  reclaims its own copies when it is recreated.
 - **Health.** Postgres is checked with `pg_isready`, and each node with
   `searchlight healthcheck`.
 - **Stopping.** `stop_grace_period` is 75 s: `shutdown_grace` (5 s) plus
-  `shutdown_timeout` (60 s), plus 10 s of slack.
+  `shutdown_timeout` (60 s), plus 10 s of slack (72 s for the SQLite node, whose
+  `shutdown_grace` is 2 s).
 - **TLS.** The peer API runs in plain HTTP on the compose network, and the nodes log a
   warning that `cluster_token` crosses it in the clear.
-- **Load balancer.** An `nginx` service fronts the three nodes on `127.0.0.1:8080`,
-  using [`deploy/nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see
-  [nginx.md](nginx.md) for what it does and why. The nodes' own ports stay published
-  too.
+- **Load balancer.** An `nginx` service fronts the three nodes, using
+  [`nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see [nginx.md](nginx.md)
+  for what it does and why.
+
+**Upgrading.** Read the new release's notes in [CHANGELOG.md](../CHANGELOG.md), set
+`SEARCHLIGHT_VERSION` in `.env` to it, and run `docker compose -f <file> up -d` again.
+Compose pulls the new image and recreates the nodes; the first to start migrates the
+schema. That restarts every node of the cluster at once. To keep it serving, recreate
+one node at a time, as in [rolling restarts](#upgrades-and-rolling-restarts):
+
+```sh
+docker compose -f compose.postgres.yml pull
+docker compose -f compose.postgres.yml up -d --no-deps searchlight-1    # then wait until it is healthy
+docker compose -f compose.postgres.yml up -d --no-deps searchlight-2    # and so on
+```
+
+A newer release's deploy bundle may change the compose files too: compare them with
+yours before you switch to them.
+
+**From a checkout**, [`deploy/compose.yml`](../deploy/compose.yml) runs the same
+three-node cluster on an image built from the working tree, for trying a change out:
+
+```sh
+docker compose -f deploy/compose.yml up --build -d
+docker compose -f deploy/compose.yml run --rm secrets cat /secrets/tokens
+```
+
+It repeats `compose.postgres.yml`'s services, with `build:` in place of the published
+image; change the two together.
 
 ### Kubernetes
 
 [`deploy/k8s/`](../deploy/k8s) holds a StatefulSet of three, a headless Service for peer
 addresses, a client Service, an admin Service for Prometheus, a PodDisruptionBudget and a
 ConfigMap. It has been validated with `kubeconform -strict` against Kubernetes 1.27 and
-master.
+master. The same files are `k8s/` in a release's deploy bundle, and run that release's
+image, `ghcr.io/imposter/searchlight:<version>`; upgrade by changing the StatefulSet's
+image, which rolls the nodes one at a time.
 
 ```sh
 kubectl create secret generic searchlight \
@@ -494,7 +612,9 @@ rebuilt.**
 
 ## Upgrades and rolling restarts
 
-Restart or upgrade **one node at a time**:
+Read the new release's notes in [CHANGELOG.md](../CHANGELOG.md) first: they say whether
+it migrates the schema and what else it asks of an upgrade. Then restart or upgrade
+**one node at a time** (for the Compose samples, see [Upgrading](#docker-compose)):
 
 1. **Signal.** Send SIGTERM: `kubectl rollout restart`, `docker compose stop`, or
    `systemctl stop`.

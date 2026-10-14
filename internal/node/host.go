@@ -288,7 +288,8 @@ func (n *Single) SegmentMajors(ctx context.Context, id store.ShardID) (oldest, n
 }
 
 // Snapshot takes a snapshot of this node's serving copy of id, for a peer's recovery.
-// Release it when done.
+// Release it when done. A copy a rebuild swaps meanwhile is snapshotted again, as its
+// replacement.
 func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapshot, error) {
 	idx, err := n.lookup(ctx, id.Index)
 	if err != nil {
@@ -308,7 +309,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 		sh := c.shard()
 		sn, err := sh.Snapshot(ctx)
 		if errors.Is(err, shard.ErrClosed) && c.shard() != sh {
-			continue // swapped by a rebuild: snapshot its replacement
+			continue
 		}
 		if err != nil {
 			return nil, api.Unavailable(err, "%s cannot be copied now", id)
@@ -514,7 +515,8 @@ func (n *Single) retire(ctx context.Context, idx *index) {
 }
 
 // reloadIfNewer re-reads idx's catalogue entry and adopts it when another node has
-// changed it since this node read it: changed reports that.
+// changed it since this node read it: changed reports that, also when another caller
+// adopted a newer entry meanwhile.
 func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, err error) {
 	m, err := n.st.Indexes().Get(ctx, idx.name)
 	if err != nil {
@@ -529,7 +531,7 @@ func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, e
 		return false, err
 	}
 	if !idx.meta.CompareAndSwap(cur, st) {
-		return true, nil // someone else adopted a newer one meanwhile
+		return true, nil
 	}
 	n.adoptSettings(idx, st.settings)
 	return true, nil

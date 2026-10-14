@@ -32,7 +32,10 @@ type prepared struct {
 	doc    *schema.Doc // an upsert's analyzed document, for percolation
 }
 
-// Write implements [api.Coordinator]: see the package documentation.
+// Write implements [api.Coordinator]: see the package documentation. With percolation,
+// a wait_for_seq past the head is refused before anything commits, and once the write
+// commits a percolation that cannot finish is reported in the result (Percolated
+// false), never as an error that hides the seqs.
 func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts api.WriteOptions) (res *api.WriteResult, err error) {
 	ctx, span := n.tr.Start(ctx, "node.write", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, name), attribute.Int("ops", len(ops)), attribute.Bool("percolate", opts.Percolate)))
@@ -49,7 +52,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	}
 	if opts.Percolate && opts.WaitForSeq > 0 {
 		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
-			return nil, err // refused before anything commits
+			return nil, err
 		}
 	}
 	res = &api.WriteResult{Items: make([]api.ItemResult, len(ops))}
@@ -94,8 +97,6 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	if opts.Percolate {
-		// The write is committed: a percolation that cannot finish is reported in
-		// the result (Percolated false), never as an error that hides the seqs.
 		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -117,15 +118,15 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 // mapping already holds cost nothing, and the new fields of concurrent writes are
 // stored together in one catalogue update (ensureFields). A write is analyzed again
 // only when a field it typed was meanwhile given another type, or no longer fits the
-// field limit.
+// field limit. On a cluster node, a write some op of which was refused re-reads the
+// catalogue once and is analyzed again: another node may have mapped a field this one
+// does not know yet, which a strict index refuses.
 func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, keepDocs bool) ([]prepared, error) {
 	base := idx.meta.Load().mapping
 	reloaded := false
 	for range maxCatalogTries {
 		batch, working := n.analyzeOps(idx, ops, items, base, keepDocs)
 		if n.cl != nil && !reloaded && refused(items) {
-			// Another node may have mapped a field this one does not know yet (a
-			// strict index refuses it): re-read the catalogue once and analyze again.
 			reloaded = true
 			if changed, _ := n.reloadIfNewer(ctx, idx); changed {
 				base = idx.meta.Load().mapping
@@ -164,7 +165,10 @@ func refused(items []api.ItemResult) bool {
 }
 
 // analyzeOps prepares every op under base, returning the batch and base grown by the
-// documents' new dynamic fields.
+// documents' new dynamic fields. An upsert's body becomes its analyzed copy: the raw
+// one is freed, and analyzing again (the mapping moved) reads the same document. Every
+// change carries the index incarnation the write means, so a write that races a drop
+// and recreate of the index is refused rather than landing in the new one.
 func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResult, base *schema.Mapping, keepDocs bool) ([]prepared, *schema.Mapping) {
 	working := base
 	limit := n.maxIndexFields()
@@ -185,13 +189,9 @@ func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResul
 			p.doc = nil
 		}
 		if p.change.Kind == store.KindUpsert {
-			// The op's body is now the analyzed copy: the raw one is freed, and
-			// analyzing again (the mapping moved) reads the same document.
 			ops[i].Body = p.change.Payload
 		}
 		p.pos = i
-		// The incarnation this write means: a write that races a drop and
-		// recreate of the index is refused rather than landing in the new one.
 		p.change.IndexUID = uid
 		working = m
 		batch = append(batch, p)
@@ -212,6 +212,13 @@ func added(base, grown *schema.Mapping) map[string]schema.FieldType {
 
 // prepareOp turns one op into a change under mapping m, returning the mapping grown
 // by an upsert's new dynamic fields.
+//
+// A document to percolate is analyzed in full; otherwise it is only checked and typed
+// (schema.Check), which allocates a fraction as much. The analyzed body is what
+// commits, as the store requires: invalid UTF-8 has become U+FFFD (three bytes for
+// one), so the limits apply to it too, and a document no segment can store never
+// reaches the changelog, where it would halt the copy. A delete of nothing is a 404
+// and writes no change.
 func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepDoc bool) (prepared, *schema.Mapping, error) {
 	c := store.Change{Index: idx.name, ID: op.ID, IfSeq: op.IfSeq}
 	if err := schema.ValidateID(op.ID); err != nil {
@@ -229,8 +236,6 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 		if limit := n.cfg.MaxDocBytes; limit > 0 && int64(len(op.Body)) > limit {
 			return prepared{}, m, api.TooLarge("the document is %d bytes, over %d (max_doc_bytes)", len(op.Body), limit)
 		}
-		// A document to percolate is analyzed in full; otherwise it is only
-		// checked and typed (schema.Check), which allocates a fraction as much.
 		var doc schema.Doc
 		var update schema.MappingUpdate
 		var err error
@@ -243,9 +248,6 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 		if err != nil {
 			return prepared{}, m, err
 		}
-		// The analyzed body is what commits: invalid UTF-8 has become U+FFFD (three
-		// bytes for one), so the limits apply to it too, and a document no segment
-		// can store never reaches the changelog, where it would halt the copy.
 		if limit := n.cfg.MaxDocBytes; limit > 0 && int64(len(doc.Body)) > limit {
 			return prepared{}, m, api.TooLarge("the document is %d bytes once its invalid UTF-8 is replaced, over %d (max_doc_bytes)", len(doc.Body), limit)
 		}
@@ -259,12 +261,11 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 			}
 			m = grown
 		}
-		// The body as analyzed: invalid UTF-8 replaced, as the store requires.
 		c.Kind, c.Payload, p.doc = store.KindUpsert, doc.Body, &doc
 	case api.OpDelete:
 		c.Kind = store.KindDelete
 		if c.IfSeq == 0 {
-			c.IfSeq = store.IfExists // a delete of nothing is a 404 and writes no change
+			c.IfSeq = store.IfExists
 		}
 	case api.OpQueryUpsert:
 		payload, err := queryPayload(op, m)
@@ -342,7 +343,7 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 			return api.Unavailable(shard.ErrClosed, "shard %d is unavailable", s)
 		}
 		if n.cl != nil && c.peerServing() != nil {
-			continue // others apply the write; this copy is not counted on
+			continue
 		}
 		if err := c.notServing(); err != nil {
 			return err
@@ -362,7 +363,8 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 
 // commit commits batch through the group committer. An op whose if_seq fails, or
 // that the store refuses on its own, is answered in its item and the rest commit
-// without it. It returns the committed ops, with their seqs.
+// without it. It returns the committed ops, with their seqs. A delete of nothing
+// (IfExists) is skipped in the transaction: it takes no seq and is a 404.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
@@ -380,8 +382,6 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 		var inf *store.IndexNotFoundError
 		switch {
 		case err == nil:
-			// A delete of nothing (IfExists) was skipped in the transaction: it
-			// took no seq and is a 404.
 			var applied []prepared
 			for i := range batch {
 				if changes[i].Seq == 0 {

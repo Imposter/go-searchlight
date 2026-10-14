@@ -62,7 +62,8 @@ func (n *Single) maxIndexFields() int {
 // write's documents bring, before the write commits. Fields the mapping already
 // holds cost nothing. Otherwise the request joins the index's queue: the writer that
 // takes the catalogue lock stores every queued request's fields in one version-checked
-// update, and the others wait for its outcome (or their deadline). It returns
+// update, and the others wait for its outcome (or their deadline): the flush the
+// writer leads answers its own request, or an earlier flush already did. It returns
 // errReanalyze when a field has another type now, or no longer fits the field limit.
 func (n *Single) ensureFields(ctx context.Context, idx *index, fields map[string]schema.FieldType) error {
 	switch missing, conflict := diffFields(idx.meta.Load().mapping, fields); {
@@ -79,7 +80,7 @@ func (n *Single) ensureFields(ctx context.Context, idx *index, fields map[string
 	case idx.catalog <- struct{}{}:
 		n.flushFields(ctx, idx)
 		idx.catalog.unlock()
-		return <-req.done // served by this flush, or by an earlier one
+		return <-req.done
 	case err := <-req.done:
 		return err
 	case <-ctx.Done():
@@ -107,7 +108,8 @@ func diffFields(m *schema.Mapping, fields map[string]schema.FieldType) (missing,
 const catalogUpdateTimeout = 30 * time.Second
 
 // flushFields stores every queued request's fields in one catalogue update and
-// answers each request. The catalogue lock is held.
+// answers each request; when another process changed the entry meanwhile, it reads
+// the entry again and merges again. The catalogue lock is held.
 func (n *Single) flushFields(ctx context.Context, idx *index) {
 	idx.fields.mu.Lock()
 	reqs := idx.fields.pending
@@ -134,7 +136,6 @@ func (n *Single) flushFields(ctx context.Context, idx *index) {
 		if len(acc.Fields) > len(cur.mapping.Fields) {
 			_, err := n.storeCatalogLocked(uctx, idx, cur, acc, cur.settings)
 			if errors.Is(err, store.ErrConflict) {
-				// Another process changed the entry: read it and merge again.
 				if rerr := n.reloadCatalog(uctx, idx); rerr != nil {
 					answerAll(reqs, results, rerr)
 					return

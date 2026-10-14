@@ -46,11 +46,12 @@ type PollReporter interface {
 // ReplicaTailers is the production [NewTailerFunc]: a replica tailer per copy, with
 // the node's settings (changelog_poll_interval, max_lag, remap_debounce and the
 // retry bounds), its shared Hub (nil: the tailers poll and are woken by writes) and
-// its clock.
+// its clock. A remap_debounce of 0 rebuilds at once, which the replica spells -1 (its
+// 0 is the default).
 func ReplicaTailers(cfg config.Config, hub *replica.Hub, clk clock.Clock, log *slog.Logger, tr trace.Tracer, meter metric.Meter) NewTailerFunc {
 	remap := cfg.RemapDebounce
 	if remap == 0 {
-		remap = -1 // the config's 0 is "rebuild at once"; the replica's is "the default"
+		remap = -1
 	}
 	return func(st store.Store, sh *shard.Shard, id store.ShardID, env TailerEnv) Tailer {
 		return replicaTailer{replica.NewTailer(st, sh, id, replica.Options{

@@ -282,18 +282,33 @@ type remoteTarget struct {
 
 var _ node.ShardTarget = (*remoteTarget)(nil)
 
+// errOlderLevel marks a peer refused for speaking a lower wire level than a request
+// needs: a copy of an older release, which another copy may stand in for.
+var errOlderLevel = errors.New("it runs an older release")
+
 // attempt runs fn on the chosen copy, or on each candidate in turn until one answers.
 // Every attempt but the last refuses a stale copy (max_lag: the peer answers a
 // retryable 503); the last accepts one, flagged stale, as does the coordinator's own
-// copy after it.
+// copy after it. A chosen copy refused for its wire level (errOlderLevel: an earlier
+// call of the read, a stored document's Get, needed less) is dropped, and the other
+// candidates are tried as on a first call. When none answers the read is unavailable
+// (503).
 func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx context.Context, c candidate, ref shardRef) error) error {
+	var last error
+	var refused *candidate
 	if t.chosen != nil {
 		ref := t.ref()
 		ref.AllowStale = true
-		return fn(ctx, *t.chosen, ref)
+		err := fn(ctx, *t.chosen, ref)
+		if err == nil || !errors.Is(err, errOlderLevel) {
+			return err
+		}
+		last, refused, t.chosen = err, t.chosen, nil
 	}
-	var last error
 	for i, c := range t.cands {
+		if refused != nil && c.key() == refused.key() {
+			continue
+		}
 		ref := t.ref()
 		ref.AllowStale = i == len(t.cands)-1
 		actx, cancel := context.WithTimeout(ctx, t.n.opts.PeerTimeout)
@@ -338,7 +353,7 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 		if err := t.n.readCall(ctx, c, searchPath(wr.Needs), msg, &reply); err != nil {
 			var ae *api.Error
 			if wr.Needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
-				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (post_filter, or a filter, filters or global aggregation): it runs an older release; retry once the upgrade is done", wr.Needs)}
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (post_filter, or a filter, filters or global aggregation): %w; retry once the upgrade is done", wr.Needs, errOlderLevel)}
 			}
 			return err
 		}
@@ -346,7 +361,7 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 			return &peerError{node: c.node, err: errors.New("no result")}
 		}
 		if reply.Level < wr.Needs {
-			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (post_filter, or a filter, filters or global aggregation): it runs an older release; retry once the upgrade is done", reply.Level, wr.Needs)}
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (post_filter, or a filter, filters or global aggregation): %w; retry once the upgrade is done", reply.Level, wr.Needs, errOlderLevel)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil
@@ -405,12 +420,12 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 		if err := t.n.readCall(ctx, c, percolatePath(needs), msg, &reply); err != nil {
 			var ae *api.Error
 			if needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
-				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (an index with a date field, whose saved queries may hold date math): it runs an older release; retry once the upgrade is done", needs)}
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (an index with a date field, whose saved queries may hold date math): %w; retry once the upgrade is done", needs, errOlderLevel)}
 			}
 			return err
 		}
 		if reply.Level < needs {
-			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (an index with a date field, whose saved queries may hold date math): it runs an older release; retry once the upgrade is done", reply.Level, needs)}
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (an index with a date field, whose saved queries may hold date math): %w; retry once the upgrade is done", reply.Level, needs, errOlderLevel)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil

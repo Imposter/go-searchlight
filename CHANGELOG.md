@@ -41,13 +41,20 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   on an upgraded node; other searches are unaffected
   ([docs/clustering.md](docs/clustering.md#rolling-restarts-and-upgrades)).
 - **Date math and older nodes.** Searches with date math need nothing: peers get
-  `now` resolved to numbers. A percolation (`_percolate`, `_bulk?percolate=true`) of an
-  index with a `date` field needs percolate wire level 1, and a shard whose copies are
-  all on 1.0.0 nodes is refused with a 503 (`_bulk` commits, with `percolated: false`)
-  until one is upgraded; indexes without a `date` field percolate as before.
-  - Saving a date-math query is not refused mid-upgrade. A 1.0.0 node percolating on
-    its own matches none of its date-math conditions: save them once every node is
-    upgraded.
+  `now` resolved to numbers.
+  - A percolation (`_percolate`, `_bulk?percolate=true`) of **every index with a
+    `date` field** needs percolate wire level 1, whether or not any saved query uses
+    date math. Through an upgraded node, a shard with a copy on an upgraded node
+    percolates there. A shard whose other copies are all on 1.0.0 nodes is refused
+    with a 503 (`_bulk` commits, with `percolated: false`), unless the coordinating
+    node holds a copy of its own that cannot serve now (stale or recovering): the
+    request's first read of the shard then falls back to that copy, which answers
+    flagged `stale` or says why it cannot. Indexes without a `date`
+    field percolate as before.
+  - Saving a date-math query is not refused mid-upgrade. A 1.0.0 node percolating its
+    own copies matches none of its date-math conditions, and a 1.0.0 node coordinating
+    a percolation sends no `now`, so the upgraded peers it asks resolve date math at
+    their own clocks. Save such queries once every node is upgraded.
   - Rolling back: a query segment holding a condition that reads `now` has a program
     tag 1.0.0 does not know. A 1.0.0 node refuses it as corrupt and rebuilds the copy,
     where the query then matches nothing; delete such queries, or rewrite them with

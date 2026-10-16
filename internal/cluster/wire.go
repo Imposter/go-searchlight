@@ -284,7 +284,8 @@ type percolateMsg struct {
 	Mapping json.RawMessage `json:"mapping,omitempty"`
 	Docs    []wireDoc       `json:"docs"`
 	// Now is the coordinator's instant for date math, Unix ms (query.WithNow): the
-	// peer resolves at it, never at its own clock. Nil from a peer that sends none.
+	// peer resolves at it, never at its own clock. Nil from a coordinator of an older
+	// release, which sends none: the peer then resolves at its node clock's wall time.
 	Now *int64 `json:"now,omitempty"`
 	// Needs is the percolate wire level a peer must speak (percolateLevel).
 	Needs int `json:"needs,omitempty"`

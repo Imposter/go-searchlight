@@ -104,9 +104,19 @@ type wireTap struct {
 	nows     []*int64
 	failed   map[int]bool
 	attempts map[int]int
+	// refuseGet fails every stored read sent to these peer addresses.
+	refuseGet map[string]bool
 }
 
 func (w *wireTap) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path == peerPrefix+"get" {
+		w.mu.Lock()
+		refuse := w.refuseGet[r.URL.Host]
+		w.mu.Unlock()
+		if refuse {
+			return nil, errors.New("tap: stored reads from this peer are dropped")
+		}
+	}
 	searching, percolating := strings.HasPrefix(r.URL.Path, peerPrefix+"search"), strings.HasPrefix(r.URL.Path, peerPrefix+"percolate")
 	if (!searching && !percolating) || r.Body == nil {
 		return w.base.RoundTrip(r)
@@ -282,8 +292,12 @@ func TestDateMathSurvivesAPeerRetry(t *testing.T) {
 	}
 }
 
-// A post_filter and a filter aggregation with date math reach a peer resolved at the
-// coordinator, whose wall clock is a month off the peer's.
+// A query, a post_filter, a filter aggregation and a filters aggregation with an other
+// bucket, each with date math, reach a peer resolved at the coordinator: the counts
+// follow the coordinator's wall clock, though the peer's is a month off (at the
+// peer's, the week would hold every document, or none). A global aggregation beside
+// them counts every document, the query's date math aside. (A filter cannot nest under
+// a global aggregation: it holds metric and bucket aggregations only.)
 func TestFilterDateMathResolvesAtTheCoordinator(t *testing.T) {
 	t0 := time.Date(2031, 3, 10, 13, 45, 30, 0, time.UTC)
 	walls := []time.Time{t0, t0.Add(30 * 24 * time.Hour)}
@@ -316,24 +330,103 @@ func TestFilterDateMathResolvesAtTheCoordinator(t *testing.T) {
 	}
 	seq := mustWrite(t, nodes[coord].n, "fd", ops...)
 	week, _ := query.Parse([]byte(`{"field": "seen", "op": "gte", "value": "now-7d"}`))
+	day, _ := query.Parse([]byte(`{"field": "seen", "op": "gte", "value": "now-1d/d"}`))
+	recent, _ := query.Parse([]byte(`{"field": "seen", "op": "gte", "value": "now-14d"}`))
 	r := &search.Request{
-		Query: &query.All{}, PostFilter: week, Size: 20, TrackTotal: search.TrackTotalAll,
-		Aggs: map[string]search.Agg{"week": {Type: search.AggFilter, Filter: week}},
+		Query: recent, PostFilter: week, Size: 20, TrackTotal: search.TrackTotalAll,
+		Aggs: map[string]search.Agg{
+			"week": {Type: search.AggFilter, Filter: week},
+			"by":   {Type: search.AggFilters, Filters: map[string]query.Node{"week": week, "day": day}, OtherBucketKey: "rest"},
+			"all":  {Type: search.AggGlobal, Aggs: map[string]search.Agg{"seen": {Type: search.AggStats, Field: "seen"}}},
+		},
 	}
 	res, err := nodes[coord].n.Search(tctx(t), "fd", r, api.ReadOptions{WaitForSeq: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Total != 8 || res.Aggs["week"].DocCount != 8 {
-		t.Fatalf("through node %d: post_filter %d, filter aggregation %d; want 8 and 8", coord, res.Total, res.Aggs["week"].DocCount)
+	by := map[string]int64{}
+	for _, b := range res.Aggs["by"].Buckets {
+		by[fmt.Sprint(b.Key)] = b.DocCount
+	}
+	if res.Total != 8 || res.Aggs["week"].DocCount != 8 || res.Aggs["all"].DocCount != 20 || res.Aggs["all"].Aggs["seen"].Count != 20 ||
+		by["week"] != 8 || by["day"] != 2 || by["rest"] != 7 {
+		t.Fatalf("through node %d: post_filter %d, filter %d, global %d, filters %v; want 8, 8, 20, week 8 day 2 rest 7",
+			coord, res.Total, res.Aggs["week"].DocCount, res.Aggs["all"].DocCount, by)
+	}
+}
+
+// dateIndexAndQueries creates index name (4 shards, replicas copies each) with seen of
+// type typ, saves eight copies of query and the document "doc" seen now, and returns
+// the seq of the write.
+func dateIndexAndQueries(t *testing.T, n *Node, st store.Store, name string, typ schema.FieldType, replicas int, raw string) int64 {
+	t.Helper()
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": typ}},
+		Settings: api.IndexSettings{Shards: 4, ReplicasPerShard: replicas},
+	}
+	if _, err := n.CreateIndex(tctx(t), name, spec); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, st, name, 4, replicas, time.Minute)
+	ops := []api.WriteOp{{Kind: api.OpUpsert, ID: "doc", Body: json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))}}
+	for i := range 8 {
+		ops = append(ops, api.WriteOp{Kind: api.OpQueryUpsert, ID: fmt.Sprintf("q%d", i), Query: json.RawMessage(raw)})
+	}
+	return mustWrite(t, n, name, ops...)
+}
+
+// lacking returns a live node hosting no copy of some shard of index, and that shard.
+func lacking(t *testing.T, nodes []*tnode, index string) (*tnode, int) {
+	t.Helper()
+	for _, tn := range nodes {
+		for s := range 4 {
+			if _, ok := tn.n.Hosted(store.ShardID{Index: index, Shard: s}); !ok {
+				return tn, s
+			}
+		}
+	}
+	t.Fatal("every node hosts every shard: no percolation reads a peer")
+	return nil, 0
+}
+
+// The three percolations of one document: given, stored (its id: a Get pins the copy
+// before the percolation) and a bulk write's. Each returns the matches and the error.
+func percolations(t *testing.T, n *Node, index string, seq int64) map[string]func() (string, error) {
+	doc := json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))
+	return map[string]func() (string, error){
+		"given": func() (string, error) {
+			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{Docs: []json.RawMessage{doc}}, api.ReadOptions{WaitForSeq: seq})
+			if err != nil {
+				return "", err
+			}
+			return string(res.Results[0].Queries), nil
+		},
+		"stored": func() (string, error) {
+			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{IDs: []string{"doc"}}, api.ReadOptions{WaitForSeq: seq})
+			if err != nil {
+				return "", err
+			}
+			return string(res.Results[0].Queries), nil
+		},
+		"bulk": func() (string, error) {
+			res, err := n.Write(tctx(t), index, []api.WriteOp{{Kind: api.OpUpsert, ID: "new", Body: doc}}, api.WriteOptions{Percolate: true, WaitForSeq: seq})
+			if err != nil {
+				return "", err
+			}
+			if !res.Percolated {
+				return "", res.PercolateErr
+			}
+			return string(res.Items[0].Queries), nil
+		},
 	}
 }
 
 // A percolation of an index with a date field needs percolate wire level 1: a peer of
 // an older release (no endpoint for it, as 1.0.0; or answering at level 0, having
 // ignored the coordinator's now) is refused, and with no other copy the percolation is
-// unavailable (503) rather than answered without its date math. An index with no date
-// field percolates through the older peer as before.
+// unavailable (503; a bulk write commits with percolated false) rather than answered
+// without its date math, a stored document's included, whose Get chose the copy
+// first. An index with no date field percolates through the older peer as before.
 func TestOlderPeerRefusedForDatePercolation(t *testing.T) {
 	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
 		t.Run(name, func(t *testing.T) {
@@ -348,40 +441,56 @@ func TestOlderPeerRefusedForDatePercolation(t *testing.T) {
 				{"plain", schema.Number, `{"field": "seen", "op": "gte", "value": 0}`},
 				{"dated", schema.Date, `{"field": "seen", "op": "gte", "value": "now-7d"}`},
 			} {
-				spec := api.IndexSpec{
-					Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": idx.typ}},
-					Settings: api.IndexSettings{Shards: 4, ReplicasPerShard: 1},
-				}
-				if _, err := a.n.CreateIndex(tctx(t), idx.name, spec); err != nil {
-					t.Fatal(err)
-				}
-				waitCopies(t, a.st, idx.name, 4, 1, time.Minute)
-				var coord *tnode
-				for _, tn := range c.live() {
-					for s := range 4 {
-						if _, ok := tn.n.Hosted(store.ShardID{Index: idx.name, Shard: s}); !ok {
-							coord = tn
-						}
+				seq := dateIndexAndQueries(t, a.n, a.st, idx.name, idx.typ, 1, idx.query)
+				coord, _ := lacking(t, c.live(), idx.name)
+				for how, run := range percolations(t, coord.n, idx.name, seq) {
+					got, err := run()
+					var ae *api.Error
+					switch {
+					case idx.typ == schema.Number && (err != nil || strings.Count(got, `"q`) != 8):
+						t.Fatalf("%s, %s, through an older peer: %s, %v", idx.name, how, got, err)
+					case idx.typ == schema.Date && (!errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable):
+						t.Fatalf("%s, %s, through an older peer: %s, %v; want a 503", idx.name, how, got, err)
 					}
-				}
-				if coord == nil {
-					t.Fatal("every node hosts every shard: no percolation reads a peer")
-				}
-				var ops []api.WriteOp
-				for i := range 8 {
-					ops = append(ops, api.WriteOp{Kind: api.OpQueryUpsert, ID: fmt.Sprintf("q%d", i), Query: json.RawMessage(idx.query)})
-				}
-				seq := mustWrite(t, a.n, idx.name, ops...)
-				doc := json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))
-				res, err := coord.n.Percolate(tctx(t), idx.name, &api.PercolateRequest{Docs: []json.RawMessage{doc}}, api.ReadOptions{WaitForSeq: seq})
-				var ae *api.Error
-				switch {
-				case idx.typ == schema.Number && (err != nil || strings.Count(string(res.Results[0].Queries), `"q`) != 8):
-					t.Fatalf("%s through an older peer: %+v, %v", idx.name, res, err)
-				case idx.typ == schema.Date && (!errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable):
-					t.Fatalf("%s through an older peer: %+v, %v; want a 503", idx.name, res, err)
 				}
 			}
 		})
+	}
+}
+
+// A shard with a copy on an older node and one on an upgraded node percolates on the
+// upgraded one: given, stored and bulk. For the stored document, the tap makes the
+// Get read the older copy, so the percolation that follows starts there and must move
+// on, rather than fail.
+func TestDatePercolationMovesPastAnOlderCopy(t *testing.T) {
+	tap := &wireTap{base: http.DefaultTransport, failed: map[int]bool{}, attempts: map[int]int{}}
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		o.Transport = tap
+		if i == 0 {
+			o.hooks.olderPeer = olderNoEndpoint
+		}
+	})
+	old := c.start(0)
+	seq := dateIndexAndQueries(t, old.n, old.st, "mx", schema.Date, 1, `{"field": "seen", "op": "gte", "value": "now-7d"}`)
+	b, d := c.start(1), c.start(2)
+	two := 2
+	if _, err := old.n.PatchSettings(tctx(t), "mx", api.SettingsPatch{ReplicasPerShard: &two}); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, old.st, "mx", 4, 2, time.Minute)
+	coord, _ := lacking(t, []*tnode{b, d}, "mx")
+	tap.mu.Lock()
+	tap.refuseGet = map[string]bool{}
+	for _, tn := range []*tnode{b, d} {
+		if tn != coord {
+			tap.refuseGet[tn.addr] = true
+		}
+	}
+	tap.mu.Unlock()
+	want := `["q0","q1","q2","q3","q4","q5","q6","q7"]`
+	for how, run := range percolations(t, coord.n, "mx", seq) {
+		if got, err := run(); err != nil || got != want {
+			t.Fatalf("%s: %s, %v; want %s", how, got, err, want)
+		}
 	}
 }

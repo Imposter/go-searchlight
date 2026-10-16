@@ -354,16 +354,22 @@ each search has a wire level, the level a peer must speak to answer it exactly.
 - [Date math](api.md#date-math) needs no level in a search: the coordinator resolves
   `now` in the query, the `post_filter` and the filter aggregations, and peers get
   plain numbers, which any release reads.
-- A percolation has a wire level of its own, kept the same way. One of an index whose
-  mapping has a `date` field needs level 1 (the coordinator's `now`, and date math in
-  saved queries, which a 1.0.0 node reads as never matching), and goes to the level-1
-  percolate endpoint. A 1.0.0 copy is refused as above: the shard's next copy answers,
-  or the percolation is unavailable (503, retryable; `_bulk?percolate=true` commits and
-  answers `percolated: false`). An index with no `date` field percolates on any node.
+- A percolation has a wire level of its own, kept the same way. One of any index whose
+  mapping has a `date` field needs level 1, whether or not a saved query uses date
+  math (the coordinator's `now`, and date math in saved queries, which a 1.0.0 node
+  reads as never matching), and goes to the level-1 percolate endpoint. A 1.0.0 copy
+  is refused as above, also when an earlier read of the request (a stored document's
+  `GET`) chose it: the shard's next copy answers. With none, the percolation is
+  unavailable (503, retryable; `_bulk?percolate=true` commits and answers
+  `percolated: false`), unless the coordinating node holds a copy of its own that
+  cannot serve now (stale or recovering): the request's first read of the shard then
+  falls back to that copy, which answers flagged `stale` or says why it cannot. An index with no `date` field percolates on any node.
 - Saving a query with date math is not refused while older nodes serve: no request
-  can tell which releases hold a shard's copies. An older node percolating by itself
-  (a request it coordinates, or a copy it rebuilt after a rollback) matches no
-  condition with date math, so save such queries once every node is upgraded.
+  can tell which releases hold a shard's copies. A 1.0.0 node percolating its own
+  copies (a request it coordinates, or a copy it rebuilt after a rollback) matches no
+  condition with date math; a 1.0.0 coordinator sends no `now`, so the upgraded peers
+  it asks resolve date math at their own clocks. Save such queries once every node is
+  upgraded.
 
 Upgrade every node before relying on these features in a cluster; a single node needs
 nothing.

@@ -329,6 +329,8 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	}
 	if msg.Now != nil {
 		ctx = query.WithNow(ctx, time.UnixMilli(*msg.Now))
+	} else {
+		ctx = query.WithNow(ctx, p.n.clock.Wall())
 	}
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{}}
 	if len(msg.Mapping) > 0 {

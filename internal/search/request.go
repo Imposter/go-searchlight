@@ -614,6 +614,53 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	return append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
 }
 
+// ResolveQueries resolves the date math of r's queries at now, as [query.Resolve]
+// does: the query, post_filter and each filter and filters aggregation's, replaced in
+// r (the aggregation maps are copied, never changed). Problems are located as
+// ValidateQueries locates them. The coordinator calls it once per request, so every
+// shard and peer reads the same instant.
+func ResolveQueries(r *Request, now time.Time) []query.Problem {
+	var ps []query.Problem
+	r.Query, ps = query.Resolve(r.Query, now)
+	if r.PostFilter != nil {
+		var more []query.Problem
+		r.PostFilter, more = query.Resolve(r.PostFilter, now)
+		ps = append(ps, relocate(more, "post_filter")...)
+	}
+	var more []query.Problem
+	r.Aggs, more = resolveAggQueries(r.Aggs, aggsLoc(r.aggsKey), now)
+	return append(ps, more...)
+}
+
+func resolveAggQueries(aggs map[string]Agg, loc string, now time.Time) (map[string]Agg, []query.Problem) {
+	if aggs == nil {
+		return nil, nil
+	}
+	var ps []query.Problem
+	out := make(map[string]Agg, len(aggs))
+	for _, name := range slices.Sorted(maps.Keys(aggs)) {
+		a := aggs[name]
+		at := loc + "." + name
+		var more []query.Problem
+		switch a.Type {
+		case AggFilter:
+			a.Filter, more = query.Resolve(a.Filter, now)
+			ps = append(ps, relocate(more, at+"."+AggFilter)...)
+		case AggFilters:
+			filters := make(map[string]query.Node, len(a.Filters))
+			for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
+				filters[key], more = query.Resolve(a.Filters[key], now)
+				ps = append(ps, relocate(more, at+".filters.filters."+key)...)
+			}
+			a.Filters = filters
+		}
+		a.Aggs, more = resolveAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), now)
+		ps = append(ps, more...)
+		out[name] = a
+	}
+	return out, ps
+}
+
 func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []query.Problem {
 	var ps []query.Problem
 	for _, name := range slices.Sorted(maps.Keys(aggs)) {

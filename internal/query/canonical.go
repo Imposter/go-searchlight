@@ -28,6 +28,11 @@ import (
 //     contains_any, contains_all, words_any, words_all: each is a set) is sorted and
 //     deduplicated after normalizing. between's [lo, hi] is ordered and keeps its
 //     shape, and so does similar's {text, min}, whose members are encoded by name.
+//   - Date math (a string bound of lt, lte, gt, gte or between) encodes parsed
+//     ([ParseDateMath]), never normalized: now-1M (a month) and now-1m (a minute)
+//     differ. The expression is kept, not resolved, so a saved query's form is the same
+//     at every instant; a search resolves its query ([Resolve]) before it is planned,
+//     so the caches keyed by a search's leaves hold resolved instants.
 func Canonical(n Node) []byte {
 	return appendNode(nil, n)
 }
@@ -102,6 +107,8 @@ const (
 	valObject
 	valWords // words_*: the phrases as the matcher reads them
 	valNever // a condition that never holds
+	valDate  // date math, parsed (a string that is none: valText)
+	valText  // a string as written, not normalized
 )
 
 // appendLeafValue appends a leaf's value, canonically: {exists} and {exists: true}
@@ -115,6 +122,9 @@ func appendLeafValue(buf []byte, l *Leaf) []byte {
 	}
 	if l.Op == OpWordsAll || l.Op == OpWordsAny {
 		return appendWords(buf, &a, l.Op == OpWordsAll)
+	}
+	if IsDateMathOp(l.Op) && hasDateText(&a) {
+		return appendDateValue(buf, &a)
 	}
 	switch a.Kind {
 	case ArgBool, ArgNumber, ArgString:
@@ -222,4 +232,29 @@ func appendWords(buf []byte, a *Arg, every bool) []byte {
 		buf = appendString(buf, p)
 	}
 	return buf
+}
+
+// appendDateValue appends a date math condition's value: a bound, or between's [lo,
+// hi], each a number or date math.
+func appendDateValue(buf []byte, a *Arg) []byte {
+	if a.Kind != ArgList {
+		return appendDateBound(buf, &a.Scalar)
+	}
+	buf = append(buf, valList)
+	buf = binary.AppendUvarint(buf, uint64(len(a.List)))
+	for i := range a.List {
+		buf = appendDateBound(buf, &a.List[i])
+	}
+	return buf
+}
+
+func appendDateBound(buf []byte, s *Scalar) []byte {
+	if s.Kind != ArgString {
+		return appendScalar(buf, *s)
+	}
+	d, why := ParseDateMath(s.Text)
+	if why != "" {
+		return appendString(append(buf, valText), s.Text)
+	}
+	return d.appendCanonical(append(buf, valDate))
 }

@@ -67,7 +67,11 @@ func TestExtractRules(t *testing.T) {
 		{`{"field":"price","op":"gte","value":10}`, fmt.Sprintf("range:price=[10,%v]", inf)},
 		{`{"field":"price","op":"between","value":[1,2]}`, `range:price=[1,2]`},
 		{`{"field":"price","op":"between","value":[2,1]}`, `always`},
-		{`{"field":"price","op":"lt","value":"x"}`, `always`},
+		// Date math: the field's presence, never an instant.
+		{`{"field":"seen","op":"lt","value":"x"}`, `present:seen=""`},
+		{`{"field":"seen","op":"gte","value":"now-7d/d"}`, `present:seen=""`},
+		{`{"field":"seen","op":"between","value":[0,"now"]}`, `present:seen=""`},
+		{`{"any":[{"field":"seen","op":"lt","value":"now"},{"field":"a","op":"eq","value":"x"}]}`, `present:seen="" value:a="x"`},
 		// Lists.
 		{`{"field":"tags","op":"has_any","value":["A","b"]}`, `entry:tags="a" entry:tags="b"`},
 		{`{"field":"tags","op":"nonempty"}`, `nonempty:tags=""`},

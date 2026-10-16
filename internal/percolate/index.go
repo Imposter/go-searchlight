@@ -340,14 +340,16 @@ func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard
 
 // add anchors the query at rank, src its stored JSON. Anchors and the class come from
 // the stored JSON parsed back, the very tree verification compiles, so the two can
-// never disagree. Each half of a pair is a member of its field (postings: every query
+// never disagree; its date math that does not read now is resolved first
+// ([query.ResolveFixed]), so it anchors and filters as any range. Each half of a pair is a member of its field (postings: every query
 // it is half of); the pair itself is stored once, under one of its halves (see
 // encode).
 func (b *segmentBuilder) add(rank uint32, src []byte) error {
-	stored, problems := query.Parse(src)
+	parsed, problems := query.Parse(src)
 	if len(problems) > 0 {
 		return fmt.Errorf("query does not round-trip: %s: %s", problems[0].Loc, problems[0].Message)
 	}
+	stored := query.ResolveFixed(parsed)
 	set := b.ex.node(stored)
 	filter, filtered := postingFilter(stored, &set)
 	rest, proven := provenRest(stored, &set, filter, filtered)

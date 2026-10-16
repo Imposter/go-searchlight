@@ -169,6 +169,10 @@ func (s *docStats) add(o *docStats) {
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match, and each
 // candidate's program decides as the matcher does.
+//
+// Date math resolves at the instant ctx carries ([query.WithNow]), which the
+// coordinator sets once for every shard of a request; without one, at the time of the
+// call.
 func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	if g == nil {
 		return nil, errors.New("percolate: no generation")
@@ -177,6 +181,11 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		attribute.Int("documents", len(docs)), attribute.Int64("queries", int64(g.NumQueries())))...)) //nolint:gosec // a query count
 	defer span.End()
 	start := time.Now()
+	now, ok := query.NowFrom(ctx)
+	if !ok {
+		now = start
+	}
+	nowMS := now.UnixMilli()
 
 	views := make([]view, len(g.QuerySegments))
 	var maxN, maxEntries uint32
@@ -213,6 +222,7 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 			sc = new(scratch)
 		}
 		sc.fit(size.n, size.entries, size.fields)
+		sc.now = nowMS
 		var local docStats
 		for {
 			i := int(next.Add(1) - 1)
@@ -474,6 +484,7 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 				c = new(scratch)
 			}
 			c.fit(size.n, size.entries, size.fields)
+			c.now = sc.now
 			scs[id] = c
 		}
 		st := &stats[id]
@@ -591,7 +602,8 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 			return err
 		}
 		st.candidates++
-		if !query.Match(q.Query, d) {
+		resolved, _ := query.Resolve(q.Query, time.UnixMilli(sc.now))
+		if !query.Match(resolved, d) {
 			st.verifiedMiss++
 			continue
 		}

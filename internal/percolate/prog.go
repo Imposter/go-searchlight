@@ -36,6 +36,10 @@ import (
 //	             contains*, words*, has*, starts_with
 //	                              texts (count, strings)
 //	             similar          minimum (a float64), keys (count, u64s)
+//	             date             op (a byte: 0 lt, 1 lte, 2 gt, 3 gte, 4 between), then per bound
+//	                              (two for between) a kind byte and a float64 (0), or now's
+//	                              date math steps (1: count, then per step its unit, round and
+//	                              N), applied to the percolation's now
 //
 // where a string is a uvarint length and its bytes, and numbers are little-endian. The
 // compiler mirrors [query.Compile] exactly (the same folding of constant conditions,
@@ -71,6 +75,7 @@ const (
 	pSimilar
 	pHas
 	pHasAll
+	pDate
 
 	numProgTags
 )
@@ -182,6 +187,13 @@ func (pc *progCompiler) group(tag byte, nodes []query.Node) pnode {
 func (pc *progCompiler) leaf(l *query.Leaf) pnode {
 	a := l.Decoded()
 	out := pnode{cost: costCompare, field: pc.field(l.Field)}
+	if l.IsDateMath() {
+		fixed, _ := query.ResolveFixed(l).(*query.Leaf)
+		if fixed.IsDateMath() {
+			return dateLeaf(l.Op, &a, out)
+		}
+		a = fixed.Decoded()
+	}
 	switch l.Op {
 	case query.OpExists:
 		out.tag = pExists
@@ -287,6 +299,60 @@ func (pc *progCompiler) leaf(l *query.Leaf) pnode {
 		out.operands = appendStrs(out.operands, list)
 	default:
 		return progNever
+	}
+	return out
+}
+
+// dateOps are the date leaf's op bytes.
+var dateOps = map[string]byte{query.OpLt: 0, query.OpLte: 1, query.OpGt: 2, query.OpGte: 3, query.OpBetween: 4}
+
+// Date bound kinds.
+const (
+	dateNumber = 0 // a float64
+	dateNow    = 1 // now, then its steps: count, and per step unit, round (0 or 1), N (varint)
+)
+
+// dateLeaf compiles a condition with date math that reads now: a program keeps its
+// steps, parsed, and each evaluation applies them to its percolation's now, so a saved
+// query's program never holds an instant. A bound that does not read now is resolved
+// here, once (as [query.ResolveFixed] resolves it); a condition with none such is a
+// plain range, compiled to the range tags.
+func dateLeaf(op string, a *query.Arg, out pnode) pnode {
+	bounds := []query.Scalar{a.Scalar}
+	if op == query.OpBetween {
+		if a.Kind != query.ArgList || len(a.List) != 2 {
+			return progNever
+		}
+		bounds = a.List
+	}
+	out.tag, out.cost = pDate, costLookup
+	out.operands = append(out.operands, dateOps[op])
+	for i := range bounds {
+		s := &bounds[i]
+		if s.Kind != query.ArgString {
+			if !finite(s) {
+				return progNever
+			}
+			out.operands = appendF64(append(out.operands, dateNumber), s.Number)
+			continue
+		}
+		d, why := query.ParseDateMath(s.Text)
+		if why != "" {
+			return progNever
+		}
+		if !d.Relative() {
+			ms, ok := d.Resolve(0, i == 1 || op == query.OpGt || op == query.OpLte)
+			if !ok {
+				return progNever
+			}
+			out.operands = appendF64(append(out.operands, dateNumber), float64(ms))
+			continue
+		}
+		steps := d.Steps()
+		out.operands = binary.AppendUvarint(append(out.operands, dateNow), uint64(len(steps)))
+		for _, st := range steps {
+			out.operands = binary.AppendVarint(append(out.operands, st.Unit, boolByte(st.Round)), st.N)
+		}
 	}
 	return out
 }
@@ -496,6 +562,8 @@ func (sc *scratch) eval(p []byte) bool {
 		return v.Text != nil && sc.similar(f, *v.Text, p)
 	case pHas, pHasAll:
 		return has(v.Entries, p, tag == pHasAll)
+	case pDate:
+		return v.Number != nil && sc.date(*v.Number, p)
 	case pNonempty:
 		return len(v.Entries) > 0
 	default:
@@ -590,14 +658,79 @@ func (sc *scratch) similar(f int, text string, p []byte) bool {
 	return analysis.SimilarityKeys(sc.simKeys[f], sc.want) >= minimum
 }
 
+// date is a date leaf's verdict on n, its bounds resolved at sc.now; a bound that
+// cannot be resolved holds for nothing, as the matcher reads a resolved tree.
+func (sc *scratch) date(n float64, p []byte) bool {
+	op := p[0]
+	p = p[1:]
+	switch op {
+	case 4:
+		lo, ok := sc.dateBound(p, false)
+		if !ok {
+			return false
+		}
+		hi, ok := sc.dateBound(skipBound(p), true)
+		return ok && lo <= n && n <= hi
+	default:
+		at, ok := sc.dateBound(p, op == 1 || op == 2)
+		switch {
+		case !ok:
+			return false
+		case op == 0:
+			return n < at
+		case op == 1:
+			return n <= at
+		case op == 2:
+			return n > at
+		default:
+			return n >= at
+		}
+	}
+}
+
+func (sc *scratch) dateBound(p []byte, roundUp bool) (float64, bool) {
+	if p[0] == dateNumber {
+		return pf64(p[1:]), true
+	}
+	ms := sc.now
+	n, p := uv(p[1:])
+	for range n {
+		st := query.DateStep{Unit: p[0], Round: p[1] != 0}
+		var k int
+		st.N, k = binary.Varint(p[2:])
+		p = p[2+k:]
+		var ok bool
+		if ms, ok = st.Apply(ms, roundUp); !ok {
+			return 0, false
+		}
+	}
+	return float64(ms), true
+}
+
+func skipBound(p []byte) []byte {
+	if p[0] == dateNumber {
+		return p[9:]
+	}
+	n, p := uv(p[1:])
+	for range n {
+		_, k := binary.Varint(p[2:])
+		p = p[2+k:]
+	}
+	return p
+}
+
 // ---- validating ----
 
 var errBadProgram = errors.New("a malformed program")
 
 // checkProg checks that p is exactly one well-formed program over numFields fields, so
 // that evaluating it reads nothing out of range.
-func checkProg(p []byte, numFields uint32) error {
-	n, err := progNode(p, numFields, 0)
+func checkProg(p []byte, numFields uint32) error { return checkProgTags(p, numFields, numProgTags) }
+
+// checkProgTags is checkProg by a reader that knows the tags below tags alone, as an
+// older build does (v1.0.0's knew those below pDate).
+func checkProgTags(p []byte, numFields uint32, tags byte) error {
+	n, err := progNode(p, numFields, tags, 0)
 	if err != nil {
 		return err
 	}
@@ -607,7 +740,7 @@ func checkProg(p []byte, numFields uint32) error {
 	return nil
 }
 
-func progNode(p []byte, numFields uint32, depth int) (int, error) {
+func progNode(p []byte, numFields uint32, tags byte, depth int) (int, error) {
 	if len(p) == 0 || depth > maxProgDepth {
 		return 0, errBadProgram
 	}
@@ -621,20 +754,20 @@ func progNode(p []byte, numFields uint32, depth int) (int, error) {
 			if !r.ok || size > uint64(len(r.p)) {
 				return 0, errBadProgram
 			}
-			got, err := progNode(r.p[:size], numFields, depth+1)
+			got, err := progNode(r.p[:size], numFields, tags, depth+1)
 			if err != nil || uint64(got) != size { //nolint:gosec // got is a length, never negative
 				return 0, errBadProgram
 			}
 			r.p = r.p[size:]
 		}
 	case pNot:
-		got, err := progNode(r.p, numFields, depth+1)
+		got, err := progNode(r.p, numFields, tags, depth+1)
 		if err != nil {
 			return 0, err
 		}
 		r.p = r.p[got:]
 	default:
-		if tag >= numProgTags || r.uvarint() >= uint64(numFields) {
+		if tag >= tags || r.uvarint() >= uint64(numFields) {
 			return 0, errBadProgram
 		}
 		r.operands(tag)
@@ -703,7 +836,48 @@ func (r *progReader) operands(tag byte) {
 	case pSimilar:
 		r.skip(8)
 		r.skip(8 * r.uvarint())
+	case pDate:
+		r.date()
 	default:
 		r.ok = false
+	}
+}
+
+// date reads a date leaf's operands: its op, then each bound's kind and value.
+func (r *progReader) date() {
+	if !r.ok || len(r.p) == 0 || r.p[0] > 4 {
+		r.ok = false
+		return
+	}
+	bounds := pick(r.p[0] == 4, 2, 1)
+	r.skip(1)
+	for range bounds {
+		if !r.ok || len(r.p) == 0 {
+			r.ok = false
+			return
+		}
+		kind := r.p[0]
+		r.skip(1)
+		switch kind {
+		case dateNumber:
+			r.skip(8)
+		case dateNow:
+			steps := r.uvarint()
+			for i := uint64(0); i < steps && r.ok; i++ {
+				if len(r.p) < 2 || !query.IsDateUnit(r.p[0]) || r.p[1] > 1 {
+					r.ok = false
+					return
+				}
+				r.skip(2)
+				v, k := binary.Varint(r.p)
+				if k <= 0 || v < math.MinInt32 || v > math.MaxInt32 {
+					r.ok = false
+					return
+				}
+				r.skip(uint64(k))
+			}
+		default:
+			r.ok = false
+		}
 	}
 }

@@ -47,6 +47,7 @@ type scratch struct {
 	pairOps  int
 	key      []byte
 	lo, hi   uint32
+	now      int64 // the percolation's now, in Unix ms: what date math resolves at
 }
 
 const (

@@ -18,6 +18,12 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     bounds and the 65,536-bucket limit apply under them too;
   - `post_filter` on `_search`: the hits, `total`, sort, `search_after` and `next`
     obey it, the aggregations (all but `global`) do not. `_count` refuses it.
+- **Date math** on `date` fields, as Elasticsearch writes it: `lt`, `lte`, `gt`, `gte`
+  and `between` take `now` or a date, then `+N`/`-N` and `/` rounding in `y M w d h H m
+  s` (`{"field": "seen_at", "op": "gte", "value": "now-7d/d"}`), in UTC. Each bound
+  rounds as Elasticsearch's range query rounds it. `now` is one instant per request,
+  read by the coordinating node and used by every shard and peer. A saved query keeps
+  its expression and resolves it at every percolation.
 
 ### Changed
 
@@ -34,6 +40,26 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   refused with a 503 (a 1.0.0 node does not apply them) until the shard has a copy
   on an upgraded node; other searches are unaffected
   ([docs/clustering.md](docs/clustering.md#rolling-restarts-and-upgrades)).
+- **Date math and older nodes.** Searches with date math need nothing: peers get
+  `now` resolved to numbers.
+  - A percolation (`_percolate`, `_bulk?percolate=true`) of **every index with a
+    `date` field** needs percolate wire level 1, whether or not any saved query uses
+    date math. Through an upgraded node, a shard with a copy on an upgraded node
+    percolates there. A shard whose other copies are all on 1.0.0 nodes is refused
+    with a 503 (`_bulk` commits, with `percolated: false`), unless the coordinating
+    node holds a copy of its own that cannot serve now (stale or recovering): the
+    request's first read of the shard then falls back to that copy, which answers
+    flagged `stale` or says why it cannot. Indexes without a `date`
+    field percolate as before.
+  - Saving a date-math query is not refused mid-upgrade. A 1.0.0 node percolating its
+    own copies matches none of its date-math conditions, and a 1.0.0 node coordinating
+    a percolation sends no `now`, so the upgraded peers it asks resolve date math at
+    their own clocks. Save such queries once every node is upgraded.
+  - Rolling back: a query segment holding a condition that reads `now` has a program
+    tag 1.0.0 does not know. A 1.0.0 node refuses it as corrupt and rebuilds the copy,
+    where the query then matches nothing; delete such queries, or rewrite them with
+    numbers, before rolling back. Segments without such a condition are unchanged
+    (format `percolate/3`).
 
 ## [1.0.0] - 2026-10-14
 

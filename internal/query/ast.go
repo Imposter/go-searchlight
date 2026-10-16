@@ -14,6 +14,10 @@
 // byte for byte, as testdata/parity/match.json pins them: text compares normalized and
 // cleaned ([analysis.Normalize], [analysis.Clean]), and a missing field matches nothing
 // but exists:false, empty and ne.
+//
+// A date field's lt, lte, gt, gte and between also take Elasticsearch's date math
+// ([ParseDateMath]): {"field": "seen_at", "op": "gte", "value": "now-7d/d"}. A query
+// keeps the expression; [Resolve] turns it into Unix milliseconds at a request's now.
 package query
 
 import (

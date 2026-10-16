@@ -23,8 +23,10 @@ import (
 
 // TestWireRoundTrip: a search request and a shard's result survive the peer API's JSON
 // exactly: the reduce over a result that went through the wire equals the reduce over
-// the original, aggregations (terms, histogram, stats, cardinality) and sort values
-// included.
+// the original, aggregations (terms, histogram, stats, cardinality, filter, filters
+// and global, with the aggregations under them) and sort values included; and the
+// decoded request, post_filter and aggregation filters included, searches as the
+// original does.
 func TestWireRoundTrip(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
@@ -37,9 +39,17 @@ func TestWireRoundTrip(t *testing.T) {
 	if len(problems) > 0 {
 		t.Fatal(problems)
 	}
+	parse := func(raw string) query.Node {
+		n, problems := query.Parse([]byte(raw))
+		if len(problems) > 0 {
+			t.Fatal(problems)
+		}
+		return n
+	}
 	minCount := 1
 	r := &search.Request{
 		Query: q, Size: 13, TrackTotal: search.TrackTotalAll, Index: "wire",
+		PostFilter:  parse(`{"field":"brand","op":"in","value":["b1","b2","b3"]}`),
 		Sort:        []search.SortField{{Field: "price", Desc: true}, {Field: "brand"}},
 		SearchAfter: []any{float64(250), "b1", "w250"},
 		Aggs: map[string]search.Agg{
@@ -49,6 +59,14 @@ func TestWireRoundTrip(t *testing.T) {
 			"hist":  {Type: search.AggHistogram, Field: "price", Interval: 50},
 			"uniq":  {Type: search.AggCardinality, Field: "brand", Precision: 14},
 			"price": {Type: search.AggStats, Field: "price"},
+			"cheap": {Type: search.AggFilter, Filter: parse(`{"field":"price","op":"lt","value":100}`), Aggs: map[string]search.Agg{
+				"brands": {Type: search.AggTerms, Field: "brand", Size: 2, Aggs: map[string]search.Agg{"uniq": {Type: search.AggCardinality, Field: "tags"}}},
+			}},
+			"tags": {Type: search.AggFilters, OtherBucketKey: "rest", Filters: map[string]query.Node{
+				"t1": parse(`{"field":"tags","op":"has","value":"t1"}`),
+				"t2": parse(`{"field":"tags","op":"has","value":"t2"}`),
+			}, Aggs: map[string]search.Agg{"price": {Type: search.AggStats, Field: "price"}}},
+			"all": {Type: search.AggGlobal, Aggs: map[string]search.Agg{"hist": {Type: search.AggHistogram, Field: "price", Interval: 100}}},
 		},
 	}
 	wr, err := encodeRequest(r)
@@ -92,6 +110,17 @@ func TestWireRoundTrip(t *testing.T) {
 	via, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{wired.Result}, r2))
 	if !bytes.Equal(direct, via) {
 		t.Fatalf("the reduce differs after the wire:\n%s\n%s", direct, via)
+	}
+	res2, err := tg.Search(tctx(t), r2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{res2}, r2))
+	if !bytes.Equal(direct, decoded) {
+		t.Fatalf("the decoded request searches differently:\n%s\n%s", direct, decoded)
+	}
+	if !bytes.Contains(direct, []byte(`"rest":{`)) || res.Total >= 300 {
+		t.Fatalf("the filters aggregation or the post_filter did not apply: total %d, %s", res.Total, direct)
 	}
 }
 

@@ -355,11 +355,15 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 		out.complete = rest.IsEmpty()
 	}
 	if s.lazy == nil && s.err == nil {
-		out.hits = card(hits)
+		matched := hits
+		if p.post != nil {
+			matched = s.matches(p.post, hits) //nolint:contextcheck // only the filter cache's hit counter takes no context
+		}
+		out.hits = card(matched)
 		p.confirmed.Add(out.hits)
-		out.top = s.topK(hits, p.size)
+		out.top = s.topK(matched, p.size)
 		if s.err == nil {
-			out.aggs = s.aggregate(hits)
+			out.aggs = s.aggregate(hits, live) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		}
 	}
 	out.scanned = s.scanned
@@ -437,14 +441,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	res := &ShardResult{TotalRelation: RelationEq, Segments: n}
 	tops := make([][]segHit, 0, n)
-	var aggs map[string]*AggPartial
-	if len(p.aggs) > 0 {
-		aggs = make(map[string]*AggPartial, len(p.aggs))
-		for _, spec := range p.aggs {
-			aggs[spec.name] = &AggPartial{Type: spec.typ}
-		}
-	}
-	ordParts := map[*aggSpec][]*ordPartial{}
+	segAggs := make([]map[string]*AggPartial, 0, n)
 	complete := true
 	for i := range results {
 		sr := &results[i]
@@ -461,24 +458,12 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		if len(sr.top) > 0 {
 			tops = append(tops, sr.top)
 		}
-		for _, spec := range p.aggs {
-			part := sr.aggs[spec.name]
-			if part != nil && part.ords != nil {
-				ordParts[spec] = append(ordParts[spec], part.ords...)
-				continue
-			}
-			mergePartial(aggs[spec.name], part, spec)
-		}
+		segAggs = append(segAggs, sr.aggs)
 	}
-	for spec, parts := range ordParts {
-		finishOrds(ctx, aggs[spec.name], parts, spec, g, p)
-	}
+	aggs := mergeShard(ctx, p.aggs, segAggs, g, p)
 	buckets := 0
-	for _, spec := range p.aggs {
-		cutShard(aggs[spec.name], spec)
-		if buckets += responseBuckets(aggs[spec.name], spec); buckets > MaxBuckets {
-			return fail(tooManyBuckets(spec), "too many buckets")
-		}
+	if spec := cutShardAggs(p.aggs, aggs, &buckets); spec != nil {
+		return fail(tooManyBuckets(spec), "too many buckets")
 	}
 	res.Aggs = aggs
 	if res.TimedOut || !complete {

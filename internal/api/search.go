@@ -32,9 +32,10 @@ type hit struct {
 	Body json.RawMessage `json:"body,omitempty"`
 }
 
-// search serves POST /indexes/{index}/_search: {query, sort, size, search_after,
-// track_total, aggs, fields, timeout}. Past the search's timeout, or the request's
-// deadline, the response holds what the shards found by then, with timed_out set.
+// search serves POST /indexes/{index}/_search: {query, post_filter, sort, size,
+// search_after, track_total, aggs, fields, timeout}. Past the search's timeout, or the
+// request's deadline, the response holds what the shards found by then, with timed_out
+// set.
 func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error {
 	start := s.clock.Now()
 	wait, e := p.waitForSeq()

@@ -51,7 +51,7 @@ func aggValues(d *schema.Doc, field string) []any {
 // bruteAgg computes a over docs, as the reduce should answer with exact shard sizes.
 func bruteAgg(t *testing.T, a Agg, docs []*schema.Doc) *AggResult {
 	t.Helper()
-	spec := prepareAgg("x", a, testMapping, "aggs.x", false, new(problems))
+	spec := prepareAgg("x", a, testMapping, "aggs.x", "", new(problems))
 	if spec == nil {
 		t.Fatalf("agg %+v refused", a)
 	}
@@ -266,8 +266,17 @@ func diffAgg(got, want *AggResult, path string) string {
 		return fmt.Sprintf("%s: cardinality %d, want %d", path, got.Value, want.Value)
 	case got.SumOtherDocCount != want.SumOtherDocCount:
 		return fmt.Sprintf("%s: sum_other_doc_count %d, want %d", path, got.SumOtherDocCount, want.SumOtherDocCount)
+	case got.DocCount != want.DocCount:
+		return fmt.Sprintf("%s: doc_count %d, want %d", path, got.DocCount, want.DocCount)
+	case len(got.Aggs) != len(want.Aggs):
+		return fmt.Sprintf("%s: %d aggregations, want %d", path, len(got.Aggs), len(want.Aggs))
 	case len(got.Buckets) != len(want.Buckets):
 		return fmt.Sprintf("%s: %d buckets %v, want %d %v", path, len(got.Buckets), bucketKeys(got.Buckets), len(want.Buckets), bucketKeys(want.Buckets))
+	}
+	for name, w := range want.Aggs {
+		if d := diffAgg(got.Aggs[name], w, path+"."+name); d != "" {
+			return d
+		}
 	}
 	for i, gb := range got.Buckets {
 		wb := want.Buckets[i]

@@ -66,7 +66,8 @@ func (g *globalOrds) local(seg int, gl uint32) (uint32, bool) {
 }
 
 // loadOrds looks up the cached global ordinals of the fields p's aggregations count by
-// ordinal (top-level terms, and every cardinality), building none.
+// ordinal (top-level terms, those under a filter, filters or global aggregation
+// included, and every cardinality), building none.
 func loadOrds(g *shard.Generation, p *prepared) {
 	var want func(spec *aggSpec, top bool)
 	want = func(spec *aggSpec, top bool) {
@@ -80,7 +81,7 @@ func loadOrds(g *shard.Generation, p *prepared) {
 			}
 		}
 		for _, sub := range spec.subs {
-			want(sub, false)
+			want(sub, spec.wrapper())
 		}
 	}
 	for _, spec := range p.aggs {

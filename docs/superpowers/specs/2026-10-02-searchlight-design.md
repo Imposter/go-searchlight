@@ -141,7 +141,9 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
 - **Errors** are problem JSON with `loc` paths such as `query.all.2.any.0.value`.
 - **Aggregations** (v1):
   - `terms` (size, min_doc_count), `range`, `histogram`, `date_histogram`, `stats`, `cardinality` (HyperLogLog++);
-  - nested one level: a bucket aggregation with metric sub-aggregations.
+  - nested one level: a bucket aggregation with metric sub-aggregations;
+  - `filter` (a query), `filters` (keyed queries, with an optional other bucket) and `global` (every live document, top level only): buckets holding any other aggregation, each with its metric sub-aggregations. Their filters go through the plan and the filter cache as the query does; their partials merge bucket by bucket, the aggregations under each reduced as top-level ones are (terms error bounds and bucket limits included);
+  - `post_filter`: a query the hits, total and paging obey but the aggregations (all but `global`) do not, so a facet panel is one search.
 
 ## 5. HTTP API
 
@@ -157,7 +159,7 @@ The API is in the Elasticsearch style:
 | `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` (applied at once, `-1` for on demand only) or the replica target |
 | `PUT/GET/DELETE /indexes/{i}/docs/{id}` | One document (`if_seq`, `refresh=true\|wait_for`) |
 | `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per request; `?percolate=true` also returns each upserted document's matching saved queries |
-| `POST /indexes/{i}/_search` | `{query, sort, size, search_after, track_total, aggs, fields, timeout}` |
+| `POST /indexes/{i}/_search` | `{query, post_filter, sort, size, search_after, track_total, aggs, fields, timeout}` |
 | `POST /indexes/{i}/_count` | Matching count |
 | `PUT/GET/DELETE /indexes/{i}/queries/{id}`, `GET /indexes/{i}/queries` | Saved queries |
 | `POST /indexes/{i}/_percolate` | Documents, or stored ids, in; matching query ids per document out |

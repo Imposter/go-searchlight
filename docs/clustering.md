@@ -336,6 +336,25 @@ compatibility rules for upgrading across a major version are in operations.md's
 section exists only to connect that to the cluster model above. [nginx.md](nginx.md)
 covers the load balancer's side of the same restart.
 
+Mid-upgrade, a coordinator may send a shard's search to a node one release older. The
+peer API only adds fields, and an older node ignores the ones it does not know, so a
+search an older node would answer only in part is never sent to it as one it reads:
+each search has a wire level, the level a peer must speak to answer it exactly.
+
+- A search with a `post_filter`, or a `filter`, `filters` or `global` aggregation,
+  needs level 1 and goes to the peer endpoint of that level, which a 1.0.0 node does
+  not have (it would run the search without the `post_filter`, and refuse the
+  aggregations). Its 404 is taken as an older release: the coordinator tries the
+  shard's next copy, and when no copy is on an upgraded node the search is
+  unavailable (503, retryable) rather than answered wrongly. Searches that need
+  neither are answered by any node.
+- Each reply says the level it was answered at, and the coordinator refuses one below
+  the search's; a node refuses (503) a search past its own level. A later wire
+  addition raises the level, so it is never silently ignored either.
+
+Upgrade every node before relying on these features in a cluster; a single node needs
+nothing.
+
 ## SQLite and MySQL notes
 
 - **SQLite is single-node only.** Its one writer can't be shared fairly by several

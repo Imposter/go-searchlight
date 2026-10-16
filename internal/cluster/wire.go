@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
@@ -57,18 +58,56 @@ const (
 // codeStale is the problem code of a read a peer refused because its copy is stale.
 const codeStale = "stale_copy"
 
-// wireRequest is a search.Request on the wire: the query as its DSL JSON.
+// searchLevel is the search wire level this binary speaks. 1.0.0 spoke 0, and its
+// decoder drops what it does not know: level 1 adds post_filter and the filter, filters
+// and global aggregations, which a level-0 peer would ignore or refuse. A request says
+// the level it needs (wireRequest.Needs), and goes to that level's endpoint
+// (searchPath), and a reply the level it was answered at (searchReply.Level): a peer
+// refuses a request past its level, and the coordinator a reply below the request's,
+// so a search is never answered with a part of it unread.
+// A wire addition a peer must not ignore raises it.
+const searchLevel = 1
+
+// noPeerEndpoint is the detail of a peer's 404 for a path it does not serve, as every
+// release since 1.0.0 words it.
+const noPeerEndpoint = "no peer endpoint here"
+
+// searchPath is the peer path of a search needing wire level needs: the search
+// endpoint for level 0, and from level 1 its level's own, which a peer of a lower level
+// does not serve (404, noPeerEndpoint). A 1.0.0 node would otherwise refuse a filter
+// aggregation with its own 400, and run a post_filter search without the post_filter.
+func searchPath(needs int) string {
+	if needs == 0 {
+		return peerPrefix + "search"
+	}
+	return peerPrefix + "search/" + strconv.Itoa(needs)
+}
+
+// wireRequest is a search.Request on the wire: the queries as their DSL JSON.
 type wireRequest struct {
-	Query       json.RawMessage       `json:"query"`
-	Sort        []search.SortField    `json:"sort,omitempty"`
-	Size        int                   `json:"size"`
-	SearchAfter []any                 `json:"search_after,omitempty"`
-	TrackTotal  int                   `json:"track_total"`
-	Aggs        map[string]search.Agg `json:"aggs,omitempty"`
-	Fields      []string              `json:"fields,omitempty"`
-	TimeoutNs   int64                 `json:"timeout_ns,omitempty"`
-	Index       string                `json:"index"`
-	NoBodies    bool                  `json:"no_bodies,omitempty"`
+	Query       json.RawMessage    `json:"query"`
+	PostFilter  json.RawMessage    `json:"post_filter,omitempty"`
+	Sort        []search.SortField `json:"sort,omitempty"`
+	Size        int                `json:"size"`
+	SearchAfter []any              `json:"search_after,omitempty"`
+	TrackTotal  int                `json:"track_total"`
+	Aggs        map[string]wireAgg `json:"aggs,omitempty"`
+	Fields      []string           `json:"fields,omitempty"`
+	TimeoutNs   int64              `json:"timeout_ns,omitempty"`
+	Index       string             `json:"index"`
+	NoBodies    bool               `json:"no_bodies,omitempty"`
+	// Needs is the search wire level a peer must speak to answer the request exactly
+	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation.
+	Needs int `json:"needs,omitempty"`
+}
+
+// wireAgg is a search.Agg on the wire: a filter or filters aggregation's queries as
+// their DSL JSON, and the aggregations under it as wireAggs.
+type wireAgg struct {
+	search.Agg
+	Filter  json.RawMessage            `json:"Filter,omitempty"`
+	Filters map[string]json.RawMessage `json:"Filters,omitempty"`
+	Aggs    map[string]wireAgg         `json:"Aggs,omitempty"`
 }
 
 func encodeRequest(r *search.Request) (*wireRequest, error) {
@@ -76,10 +115,52 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: encoding the query: %w", err)
 	}
-	return &wireRequest{
+	w := &wireRequest{
 		Query: q, Sort: r.Sort, Size: r.Size, SearchAfter: r.SearchAfter, TrackTotal: r.TrackTotal,
-		Aggs: r.Aggs, Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies,
-	}, nil
+		Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies,
+	}
+	if r.PostFilter != nil {
+		if w.PostFilter, err = percolate.EncodeQuery(r.PostFilter); err != nil {
+			return nil, fmt.Errorf("cluster: encoding the post_filter: %w", err)
+		}
+	}
+	if w.Aggs, err = encodeAggs(r.Aggs); err != nil {
+		return nil, err
+	}
+	if r.PostFilter != nil || filterAggs(r.Aggs) {
+		w.Needs = 1
+	}
+	return w, nil
+}
+
+func encodeAggs(aggs map[string]search.Agg) (map[string]wireAgg, error) {
+	if aggs == nil {
+		return nil, nil
+	}
+	out := make(map[string]wireAgg, len(aggs))
+	for name := range aggs {
+		a := aggs[name]
+		w := wireAgg{Agg: a}
+		var err error
+		if a.Filter != nil {
+			if w.Filter, err = percolate.EncodeQuery(a.Filter); err != nil {
+				return nil, fmt.Errorf("cluster: encoding aggregation %q's filter: %w", name, err)
+			}
+		}
+		if a.Filters != nil {
+			w.Filters = make(map[string]json.RawMessage, len(a.Filters))
+			for key, f := range a.Filters {
+				if w.Filters[key], err = percolate.EncodeQuery(f); err != nil {
+					return nil, fmt.Errorf("cluster: encoding aggregation %q's filter %q: %w", name, key, err)
+				}
+			}
+		}
+		if w.Aggs, err = encodeAggs(a.Aggs); err != nil {
+			return nil, err
+		}
+		out[name] = w
+	}
+	return out, nil
 }
 
 func (w *wireRequest) decode() (*search.Request, error) {
@@ -87,10 +168,53 @@ func (w *wireRequest) decode() (*search.Request, error) {
 	if len(problems) > 0 {
 		return nil, api.Invalid("the query is invalid", problems...)
 	}
-	return &search.Request{
+	r := &search.Request{
 		Query: q, Sort: w.Sort, Size: w.Size, SearchAfter: w.SearchAfter, TrackTotal: w.TrackTotal,
-		Aggs: w.Aggs, Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies,
-	}, nil
+		Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies,
+	}
+	if w.PostFilter != nil {
+		if r.PostFilter, problems = query.Parse(w.PostFilter); len(problems) > 0 {
+			return nil, api.Invalid("the post_filter is invalid", problems...)
+		}
+	}
+	aggs, err := decodeAggs(w.Aggs)
+	if err != nil {
+		return nil, err
+	}
+	r.Aggs = aggs
+	return r, nil
+}
+
+func decodeAggs(aggs map[string]wireAgg) (map[string]search.Agg, error) {
+	if aggs == nil {
+		return nil, nil
+	}
+	out := make(map[string]search.Agg, len(aggs))
+	for name := range aggs {
+		w := aggs[name]
+		a := w.Agg
+		var problems []query.Problem
+		if w.Filter != nil {
+			if a.Filter, problems = query.Parse(w.Filter); len(problems) > 0 {
+				return nil, api.Invalid("aggregation "+name+"'s filter is invalid", problems...)
+			}
+		}
+		if w.Filters != nil {
+			a.Filters = make(map[string]query.Node, len(w.Filters))
+			for key, raw := range w.Filters {
+				if a.Filters[key], problems = query.Parse(raw); len(problems) > 0 {
+					return nil, api.Invalid("aggregation "+name+"'s filter "+key+" is invalid", problems...)
+				}
+			}
+		}
+		subs, err := decodeAggs(w.Aggs)
+		if err != nil {
+			return nil, err
+		}
+		a.Aggs = subs
+		out[name] = a
+	}
+	return out, nil
 }
 
 // searchMsg asks a peer to search its copy; Pin keeps the generation for a fetch.
@@ -104,6 +228,9 @@ type searchReply struct {
 	Result *search.ShardResult `json:"result"`
 	Pin    string              `json:"pin,omitempty"`
 	Stale  bool                `json:"stale,omitempty"`
+	// Level is the search wire level the peer speaks (searchLevel); a 1.0.0 peer, which
+	// speaks 0, sends none.
+	Level int `json:"level,omitempty"`
 }
 
 // fetchMsg asks a peer to fill hits' bodies from a pinned generation.
@@ -212,4 +339,20 @@ type errorReply struct {
 	Detail       string          `json:"detail,omitempty"`
 	Problems     []query.Problem `json:"problems,omitempty"`
 	RetryAfterMs int64           `json:"retry_after_ms,omitempty"`
+}
+
+// filterAggs reports whether aggs hold a filter, filters or global aggregation, at
+// any level.
+func filterAggs(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		switch a := aggs[name]; a.Type {
+		case search.AggFilter, search.AggFilters, search.AggGlobal:
+			return true
+		default:
+			if filterAggs(a.Aggs) {
+				return true
+			}
+		}
+	}
+	return false
 }

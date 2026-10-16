@@ -334,11 +334,18 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 	err = t.attempt(ctx, "search", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = searchReply{}
 		msg := searchMsg{shardRef: ref, Request: wr, Pin: r.NoBodies}
-		if err := t.n.readCall(ctx, c, peerPrefix+"search", msg, &reply); err != nil {
+		if err := t.n.readCall(ctx, c, searchPath(wr.Needs), msg, &reply); err != nil {
+			var ae *api.Error
+			if wr.Needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (post_filter, or a filter, filters or global aggregation): it runs an older release; retry once the upgrade is done", wr.Needs)}
+			}
 			return err
 		}
 		if reply.Result == nil {
 			return &peerError{node: c.node, err: errors.New("no result")}
+		}
+		if reply.Level < wr.Needs {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (post_filter, or a filter, filters or global aggregation): it runs an older release; retry once the upgrade is done", reply.Level, wr.Needs)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil

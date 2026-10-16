@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
+	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
 // Aggregations.
@@ -27,6 +29,14 @@ import (
 // the sum over the shards that did not return it. A bucket's doc_count is therefore a
 // lower bound, exact when its bound is 0; with one shard, or shard_size at least the
 // number of distinct terms, every count is exact.
+//
+// A filter, filters or global aggregation is a few buckets of documents: per segment,
+// the hits its filter matches (the plan's, as the query's: filter cache and residual
+// checks alike), or the live documents for global. Its partial holds each bucket, in
+// its spec's key order, with the partials of the aggregations under it collected over
+// the bucket's documents as top-level ones are over the hits; every level merges
+// those as it merges top-level partials, so a terms aggregation under a filter is cut
+// and bounded as one at the top.
 
 // AggPartial is one aggregation's partial result: a segment's, or a shard's.
 type AggPartial struct {
@@ -47,7 +57,8 @@ type AggPartial struct {
 }
 
 // BucketPartial is one bucket of a partial: its key (a string, float64 or bool; a
-// range bucket's index as a float64), documents, and sub-aggregation partials.
+// range bucket's index as a float64; a filters bucket's key, nil for filter and
+// global), documents, and sub-aggregation partials.
 type BucketPartial struct {
 	Key      any                    `json:"key"`
 	DocCount int64                  `json:"doc_count"`
@@ -836,17 +847,31 @@ type denseCounter interface {
 	countDense(notHit *roaring.Bitmap) bool
 }
 
-// aggregate collects every aggregation over a segment's hits. A stats aggregation over
-// every document of a segment with no deletes is the number column's own stats.
-func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
+// aggregate collects every aggregation over a segment's hits; live are the segment's
+// live documents, which a global aggregation counts.
+func (s *segExec) aggregate(hits, live *roaring.Bitmap) map[string]*AggPartial {
 	if len(s.p.aggs) == 0 {
 		return nil
 	}
-	colls := make([]collector, len(s.p.aggs))
+	return s.aggregateSpecs(s.p.aggs, hits, live)
+}
+
+// aggregateSpecs collects specs over hits, as top-level aggregations: the request's
+// over its hits, or a filter, filters or global aggregation's over a bucket's
+// documents. A stats aggregation over every document of a segment with no deletes is
+// the number column's own stats.
+func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) map[string]*AggPartial {
+	if len(specs) == 0 {
+		return nil
+	}
+	colls := make([]collector, len(specs))
 	var perDoc []int
 	var notHit *roaring.Bitmap
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
-	for i, spec := range s.p.aggs {
+	for i, spec := range specs {
+		if spec.wrapper() {
+			continue
+		}
 		c := s.newCollector(spec, true)
 		colls[i] = c
 		if dc, ok := c.(denseCounter); ok && dense {
@@ -868,8 +893,12 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 	}
 	out := make(map[string]*AggPartial, len(colls))
 	if len(perDoc) > 0 && hits.GetCardinality() >= aggChunkMin && hits.Maximum()/aggChunk > hits.Minimum()/aggChunk {
-		for i, p := range s.collectChunked(hits, perDoc) {
-			out[s.p.aggs[perDoc[i]].name] = p
+		chunked := make([]*aggSpec, len(perDoc))
+		for j, i := range perDoc {
+			chunked[j] = specs[i]
+		}
+		for j, p := range s.collectChunked(hits, chunked) {
+			out[chunked[j].name] = p
 		}
 		perDoc = nil
 	}
@@ -883,12 +912,45 @@ func (s *segExec) aggregate(hits *roaring.Bitmap) map[string]*AggPartial {
 	if s.err != nil {
 		return nil
 	}
-	for i, spec := range s.p.aggs {
-		if out[spec.name] == nil {
+	for i, spec := range specs {
+		switch {
+		case spec.wrapper():
+			out[spec.name] = s.bucketPartial(spec, hits, live)
+		case out[spec.name] == nil:
 			out[spec.name] = colls[i].partial()
 		}
 	}
+	if s.err != nil {
+		return nil
+	}
 	return out
+}
+
+// bucketPartial collects a filter, filters or global aggregation over a segment: each
+// bucket's documents (the hits a filter matches, the hits no filter matches for
+// filters' other bucket, the live documents for global) counted, with the
+// aggregations under it collected over them.
+func (s *segExec) bucketPartial(spec *aggSpec, hits, live *roaring.Bitmap) *AggPartial {
+	p := &AggPartial{Type: spec.typ, Buckets: make([]*BucketPartial, 0, len(spec.keys))}
+	add := func(key any, docs *roaring.Bitmap) {
+		p.Buckets = append(p.Buckets, &BucketPartial{Key: key, DocCount: card(docs), Aggs: s.aggregateSpecs(spec.subs, docs, live)})
+	}
+	if spec.typ == AggGlobal {
+		add(nil, live)
+		return p
+	}
+	var matched []*roaring.Bitmap
+	for i, f := range spec.filters {
+		docs := s.matches(f, hits)
+		add(spec.keys[i], docs)
+		if spec.hasOther {
+			matched = append(matched, docs)
+		}
+	}
+	if spec.hasOther {
+		add(spec.keys[len(spec.keys)-1], roaring.AndNot(hits, roaring.FastOr(matched...)))
+	}
+	return p
 }
 
 func (s *segExec) collect(docs *roaring.Bitmap, cs []collector) {
@@ -915,9 +977,9 @@ var (
 	aggChunk           = scanChunk
 )
 
-// collectChunked collects the aggregations specs (indexes into the request's) over
-// hits in parts, in parallel, and returns each one's partial, merged.
-func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartial {
+// collectChunked collects the aggregations specs over hits in parts, in parallel, and
+// returns each one's partial, merged.
+func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggPartial {
 	first, last := hits.Minimum()/aggChunk, hits.Maximum()/aggChunk
 	chunks := int(last-first) + 1
 	parts := make([][]*AggPartial, chunks)
@@ -929,8 +991,8 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartia
 		docs := roaring.And(hits, window)
 		cs := s.fork()
 		colls := make([]collector, len(specs))
-		for j, i := range specs {
-			colls[j] = cs.newCollector(s.p.aggs[i], true)
+		for j, spec := range specs {
+			colls[j] = cs.newCollector(spec, true)
 		}
 		cs.collect(docs, colls)
 		if cs.err != nil {
@@ -952,8 +1014,7 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []int) []*AggPartia
 		return nil
 	}
 	out := make([]*AggPartial, len(specs))
-	for j, i := range specs {
-		spec := s.p.aggs[i]
+	for j, spec := range specs {
 		merged := &AggPartial{Type: spec.typ}
 		for c := range parts {
 			if p := parts[c][j]; p.ords != nil {
@@ -1085,6 +1146,72 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 	}
 }
 
+// mergeShard merges the segments' partials of specs (one map per segment searched)
+// into the shard's: by key, exactly; ordinal partials by global ordinal or by term
+// (finishOrds); and a filter, filters or global aggregation bucket by bucket, the
+// aggregations under each merged as top-level ones are.
+func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) map[string]*AggPartial {
+	if len(specs) == 0 {
+		return nil
+	}
+	out := make(map[string]*AggPartial, len(specs))
+	for _, spec := range specs {
+		dst := &AggPartial{Type: spec.typ}
+		out[spec.name] = dst
+		if spec.wrapper() {
+			for i, key := range spec.keys {
+				b := &BucketPartial{Key: key}
+				subs := make([]map[string]*AggPartial, 0, len(segs))
+				for _, m := range segs {
+					if part := m[spec.name]; part != nil && i < len(part.Buckets) {
+						b.DocCount += part.Buckets[i].DocCount
+						subs = append(subs, part.Buckets[i].Aggs)
+					}
+				}
+				b.Aggs = mergeShard(ctx, spec.subs, subs, g, p)
+				dst.Buckets = append(dst.Buckets, b)
+			}
+			continue
+		}
+		var ords []*ordPartial
+		for _, m := range segs {
+			part := m[spec.name]
+			if part != nil && part.ords != nil {
+				ords = append(ords, part.ords...)
+				continue
+			}
+			mergePartial(dst, part, spec)
+		}
+		if len(ords) > 0 {
+			finishOrds(ctx, dst, ords, spec, g, p)
+		}
+	}
+	return out
+}
+
+// cutShardAggs finishes the shard's partials of specs with cutShard, the aggregations
+// under a filter, filters or global aggregation's buckets too, and adds the buckets
+// the response can hold of them to *buckets: it returns the aggregation at which they
+// pass MaxBuckets, or nil. A filter or global aggregation counts its one bucket, a
+// filters aggregation each of its buckets.
+func cutShardAggs(specs []*aggSpec, aggs map[string]*AggPartial, buckets *int) *aggSpec {
+	for _, spec := range specs {
+		p := aggs[spec.name]
+		cutShard(p, spec)
+		if *buckets += responseBuckets(p, spec); *buckets > MaxBuckets {
+			return spec
+		}
+		if spec.wrapper() {
+			for _, b := range p.Buckets {
+				if over := cutShardAggs(spec.subs, b.Aggs, buckets); over != nil {
+					return over
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // responseBuckets is how many of a shard partial's buckets the response can hold: a
 // terms aggregation's at most its size (the rest of its shard_size over-fetch only
 // sharpens the counts across shards), every other aggregation's all of them.
@@ -1110,6 +1237,11 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
+	// DocCount and Aggs are a filter or global aggregation's one bucket: its documents
+	// and the results of the aggregations under it. A filters aggregation's buckets
+	// are Buckets, keyed by filter.
+	DocCount int64
+	Aggs     map[string]*AggResult
 	// Truncated is set on a bucket aggregation cut, or a histogram left without its
 	// empty buckets, to keep the response within MaxBuckets buckets.
 	Truncated bool
@@ -1117,8 +1249,9 @@ type AggResult struct {
 
 // Bucket is one bucket of a result.
 type Bucket struct {
-	// Key is a terms bucket's value (string, float64 or bool), a range's name, or a
-	// histogram bucket's start (milliseconds, for a date_histogram).
+	// Key is a terms bucket's value (string, float64 or bool), a range's name, a
+	// histogram bucket's start (milliseconds, for a date_histogram), or a filters
+	// bucket's key.
 	Key any
 	// KeyAsString is a date_histogram bucket's start in RFC 3339.
 	KeyAsString string
@@ -1147,6 +1280,17 @@ func (a *AggResult) MarshalJSON() ([]byte, error) {
 		return json.Marshal(struct {
 			Value int64 `json:"value"`
 		}{a.Value})
+	case AggFilter, AggGlobal:
+		return json.Marshal(inlineBucket(a.DocCount, a.Aggs))
+	case AggFilters:
+		keyed := make(map[string]map[string]any, len(a.Buckets))
+		for _, b := range a.Buckets {
+			key, _ := b.Key.(string)
+			keyed[key] = inlineBucket(b.DocCount, b.Aggs)
+		}
+		return json.Marshal(struct {
+			Buckets map[string]map[string]any `json:"buckets"`
+		}{keyed})
 	case AggTerms:
 		return json.Marshal(struct {
 			Error     int64     `json:"doc_count_error_upper_bound"`
@@ -1167,6 +1311,17 @@ func nonNil(bs []*Bucket) []*Bucket {
 		return []*Bucket{}
 	}
 	return bs
+}
+
+// inlineBucket is a filter, filters or global bucket as Elasticsearch writes it: its
+// doc_count, and the aggregations under it inline, by name.
+func inlineBucket(docCount int64, aggs map[string]*AggResult) map[string]any {
+	m := make(map[string]any, 1+len(aggs))
+	for name, sub := range aggs {
+		m[name] = sub
+	}
+	m["doc_count"] = docCount
+	return m
 }
 
 // MarshalJSON writes the bucket with its sub-aggregations inline, by name.

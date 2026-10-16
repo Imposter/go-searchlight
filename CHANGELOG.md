@@ -4,6 +4,37 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Added
+
+- **Filter aggregations and `post_filter`**, so a facet panel is one search
+  ([docs/api.md](docs/api.md#search-and-count)):
+  - `filter` (a query), `filters` (keyed queries, with `other_bucket_key`) and
+    `global` (every document of the index, top level only), each holding any other
+    aggregation with its metric sub-aggregations. Their filters are planned and
+    cached as the query is, checked against the mapping at their own `loc`, and
+    reduced across shards and nodes as top-level aggregations are: `terms` error
+    bounds and the 65,536-bucket limit apply under them too;
+  - `post_filter` on `_search`: the hits, `total`, sort, `search_after` and `next`
+    obey it, the aggregations (all but `global`) do not. `_count` refuses it.
+
+### Changed
+
+- The 100-aggregation bound counts the aggregations under a `filters` aggregation once
+  per bucket.
+- A sub-aggregation named after a member of the bucket it is written in (`key`,
+  `doc_count`, ...) is refused with a 400, rather than overwritten in the response.
+- Problems are located under `aggregations` when the request spells it so.
+
+### Upgrading
+
+- During a rolling upgrade from 1.0.0, a search with a `post_filter` or a `filter`,
+  `filters` or `global` aggregation that would read a shard from a 1.0.0 node is
+  refused with a 503 (a 1.0.0 node does not apply them) until the shard has a copy
+  on an upgraded node; other searches are unaffected
+  ([docs/clustering.md](docs/clustering.md#rolling-restarts-and-upgrades)).
+
 ## [1.0.0] - 2026-10-14
 
 The first release: a search engine that behaves like Elasticsearch for filtering,

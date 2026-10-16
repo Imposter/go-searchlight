@@ -145,9 +145,10 @@ func (n *Single) now(ctx context.Context) time.Time {
 const requeryRounds = 3
 
 // Search implements [api.Coordinator]: a query-then-fetch over every shard, each
-// shard's generation held from its query to its fetch. Its date math resolves here,
-// once, at the clock's wall time (or the instant ctx carries, [query.WithNow]): every
-// shard, local or a peer's, gets the resolved query.
+// shard's generation held from its query to its fetch. Its date math (the query's,
+// post_filter's and the filter aggregations') resolves here, once, at the clock's wall
+// time (or the instant ctx carries, [query.WithNow]): every shard, local or a peer's,
+// gets the resolved queries.
 func (n *Single) Search(ctx context.Context, name string, r *search.Request, opts api.ReadOptions) (res *api.SearchResult, err error) {
 	ctx, span := n.readSpan(ctx, "node.search", name)
 	defer func() { endSpan(span, err) }()
@@ -158,11 +159,9 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 	if err := n.validQuery(ctx, idx, r); err != nil {
 		return nil, err
 	}
-	resolved, problems := query.Resolve(r.Query, n.now(ctx))
-	if len(problems) > 0 {
+	if problems := search.ResolveQueries(r, n.now(ctx)); len(problems) > 0 {
 		return nil, api.Invalid("the query is invalid", problems...)
 	}
-	r.Query = resolved
 	r.Index = name
 	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
 	if err != nil {

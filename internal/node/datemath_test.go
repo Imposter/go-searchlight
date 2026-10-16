@@ -13,6 +13,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/search"
 )
 
 // wallClock is the real clock with a wall time the test sets: each Wall reads the next
@@ -145,4 +146,56 @@ func mustParseQuery(t *testing.T, raw string) query.Node {
 		t.Fatal(problems)
 	}
 	return q
+}
+
+// A filter and a filters aggregation and a post_filter resolve their date math at the
+// request's now too, as the query does: across clock moves, with their leaves warm in
+// the filter cache, each answers for its own now.
+func TestFilterAggsAndPostFilterDateMathFollowTheClock(t *testing.T) {
+	wall := &wallClock{times: []time.Time{dateT0}}
+	n := dateIndex(t, wall)
+	var ops []api.WriteOp
+	for d := range 20 {
+		ops = append(ops, upsert(fmt.Sprintf("doc%d", d), fmt.Sprintf(`{"seen": %q, "brand": "b%d"}`, dateT0.Add(-days(d)).Format(time.RFC3339), d%2)))
+	}
+	seq := mustWrite(t, n, "d", ops...).Seq
+	week := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-7d"}`)
+	day := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-1d/d"}`)
+	for _, tc := range []struct {
+		at              time.Time
+		week, day, hits int64
+	}{
+		{dateT0, 8, 2, 8},
+		{dateT0.Add(days(3)), 5, 0, 5},
+		{dateT0.Add(days(30)), 0, 0, 0},
+		{dateT0, 8, 2, 8},
+	} {
+		wall.set(tc.at)
+		for range 4 { // past the usage sketch, into the filter cache
+			r := &search.Request{
+				Query: &query.All{}, PostFilter: week, Size: 20, TrackTotal: search.TrackTotalAll,
+				Aggs: map[string]search.Agg{
+					"week": {Type: search.AggFilter, Filter: week},
+					"by":   {Type: search.AggFilters, Filters: map[string]query.Node{"week": week, "day": day}},
+				},
+			}
+			resp, err := n.Search(ctx(t), "d", r, api.ReadOptions{WaitForSeq: seq})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.Total != tc.hits || int64(len(resp.Hits)) != tc.hits {
+				t.Fatalf("at %s: post_filter keeps %d (%d hits), want %d", tc.at, resp.Total, len(resp.Hits), tc.hits)
+			}
+			if got := resp.Aggs["week"].DocCount; got != tc.week {
+				t.Fatalf("at %s: the filter aggregation counts %d, want %d", tc.at, got, tc.week)
+			}
+			counts := map[string]int64{}
+			for _, b := range resp.Aggs["by"].Buckets {
+				counts[fmt.Sprint(b.Key)] = b.DocCount
+			}
+			if counts["week"] != tc.week || counts["day"] != tc.day {
+				t.Fatalf("at %s: the filters aggregation counts %v, want week %d, day %d", tc.at, counts, tc.week, tc.day)
+			}
+		}
+	}
 }

@@ -351,6 +351,19 @@ each search has a wire level, the level a peer must speak to answer it exactly.
 - Each reply says the level it was answered at, and the coordinator refuses one below
   the search's; a node refuses (503) a search past its own level. A later wire
   addition raises the level, so it is never silently ignored either.
+- [Date math](api.md#date-math) needs no level in a search: the coordinator resolves
+  `now` in the query, the `post_filter` and the filter aggregations, and peers get
+  plain numbers, which any release reads.
+- A percolation has a wire level of its own, kept the same way. One of an index whose
+  mapping has a `date` field needs level 1 (the coordinator's `now`, and date math in
+  saved queries, which a 1.0.0 node reads as never matching), and goes to the level-1
+  percolate endpoint. A 1.0.0 copy is refused as above: the shard's next copy answers,
+  or the percolation is unavailable (503, retryable; `_bulk?percolate=true` commits and
+  answers `percolated: false`). An index with no `date` field percolates on any node.
+- Saving a query with date math is not refused while older nodes serve: no request
+  can tell which releases hold a shard's copies. An older node percolating by itself
+  (a request it coordinates, or a copy it rebuilt after a rollback) matches no
+  condition with date math, so save such queries once every node is upgraded.
 
 Upgrade every node before relying on these features in a cluster; a single node needs
 nothing.

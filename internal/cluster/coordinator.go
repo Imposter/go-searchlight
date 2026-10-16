@@ -184,9 +184,10 @@ type testHooks struct {
 	// pinned is told of every generation of this node's copy of id a peer's query phase
 	// pinned, before the reply goes back.
 	pinned func(id store.ShardID, pin string)
-	// olderPeer makes the node answer peer searches as an older one: olderNoEndpoint as
-	// 1.0.0 does (no endpoint for a search past level 0), olderDropsLevel by serving it
-	// with its post_filter dropped and no wire level in the reply.
+	// olderPeer makes the node answer peer searches and percolations as an older one:
+	// olderNoEndpoint as 1.0.0 does (no endpoint past level 0), olderDropsLevel by
+	// serving them with their post_filter (a search's) or now (a percolation's) dropped
+	// and no wire level in the reply.
 	olderPeer olderPeer
 }
 

@@ -363,7 +363,8 @@ On a `date` field, `lt`, `lte`, `gt`, `gte` and each bound of `between` take a n
   whole day, and a time with no fraction stands for its second's last millisecond.
 - **Time zone.** UTC. There is no `time_zone` parameter.
 - **`now`** is read once per request, to the millisecond, by the node that takes it.
-  Every shard, on this node or a peer, answers at that instant.
+  Every shard, on this node or a peer, answers at that instant: the query's, the
+  `post_filter`'s and every `filter` and `filters` aggregation's date math alike.
 - **Saved queries** keep the expression: `GET` returns it as written. Each percolation
   (`_percolate`, `_bulk?percolate=true`) resolves it at its own `now`, so a saved
   `gte now-7d` stops matching a document once the document is a week old.

@@ -397,12 +397,20 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 		ms := now.UnixMilli()
 		at = &ms
 	}
+	needs := percolateNeeds(mapping)
 	var reply percolateReply
 	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = percolateReply{}
-		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at}
-		if err := t.n.readCall(ctx, c, peerPrefix+"percolate", msg, &reply); err != nil {
+		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at, Needs: needs}
+		if err := t.n.readCall(ctx, c, percolatePath(needs), msg, &reply); err != nil {
+			var ae *api.Error
+			if needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (an index with a date field, whose saved queries may hold date math): it runs an older release; retry once the upgrade is done", needs)}
+			}
 			return err
+		}
+		if reply.Level < needs {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (an index with a date field, whose saved queries may hold date math): it runs an older release; retry once the upgrade is done", reply.Level, needs)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil

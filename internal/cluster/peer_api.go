@@ -41,6 +41,7 @@ import (
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
+//	POST   /_internal/percolate/1               the same, for a percolation of wire level 1 (percolatePath)
 //	POST   /_internal/get                       a stored document or saved query from a copy
 //	POST   /_internal/wait                      wait until a copy has a seq searchable
 //	POST   /_internal/counts                    a copy's live documents and saved queries
@@ -67,6 +68,7 @@ func (p *peerAPI) handler() http.Handler {
 	handle("POST /_internal/fetch", p.fetch)
 	handle("DELETE /_internal/pins/{id}", p.unpin)
 	handle("POST /_internal/percolate", p.percolate)
+	handle("POST /_internal/percolate/1", p.percolate)
 	handle("POST /_internal/get", p.get)
 	handle("POST /_internal/wait", p.wait)
 	handle("POST /_internal/counts", p.counts)
@@ -313,6 +315,18 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	if err := decode(r, &msg); err != nil {
 		return nil, err
 	}
+	if msg.Needs > percolateLevel {
+		return nil, api.Unavailable(nil, "this node speaks percolate wire level %d and the percolation needs %d: it runs an older release than the coordinator", percolateLevel, msg.Needs)
+	}
+	level := percolateLevel
+	if h := p.n.opts.hooks; h != nil && msg.Needs > 0 {
+		switch h.olderPeer {
+		case olderNoEndpoint:
+			return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
+		case olderDropsLevel:
+			msg.Now, level = nil, 0
+		}
+	}
 	if msg.Now != nil {
 		ctx = query.WithNow(ctx, time.UnixMilli(*msg.Now))
 	}
@@ -346,7 +360,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 			out[i] = json.RawMessage("[]")
 		}
 	}
-	return &percolateReply{Matches: out, Stale: t.Stale()}, nil
+	return &percolateReply{Matches: out, Stale: t.Stale(), Level: level}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {

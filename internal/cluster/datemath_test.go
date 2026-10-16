@@ -107,7 +107,7 @@ type wireTap struct {
 }
 
 func (w *wireTap) RoundTrip(r *http.Request) (*http.Response, error) {
-	searching, percolating := r.URL.Path == peerPrefix+"search", r.URL.Path == peerPrefix+"percolate"
+	searching, percolating := strings.HasPrefix(r.URL.Path, peerPrefix+"search"), strings.HasPrefix(r.URL.Path, peerPrefix+"percolate")
 	if (!searching && !percolating) || r.Body == nil {
 		return w.base.RoundTrip(r)
 	}
@@ -279,5 +279,109 @@ func TestDateMathSurvivesAPeerRetry(t *testing.T) {
 		if now == nil || *now != at.UnixMilli() {
 			t.Fatalf("a percolation was sent now %v, want %d", now, at.UnixMilli())
 		}
+	}
+}
+
+// A post_filter and a filter aggregation with date math reach a peer resolved at the
+// coordinator, whose wall clock is a month off the peer's.
+func TestFilterDateMathResolvesAtTheCoordinator(t *testing.T) {
+	t0 := time.Date(2031, 3, 10, 13, 45, 30, 0, time.UTC)
+	walls := []time.Time{t0, t0.Add(30 * 24 * time.Hour)}
+	tap := &wireTap{base: http.DefaultTransport, failed: map[int]bool{}, attempts: map[int]int{}}
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		o.Transport = tap
+		o.Engine = func(eo *node.Options) { eo.Clock = fixedWall{at: walls[i]} }
+	})
+	nodes := []*tnode{c.start(0), c.start(1)}
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": schema.Date}},
+		Settings: api.IndexSettings{Shards: 4, ReplicasPerShard: 1},
+	}
+	if _, err := nodes[0].n.CreateIndex(tctx(t), "fd", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, nodes[0].st, "fd", 4, 1, time.Minute)
+	coord := 0
+	for i, tn := range nodes {
+		for s := range 4 {
+			if _, ok := tn.n.Hosted(store.ShardID{Index: "fd", Shard: s}); !ok {
+				coord = i
+			}
+		}
+	}
+	at := walls[coord]
+	var ops []api.WriteOp
+	for k := range 20 {
+		ops = append(ops, api.WriteOp{Kind: api.OpUpsert, ID: fmt.Sprintf("d%02d", k), Body: json.RawMessage(fmt.Sprintf(`{"seen": %d}`, at.Add(-time.Duration(k)*24*time.Hour).UnixMilli()))})
+	}
+	seq := mustWrite(t, nodes[coord].n, "fd", ops...)
+	week, _ := query.Parse([]byte(`{"field": "seen", "op": "gte", "value": "now-7d"}`))
+	r := &search.Request{
+		Query: &query.All{}, PostFilter: week, Size: 20, TrackTotal: search.TrackTotalAll,
+		Aggs: map[string]search.Agg{"week": {Type: search.AggFilter, Filter: week}},
+	}
+	res, err := nodes[coord].n.Search(tctx(t), "fd", r, api.ReadOptions{WaitForSeq: seq})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Total != 8 || res.Aggs["week"].DocCount != 8 {
+		t.Fatalf("through node %d: post_filter %d, filter aggregation %d; want 8 and 8", coord, res.Total, res.Aggs["week"].DocCount)
+	}
+}
+
+// A percolation of an index with a date field needs percolate wire level 1: a peer of
+// an older release (no endpoint for it, as 1.0.0; or answering at level 0, having
+// ignored the coordinator's now) is refused, and with no other copy the percolation is
+// unavailable (503) rather than answered without its date math. An index with no date
+// field percolates through the older peer as before.
+func TestOlderPeerRefusedForDatePercolation(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) {
+			c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.hooks.olderPeer = older })
+			a := c.start(0)
+			c.start(1)
+			for _, idx := range []struct {
+				name  string
+				typ   schema.FieldType
+				query string
+			}{
+				{"plain", schema.Number, `{"field": "seen", "op": "gte", "value": 0}`},
+				{"dated", schema.Date, `{"field": "seen", "op": "gte", "value": "now-7d"}`},
+			} {
+				spec := api.IndexSpec{
+					Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": idx.typ}},
+					Settings: api.IndexSettings{Shards: 4, ReplicasPerShard: 1},
+				}
+				if _, err := a.n.CreateIndex(tctx(t), idx.name, spec); err != nil {
+					t.Fatal(err)
+				}
+				waitCopies(t, a.st, idx.name, 4, 1, time.Minute)
+				var coord *tnode
+				for _, tn := range c.live() {
+					for s := range 4 {
+						if _, ok := tn.n.Hosted(store.ShardID{Index: idx.name, Shard: s}); !ok {
+							coord = tn
+						}
+					}
+				}
+				if coord == nil {
+					t.Fatal("every node hosts every shard: no percolation reads a peer")
+				}
+				var ops []api.WriteOp
+				for i := range 8 {
+					ops = append(ops, api.WriteOp{Kind: api.OpQueryUpsert, ID: fmt.Sprintf("q%d", i), Query: json.RawMessage(idx.query)})
+				}
+				seq := mustWrite(t, a.n, idx.name, ops...)
+				doc := json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))
+				res, err := coord.n.Percolate(tctx(t), idx.name, &api.PercolateRequest{Docs: []json.RawMessage{doc}}, api.ReadOptions{WaitForSeq: seq})
+				var ae *api.Error
+				switch {
+				case idx.typ == schema.Number && (err != nil || strings.Count(string(res.Results[0].Queries), `"q`) != 8):
+					t.Fatalf("%s through an older peer: %+v, %v", idx.name, res, err)
+				case idx.typ == schema.Date && (!errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable):
+					t.Fatalf("%s through an older peer: %+v, %v; want a 503", idx.name, res, err)
+				}
+			}
+		})
 	}
 }

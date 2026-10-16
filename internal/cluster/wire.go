@@ -9,6 +9,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 )
 
@@ -244,6 +245,38 @@ type fetchReply struct {
 	Bodies []json.RawMessage `json:"bodies"`
 }
 
+// percolateLevel is the percolate wire level this binary speaks, as searchLevel is
+// the search's. 1.0.0 spoke 0: it reads no date math in saved queries and ignores
+// percolateMsg.Now. Level 1 adds both. A percolation of an index whose mapping holds a
+// date field (the only fields date math applies to) needs it, and goes to its level's
+// endpoint (percolatePath), which a 1.0.0 peer does not serve; a reply below it is
+// refused, so the shard's next copy answers, or none does (503).
+const percolateLevel = 1
+
+// percolatePath is the peer path of a percolation needing wire level needs.
+func percolatePath(needs int) string {
+	if needs == 0 {
+		return peerPrefix + "percolate"
+	}
+	return peerPrefix + "percolate/" + strconv.Itoa(needs)
+}
+
+// percolateNeeds is the percolate wire level a percolation under mapping (the
+// catalogue's JSON) needs: 1 when it holds a date field, whose saved conditions may
+// hold date math; 0 otherwise. A mapping it cannot read needs 1.
+func percolateNeeds(mapping json.RawMessage) int {
+	var m schema.Mapping
+	if len(mapping) > 0 && json.Unmarshal(mapping, &m) != nil {
+		return 1
+	}
+	for _, t := range m.Fields {
+		if t == schema.Date {
+			return 1
+		}
+	}
+	return 0
+}
+
 // percolateMsg asks a peer to percolate documents, analyzed under Mapping (the
 // catalogue's JSON), against its copy's saved queries.
 type percolateMsg struct {
@@ -253,6 +286,8 @@ type percolateMsg struct {
 	// Now is the coordinator's instant for date math, Unix ms (query.WithNow): the
 	// peer resolves at it, never at its own clock. Nil from a peer that sends none.
 	Now *int64 `json:"now,omitempty"`
+	// Needs is the percolate wire level a peer must speak (percolateLevel).
+	Needs int `json:"needs,omitempty"`
 }
 
 type wireDoc struct {
@@ -260,9 +295,12 @@ type wireDoc struct {
 	Body json.RawMessage `json:"body"`
 }
 
+// percolateReply is a peer's percolation; Level is the percolate wire level it speaks
+// (a 1.0.0 peer sends none).
 type percolateReply struct {
 	Matches []json.RawMessage `json:"matches"`
 	Stale   bool              `json:"stale,omitempty"`
+	Level   int               `json:"level,omitempty"`
 }
 
 // getMsg reads a document or a saved query from a peer's copy.

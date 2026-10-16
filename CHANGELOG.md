@@ -19,6 +19,22 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   - `post_filter` on `_search`: the hits, `total`, sort, `search_after` and `next`
     obey it, the aggregations (all but `global`) do not. `_count` refuses it.
 
+### Changed
+
+- The 100-aggregation bound counts the aggregations under a `filters` aggregation once
+  per bucket.
+- A sub-aggregation named after a member of the bucket it is written in (`key`,
+  `doc_count`, ...) is refused with a 400, rather than overwritten in the response.
+- Problems are located under `aggregations` when the request spells it so.
+
+### Upgrading
+
+- During a rolling upgrade from 1.0.0, a search with a `post_filter` or a `filter`,
+  `filters` or `global` aggregation that would read a shard from a 1.0.0 node is
+  refused with a 503 (a 1.0.0 node does not apply them) until the shard has a copy
+  on an upgraded node; other searches are unaffected
+  ([docs/clustering.md](docs/clustering.md#rolling-restarts-and-upgrades)).
+
 ## [1.0.0] - 2026-10-14
 
 The first release: a search engine that behaves like Elasticsearch for filtering,

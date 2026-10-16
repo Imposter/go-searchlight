@@ -542,3 +542,53 @@ func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
 		t.Fatalf("percolating on the node with a stale catalogue: %+v, %v", res, err)
 	}
 }
+
+// TestOlderPeerRefusedForPostFilter: a peer of an older release, one with no endpoint
+// for a level-1 search (as 1.0.0) or one answering it at level 0 (having dropped the
+// post_filter unread), is not trusted with a search that needs level 1: the coordinator refuses its reply, and with no other copy the search is
+// unavailable (503) rather than answered with unfiltered hits. Searches that need
+// nothing new are answered as before.
+func TestOlderPeerRefusedForPostFilter(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older) })
+	}
+}
+
+func testOlderPeer(t *testing.T, older olderPeer) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.hooks.olderPeer = older
+	})
+	a := c.start(0)
+	c.start(1)
+	createIndex(t, a.n, "lv", 4, 1)
+	waitCopies(t, a.st, "lv", 4, 1, time.Minute)
+	var last int64
+	for k := range 20 {
+		last = mustWrite(t, a.n, "lv", upsertOp(fmt.Sprintf("l%02d", k), k))
+	}
+	var coord *tnode
+	for _, tn := range c.live() {
+		for s := range 4 {
+			if _, ok := tn.n.Hosted(store.ShardID{Index: "lv", Shard: s}); !ok {
+				coord = tn
+			}
+		}
+	}
+	if coord == nil {
+		t.Fatal("every node hosts every shard: no search reads a peer")
+	}
+	cheap := &query.Leaf{Field: "price", Op: query.OpLt, Value: json.RawMessage(`5`)}
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
+		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
+	}
+	for name, r := range map[string]*search.Request{
+		"post_filter": {Query: &query.All{}, PostFilter: cheap, Size: 20, TrackTotal: search.TrackTotalAll},
+		"filter":      {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap}}},
+	} {
+		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last})
+		var ae *api.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+			t.Fatalf("%s through an older peer: %v, %v; want a 503", name, res, err)
+		}
+	}
+}

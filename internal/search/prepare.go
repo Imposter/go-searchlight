@@ -139,10 +139,10 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		ps.add("fields", "fields: at most %d names", MaxFields)
 	}
 	if n := countAggs(r.Aggs); n > MaxAggs {
-		ps.add("aggs", "a search holds at most %d aggregations, sub-aggregations included; this one holds %d", MaxAggs, n)
+		ps.add(aggsLoc(r.aggsKey), "a search holds at most %d aggregations, sub-aggregations included and those under a filters aggregation counted once per bucket; this one holds %d", MaxAggs, n)
 	} else {
 		for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-			if s := prepareAgg(name, r.Aggs[name], m, "aggs."+name, "", &ps); s != nil {
+			if s := prepareAgg(name, r.Aggs[name], m, aggsLoc(r.aggsKey)+"."+name, "", &ps); s != nil {
 				p.aggs = append(p.aggs, s)
 			}
 		}
@@ -174,11 +174,21 @@ func compileFilters(specs []*aggSpec, req uint64) {
 	}
 }
 
-// countAggs counts aggs and their sub-aggregations.
+// countAggs counts aggs and their sub-aggregations, those of a filters aggregation
+// once per bucket (each key, and the other bucket), as each bucket collects them
+// apart: what bounds the collectors a segment builds.
 func countAggs(aggs map[string]Agg) int {
 	n := len(aggs)
 	for name := range aggs {
-		n += countAggs(aggs[name].Aggs)
+		a := aggs[name]
+		buckets := 1
+		if a.Type == AggFilters {
+			buckets = max(1, len(a.Filters))
+			if a.OtherBucketKey != "" {
+				buckets++
+			}
+		}
+		n += buckets * countAggs(a.Aggs)
 	}
 	return n
 }
@@ -446,10 +456,15 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 	}
 	if len(a.Aggs) > 0 {
 		if isMetric || (parent != "" && !singleBucket(parent)) {
-			ps.add(loc+".aggs", "only a bucket aggregation holds sub-aggregations: metrics, one level deep, or under filter, filters and global any aggregation but those")
+			ps.add(loc+"."+aggsLoc(a.aggsKey), "only a bucket aggregation holds sub-aggregations: metrics, one level deep, or under filter, filters and global any aggregation but those")
 		} else {
 			for _, subName := range slices.Sorted(maps.Keys(a.Aggs)) {
-				if ss := prepareAgg(subName, a.Aggs[subName], m, loc+".aggs."+subName, a.Type, ps); ss != nil {
+				at := loc + "." + aggsLoc(a.aggsKey) + "." + subName
+				if slices.Contains(reservedNames(a.Type), subName) {
+					ps.add(at, "%q is a member of the %s bucket the sub-aggregation is written in: name it otherwise", subName, a.Type)
+					continue
+				}
+				if ss := prepareAgg(subName, a.Aggs[subName], m, at, a.Type, ps); ss != nil {
 					s.subs = append(s.subs, ss)
 				}
 			}
@@ -492,4 +507,13 @@ func tooManyBuckets(spec *aggSpec) error {
 		Loc:     spec.loc + "." + spec.typ,
 		Message: fmt.Sprintf("the aggregations hold more than %d buckets: widen the interval, lower a size or narrow the query", MaxBuckets),
 	}}}
+}
+
+// reservedNames are the members a bucket of an aggregation of type typ is written with,
+// which a sub-aggregation, written inline beside them, cannot be named.
+func reservedNames(typ string) []string {
+	if singleBucket(typ) {
+		return []string{"doc_count"}
+	}
+	return []string{"key", "key_as_string", "from", "to", "doc_count", "doc_count_error_upper_bound"}
 }

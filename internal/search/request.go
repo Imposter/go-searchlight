@@ -143,6 +143,10 @@ type Request struct {
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
 
+	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
+	// ("" reads as aggs).
+	aggsKey string
+
 	// serial identifies a parsed request for the filter cache's admission (0: not
 	// parsed here; its address stands in).
 	serial uint64
@@ -214,6 +218,8 @@ type Agg struct {
 
 	// Aggs are the sub-aggregations computed per bucket.
 	Aggs map[string]Agg
+	// aggsKey is the key the body gave Aggs under, as Request.aggsKey.
+	aggsKey string
 }
 
 // Range is one bucket of a range aggregation.
@@ -319,7 +325,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				}
 			}
 		case "aggs", "aggregations":
-			r.Aggs = parseAggs(val, key, 0, false, &ps)
+			r.Aggs, r.aggsKey = parseAggs(val, key, 0, false, &ps), key
 		case "fields":
 			var fields []string
 			if err := json.Unmarshal(val, &fields); err != nil {
@@ -510,7 +516,7 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 		}
 		if subs != nil {
 			if depth == 0 || (depth == 1 && wrapped) {
-				a.Aggs = parseAggs(subs, at+"."+subsKey, depth+1, singleBucket(a.Type), ps)
+				a.Aggs, a.aggsKey = parseAggs(subs, at+"."+subsKey, depth+1, singleBucket(a.Type), ps), subsKey
 			} else {
 				ps.add(at+"."+subsKey, "sub-aggregations nest one level deep, or two under filter, filters and global")
 			}
@@ -605,7 +611,7 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	if r.PostFilter != nil {
 		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
 	}
-	return append(ps, validateAggQueries(r.Aggs, "aggs", m)...)
+	return append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
 }
 
 func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []query.Problem {
@@ -621,7 +627,7 @@ func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []qu
 				ps = append(ps, relocate(query.Validate(a.Filters[key], m), at+".filters.filters."+key)...)
 			}
 		}
-		ps = append(ps, validateAggQueries(a.Aggs, at+".aggs", m)...)
+		ps = append(ps, validateAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), m)...)
 	}
 	return ps
 }
@@ -781,3 +787,12 @@ func intervalMillis(raw json.RawMessage) (float64, bool) {
 
 // errNoGeneration is ExecuteShard called without a generation.
 var errNoGeneration = errors.New("search: no generation")
+
+// aggsLoc is the loc of aggregations given under key: aggs unless the body spelled it
+// aggregations.
+func aggsLoc(key string) string {
+	if key == "" {
+		return "aggs"
+	}
+	return key
+}

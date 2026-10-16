@@ -976,7 +976,7 @@ components:
         aggs:
           type: object
           maxProperties: 100
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep; and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations and those under filter, filters and global included; at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep; and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
         aggregations:
           type: object
           maxProperties: 100

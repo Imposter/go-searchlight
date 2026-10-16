@@ -184,6 +184,10 @@ type testHooks struct {
 	// pinned is told of every generation of this node's copy of id a peer's query phase
 	// pinned, before the reply goes back.
 	pinned func(id store.ShardID, pin string)
+	// olderPeer makes the node answer peer searches as an older one: olderNoEndpoint as
+	// 1.0.0 does (no endpoint for a search past level 0), olderDropsLevel by serving it
+	// with its post_filter dropped and no wire level in the reply.
+	olderPeer olderPeer
 }
 
 func (o *Options) resolve() error {
@@ -668,3 +672,12 @@ func (n *Node) Stop(ctx context.Context) error {
 
 // Close implements [api.Coordinator]: [Node.Stop].
 func (n *Node) Close(ctx context.Context) error { return n.Stop(ctx) }
+
+// olderPeer is how a test node plays a peer of an older release (testHooks.olderPeer).
+type olderPeer uint8
+
+const (
+	olderNone olderPeer = iota
+	olderNoEndpoint
+	olderDropsLevel
+)

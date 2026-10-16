@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
@@ -57,6 +58,31 @@ const (
 // codeStale is the problem code of a read a peer refused because its copy is stale.
 const codeStale = "stale_copy"
 
+// searchLevel is the search wire level this binary speaks. 1.0.0 spoke 0, and its
+// decoder drops what it does not know: level 1 adds post_filter and the filter, filters
+// and global aggregations, which a level-0 peer would ignore or refuse. A request says
+// the level it needs (wireRequest.Needs), and goes to that level's endpoint
+// (searchPath), and a reply the level it was answered at (searchReply.Level): a peer
+// refuses a request past its level, and the coordinator a reply below the request's,
+// so a search is never answered with a part of it unread.
+// A wire addition a peer must not ignore raises it.
+const searchLevel = 1
+
+// noPeerEndpoint is the detail of a peer's 404 for a path it does not serve, as every
+// release since 1.0.0 words it.
+const noPeerEndpoint = "no peer endpoint here"
+
+// searchPath is the peer path of a search needing wire level needs: the search
+// endpoint for level 0, and from level 1 its level's own, which a peer of a lower level
+// does not serve (404, noPeerEndpoint). A 1.0.0 node would otherwise refuse a filter
+// aggregation with its own 400, and run a post_filter search without the post_filter.
+func searchPath(needs int) string {
+	if needs == 0 {
+		return peerPrefix + "search"
+	}
+	return peerPrefix + "search/" + strconv.Itoa(needs)
+}
+
 // wireRequest is a search.Request on the wire: the queries as their DSL JSON.
 type wireRequest struct {
 	Query       json.RawMessage    `json:"query"`
@@ -70,6 +96,9 @@ type wireRequest struct {
 	TimeoutNs   int64              `json:"timeout_ns,omitempty"`
 	Index       string             `json:"index"`
 	NoBodies    bool               `json:"no_bodies,omitempty"`
+	// Needs is the search wire level a peer must speak to answer the request exactly
+	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation.
+	Needs int `json:"needs,omitempty"`
 }
 
 // wireAgg is a search.Agg on the wire: a filter or filters aggregation's queries as
@@ -97,6 +126,9 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	}
 	if w.Aggs, err = encodeAggs(r.Aggs); err != nil {
 		return nil, err
+	}
+	if r.PostFilter != nil || filterAggs(r.Aggs) {
+		w.Needs = 1
 	}
 	return w, nil
 }
@@ -196,6 +228,9 @@ type searchReply struct {
 	Result *search.ShardResult `json:"result"`
 	Pin    string              `json:"pin,omitempty"`
 	Stale  bool                `json:"stale,omitempty"`
+	// Level is the search wire level the peer speaks (searchLevel); a 1.0.0 peer, which
+	// speaks 0, sends none.
+	Level int `json:"level,omitempty"`
 }
 
 // fetchMsg asks a peer to fill hits' bodies from a pinned generation.
@@ -304,4 +339,20 @@ type errorReply struct {
 	Detail       string          `json:"detail,omitempty"`
 	Problems     []query.Problem `json:"problems,omitempty"`
 	RetryAfterMs int64           `json:"retry_after_ms,omitempty"`
+}
+
+// filterAggs reports whether aggs hold a filter, filters or global aggregation, at
+// any level.
+func filterAggs(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		switch a := aggs[name]; a.Type {
+		case search.AggFilter, search.AggFilters, search.AggGlobal:
+			return true
+		default:
+			if filterAggs(a.Aggs) {
+				return true
+			}
+		}
+	}
+	return false
 }

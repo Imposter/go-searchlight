@@ -254,16 +254,22 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   A bucket aggregation may carry metric sub-aggregations one level deep. `filter`,
   `filters` and `global` may carry any other aggregation, written inline in their
   bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
-  most `filter` → `terms` → `stats`. A filter is the query language, checked against
-  the mapping as `query` is, with the same bounds, each problem at its own `loc`
-  (`aggs.brands.filter.field`, `aggs.picked.filters.filters.acme.op`). A `terms`
-  aggregation over several shards reports its error bound, as Elasticsearch does,
-  under a `filter` too. On one shard it is exact, and its
-  `doc_count_error_upper_bound` is 0.
+  most `filter` → `terms` → `stats`. A sub-aggregation is never named after a member
+  of the bucket it is written in (`doc_count` under `filter`, `filters` and `global`;
+  `key`, `key_as_string`, `from`, `to`, `doc_count` and `doc_count_error_upper_bound`
+  under a bucket aggregation). A filter is the query language, checked against the
+  mapping as `query` is, each problem at its own `loc` (`aggs.brands.filter.field`,
+  `aggs.picked.filters.filters.acme.op`), and each filter on its own within the
+  query's bounds (4 levels, 50 conditions, 100 nodes). A `terms` aggregation over
+  several shards reports its error bound, as Elasticsearch does, under a `filter`
+  too. On one shard it is exact, and its `doc_count_error_upper_bound` is 0.
 
   Bounds, each refused with a 400 whose `loc` names the place:
-  - At most 100 aggregations per search, sub-aggregations and those under `filter`,
-    `filters` and `global` included (`loc` `aggs`).
+  - At most 100 aggregations per search (`loc` `aggs`, or `aggregations` as the body
+    spells it), sub-aggregations included,
+    and those under a `filters` aggregation counted once per bucket, as each bucket
+    collects them apart: a `filters` of 10 keys and an `other_bucket_key` holding 2
+    aggregations counts 1 + 11 × 2 = 23.
   - At most 100 `ranges` per `range` aggregation, and 100 `filters` per `filters`
     aggregation.
   - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.

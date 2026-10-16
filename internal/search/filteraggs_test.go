@@ -111,8 +111,10 @@ func both(q, post query.Node) query.Node {
 // shards (with deletes, merges and writes not yet refreshed), equal brute force: each
 // bucket counts the query's documents its filter matches (global: every visible
 // document, the unrefreshed ones not), and the hits, total and search_after pages are
-// those of the query and the post_filter together. Each search runs twice, the second
-// through the filter cache.
+// those of the query and the post_filter together, under every track_total and through
+// search_after when the post_filter is folded into a query without aggregations. Each
+// search runs three times as three requests, a leaf being cached from its second
+// sighting, so the third is served from the filter cache.
 func TestFilterAggregationsEqualBruteForce(t *testing.T) {
 	seed := testSeed(t)
 	rng := rand.New(rand.NewPCG(seed, seed^0xf117))
@@ -156,9 +158,10 @@ func TestFilterAggregationsEqualBruteForce(t *testing.T) {
 				aggChunkMin, aggChunk = 1, 1+rng.Uint32N(40)
 			}
 			globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40})
-			var got [2]*Response
+			var got [3]*Response
 			for pass := range got {
-				resp, err := c.search(r)
+				again := *r
+				resp, err := c.search(&again)
 				if err != nil {
 					t.Fatalf("%s %+v: %v", raw, aggs, err)
 				}
@@ -187,7 +190,37 @@ func TestFilterAggregationsEqualBruteForce(t *testing.T) {
 			if rng.IntN(4) == 0 && len(want) > 0 {
 				pageWithAggs(t, c, r, 1+rng.IntN(7), want, fail)
 			}
+			checkFoldedPostFilter(t, c, rng, q, post, docs, fail)
 		}
+	}
+	if st := c.cache.Stats(); st.Hits == 0 {
+		t.Fatalf("no search was served from the filter cache: %+v", st)
+	}
+}
+
+// checkFoldedPostFilter checks a post_filter without aggregations, folded into the
+// query: under every track_total (lazy verification included) the hits and total are
+// the query and post_filter's together, and search_after pages through them.
+func checkFoldedPostFilter(t *testing.T, c *cluster, rng *rand.Rand, q, post query.Node, docs []*schema.Doc, fail func(string, ...any)) {
+	t.Helper()
+	if post == nil {
+		post, _ = randomQuery(t, rng)
+	}
+	r := &Request{
+		Query: q, PostFilter: post, Size: pick(rng, []int{0, 1, 3, 10, 1000}), Sort: pick(rng, sortChoices),
+		TrackTotal: pick(rng, []int{0, 1, 5, TrackTotalAll, TrackTotalNone}),
+	}
+	want := brute(docs, both(q, post), r.Sort)
+	resp, err := c.search(r)
+	if err != nil {
+		fail("post_filter without aggregations: %v", err)
+	}
+	checkTotal(t, resp, int64(len(want)), r.TrackTotal, fail)
+	if ids, w := hitIDs(resp.Hits), docIDs(want[:min(len(want), r.Size)]); !slices.Equal(ids, w) {
+		fail("post_filter %v without aggregations, track_total %d: hits %v, want %v", post, r.TrackTotal, ids, w)
+	}
+	if rng.IntN(3) == 0 && len(want) > 0 {
+		pageWithAggs(t, c, r, 1+rng.IntN(7), want, fail)
 	}
 }
 
@@ -390,6 +423,33 @@ func TestFilterAggregationProblems(t *testing.T) {
 	}
 	children["s999"] = Agg{Type: AggStats, Field: "price"}
 	refusedAt(t, c, &Request{Query: all, Aggs: map[string]Agg{"g": {Type: AggGlobal, Aggs: children}}}, "aggs")
+
+	perBucket := func(keys int) Agg {
+		a := Agg{Type: AggFilters, Filters: map[string]query.Node{}, OtherBucketKey: "rest", Aggs: map[string]Agg{
+			"c": {Type: AggCardinality, Field: "brand"}, "s": {Type: AggStats, Field: "price"},
+		}}
+		for i := range keys {
+			a.Filters[fmt.Sprintf("k%02d", i)] = all
+		}
+		return a
+	}
+	if _, err := c.search(&Request{Query: all, Aggs: map[string]Agg{"s": perBucket((MaxAggs-1)/2 - 1)}}); err != nil {
+		t.Fatalf("filters of %d buckets holding 2 aggregations: %v", (MaxAggs-1)/2, err)
+	}
+	refusedAt(t, c, &Request{Query: all, Aggs: map[string]Agg{"s": perBucket((MaxAggs - 1) / 2)}}, "aggs")
+
+	for _, tc := range []struct{ body, loc string }{
+		{`{"aggs":{"f":{"filter":{"all":[]},"aggs":{"doc_count":{"stats":{"field":"price"}}}}}}`, "aggs.f.aggs.doc_count"},
+		{`{"aggs":{"t":{"terms":{"field":"brand"},"aggs":{"key":{"stats":{"field":"price"}}}}}}`, "aggs.t.aggs.key"},
+		{`{"aggregations":{"t":{"terms":{"field":"brand"},"aggregations":{"doc_count":{"stats":{"field":"price"}}}}}}`, "aggregations.t.aggregations.doc_count"},
+		{`{"aggregations":{"g":{"global":{},"aggs":{"r":{"range":{"field":"brand","ranges":[{}]}}}}}}`, "aggregations.g.aggs.r.range.field"},
+	} {
+		r, ps := ParseRequest([]byte(tc.body))
+		if len(ps) > 0 {
+			t.Fatalf("%s: %v", tc.body, ps)
+		}
+		refusedAt(t, c, r, tc.loc)
+	}
 }
 
 // ValidateQueries checks every query of a request against the mapping, each problem
@@ -415,6 +475,10 @@ func TestValidateQueriesLocatesEveryQuery(t *testing.T) {
 	want := []string{"query.field", "post_filter.all.1.field", "aggs.f.filter.op", "aggs.g.aggs.in.filter.field", "aggs.s.filters.filters.bad.field"}
 	if !slices.Equal(locs, want) {
 		t.Fatalf("locs %v, want %v", locs, want)
+	}
+	r, _ = ParseRequest([]byte(`{"aggregations": {"g": {"global": {}, "aggregations": {"f": {"filter": {"field": "nope", "op": "exists"}}}}}}`))
+	if ps := ValidateQueries(r, testMapping); len(ps) != 1 || ps[0].Loc != "aggregations.g.aggregations.f.filter.field" {
+		t.Fatalf("aggregations spelled out: %v", ps)
 	}
 	r, _ = ParseRequest([]byte(`{"post_filter": {"all": []}, "aggs": {"f": {"filter": {"field": "brand", "op": "eq", "value": "x"}}}}`))
 	if ps := ValidateQueries(r, testMapping); len(ps) > 0 {
@@ -566,4 +630,31 @@ func unfilled(got, want *AggResult) *AggResult {
 		}
 	}
 	return want
+}
+
+// A filter aggregation's leaves are cached as the query's are: from the second request
+// that holds one, the third served from the filter cache.
+func TestFilterAggregationUsesTheFilterCache(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 50 {
+		c.upsert(fmt.Sprintf("d%02d", i), fmt.Sprintf(`{"price":%d}`, i))
+	}
+	c.refreshAll()
+	defer leafUsage.reset()
+	leafUsage.reset()
+	cheap := &query.Leaf{Field: "price", Op: query.OpBetween, Value: json.RawMessage(`[3, 17]`)}
+	var hits [3]int64
+	for i := range hits {
+		resp, err := c.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{"f": {Type: AggFilter, Filter: cheap}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := resp.Aggs["f"].DocCount; n != 15 {
+			t.Fatalf("request %d: %d documents, want 15", i, n)
+		}
+		hits[i] = c.cache.Stats().Hits
+	}
+	if hits[0] != 0 || hits[1] != 0 || hits[2] == 0 {
+		t.Fatalf("filter cache hits after each request %v: want none, none, then some", hits)
+	}
 }

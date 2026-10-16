@@ -36,6 +36,7 @@ import (
 //
 //	POST   /_internal/hint                      push hints: wake the named copies' tailers
 //	POST   /_internal/search                    a shard's query (or whole search) on this node's copy
+//	POST   /_internal/search/1                  the same, for a search of wire level 1 (searchPath)
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
@@ -61,6 +62,7 @@ func (p *peerAPI) handler() http.Handler {
 	}
 	handle("POST /_internal/hint", p.hint)
 	handle("POST /_internal/search", p.search)
+	handle("POST /_internal/search/1", p.search)
 	handle("POST /_internal/fetch", p.fetch)
 	handle("DELETE /_internal/pins/{id}", p.unpin)
 	handle("POST /_internal/percolate", p.percolate)
@@ -72,7 +74,7 @@ func (p *peerAPI) handler() http.Handler {
 	handle("DELETE /_internal/snapshots/{id}", p.release)
 	mux.Handle("GET /_internal/snapshots/{id}/files/{name}", p.wrapStream("GET /_internal/snapshots/{id}/files/{name}", p.file))
 	mux.Handle("/", p.wrap("unmatched", func(*http.Request) (any, error) {
-		return nil, api.NotFound(api.CodeNotFound, "no peer endpoint here")
+		return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
 	}))
 	return mux
 }
@@ -236,9 +238,21 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	if msg.Request == nil {
 		return nil, api.InvalidAt("request", "no search request")
 	}
+	if msg.Request.Needs > searchLevel {
+		return nil, api.Unavailable(nil, "this node speaks search wire level %d and the search needs %d: it runs an older release than the coordinator", searchLevel, msg.Request.Needs)
+	}
 	req, err := msg.Request.decode()
 	if err != nil {
 		return nil, err
+	}
+	level := searchLevel
+	if h := p.n.opts.hooks; h != nil && msg.Request.Needs > 0 {
+		switch h.olderPeer {
+		case olderNoEndpoint:
+			return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
+		case olderDropsLevel:
+			req.PostFilter, level = nil, 0
+		}
 	}
 	t, err := p.target(r, msg.shardRef)
 	if err != nil {
@@ -249,7 +263,7 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 		t.Release()
 		return nil, err
 	}
-	reply := &searchReply{Result: res, Stale: t.Stale()}
+	reply := &searchReply{Result: res, Stale: t.Stale(), Level: level}
 	if msg.Pin {
 		reply.Pin = p.n.pins.add(t)
 		if h := p.n.opts.hooks; h != nil && h.pinned != nil {

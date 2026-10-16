@@ -83,7 +83,11 @@ type aggSpec struct {
 	offset    float64
 	calendar  string
 	precision uint8
-	subs      []*aggSpec
+	// terms is a terms aggregation's include and exclude, compiled; include and exclude
+	// are them as given.
+	terms            *termsFilter
+	include, exclude *TermsFilter
+	subs             []*aggSpec
 	// keys are a filter, filters or global aggregation's buckets' keys, in order: nil
 	// alone for filter and global; filters' keys sorted, then its other bucket's.
 	// queries are the filters of the buckets that have one, in keys' order, and
@@ -340,6 +344,13 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
+	if a.Type != AggTerms && (a.Include != nil || a.Exclude != nil) {
+		key := "include"
+		if a.Include == nil {
+			key = "exclude"
+		}
+		ps.add(at+"."+key, "include and exclude choose a terms aggregation's values: %s takes neither", a.Type)
+	}
 	switch a.Type {
 	case AggTerms:
 		s.size = a.Size
@@ -361,6 +372,8 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			}
 			s.minDoc = *a.MinDocCount
 		}
+		s.include, s.exclude = a.Include, a.Exclude
+		s.terms = compileTermsFilter(a.Include, a.Exclude, s.ftype, at, ps)
 	case AggRange:
 		if !numeric {
 			ps.add(at+".field", "%q is a %s: range takes a number or date field", a.Field, s.ftype)

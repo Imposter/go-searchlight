@@ -550,13 +550,24 @@ func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
 // nothing new are answered as before.
 func TestOlderPeerRefusedForPostFilter(t *testing.T) {
 	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
-		t.Run(name, func(t *testing.T) { testOlderPeer(t, older) })
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, 0) })
 	}
 }
 
-func testOlderPeer(t *testing.T, older olderPeer) {
+// TestOlderPeerRefusedForTermsFilter: a peer at wire level 1 (filter aggregations, no
+// include or exclude), with no endpoint for a level-2 search or answering it at level
+// 1 with every value counted, is not trusted with a terms aggregation's include or
+// exclude: the search is unavailable (503), while the level-1 features it has are
+// answered.
+func TestOlderPeerRefusedForTermsFilter(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelFilterAggs) })
+	}
+}
+
+func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
-		o.hooks.olderPeer = older
+		o.hooks.olderPeer, o.hooks.olderLevel = older, level
 	})
 	a := c.start(0)
 	c.start(1)
@@ -581,10 +592,26 @@ func testOlderPeer(t *testing.T, older olderPeer) {
 	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
 		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
 	}
-	for name, r := range map[string]*search.Request{
+	refused := map[string]*search.Request{
+		"include": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Include: &search.TermsFilter{Pattern: "b[0-2]"}}}},
+		"exclude": {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap, Aggs: map[string]search.Agg{
+			"b": {Type: search.AggTerms, Field: "brand", Exclude: &search.TermsFilter{Values: []any{"b1"}}},
+		}}}},
+	}
+	levelOne := map[string]*search.Request{
 		"post_filter": {Query: &query.All{}, PostFilter: cheap, Size: 20, TrackTotal: search.TrackTotalAll},
 		"filter":      {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap}}},
-	} {
+	}
+	if level < levelFilterAggs {
+		maps.Copy(refused, levelOne)
+	} else {
+		for name, r := range levelOne {
+			if res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last}); err != nil {
+				t.Fatalf("%s through a level-%d peer: %v, %v", name, level, res, err)
+			}
+		}
+	}
+	for name, r := range refused {
 		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last})
 		var ae *api.Error
 		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {

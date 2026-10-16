@@ -103,6 +103,9 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 		var total int64
 		for _, d := range docs {
 			for _, v := range aggValues(d, spec.field) {
+				if !bruteKeeps(spec, v) {
+					continue
+				}
 				in[v] = append(in[v], d)
 				total++
 			}
@@ -332,6 +335,13 @@ func randomAgg(rng *rand.Rand) Agg {
 		}
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(3))
+		}
+		if rng.IntN(3) == 0 {
+			seed := func() string { return pick(rng, vocab) }
+			if a.Field == IDField {
+				seed = func() string { return pick(rng, ids) }
+			}
+			a.Include, a.Exclude = randomTermsFilters(rng, a.Field, seed)
 		}
 	case 1:
 		a = Agg{Type: AggRange, Field: pick(rng, []string{"price", "created"}), Ranges: []Range{

@@ -375,6 +375,11 @@ func revAgg(rng *rand.Rand, vals []float64) Agg {
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(20))
 		}
+		if rng.IntN(3) == 0 {
+			a.Include, a.Exclude = randomTermsFilters(rng, a.Field, func() string {
+				return pick(rng, []string{fmt.Sprintf("B%03d", rng.IntN(60)), fmt.Sprintf("t%02d", rng.IntN(60)), "red cup 1", "7", "true"})
+			})
+		}
 	case 2:
 		var rs []Range
 		for range 1 + rng.IntN(5) {

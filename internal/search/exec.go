@@ -171,7 +171,10 @@ type segExec struct {
 	// buckets counts the buckets the segment's histograms hold by key, together at
 	// most MaxBuckets: shared by the forks that collect parts of the segment apart.
 	buckets *atomic.Int64
-	err     error
+	// masks are the terms aggregations' filters over this segment's ordinals, shared
+	// by the forks as buckets is.
+	masks *termMasks
+	err   error
 }
 
 // lazyState is a segment's lazy verification: the root's maybe documents, those
@@ -233,6 +236,7 @@ func newSegExec(ctx context.Context, p *prepared, g *shard.Generation, i int) *s
 		estimates:  map[*leafPlan]estimate{},
 		sources:    map[string]*fieldSrc{},
 		buckets:    new(atomic.Int64),
+		masks:      &termMasks{},
 	}
 }
 

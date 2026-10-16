@@ -187,6 +187,11 @@ type Agg struct {
 	// at least 1); histograms default to 0, which fills the empty buckets between the
 	// first and the last.
 	MinDocCount *int
+	// Include and Exclude choose a terms aggregation's values (exclude wins), before
+	// any shard cuts its list: see [TermsFilter]. Nil includes every value and
+	// excludes none.
+	Include *TermsFilter `json:",omitempty"`
+	Exclude *TermsFilter `json:",omitempty"`
 
 	// Ranges are a range aggregation's buckets: From inclusive, To exclusive, either
 	// open when nil.
@@ -254,7 +259,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
 //   - track_total: true (exact) or a count;
-//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}, or
+//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
+//     (terms also takes include and exclude, an array of values or a pattern), or
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
@@ -686,7 +692,7 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count"},
+		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude"},
 		AggRange:         {"field", "ranges"},
 		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
 		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
@@ -719,6 +725,10 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			default:
 				a.Precision = n
 			}
+		case "include":
+			a.Include = parseTermsFilter(val, at, ps)
+		case "exclude":
+			a.Exclude = parseTermsFilter(val, at, ps)
 		case "min_doc_count":
 			n, ok := intOf(val)
 			if !ok || n < 0 {

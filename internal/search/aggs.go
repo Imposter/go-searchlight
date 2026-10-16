@@ -256,7 +256,7 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		}
 		return c
 	case AggTerms:
-		return &termsColl{s: s, spec: spec, src: src}
+		return &termsColl{s: s, spec: spec, src: src, allow: s.termMask(spec, src)}
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
 	default:
@@ -402,6 +402,38 @@ func (fs *fieldSrc) denseCounts(notHit *roaring.Bitmap) []int64 {
 	}
 }
 
+// listedCounts is denseCounts for the ordinals m lists alone: each one's document
+// frequency, minus the documents not hit that hold it.
+func (fs *fieldSrc) listedCounts(m *termMask, notHit *roaring.Bitmap) []int64 {
+	counts := make([]int64, fs.numTerms())
+	for i, o := range m.ords {
+		counts[o] = int64(m.dfs[i])
+	}
+	it := notHit.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 {
+			return counts
+		}
+		for _, d := range buf[:n] {
+			switch fs.kind {
+			case srcKeyword:
+				if o, ok := fs.kc.Ord(d); ok && m.has(o) {
+					counts[o]--
+				}
+			case srcList:
+				fs.buf = fs.mc.Ords(d, fs.buf[:0])
+				for _, o := range fs.buf {
+					if m.has(o) {
+						counts[o]--
+					}
+				}
+			}
+		}
+	}
+}
+
 // termsColl counts documents per value; -0 and 0 are one value, in one bucket.
 type termsColl struct {
 	s    *segExec
@@ -411,6 +443,16 @@ type termsColl struct {
 	counts  []int64       // by ordinal (keyword, list) or 0/1 (bool)
 	subs    [][]collector // by ordinal, made on first use
 	numbers map[float64]*histBucket
+	// allow is the filter of include and exclude over the ordinals (or bool keys): nil
+	// without them, and for a number field, whose values are checked as first seen.
+	allow *termMask
+}
+
+// excludedBucket marks a number a terms aggregation's include or exclude leaves out.
+var excludedBucket = &histBucket{}
+
+func (c *termsColl) allowed(o uint32) bool {
+	return c.allow == nil || c.allow.has(o)
 }
 
 func (c *termsColl) slot(o uint32) {
@@ -440,15 +482,17 @@ func (c *termsColl) withSubs(o, d uint32) {
 func (c *termsColl) collect(d uint32) {
 	switch c.src.kind {
 	case srcKeyword:
-		if o, ok := c.src.kc.Ord(d); ok {
+		if o, ok := c.src.kc.Ord(d); ok && c.allowed(o) {
 			c.slot(o)
 			c.withSubs(o, d)
 		}
 	case srcList:
 		c.src.buf = c.src.mc.Ords(d, c.src.buf[:0])
 		for _, o := range c.src.buf {
-			c.slot(o)
-			c.withSubs(o, d)
+			if c.allowed(o) {
+				c.slot(o)
+				c.withSubs(o, d)
+			}
 		}
 	case srcBool:
 		if b, ok := c.src.boolOf(d); ok {
@@ -456,8 +500,10 @@ func (c *termsColl) collect(d uint32) {
 			if b {
 				o = 1
 			}
-			c.slot(o)
-			c.withSubs(o, d)
+			if c.allowed(o) {
+				c.slot(o)
+				c.withSubs(o, d)
+			}
 		}
 	case srcNumber:
 		if v, ok := c.src.nc.Value(d); ok {
@@ -467,8 +513,15 @@ func (c *termsColl) collect(d uint32) {
 			}
 			b := c.numbers[v]
 			if b == nil {
+				if c.spec.terms != nil && !c.spec.terms.number(v) {
+					c.numbers[v] = excludedBucket
+					return
+				}
 				b = &histBucket{subs: c.s.newSubs(c.spec)}
 				c.numbers[v] = b
+			}
+			if b == excludedBucket {
+				return
 			}
 			b.count++
 			collectSubs(b.subs, d)
@@ -483,7 +536,18 @@ func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
 	if len(c.spec.subs) > 0 || !c.src.ordinal() {
 		return false
 	}
+	if c.allow != nil && c.allow.listed {
+		c.counts = c.src.listedCounts(c.allow, notHit)
+		return true
+	}
 	c.counts = c.src.denseCounts(notHit)
+	if c.allow != nil {
+		for o := range c.counts {
+			if !c.allowed(uint32(o)) {
+				c.counts[o] = 0
+			}
+		}
+	}
 	return true
 }
 
@@ -492,6 +556,9 @@ func (c *termsColl) partial() *AggPartial {
 	switch {
 	case c.src.kind == srcNumber:
 		for v, b := range c.numbers {
+			if b == excludedBucket {
+				continue
+			}
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
 	case c.src.ordinal():

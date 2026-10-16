@@ -92,3 +92,68 @@ func TestFacetPanelInOneSearch(t *testing.T) {
 		t.Errorf("_count with a post_filter: %v, want a problem at post_filter", p)
 	}
 }
+
+// TestTermsIncludeExclude: a facet's type-ahead (a pattern include over the
+// normalized keys) and its picked values counted in the same search (an exact include,
+// normalized), over three shards, end to end: each bucket answers what a search of
+// its own would, and sum_other_doc_count counts only the chosen values. Malformed
+// include and exclude are refused at their locs.
+func TestTermsIncludeExclude(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.createIndex("ti", `{"mapping": {"dynamic": "strict", "fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 3}}`)
+	brands := []string{"Nike", "Nikon", "Nissan", "Adidas", "Puma", "nike"}
+	lines := make([]string, 0, 300)
+	for i := range 150 {
+		lines = append(lines, fmt.Sprintf(`{"upsert": {"id": "d%03d"}}`, i),
+			fmt.Sprintf(`{"brand": %q, "price": %d}`, brands[(i*i)%len(brands)], i%10))
+	}
+	e.must(http.StatusOK, "POST", "/indexes/ti/_bulk?refresh=wait_for", ndjson(lines...))
+	count := func(brand string) float64 {
+		r := e.must(http.StatusOK, "POST", "/indexes/ti/_search", `{"query": {"field": "brand", "op": "eq", "value": `+jsonQuote(brand)+`}, "size": 0, "track_total": true}`)
+		return r["total"].(map[string]any)["value"].(float64) //nolint:forcetypeassert,errcheck // the shape
+	}
+	r := e.must(http.StatusOK, "POST", "/indexes/ti/_search", `{"size": 0, "aggs": {
+		"typeahead": {"terms": {"field": "brand", "size": 2, "include": "ni.*", "exclude": ["NISSAN"]}},
+		"picked": {"terms": {"field": "brand", "include": ["PUMA", " adidas "]}},
+		"prices": {"terms": {"field": "price", "include": [1, 2.0, 3], "exclude": [3]}}
+	}}`)
+	aggs := r["aggs"].(map[string]any) //nolint:forcetypeassert,errcheck // the shape
+	buckets := func(name string) (map[string]float64, float64) {
+		res := aggs[name].(map[string]any) //nolint:forcetypeassert,errcheck // the shape
+		out := map[string]float64{}
+		for _, b := range res["buckets"].([]any) { //nolint:forcetypeassert,errcheck // the shape
+			bm := b.(map[string]any)                               //nolint:forcetypeassert,errcheck // the shape
+			out[fmt.Sprint(bm["key"])] = bm["doc_count"].(float64) //nolint:forcetypeassert,errcheck // the shape
+		}
+		return out, res["sum_other_doc_count"].(float64) //nolint:forcetypeassert,errcheck // the shape
+	}
+	ta, other := buckets("typeahead")
+	if len(ta) != 2 || ta["nike"] != count("nike") || ta["nikon"] != count("nikon") || other != 0 {
+		t.Fatalf("type-ahead %v other %v: want nike %v and nikon %v, other 0", ta, other, count("nike"), count("nikon"))
+	}
+	if picked, other := buckets("picked"); len(picked) != 2 || picked["puma"] != count("puma") || picked["adidas"] != count("adidas") || other != 0 {
+		t.Fatalf("picked %v other %v", picked, other)
+	}
+	if prices, _ := buckets("prices"); len(prices) != 2 || prices["1"] != 15 || prices["2"] != 15 {
+		t.Fatalf("prices %v: want 1 and 2, 15 each", prices)
+	}
+
+	for _, tc := range []struct{ body, loc string }{
+		{`{"aggs": {"b": {"terms": {"field": "brand", "include": "^ni"}}}}`, "aggs.b.terms.include"},
+		{`{"aggs": {"b": {"terms": {"field": "brand", "exclude": {"partition": 0, "num_partitions": 2}}}}}`, "aggs.b.terms.exclude"},
+		{`{"aggs": {"b": {"terms": {"field": "brand", "include": ["a", {}]}}}}`, "aggs.b.terms.include.1"},
+		{`{"aggs": {"p": {"terms": {"field": "price", "include": "1.*"}}}}`, "aggs.p.terms.include"},
+		{`{"aggs": {"p": {"terms": {"field": "price", "include": [1, "x"]}}}}`, "aggs.p.terms.include.1"},
+		{`{"aggs": {"f": {"filter": {"all": []}, "aggs": {"b": {"terms": {"field": "brand", "include": "(ni"}}}}}}`, "aggs.f.aggs.b.terms.include"},
+	} {
+		p := e.problem(e.do("POST", "/indexes/ti/_search", tc.body), 400, "invalid_request")
+		if !slices.Contains(locs(p), tc.loc) {
+			t.Errorf("%s: %v, want a problem at %s", tc.body, p, tc.loc)
+		}
+	}
+}
+
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}

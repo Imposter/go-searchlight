@@ -430,6 +430,16 @@ func BenchmarkTermsAggUnique(b *testing.B) {
 	})
 }
 
+// BenchmarkTermsAggPrefixInclude: a facet type-ahead over a field of unique values
+// (sku), every document hit: a prefix include of 1 to 4 typed digits, which each
+// segment decides from the dictionary terms after the prefix alone.
+func BenchmarkTermsAggPrefixInclude(b *testing.B) {
+	runBench(b, func(rng *rand.Rand) *Request {
+		typed := fmt.Sprintf("%04d", rng.IntN(10_000))[:1+rng.IntN(4)]
+		return &Request{Query: &query.All{}, Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10, Include: &TermsFilter{Pattern: "sku-000" + typed + ".*"}}}}
+	})
+}
+
 // facetPicks are a facet panel's picks: two brands and a category, over a price range.
 func facetPicks(c *corpus, rng *rand.Rand) (q, brands, category query.Node) {
 	lo := float64(rng.IntN(200))

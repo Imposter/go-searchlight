@@ -210,6 +210,8 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		"distinct": {Type: search.AggCardinality, Field: "brand"},
 		"spread":   {Type: search.AggHistogram, Field: "price", Interval: 5},
 		"bands":    {Type: search.AggRange, Field: "price", Ranges: []search.Range{{To: bound(5)}, {From: bound(5), To: bound(12)}, {From: bound(12)}}},
+		"cheap":    {Type: search.AggFilter, Filter: &query.Leaf{Field: "price", Op: query.OpLt, Value: json.RawMessage(`10`)}, Aggs: map[string]search.Agg{"brands": {Type: search.AggTerms, Field: "brand", Size: 2}}},
+		"all":      {Type: search.AggGlobal, Aggs: map[string]search.Agg{"prices": {Type: search.AggStats, Field: "price"}}},
 	}
 	for _, tc := range []struct {
 		r           search.Request

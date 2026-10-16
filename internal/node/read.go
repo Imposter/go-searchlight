@@ -115,14 +115,14 @@ func endSpan(span trace.Span, err error) {
 	span.End()
 }
 
-// validQuery checks q against the index's mapping. A cluster node whose mapping lacks a
-// field another node has since added re-reads the catalogue first, so the field is no
-// spurious 400.
-func (n *Single) validQuery(ctx context.Context, idx *index, q query.Node) error {
-	problems := query.Validate(q, idx.meta.Load().mapping)
+// validQuery checks r's queries (its query, post_filter and aggregation filters)
+// against the index's mapping. A cluster node whose mapping lacks a field another node
+// has since added re-reads the catalogue first, so the field is no spurious 400.
+func (n *Single) validQuery(ctx context.Context, idx *index, r *search.Request) error {
+	problems := search.ValidateQueries(r, idx.meta.Load().mapping)
 	if len(problems) > 0 && n.cl != nil {
 		if changed, _ := n.reloadIfNewer(ctx, idx); changed {
-			problems = query.Validate(q, idx.meta.Load().mapping)
+			problems = search.ValidateQueries(r, idx.meta.Load().mapping)
 		}
 	}
 	if len(problems) > 0 {
@@ -144,7 +144,7 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 	if err != nil {
 		return nil, err
 	}
-	if err := n.validQuery(ctx, idx, r.Query); err != nil {
+	if err := n.validQuery(ctx, idx, r); err != nil {
 		return nil, err
 	}
 	r.Index = name

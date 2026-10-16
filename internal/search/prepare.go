@@ -20,6 +20,9 @@ type prepared struct {
 	req     *Request
 	mapping *schema.Mapping
 	root    *pnode
+	// post is the post_filter, compiled, when the request has aggregations, which see
+	// root's matches; without them root is the query and the post_filter together.
+	post *pnode
 	// sorts are the request's sort keys, then the _id tie-breaker (unless a sort key
 	// is _id, after which nothing can tie): a total order.
 	sorts []sortSpec
@@ -66,7 +69,9 @@ type sortSpec struct {
 
 // aggSpec is one aggregation, checked.
 type aggSpec struct {
-	name      string
+	name string
+	// loc is where the request gives the aggregation ("aggs.brands").
+	loc       string
 	typ       string
 	field     string
 	ftype     schema.FieldType // 0: not in the mapping
@@ -79,7 +84,18 @@ type aggSpec struct {
 	calendar  string
 	precision uint8
 	subs      []*aggSpec
+	// keys are a filter, filters or global aggregation's buckets' keys, in order: nil
+	// alone for filter and global; filters' keys sorted, then its other bucket's.
+	// queries are the filters of the buckets that have one, in keys' order, and
+	// filters those compiled (by prepare alone: the reduce needs none).
+	keys     []any
+	queries  []query.Node
+	filters  []*pnode
+	hasOther bool
 }
+
+// wrapper reports whether the aggregation is a filter, filters or global one.
+func (s *aggSpec) wrapper() bool { return singleBucket(s.typ) }
 
 type rangeSpec struct {
 	key      string
@@ -126,7 +142,7 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		ps.add("aggs", "a search holds at most %d aggregations, sub-aggregations included; this one holds %d", MaxAggs, n)
 	} else {
 		for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-			if s := prepareAgg(name, r.Aggs[name], m, "aggs."+name, false, &ps); s != nil {
+			if s := prepareAgg(name, r.Aggs[name], m, "aggs."+name, "", &ps); s != nil {
 				p.aggs = append(p.aggs, s)
 			}
 		}
@@ -134,8 +150,28 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	if len(ps) > 0 {
 		return nil, &RequestError{Problems: ps}
 	}
-	p.root = compileNode(r.Query, requestID(r))
+	id := requestID(r)
+	switch {
+	case r.PostFilter == nil:
+		p.root = compileNode(r.Query, id)
+	case len(p.aggs) == 0:
+		p.root = compileNode(&query.All{Children: []query.Node{r.Query, r.PostFilter}}, id)
+	default:
+		p.root = compileNode(r.Query, id)
+		p.post = compileNode(r.PostFilter, id)
+	}
+	compileFilters(p.aggs, id)
 	return p, nil
+}
+
+// compileFilters compiles the filters of specs' filter and filters aggregations.
+func compileFilters(specs []*aggSpec, req uint64) {
+	for _, s := range specs {
+		for _, q := range s.queries {
+			s.filters = append(s.filters, compileNode(q, req))
+		}
+		compileFilters(s.subs, req)
+	}
 }
 
 // countAggs counts aggs and their sub-aggregations.
@@ -269,15 +305,27 @@ func toFloat(v any) (float64, bool) {
 
 var calendarUnits = []string{"minute", "hour", "day", "week", "month", "quarter", "year"}
 
-func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, sub bool, ps *problems) *aggSpec {
-	s := &aggSpec{name: name, typ: a.Type, field: a.Field, ftype: fieldType(m, a.Field)}
+// prepareAgg checks aggregation a, given at loc under an aggregation of type parent
+// ("" at the top level), against m, and compiles it (its filters aside: see
+// compileFilters).
+func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *problems) *aggSpec {
+	s := &aggSpec{name: name, loc: loc, typ: a.Type, field: a.Field, ftype: fieldType(m, a.Field)}
 	at := loc + "." + a.Type
-	if a.Field == "" {
+	wrapper := singleBucket(a.Type)
+	if a.Field == "" && !wrapper {
 		ps.add(at+".field", "an aggregation needs a field")
 		return nil
 	}
 	isMetric := a.Type == AggStats || a.Type == AggCardinality
-	if sub && !isMetric {
+	switch {
+	case parent == "":
+	case a.Type == AggGlobal:
+		ps.add(loc, "global is a top-level aggregation only: it counts every document, whatever holds it")
+		return nil
+	case singleBucket(parent) && wrapper:
+		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats and cardinality", a.Type, parent)
+		return nil
+	case !singleBucket(parent) && !isMetric:
 		ps.add(loc, "a sub-aggregation is a metric: stats or cardinality")
 		return nil
 	}
@@ -371,16 +419,37 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, sub bool, ps 
 			ps.add(at+".precision", "precision is from %d to %d", MinPrecision, MaxPrecision)
 		}
 		s.precision = uint8(min(max(p, MinPrecision), MaxPrecision))
+	case AggFilter:
+		s.keys, s.queries = []any{nil}, []query.Node{a.Filter}
+	case AggFilters:
+		switch {
+		case len(a.Filters) == 0:
+			ps.add(at+".filters", "a filters aggregation needs filters")
+		case len(a.Filters) > MaxFilters:
+			ps.add(at+".filters", "a filters aggregation holds at most %d filters", MaxFilters)
+		}
+		for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
+			s.keys = append(s.keys, key)
+			s.queries = append(s.queries, a.Filters[key])
+		}
+		if a.OtherBucketKey != "" {
+			if _, taken := a.Filters[a.OtherBucketKey]; taken {
+				ps.add(at+".other_bucket_key", "other_bucket_key %q is a filter's key already", a.OtherBucketKey)
+			}
+			s.keys, s.hasOther = append(s.keys, a.OtherBucketKey), true
+		}
+	case AggGlobal:
+		s.keys = []any{nil}
 	default:
-		ps.add(loc, "unknown aggregation type %q: use terms, range, histogram, date_histogram, stats or cardinality", a.Type)
+		ps.add(loc, "unknown aggregation type %q: use terms, range, histogram, date_histogram, stats, cardinality, filter, filters or global", a.Type)
 		return nil
 	}
 	if len(a.Aggs) > 0 {
-		if isMetric || sub {
-			ps.add(loc+".aggs", "only a bucket aggregation holds sub-aggregations, one level deep")
+		if isMetric || (parent != "" && !singleBucket(parent)) {
+			ps.add(loc+".aggs", "only a bucket aggregation holds sub-aggregations: metrics, one level deep, or under filter, filters and global any aggregation but those")
 		} else {
 			for _, subName := range slices.Sorted(maps.Keys(a.Aggs)) {
-				if ss := prepareAgg(subName, a.Aggs[subName], m, loc+".aggs."+subName, true, ps); ss != nil {
+				if ss := prepareAgg(subName, a.Aggs[subName], m, loc+".aggs."+subName, a.Type, ps); ss != nil {
 					s.subs = append(s.subs, ss)
 				}
 			}
@@ -420,7 +489,7 @@ func requestID(r *Request) uint64 {
 // at spec's, as Elasticsearch refuses a search with too many buckets.
 func tooManyBuckets(spec *aggSpec) error {
 	return &RequestError{Problems: []query.Problem{{
-		Loc:     "aggs." + spec.name + "." + spec.typ,
+		Loc:     spec.loc + "." + spec.typ,
 		Message: fmt.Sprintf("the aggregations hold more than %d buckets: widen the interval, lower a size or narrow the query", MaxBuckets),
 	}}}
 }

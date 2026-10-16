@@ -572,6 +572,17 @@ func (s *segExec) within(bm, scope *roaring.Bitmap) *roaring.Bitmap {
 	return roaring.And(bm, scope)
 }
 
+// matches returns exactly the documents of scope that n matches, n a query compiled
+// apart from the root (an aggregation's filter, the post_filter): approximated within
+// scope, as the root is within the live documents, then its maybe documents resolved.
+func (s *segExec) matches(n *pnode, scope *roaring.Bitmap) *roaring.Bitmap {
+	a := s.approximate(n, scope)
+	if a.maybe.IsEmpty() {
+		return a.sure
+	}
+	return roaring.Or(a.sure, s.resolve(n, a.maybe))
+}
+
 // resolve returns exactly the documents of d that n matches, verifying in batches:
 // d must lie within n's scope (the root's maybe, or a part of it).
 func (s *segExec) resolve(n *pnode, d *roaring.Bitmap) *roaring.Bitmap {

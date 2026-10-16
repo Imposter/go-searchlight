@@ -63,6 +63,8 @@ const (
 	MaxAggs = 100
 	// MaxRanges is the most ranges one range aggregation holds.
 	MaxRanges = 100
+	// MaxFilters is the most filters one filters aggregation holds.
+	MaxFilters = 100
 	// MaxFields is the most names Request.Fields holds.
 	MaxFields = 100
 	// DefaultTermsSize is a terms aggregation's bucket count when Size is 0.
@@ -87,7 +89,17 @@ const (
 	AggDateHistogram = "date_histogram"
 	AggStats         = "stats"
 	AggCardinality   = "cardinality"
+	AggFilter        = "filter"
+	AggFilters       = "filters"
+	AggGlobal        = "global"
 )
+
+// singleBucket reports whether typ is a filter, filters or global aggregation: buckets
+// of documents chosen by query (or every live document), each holding the aggregations
+// under it as the search holds its top-level ones.
+func singleBucket(typ string) bool {
+	return typ == AggFilter || typ == AggFilters || typ == AggGlobal
+}
 
 // Request is one search (spec section 5).
 type Request struct {
@@ -116,6 +128,10 @@ type Request struct {
 	TrackTotal int
 	// Aggs are the aggregations to compute over every matching document, by name.
 	Aggs map[string]Agg
+	// PostFilter, when set, narrows the hits once the aggregations are computed: Hits,
+	// Total, the sort, SearchAfter paging and Next are those of the documents Query and
+	// PostFilter both match, while every aggregation but global counts Query's alone.
+	PostFilter query.Node
 	// Fields, when set, limits each hit's body to these top-level members.
 	Fields []string
 	// Timeout bounds the search; past it the shards answer with what they have,
@@ -143,7 +159,10 @@ type SortField struct {
 
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
 // date_histogram) may hold metric sub-aggregations (stats, cardinality) in Aggs, one
-// level deep.
+// level deep. A filter, filters or global aggregation (global only at the top level)
+// holds any other aggregation in Aggs, each with its own metric sub-aggregations: its
+// buckets are sets of documents, which the aggregations under it count as top-level
+// ones count the search's matches.
 //
 // Text values aggregate as they are indexed and compared: normalized (casefolded,
 // whitespace folded). That includes the _id field, a normalized keyword for queries
@@ -182,6 +201,17 @@ type Agg struct {
 	// 2^(Precision-2) distinct values are seen.
 	Precision int
 
+	// Filter is a filter aggregation's query: its one bucket holds the documents both
+	// the search's query and Filter match. Its owner encodes it (as query DSL) on the
+	// wire.
+	Filter query.Node `json:"-"`
+	// Filters are a filters aggregation's queries by bucket key (at most MaxFilters),
+	// each bucket a filter aggregation's. Its owner encodes them on the wire.
+	Filters map[string]query.Node `json:"-"`
+	// OtherBucketKey, when set, gives a filters aggregation one more bucket, by that
+	// key: the documents the search's query matches and no filter does.
+	OtherBucketKey string
+
 	// Aggs are the sub-aggregations computed per bucket.
 	Aggs map[string]Agg
 }
@@ -213,18 +243,23 @@ func (ps *problems) add(loc, format string, args ...any) {
 	*ps = append(*ps, query.Problem{Loc: loc, Message: fmt.Sprintf(format, args...)})
 }
 
-// ParseRequest reads a search request body: {query, sort, size, search_after,
-// track_total, aggs, fields, timeout}, Elasticsearch style:
+// ParseRequest reads a search request body: {query, post_filter, sort, size,
+// search_after, track_total, aggs, fields, timeout}, Elasticsearch style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
 //   - track_total: true (exact) or a count;
-//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}};
+//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}, or
+//     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
+//     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
 //
 // A missing query matches every document, and a missing size is DefaultSize. It
-// returns every problem found, each with
-// its loc ("sort.1", "aggs.by_brand.terms.size"); the query's are [query.Parse]'s.
-// Fields, sort and aggregation types are checked against the mapping by ExecuteShard.
+// returns every problem found, each with its loc ("sort.1",
+// "aggs.by_brand.terms.size"); the query's are [query.Parse]'s, and so are
+// post_filter's and each aggregation filter's, under their own locs
+// ("post_filter.all.0.op", "aggs.brand.filter.field"). Fields, sort and aggregation
+// types are checked against the mapping by ExecuteShard, and the queries by
+// [ValidateQueries].
 func ParseRequest(raw []byte) (*Request, []query.Problem) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -243,6 +278,8 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			if n != nil {
 				r.Query = n
 			}
+		case "post_filter":
+			r.PostFilter = parseQueryAt(val, key, &ps)
 		case "sort":
 			r.Sort = parseSort(val, &ps)
 		case "size":
@@ -282,7 +319,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				}
 			}
 		case "aggs", "aggregations":
-			r.Aggs = parseAggs(val, key, 0, &ps)
+			r.Aggs = parseAggs(val, key, 0, false, &ps)
 		case "fields":
 			var fields []string
 			if err := json.Unmarshal(val, &fields); err != nil {
@@ -298,7 +335,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.Timeout = d
 		default:
-			ps.add(key, "unknown key: a search holds query, sort, size, search_after, track_total, aggs, fields and timeout")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, search_after, track_total, aggs, fields and timeout")
 		}
 	}
 	if len(ps) > 0 {
@@ -421,7 +458,10 @@ func parseDuration(s string) (time.Duration, bool) {
 	return d, err == nil
 }
 
-func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[string]Agg {
+// parseAggs reads named aggregations at loc, depth levels below the top; wrapped is
+// set under a filter, filters or global aggregation, whose children hold
+// sub-aggregations of their own one level further down.
+func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *problems) map[string]Agg {
 	var named map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &named); err != nil {
 		ps.add(loc, "aggs is an object of named aggregations")
@@ -441,21 +481,38 @@ func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[str
 		}
 		var a Agg
 		typed := 0
+		var subs json.RawMessage
+		var subsKey string
 		for _, key := range slices.Sorted(maps.Keys(body)) {
 			val := body[key]
 			switch key {
 			case "aggs", "aggregations":
-				if depth > 0 {
-					ps.add(at+"."+key, "sub-aggregations nest one level deep")
-					continue
-				}
-				a.Aggs = parseAggs(val, at+"."+key, depth+1, ps)
+				subs, subsKey = val, key
 			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality:
 				typed++
 				a.Type = key
 				parseAggBody(&a, val, at+"."+key, ps)
+			case AggFilter:
+				typed++
+				a.Type = key
+				a.Filter = parseQueryAt(val, at+"."+key, ps)
+			case AggFilters:
+				typed++
+				a.Type = key
+				parseFilters(&a, val, at+"."+key, ps)
+			case AggGlobal:
+				typed++
+				a.Type = key
+				parseGlobal(val, at+"."+key, ps)
 			default:
-				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats or cardinality")
+				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats, cardinality, filter, filters or global")
+			}
+		}
+		if subs != nil {
+			if depth == 0 || (depth == 1 && wrapped) {
+				a.Aggs = parseAggs(subs, at+"."+subsKey, depth+1, singleBucket(a.Type), ps)
+			} else {
+				ps.add(at+"."+subsKey, "sub-aggregations nest one level deep, or two under filter, filters and global")
 			}
 		}
 		if typed != 1 {
@@ -465,6 +522,108 @@ func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[str
 		out[name] = a
 	}
 	return out
+}
+
+// parseQueryAt reads a query given at loc (post_filter, or an aggregation's filter):
+// [query.Parse]'s tree and problems, located under loc.
+func parseQueryAt(raw json.RawMessage, loc string, ps *problems) query.Node {
+	n, qps := query.Parse(raw)
+	*ps = append(*ps, relocate(qps, loc)...)
+	return n
+}
+
+// relocate moves problems located under [query.RootLoc] to loc, in place.
+func relocate(ps []query.Problem, loc string) []query.Problem {
+	for i := range ps {
+		if rest, ok := strings.CutPrefix(ps[i].Loc, query.RootLoc); ok && (rest == "" || rest[0] == '.') {
+			ps[i].Loc = loc + rest
+		}
+	}
+	return ps
+}
+
+// parseFilters reads a filters aggregation's settings: {"filters": {key: query},
+// "other_bucket_key": key}. The anonymous form, a list of queries, is refused: every
+// bucket is keyed.
+func parseFilters(a *Agg, raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, `a filters aggregation's settings are an object: {"filters": {"key": query}, "other_bucket_key": "key"}`)
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		val := body[key]
+		at := loc + "." + key
+		switch key {
+		case "filters":
+			var named map[string]json.RawMessage
+			if err := json.Unmarshal(val, &named); err != nil {
+				ps.add(at, `filters is an object of queries by bucket key, {"key": query}; the anonymous list is not taken`)
+				continue
+			}
+			if len(named) > MaxFilters {
+				ps.add(at, "a filters aggregation holds at most %d filters", MaxFilters)
+				continue
+			}
+			a.Filters = make(map[string]query.Node, len(named))
+			for _, k := range slices.Sorted(maps.Keys(named)) {
+				if k == "" {
+					ps.add(at, "a filter needs a bucket key")
+					continue
+				}
+				a.Filters[k] = parseQueryAt(named[k], at+"."+k, ps)
+			}
+		case "other_bucket_key":
+			if json.Unmarshal(val, &a.OtherBucketKey) != nil || a.OtherBucketKey == "" {
+				ps.add(at, "other_bucket_key is a bucket key: text")
+			}
+		default:
+			ps.add(at, "unknown key: filters takes filters and other_bucket_key")
+		}
+	}
+}
+
+// parseGlobal reads a global aggregation's settings: {}, as it takes none.
+func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, "a global aggregation's settings are an empty object, {}")
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		ps.add(loc+"."+key, "unknown key: global takes no settings")
+	}
+}
+
+// ValidateQueries reports every problem with r's queries as queries of an index with
+// mapping m, as [query.Validate] finds them: the query's (at query...), post_filter's
+// (at post_filter...), and each filter and filters aggregation's (at
+// aggs.<name>.filter... and aggs.<name>.filters.filters.<key>..., under the
+// aggregation that holds it).
+func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
+	ps := query.Validate(r.Query, m)
+	if r.PostFilter != nil {
+		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
+	}
+	return append(ps, validateAggQueries(r.Aggs, "aggs", m)...)
+}
+
+func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []query.Problem {
+	var ps []query.Problem
+	for _, name := range slices.Sorted(maps.Keys(aggs)) {
+		a := aggs[name]
+		at := loc + "." + name
+		switch a.Type {
+		case AggFilter:
+			ps = append(ps, relocate(query.Validate(a.Filter, m), at+"."+AggFilter)...)
+		case AggFilters:
+			for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
+				ps = append(ps, relocate(query.Validate(a.Filters[key], m), at+".filters.filters."+key)...)
+			}
+		}
+		ps = append(ps, validateAggQueries(a.Aggs, at+".aggs", m)...)
+	}
+	return ps
 }
 
 func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {

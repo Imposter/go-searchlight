@@ -30,7 +30,7 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	sorts := prepareSorts(r.Sort, nil, new(problems))
 	var specs []*aggSpec
 	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, false, new(problems)); s != nil {
+		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, "", new(problems)); s != nil {
 			specs = append(specs, s)
 		}
 	}
@@ -62,19 +62,12 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 		resp.Next = slices.Clone(resp.Hits[len(resp.Hits)-1].Sort)
 	}
 	if len(specs) > 0 {
-		resp.Aggs = make(map[string]*AggResult, len(specs))
-		results := make([]*AggResult, len(specs))
-		for i, spec := range specs {
-			parts := make([]*AggPartial, 0, len(live))
-			for _, sr := range live {
-				if p := sr.Aggs[spec.name]; p != nil {
-					parts = append(parts, p)
-				}
-			}
-			results[i] = reduceAgg(parts, spec)
-			resp.Aggs[spec.name] = results[i]
+		shards := make([]map[string]*AggPartial, len(live))
+		for i, sr := range live {
+			shards[i] = sr.Aggs
 		}
-		boundBuckets(specs, results)
+		resp.Aggs = reduceAggs(specs, shards)
+		boundBuckets(specs, resp.Aggs)
 	}
 	instruments().recordPhase(ctx, r.Index, "reduce", time.Since(start))
 	span.SetAttributes(attribute.Int64("total", resp.Total), attribute.Int("hits", len(resp.Hits)))
@@ -143,9 +136,31 @@ func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
 	return out
 }
 
+// reduceAggs merges the shards' partials of specs (one map per shard) and finishes
+// them, by name.
+func reduceAggs(specs []*aggSpec, shards []map[string]*AggPartial) map[string]*AggResult {
+	if len(specs) == 0 {
+		return nil
+	}
+	out := make(map[string]*AggResult, len(specs))
+	for _, spec := range specs {
+		parts := make([]*AggPartial, 0, len(shards))
+		for _, m := range shards {
+			if p := m[spec.name]; p != nil {
+				parts = append(parts, p)
+			}
+		}
+		out[spec.name] = reduceAgg(parts, spec)
+	}
+	return out
+}
+
 // reduceAgg merges the shards' partials of one aggregation and finishes them.
 func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
-	if spec.typ == AggTerms {
+	switch {
+	case spec.wrapper():
+		return reduceWrapper(parts, spec)
+	case spec.typ == AggTerms:
 		return reduceTerms(parts, spec)
 	}
 	merged := &AggPartial{Type: spec.typ}
@@ -153,6 +168,32 @@ func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
 		mergePartial(merged, p, spec)
 	}
 	return finish(merged, spec)
+}
+
+// reduceWrapper merges the shards' partials of a filter, filters or global aggregation
+// bucket by bucket: the documents summed, and the aggregations under each reduced as
+// top-level ones are, from the shards' partials of that bucket.
+func reduceWrapper(parts []*AggPartial, spec *aggSpec) *AggResult {
+	res := &AggResult{Type: spec.typ}
+	for _, key := range spec.keys {
+		b := &Bucket{Key: key}
+		subs := make([]map[string]*AggPartial, 0, len(parts))
+		for _, p := range parts {
+			for _, pb := range p.Buckets {
+				if pb.Key == key {
+					b.DocCount += pb.DocCount
+					subs = append(subs, pb.Aggs)
+					break
+				}
+			}
+		}
+		b.Aggs = reduceAggs(spec.subs, subs)
+		res.Buckets = append(res.Buckets, b)
+	}
+	if spec.typ != AggFilters && len(res.Buckets) == 1 {
+		res.DocCount, res.Aggs, res.Buckets = res.Buckets[0].DocCount, res.Buckets[0].Aggs, nil
+	}
+	return res
 }
 
 // reduceTerms merges terms lists, tracking which shards returned each term for its
@@ -269,6 +310,8 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 		}
 	case AggTerms:
 		return reduceTerms([]*AggPartial{p}, spec)
+	case AggFilter, AggFilters, AggGlobal:
+		return reduceWrapper([]*AggPartial{p}, spec)
 	default:
 		bs := slices.Clone(p.Buckets)
 		slices.SortFunc(bs, func(a, b *BucketPartial) int { return cmpValue(a.Key, b.Key, false) })
@@ -298,24 +341,55 @@ func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
 // they can pass it: past it, in name order, an aggregation's buckets are cut and it is
 // marked Truncated (a terms aggregation's cut buckets join its sum_other_doc_count).
 // Then each histogram with min_doc_count 0 has its empty buckets filled in, in name
-// order, when they fit in what is left; one whose do not is marked Truncated.
-func boundBuckets(specs []*aggSpec, results []*AggResult) {
+// order, when they fit in what is left; one whose do not is marked Truncated. The
+// aggregations under a filter, filters or global aggregation's buckets are bounded in
+// turn, right after it; its own buckets (one, or at most MaxFilters+1) count but are
+// never cut.
+func boundBuckets(specs []*aggSpec, results map[string]*AggResult) {
 	left := MaxBuckets
-	for _, res := range results {
-		if len(res.Buckets) > left {
+	cutBuckets(specs, results, &left)
+	fillBuckets(specs, results, &left)
+}
+
+func cutBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
+	for _, spec := range specs {
+		res := results[spec.name]
+		switch spec.typ {
+		case AggFilter, AggGlobal:
+			*left = max(*left-1, 0)
+			cutBuckets(spec.subs, res.Aggs, left)
+			continue
+		case AggFilters:
+			*left = max(*left-len(res.Buckets), 0)
+			for _, b := range res.Buckets {
+				cutBuckets(spec.subs, b.Aggs, left)
+			}
+			continue
+		}
+		if len(res.Buckets) > *left {
 			if res.Type == AggTerms {
-				for _, b := range res.Buckets[left:] {
+				for _, b := range res.Buckets[*left:] {
 					res.SumOtherDocCount += b.DocCount
 				}
 			}
-			res.Buckets, res.Truncated = res.Buckets[:left], true
+			res.Buckets, res.Truncated = res.Buckets[:*left], true
 		}
-		left -= len(res.Buckets)
+		*left -= len(res.Buckets)
 	}
-	for i, spec := range specs {
-		res := results[i]
-		if (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && spec.minDoc <= 0 && !res.Truncated && len(res.Buckets) > 1 {
-			left -= fillHistogram(res, spec, left)
+}
+
+func fillBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
+	for _, spec := range specs {
+		res := results[spec.name]
+		switch {
+		case spec.typ == AggFilter || spec.typ == AggGlobal:
+			fillBuckets(spec.subs, res.Aggs, left)
+		case spec.typ == AggFilters:
+			for _, b := range res.Buckets {
+				fillBuckets(spec.subs, b.Aggs, left)
+			}
+		case (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && spec.minDoc <= 0 && !res.Truncated && len(res.Buckets) > 1:
+			*left -= fillHistogram(res, spec, *left)
 		}
 	}
 }

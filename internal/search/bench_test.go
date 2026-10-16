@@ -429,3 +429,68 @@ func BenchmarkTermsAggUnique(b *testing.B) {
 		return &Request{Query: &query.All{}, Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10}}}
 	})
 }
+
+// facetPicks are a facet panel's picks: two brands and a category, over a price range.
+func facetPicks(c *corpus, rng *rand.Rand) (q, brands, category query.Node) {
+	lo := float64(rng.IntN(200))
+	return leaf("price", query.OpBetween, []float64{lo, lo + 300}),
+		leaf("brand", query.OpIn, []string{c.brands[rng.IntN(50)], c.brands[rng.IntN(50)]}),
+		leaf("category", query.OpEq, c.categories[rng.IntN(len(c.categories))])
+}
+
+// BenchmarkFacetPanel: a facet panel in one search, as docs/api.md builds it: 20 hits
+// under a post_filter of every pick, each facet a filter aggregation of the other
+// picks.
+func BenchmarkFacetPanel(b *testing.B) {
+	_, c := openBench(b)
+	runBench(b, func(rng *rand.Rand) *Request {
+		q, brands, category := facetPicks(c, rng)
+		return &Request{Query: q, PostFilter: &query.All{Children: []query.Node{brands, category}}, Size: 20, Aggs: map[string]Agg{
+			"brands":     {Type: AggFilter, Filter: category, Aggs: map[string]Agg{"brands": {Type: AggTerms, Field: "brand", Size: 10}}},
+			"categories": {Type: AggFilter, Filter: brands, Aggs: map[string]Agg{"categories": {Type: AggTerms, Field: "category", Size: 10}}},
+		}}
+	})
+}
+
+// BenchmarkFacetPanelSearches: the same panel as BenchmarkFacetPanel the way it took
+// before filter aggregations, one search per picked facet and one for the hits, run one
+// after another; a p50 and p99 of all of them together.
+func BenchmarkFacetPanelSearches(b *testing.B) {
+	s, c := openBench(b)
+	rng := rand.New(rand.NewPCG(1, 2))
+	panel := func() []*Request {
+		q, brands, category := facetPicks(c, rng)
+		and := func(ns ...query.Node) query.Node { return &query.All{Children: ns} }
+		return []*Request{
+			{Query: and(q, brands, category), Size: 20},
+			{Query: and(q, category), Aggs: map[string]Agg{"brands": {Type: AggTerms, Field: "brand", Size: 10}}},
+			{Query: and(q, brands), Aggs: map[string]Agg{"categories": {Type: AggTerms, Field: "category", Size: 10}}},
+		}
+	}
+	search := func(rs []*Request) {
+		for _, r := range rs {
+			g := s.Acquire()
+			res, err := ExecuteShard(context.Background(), g, r)
+			g.Release()
+			if err != nil {
+				b.Fatal(err)
+			}
+			Reduce(context.Background(), []*ShardResult{res}, r)
+		}
+	}
+	for range 3 {
+		search(panel())
+	}
+	lat := make([]time.Duration, 0, b.N)
+	b.ResetTimer()
+	for range b.N {
+		rs := panel()
+		start := nanotime()
+		search(rs)
+		lat = append(lat, time.Duration(nanotime()-start))
+	}
+	b.StopTimer()
+	slices.Sort(lat)
+	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds())/1e3, "p50-µs")
+	b.ReportMetric(float64(lat[min(len(lat)-1, len(lat)*99/100)].Nanoseconds())/1e3, "p99-µs")
+}

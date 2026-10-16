@@ -241,22 +241,40 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - `date_histogram`, with `fixed_interval`, `calendar_interval`, `offset` and
     `min_doc_count`;
   - `stats`;
-  - `cardinality` (HyperLogLog++).
+  - `cardinality` (HyperLogLog++);
+  - `filter`, a query: one bucket of the documents both the search's `query` and it
+    match, `{"doc_count": n, ...}`;
+  - `filters`, `{"filters": {"key": query, ...}, "other_bucket_key": "other"}`: a
+    `filter` bucket per key, and with `other_bucket_key` one more of the documents no
+    filter matches, `{"buckets": {"key": {"doc_count": n, ...}, ...}}`. Keyed only:
+    the anonymous list form is refused;
+  - `global`, `{}`: one bucket of every document of the index, whatever the `query`
+    and `post_filter`, `{"doc_count": n, ...}`. Top level only.
 
-  A bucket aggregation may carry metric sub-aggregations one level deep. A `terms`
-  aggregation over several shards reports its error bound, as Elasticsearch does. On
-  one shard it is exact, and its `doc_count_error_upper_bound` is 0.
+  A bucket aggregation may carry metric sub-aggregations one level deep. `filter`,
+  `filters` and `global` may carry any other aggregation, written inline in their
+  bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
+  most `filter` → `terms` → `stats`. A filter is the query language, checked against
+  the mapping as `query` is, with the same bounds, each problem at its own `loc`
+  (`aggs.brands.filter.field`, `aggs.picked.filters.filters.acme.op`). A `terms`
+  aggregation over several shards reports its error bound, as Elasticsearch does,
+  under a `filter` too. On one shard it is exact, and its
+  `doc_count_error_upper_bound` is 0.
 
   Bounds, each refused with a 400 whose `loc` names the place:
-  - At most 100 aggregations per search, sub-aggregations included (`loc` `aggs`).
-  - At most 100 `ranges` per `range` aggregation.
+  - At most 100 aggregations per search, sub-aggregations and those under `filter`,
+    `filters` and `global` included (`loc` `aggs`).
+  - At most 100 `ranges` per `range` aggregation, and 100 `filters` per `filters`
+    aggregation.
   - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.
   - At most 65,536 buckets per response, every aggregation's together (Elasticsearch's
-    `search.max_buckets`). A shard whose own buckets pass it refuses the search, at
+    `search.max_buckets`), nested ones included: a `filter` or `global` counts one,
+    a `filters` one per key. A shard whose own buckets pass it refuses the search, at
     the aggregation that passed it, asking for a wider interval, a lower size or a
     narrower query. A `terms` aggregation counts its `size` there, not its
     `shard_size` over-fetch. Shards that pass it only once merged are cut, in aggregation name
-    order, and each aggregation cut says `"truncated": true`. A cut `terms`
+    order (those under a `filter`, `filters` or `global` right after it, whose own
+    buckets are never cut), and each aggregation cut says `"truncated": true`. A cut `terms`
     aggregation counts the documents of its cut buckets in `sum_other_doc_count`.
   - A histogram's empty buckets (`min_doc_count` 0) are filled in only while the
     response stays within 65,536 buckets. A histogram left without them says
@@ -264,12 +282,45 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - A value a histogram cannot place in a bucket (its bucket's key overflows a
     float64, or a calendar interval cannot date it) refuses the search as too many
     buckets, rather than drop a counted document from every bucket.
+- **`post_filter`**, a query, narrows the hits once the aggregations are counted:
+  `hits`, `total`, the sort, `search_after` and `next` are those of the documents
+  `query` and `post_filter` both match, while every aggregation but `global` counts
+  `query`'s. It is checked as `query` is, at `post_filter...`.
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
   Past it, the answer holds what was found, with `timed_out: true`.
 
+**A facet panel in one search.** Each facet counts under every pick but its own, and
+the hits obey every pick: put the picks in `post_filter`, and make each facet a
+`filter` aggregation of the other facets' picks. Here brand `acme` and colour `red`
+are picked, under a price range:
+
+```json
+{"query": {"field": "price", "op": "lt", "value": 100},
+ "post_filter": {"all": [
+   {"field": "brand", "op": "in", "value": ["acme"]},
+   {"field": "color", "op": "in", "value": ["red"]}]},
+ "sort": [{"price": "desc"}], "size": 20,
+ "aggs": {
+   "brand": {"filter": {"field": "color", "op": "in", "value": ["red"]},
+             "aggs": {"brand": {"terms": {"field": "brand"}}}},
+   "color": {"filter": {"field": "brand", "op": "in", "value": ["acme"]},
+             "aggs": {"color": {"terms": {"field": "color"}}}},
+   "everything": {"global": {}, "aggs": {"price": {"stats": {"field": "price"}}}}}}
+```
+
+```json
+{"total": {"value": 3, "relation": "eq"}, "hits": ["..."],
+ "aggs": {"brand": {"doc_count": 9, "brand": {"buckets": [{"key": "acme", "doc_count": 3}, "..."], "...": "..."}},
+          "color": {"doc_count": 12, "color": {"buckets": [{"key": "red", "doc_count": 3}, "..."], "...": "..."}},
+          "everything": {"doc_count": 120, "price": {"count": 120, "...": "..."}}}}
+```
+
+A facet with no pick of its own is a `filter` of every pick, or a plain aggregation
+while nothing is picked.
+
 `_count` takes `{"query": ...}` and answers `{"count", "relation", "timed_out"}`, counting
-exactly.
+exactly. It refuses any other member, `post_filter` included (400 at its name).
 
 ## Saved queries
 

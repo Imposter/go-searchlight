@@ -298,3 +298,79 @@ func TestCheckProgRefusesBadDateOperands(t *testing.T) {
 		}
 	}
 }
+
+// A date math bound that reads no now is resolved when the segment is built: it
+// anchors on a range and compiles to the range tags, as a number would.
+func TestFixedDateMathIndexesAsARange(t *testing.T) {
+	n, _ := query.Parse([]byte(`{"field":"seen","op":"gt","value":"2026-10-09||/M"}`))
+	set := newExtractor(nil).node(query.ResolveFixed(n))
+	if len(set.terms) != 0 || len(set.ranges) != 1 || set.ranges[0].Field != "seen" ||
+		set.ranges[0].Lo != float64(time.Date(2026, 10, 31, 23, 59, 59, 999e6, time.UTC).UnixMilli()) {
+		t.Fatalf("anchors %+v", set)
+	}
+	ft := &fieldTable{at: map[string]uint32{}}
+	pc := progCompiler{field: ft.field}
+	for _, raw := range []string{
+		`{"field":"seen","op":"gt","value":"2026-10-09||/M"}`,
+		`{"field":"seen","op":"between","value":["2026-10-01","2026-10-31"]}`,
+	} {
+		q, _ := query.Parse([]byte(raw))
+		if p := pc.compile(q); p[0] == pDate {
+			t.Errorf("%s compiles to a date leaf", raw)
+		}
+	}
+	q, _ := query.Parse([]byte(`{"field":"seen","op":"between","value":["2026-10-01","now"]}`))
+	if p := pc.compile(q); p[0] != pDate {
+		t.Errorf("a bound reading now compiles to tag %d", p[0])
+	}
+}
+
+// The upgrade note's claim: a query segment holding no date math is one an older build
+// (v1.0.0, which knew the program tags below pDate) reads as it is, in the same format;
+// one holding a now-relative condition has a program that build refuses, so it treats
+// the file as corrupt.
+func TestOlderBuildsAndDateMathSegments(t *testing.T) {
+	if FormatName != "percolate/3" || formatVersion != 3 {
+		t.Fatalf("format %s (%d): the upgrade note describes percolate/3", FormatName, formatVersion)
+	}
+	if pDate != numProgTags-1 {
+		t.Fatal("pDate is not the newest program tag")
+	}
+	build := func(raws ...string) *Segment {
+		t.Helper()
+		var qs []shard.StoredQuery
+		for i, raw := range raws {
+			n, problems := query.Parse([]byte(raw))
+			if len(problems) > 0 {
+				t.Fatal(problems)
+			}
+			qs = append(qs, shard.StoredQuery{ID: fmt.Sprintf("q%d", i), Seq: int64(i + 1), Query: n})
+		}
+		data, err := encodeSegment(context.Background(), qs, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seg, err := openData("test.perc", data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seg
+	}
+	refused := func(seg *Segment) int {
+		bad := 0
+		for r := range seg.NumQueries() {
+			if p := seg.program(r); len(p) > 0 && checkProgTags(p, uint32(len(seg.fields)), pDate) != nil {
+				bad++
+			}
+		}
+		return bad
+	}
+	plain := build(`{"field":"price","op":"lt","value":10}`, `{"all":[{"field":"brand","op":"eq","value":"acme"},{"field":"seen","op":"gte","value":"2026-10-01||/M"}]}`)
+	if n := refused(plain); n != 0 {
+		t.Fatalf("an older build refuses %d programs of a segment with no now-relative date math", n)
+	}
+	dated := build(`{"field":"price","op":"lt","value":10}`, dateQueries["acme-week"])
+	if n := refused(dated); n != 1 {
+		t.Fatalf("an older build refuses %d programs of a segment with one now-relative query, want 1", n)
+	}
+}

@@ -76,10 +76,21 @@ func TestDateMathUnits(t *testing.T) {
 		{"2026-10-01", "2026-10-01T00:00:00Z", "2026-10-01T23:59:59.999Z", true},
 		{"2026-10-01T09:30:00Z", "2026-10-01T09:30:00Z", "2026-10-01T09:30:00.999Z", true},
 		{"2026-10-01T09:30:00.250Z", "2026-10-01T09:30:00.250Z", "", false},
+		{"2026-10-01T09:30:00,5Z", "2026-10-01T09:30:00.500Z", "", false},
+		{"2026-10-01T09:30:00.000Z", "2026-10-01T09:30:00Z", "", false},
 		{"2026-10-01T11:30:00+02:00", "2026-10-01T09:30:00Z", "2026-10-01T09:30:00.999Z", true},
 		// Before 1970, rounding still goes down.
 		{"1969-12-31T23:59:59.500Z||/s", "1969-12-31T23:59:59Z", "1969-12-31T23:59:59.999Z", true},
 		{"1969-12-31||/w", "1969-12-29T00:00:00Z", "1970-01-04T23:59:59.999Z", true},
+		{"1955-07-20T10:00:00Z||/M", "1955-07-01T00:00:00Z", "1955-07-31T23:59:59.999Z", true},
+		{"1955-07-20||/y", "1955-01-01T00:00:00Z", "1955-12-31T23:59:59.999Z", true},
+		{"1969-12-31T23:59:59.999Z||+1s", "1970-01-01T00:00:00.999Z", "", false},
+		// Rounding after month arithmetic at a month's end, and in a leap year.
+		{"2026-01-31||+1M/M", "2026-02-01T00:00:00Z", "2026-02-28T23:59:59.999Z", true},
+		{"2024-01-31||+1M/M", "2024-02-01T00:00:00Z", "2024-02-29T23:59:59.999Z", true},
+		{"2024-03-15||-1M/M", "2024-02-01T00:00:00Z", "2024-02-29T23:59:59.999Z", true},
+		{"2024-02-29||/y", "2024-01-01T00:00:00Z", "2024-12-31T23:59:59.999Z", true},
+		{"2024-02-29||+1y/y", "2025-01-01T00:00:00Z", "2025-12-31T23:59:59.999Z", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.expr, func(t *testing.T) {
@@ -116,6 +127,10 @@ func TestDateMathMonthEnds(t *testing.T) {
 		"2024-02-29||-4y":           "2020-02-29T00:00:00Z",
 		"2024-02-29||+12M":          "2025-02-28T00:00:00Z",
 		"2024-02-29T10:00:00Z||+1y": "2025-02-28T10:00:00Z",
+		"1900-03-01||-1d":           "1900-02-28T00:00:00Z",
+		"1960-02-29||+1y":           "1961-02-28T00:00:00Z",
+		"1960-03-31||-1M":           "1960-02-29T00:00:00Z",
+		"1901-01-31||-2M":           "1900-11-30T00:00:00Z",
 	}
 	for expr, want := range cases {
 		if got := resolveText(t, expr, false); got != ms(t, want) {
@@ -175,6 +190,10 @@ func TestValidateDateMath(t *testing.T) {
 		`{"field": "seen", "op": "between", "value": [0, "now"]}`,
 		`{"field": "seen", "op": "between", "value": ["2026-10-01", "2026-10-01"]}`,
 		`{"field": "seen", "op": "between", "value": ["now", "2020-01-01"]}`,
+		`{"field": "seen", "op": "between", "value": ["now-1d", "now"]}`,
+		`{"field": "seen", "op": "between", "value": ["now", "now"]}`,
+		`{"field": "seen", "op": "between", "value": ["now/d", "now-1h"]}`,
+		`{"field": "seen", "op": "between", "value": ["now+1M", "now+30d"]}`,
 	}
 	for _, raw := range valid {
 		if ps := Validate(mustParse(t, raw), dateMapping()); len(ps) != 0 {
@@ -188,6 +207,10 @@ func TestValidateDateMath(t *testing.T) {
 		{`{"field": "seen", "op": "between", "value": ["now"]}`, "query.value", "[lo, hi]"},
 		{`{"field": "seen", "op": "between", "value": [true, "now"]}`, "query.value", "two numbers or date math"},
 		{`{"field": "seen", "op": "between", "value": ["2026-10-02", "2026-10-01"]}`, "query.value", "lo <= hi"},
+		{`{"field": "seen", "op": "between", "value": ["now", "now-1d"]}`, "query.value", "lo <= hi"},
+		{`{"field": "seen", "op": "between", "value": ["now+2h", "now+90m"]}`, "query.value", "lo <= hi"},
+		{`{"field": "seen", "op": "eq", "value": "2026-10-01"}`, "query.value", "Unix milliseconds: date strings are for lt"},
+		{`{"field": "seen", "op": "in", "value": ["2026-10-01"]}`, "query.value", "Unix milliseconds"},
 		{`{"field": "seen", "op": "gte", "value": "2026-01-01||+300000y"}`, "query.value", "falls outside"},
 		{`{"field": "seen", "op": "gte", "value": true}`, "query.value", "a number or date math"},
 		{`{"field": "seen", "op": "eq", "value": "now/d"}`, "query.value", "date math is for lt, lte, gt, gte and between"},
@@ -371,4 +394,35 @@ func mustEncode(t *testing.T, n Node) []byte {
 	}
 	write(n)
 	return []byte(b.String())
+}
+
+// ResolveFixed resolves what reads no now and keeps what does, so a saved query's
+// absolute dates index as plain ranges.
+func TestResolveFixed(t *testing.T) {
+	t.Parallel()
+	relative := mustParse(t, `{"field": "seen", "op": "gte", "value": "now-7d"}`)
+	if got := ResolveFixed(relative); got != relative {
+		t.Fatal("a now-relative condition was rewritten")
+	}
+	raw := `{"all": [{"field": "seen", "op": "lte", "value": "2026-10-01"},` +
+		`{"field": "seen", "op": "between", "value": ["2026-10-01||+1M", "now"]},` +
+		`{"field": "seen", "op": "gt", "value": "now/d"}]}`
+	got := ResolveFixed(mustParse(t, raw))
+	want := mustParse(t, fmt.Sprintf(`{"all": [{"field": "seen", "op": "lte", "value": %d},`+
+		`{"field": "seen", "op": "between", "value": [%d, "now"]},`+
+		`{"field": "seen", "op": "gt", "value": "now/d"}]}`, ms(t, "2026-10-01T23:59:59.999Z"), ms(t, "2026-11-01T00:00:00Z")))
+	if !bytes.Equal(Canonical(got), Canonical(want)) {
+		t.Fatalf("ResolveFixed = %s", mustEncode(t, got))
+	}
+	back, ps := Parse(mustEncode(t, got))
+	if len(ps) != 0 || !bytes.Equal(Canonical(back), Canonical(want)) {
+		t.Fatalf("round trip: %v", ps)
+	}
+	for _, now := range []time.Time{testNow, testNow.Add(400 * 24 * time.Hour)} {
+		a, _ := Resolve(got, now)
+		b, _ := Resolve(mustParse(t, raw), now)
+		if !bytes.Equal(Canonical(a), Canonical(b)) {
+			t.Fatalf("at %s, resolving after ResolveFixed differs", now)
+		}
+	}
 }

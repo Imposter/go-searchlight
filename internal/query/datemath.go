@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -46,14 +47,35 @@ type DateMath struct {
 	now    bool
 	anchor int64 // Unix ms, when !now
 	fill   int64 // ms rounding up adds to an anchor with no math: what its form leaves out
-	steps  []dateStep
+	steps  []DateStep
 }
 
-// dateStep is one +N, -N or /unit step.
-type dateStep struct {
-	round bool
-	n     int64 // +N or -N, signed
-	unit  byte
+// DateStep is one step of date math: +N or -N of Unit (N signed), or, when Round, a
+// rounding to Unit.
+type DateStep struct {
+	Round bool
+	N     int64
+	Unit  byte
+}
+
+// IsDateUnit reports whether u is a date math unit: y, M, w, d, h, H, m or s.
+func IsDateUnit(u byte) bool { return u != 0 && strings.IndexByte("yMwdhHms", u) >= 0 }
+
+// Steps returns the expression's steps, in order; the caller must not change them.
+func (d *DateMath) Steps() []DateStep { return d.steps }
+
+// constantOffset reports whether the expression is now plus a fixed length: no
+// rounding, no months or years, so two such expressions keep their order at every now.
+func (d *DateMath) constantOffset() bool {
+	if !d.now {
+		return false
+	}
+	for _, st := range d.steps {
+		if st.Round || st.Unit == 'y' || st.Unit == 'M' {
+			return false
+		}
+	}
+	return true
 }
 
 // Relative reports whether the expression reads now.
@@ -79,14 +101,14 @@ func ParseDateMath(s string) (DateMath, string) {
 		math = rest
 	}
 	for i := 0; i < len(math); {
-		var st dateStep
+		var st DateStep
 		switch math[i] {
 		case '/':
-			st.round = true
+			st.Round = true
 		case '+':
-			st.n = 1
+			st.N = 1
 		case '-':
-			st.n = -1
+			st.N = -1
 		default:
 			return DateMath{}, fmt.Sprintf("date math %q: unknown operator %q; use +, - or /", s, math[i])
 		}
@@ -106,15 +128,15 @@ func ParseDateMath(s string) (DateMath, string) {
 		if i >= len(math) {
 			return DateMath{}, fmt.Sprintf("date math %q ends early: a step needs a unit (y, M, w, d, h, H, m or s)", s)
 		}
-		if st.round && num != 1 {
+		if st.Round && num != 1 {
 			return DateMath{}, fmt.Sprintf("date math %q: / rounds to one unit (/d), not %d", s, num)
 		}
-		st.unit = math[i]
+		st.Unit = math[i]
 		i++
-		if !strings.ContainsRune("yMwdhHms", rune(st.unit)) {
-			return DateMath{}, fmt.Sprintf("date math %q: unknown unit %q; use y, M, w, d, h, H, m or s", s, st.unit)
+		if !IsDateUnit(st.Unit) {
+			return DateMath{}, fmt.Sprintf("date math %q: unknown unit %q; use y, M, w, d, h, H, m or s", s, st.Unit)
 		}
-		st.n *= num
+		st.N *= num
 		d.steps = append(d.steps, st)
 	}
 	return d, ""
@@ -130,7 +152,7 @@ func anchorMillis(s string) (ms, fill int64, ok bool) {
 		return at.UnixMilli(), msDay - 1, inDateRange(at.UnixMilli())
 	}
 	if at, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		if !strings.Contains(s, ".") {
+		if !strings.ContainsAny(s, ".,") {
 			fill = msSecond - 1
 		}
 		return at.UnixMilli(), fill, inDateRange(at.UnixMilli())
@@ -156,32 +178,33 @@ func (d *DateMath) Resolve(now int64, roundUp bool) (int64, bool) {
 	}
 	for _, st := range d.steps {
 		var ok bool
-		if ms, ok = st.apply(ms, roundUp); !ok {
+		if ms, ok = st.Apply(ms, roundUp); !ok {
 			return 0, false
 		}
 	}
 	return ms, true
 }
 
-// apply applies one step to ms, which is in range; false when the result is not.
-func (st dateStep) apply(ms int64, roundUp bool) (int64, bool) {
-	if !st.round {
-		switch st.unit {
+// Apply applies the step to ms (Unix milliseconds, in range), rounding up or down;
+// false when the result is out of range.
+func (st DateStep) Apply(ms int64, roundUp bool) (int64, bool) {
+	if !st.Round {
+		switch st.Unit {
 		case 'y':
-			return addMonths(ms, 12*st.n)
+			return addMonths(ms, 12*st.N)
 		case 'M':
-			return addMonths(ms, st.n)
+			return addMonths(ms, st.N)
 		}
-		out := ms + st.n*fixedUnit(st.unit)
+		out := ms + st.N*fixedUnit(st.Unit)
 		return out, inDateRange(out)
 	}
 	var start, next int64
 	var ok bool
-	switch st.unit {
+	switch st.Unit {
 	case 'y', 'M':
 		t := time.UnixMilli(ms).UTC()
 		month, months := t.Month(), int64(1)
-		if st.unit == 'y' {
+		if st.Unit == 'y' {
 			month, months = time.January, 12
 		}
 		start = time.Date(t.Year(), month, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
@@ -194,7 +217,7 @@ func (st dateStep) apply(ms int64, roundUp bool) (int64, bool) {
 		start = monday * msDay
 		next = start + msWeek
 	default:
-		unit := fixedUnit(st.unit)
+		unit := fixedUnit(st.Unit)
 		start = floorDiv(ms, unit) * unit
 		next = start + unit
 	}
@@ -260,16 +283,16 @@ func (d *DateMath) appendCanonical(buf []byte) []byte {
 	}
 	buf = binary.AppendUvarint(buf, uint64(len(d.steps)))
 	for _, st := range d.steps {
-		unit := st.unit
+		unit := st.Unit
 		if unit == 'H' {
 			unit = 'h'
 		}
-		if st.round {
+		if st.Round {
 			buf = append(buf, '/', unit)
 			continue
 		}
 		buf = append(buf, '+', unit)
-		buf = binary.AppendVarint(buf, st.n)
+		buf = binary.AppendVarint(buf, st.N)
 	}
 	return buf
 }
@@ -364,9 +387,22 @@ func Resolve(n Node, now time.Time) (Node, []Problem) {
 	return r.node(n, RootLoc), r.problems
 }
 
+// ResolveFixed returns n with every date math bound that does not read now resolved,
+// as [Resolve] resolves it: the same at every instant. A condition left with no date
+// math is a plain range; one whose other bound reads now keeps that bound. A tree
+// with none is returned as it is; n is never changed.
+func ResolveFixed(n Node) Node {
+	if !HasDateMath(n) {
+		return n
+	}
+	r := resolver{fixedOnly: true}
+	return r.node(n, RootLoc)
+}
+
 type resolver struct {
-	now      int64
-	problems problems
+	now       int64
+	fixedOnly bool // resolve only the bounds that do not read now
+	problems  problems
 }
 
 func (r *resolver) node(n Node, loc string) Node {
@@ -387,7 +423,7 @@ func (r *resolver) node(n Node, loc string) Node {
 		}
 		return &Not{Child: r.node(x.Child, join(loc, "not"))}
 	case *Leaf:
-		if x == nil || !x.IsDateMath() {
+		if x == nil || !x.IsDateMath() || r.fixedOnly && !hasFixedBound(x) {
 			return x
 		}
 		return r.leaf(x, join(loc, "value"))
@@ -412,8 +448,8 @@ func (r *resolver) leaf(l *Leaf, loc string) *Leaf {
 	out := &Leaf{Field: l.Field, Op: l.Op}
 	if l.Op != OpBetween {
 		s := r.bound(&a.Scalar, RoundsUp(l.Op), loc)
-		out.Arg = Arg{Kind: ArgNumber, Scalar: s}
-		out.Value = numberJSON(&s)
+		out.Arg = Arg{Kind: s.Kind, Scalar: s}
+		out.Value = boundJSON(&s)
 		return out
 	}
 	if a.Kind != ArgList || len(a.List) != 2 {
@@ -424,13 +460,36 @@ func (r *resolver) leaf(l *Leaf, loc string) *Leaf {
 	lo := r.bound(&a.List[0], false, index(loc, 0))
 	hi := r.bound(&a.List[1], true, index(loc, 1))
 	out.Arg = Arg{Kind: ArgList, List: []Scalar{lo, hi}}
-	out.Value = append(append(append(append([]byte{'['}, numberJSON(&lo)...), ','), numberJSON(&hi)...), ']')
+	out.Value = append(append(append(append([]byte{'['}, boundJSON(&lo)...), ','), boundJSON(&hi)...), ']')
 	return out
+}
+
+// hasFixedBound reports whether a date math condition has a string bound that does
+// not read now.
+func hasFixedBound(l *Leaf) bool {
+	a := l.arg()
+	bounds := []Scalar{a.Scalar}
+	if a.Kind == ArgList {
+		bounds = a.List
+	}
+	for i := range bounds {
+		if bounds[i].Kind == ArgString {
+			if d, why := ParseDateMath(bounds[i].Text); why != "" || !d.now {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *resolver) bound(s *Scalar, roundUp bool, loc string) Scalar {
 	if s.Kind == ArgNumber {
 		return *s
+	}
+	if r.fixedOnly && s.Kind == ArgString {
+		if d, why := ParseDateMath(s.Text); why == "" && d.now {
+			return *s
+		}
 	}
 	ms, ok := ResolveDate(s, r.now, roundUp)
 	if !ok {
@@ -442,6 +501,15 @@ func (r *resolver) bound(s *Scalar, roundUp bool, loc string) Scalar {
 		return unresolved
 	}
 	return Scalar{Kind: ArgNumber, Number: ms, Finite: true}
+}
+
+// boundJSON is a bound as JSON: a number, or a string kept as written.
+func boundJSON(s *Scalar) []byte {
+	if s.Kind == ArgString {
+		b, _ := json.Marshal(s.Text)
+		return b
+	}
+	return numberJSON(s)
 }
 
 func numberJSON(s *Scalar) []byte {

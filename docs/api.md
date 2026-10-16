@@ -367,13 +367,20 @@ On a `date` field, `lt`, `lte`, `gt`, `gte` and each bound of `between` take a n
 - **Saved queries** keep the expression: `GET` returns it as written. Each percolation
   (`_percolate`, `_bulk?percolate=true`) resolves it at its own `now`, so a saved
   `gte now-7d` stops matching a document once the document is a week old.
-- **Not for `eq`, `ne` or `in`.** Elasticsearch turns date math in a `term` query into a
-  range. Write the range instead: `between ["now/d", "now/d"]` is today.
-- **Validation.** A malformed expression, date math on a field that is not a `date`, or
-  a bound outside the dates a `date` field holds (±8.64e15 ms) is a 400 at the value's
-  `loc` (`query.value`, or `query.value.1` for `between`'s hi). A `between` whose `lo`
-  is past its `hi` is a 400 when neither reads `now`. One that reads `now` matches
-  nothing while it is reversed.
+- **Not for `eq`, `ne` or `in`.** These take Unix milliseconds on a `date` field, and
+  refuse any string, a plain date as well as date math: the ranges read date strings,
+  the equalities do not. Elasticsearch turns a date in a `term` query into a range;
+  write the range instead: `between ["now/d", "now/d"]` is today, and
+  `between ["2026-10-01", "2026-10-01"]` is that day.
+- **Validation.** Each of these is a 400 at the value's `loc` (`query.value`, or
+  `query.value.1` for `between`'s hi): a malformed expression; a string on a `number`
+  field; a bound outside the dates a `date` field holds (±8.64e15 ms); a string to
+  `eq`, `ne` or `in` on a `date` field. A range on a field whose type takes none
+  (`lt` on a `keyword`) is refused at `query.op`, as any op its type does not take.
+  A `between` whose `lo` is past its `hi` at every instant is a 400: when neither
+  reads `now`, or when both are `now` plus or minus fixed-length units (`d`, `w`, `h`,
+  `m`, `s`) with no rounding, such as `["now", "now-1d"]`. Any other `between` that
+  reads `now` matches nothing while it is reversed.
 
 ## Saved queries
 

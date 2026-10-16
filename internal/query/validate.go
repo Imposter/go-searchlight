@@ -120,7 +120,9 @@ func checkLeaf(ps *problems, loc string, l *Leaf, m *schema.Mapping) {
 
 // dateBoundProblem is why a is not what op (lt, lte, gt, gte or between) takes on a date
 // field, a number or date math for each bound, and the loc below the value it is at;
-// "" when it is. between's lo must not be past its hi when neither reads now.
+// "" when it is. between's lo must not be past its hi when that holds at every now:
+// when neither reads now, or both are now plus a fixed length (no rounding, months or
+// years), whose order never changes.
 func dateBoundProblem(op string, a *Arg) (string, string) {
 	if op != OpBetween {
 		if a.Kind == ArgString {
@@ -136,7 +138,7 @@ func dateBoundProblem(op string, a *Arg) (string, string) {
 		return "", "between needs [lo, hi]"
 	}
 	var ends [2]float64
-	relative := false
+	relative, constant := 0, 0
 	for i := range a.List {
 		s := &a.List[i]
 		switch {
@@ -146,14 +148,20 @@ func dateBoundProblem(op string, a *Arg) (string, string) {
 				return "." + strconv.Itoa(i), why
 			}
 			ms, _ := d.Resolve(0, i == 1)
-			ends[i], relative = float64(ms), relative || d.Relative()
+			ends[i] = float64(ms)
+			if d.Relative() {
+				relative++
+			}
+			if d.constantOffset() {
+				constant++
+			}
 		case fits(s, "number"):
 			ends[i] = s.Number
 		default:
 			return "", "between needs two numbers or date math, [lo, hi]"
 		}
 	}
-	if !relative && ends[0] > ends[1] {
+	if (relative == 0 || constant == 2) && ends[0] > ends[1] {
 		return "", "between needs lo <= hi"
 	}
 	return "", ""
@@ -316,11 +324,14 @@ func checkDateMath(s string) (DateMath, string) {
 }
 
 // dateMathHint explains, for a value holding a string where a number is wanted, where
-// date math applies; "" for any other value.
+// date strings apply; "" for any other value. eq, ne and in on a date field take Unix
+// milliseconds only: a plain date there is refused as date math is.
 func dateMathHint(a *Arg, t schema.FieldType) string {
 	switch {
 	case !hasDateText(a):
 		return ""
+	case t == schema.Date && plainDate(a):
+		return "; give the date as Unix milliseconds: date strings are for lt, lte, gt, gte and between"
 	case t == schema.Date:
 		return "; date math is for lt, lte, gt, gte and between"
 	case t == schema.Number:
@@ -328,6 +339,21 @@ func dateMathHint(a *Arg, t schema.FieldType) string {
 	default:
 		return ""
 	}
+}
+
+// plainDate reports whether a value's first string is a plain date: no now, no ||.
+func plainDate(a *Arg) bool {
+	text := a.Scalar.Text
+	if a.Kind == ArgList {
+		for i := range a.List {
+			if a.List[i].Kind == ArgString {
+				text = a.List[i].Text
+				break
+			}
+		}
+	}
+	d, why := ParseDateMath(text)
+	return why == "" && !d.Relative() && !strings.Contains(text, "||")
 }
 
 func similarProblem(a *Arg) string {

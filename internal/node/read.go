@@ -131,12 +131,23 @@ func (n *Single) validQuery(ctx context.Context, idx *index, r *search.Request) 
 	return nil
 }
 
+// now is the instant a request's date math resolves at: the one ctx carries
+// ([query.WithNow]), else the clock's wall time.
+func (n *Single) now(ctx context.Context) time.Time {
+	if now, ok := query.NowFrom(ctx); ok {
+		return now
+	}
+	return n.clock.Wall()
+}
+
 // requeryRounds bounds how many times a search runs the query phase again on the
 // shards whose fetch found their copy's generation gone.
 const requeryRounds = 3
 
 // Search implements [api.Coordinator]: a query-then-fetch over every shard, each
-// shard's generation held from its query to its fetch.
+// shard's generation held from its query to its fetch. Its date math resolves here,
+// once, at the clock's wall time (or the instant ctx carries, [query.WithNow]): every
+// shard, local or a peer's, gets the resolved query.
 func (n *Single) Search(ctx context.Context, name string, r *search.Request, opts api.ReadOptions) (res *api.SearchResult, err error) {
 	ctx, span := n.readSpan(ctx, "node.search", name)
 	defer func() { endSpan(span, err) }()
@@ -147,6 +158,11 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 	if err := n.validQuery(ctx, idx, r); err != nil {
 		return nil, err
 	}
+	resolved, problems := query.Resolve(r.Query, n.now(ctx))
+	if len(problems) > 0 {
+		return nil, api.Invalid("the query is invalid", problems...)
+	}
+	r.Query = resolved
 	r.Index = name
 	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
 	if err != nil {

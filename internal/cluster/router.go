@@ -23,6 +23,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -391,10 +392,15 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 	for i := range docs {
 		wdocs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
 	}
+	var at *int64
+	if now, ok := query.NowFrom(ctx); ok {
+		ms := now.UnixMilli()
+		at = &ms
+	}
 	var reply percolateReply
 	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = percolateReply{}
-		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs}
+		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at}
 		if err := t.n.readCall(ctx, c, peerPrefix+"percolate", msg, &reply); err != nil {
 			return err
 		}

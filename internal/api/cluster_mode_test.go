@@ -23,6 +23,7 @@ func TestSuitesOnSingleNodeCluster(t *testing.T) {
 		{"Bulk", TestBulk, false},
 		{"Search", TestSearch, false},
 		{"SavedQueriesAndPercolate", TestSavedQueriesAndPercolate, false},
+		{"DateMath", TestDateMath, false},
 		{"BulkPercolateMatchesBruteForce", TestBulkPercolateMatchesBruteForce, false},
 		{"FieldsAndCluster", TestFieldsAndCluster, false},
 		{"HostileRequests", TestHostileRequests, false},

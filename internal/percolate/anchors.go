@@ -480,7 +480,9 @@ func newExtractor(stats TermStats) *extractor {
 //   - eq, in: a string is an AtomValue of its normalized text (the _id pseudo-field
 //     included), a bool an AtomBool, a finite number a point Range. An in is the union
 //     of its values.
-//   - lt, lte, gt, gte, between: a Range.
+//   - lt, lte, gt, gte, between: a Range; with date math, whose instant is the
+//     percolation's, AtomPresent (a match has the field), so a saved query's anchors
+//     never hold an instant.
 //   - has, has_any: the union of AtomEntry; has_all: its rarest entry.
 //   - words_any: the union over phrases of each phrase's anchor, the pair of its two
 //     rarest distinct words (one word: that word); words_all: the cheapest phrase's
@@ -631,6 +633,9 @@ func cheapest(sets []aset) aset {
 func (e *extractor) leaf(l *query.Leaf) aset {
 	a := l.Decoded()
 	f := l.Field
+	if l.IsDateMath() {
+		return e.term(AtomPresent, f, "")
+	}
 	switch l.Op {
 	case query.OpEq:
 		return e.eq(f, &a)

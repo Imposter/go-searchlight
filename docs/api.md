@@ -88,7 +88,8 @@ curl -sS -X PUT localhost:8780/indexes/products -H "Authorization: Bearer $TOKEN
   `version`, `created_at`, `mapping`, `settings`, and `docs` and `queries` (the live
   counts searchable on this node). An existing name is a 409 `index_exists`.
 - **Field types.** `keyword`, `text`, `keyword_list`, `number`, `bool` and `date` (Unix
-  milliseconds). The spec's §3 has the operators and aggregations each type supports.
+  milliseconds; a document may give an RFC 3339 string or a bare `YYYY-MM-DD`, midnight
+  UTC). The spec's §3 has the operators and aggregations each type supports.
 - **`dynamic`.**
   - `true`, the default, types a new field from its first value.
   - `false` stores a new field but does not index it.
@@ -222,6 +223,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - Matching is boolean. There is no relevance scoring.
   - Text compares normalized, so `"acme"` matches `"ACME"`. This is byte-for-byte
     compatible with scrape-bot.
+  - [Date math](#date-math) gives a `date` field's ranges relative bounds, such as
+    `"now-7d/d"`.
 - **`sort`** takes field names, `{"field": "asc"|"desc"}` or
   `{"field": {"order": "desc"}}`. `_id` breaks ties.
   - At most 16 keys, each field once.
@@ -327,6 +330,50 @@ while nothing is picked.
 
 `_count` takes `{"query": ...}` and answers `{"count", "relation", "timed_out"}`, counting
 exactly. It refuses any other member, `post_filter` included (400 at its name).
+
+### Date math
+
+On a `date` field, `lt`, `lte`, `gt`, `gte` and each bound of `between` take a number
+(Unix milliseconds) or a string: a date, or Elasticsearch's date math.
+
+```json
+{"all": [
+  {"field": "seen_at", "op": "gte", "value": "now-7d/d"},
+  {"field": "seen_at", "op": "between", "value": ["2026-10-01||+1M", "now"]}
+]}
+```
+
+- **Anchor.** `now`, or a date (RFC 3339, or `YYYY-MM-DD` for midnight UTC) followed by
+  `||`. A date with no `||` is a plain date.
+- **Steps**, any number, applied in order: `+N<unit>` and `-N<unit>` (N defaults to
+  1), and `/<unit>`, which rounds to the unit's start. Units: `y` years, `M` months,
+  `w` weeks (from Monday), `d` days, `h` or `H` hours, `m` minutes, `s` seconds.
+  Months and years keep the day, clamped to the month's last: `2026-01-31||+1M` is
+  2026-02-28.
+- **Rounding by op**, as Elasticsearch's range query rounds:
+
+  | Op | Rounds | `now/d` on 2026-10-16 | Matches |
+  | --- | --- | --- | --- |
+  | `gte`, `between` lo | down | 2026-10-16T00:00:00.000 | from the day's start |
+  | `lt` | down | 2026-10-16T00:00:00.000 | before the day |
+  | `lte`, `between` hi | up | 2026-10-16T23:59:59.999 | through the day's end |
+  | `gt` | up | 2026-10-16T23:59:59.999 | after the day |
+
+  Rounding up also fills what a plain date leaves out: `lte "2026-10-16"` takes in the
+  whole day, and a time with no fraction stands for its second's last millisecond.
+- **Time zone.** UTC. There is no `time_zone` parameter.
+- **`now`** is read once per request, to the millisecond, by the node that takes it.
+  Every shard, on this node or a peer, answers at that instant.
+- **Saved queries** keep the expression: `GET` returns it as written. Each percolation
+  (`_percolate`, `_bulk?percolate=true`) resolves it at its own `now`, so a saved
+  `gte now-7d` stops matching a document once the document is a week old.
+- **Not for `eq`, `ne` or `in`.** Elasticsearch turns date math in a `term` query into a
+  range. Write the range instead: `between ["now/d", "now/d"]` is today.
+- **Validation.** A malformed expression, date math on a field that is not a `date`, or
+  a bound outside the dates a `date` field holds (±8.64e15 ms) is a 400 at the value's
+  `loc` (`query.value`, or `query.value.1` for `between`'s hi). A `between` whose `lo`
+  is past its `hi` is a 400 when neither reads `now`. One that reads `now` matches
+  nothing while it is reversed.
 
 ## Saved queries
 

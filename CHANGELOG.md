@@ -18,6 +18,12 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     bounds and the 65,536-bucket limit apply under them too;
   - `post_filter` on `_search`: the hits, `total`, sort, `search_after` and `next`
     obey it, the aggregations (all but `global`) do not. `_count` refuses it.
+- **Date math** on `date` fields, as Elasticsearch writes it: `lt`, `lte`, `gt`, `gte`
+  and `between` take `now` or a date, then `+N`/`-N` and `/` rounding in `y M w d h H m
+  s` (`{"field": "seen_at", "op": "gte", "value": "now-7d/d"}`), in UTC. Each bound
+  rounds as Elasticsearch's range query rounds it. `now` is one instant per request,
+  read by the coordinating node and used by every shard and peer. A saved query keeps
+  its expression and resolves it at every percolation.
 
 ### Changed
 

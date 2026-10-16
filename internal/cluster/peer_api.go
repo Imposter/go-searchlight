@@ -25,6 +25,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -311,6 +312,9 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	var msg percolateMsg
 	if err := decode(r, &msg); err != nil {
 		return nil, err
+	}
+	if msg.Now != nil {
+		ctx = query.WithNow(ctx, time.UnixMilli(*msg.Now))
 	}
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{}}
 	if len(msg.Mapping) > 0 {

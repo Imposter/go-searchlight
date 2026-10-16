@@ -250,6 +250,9 @@ type percolateMsg struct {
 	shardRef
 	Mapping json.RawMessage `json:"mapping,omitempty"`
 	Docs    []wireDoc       `json:"docs"`
+	// Now is the coordinator's instant for date math, Unix ms (query.WithNow): the
+	// peer resolves at it, never at its own clock. Nil from a peer that sends none.
+	Now *int64 `json:"now,omitempty"`
 }
 
 type wireDoc struct {

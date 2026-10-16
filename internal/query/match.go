@@ -25,7 +25,8 @@ type Compiled struct {
 
 // Compile prepares n for matching. It accepts any tree, valid or not: a condition whose
 // value its op cannot read matches as scrape-bot's matcher does (eq never, ne always), a
-// nil node or an unknown op never matches.
+// nil node or an unknown op never matches. Date math is read only once resolved
+// ([Resolve]): a condition still holding it never matches.
 func Compile(n Node) *Compiled {
 	return &Compiled{root: compileNode(n)}
 }

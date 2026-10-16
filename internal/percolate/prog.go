@@ -36,6 +36,9 @@ import (
 //	             contains*, words*, has*, starts_with
 //	                              texts (count, strings)
 //	             similar          minimum (a float64), keys (count, u64s)
+//	             date             op (a byte: 0 lt, 1 lte, 2 gt, 3 gte, 4 between), then per bound
+//	                              (two for between) a kind byte and a float64 (0) or a string of
+//	                              date math (1), resolved at the percolation's now
 //
 // where a string is a uvarint length and its bytes, and numbers are little-endian. The
 // compiler mirrors [query.Compile] exactly (the same folding of constant conditions,
@@ -71,6 +74,7 @@ const (
 	pSimilar
 	pHas
 	pHasAll
+	pDate
 
 	numProgTags
 )
@@ -182,6 +186,9 @@ func (pc *progCompiler) group(tag byte, nodes []query.Node) pnode {
 func (pc *progCompiler) leaf(l *query.Leaf) pnode {
 	a := l.Decoded()
 	out := pnode{cost: costCompare, field: pc.field(l.Field)}
+	if l.IsDateMath() {
+		return dateLeaf(l.Op, &a, out)
+	}
 	switch l.Op {
 	case query.OpExists:
 		out.tag = pExists
@@ -287,6 +294,42 @@ func (pc *progCompiler) leaf(l *query.Leaf) pnode {
 		out.operands = appendStrs(out.operands, list)
 	default:
 		return progNever
+	}
+	return out
+}
+
+// dateOps are the date leaf's op bytes.
+var dateOps = map[string]byte{query.OpLt: 0, query.OpLte: 1, query.OpGt: 2, query.OpGte: 3, query.OpBetween: 4}
+
+// Date bound kinds.
+const (
+	dateNumber = 0
+	dateMath   = 1
+)
+
+// dateLeaf compiles a condition with date math, which a program keeps as written:
+// each evaluation resolves it at its percolation's now ([query.ResolveDate]), so a
+// saved query's program never holds an instant.
+func dateLeaf(op string, a *query.Arg, out pnode) pnode {
+	bounds := []query.Scalar{a.Scalar}
+	if op == query.OpBetween {
+		if a.Kind != query.ArgList || len(a.List) != 2 {
+			return progNever
+		}
+		bounds = a.List
+	}
+	out.tag, out.cost = pDate, costLookup
+	out.operands = append(out.operands, dateOps[op])
+	for i := range bounds {
+		s := &bounds[i]
+		switch {
+		case s.Kind == query.ArgString:
+			out.operands = appendStr(append(out.operands, dateMath), s.Text)
+		case finite(s):
+			out.operands = appendF64(append(out.operands, dateNumber), s.Number)
+		default:
+			return progNever
+		}
 	}
 	return out
 }
@@ -496,6 +539,8 @@ func (sc *scratch) eval(p []byte) bool {
 		return v.Text != nil && sc.similar(f, *v.Text, p)
 	case pHas, pHasAll:
 		return has(v.Entries, p, tag == pHasAll)
+	case pDate:
+		return v.Number != nil && sc.date(*v.Number, p)
 	case pNonempty:
 		return len(v.Entries) > 0
 	default:
@@ -588,6 +633,52 @@ func (sc *scratch) similar(f int, text string, p []byte) bool {
 		sc.want = append(sc.want, binary.LittleEndian.Uint64(p[8*i:]))
 	}
 	return analysis.SimilarityKeys(sc.simKeys[f], sc.want) >= minimum
+}
+
+// date is a date leaf's verdict on n, its bounds resolved at sc.now; a bound that
+// cannot be resolved holds for nothing, as the matcher reads a resolved tree.
+func (sc *scratch) date(n float64, p []byte) bool {
+	op := p[0]
+	p = p[1:]
+	switch op {
+	case 4:
+		lo, ok := sc.dateBound(p, false)
+		if !ok {
+			return false
+		}
+		hi, ok := sc.dateBound(skipBound(p), true)
+		return ok && lo <= n && n <= hi
+	default:
+		at, ok := sc.dateBound(p, op == 1 || op == 2)
+		switch {
+		case !ok:
+			return false
+		case op == 0:
+			return n < at
+		case op == 1:
+			return n <= at
+		case op == 2:
+			return n > at
+		default:
+			return n >= at
+		}
+	}
+}
+
+func (sc *scratch) dateBound(p []byte, roundUp bool) (float64, bool) {
+	if p[0] == dateNumber {
+		return pf64(p[1:]), true
+	}
+	text, _ := str(p[1:])
+	return query.ResolveDate(&query.Scalar{Kind: query.ArgString, Text: text}, sc.now, roundUp)
+}
+
+func skipBound(p []byte) []byte {
+	if p[0] == dateNumber {
+		return p[9:]
+	}
+	_, rest := str(p[1:])
+	return rest
 }
 
 // ---- validating ----
@@ -703,7 +794,35 @@ func (r *progReader) operands(tag byte) {
 	case pSimilar:
 		r.skip(8)
 		r.skip(8 * r.uvarint())
+	case pDate:
+		r.date()
 	default:
 		r.ok = false
+	}
+}
+
+// date reads a date leaf's operands: its op, then each bound's kind and value.
+func (r *progReader) date() {
+	if !r.ok || len(r.p) == 0 || r.p[0] > 4 {
+		r.ok = false
+		return
+	}
+	bounds := pick(r.p[0] == 4, 2, 1)
+	r.skip(1)
+	for range bounds {
+		if !r.ok || len(r.p) == 0 {
+			r.ok = false
+			return
+		}
+		kind := r.p[0]
+		r.skip(1)
+		switch kind {
+		case dateNumber:
+			r.skip(8)
+		case dateMath:
+			r.skip(r.uvarint())
+		default:
+			r.ok = false
+		}
 	}
 }

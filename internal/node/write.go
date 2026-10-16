@@ -268,7 +268,7 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 			c.IfSeq = store.IfExists
 		}
 	case api.OpQueryUpsert:
-		payload, err := queryPayload(op, m)
+		payload, err := queryPayload(op, m, n.clock.Wall())
 		if err != nil {
 			return prepared{}, m, err
 		}
@@ -285,12 +285,17 @@ func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepD
 	return p, m, nil
 }
 
-// queryPayload checks a saved query (it parses, it is valid against the mapping, the
-// percolator can index it, its meta is an object of at most 16 KiB) and encodes it.
-func queryPayload(op *api.WriteOp, m *schema.Mapping) ([]byte, error) {
+// queryPayload checks a saved query (it parses, it is valid against the mapping, its
+// date math resolves at now, the percolator can index it, its meta is an object of at
+// most 16 KiB) and encodes it as written: its date math resolves anew at every
+// percolation.
+func queryPayload(op *api.WriteOp, m *schema.Mapping, now time.Time) ([]byte, error) {
 	node, problems := query.Parse(op.Query)
 	if len(problems) == 0 {
 		problems = query.Validate(node, m)
+	}
+	if len(problems) == 0 {
+		_, problems = query.Resolve(node, now)
 	}
 	if len(problems) > 0 {
 		return nil, api.Invalid("the saved query is invalid", problems...)
@@ -615,7 +620,10 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 
 // percolateDocs percolates docs against the saved queries of every shard of idx (a
 // saved query lives on the shard its id hashes to), merging each document's matches.
+//
+// Every shard resolves date math at one instant, set here once ([query.WithNow]).
 func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc) ([]percolate.IDs, error) {
+	ctx = query.WithNow(ctx, n.now(ctx))
 	mapping := idx.meta.Load().meta.Mapping
 	perShard := make([][]percolate.IDs, len(ts))
 	for s, t := range ts {

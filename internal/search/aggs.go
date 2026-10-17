@@ -6,6 +6,9 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -627,6 +630,9 @@ type termsColl struct {
 	// counts, read again once the shard knows the buckets it keeps.
 	deferred bool
 	docs     *roaring.Bitmap
+	// pool, for a part of a segment collected apart, lends counts shared with the
+	// segment's other parts (collectChunked).
+	pool *countPool
 	// allow is the filter of include and exclude over the ordinals (or bool keys), or
 	// lazy decides it ordinal by ordinal (few hits over a large dictionary): both nil
 	// without them, and for a number field, whose values are checked directly.
@@ -677,7 +683,11 @@ func (c *termsColl) slot(o uint32) {
 		if c.src.ordinal() {
 			n = c.src.numTerms()
 		}
-		c.counts = make([]int64, n)
+		if c.pool != nil {
+			c.counts = c.pool.get()
+		} else {
+			c.counts = make([]int64, n)
+		}
 		if len(c.spec.subs) > 0 && !c.deferred {
 			c.subs = make([][]collector, n)
 		}
@@ -765,6 +775,12 @@ func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
 
 func (c *termsColl) partial() *AggPartial {
 	p := &AggPartial{Type: AggTerms}
+	if c.pool != nil {
+		if c.counts != nil {
+			c.pool.put(c.counts)
+		}
+		return p
+	}
 	switch {
 	case c.src.kind == srcNumber:
 		for v, b := range c.numbers {
@@ -1276,6 +1292,15 @@ var (
 func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggPartial {
 	first, last := hits.Minimum()/aggChunk, hits.Maximum()/aggChunk
 	chunks := int(last-first) + 1
+	pools := make([]*countPool, len(specs))
+	for j, spec := range specs {
+		if spec.typ != AggTerms {
+			continue
+		}
+		if src := s.source(spec.field, spec.ftype); src.ordinal() && (len(spec.subs) == 0 || deferSubs(spec, src)) {
+			pools[j] = &countPool{n: int(src.numTerms())}
+		}
+	}
 	parts := make([][]*AggPartial, chunks)
 	errs := make([]error, chunks)
 	err := runParallel(chunks, func(c int) {
@@ -1287,7 +1312,9 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggP
 		colls := make([]collector, len(specs))
 		for j, spec := range specs {
 			colls[j] = cs.newCollector(spec, true)
-			deferTo(colls[j], docs)
+			if tc, ok := colls[j].(*termsColl); ok && pools[j] != nil {
+				tc.pool = pools[j]
+			}
 		}
 		cs.collect(docs, colls)
 		if cs.err != nil {
@@ -1311,6 +1338,15 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggP
 	out := make([]*AggPartial, len(specs))
 	for j, spec := range specs {
 		merged := &AggPartial{Type: spec.typ}
+		if pools[j] != nil {
+			op := &ordPartial{seg: s.seg, counts: pools[j].sum()}
+			if op.counts != nil && len(spec.subs) > 0 {
+				op.deferred = &deferredPart{s: s, docs: hits}
+			}
+			merged.ords = []*ordPartial{op}
+			out[j] = merged
+			continue
+		}
 		for c := range parts {
 			if p := parts[c][j]; p.ords != nil {
 				merged.ords = append(merged.ords, p.ords...)
@@ -1319,6 +1355,50 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggP
 			}
 		}
 		out[j] = merged
+	}
+	return out
+}
+
+// countPool lends the parts of one segment collected apart (collectChunked) the
+// count arrays of a terms aggregation by ordinal: one per part collected at once,
+// each counting the parts it is lent to, summed into one once every part is done.
+// Counting needs no atomics and the segment no array per part.
+type countPool struct {
+	n    int
+	mu   sync.Mutex
+	free [][]int64
+	all  [][]int64
+}
+
+func (p *countPool) get() []int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if k := len(p.free); k > 0 {
+		a := p.free[k-1]
+		p.free = p.free[:k-1]
+		return a
+	}
+	a := make([]int64, p.n)
+	p.all = append(p.all, a)
+	return a
+}
+
+func (p *countPool) put(a []int64) {
+	p.mu.Lock()
+	p.free = append(p.free, a)
+	p.mu.Unlock()
+}
+
+// sum adds every array lent into the first and returns it: nil when none was.
+func (p *countPool) sum() []int64 {
+	if len(p.all) == 0 {
+		return nil
+	}
+	out := p.all[0]
+	for _, a := range p.all[1:] {
+		for o, n := range a {
+			out[o] += n
+		}
 	}
 	return out
 }
@@ -1417,17 +1497,15 @@ func mergeBucket(dst, src *BucketPartial, spec *aggSpec) {
 	}
 }
 
-// sortTerms orders terms buckets: most documents first, then by key.
-func sortTerms(bs []*BucketPartial) {
-	slices.SortFunc(bs, func(a, b *BucketPartial) int {
-		if a.DocCount != b.DocCount {
-			if a.DocCount > b.DocCount {
-				return -1
-			}
-			return 1
+// cmpTerms orders terms buckets: most documents first, then by key.
+func cmpTerms(a, b *BucketPartial) int {
+	if a.DocCount != b.DocCount {
+		if a.DocCount > b.DocCount {
+			return -1
 		}
-		return cmpValue(a.Key, b.Key, false)
-	})
+		return 1
+	}
+	return cmpValue(a.Key, b.Key, false)
 }
 
 // cutShard finishes a shard's partial: a terms list sorted and cut to shard_size (with
@@ -1435,7 +1513,7 @@ func sortTerms(bs []*BucketPartial) {
 func cutShard(p *AggPartial, spec *aggSpec) {
 	switch spec.typ {
 	case AggTerms:
-		sortTerms(p.Buckets)
+		topK(p.Buckets, spec.shardSize, cmpTerms)
 		if len(p.Buckets) > spec.shardSize {
 			for _, b := range p.Buckets[spec.shardSize:] {
 				p.OtherDocCount += b.DocCount
@@ -1581,86 +1659,256 @@ type Bucket struct {
 
 // MarshalJSON writes the result in Elasticsearch's shape.
 func (a *AggResult) MarshalJSON() ([]byte, error) {
+	return a.appendJSON(make([]byte, 0, 64))
+}
+
+// appendJSON appends the result's JSON to dst, as encoding/json writes it (members of
+// a bucket in name order, as a map's), without building maps or reflecting.
+func (a *AggResult) appendJSON(dst []byte) ([]byte, error) {
 	switch a.Type {
 	case AggStats:
-		return json.Marshal(struct {
-			Count int64    `json:"count"`
-			Min   *float64 `json:"min"`
-			Max   *float64 `json:"max"`
-			Avg   *float64 `json:"avg"`
-			Sum   float64  `json:"sum"`
-		}{a.Count, a.Min, a.Max, a.Avg, a.Sum})
+		dst = strconv.AppendInt(append(dst, `{"count":`...), a.Count, 10)
+		dst = appendJSONNumber(append(dst, `,"min":`...), a.Min)
+		dst = appendJSONNumber(append(dst, `,"max":`...), a.Max)
+		dst = appendJSONNumber(append(dst, `,"avg":`...), a.Avg)
+		dst = appendJSONFloat(append(dst, `,"sum":`...), a.Sum)
+		return append(dst, '}'), nil
 	case AggCardinality:
-		return json.Marshal(struct {
-			Value int64 `json:"value"`
-		}{a.Value})
+		return append(strconv.AppendInt(append(dst, `{"value":`...), a.Value, 10), '}'), nil
 	case AggMin, AggMax:
-		return json.Marshal(struct {
-			Value *float64 `json:"value"`
-		}{a.Number})
+		return append(appendJSONNumber(append(dst, `{"value":`...), a.Number), '}'), nil
 	case AggFilter, AggGlobal:
-		return json.Marshal(inlineBucket(a.DocCount, a.Aggs))
+		return appendInlineBucket(dst, a.DocCount, a.Aggs)
 	case AggFilters:
-		keyed := make(map[string]map[string]any, len(a.Buckets))
-		for _, b := range a.Buckets {
-			key, _ := b.Key.(string)
-			keyed[key] = inlineBucket(b.DocCount, b.Aggs)
+		bs := slices.Clone(a.Buckets)
+		key := func(b *Bucket) string { k, _ := b.Key.(string); return k }
+		slices.SortStableFunc(bs, func(x, y *Bucket) int { return strings.Compare(key(x), key(y)) })
+		dst = append(dst, `{"buckets":{`...)
+		for i, b := range bs {
+			if i > 0 && key(b) == key(bs[i-1]) {
+				continue // a map keeps one bucket of a key
+			}
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			var err error
+			if dst, err = appendJSONString(dst, key(b)); err != nil {
+				return nil, err
+			}
+			if dst, err = appendInlineBucket(append(dst, ':'), b.DocCount, b.Aggs); err != nil {
+				return nil, err
+			}
 		}
-		return json.Marshal(struct {
-			Buckets map[string]map[string]any `json:"buckets"`
-		}{keyed})
-	case AggTerms:
-		return json.Marshal(struct {
-			Error     int64     `json:"doc_count_error_upper_bound"`
-			Other     int64     `json:"sum_other_doc_count"`
-			Buckets   []*Bucket `json:"buckets"`
-			Truncated bool      `json:"truncated,omitempty"`
-		}{a.DocCountErrorUpperBound, a.SumOtherDocCount, nonNil(a.Buckets), a.Truncated})
-	default:
-		return json.Marshal(struct {
-			Buckets   []*Bucket `json:"buckets"`
-			Truncated bool      `json:"truncated,omitempty"`
-		}{nonNil(a.Buckets), a.Truncated})
+		return append(dst, "}}"...), nil
 	}
+	if a.Type == AggTerms {
+		dst = strconv.AppendInt(append(dst, `{"doc_count_error_upper_bound":`...), a.DocCountErrorUpperBound, 10)
+		dst = strconv.AppendInt(append(dst, `,"sum_other_doc_count":`...), a.SumOtherDocCount, 10)
+		dst = append(dst, `,"buckets":[`...)
+	} else {
+		dst = append(dst, `{"buckets":[`...)
+	}
+	for i, b := range a.Buckets {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		var err error
+		if dst, err = b.appendJSON(dst); err != nil {
+			return nil, err
+		}
+	}
+	dst = append(dst, ']')
+	if a.Truncated {
+		dst = append(dst, `,"truncated":true`...)
+	}
+	return append(dst, '}'), nil
 }
 
-func nonNil(bs []*Bucket) []*Bucket {
-	if bs == nil {
-		return []*Bucket{}
+// appendInlineBucket appends a filter, filters or global bucket as Elasticsearch writes
+// it: its doc_count, and the aggregations under it inline, by name, in name order.
+func appendInlineBucket(dst []byte, docCount int64, aggs map[string]*AggResult) ([]byte, error) {
+	names := make([]string, 0, len(aggs)+1)
+	for name := range aggs {
+		if name != "doc_count" {
+			names = append(names, name)
+		}
 	}
-	return bs
-}
-
-// inlineBucket is a filter, filters or global bucket as Elasticsearch writes it: its
-// doc_count, and the aggregations under it inline, by name.
-func inlineBucket(docCount int64, aggs map[string]*AggResult) map[string]any {
-	m := make(map[string]any, 1+len(aggs))
-	for name, sub := range aggs {
-		m[name] = sub
+	names = append(names, "doc_count")
+	slices.Sort(names)
+	dst = append(dst, '{')
+	for i, name := range names {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		var err error
+		if dst, err = appendJSONString(dst, name); err != nil {
+			return nil, err
+		}
+		dst = append(dst, ':')
+		if name == "doc_count" {
+			dst = strconv.AppendInt(dst, docCount, 10)
+		} else if dst, err = appendJSONAgg(dst, aggs[name]); err != nil {
+			return nil, err
+		}
 	}
-	m["doc_count"] = docCount
-	return m
+	return append(dst, '}'), nil
 }
 
 // MarshalJSON writes the bucket with its sub-aggregations inline, by name.
 func (b *Bucket) MarshalJSON() ([]byte, error) {
-	m := make(map[string]any, 6+len(b.Aggs))
-	for name, sub := range b.Aggs {
-		m[name] = sub
+	return b.appendJSON(make([]byte, 0, 64))
+}
+
+// bucketMembers are a bucket's own members, in name order.
+var bucketMembers = []string{"doc_count", "doc_count_error_upper_bound", "from", "key", "key_as_string", "to"}
+
+// appendJSON appends the bucket's JSON to dst: its members and its sub-aggregations
+// together in name order, as encoding/json writes a map, without building one.
+func (b *Bucket) appendJSON(dst []byte) ([]byte, error) {
+	names := make([]string, 0, len(b.Aggs))
+	for name := range b.Aggs {
+		if !slices.Contains(bucketMembers, name) {
+			names = append(names, name)
+		}
 	}
-	m["key"] = b.Key
-	if b.KeyAsString != "" {
-		m["key_as_string"] = b.KeyAsString
+	slices.Sort(names)
+	dst = append(dst, '{')
+	first := true
+	member := func(name string) {
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = append(append(append(dst, '"'), name...), `":`...)
 	}
-	if b.From != nil {
-		m["from"] = *b.From
+	var err error
+	write := func(name string) {
+		if err != nil {
+			return
+		}
+		switch name {
+		case "doc_count":
+			member(name)
+			dst = strconv.AppendInt(dst, b.DocCount, 10)
+		case "doc_count_error_upper_bound":
+			if b.DocCountErrorUpperBound != 0 {
+				member(name)
+				dst = strconv.AppendInt(dst, b.DocCountErrorUpperBound, 10)
+			}
+		case "from":
+			if b.From != nil {
+				member(name)
+				dst = appendJSONFloat(dst, *b.From)
+			}
+		case "key":
+			member(name)
+			dst, err = appendJSONValue(dst, b.Key)
+		case "key_as_string":
+			if b.KeyAsString != "" {
+				member(name)
+				dst, err = appendJSONString(dst, b.KeyAsString)
+			}
+		case "to":
+			if b.To != nil {
+				member(name)
+				dst = appendJSONFloat(dst, *b.To)
+			}
+		}
 	}
-	if b.To != nil {
-		m["to"] = *b.To
+	// Merge the members and the sub-aggregations' names, both sorted.
+	i := 0
+	for _, m := range bucketMembers {
+		for ; i < len(names) && names[i] < m && err == nil; i++ {
+			if !first {
+				dst = append(dst, ',')
+			}
+			first = false
+			if dst, err = appendJSONString(dst, names[i]); err == nil {
+				dst, err = appendJSONAgg(append(dst, ':'), b.Aggs[names[i]])
+			}
+		}
+		write(m)
 	}
-	m["doc_count"] = b.DocCount
-	if b.DocCountErrorUpperBound != 0 {
-		m["doc_count_error_upper_bound"] = b.DocCountErrorUpperBound
+	for ; i < len(names) && err == nil; i++ {
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		if dst, err = appendJSONString(dst, names[i]); err == nil {
+			dst, err = appendJSONAgg(append(dst, ':'), b.Aggs[names[i]])
+		}
 	}
-	return json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, '}'), nil
+}
+
+// appendJSONAgg appends a sub-aggregation's result, null for none.
+func appendJSONAgg(dst []byte, a *AggResult) ([]byte, error) {
+	if a == nil {
+		return append(dst, "null"...), nil
+	}
+	return a.appendJSON(dst)
+}
+
+// appendJSONValue appends a bucket key: a string, float64 or bool as encoding/json
+// writes it, anything else through it.
+func appendJSONValue(dst []byte, v any) ([]byte, error) {
+	switch v := v.(type) {
+	case string:
+		return appendJSONString(dst, v)
+	case float64:
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			break
+		}
+		return appendJSONFloat(dst, v), nil
+	case bool:
+		return strconv.AppendBool(dst, v), nil
+	case nil:
+		return append(dst, "null"...), nil
+	}
+	raw, err := json.Marshal(v)
+	return append(dst, raw...), err
+}
+
+// appendJSONString appends s quoted as encoding/json quotes it: printable ASCII other
+// than " \ < > & as it is, anything else through encoding/json.
+func appendJSONString(dst []byte, s string) ([]byte, error) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			raw, err := json.Marshal(s)
+			return append(dst, raw...), err
+		}
+	}
+	return append(append(append(dst, '"'), s...), '"'), nil
+}
+
+// appendJSONNumber appends *f, or null for nil.
+func appendJSONNumber(dst []byte, f *float64) []byte {
+	if f == nil {
+		return append(dst, "null"...)
+	}
+	return appendJSONFloat(dst, *f)
+}
+
+// appendJSONFloat appends a finite f as encoding/json writes a float64: positional
+// between 1e-6 and 1e21, else with an exponent of at least two digits' worth.
+func appendJSONFloat(dst []byte, f float64) []byte {
+	if f == math.Trunc(f) && math.Abs(f) < 1e15 && !(f == 0 && math.Signbit(f)) {
+		return strconv.AppendInt(dst, int64(f), 10) // as 'f' writes it, without the search for digits
+	}
+	format := byte('f')
+	if abs := math.Abs(f); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	dst = strconv.AppendFloat(dst, f, format, -1, 64)
+	if format == 'e' {
+		// e-09 is e-9, as encoding/json cleans it up.
+		if n := len(dst); n >= 4 && dst[n-4] == 'e' && dst[n-3] == '-' && dst[n-2] == '0' {
+			dst[n-2] = dst[n-1]
+			dst = dst[:n-1]
+		}
+	}
+	return dst
 }

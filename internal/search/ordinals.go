@@ -427,7 +427,7 @@ func finishTerms(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.G
 			kept = append(kept, uint32(gl))
 		}
 	}
-	slices.SortFunc(kept, func(a, b uint32) int {
+	topK(kept, spec.shardSize, func(a, b uint32) int {
 		if counts[a] != counts[b] {
 			if counts[a] > counts[b] {
 				return -1
@@ -556,10 +556,8 @@ func keptSubs(buckets []*BucketPartial, parts []*ordPartial, sels [][]int32, spe
 		if p.deferred != nil {
 			if err == nil {
 				for _, stretch := range replayed[i] {
-					for b, cs := range stretch {
-						if cs != nil {
-							mergeSubs(buckets[b].Aggs, spec, cs)
-						}
+					for j, sub := range spec.subs {
+						stretch[j].mergeInto(buckets, sub)
 					}
 				}
 			}
@@ -578,9 +576,8 @@ func keptSubs(buckets []*BucketPartial, parts []*ordPartial, sels [][]int32, spe
 
 // replay reads the deferred parts' documents again, in stretches on the search pool
 // (stretches), collecting spec's sub-aggregations for the ordinals sels keeps: per
-// part, per stretch in document order, each bucket's collectors (nil for a bucket
-// without documents there).
-func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([][][][]collector, error) {
+// part, per stretch in document order, each sub-aggregation's metrics by bucket.
+func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([][][]bucketMetrics, error) {
 	type task struct {
 		part int
 		docs *roaring.Bitmap
@@ -594,11 +591,11 @@ func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([]
 			tasks = append(tasks, task{part: i, docs: docs})
 		}
 	}
-	out := make([][][][]collector, len(parts))
+	out := make([][][]bucketMetrics, len(parts))
 	if len(tasks) == 0 {
 		return out, nil
 	}
-	got := make([][][]collector, len(tasks))
+	got := make([][]bucketMetrics, len(tasks))
 	errs := make([]error, len(tasks))
 	err := runParallel(len(tasks), func(k int) {
 		t := tasks[k]
@@ -619,38 +616,136 @@ func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([]
 }
 
 // replaySubs collects spec's sub-aggregations over docs for the ordinals sel keeps:
-// each kept bucket's collectors, made on its first document.
-func (s *segExec) replaySubs(spec *aggSpec, docs *roaring.Bitmap, sel []int32, buckets int) [][]collector {
+// one bucketMetrics per sub-aggregation, each document given the kept buckets of its
+// values at once.
+func (s *segExec) replaySubs(spec *aggSpec, docs *roaring.Bitmap, sel []int32, buckets int) []bucketMetrics {
 	src := s.source(spec.field, spec.ftype)
-	out := make([][]collector, buckets)
-	add := func(o, d uint32) {
-		if b := sel[o]; b >= 0 {
-			if out[b] == nil {
-				out[b] = s.newSubs(spec)
-			}
-			collectSubs(out[b], d)
-		}
+	ms := make([]bucketMetrics, len(spec.subs))
+	for j, sub := range spec.subs {
+		ms[j] = s.newBucketMetrics(sub, buckets)
 	}
 	it := docs.ManyIterator()
 	buf := make([]uint32, 512)
 	var ords []uint32
+	var bs []int32
 	for {
 		n := it.NextMany(buf)
 		if n == 0 || s.checkCtx() {
-			return out
+			return ms
 		}
 		for _, d := range buf[:n] {
+			bs = bs[:0]
 			switch src.kind {
 			case srcKeyword:
-				if o, ok := src.kc.Ord(d); ok {
-					add(o, d)
+				if o, ok := src.kc.Ord(d); ok && sel[o] >= 0 {
+					bs = append(bs, sel[o])
 				}
 			case srcList:
 				ords = src.mc.Ords(d, ords[:0])
 				for _, o := range ords {
-					add(o, d)
+					if b := sel[o]; b >= 0 {
+						bs = append(bs, b)
+					}
 				}
 			}
+			if len(bs) > 0 {
+				for _, m := range ms {
+					m.collect(bs, d)
+				}
+			}
+		}
+	}
+}
+
+// bucketMetrics collects one metric sub-aggregation for every kept bucket of a terms
+// aggregation at once: in arrays by bucket for stats, min and max (a document's value
+// read once for all its buckets), in a collector per bucket otherwise.
+type bucketMetrics interface {
+	// collect adds document d to buckets bs.
+	collect(bs []int32, d uint32)
+	// mergeInto merges each bucket's metric into the bucket's partial of sub.
+	mergeInto(buckets []*BucketPartial, sub *aggSpec)
+}
+
+func (s *segExec) newBucketMetrics(sub *aggSpec, buckets int) bucketMetrics {
+	src := s.source(sub.field, sub.ftype)
+	switch sub.typ {
+	case AggStats:
+		return &statsBuckets{src: src, st: make([]StatsPartial, buckets)}
+	case AggMin, AggMax:
+		return &extremeBuckets{src: src, max: sub.typ == AggMax, v: make([]float64, buckets), has: make([]bool, buckets)}
+	}
+	return &collBuckets{s: s, sub: sub, colls: make([]collector, buckets)}
+}
+
+type statsBuckets struct {
+	src *fieldSrc
+	st  []StatsPartial
+}
+
+func (m *statsBuckets) collect(bs []int32, d uint32) {
+	if v, ok := m.src.number(d); ok {
+		for _, b := range bs {
+			m.st[b].add(v)
+		}
+	}
+}
+
+func (m *statsBuckets) mergeInto(buckets []*BucketPartial, sub *aggSpec) {
+	for b := range m.st {
+		if m.st[b].Count > 0 {
+			buckets[b].Aggs[sub.name].Stats.merge(&m.st[b])
+		}
+	}
+}
+
+type extremeBuckets struct {
+	src *fieldSrc
+	max bool
+	v   []float64
+	has []bool
+}
+
+func (m *extremeBuckets) collect(bs []int32, d uint32) {
+	v, ok := m.src.number(d)
+	if !ok {
+		return
+	}
+	v = positiveZero(v)
+	for _, b := range bs {
+		if !m.has[b] || (m.max && v > m.v[b]) || (!m.max && v < m.v[b]) {
+			m.v[b], m.has[b] = v, true
+		}
+	}
+}
+
+func (m *extremeBuckets) mergeInto(buckets []*BucketPartial, sub *aggSpec) {
+	for b, ok := range m.has {
+		if ok {
+			mergeExtreme(&buckets[b].Aggs[sub.name].Value, &m.v[b], m.max)
+		}
+	}
+}
+
+type collBuckets struct {
+	s     *segExec
+	sub   *aggSpec
+	colls []collector
+}
+
+func (m *collBuckets) collect(bs []int32, d uint32) {
+	for _, b := range bs {
+		if m.colls[b] == nil {
+			m.colls[b] = m.s.newCollector(m.sub, false)
+		}
+		m.colls[b].collect(d)
+	}
+}
+
+func (m *collBuckets) mergeInto(buckets []*BucketPartial, sub *aggSpec) {
+	for b, c := range m.colls {
+		if c != nil {
+			mergePartial(buckets[b].Aggs[sub.name], c.partial(), sub)
 		}
 	}
 }

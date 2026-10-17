@@ -163,9 +163,17 @@ func listQuery() query.Node {
 }
 
 // BenchmarkTermsList: the top 100 items (shard_size 5,000) of most of the index, alone
-// and with a metric sub-aggregation on the snapshot.
+// and with a metric sub-aggregation on the snapshot; and of 6 sources (sparse: under
+// half of each segment, collected in parts rather than from the dictionary).
 func BenchmarkTermsList(b *testing.B) {
 	s := openListBench(b)
+	b.Run("sparse", func(b *testing.B) {
+		runBenchOn(b, s, func(_ *rand.Rand) *Request {
+			return &Request{Query: leaf("source", query.OpIn, listSources()[:6]), Aggs: map[string]Agg{
+				"items": {Type: AggTerms, Field: "items", Size: 100, ShardSize: 5000},
+			}}
+		})
+	})
 	for _, tc := range []struct {
 		name, mode string
 		subs       map[string]Agg

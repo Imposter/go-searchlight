@@ -25,8 +25,20 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   Breadth first counts the values, makes each shard's `shard_size` cut, then reads
   the hits again for the sub-aggregations of the values kept alone. Unset, a segment
   whose field holds more distinct values than `shard_size` collects breadth first;
-  results are the same either way. A `terms` over a field of 150,000 values with a
-  `stats` sub-aggregation, over a million documents, went from 190 ms to 57 ms.
+  results are the same either way.
+
+### Changed
+
+- **Faster `terms` over many values.** A shard keeps its `shard_size` best terms by
+  selection rather than a sort of every term (the reduce its `size` likewise); the
+  parts of a large segment collected apart share count arrays, one per part counted
+  at once, rather than one per part; breadth-first sub-aggregations collect stats,
+  `min` and `max` into arrays by bucket, each hit's value read once; the reduce copies
+  a shard's bucket only when another shard returns its term too; and buckets are
+  written as JSON without building a map per bucket. Over a million documents and
+  150,000 distinct list values: the top 100 terms of 95% of the index from 23 to 10
+  ms, of 45% from 35 to 15 ms, and with a `stats` sub-aggregation (breadth first)
+  from 190 to 22 ms.
 
 ### Upgrading
 

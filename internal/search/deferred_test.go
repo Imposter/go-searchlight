@@ -236,3 +236,31 @@ func TestCardinalityThreshold(t *testing.T) {
 		}
 	}
 }
+
+// TestReduceKeepsShardResults: the reduce reads the shards' results without changing
+// them, so reducing them again (a cached shard result, say) answers the same.
+func TestReduceKeepsShardResults(t *testing.T) {
+	c := newCluster(t, 3)
+	for i := range 200 {
+		c.upsert(fmt.Sprintf("d%03d", i), fmt.Sprintf(`{"brand":"b%d","tags":["t%d","t%d"],"price":%d}`, i%7, i%5, i%11, i))
+	}
+	c.refreshAll()
+	r := &Request{Query: &query.All{}, Aggs: map[string]Agg{
+		"t": {Type: AggTerms, Field: "tags", Size: 4, Aggs: map[string]Agg{"s": {Type: AggStats, Field: "price"}, "n": {Type: AggCardinality, Field: "brand"}}},
+		"f": {Type: AggFilter, Filter: &query.All{}, Aggs: map[string]Agg{"b": {Type: AggTerms, Field: "brand", Aggs: map[string]Agg{"lo": {Type: AggMin, Field: "price"}}}}},
+	}}
+	var parts []*ShardResult
+	for _, s := range c.shards {
+		g := s.Acquire()
+		res, err := ExecuteShard(t.Context(), g, r)
+		g.Release()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts = append(parts, res)
+	}
+	first := string(mustJSON(Reduce(t.Context(), parts, r).Aggs))
+	if again := string(mustJSON(Reduce(t.Context(), parts, r).Aggs)); again != first {
+		t.Fatalf("reduced again:\n%s\nfirst:\n%s", again, first)
+	}
+}

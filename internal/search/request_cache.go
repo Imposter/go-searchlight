@@ -744,8 +744,8 @@ func partialsBytes(m map[string]*AggPartial) int64 {
 
 // partialBytes estimates one partial: its fixed part, buckets with their keys and
 // sub-aggregations, stats, sketch, a min or max value, and a thresholded
-// cardinality's distinct hashes (up to MaxThreshold, 8 bytes each). A field added to AggPartial that holds memory
-// belongs here.
+// cardinality's distinct hashes (up to MaxThreshold, 8 bytes each). A field added
+// to AggPartial that holds memory belongs here.
 func partialBytes(p *AggPartial) int64 {
 	n := int64(112)
 	for _, b := range p.Buckets {
@@ -879,15 +879,30 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 				return fmt.Errorf("%w: aggregation %q's sketch", errBadCachedResult, name)
 			}
 		}
+		if st := p.Stats; st != nil && (st.Count < 0 || (st.Count > 0 && st.Min > st.Max)) {
+			return fmt.Errorf("%w: aggregation %q's stats", errBadCachedResult, name)
+		}
+		if a.Type == AggRange && p.Buckets != nil && len(p.Buckets) != len(a.Ranges) {
+			return fmt.Errorf("%w: aggregation %q has %d range buckets, the request %d", errBadCachedResult, name, len(p.Buckets), len(a.Ranges))
+		}
+		keys := make(map[any]struct{}, len(p.Buckets))
 		for _, b := range p.Buckets {
 			if b == nil || b.DocCount < 0 {
 				return fmt.Errorf("%w: aggregation %q's buckets", errBadCachedResult, name)
 			}
 			switch b.Key.(type) {
-			case nil, string, float64, bool:
+			case float64:
+			case nil, string, bool:
+				if a.Type == AggHistogram || a.Type == AggDateHistogram || a.Type == AggRange {
+					return fmt.Errorf("%w: aggregation %q's bucket key is not a number", errBadCachedResult, name)
+				}
 			default:
 				return fmt.Errorf("%w: aggregation %q's bucket key", errBadCachedResult, name)
 			}
+			if _, dup := keys[b.Key]; dup {
+				return fmt.Errorf("%w: aggregation %q holds bucket %v twice", errBadCachedResult, name, b.Key)
+			}
+			keys[b.Key] = struct{}{}
 			if err := validPartials(b.Aggs, a.Aggs, depth+1); err != nil {
 				return err
 			}

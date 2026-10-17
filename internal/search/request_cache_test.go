@@ -921,3 +921,94 @@ func TestCachedResultDecodeChecksNewPartials(t *testing.T) {
 		t.Error("a terms partial with a value decoded")
 	}
 }
+
+// TestRequestCacheStoresNoCutOrFailedResult: a shard result the merge cut short
+// (a breadth-first replay past the deadline: TimedOut) or that failed (a replay that
+// panics: an error) is stored neither in memory nor in the store, and the next
+// identical search computes again.
+func TestRequestCacheStoresNoCutOrFailedResult(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(300)
+	st := newMemStore()
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent, Logger: quiet})
+	const body = `{"size":0,%s"aggs":{"t":{"terms":{"field":"tags","size":3,"collect_mode":"breadth_first"},"aggs":{"s":{"stats":{"field":"price"}}}}}}`
+	req := func(timeout string) *Request { return parseReq(t, fmt.Sprintf(body, timeout)) }
+	var replays atomic.Int32
+	defer func() { replayHook = nil }()
+	nothingStored := func(what string) {
+		t.Helper()
+		c.writes.Wait()
+		if got := c.Stats(); got.Entries != 0 || st.writes.Load() != 0 {
+			t.Fatalf("%s: stats %v, %d store writes: a result was stored", what, got, st.writes.Load())
+		}
+	}
+
+	replayHook = func(ctx context.Context, _ []*ordPartial) {
+		replays.Add(1)
+		<-ctx.Done()
+	}
+	if res := s.search(c, req(`"timeout":"300ms",`)); !res.TimedOut {
+		t.Fatal("the cut replay did not time the shard out")
+	}
+	nothingStored("a cut merge")
+
+	replayHook = func(_ context.Context, parts []*ordPartial) {
+		replays.Add(1)
+		for _, p := range parts {
+			if p.deferred != nil {
+				p.deferred.s = &segExec{ctx: t.Context()} // no reader: the replay panics
+			}
+		}
+	}
+	g := s.s.Acquire()
+	_, err := c.Search(context.Background(), g, req(""))
+	g.Release()
+	if err == nil || isCtxErr(err) {
+		t.Fatalf("a failed replay answered %v; want the shard's failure", err)
+	}
+	nothingStored("a failed replay")
+	if replays.Load() != 2 {
+		t.Fatalf("%d replays: the searches did not take the breadth-first path", replays.Load())
+	}
+
+	replayHook = nil
+	misses := c.Stats().Misses
+	res := s.search(c, req(""))
+	c.writes.Wait()
+	if got := c.Stats(); res.TimedOut || len(res.Aggs["t"].Buckets) == 0 || got.Misses != misses+1 || got.Entries != 1 || st.writes.Load() != 1 {
+		t.Fatalf("the next search: timed out %v, stats %v, %d store writes; want it computed and stored", res.TimedOut, got, st.writes.Load())
+	}
+}
+
+// TestCachedResultDecodeRefusesImpossibleBuckets: a value no shard computes (a
+// bucket twice, stats out of order, a range partial of another length, a histogram
+// key that is no number) decodes to an error.
+func TestCachedResultDecodeRefusesImpossibleBuckets(t *testing.T) {
+	req := parseReq(t, `{"size":0,"aggs":{"b":{"terms":{"field":"brand"}},"p":{"stats":{"field":"price"}},
+		"r":{"range":{"field":"price","ranges":[{"to":50},{"from":50}]}},"h":{"histogram":{"field":"price","interval":10}}}}`)
+	ok := `{"total":3,"total_relation":"eq","aggs":{` +
+		`"b":{"type":"terms","buckets":[{"key":"x","doc_count":2},{"key":"y","doc_count":1}]},` +
+		`"p":{"type":"stats","stats":{"count":3,"sum":6,"min":1,"max":3}},` +
+		`"r":{"type":"range","buckets":[{"key":0,"doc_count":1},{"key":1,"doc_count":2}]},` +
+		`"h":{"type":"histogram","buckets":[{"key":0,"doc_count":3}]}}}`
+	if _, err := decodeCachedResult(encodeJSONValue(t, ok), 4096, req); err != nil {
+		t.Fatalf("a valid value: %v", err)
+	}
+	for name, js := range map[string]string{
+		"duplicate term":     strings.Replace(ok, `{"key":"y","doc_count":1}`, `{"key":"x","doc_count":1}`, 1),
+		"negative count":     strings.Replace(ok, `"count":3`, `"count":-3`, 1),
+		"min past max":       strings.Replace(ok, `"min":1,"max":3`, `"min":4,"max":3`, 1),
+		"a range short":      strings.Replace(ok, `[{"key":0,"doc_count":1},{"key":1,"doc_count":2}]`, `[{"key":0,"doc_count":1}]`, 1),
+		"a range more":       strings.Replace(ok, `{"key":1,"doc_count":2}]`, `{"key":1,"doc_count":2},{"key":2,"doc_count":0}]`, 1),
+		"duplicate range":    strings.Replace(ok, `{"key":1,"doc_count":2}`, `{"key":0,"doc_count":2}`, 1),
+		"histogram text key": strings.Replace(ok, `{"key":0,"doc_count":3}`, `{"key":"zero","doc_count":3}`, 1),
+	} {
+		if res, err := decodeCachedResult(encodeJSONValue(t, js), 4096, req); err == nil {
+			t.Errorf("%s: decoded %+v", name, res)
+		}
+	}
+	empty := `{"total":0,"total_relation":"eq","aggs":{"p":{"type":"stats","stats":{"count":0,"sum":0,"min":9,"max":1}}}}`
+	if _, err := decodeCachedResult(encodeJSONValue(t, empty), 4096, req); err != nil {
+		t.Fatalf("empty stats, whose min and max mean nothing: %v", err)
+	}
+}

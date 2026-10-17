@@ -69,6 +69,18 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   ms, of 45% from 35 to 15 ms, and with a `stats` sub-aggregation (breadth first)
   from 190 to 22 ms.
 
+### Fixed
+
+- **A histogram's empty buckets past 2^53 no longer hang the search.** Filling in a
+  `histogram` or fixed-interval `date_histogram` with `min_doc_count` 0 (the default)
+  counted bucket indices in a float64, which stops advancing past 2^53: buckets at
+  1e16 with an interval of 1 kept a reduce goroutine appending forever. Indices past
+  2^53 or not finite (a huge value over a tiny interval), and neighbouring keys that
+  round together (an offset huge beside the interval), now leave the histogram
+  sparse and `"truncated": true`, as one whose empty buckets pass the response's
+  65,536; a recomputed grid that starts or ends off the real buckets leaves it as it
+  is. Other histograms are filled as before.
+
 ### Upgrading
 
 - A search with a `min` or `max` aggregation, or a cardinality `threshold` (search

@@ -417,11 +417,19 @@ func fillBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
 	}
 }
 
+// maxExactIndex is the greatest bucket index (a count of intervals from offset) a
+// float64 holds together with its neighbours: past 2^53, j+1 rounds back to j, so
+// there the empty buckets between two real ones cannot be keyed.
+const maxExactIndex = 1 << 53
+
 // fillHistogram adds res's empty buckets between its first and its last (min_doc_count
 // 0, Elasticsearch's default), when there are at most room of them, and returns how
-// many it added. When there are more, res stays sparse and is marked Truncated. A real
-// bucket's key off the grid (float rounding) leaves res as it is rather than lose that
-// bucket.
+// many it added. When there are more, or their indices pass maxExactIndex or are not
+// finite (a huge key over a tiny interval), or neighbouring keys round to one float64
+// (an offset huge beside the interval), res stays sparse and is marked Truncated. A
+// real bucket's key off the grid (float rounding), or a grid that starts or ends off
+// the real first or last, leaves res as it is rather than lose that bucket or add one
+// outside them.
 func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 	first, ok1 := res.Buckets[0].Key.(float64)
 	last, ok2 := res.Buckets[len(res.Buckets)-1].Key.(float64)
@@ -433,12 +441,22 @@ func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 	if spec.calendar == "" {
 		j0 := math.Round((first - spec.offset) / spec.interval)
 		j1 := math.Round((last - spec.offset) / spec.interval)
-		if j1-j0+1 > float64(most) {
+		if !(math.Abs(j0) <= maxExactIndex && math.Abs(j1) <= maxExactIndex && j1-j0+1 <= float64(most)) {
 			res.Truncated = true
 			return 0
 		}
-		for j := j0; j <= j1; j++ {
-			keys = append(keys, j*spec.interval+spec.offset)
+		n := int(j1-j0) + 1
+		keys = make([]float64, 0, max(n, 0))
+		for i := range n {
+			k := (j0+float64(i))*spec.interval + spec.offset
+			if i > 0 && !(k > keys[i-1]) {
+				res.Truncated = true // an offset too large for the interval rounds neighbours together
+				return 0
+			}
+			keys = append(keys, k)
+		}
+		if len(keys) == 0 || keys[0] != first || keys[len(keys)-1] != last {
+			return 0 // the grid, recomputed, rounds off the real buckets' keys
 		}
 	} else {
 		t := time.UnixMilli(int64(first - spec.offset)).UTC()

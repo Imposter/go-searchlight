@@ -264,6 +264,7 @@ func TestDateMathSurvivesAPeerRetry(t *testing.T) {
 	if lacking < 0 {
 		t.Fatal("every node hosts every shard")
 	}
+	waitRoutes(t, nodes[coord], "pr", 4, 2, time.Minute)
 	at := walls[coord]
 	const window = `{"field": "seen", "op": "between", "value": ["now-1d", "now+1d"]}`
 	var ops []api.WriteOp
@@ -479,6 +480,7 @@ func TestDatePercolationMovesPastAnOlderCopy(t *testing.T) {
 	}
 	waitCopies(t, old.st, "mx", 4, 2, time.Minute)
 	coord, _ := lacking(t, []*tnode{b, d}, "mx")
+	waitRoutes(t, coord, "mx", 4, 2, time.Minute)
 	tap.mu.Lock()
 	tap.refuseGet = map[string]bool{}
 	for _, tn := range []*tnode{b, d} {

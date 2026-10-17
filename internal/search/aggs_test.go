@@ -107,6 +107,9 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 			}
 		}
 		res.Value = int64(len(seen))
+		if spec.threshold > 0 {
+			res.Value = min(res.Value, int64(spec.threshold))
+		}
 	case AggTerms:
 		in := map[any][]*schema.Doc{}
 		var total int64
@@ -338,7 +341,11 @@ func randomAgg(rng *rand.Rand) Agg {
 		case 1:
 			return Agg{Type: pick(rng, []string{AggMin, AggMax}), Field: pick(rng, []string{"price", "created", "nope"})}
 		}
-		return Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		a := Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		if rng.IntN(2) == 0 {
+			a.Threshold = pick(rng, []int{1, 2, 3, 7, 40, 1000})
+		}
+		return a
 	}
 	var a Agg
 	switch rng.IntN(7) {

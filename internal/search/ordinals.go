@@ -699,7 +699,7 @@ func finishCardinality(dst *AggPartial, parts []*ordPartial, spec *aggSpec, ords
 		}
 	}
 	slices.Sort(hashes)
-	mergePartial(dst, &AggPartial{Type: AggCardinality, Sketch: sketchOf(spec.precision, slices.Compact(hashes))}, spec)
+	mergePartial(dst, distinctPartial(spec, slices.Compact(hashes)), spec)
 }
 
 // finishCardinalityByKey merges the segments' seen ordinals into dst's sketch by
@@ -719,7 +719,7 @@ func finishCardinalityByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec,
 		}
 	}
 	slices.Sort(hashes)
-	mergePartial(dst, &AggPartial{Type: AggCardinality, Sketch: sketchOf(spec.precision, slices.Compact(hashes))}, spec)
+	mergePartial(dst, distinctPartial(spec, slices.Compact(hashes)), spec)
 }
 
 // segmentTerms reads the terms of ords (ascending local ordinals) of field in r: one
@@ -770,7 +770,9 @@ func emptyPartial(spec *aggSpec) *AggPartial {
 	case AggStats:
 		p.Stats = &StatsPartial{}
 	case AggCardinality:
-		p.Sketch = NewSketch(spec.precision)
+		if spec.threshold == 0 {
+			p.Sketch = NewSketch(spec.precision)
+		}
 	}
 	return p
 }

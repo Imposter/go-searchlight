@@ -296,6 +296,10 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			res.Number = &v
 		}
 	case AggCardinality:
+		if spec.threshold > 0 {
+			res.Value = int64(min(len(p.Distinct), spec.threshold))
+			break
+		}
 		if p.Sketch != nil {
 			res.Value = p.Sketch.Estimate()
 		}

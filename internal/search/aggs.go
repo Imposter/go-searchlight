@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -51,6 +52,9 @@ type AggPartial struct {
 	Sketch        *Sketch       `json:"sketch,omitempty"`
 	// Value is a min or max aggregation's least or greatest value, nil with none.
 	Value *float64 `json:"value,omitempty"`
+	// Distinct (a cardinality with a threshold) are distinct value hashes, sorted: all
+	// of them while fewer than the threshold, else threshold of them.
+	Distinct []uint64 `json:"distinct,omitempty"`
 
 	// ords are a segment's partials by local ordinal (a keyword or list field's terms
 	// or cardinality, one per part of the segment collected apart), which the shard
@@ -254,9 +258,14 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 	case AggMin, AggMax:
 		return &extremeColl{src: src, max: spec.typ == AggMax}
 	case AggCardinality:
-		c := &cardColl{s: s, src: src, sketch: NewSketch(spec.precision)}
-		if top && src.ordinal() {
+		c := &cardColl{s: s, src: src, limit: spec.threshold, reached: spec.reached}
+		switch {
+		case top && src.ordinal():
 			c.seen = make([]uint64, (src.numTerms()+63)/64)
+		case c.limit > 0:
+			c.set = map[uint64]struct{}{}
+		default:
+			c.sketch = NewSketch(spec.precision)
 		}
 		return c
 	case AggTerms:
@@ -396,52 +405,143 @@ func mergeExtreme(dst **float64, src *float64, greatest bool) {
 	}
 }
 
+// cardColl counts a cardinality's distinct values: by local ordinal for a top-level
+// keyword or list field (seen), else by hash, into a sketch or, with a threshold, an
+// exact set of at most threshold hashes. With a threshold it stops once it has seen
+// that many values, or once another segment of the shard has (reached).
 type cardColl struct {
 	s      *segExec
 	src    *fieldSrc
 	sketch *Sketch
 	seen   []uint64
+	// limit is the spec's threshold (0: none); n counts the values seen, by ordinal or
+	// in set.
+	limit   int
+	n       int
+	set     map[uint64]struct{}
+	reached *atomic.Bool
 }
 
 func (c *cardColl) collect(d uint32) {
+	if c.full() {
+		return
+	}
 	if c.seen != nil {
 		switch c.src.kind {
 		case srcKeyword:
 			if o, ok := c.src.kc.Ord(d); ok {
-				c.seen[o/64] |= 1 << (o % 64)
+				c.mark(o)
 			}
 		case srcList:
 			c.src.buf = c.src.mc.Ords(d, c.src.buf[:0])
 			for _, o := range c.src.buf {
-				c.seen[o/64] |= 1 << (o % 64)
+				c.mark(o)
 			}
 		}
+		return
+	}
+	if c.limit > 0 {
+		c.src.eachHash(d, c.addHash)
 		return
 	}
 	c.src.eachHash(d, c.sketch.Add)
 }
 
+// mark records local ordinal o as seen.
+func (c *cardColl) mark(o uint32) {
+	if w, bit := &c.seen[o/64], uint64(1)<<(o%64); *w&bit == 0 {
+		*w |= bit
+		c.count()
+	}
+}
+
+func (c *cardColl) addHash(h uint64) {
+	if _, ok := c.set[h]; !ok && len(c.set) < c.limit {
+		c.set[h] = struct{}{}
+		c.count()
+	}
+}
+
+// count notes one more value seen, and the threshold when it is reached.
+func (c *cardColl) count() {
+	c.n++
+	if c.limit > 0 && c.n >= c.limit && c.reached != nil {
+		c.reached.Store(true)
+	}
+}
+
+// full reports whether a cardinality with a threshold has nothing left to count: it
+// has seen threshold values, or another segment of the shard has.
+func (c *cardColl) full() bool {
+	return c.limit > 0 && (c.n >= c.limit || (c.reached != nil && c.reached.Load()))
+}
+
+// done lets a segment's collection drop the collector once it is full.
+func (c *cardColl) done() bool { return c.full() }
+
 // countDense marks the ordinals of a dense hit set from the dictionary's document
-// frequencies, minus the documents not hit.
+// frequencies, minus the documents not hit. With a threshold it first marks the
+// ordinals held by more documents than are not hit, which some hit must hold, and
+// stops there when they are threshold or more.
 func (c *cardColl) countDense(notHit *roaring.Bitmap) bool {
 	if c.seen == nil {
 		return false
 	}
+	if c.limit > 0 {
+		miss := notHit.GetCardinality()
+		if fs := c.src; fs.ords != nil {
+			for o, df := range fs.ords.dfs[fs.seg] {
+				if c.full() {
+					return true
+				}
+				if uint64(df) > miss {
+					c.mark(uint32(o))
+				}
+			}
+		} else {
+			cur := fs.r.Cursor(fs.field, ordTermKind(fs.kind == srcList))
+			for o := uint32(0); o < fs.numTerms() && !c.full() && cur.Next(); o++ {
+				if uint64(cur.DocFreq()) > miss {
+					c.mark(o)
+				}
+			}
+		}
+		if c.full() {
+			return true
+		}
+	}
 	counts := c.src.denseCounts(notHit)
 	for o, n := range counts {
 		if n > 0 {
-			c.seen[o/64] |= 1 << (o % 64)
+			c.mark(uint32(o))
 		}
 	}
 	return true
 }
 
 func (c *cardColl) partial() *AggPartial {
-	if c.seen != nil {
+	switch {
+	case c.seen != nil:
 		return &AggPartial{Type: AggCardinality, ords: []*ordPartial{{seg: c.s.seg, seen: c.seen}}}
+	case c.limit > 0:
+		hashes := make([]uint64, 0, len(c.set))
+		for h := range c.set {
+			hashes = append(hashes, h)
+		}
+		slices.Sort(hashes)
+		return &AggPartial{Type: AggCardinality, Distinct: hashes}
 	}
 	c.sketch.seal()
 	return &AggPartial{Type: AggCardinality, Sketch: c.sketch}
+}
+
+// distinctPartial is a cardinality's partial of hashes, sorted and distinct (and taken
+// over): an exact set of at most its threshold of them when it has one, else a sketch.
+func distinctPartial(spec *aggSpec, hashes []uint64) *AggPartial {
+	if spec.threshold > 0 {
+		return &AggPartial{Type: AggCardinality, Distinct: hashes[:min(len(hashes), spec.threshold)]}
+	}
+	return &AggPartial{Type: AggCardinality, Sketch: sketchOf(spec.precision, hashes)}
 }
 
 // denseCounts is each local ordinal's documents among a dense hit set: its document
@@ -1135,12 +1235,24 @@ func (s *segExec) bucketPartial(spec *aggSpec, hits, live *roaring.Bitmap) *AggP
 	return p
 }
 
+// doner is a collector that can be done before its documents are: a cardinality
+// with a threshold, once it has seen threshold values.
+type doner interface {
+	done() bool
+}
+
+// collect collects docs into cs, dropping each collector once it is done.
 func (s *segExec) collect(docs *roaring.Bitmap, cs []collector) {
 	it := docs.ManyIterator()
 	buf := make([]uint32, 512)
+	cs = slices.Clone(cs)
 	for {
+		cs = slices.DeleteFunc(cs, func(c collector) bool {
+			d, ok := c.(doner)
+			return ok && d.done()
+		})
 		n := it.NextMany(buf)
-		if n == 0 || s.checkCtx() {
+		if n == 0 || len(cs) == 0 || s.checkCtx() {
 			return
 		}
 		for _, d := range buf[:n] {
@@ -1234,6 +1346,11 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 	case AggMin, AggMax:
 		mergeExtreme(&dst.Value, src.Value, spec.typ == AggMax)
 	case AggCardinality:
+		if spec.threshold > 0 {
+			u := unionSorted(dst.Distinct, src.Distinct)
+			dst.Distinct = u[:min(len(u), spec.threshold)]
+			return
+		}
 		if dst.Sketch == nil {
 			dst.Sketch = NewSketch(spec.precision)
 		}
@@ -1429,7 +1546,8 @@ type AggResult struct {
 	Count         int64
 	Sum           float64
 	Min, Max, Avg *float64
-	// Value is a cardinality's estimate.
+	// Value is a cardinality's estimate; with a threshold, the exact number of
+	// distinct values when it is below the threshold, else the threshold.
 	Value int64
 	// Number is a min or max aggregation's value: nil when no document has one.
 	Number *float64

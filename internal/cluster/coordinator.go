@@ -191,7 +191,7 @@ type testHooks struct {
 	// (search level 3). olderNoEndpoint gives them no endpoint,
 	// olderDropsLevel serves them with what that release lacks dropped (a search's
 	// post_filter below level 1, include and exclude below 2, from below 3, min and
-	// max aggregations below 4; a
+	// max aggregations and cardinality thresholds below 4; a
 	// percolation's now below 1) and its level in the reply.
 	olderPeer  olderPeer
 	olderLevel int

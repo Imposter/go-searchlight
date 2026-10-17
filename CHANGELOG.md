@@ -13,6 +13,14 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   `global`, and as a bucket aggregation's sub-aggregation. Each keeps one value per
   bucket; over a dense hit set it reads the point index from the end sought until a
   block holds a hit ([docs/api.md](docs/api.md#search-and-count)).
+- **`threshold` on `cardinality`**: `{"cardinality": {"field": "brand", "threshold":
+  2}}` answers exactly with the number of distinct values when there are fewer than
+  the threshold, else the threshold (1 to 65,536; not Elasticsearch's
+  `precision_threshold`, and not with `precision`). A segment stops once it has seen
+  that many values, and so does the rest of its shard; a dense hit set is answered
+  from the dictionary's document frequencies. One value in several segments or shards
+  counts once. 100 cardinality aggregations over a million documents went from about
+  850 ms to 14 ms with a threshold of 2.
 - **`collect_mode` on `terms`**, `depth_first` or `breadth_first`, as Elasticsearch's.
   Breadth first counts the values, makes each shard's `shard_size` cut, then reads
   the hits again for the sub-aggregations of the values kept alone. Unset, a segment
@@ -22,9 +30,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ### Upgrading
 
-- A search with a `min` or `max` aggregation (search wire level 4) is refused with a
-  503 rather than read from a node of an earlier release, which would refuse it as
-  unknown. `collect_mode` needs nothing: an earlier node collects depth first, with
+- A search with a `min` or `max` aggregation, or a cardinality `threshold` (search
+  wire level 4), is refused with a 503 rather than read from a node of an earlier
+  release, which would refuse the aggregation as unknown or estimate past the
+  threshold. `collect_mode` needs nothing: an earlier node collects depth first, with
   the same results.
 
 ## [1.1.0] - 2026-10-17

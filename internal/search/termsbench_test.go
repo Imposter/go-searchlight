@@ -186,18 +186,23 @@ func BenchmarkTermsList(b *testing.B) {
 }
 
 // BenchmarkCardinalityMany: 100 cardinality aggregations of most of the index, as a
-// listing page asks whether each of its facets has two values or more.
+// listing page asks whether each of its facets has two values or more: estimated, and
+// with a threshold of 2.
 func BenchmarkCardinalityMany(b *testing.B) {
 	s := openListBench(b)
-	runBenchOn(b, s, func(_ *rand.Rand) *Request {
-		aggs := make(map[string]Agg, 100)
-		for i := range 100 {
-			field := "items"
-			if i%2 == 1 {
-				field = "source"
-			}
-			aggs[fmt.Sprintf("c%02d", i)] = Agg{Type: AggCardinality, Field: field}
-		}
-		return &Request{Query: listQuery(), Aggs: aggs}
-	})
+	for name, threshold := range map[string]int{"estimate": 0, "threshold": 2} {
+		b.Run(name, func(b *testing.B) {
+			runBenchOn(b, s, func(_ *rand.Rand) *Request {
+				aggs := make(map[string]Agg, 100)
+				for i := range 100 {
+					field := "items"
+					if i%2 == 1 {
+						field = "source"
+					}
+					aggs[fmt.Sprintf("c%02d", i)] = Agg{Type: AggCardinality, Field: field, Threshold: threshold}
+				}
+				return &Request{Query: listQuery(), Aggs: aggs}
+			})
+		})
+	}
 }

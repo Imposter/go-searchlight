@@ -180,3 +180,59 @@ func TestParseMinMaxCollectMode(t *testing.T) {
 		}
 	}
 }
+
+// TestCardinalityThreshold: a cardinality with a threshold is exact below it and the
+// threshold at or past it, however its values spread over segments and shards (one
+// value in several counts once), as a top-level aggregation (by ordinal, dense or
+// not), under a filters aggregation's buckets and under a terms bucket (by hash).
+func TestCardinalityThreshold(t *testing.T) {
+	c := newCluster(t, 2)
+	brands := []string{"a", "b", "c", "a", "b", "a", "d"}
+	for i, b := range brands {
+		c.upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"brand":%q,"tags":[%q,"x"],"price":%d,"active":true}`, b, b, i%3))
+		c.refreshAll() // a segment per document: every value in several segments
+	}
+	cheap := leaf("price", query.OpLt, 1)
+	for threshold, want := range map[int]int64{1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 100: 4} {
+		card := func(field string) Agg { return Agg{Type: AggCardinality, Field: field, Threshold: threshold} }
+		for _, q := range []query.Node{&query.All{}, leaf("brand", query.OpIn, brands)} {
+			got, err := c.search(&Request{Query: q, Aggs: map[string]Agg{
+				"brand": card("brand"), "tags": card("tags"),
+				"price": card("price"),
+				"by":    {Type: AggTerms, Field: "active", Aggs: map[string]Agg{"brand": card("brand")}},
+				"f":     {Type: AggFilters, Filters: map[string]query.Node{"all": &query.All{}, "cheap": cheap}, Aggs: map[string]Agg{"brand": card("brand")}},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tags := min(want+1, int64(threshold)) // x too
+			for name, w := range map[string]int64{"brand": want, "tags": tags, "price": min(3, int64(threshold))} {
+				if v := got.Aggs[name].Value; v != w {
+					t.Errorf("threshold %d: %s %d, want %d", threshold, name, v, w)
+				}
+			}
+			if v := got.Aggs["by"].Buckets[0].Aggs["brand"].Value; v != want {
+				t.Errorf("threshold %d: under terms %d, want %d", threshold, v, want)
+			}
+			// The cheap documents (price 0) are d0, d3 and d6: brands a, a, d.
+			for i, w := range []int64{want, min(2, int64(threshold))} {
+				if v := got.Aggs["f"].Buckets[i].Aggs["brand"].Value; v != w {
+					t.Errorf("threshold %d: filters bucket %v %d, want %d", threshold, got.Aggs["f"].Buckets[i].Key, v, w)
+				}
+			}
+			if s := string(mustJSON(got.Aggs["brand"])); s != fmt.Sprintf(`{"value":%d}`, want) {
+				t.Errorf("threshold %d: %s", threshold, s)
+			}
+		}
+	}
+	for _, a := range []Agg{
+		{Type: AggCardinality, Field: "brand", Threshold: MaxThreshold + 1},
+		{Type: AggCardinality, Field: "brand", Threshold: 2, Precision: 10},
+	} {
+		var ps problems
+		prepareAgg("x", a, testMapping, "aggs.x", "", &ps)
+		if len(ps) != 1 || ps[0].Loc != "aggs.x.cardinality.threshold" {
+			t.Errorf("%+v: %v", a, ps)
+		}
+	}
+}

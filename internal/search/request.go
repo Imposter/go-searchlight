@@ -81,6 +81,8 @@ const (
 	// MinPrecision and MaxPrecision bound a cardinality aggregation's precision.
 	MinPrecision = 4
 	MaxPrecision = 18
+	// MaxThreshold is the largest threshold a cardinality aggregation takes.
+	MaxThreshold = 65_536
 )
 
 // IDField is the pseudo-field of the document id. Sorting on it sorts by the exact id;
@@ -246,6 +248,12 @@ type Agg struct {
 	// to MaxPrecision): DefaultPrecision when 0. Counts are exact while fewer than
 	// 2^(Precision-2) distinct values are seen.
 	Precision int
+	// Threshold (1 to MaxThreshold), when set, makes a cardinality aggregation exact
+	// up to it: its value is the number of distinct values when there are fewer than
+	// Threshold, else Threshold ("are there at least two?"). Each segment stops
+	// counting once it has seen Threshold values, and so do the shard's others. It is
+	// not Elasticsearch's precision_threshold, and takes no Precision.
+	Threshold int `json:",omitempty"`
 
 	// Filter is a filter aggregation's query: its one bucket holds the documents both
 	// the search's query and Filter match. Its owner encodes it (as query DSL) on the
@@ -751,7 +759,7 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		AggStats:         {"field"},
 		AggMin:           {"field"},
 		AggMax:           {"field"},
-		AggCardinality:   {"field", "precision"},
+		AggCardinality:   {"field", "precision", "threshold"},
 	}[a.Type]
 	for _, key := range slices.Sorted(maps.Keys(body)) {
 		val := body[key]
@@ -765,7 +773,7 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			if json.Unmarshal(val, &a.Field) != nil || a.Field == "" {
 				ps.add(at, "field is a field name")
 			}
-		case "size", "shard_size", "precision":
+		case "size", "shard_size", "precision", "threshold":
 			n, ok := intOf(val)
 			if !ok || n < 1 {
 				ps.add(at, "%s is a whole number of at least 1", key)
@@ -776,6 +784,8 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 				a.Size = n
 			case "shard_size":
 				a.ShardSize = n
+			case "threshold":
+				a.Threshold = n
 			default:
 				a.Precision = n
 			}

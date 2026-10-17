@@ -85,6 +85,12 @@ type aggSpec struct {
 	offset    float64
 	calendar  string
 	precision uint8
+	// threshold is a cardinality's threshold (0: none), and reached is set once a
+	// segment of the shard has seen that many values, so the others stop: shared by
+	// a top-level cardinality's segments, or one under a filter or global aggregation
+	// (nil under a filters aggregation's buckets, or a bucket aggregation's).
+	threshold int
+	reached   *atomic.Bool
 	// terms is a terms aggregation's include and exclude, compiled; include and exclude
 	// are them as given.
 	terms            *termsFilter
@@ -180,7 +186,23 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		p.post = compileNode(r.PostFilter, id)
 	}
 	compileFilters(p.aggs, id)
+	shareThresholds(p.aggs)
 	return p, nil
+}
+
+// shareThresholds gives each cardinality with a threshold among specs, and under their
+// filter and global aggregations, the flag its segments share (aggSpec.reached). Those
+// under a filters aggregation are collected once per bucket, and those under a bucket
+// aggregation once per bucket too, so they share none.
+func shareThresholds(specs []*aggSpec) {
+	for _, s := range specs {
+		switch {
+		case s.typ == AggCardinality && s.threshold > 0:
+			s.reached = new(atomic.Bool)
+		case s.typ == AggFilter || s.typ == AggGlobal:
+			shareThresholds(s.subs)
+		}
+	}
 }
 
 // compileFilters compiles the filters of specs' filter and filters aggregations.
@@ -439,6 +461,15 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			ps.add(at+".precision", "precision is from %d to %d", MinPrecision, MaxPrecision)
 		}
 		s.precision = uint8(min(max(p, MinPrecision), MaxPrecision))
+		switch {
+		case a.Threshold == 0:
+		case a.Threshold < 0 || a.Threshold > MaxThreshold:
+			ps.add(at+".threshold", "threshold is from 1 to %d", MaxThreshold)
+		case a.Precision != 0:
+			ps.add(at+".threshold", "a cardinality takes precision or threshold, not both: a threshold counts exactly")
+		default:
+			s.threshold = a.Threshold
+		}
 	case AggFilter:
 		s.keys, s.queries = []any{nil}, []query.Node{a.Filter}
 	case AggFilters:

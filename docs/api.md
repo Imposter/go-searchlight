@@ -260,7 +260,13 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     `min_doc_count`;
   - `stats`;
   - `min` and `max`, `{"value": x}`, or `{"value": null}` when no document has one;
-  - `cardinality` (HyperLogLog++);
+  - `cardinality` (HyperLogLog++), with `precision`, or `threshold` (1 to 65,536) for
+    an exact answer to "are there at least n values?": `{"value": v}` is the number of
+    distinct values when there are fewer than `threshold`, else `threshold`. Each
+    segment stops counting once it has seen `threshold` values, and so does the rest of
+    its shard; over a dense hit set the dictionary's document frequencies answer
+    without reading the hits. It is not Elasticsearch's `precision_threshold`, and
+    takes no `precision`;
   - `filter`, a query: one bucket of the documents both the search's `query` and it
     match, `{"doc_count": n, ...}`;
   - `filters`, `{"filters": {"key": query, ...}, "other_bucket_key": "other"}`: a

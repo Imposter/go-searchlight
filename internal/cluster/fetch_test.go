@@ -624,6 +624,7 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 		"max": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{
 			"hi": {Type: search.AggMax, Field: "price"},
 		}}}},
+		"threshold": {Query: &query.All{}, Aggs: map[string]search.Agg{"n": {Type: search.AggCardinality, Field: "brand", Threshold: 2}}},
 	}
 	levelThree := map[string]*search.Request{
 		"from": {Query: &query.All{}, Sort: []search.SortField{{Field: "price"}}, Size: 5, From: 5},

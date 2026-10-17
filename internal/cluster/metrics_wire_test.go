@@ -8,8 +8,9 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 )
 
-// TestWireMetrics: a min or max aggregation, at any level, needs search wire level 4,
-// which a peer of an earlier release would refuse as unknown; a terms aggregation's
+// TestWireMetrics: a min or max aggregation, or a cardinality's threshold, at any
+// level, needs search wire level 4, which a peer of an earlier release would refuse as
+// unknown or ignore; a terms aggregation's
 // collect_mode crosses the wire and needs nothing new, as either mode answers the
 // same.
 func TestWireMetrics(t *testing.T) {
@@ -23,6 +24,7 @@ func TestWireMetrics(t *testing.T) {
 		"min":          {map[string]search.Agg{"m": {Type: search.AggMin, Field: "price"}}, levelMetrics},
 		"max under":    {terms(search.Agg{Type: search.AggMax, Field: "price"}), levelMetrics},
 		"collect_mode": {terms(search.Agg{Type: search.AggStats, Field: "price"}), 0},
+		"threshold":    {terms(search.Agg{Type: search.AggCardinality, Field: "tags", Threshold: 2}), levelMetrics},
 	} {
 		wr, err := encodeRequest(&search.Request{Query: &query.All{}, Aggs: tc.aggs})
 		if err != nil {
@@ -42,6 +44,9 @@ func TestWireMetrics(t *testing.T) {
 		}
 		if wr.Needs != tc.needs || back.Needs != tc.needs {
 			t.Errorf("%s: needs %d, %d after the wire; want %d", name, wr.Needs, back.Needs, tc.needs)
+		}
+		if got, want := r.Aggs["t"].Aggs["m"].Threshold, tc.aggs["t"].Aggs["m"].Threshold; got != want {
+			t.Errorf("%s: threshold %d after the wire, want %d", name, got, want)
 		}
 		if got, want := r.Aggs["t"].CollectMode, tc.aggs["t"].CollectMode; got != want {
 			t.Errorf("%s: collect_mode %q after the wire, want %q", name, got, want)

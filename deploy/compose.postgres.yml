@@ -93,7 +93,7 @@ services:
         chmod 0444 postgres_password store_url cluster_token tokens
 
   postgres:
-    image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
+    image: postgres:18@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
     # Docker gives a container 64 MB of /dev/shm; Postgres keeps its parallel queries' shared
     # memory there, and runs out under load ("could not resize shared memory segment").
     shm_size: 256mb

@@ -90,6 +90,15 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 		if res.Count > 0 {
 			res.Avg = ptr(res.Sum / float64(res.Count))
 		}
+	case AggMin, AggMax:
+		for _, d := range docs {
+			for _, v := range aggValues(d, spec.field) {
+				x, ok := v.(float64)
+				if ok && (res.Number == nil || (spec.typ == AggMin && x < *res.Number) || (spec.typ == AggMax && x > *res.Number)) {
+					res.Number = ptr(x)
+				}
+			}
+		}
 	case AggCardinality:
 		seen := map[any]bool{}
 		for _, d := range docs {
@@ -98,6 +107,9 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 			}
 		}
 		res.Value = int64(len(seen))
+		if spec.threshold > 0 {
+			res.Value = min(res.Value, int64(spec.threshold))
+		}
 	case AggTerms:
 		in := map[any][]*schema.Doc{}
 		var total int64
@@ -265,6 +277,8 @@ func diffAgg(got, want *AggResult, path string) string {
 		return fmt.Sprintf("%s: stats %d %v %v %v %v, want %d %v %v %v %v", path,
 			got.Count, got.Sum, deref(got.Min), deref(got.Max), deref(got.Avg),
 			want.Count, want.Sum, deref(want.Min), deref(want.Max), deref(want.Avg))
+	case !ptrEq(got.Number, want.Number):
+		return fmt.Sprintf("%s: value %v, want %v", path, deref(got.Number), deref(want.Number))
 	case got.Value != want.Value:
 		return fmt.Sprintf("%s: cardinality %d, want %d", path, got.Value, want.Value)
 	case got.SumOtherDocCount != want.SumOtherDocCount:
@@ -321,10 +335,17 @@ func deref(p *float64) any {
 
 func randomAgg(rng *rand.Rand) Agg {
 	metric := func() Agg {
-		if rng.IntN(2) == 0 {
+		switch rng.IntN(4) {
+		case 0:
 			return Agg{Type: AggStats, Field: pick(rng, []string{"price", "created", "nope"})}
+		case 1:
+			return Agg{Type: pick(rng, []string{AggMin, AggMax}), Field: pick(rng, []string{"price", "created", "nope"})}
 		}
-		return Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		a := Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		if rng.IntN(2) == 0 {
+			a.Threshold = pick(rng, []int{1, 2, 3, 7, 40, 1000})
+		}
+		return a
 	}
 	var a Agg
 	switch rng.IntN(7) {
@@ -332,6 +353,7 @@ func randomAgg(rng *rand.Rand) Agg {
 		a = Agg{
 			Type: AggTerms, Field: pick(rng, []string{"brand", "tags", "active", "price", "title", "_id", "created", "nope"}),
 			Size: pick(rng, []int{0, 1, 3, 100}), ShardSize: 10_000,
+			CollectMode: pick(rng, []string{"", CollectDepthFirst, CollectBreadthFirst}),
 		}
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(3))

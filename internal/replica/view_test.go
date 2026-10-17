@@ -36,6 +36,12 @@ func viewOf(t testing.TB, sh *shard.Shard) view {
 		t.Fatal("the shard is closed")
 	}
 	defer g.Release()
+	return viewOfGeneration(t, g)
+}
+
+// viewOfGeneration reads g, which the caller holds.
+func viewOfGeneration(t testing.TB, g *shard.Generation) view {
+	t.Helper()
 	v := view{seq: g.Seq(), docs: map[string]string{}, queries: map[string]string{}, terms: map[string]string{}}
 	m := g.Mapping()
 	if m != nil {

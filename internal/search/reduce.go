@@ -206,9 +206,13 @@ func reduceWrapper(parts []*AggPartial, spec *aggSpec) *AggResult {
 // error bound (see aggs.go). One shard's list is exact, so its bound is 0: no term it
 // left out has more documents than one it returned.
 func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
+	// acc is one term's bucket over the shards: the first shard's own until a second
+	// returns the term, then a copy the others merge into, so a shard's partial is
+	// never changed, and a term one shard returned is never copied.
 	type acc struct {
-		b    *BucketPartial
-		seen []bool
+		b     *BucketPartial
+		owned bool
+		seen  []bool
 	}
 	accs := map[any]*acc{}
 	var all []*acc
@@ -222,11 +226,15 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 		for _, b := range p.Buckets {
 			docs += b.DocCount
 			a := accs[b.Key]
-			if a == nil {
-				a = &acc{b: cloneBucket(b, spec), seen: make([]bool, len(parts))}
+			switch {
+			case a == nil:
+				a = &acc{b: b, seen: make([]bool, len(parts))}
 				accs[b.Key] = a
 				all = append(all, a)
-			} else {
+			case !a.owned:
+				a.b, a.owned = cloneBucket(a.b, spec), true
+				fallthrough
+			default:
 				mergeBucket(a.b, b, spec)
 			}
 			a.seen[i] = true
@@ -246,7 +254,7 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 			buckets = append(buckets, a.b)
 		}
 	}
-	sortTerms(buckets)
+	topK(buckets, spec.size, cmpTerms)
 	if len(buckets) > spec.size {
 		buckets = buckets[:spec.size]
 	}
@@ -290,7 +298,16 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			lo, hi, avg := st.Min, st.Max, st.Sum/float64(st.Count)
 			res.Min, res.Max, res.Avg = &lo, &hi, &avg
 		}
+	case AggMin, AggMax:
+		if p.Value != nil {
+			v := *p.Value
+			res.Number = &v
+		}
 	case AggCardinality:
+		if spec.threshold > 0 {
+			res.Value = int64(min(len(p.Distinct), spec.threshold))
+			break
+		}
 		if p.Sketch != nil {
 			res.Value = p.Sketch.Estimate()
 		}

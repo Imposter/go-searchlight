@@ -252,13 +252,23 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - A number counts exactly up to it (10,000 by default). Past it, `relation` is
     `gte`.
 - **Aggregations** (`aggs`, or `aggregations`):
-  - `terms`, with `size`, `shard_size`, `min_doc_count`, `include` and `exclude`;
+  - `terms`, with `size`, `shard_size`, `min_doc_count`, `include`, `exclude` and
+    `collect_mode`;
   - `range`, with `ranges` of `from`/`to`/`key`;
   - `histogram`, with `interval`, `offset` and `min_doc_count`;
   - `date_histogram`, with `fixed_interval`, `calendar_interval`, `offset` and
     `min_doc_count`;
   - `stats`;
-  - `cardinality` (HyperLogLog++);
+  - `min` and `max`, `{"value": x}`, or `{"value": null}` when no document has one.
+    On a `date` field the value is Unix milliseconds, as `stats` gives it. `-0` is
+    `0` to them and to `stats`' `min` and `max`, as it is to every bucket key;
+  - `cardinality` (HyperLogLog++), with `precision`, or `threshold` (1 to 65,536) for
+    an exact answer to "are there at least n values?": `{"value": v}` is the number of
+    distinct values when there are fewer than `threshold`, else `threshold`. Each
+    segment stops counting once it has seen `threshold` values, and so does the rest of
+    its shard; over a dense hit set the dictionary's document frequencies answer
+    without reading the hits. It is not Elasticsearch's `precision_threshold`, and
+    takes no `precision`;
   - `filter`, a query: one bucket of the documents both the search's `query` and it
     match, `{"doc_count": n, ...}`;
   - `filters`, `{"filters": {"key": query, ...}, "other_bucket_key": "other"}`: a
@@ -268,7 +278,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - `global`, `{}`: one bucket of every document of the index, whatever the `query`
     and `post_filter`, `{"doc_count": n, ...}`. Top level only.
 
-  A bucket aggregation may carry metric sub-aggregations one level deep. `filter`,
+  A bucket aggregation may carry metric sub-aggregations (`stats`, `cardinality`,
+  `min`, `max`) one level deep. `filter`,
   `filters` and `global` may carry any other aggregation, written inline in their
   bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
   most `filter` → `terms` → `stats`. A sub-aggregation is never named after a member
@@ -280,6 +291,17 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   query's bounds (4 levels, 50 conditions, 100 nodes). A `terms` aggregation over
   several shards reports its error bound, as Elasticsearch does, under a `filter`
   too. On one shard it is exact, and its `doc_count_error_upper_bound` is 0.
+
+  **`collect_mode`** is how a `terms` aggregation collects its sub-aggregations, as
+  Elasticsearch's: `depth_first` collects them for every value as the hits are read;
+  `breadth_first` counts the values first, makes each shard's `shard_size` cut, then
+  reads the hits again for the values kept alone, so a field of many values does not
+  pay for buckets the shard drops. Unset, each segment chooses: breadth first when its
+  field holds more distinct values than `shard_size`, depth first otherwise. Both
+  answer the same; only keyword, text and `keyword_list` fields defer (number and bool
+  fields collect depth first). Breadth first reads each hit's values twice, but counts
+  a dense hit set from the dictionary as a `terms` aggregation without
+  sub-aggregations does.
 
   **`include` and `exclude`** choose the values a `terms` aggregation buckets, as
   Elasticsearch's do. Each is an array of exact values or a pattern, and the two
@@ -351,7 +373,22 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   `query`'s. It is checked as `query` is, at `post_filter...`.
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
-  Past it, the answer holds what was found, with `timed_out: true`.
+  Past it, the answer holds what was found, with `timed_out: true`. The deadline (the
+  earlier of `timeout` and `request_timeout`) bounds each shard's whole search, not
+  only its scan, and keeps a tenth of the budget (1 ms to 1 s) for the merge after
+  the scan:
+  - each shard scans its segments until the deadline less that reserve; a segment
+    unfinished then is left out, its hits, total and aggregations with it;
+  - the shard then merges its segments' aggregations until the deadline. A `terms`
+    or `cardinality` whose field's global ordinals are still building waits only
+    for a build already running, at most 250 ms, then merges by term, exactly (the
+    build goes on in the background, for the next search). Only an aggregation the deadline cuts
+    off even so is answered empty from that shard;
+  - the coordinating node merges the shards' answers once it has them all, which is
+    never cut: it is bounded by what the shards sent.
+
+  Any cut sets `timed_out: true`. The hits found are fetched past the deadline, and
+  the response written after it.
 - **`request_cache`** (`true` by default), Elasticsearch's shard request cache. A search
   with `size` 0 (a count, or aggregations only; no `from` or `search_after`) is
   answered, shard by shard, from what an identical search of the same shard contents

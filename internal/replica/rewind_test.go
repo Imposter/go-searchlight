@@ -13,6 +13,7 @@ import (
 	gomysql "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/mysql"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -79,8 +80,14 @@ func waitMatches(t *testing.T, c *copyRunner, st store.Store, id ShardID) {
 		tl := c.current()
 		tl.Wake()
 		sh := tl.Shard()
+		var g *shard.Generation
 		if tl.State() == StateTailing && sh.Refresh(context.Background()) == nil {
-			dd := diff(viewOf(t, sh), truthOf(t, st, id), false)
+			g = sh.Acquire() // nil when a rebuild closed sh meanwhile: look again
+		}
+		if g != nil {
+			v := viewOfGeneration(t, g)
+			g.Release()
+			dd := diff(v, truthOf(t, st, id), false)
 			if dd == "" {
 				return
 			}

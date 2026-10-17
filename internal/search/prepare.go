@@ -44,6 +44,12 @@ type prepared struct {
 	// ords are the global ordinals of the keyword and list fields the aggregations
 	// count by ordinal: top-level terms, and every cardinality.
 	ords map[ordField]*globalOrds
+	// cut is set when the shard's merge of the segments' partials ran out of time and
+	// left aggregations empty: the result is timed out.
+	cut atomic.Bool
+	// failed is the first error of the merge that is not its context's (a replay's
+	// panic, say), which fails the shard.
+	failed atomic.Pointer[error]
 }
 
 // ordField names one field's global ordinals: its values, or its list entries.
@@ -85,11 +91,20 @@ type aggSpec struct {
 	offset    float64
 	calendar  string
 	precision uint8
+	// threshold is a cardinality's threshold (0: none), and reached is set once a
+	// segment of the shard has seen that many values, so the others stop: shared by
+	// a top-level cardinality's segments, or one under a filter or global aggregation
+	// (nil under a filters aggregation's buckets, or a bucket aggregation's).
+	threshold int
+	reached   *atomic.Bool
 	// terms is a terms aggregation's include and exclude, compiled; include and exclude
 	// are them as given.
 	terms            *termsFilter
 	include, exclude *TermsFilter
-	subs             []*aggSpec
+	// collect is a terms aggregation's collect mode as given: "", CollectDepthFirst
+	// or CollectBreadthFirst (see deferSubs).
+	collect string
+	subs    []*aggSpec
 	// keys are a filter, filters or global aggregation's buckets' keys, in order: nil
 	// alone for filter and global; filters' keys sorted, then its other bucket's.
 	// queries are the filters of the buckets that have one, in keys' order, and
@@ -177,7 +192,23 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		p.post = compileNode(r.PostFilter, id)
 	}
 	compileFilters(p.aggs, id)
+	shareThresholds(p.aggs)
 	return p, nil
+}
+
+// shareThresholds gives each cardinality with a threshold among specs, and under their
+// filter and global aggregations, the flag its segments share (aggSpec.reached). Those
+// under a filters aggregation are collected once per bucket, and those under a bucket
+// aggregation once per bucket too, so they share none.
+func shareThresholds(specs []*aggSpec) {
+	for _, s := range specs {
+		switch {
+		case s.typ == AggCardinality && s.threshold > 0:
+			s.reached = new(atomic.Bool)
+		case s.typ == AggFilter || s.typ == AggGlobal:
+			shareThresholds(s.subs)
+		}
+	}
 }
 
 // compileFilters compiles the filters of specs' filter and filters aggregations.
@@ -317,17 +348,17 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 		ps.add(at+".field", "an aggregation needs a field")
 		return nil
 	}
-	isMetric := a.Type == AggStats || a.Type == AggCardinality
+	isMetric := metricType(a.Type)
 	switch {
 	case parent == "":
 	case a.Type == AggGlobal:
 		ps.add(loc, "global is a top-level aggregation only: it counts every document, whatever holds it")
 		return nil
 	case singleBucket(parent) && wrapper:
-		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats and cardinality", a.Type, parent)
+		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min and max", a.Type, parent)
 		return nil
 	case !singleBucket(parent) && !isMetric:
-		ps.add(loc, "a sub-aggregation is a metric: stats or cardinality")
+		ps.add(loc, "a sub-aggregation is a metric: stats, cardinality, min or max")
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
@@ -337,6 +368,13 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			key = "exclude"
 		}
 		ps.add(at+"."+key, "include and exclude choose a terms aggregation's values: %s takes neither", a.Type)
+	}
+	switch {
+	case a.CollectMode == "":
+	case a.Type != AggTerms:
+		ps.add(at+".collect_mode", "collect_mode is a terms aggregation's: %s takes none", a.Type)
+	case a.CollectMode != CollectDepthFirst && a.CollectMode != CollectBreadthFirst:
+		ps.add(at+".collect_mode", "collect_mode is %q or %q", CollectDepthFirst, CollectBreadthFirst)
 	}
 	switch a.Type {
 	case AggTerms:
@@ -359,7 +397,7 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			}
 			s.minDoc = *a.MinDocCount
 		}
-		s.include, s.exclude = a.Include, a.Exclude
+		s.include, s.exclude, s.collect = a.Include, a.Exclude, a.CollectMode
 		s.terms = compileTermsFilter(a.Include, a.Exclude, s.ftype, at, ps)
 	case AggRange:
 		if !numeric {
@@ -416,9 +454,9 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 		if a.MinDocCount != nil {
 			s.minDoc = *a.MinDocCount
 		}
-	case AggStats:
+	case AggStats, AggMin, AggMax:
 		if !numeric {
-			ps.add(at+".field", "%q is a %s: stats takes a number or date field", a.Field, s.ftype)
+			ps.add(at+".field", "%q is a %s: %s takes a number or date field", a.Field, s.ftype, a.Type)
 		}
 	case AggCardinality:
 		p := a.Precision
@@ -429,6 +467,15 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			ps.add(at+".precision", "precision is from %d to %d", MinPrecision, MaxPrecision)
 		}
 		s.precision = uint8(min(max(p, MinPrecision), MaxPrecision))
+		switch {
+		case a.Threshold == 0:
+		case a.Threshold < 0 || a.Threshold > MaxThreshold:
+			ps.add(at+".threshold", "threshold is from 1 to %d", MaxThreshold)
+		case a.Precision != 0:
+			ps.add(at+".threshold", "a cardinality takes precision or threshold, not both: a threshold counts exactly")
+		default:
+			s.threshold = a.Threshold
+		}
 	case AggFilter:
 		s.keys, s.queries = []any{nil}, []query.Node{a.Filter}
 	case AggFilters:
@@ -451,7 +498,7 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 	case AggGlobal:
 		s.keys = []any{nil}
 	default:
-		ps.add(loc, "unknown aggregation type %q: use terms, range, histogram, date_histogram, stats, cardinality, filter, filters or global", a.Type)
+		ps.add(loc, "unknown aggregation type %q: use terms, range, histogram, date_histogram, stats, cardinality, min, max, filter, filters or global", a.Type)
 		return nil
 	}
 	if len(a.Aggs) > 0 {

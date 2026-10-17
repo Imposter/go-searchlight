@@ -660,6 +660,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		Logger:          n.log,
 		Tracer:          n.tr,
 		Meter:           n.meter,
+		Published:       search.WarmOrdinals,
 	}
 	if n.opts.ShardOptions != nil {
 		n.opts.ShardOptions(&opts)

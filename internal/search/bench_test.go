@@ -252,6 +252,12 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 // reduce, as the node runs a from.
 func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 	s, _ := openBench(b)
+	runBenchOn(b, s, next)
+}
+
+// runBenchOn is runBench on shard s.
+func runBenchOn(b *testing.B, s *shard.Shard, next func(rng *rand.Rand) *Request) {
+	b.Helper()
 	rng := rand.New(rand.NewPCG(1, 2))
 	// Warm up the mappings (the OS page cache) and the rank arrays, as a serving node is.
 	for range 3 {

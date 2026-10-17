@@ -83,7 +83,7 @@ func canonAgg1(raw json.RawMessage, spec search.Agg) (*canonAgg, error) {
 	case search.AggStats:
 		a.Stats = []float64{num(m["count"]), num(m["min"]), num(m["max"]), num(m["avg"]), num(m["sum"])}
 		return a, nil
-	case search.AggCardinality:
+	case search.AggCardinality, search.AggMin, search.AggMax:
 		a.Value = num(m["value"])
 		return a, nil
 	}
@@ -181,6 +181,11 @@ func diffAgg(path string, s, e *canonAgg) ([]string, bool) {
 			}
 		}
 		return ps, false
+	case search.AggMin, search.AggMax:
+		if relDiff(s.Value, e.Value) > 0 {
+			return []string{fmt.Sprintf("%s: %s %v vs %v", path, s.Type, s.Value, e.Value)}, false
+		}
+		return nil, false
 	case search.AggCardinality:
 		if relDiff(s.Value, e.Value) > cardinalityRelTol {
 			return []string{fmt.Sprintf("%s: cardinality %v vs %v (beyond %.0f%%)", path, s.Value, e.Value, cardinalityRelTol*100)}, false

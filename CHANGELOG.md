@@ -6,6 +6,28 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+### Added
+
+- **`min` and `max` aggregations**, Elasticsearch's: `{"value": x}`, or `{"value":
+  null}` when no document has one (Unix milliseconds on a `date` field, as `stats`
+  gives them), at the top level, under `filter`, `filters` and
+  `global`, and as a bucket aggregation's sub-aggregation. Each keeps one value per
+  bucket; over a dense hit set it reads the point index from the end sought until a
+  block holds a hit ([docs/api.md](docs/api.md#search-and-count)).
+- **`threshold` on `cardinality`**: `{"cardinality": {"field": "brand", "threshold":
+  2}}` answers exactly with the number of distinct values when there are fewer than
+  the threshold, else the threshold (1 to 65,536; not Elasticsearch's
+  `precision_threshold`, and not with `precision`). A segment stops once it has seen
+  that many values, and so does the rest of its shard; a dense hit set is answered
+  from the dictionary's document frequencies. One value in several segments or shards
+  counts once. 100 cardinality aggregations over a million documents went from about
+  850 ms to 14 ms with a threshold of 2.
+- **`collect_mode` on `terms`**, `depth_first` or `breadth_first`, as Elasticsearch's.
+  Breadth first counts the values, makes each shard's `shard_size` cut, then reads
+  the hits again for the sub-aggregations of the values kept alone. Unset, a segment
+  whose field holds more distinct values than `shard_size` collects breadth first;
+  results are the same either way.
+
 ### Changed
 
 - **Global ordinals survive refreshes.** A refresh's or merge's new segment list
@@ -31,6 +53,29 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   deadline, and only one the deadline cuts off even so is answered empty, with
   `timed_out: true` ([docs/api.md](docs/api.md#search-and-count)). A search
   cancelled during the merge returns its cancellation.
+- `stats`' `min` and `max` read `-0` as `0`, as `min`, `max` and every bucket key do.
+- A deadline that passes while a shard reads its hits again for breadth-first
+  sub-aggregations leaves that `terms` aggregation empty on the shard, with
+  `timed_out`, rather than counts its sub-aggregations do not match; a client's
+  cancel then is the search's error.
+- **Faster `terms` over many values.** A shard keeps its `shard_size` best terms by
+  selection rather than a sort of every term (the reduce its `size` likewise); the
+  parts of a large segment collected apart share count arrays, one per part counted
+  at once, rather than one per part; breadth-first sub-aggregations collect stats,
+  `min` and `max` into arrays by bucket, each hit's value read once; the reduce copies
+  a shard's bucket only when another shard returns its term too; and buckets are
+  written as JSON without building a map per bucket. Over a million documents and
+  150,000 distinct list values: the top 100 terms of 95% of the index from 23 to 10
+  ms, of 45% from 35 to 15 ms, and with a `stats` sub-aggregation (breadth first)
+  from 190 to 22 ms.
+
+### Upgrading
+
+- A search with a `min` or `max` aggregation, or a cardinality `threshold` (search
+  wire level 4), is refused with a 503 rather than read from a node of an earlier
+  release, which would refuse the aggregation as unknown or estimate past the
+  threshold. `collect_mode` needs nothing: an earlier node collects depth first, with
+  the same results.
 
 ## [1.1.0] - 2026-10-17
 

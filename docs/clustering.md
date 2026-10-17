@@ -353,6 +353,10 @@ each search has a wire level, the level a peer must speak to answer it exactly.
 - A search with a `from` past 0 (and a `size` past 0) needs level 3, and its endpoint,
   in the same way: a node of level 0 to 2 would ignore `from` and return its first
   `size` hits, the wrong page. A `from` of 0 needs nothing.
+- A search with a `min` or `max` aggregation, or a cardinality's `threshold`, needs
+  level 4, and its endpoint, in the same way: a node of level 0 to 3 would refuse the
+  aggregation as unknown, or estimate past the threshold. A `terms`
+  aggregation's `collect_mode` needs nothing, as either mode answers the same.
 - Each reply says the level it was answered at, and the coordinator refuses one below
   the search's; a node refuses (503) a search past its own level. A later wire
   addition raises the level, so it is never silently ignored either.

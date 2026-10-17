@@ -483,7 +483,6 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		}
 		segAggs = append(segAggs, sr.aggs)
 	}
-	p.mergeCtx = ctx
 	aggs := mergeShard(ctx, p.aggs, segAggs, g, p)
 	if err := parent.Err(); errors.Is(err, context.Canceled) {
 		return fail(err, "cancelled")

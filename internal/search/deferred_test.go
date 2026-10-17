@@ -290,7 +290,7 @@ func TestReplayCutShort(t *testing.T) {
 	g := c.shards[0].Acquire()
 	defer g.Release()
 
-	replayHook = func(ctx context.Context) { <-ctx.Done() }
+	replayHook = func(ctx context.Context, _ []*ordPartial) { <-ctx.Done() }
 	res, err := ExecuteShard(t.Context(), g, r(300*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +306,7 @@ func TestReplayCutShort(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	replayHook = func(context.Context) { cancel() }
+	replayHook = func(context.Context, []*ordPartial) { cancel() }
 	if res, err := ExecuteShard(ctx, g, r(0)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled during the replay: %+v, %v; want context.Canceled", res, err)
 	}
@@ -315,5 +315,63 @@ func TestReplayCutShort(t *testing.T) {
 	res, err = ExecuteShard(t.Context(), g, r(0))
 	if err != nil || res.TimedOut || len(res.Aggs["t"].Buckets) != 13 {
 		t.Fatalf("uncut: %+v, %v", res, err)
+	}
+}
+
+// TestReplayOutlivesSegments: the replay runs within the shard merge's context, which
+// lasts the shard's whole deadline: once the segments' own has ended (a reserve
+// before it), the replay still finishes, and every bucket's sub-aggregations count
+// its documents. A replay that fails outright (here, a panic) fails the shard, rather
+// than time it out.
+func TestReplayOutlivesSegments(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 300 {
+		c.upsert(fmt.Sprintf("d%03d", i), fmt.Sprintf(`{"tags":["t%d","t%d"],"price":%d}`, i%13, i%7, i))
+	}
+	c.refreshAll()
+	r := &Request{Query: &query.All{}, Timeout: 3 * time.Second, Aggs: map[string]Agg{
+		"t": {Type: AggTerms, Field: "tags", Size: 3, CollectMode: CollectBreadthFirst, Aggs: map[string]Agg{"s": {Type: AggStats, Field: "price"}}},
+	}}
+	defer func() { replayHook = nil }()
+	g := c.shards[0].Acquire()
+	defer g.Release()
+
+	replayHook = func(ctx context.Context, parts []*ordPartial) {
+		for _, p := range parts {
+			if p.deferred != nil {
+				<-p.deferred.s.ctx.Done() // the segments' deadline
+			}
+		}
+		if ctx.Err() != nil {
+			t.Error("the merge's context ended with the segments'")
+		}
+	}
+	res, err := ExecuteShard(t.Context(), g, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := Reduce(t.Context(), []*ShardResult{res}, r).Aggs["t"]
+	if res.TimedOut || len(got.Buckets) == 0 {
+		t.Fatalf("after the segments' deadline: timed out %v, %d buckets", res.TimedOut, len(got.Buckets))
+	}
+	for _, b := range got.Buckets {
+		if b.Aggs["s"].Count != b.DocCount {
+			t.Fatalf("bucket %v: %d documents, stats of %d", b.Key, b.DocCount, b.Aggs["s"].Count)
+		}
+	}
+
+	replayHook = func(_ context.Context, parts []*ordPartial) {
+		for _, p := range parts {
+			if p.deferred != nil {
+				p.deferred.s = &segExec{ctx: t.Context()} // no reader: the replay panics
+			}
+		}
+	}
+	r.Timeout = 0
+	if res, err := ExecuteShard(t.Context(), g, r); err == nil || isCtxErr(err) {
+		t.Fatalf("a failed replay: %+v, %v; want the shard to fail", res, err)
+	}
+	if err := firstFailure([]error{context.DeadlineExceeded, nil, errors.New("boom")}); err == nil || err.Error() != "boom" {
+		t.Fatalf("firstFailure: %v, want boom", err)
 	}
 }

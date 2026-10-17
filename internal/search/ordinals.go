@@ -6,7 +6,6 @@ import (
 	"container/heap"
 	"container/list"
 	"context"
-	"errors"
 	"log/slog"
 	"math"
 	"math/bits"
@@ -1373,8 +1372,9 @@ func keptSubs(ctx context.Context, buckets []*BucketPartial, parts []*ordPartial
 	return nil
 }
 
-// replayHook, when set (by tests), runs as a replay starts, with its context.
-var replayHook func(ctx context.Context)
+// replayHook, when set (by tests), runs as a replay starts, with its context and
+// parts.
+var replayHook func(ctx context.Context, parts []*ordPartial)
 
 // replay reads the deferred parts' documents again, in stretches on the search pool
 // (stretches), collecting spec's sub-aggregations for the ordinals sels keeps: per
@@ -1400,7 +1400,7 @@ func replay(ctx context.Context, parts []*ordPartial, sels [][]int32, buckets in
 		return out, nil
 	}
 	if replayHook != nil {
-		replayHook(ctx)
+		replayHook(ctx, parts)
 	}
 	got := make([][]bucketMetrics, len(tasks))
 	errs := make([]error, len(tasks))
@@ -1412,7 +1412,7 @@ func replay(ctx context.Context, parts []*ordPartial, sels [][]int32, buckets in
 		errs[k] = s.err
 	})
 	if err == nil {
-		err = errors.Join(errs...)
+		err = firstFailure(errs)
 	}
 	if err != nil {
 		return nil, err
@@ -1421,6 +1421,23 @@ func replay(ctx context.Context, parts []*ordPartial, sels [][]int32, buckets in
 		out[t.part] = append(out[t.part], got[k])
 	}
 	return out, nil
+}
+
+// firstFailure is the first of errs that is not a context's, else the first context
+// error, else nil: a stretch that failed outright fails the replay, whatever others
+// ran out of time.
+func firstFailure(errs []error) error {
+	var timeout error
+	for _, err := range errs {
+		switch {
+		case err == nil:
+		case !isCtxErr(err):
+			return err
+		case timeout == nil:
+			timeout = err
+		}
+	}
+	return timeout
 }
 
 // replaySubs collects spec's sub-aggregations over docs for the ordinals sel keeps:

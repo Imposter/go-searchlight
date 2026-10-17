@@ -16,9 +16,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   failed (or refused it for an older wire level), a read now reads the copy table again,
   once per shard (shards of the request, and concurrent reads, share one read), and
   tries the serving copies it has not tried, a peer back at a new address included. The
-  re-read gets at most a quarter of the request's remaining time and 1 s, so a slow
-  database leaves time for the coordinator's own stale copy to answer instead; waiting
-  for the routing reads' turn now gives up at the request's deadline too. Date math
+  read waits on the re-read for at most a quarter of its remaining time and 1 s, so a
+  slow database leaves time for the coordinator's own stale copy to answer instead; the
+  registry read itself runs on for the reads after it, and waiting for the routing
+  reads' turn now gives up at the request's deadline too. Date math
   stays resolved once and `wait_for_seq` holds. `searchlight_cluster_read_rereads_total`
   counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
 

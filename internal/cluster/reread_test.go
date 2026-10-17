@@ -304,7 +304,7 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 			t.Fatal(err)
 		}
 		reads := r.coord.wrap.tableReads.Load()
-		cands, _ := r.coord.n.rerouteCandidates(tctx(t), r.id, r.trailing.readBegan)
+		cands, _, _ := r.coord.n.rerouteCandidates(tctx(t), r.id, r.trailing.readBegan)
 		if len(cands) != 2 {
 			t.Fatalf("the newer view routes to %v, want both copies", cands)
 		}
@@ -459,16 +459,31 @@ func TestRereadFindingNothingNewIsUnavailable(t *testing.T) {
 	})
 }
 
-// TestRereadKeepsTheRequestBudget: a re-read waiting its turn behind a slow registry
-// read gives up within its share of the request's time: the read answers 503 while
+// holdTable makes tn's reads of the whole copy table wait until the test ends (or
+// their own context does): a database that does not answer.
+func holdTable(t *testing.T, tn *tnode) {
+	release := make(chan struct{})
+	hold := func(ctx context.Context) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}
+	tn.wrap.holdTable.Store(&hold)
+	t.Cleanup(func() {
+		tn.wrap.holdTable.Store(nil)
+		close(release)
+	})
+}
+
+// TestRereadKeepsTheRequestBudget: a re-read waiting on a registry read that does not
+// answer gives up within its share of the request's time: the read answers 503 while
 // the request still has time (for the coordinator's own copy, when it holds one), and
 // asks no other copy.
 func TestRereadKeepsTheRequestBudget(t *testing.T) {
 	r := newRereadRig(t)
 	r.reset(r.b.addr)
-	n := r.coord.n
-	n.miss <- struct{}{}
-	defer func() { <-n.miss }()
+	holdTable(t, r.coord)
 	before := r.rereads(t, "get", "timeout")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -490,9 +505,9 @@ func TestRereadKeepsTheRequestBudget(t *testing.T) {
 }
 
 // TestRereadLeavesTimeForTheLocalCopy: a coordinator whose own copy is stale (paused)
-// reads
-// another; when every other copy fails and the re-read is held behind a slow registry
-// read, the search still falls back to the coordinator's copy within its deadline.
+// reads another; when every other copy fails and the re-read waits on a registry read
+// that does not answer, the search still falls back to the coordinator's copy within
+// its deadline.
 func TestRereadLeavesTimeForTheLocalCopy(t *testing.T) {
 	tap := &downTap{base: http.DefaultTransport}
 	tap.set()
@@ -514,8 +529,7 @@ func TestRereadLeavesTimeForTheLocalCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	tap.set(b.addr, c.addr)
-	a.n.miss <- struct{}{}
-	defer func() { <-a.n.miss }()
+	holdTable(t, a)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	res, err := a.n.Search(ctx, "lf", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{})
@@ -527,5 +541,44 @@ func TestRereadLeavesTimeForTheLocalCopy(t *testing.T) {
 	}
 	if tap.count(b.addr)+tap.count(c.addr) == 0 {
 		t.Fatal("no other copy was asked first")
+	}
+}
+
+// TestRereadsOfShortRequestsAreNotStarved: requests with too little time to wait out a
+// slow registry read (a 400 ms deadline gives a re-read 100 ms; the read takes 300 ms)
+// each give up on it, but the read they started goes on and publishes its view, so a
+// later request routed by the same trailing view takes it and is answered.
+func TestRereadsOfShortRequestsAreNotStarved(t *testing.T) {
+	r := newRereadRig(t)
+	r.reset(r.b.addr)
+	slow := func(ctx context.Context) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+		case <-ctx.Done():
+		}
+	}
+	r.coord.wrap.holdTable.Store(&slow)
+	defer r.coord.wrap.holdTable.Store(nil)
+	reads := r.coord.wrap.tableReads.Load()
+	answered := -1
+	for i := range 20 {
+		rt := r.target(r.at(r.b))
+		rt.routed = r.trailing.readBegan
+		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+		_, found, err := rt.Get(ctx, "x")
+		cancel()
+		if err == nil && found {
+			answered = i
+			break
+		}
+	}
+	if answered < 0 {
+		t.Fatal("no request of 20 was answered: every re-read was cut short")
+	}
+	if n := r.coord.wrap.tableReads.Load() - reads; n > 2 {
+		t.Fatalf("the copy table was read %d times, want the requests to share a read", n)
+	}
+	if got := r.rereads(t, "get", "timeout"); got < 1 && answered > 0 {
+		t.Fatalf("requests gave up on the re-read (%d) but none was counted as timed out", answered)
 	}
 }

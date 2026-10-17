@@ -367,10 +367,14 @@ Any node takes any request.
   for an older wire level), the read reads the copy table again, once per shard, and
   tries the serving copies it has not tried, a node at a new address included. A view
   read since the shard was routed (by another shard of the request, or the view loop)
-  serves without a read, and concurrent re-reads share one. A re-read gets at most a
-  quarter of the request's remaining time, and 1 s: one stuck behind a slow database
-  gives up, so the read still has time for the copies it finds and for this node's own
-  copy, which a read falls back to (stale) when no copy elsewhere answers. When nothing
+  serves without a read, and concurrent re-reads share one. A read waits on its re-read
+  for at most a quarter of the request's remaining time, and 1 s, so it still has time
+  for the copies it finds and for this node's own copy, which a read falls back to
+  (stale) when no copy elsewhere answers. The registry read goes on (up to 2 s) after a
+  read stops waiting, and its view serves the reads after it. Registry reads for
+  routing are 75 ms apart, so a re-read that needs one realistically needs 400 ms or
+  more left on the request; one with less mostly gives up, and a later read benefits.
+  When nothing
   new turns up, the copies that refused only for being stale are asked once more,
   accepting a stale answer, and then the shard is a 503.
   `searchlight_cluster_read_rereads_total` counts each shard's re-read (whether it read

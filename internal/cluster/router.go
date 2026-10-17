@@ -65,10 +65,11 @@ func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) (c []candi
 // view when one was read since (another shard of the request, or the view loop, read
 // it), and otherwise a registry read the reads waiting on one share (refreshSince). It
 // is for a read whose every known copy failed: the view it was routed with can trail
-// the registry by a refresh, and miss a copy that serves.
-func (n *Node) rerouteCandidates(ctx context.Context, id store.ShardID, routed time.Duration) ([]candidate, time.Duration) {
-	n.refreshSince(ctx, routed+1)
-	return n.route(id)
+// the registry by a refresh, and miss a copy that serves. gaveUp is refreshSince's.
+func (n *Node) rerouteCandidates(ctx context.Context, id store.ShardID, routed time.Duration) (c []candidate, at time.Duration, gaveUp bool) {
+	gaveUp = n.refreshSince(ctx, routed+1)
+	c, at = n.route(id)
+	return c, at, gaveUp
 }
 
 // missRefreshEvery is the least time between two registry reads routing misses make:
@@ -76,31 +77,70 @@ func (n *Node) rerouteCandidates(ctx context.Context, id store.ShardID, routed t
 // interval, and each miss waits at most that long for a fresh view.
 const missRefreshEvery = 75 * time.Millisecond
 
+// missFlight is a routing registry read under way: began is when it began reading
+// (set before done closes), and done closes once it is over.
+type missFlight struct {
+	began time.Duration
+	done  chan struct{}
+}
+
+// missReadWait bounds a routing registry read. The read runs for every caller waiting
+// on it, under the node's life rather than a caller's context, so a caller whose time
+// runs out does not cut it short for the others.
+const missReadWait = 2 * time.Second
+
 // refreshSince re-reads the registry for routing, unless the published view was read
-// by a read that began at since or later: concurrent callers share one registry read.
-// Reads it makes are missRefreshEvery apart. It gives up, reading nothing, when ctx
-// ends first, waiting for its turn included.
-func (n *Node) refreshSince(ctx context.Context, since time.Duration) {
-	fresh := func() bool { v := n.view.Load(); return v != nil && v.readBegan >= since }
-	if fresh() {
-		return
+// by a read that began at since or later: concurrent callers share one registry read,
+// and reads are missRefreshEvery apart. It reports whether ctx ended first: the caller
+// stops waiting then, and the read goes on for the others.
+func (n *Node) refreshSince(ctx context.Context, since time.Duration) (gaveUp bool) {
+	for {
+		if v := n.view.Load(); v != nil && v.readBegan >= since {
+			return false
+		}
+		n.missMu.Lock()
+		f := n.missFlight
+		if f == nil {
+			f = &missFlight{done: make(chan struct{})}
+			n.missFlight = f
+			if !n.background(func(bctx context.Context) { n.missRead(bctx, f) }) {
+				n.missFlight = nil
+				n.missMu.Unlock()
+				return false
+			}
+		}
+		n.missMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return true
+		}
+		if f.began >= since {
+			return false
+		}
 	}
-	select {
-	case n.miss <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
-	defer func() { <-n.miss }()
-	if fresh() {
-		return
-	}
+}
+
+// missRead is flight f: it waits out the spacing between routing reads, reads the
+// registry, and ends the flight.
+func (n *Node) missRead(ctx context.Context, f *missFlight) {
+	defer func() {
+		n.missMu.Lock()
+		n.missFlight = nil
+		n.missMu.Unlock()
+		close(f.done)
+	}()
 	if wait := missRefreshEvery - n.clock.Since(n.missReadAt); wait > 0 {
-		if n.clock.Sleep(ctx, wait) != nil || fresh() {
+		if n.clock.Sleep(ctx, wait) != nil {
+			f.began = n.lc.Now()
 			return
 		}
 	}
+	f.began = n.lc.Now()
 	n.missReadAt = n.clock.Now()
-	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
+	rctx, cancel := context.WithTimeout(ctx, missReadWait)
+	defer cancel()
+	if err := n.refreshView(rctx); err != nil && ctx.Err() == nil {
 		n.log.DebugContext(ctx, "reading the registry again for routing failed", slog.Any("error", err))
 	}
 }
@@ -400,23 +440,27 @@ func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx conte
 	return api.Unavailable(last, "no copy of shard %d of index %q answered", t.id.Shard, t.id.Index)
 }
 
-// rereadWait bounds a read's copy table re-read (reroute), as does a quarter of the
-// time the request has left: the rest is for the copies it finds and, after them, the
-// coordinator's own copy, which a read falls back to when no copy elsewhere answers.
+// rereadWait bounds how long a read waits on its copy table re-read (reroute), as does
+// a quarter of the time the request has left: the rest is for the copies it finds and,
+// after them, the coordinator's own copy, which a read falls back to when no copy
+// elsewhere answers. The registry read itself goes on for the others (refreshSince).
 const rereadWait = time.Second
 
 // reroute reads the copy table again for the shard, once per read, and reports
-// whether it shows a serving copy the read has not tried. A re-read that runs out of
-// its time leaves the routing as it was.
+// whether it shows a serving copy the read has not tried. A re-read the read stops
+// waiting on (its time ran out, or it had none) leaves the routing as it was.
 func (t *remoteTarget) reroute(ctx context.Context, op string, tried map[string]bool) (bool, error) {
 	t.reread = true
 	budget := rereadWait
 	if dl, ok := ctx.Deadline(); ok {
 		budget = min(budget, time.Until(dl)/4) //nolint:forbidigo // a context deadline is by the process clock
 	}
+	if budget <= 0 {
+		t.n.inst.reread(ctx, op, "timeout")
+		return false, nil
+	}
 	rctx, cancel := context.WithTimeout(ctx, budget)
-	cands, routed := t.n.rerouteCandidates(rctx, t.id, t.routed)
-	timedOut := rctx.Err() != nil
+	cands, routed, timedOut := t.n.rerouteCandidates(rctx, t.id, t.routed)
 	cancel()
 	if ctx.Err() != nil {
 		return false, ctx.Err()
@@ -608,14 +652,16 @@ func (t *remoteTarget) Release() {
 	})
 }
 
-// background runs fn in a goroutine bounded by the node's life; Stop waits for it.
-func (n *Node) background(fn func(ctx context.Context)) {
+// background runs fn in a goroutine bounded by the node's life; Stop waits for it. It
+// reports whether fn runs: not once the node stopped.
+func (n *Node) background(fn func(ctx context.Context)) bool {
 	n.bgMu.Lock()
 	defer n.bgMu.Unlock()
 	if n.bgClosed {
-		return
+		return false
 	}
 	n.bg.Go(func() { fn(n.loopCtx) })
+	return true
 }
 
 // closeBackground stops background work and waits for it.

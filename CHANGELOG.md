@@ -4,7 +4,9 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-17
+
+Fast aggregations: a shard request cache (in memory, optionally Redis), breadth-first `terms`, `min`/`max`, a cardinality `threshold`, global ordinals that survive refreshes, and a `timeout` that bounds the whole shard search.
 
 ### Added
 
@@ -305,5 +307,6 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.2.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.0.0

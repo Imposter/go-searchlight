@@ -15,12 +15,14 @@ var copyIDs atomic.Uint64
 //     with the same three expose the same documents under the same mapping, so a
 //     result is reusable between them however far Seq moved; any refresh that writes,
 //     delete, merge or remap changes them.
-//   - The copy-independent one: IndexUID, Shard, MappingVersion, Seq and SeqMark. Every
-//     copy of a shard that has applied the changelog up to Seq holds the same
-//     documents, whatever its segments. SeqMark, the mark of the change at Seq, tells
-//     the same Seq of two changelog histories apart (a database failover that lost
-//     commits reissues their seqs to other changes). It holds only when SeqMark is set
-//     and MappingVersion and Seq are above 0: see [CacheIdentity.Shareable].
+//   - The copy-independent one: IndexUID, Shard, MappingVersion and what OwnMark says
+//     of the shard's own changes up to Seq (the caller's encoding, which the shard does
+//     not read: replica.OwnContentMark reads it). Every copy that holds the shard's
+//     changes up to the same last one holds the same documents, whatever its
+//     segments, its Seq, or the other shards' writes. The shard's newest applied
+//     change ([Generation.MaxSeq]) is no such key: a copy loaded from a snapshot
+//     holds no deleted document, so its newest change can be an older one than a
+//     tailing copy's with other contents.
 type CacheIdentity struct {
 	// Copy is the open copy's number, unique in the process (a reopened copy gets a
 	// new one).
@@ -36,15 +38,9 @@ type CacheIdentity struct {
 	MappingVersion int64
 	// Seq is [Generation.Seq].
 	Seq int64
-	// SeqMark is the changelog mark of the change at Seq, as the copy recorded it; nil
-	// when it recorded none.
-	SeqMark json.RawMessage
-}
-
-// Shareable reports whether the copy-independent key holds: the index incarnation,
-// the mapping's version and the mark of the change at Seq are all known.
-func (c CacheIdentity) Shareable() bool {
-	return c.IndexUID != "" && c.MappingVersion > 0 && c.Seq > 0 && len(c.SeqMark) > 0
+	// OwnMark is the own mark ([Shard.SetOwnMark]) as of the generation's refresh;
+	// nil when none was recorded.
+	OwnMark json.RawMessage
 }
 
 // CacheIdentity returns the generation's [CacheIdentity].
@@ -57,6 +53,6 @@ func (g *Generation) CacheIdentity() CacheIdentity {
 		IndexUID:       g.uid,
 		MappingVersion: g.mp.version,
 		Seq:            g.seq,
-		SeqMark:        g.marks.seq,
+		OwnMark:        g.marks.own,
 	}
 }

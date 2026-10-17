@@ -1003,7 +1003,7 @@ components:
         request_cache:
           type: boolean
           default: true
-          description: Whether a search with size 0 (a count, or aggregations only) may be answered from, and stored in, each shard's request cache, as Elasticsearch's request_cache. A search with hits is never cached; a timed-out result is never stored.
+          description: Whether a search with size 0 (a count, or aggregations only; no from or search_after) may be answered from, and stored in, each shard's request cache, as Elasticsearch's request_cache. A search with hits, or with date math reading now unrounded (now-7d; now-7d/d is cached), is never cached; a timed-out result is never stored.
     SearchResponse:
       type: object
       additionalProperties: false

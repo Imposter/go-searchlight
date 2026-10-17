@@ -373,8 +373,8 @@ unless `insecure_no_auth` is set.
 | `request_cache_redis_password` | (none) | the Redis password, in place of the URL's; also `SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD_FILE` |
 | `request_cache_redis_prefix` | `searchlight:rc:` | prefix of every key the cache writes to Redis |
 | `request_cache_redis_ttl` | `24h` | how long a Redis entry lives |
-| `request_cache_redis_timeout` | `50ms` | bound of each Redis dial, read and write: a slow or unreachable Redis delays a search by about this much |
-| `request_cache_redis_max_entry_bytes` | `8MiB` | largest encoded shard result written to Redis |
+| `request_cache_redis_timeout` | `50ms` | bound of each Redis call, its dial included: a slow or unreachable Redis delays a search by at most about this much (and is skipped for a while after 5 failures in a row) |
+| `request_cache_redis_max_entry_bytes` | `8MiB` | largest encoded shard result written to or read from Redis |
 | `log_level` | `info` | `debug`, `info`, `warn` or `error` |
 | `pprof` | `false` | serve `/debug/pprof/*` on the admin listener |
 
@@ -385,34 +385,47 @@ aggregation-only searches, such as a facet panel's) and answers an identical sea
 the same shard contents from them, as Elasticsearch's shard request cache does
 ([`request_cache`](api.md#search-and-count)).
 
-- **Always fresh.** An entry is keyed by the request and by what the shard copy holds:
+- **Never stale.** An entry is keyed by the request and by what the shard copy holds:
   a refresh that writes, a delete, a merge or a mapping change makes new keys, and the
   copy's older entries are dropped from memory at the next store. Nothing is
-  invalidated by hand, and a hit is exactly what the search would compute.
+  invalidated by hand. A hit has the counts and buckets the search would compute; a
+  float sum may differ in its last bits (it was summed in another copy's segment
+  order), and the result's segment and scan counts are the computing copy's.
 - **Memory.** `request_cache_size` (128 MiB) bounds the entries' estimated heap,
   least recently used out first; one entry takes at most an eighth of it. Concurrent
-  identical searches of a copy compute once.
+  identical searches of a copy compute once; a search waiting for another's result
+  waits within its own `timeout`.
 - **Redis.** With `request_cache_redis_url` set, the memory cache sits in front of a
   Redis that every node, and every copy of a shard, shares, and that outlives
-  restarts. Its keys name the index incarnation, the shard, the mapping version, the
-  changelog seq the copy has applied and the mark of the change at that seq (so a
-  database failover that reissued seqs never reads another history's results), this
-  binary's version, and a hash of the request: every copy at that seq holds the same
-  documents, whatever its segments. Its values are the shard result as peers send it,
-  compressed with zstd. A copy that has not recorded the mark of its seq (just
-  rebuilt, before its next write or poll) uses its memory cache alone. The seq moves
-  with every write to the database, so a shard's Redis keys change as any index takes
-  writes, while its memory entries change only with its own: Redis pays off most for
-  several nodes, read-heavy clusters, and restarts.
-- **A Redis that fails costs nothing but its hits.** Each call is bounded by
-  `request_cache_redis_timeout` (50 ms), with no retries; a failed read or write is
-  logged (once per 10 s per operation) and counted in
-  `searchlight_search_request_cache_errors_total`, and the shard computes. Writes are
-  made in the background, at most 16 at once.
+  restarts. Its keys name the index incarnation, the shard, the mapping version and
+  the shard's newest change the copy holds (its seq, and its mark: id, commit time and
+  nonce, so a database failover that reissued seqs never reads another history's
+  results), this binary's version, and a hash of the request. Every copy that holds the
+  shard's changes up to that change holds the same documents, whatever its segments
+  and however far writes to other shards and indexes have moved its seq, so a shard
+  nobody writes keeps its keys. A copy uses its memory cache alone until a changelog
+  poll has checked what it holds (after a write to its shard, or a rebuild, until its
+  next poll). Values are the shard result as peers send it, compressed with zstd.
+- **A Redis that fails costs nothing but its hits.** Each call, its dial included, is
+  bounded by `request_cache_redis_timeout` (50 ms) and the search's own `timeout`,
+  with no retries. A failed read or write is logged (once per 10 s per operation),
+  counted in `searchlight_search_request_cache_errors_total`, and the shard computes.
+  After 5 failures in a row Redis is skipped for 1 s, then one call probes it; each
+  failed probe doubles the wait, up to 30 s
+  (`searchlight_search_request_cache_store_open_ratio` is 1 meanwhile). Writes are made in
+  the background, at most 16 at once; those dropped are counted in
+  `searchlight_search_request_cache_writes_dropped_total`.
+- **Redis is trusted, as the database is.** Anyone who can write to it can make
+  searches return forged counts: give it a password (`request_cache_redis_password`),
+  TLS (`rediss://`) on an untrusted network, and no other writers under the prefix.
+  What is read back is bounded (`request_cache_redis_max_entry_bytes`, and at most 8
+  times that decoded) and checked against the request, so a corrupt value is a miss,
+  never a failure.
 - **Expiry.** Redis entries expire after `request_cache_redis_ttl` (24 h); results
-  larger than `request_cache_redis_max_entry_bytes` stay in memory only. Point several
-  clusters at one Redis with different `request_cache_redis_prefix`es, and give the
-  Redis a `maxmemory` with an eviction policy such as `allkeys-lru`.
+  whose encoding is larger than `request_cache_redis_max_entry_bytes` stay in memory
+  only. Point several clusters at one Redis with different
+  `request_cache_redis_prefix`es, and give the Redis a `maxmemory` with an eviction
+  policy such as `allkeys-lru`.
 
 ### Refresh and flush
 
@@ -797,7 +810,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 |---|---|
 | Requests | `searchlight_http_request_duration_seconds` (by route, method, status), `searchlight_http_request_errors_total`, `searchlight_http_requests_inflight` |
 | Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total` |
-| Request cache | `searchlight_search_request_cache_lookups_total` (by `store`, memory or redis, and `result`, hit or miss), `searchlight_search_request_cache_errors_total` (by store and operation: get, set, encode, decode), `searchlight_search_request_cache_evictions_total`, `searchlight_search_request_cache_stored_bytes_total` (written to Redis), `searchlight_search_request_cache_size_bytes`, `searchlight_search_request_cache_entries` |
+| Request cache | `searchlight_search_request_cache_lookups_total` (by `store`, memory or redis, and `result`: hit, miss, or skipped while Redis is skipped), `searchlight_search_request_cache_errors_total` (by store and operation: get, set, encode, decode), `searchlight_search_request_cache_evictions_total`, `searchlight_search_request_cache_stored_bytes_total` (written to Redis), `searchlight_search_request_cache_writes_dropped_total` (by reason: busy, store_failing, closed), `searchlight_search_request_cache_store_open_ratio` (1 while Redis is skipped), `searchlight_search_request_cache_size_bytes`, `searchlight_search_request_cache_entries` |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |

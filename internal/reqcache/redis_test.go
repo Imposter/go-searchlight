@@ -121,3 +121,22 @@ func TestRedisURLErrorsHideThePassword(t *testing.T) {
 		t.Fatalf("NewRedis = %v: want an error without the password", err)
 	}
 }
+
+// TestRedisStoreReadsNoMoreThanMaxEntry: a value past MaxEntryBytes in Redis (written
+// by another client) is ErrTooLarge, read only one byte past the bound.
+func TestRedisStoreReadsNoMoreThanMaxEntry(t *testing.T) {
+	t.Parallel()
+	s, mr := newTestRedis(t, RedisOptions{MaxEntryBytes: 8})
+	if err := mr.Set(DefaultRedisPrefix+"big", strings.Repeat("x", 1000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(context.Background(), "big"); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("Get = %v, want ErrTooLarge", err)
+	}
+	if err := mr.Set(DefaultRedisPrefix+"ok", "12345678"); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := s.Get(context.Background(), "ok"); string(v) != "12345678" || err != nil {
+		t.Fatalf("Get = %q, %v", v, err)
+	}
+}

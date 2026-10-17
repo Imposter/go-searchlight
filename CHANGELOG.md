@@ -14,7 +14,9 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   shard contents, and stored otherwise. Keys hold the request (date math resolved,
   never its `timeout`) and what the shard holds, so a refresh that writes, a delete, a
   merge or a remap misses and no hit is ever stale; concurrent identical searches
-  compute once. A timed-out result is never stored, nor a search with hits.
+  compute once, each waiting within its own `timeout`. Never cached: a search with
+  hits, a `from` or a `search_after`; date math reading `now` unrounded (`now-7d`;
+  `now-7d/d` is cached); a result that timed out.
   - `request_cache: false` on `_search` keeps a search out of it
     ([docs/api.md](docs/api.md#search-and-count)). It travels to peers without a new
     wire level: an older peer has no cache to keep it out of.
@@ -23,12 +25,16 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     `request_cache_redis_password`, `_prefix`, `_ttl`, `_timeout` and
     `_max_entry_bytes`; the URL and the password also from `_FILE`), shared by every
     node and shard copy and kept across restarts. Its entries are keyed by the shard's
-    applied seq, the mark of the change at it, and this binary's version. A Redis that
-    is down or slow fails no search: each call is bounded (50 ms by default), and
-    failures are logged and counted.
+    newest change the copy holds, so writes to other shards and indexes leave them be,
+    and by this binary's version. A Redis that is down or slow fails no search: each
+    call is bounded (50 ms by default, and by the search's `timeout`), a breaker
+    skips it after 5 failures in a row, and failures are logged and counted. What is
+    read back is bounded and checked; Redis is trusted as the database is.
   - Metrics: `searchlight_search_request_cache_lookups_total` (by store and result),
-    `_errors_total`, `_evictions_total`, `_stored_bytes_total`, `_size_bytes` and
-    `_entries`.
+    `_errors_total`, `_evictions_total`, `_stored_bytes_total`,
+    `_writes_dropped_total`, `_store_open_ratio`, `_size_bytes` and `_entries`.
+- The benchmark sends Searchlight's searches with `request_cache: false`, as it does
+  Elasticsearch's.
 
 ## [1.1.0] - 2026-10-17
 

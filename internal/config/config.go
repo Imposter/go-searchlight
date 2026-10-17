@@ -204,10 +204,11 @@ type Config struct {
 	RequestCacheRedisPrefix string
 	// RequestCacheRedisTTL is how long a Redis entry lives.
 	RequestCacheRedisTTL time.Duration
-	// RequestCacheRedisTimeout bounds each Redis dial, read and write: a slow or
+	// RequestCacheRedisTimeout bounds each Redis call, its dial included: a slow or
 	// unreachable Redis delays a search by at most about this much.
 	RequestCacheRedisTimeout time.Duration
-	// RequestCacheRedisMaxEntryBytes is the largest encoded result written to Redis.
+	// RequestCacheRedisMaxEntryBytes is the largest encoded result written to, or read
+	// from, Redis.
 	RequestCacheRedisMaxEntryBytes int64
 }
 
@@ -220,6 +221,15 @@ const MaxBodyLimit = 32<<20 - 1<<10
 // MaxResultWindowLimit is the largest max_result_window: the most hits of one search
 // a shard keeps (search.MaxResultWindow is it).
 const MaxResultWindowLimit = 1_000_000
+
+// The request cache's defaults (request_cache_size and request_cache_redis_*).
+const (
+	DefaultRequestCacheSize               = 128 << 20
+	DefaultRequestCacheRedisPrefix        = "searchlight:rc:"
+	DefaultRequestCacheRedisTTL           = 24 * time.Hour
+	DefaultRequestCacheRedisTimeout       = 50 * time.Millisecond
+	DefaultRequestCacheRedisMaxEntryBytes = 8 << 20
+)
 
 // Default returns the production defaults. StoreURL is empty because it has
 // no default.
@@ -262,11 +272,11 @@ func Default() Config {
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
 
-		RequestCacheSize:               128 << 20,
-		RequestCacheRedisPrefix:        "searchlight:rc:",
-		RequestCacheRedisTTL:           24 * time.Hour,
-		RequestCacheRedisTimeout:       50 * time.Millisecond,
-		RequestCacheRedisMaxEntryBytes: 8 << 20,
+		RequestCacheSize:               DefaultRequestCacheSize,
+		RequestCacheRedisPrefix:        DefaultRequestCacheRedisPrefix,
+		RequestCacheRedisTTL:           DefaultRequestCacheRedisTTL,
+		RequestCacheRedisTimeout:       DefaultRequestCacheRedisTimeout,
+		RequestCacheRedisMaxEntryBytes: DefaultRequestCacheRedisMaxEntryBytes,
 	}
 }
 
@@ -646,12 +656,12 @@ var settings = []setting{
 		format: func(c *Config) string { return c.RequestCacheRedisTTL.String() },
 	},
 	{
-		name: "request_cache_redis_timeout", usage: "bound of each Redis dial, read and write (a slow Redis delays a search by about this much)",
+		name: "request_cache_redis_timeout", usage: "bound of each Redis call, its dial included (a slow Redis delays a search by at most about this much)",
 		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestCacheRedisTimeout, v) },
 		format: func(c *Config) string { return c.RequestCacheRedisTimeout.String() },
 	},
 	{
-		name: "request_cache_redis_max_entry_bytes", usage: "largest encoded shard result written to Redis, e.g. 8MiB",
+		name: "request_cache_redis_max_entry_bytes", usage: "largest encoded shard result written to or read from Redis, e.g. 8MiB",
 		parse: func(c *Config, v string) error {
 			n, err := ParseBytes(v)
 			if err == nil && n == 0 {

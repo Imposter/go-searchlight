@@ -157,8 +157,9 @@ type Request struct {
 	NoBodies bool
 	// NoRequestCache keeps the search out of the shard request cache
 	// ([RequestCache]), as Elasticsearch's request_cache: false does: each shard
-	// computes its result, and stores none. Only searches with Size 0 are cached in
-	// any case.
+	// computes its result, and stores none. Only searches with Size 0 (and no From or
+	// SearchAfter) are cached in any case; [ResolveQueries] sets it for date math
+	// that reads now unrounded.
 	NoRequestCache bool
 
 	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
@@ -667,8 +668,13 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 // does: the query, post_filter and each filter and filters aggregation's, replaced in
 // r (the aggregation maps are copied, never changed). Problems are located as
 // ValidateQueries locates them. The coordinator calls it once per request, so every
-// shard and peer reads the same instant.
+// shard and peer reads the same instant. Date math that reads now with no rounding
+// (now-7d, not now-7d/d) turns r's request cache off (NoRequestCache): it resolves
+// to another instant every millisecond.
 func ResolveQueries(r *Request, now time.Time) []query.Problem {
+	if readsNowUnrounded(r) {
+		r.NoRequestCache = true
+	}
 	var ps []query.Problem
 	r.Query, ps = query.Resolve(r.Query, now)
 	if r.PostFilter != nil {

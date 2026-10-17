@@ -257,13 +257,19 @@ type slPrepared struct {
 
 func (*slPrepared) isPrepared() {}
 
-// Prepare implements Engine: Searchlight takes the body as it is.
+// Prepare implements Engine: Searchlight takes the body as it is, with its request
+// cache off, as Elasticsearch's is: the benchmark measures computing each search.
 func (*Searchlight) Prepare(search []byte) (Prepared, error) {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(search, &keys); err != nil {
 		return nil, fmt.Errorf("searchlight: a search body: %w", err)
 	}
-	return &slPrepared{raw: search, keys: keys}, nil
+	keys["request_cache"] = json.RawMessage("false")
+	raw, err := json.Marshal(keys)
+	if err != nil {
+		return nil, err
+	}
+	return &slPrepared{raw: raw, keys: keys}, nil
 }
 
 type slSearchResponse struct {

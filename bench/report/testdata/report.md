@@ -123,7 +123,7 @@ Top-k with a sort, and `search_after` walks to the stated depth (latency per pag
 
 ## Aggregations
 
-Size 0; Elasticsearch's request cache is off; filters vary per iteration.
+Size 0; both engines' request caches are off; filters vary per iteration.
 
 | workload | engine | load | ops/s | docs/s | p50 | p99 (± run-to-run) | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

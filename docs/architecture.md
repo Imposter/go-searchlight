@@ -183,8 +183,9 @@ data_dir/
    - A search with `size` 0 first asks the shard request cache
      ([`request_cache.go`](../internal/search/request_cache.go)): an LRU in memory
      keyed by the copy's generation, then, when one is configured, a Redis shared by
-     every copy and node, keyed by the shard's applied seq and the mark of the change
-     at it. A complete result is stored in both, a timed-out one in neither.
+     every copy and node, keyed by the shard's newest change the copy holds (as its
+     changelog poll checked it). A complete result is stored in both, a timed-out one
+     in neither.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
    - A range leaf is collected from the point index, or checked on doc values when far

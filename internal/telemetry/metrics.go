@@ -119,6 +119,8 @@ const (
 	MetricSearchRequestCacheStored    = "searchlight.search.request_cache.stored"
 	MetricSearchRequestCacheSize      = "searchlight.search.request_cache.size"
 	MetricSearchRequestCacheEntries   = "searchlight.search.request_cache.entries"
+	MetricSearchRequestCacheDropped   = "searchlight.search.request_cache.writes_dropped"
+	MetricSearchRequestCacheStoreOpen = "searchlight.search.request_cache.store_open"
 
 	// Percolation.
 	MetricPercolateDuration      = "searchlight.percolate.duration"
@@ -197,12 +199,14 @@ var Catalog = []MetricSpec{
 	{MetricSearchFilterCacheLooks, KindCounter, "{lookup}", "Filter cache lookups by index and result (hit or miss).", nil},
 	{MetricSearchDocsScanned, KindCounter, "{document}", "Documents a shard search checked one at a time (residual verification), by index.", nil},
 	{MetricSearchDocsMatched, KindCounter, "{document}", "Documents a shard search matched, by index.", nil},
-	{MetricSearchRequestCacheLookups, KindCounter, "{lookup}", "Shard request cache lookups, by store (memory or redis) and result (hit or miss).", nil},
+	{MetricSearchRequestCacheLookups, KindCounter, "{lookup}", "Shard request cache lookups, by store (memory or redis) and result (hit, miss, or skipped while the store's breaker is open).", nil},
 	{MetricSearchRequestCacheErrors, KindCounter, "{error}", "Shard request cache store failures (the shard computed its result), by store and operation (get, set, encode or decode).", nil},
 	{MetricSearchRequestCacheEvictions, KindCounter, "{entry}", "Shard request cache memory entries evicted for room.", nil},
 	{MetricSearchRequestCacheStored, KindCounter, "By", "Bytes of shard results written to the request cache's shared store, by store.", nil},
 	{MetricSearchRequestCacheSize, KindGauge, "By", "Estimated bytes the shard request cache's memory entries hold.", nil},
 	{MetricSearchRequestCacheEntries, KindGauge, "{entry}", "Entries in the shard request cache's memory.", nil},
+	{MetricSearchRequestCacheDropped, KindCounter, "{write}", "Shard results not written to the request cache's shared store, by reason (busy: too many writes in flight; store_failing: its breaker open; closed).", nil},
+	{MetricSearchRequestCacheStoreOpen, KindGauge, "1", "1 while the request cache's shared store is skipped after failing (its breaker open), else 0, by store.", nil},
 
 	{MetricPercolateDuration, KindHistogram, "s", "Percolation time per document by phase (probe, verify) and index.", FastBuckets},
 	{MetricPercolateCandidates, KindHistogram, "{query}", "Candidate queries per percolated document, by index.", CountBuckets},

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,12 @@ type rcShard struct {
 	t   testing.TB
 	s   *shard.Shard
 	seq int64
+	own int64 // the seq of the shard's newest change
 }
+
+// testContent stands in for replica.OwnContentMark: rcShard's own marks name the
+// shard's newest change as they are.
+func testContent(own json.RawMessage, _ int64) json.RawMessage { return own }
 
 func newRCShard(t testing.TB) *rcShard {
 	t.Helper()
@@ -46,6 +52,7 @@ func newRCShard(t testing.TB) *rcShard {
 func (r *rcShard) apply(ch shard.Change) {
 	r.t.Helper()
 	r.seq++
+	r.own = r.seq
 	ch.Seq, ch.IndexUID = r.seq, "uid-products"
 	if err := r.s.Apply(context.Background(), []shard.Change{ch}); err != nil {
 		r.t.Fatalf("Apply: %v", err)
@@ -66,11 +73,11 @@ func (r *rcShard) del(id string) {
 	r.apply(shard.Change{Kind: shard.Delete, DocID: id})
 }
 
-// refresh publishes what was applied, with the mark every copy records of the
-// change at its seq.
+// refresh publishes what was applied, with the own mark every copy records of the
+// shard's newest change.
 func (r *rcShard) refresh() {
 	r.t.Helper()
-	r.s.SetMark(r.seq, json.RawMessage(fmt.Sprintf(`{"seq":%d,"nonce":7}`, r.seq)))
+	r.s.SetOwnMark(json.RawMessage(fmt.Sprintf(`{"seq":%d,"nonce":7}`, r.own)))
 	if err := r.s.Refresh(context.Background()); err != nil {
 		r.t.Fatalf("Refresh: %v", err)
 	}
@@ -152,12 +159,12 @@ func TestRequestCacheHitIsIdentical(t *testing.T) {
 
 func TestRequestCacheKeyIgnoresTimeoutAndIndexLabel(t *testing.T) {
 	a := parseReq(t, `{"size":0,"timeout":"1s","aggs":{"b":{"terms":{"field":"brand"}}}}`)
-	b := parseReq(t, `{"size":0,"timeout":"5s","aggregations":{"b":{"terms":{"field":"brand"}}}}`)
+	b := parseReq(t, `{"size":0,"timeout":"5s","sort":[{"price":"desc"}],"aggregations":{"b":{"terms":{"field":"brand"}}}}`)
 	b.Index = "other"
 	ka, _ := requestCacheKey(a)
 	kb, _ := requestCacheKey(b)
 	if !bytes.Equal(ka, kb) {
-		t.Fatal("the timeout, the aggs spelling or the index label changed the key")
+		t.Fatal("the timeout, the sort, the aggs spelling or the index label changed the key")
 	}
 	for _, raw := range []string{
 		`{"size":0,"aggs":{"b":{"terms":{"field":"brand","size":5}}}}`,
@@ -237,7 +244,7 @@ func TestRequestCacheSeqOnlyRefreshStillHits(t *testing.T) {
 	s := newRCShard(t)
 	s.fill(20)
 	st := newMemStore()
-	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st})
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent})
 	req := parseReq(t, `{"size":0}`)
 	s.search(c, req)
 	if err := s.s.Advance(s.seq + 100); err != nil {
@@ -249,10 +256,15 @@ func TestRequestCacheSeqOnlyRefreshStillHits(t *testing.T) {
 	s.search(c, req)
 	wantStats(t, c, 2, 1)
 	c.writes.Wait()
-	// The memory hit at the new seq wrote the result under the new seq's key, once,
-	// for the other copies there.
-	if n := st.writes.Load(); n != 2 {
-		t.Fatalf("%d store writes, want 2", n)
+	// Writes elsewhere moved the seq, not what the shard holds: its store key stands,
+	// and a copy on another node at the new seq reads it.
+	if n := st.writes.Load(); n != 1 {
+		t.Fatalf("%d store writes, want 1", n)
+	}
+	other := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent})
+	s.search(other, req)
+	if got := other.Stats(); got.StoreHits != 1 {
+		t.Fatalf("another node's stats %v: want a store hit at the new seq", got)
 	}
 }
 
@@ -264,6 +276,8 @@ func TestRequestCacheNeverCaches(t *testing.T) {
 		`{"size":0,"request_cache":false,"aggs":{"b":{"terms":{"field":"brand"}}}}`,
 		`{"size":5,"aggs":{"b":{"terms":{"field":"brand"}}}}`,
 		`{"size":5,"request_cache":true}`,
+		`{"size":0,"from":5}`,
+		`{"size":0,"search_after":["x"]}`,
 	} {
 		for range 2 {
 			s.search(c, parseReq(t, raw))
@@ -317,11 +331,24 @@ func TestRequestCacheDateMath(t *testing.T) {
 	s.search(c, at(rounded, day.Add(3*time.Hour)))
 	wantStats(t, c, 1, 1)
 	exact := `{"size":0,"query":{"field":"created","op":"gte","value":"now-7d"}}`
+	if r := at(exact, day); !r.NoRequestCache {
+		t.Fatal("unrounded now left the request cache on")
+	}
+	if r := at(rounded, day); r.NoRequestCache {
+		t.Fatal("rounded now turned the request cache off")
+	}
+	for _, raw := range []string{
+		`{"size":0,"post_filter":{"field":"created","op":"between","value":["2026-01-01","now"]}}`,
+		`{"size":0,"aggs":{"recent":{"filter":{"field":"created","op":"gt","value":"now-1h"}}}}`,
+		`{"size":0,"aggs":{"f":{"filters":{"filters":{"a":{"field":"created","op":"lt","value":"now+1d"}}}}}}`,
+	} {
+		if !at(raw, day).NoRequestCache {
+			t.Errorf("%s: unrounded now left the request cache on", raw)
+		}
+	}
 	s.search(c, at(exact, day))
-	s.search(c, at(exact, day.Add(time.Millisecond)))
-	wantStats(t, c, 1, 3)
 	s.search(c, at(exact, day))
-	wantStats(t, c, 2, 3)
+	wantStats(t, c, 1, 1)
 }
 
 // TestRequestCacheComputesOnce: concurrent identical searches compute once.
@@ -418,11 +445,11 @@ func TestCachedResultEncodingRoundTrips(t *testing.T) {
 	for _, raw := range []string{rcAggs, `{"size":0,"track_total":true}`, `{"size":0,"aggs":{"g":{"global":{},"aggs":{"n":{"cardinality":{"field":"brand"}}}}}}`} {
 		req := parseReq(t, raw)
 		res := s.search(nil, req)
-		enc, err := encodeCachedResult(res)
+		enc, err := encodeCachedResult(res, 8<<20)
 		if err != nil {
 			t.Fatal(err)
 		}
-		dec, err := decodeCachedResult(enc)
+		dec, err := decodeCachedResult(enc, 8<<20, req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -440,7 +467,7 @@ func TestCachedResultEncodingRoundTrips(t *testing.T) {
 			}
 		}
 		enc[0]++
-		if _, err := decodeCachedResult(enc); err == nil {
+		if _, err := decodeCachedResult(enc, 8<<20, req); err == nil {
 			t.Fatal("a value of another format decoded")
 		}
 	}
@@ -497,8 +524,8 @@ func TestRequestCacheSharedAcrossCopies(t *testing.T) {
 		b.put(fmt.Sprintf("d%d", i), body)
 	}
 	b.refresh()
-	nodeA := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, Version: "v1"})
-	nodeB := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, Version: "v1"})
+	nodeA := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent, Version: "v1"})
+	nodeB := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent, Version: "v1"})
 	req := parseReq(t, rcAggs)
 	fromA := a.search(nodeA, req)
 	nodeA.writes.Wait()
@@ -516,20 +543,20 @@ func TestRequestCacheSharedAcrossCopies(t *testing.T) {
 	if s := nodeB.Stats(); s.Hits != 1 || st.gets.Load() != 2 {
 		t.Fatalf("node B stats %v, %d store reads: the store hit was not kept in memory", s, st.gets.Load())
 	}
-	restarted := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, Version: "v1"})
+	restarted := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent, Version: "v1"})
 	b.search(restarted, req)
 	if s := restarted.Stats(); s.StoreHits != 1 {
 		t.Fatalf("restarted node stats %v: want a store hit", s)
 	}
-	upgraded := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, Version: "v2"})
+	upgraded := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent, Version: "v2"})
 	b.search(upgraded, req)
 	if s := upgraded.Stats(); s.StoreHits != 0 || s.StoreMisses != 1 {
 		t.Fatalf("upgraded node stats %v: another release read the entry", s)
 	}
 }
 
-// TestRequestCacheStoreNeedsAMark: a copy whose seq has no mark is not shareable: the
-// store is never asked.
+// TestRequestCacheStoreNeedsAMark: a copy whose own mark names no change of its
+// shard is not shareable: the store is never asked.
 func TestRequestCacheStoreNeedsAMark(t *testing.T) {
 	st := newMemStore()
 	s := newRCShard(t)
@@ -537,7 +564,7 @@ func TestRequestCacheStoreNeedsAMark(t *testing.T) {
 	if err := s.s.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st})
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20, Store: st, ContentMark: testContent})
 	s.search(c, parseReq(t, `{"size":0}`))
 	c.writes.Wait()
 	if st.gets.Load() != 0 || st.writes.Load() != 0 {
@@ -551,7 +578,7 @@ func TestRequestCacheStoreDown(t *testing.T) {
 	st.fail = true
 	s := newRCShard(t)
 	s.fill(30)
-	c := NewRequestCache(RequestCacheOptions{Store: st, Logger: quiet})
+	c := NewRequestCache(RequestCacheOptions{Store: st, ContentMark: testContent, Logger: quiet})
 	req := parseReq(t, `{"size":0,"aggs":{"b":{"terms":{"field":"brand"}}}}`)
 	for range 3 {
 		if got := s.search(c, req); got.Total != 30 {
@@ -589,10 +616,10 @@ func BenchmarkRequestCache(b *testing.B) {
 	})
 	b.Run("store_hit", func(b *testing.B) {
 		st := newMemStore()
-		warm := NewRequestCache(RequestCacheOptions{Store: st})
+		warm := NewRequestCache(RequestCacheOptions{Store: st, ContentMark: testContent})
 		s.search(warm, req)
 		warm.writes.Wait()
-		c := NewRequestCache(RequestCacheOptions{Store: st})
+		c := NewRequestCache(RequestCacheOptions{Store: st, ContentMark: testContent})
 		b.ReportAllocs()
 		for b.Loop() {
 			if _, err := s.searchCtx(context.Background(), c, req); err != nil {
@@ -616,15 +643,15 @@ func TestRequestCacheOnRedis(t *testing.T) {
 	a, b := newRCShard(t), newRCShard(t)
 	a.fill(100)
 	b.fill(100)
-	nodeA := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: redis(), Version: "v1", Logger: quiet})
-	nodeB := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: redis(), Version: "v1", Logger: quiet})
+	nodeA := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: redis(), ContentMark: testContent, Version: "v1", Logger: quiet})
+	nodeB := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: redis(), ContentMark: testContent, Version: "v1", Logger: quiet})
 	defer nodeB.Close()
 	req := parseReq(t, rcAggs)
 	want := reduceOne(req, a.search(nodeA, req))
 	if err := nodeA.Close(); err != nil { // waits for the write
 		t.Fatal(err)
 	}
-	if keys := mr.Keys(); len(keys) != 1 || !strings.HasPrefix(keys[0], reqcache.DefaultRedisPrefix+"1:products:0:") {
+	if keys := mr.Keys(); len(keys) != 1 || !strings.HasPrefix(keys[0], reqcache.DefaultRedisPrefix+strconv.Itoa(requestCacheFormat)+":products:0:") {
 		t.Fatalf("Redis keys %v", keys)
 	}
 	if got := reduceOne(req, b.search(nodeB, req)); !reflect.DeepEqual(got, want) {
@@ -649,5 +676,158 @@ func TestRequestCacheOnRedis(t *testing.T) {
 	}
 	if s := nodeB.Stats(); s.StoreErrors < 2 || s.Hits != 2 {
 		t.Fatalf("stats %v: want Redis errors, and the memory cache still answering", s)
+	}
+}
+
+func encodeJSONValue(t *testing.T, js string) []byte {
+	t.Helper()
+	return rcEncoder().EncodeAll([]byte(js), []byte{requestCacheFormat})
+}
+
+// TestCachedResultDecodeRefusesForgeries: a value that is too large, of another
+// format, or not a shard result of its request decodes to an error, never a panic.
+func TestCachedResultDecodeRefusesForgeries(t *testing.T) {
+	req := parseReq(t, `{"size":0,"aggs":{"n":{"cardinality":{"field":"brand"}},"b":{"terms":{"field":"brand"},"aggs":{"p":{"stats":{"field":"price"}}}}}}`)
+	ok := `{"hits":null,"total":3,"total_relation":"eq","aggs":{"n":{"type":"cardinality","sketch":{"p":14,"hashes":[1,2,3]}},"b":{"type":"terms","buckets":[{"key":"x","doc_count":3,"aggs":{"p":{"type":"stats","stats":{"count":3,"sum":6,"min":1,"max":3}}}}]}},"timed_out":false,"segments":1,"scanned":0}`
+	const maxEntry = 4096
+	if _, err := decodeCachedResult(encodeJSONValue(t, ok), maxEntry, req); err != nil {
+		t.Fatalf("a valid value: %v", err)
+	}
+	big := `{"total":1,"total_relation":"eq","pad":"` + strings.Repeat("x", 100_000) + `"}`
+	for name, raw := range map[string][]byte{
+		"empty":           nil,
+		"other format":    append([]byte{requestCacheFormat + 1}, encodeJSONValue(t, ok)[1:]...),
+		"not zstd":        append([]byte{requestCacheFormat}, "garbage"...),
+		"not json":        encodeJSONValue(t, `{"total":`),
+		"past max entry":  append(encodeJSONValue(t, ok), make([]byte, maxEntry)...),
+		"decodes too big": encodeJSONValue(t, big),
+		"timed out":       encodeJSONValue(t, strings.Replace(ok, `"timed_out":false`, `"timed_out":true`, 1)),
+		"hits":            encodeJSONValue(t, strings.Replace(ok, `"hits":null`, `"hits":[{"id":"a","sort":null}]`, 1)),
+		"bad relation":    encodeJSONValue(t, strings.Replace(ok, `"eq"`, `"lt"`, 1)),
+		"unknown agg":     encodeJSONValue(t, strings.Replace(ok, `"n":{`, `"zz":{`, 1)),
+		"wrong type":      encodeJSONValue(t, strings.Replace(ok, `"type":"cardinality"`, `"type":"terms"`, 1)),
+		"precision":       encodeJSONValue(t, strings.Replace(ok, `"p":14`, `"p":12`, 1)),
+		"registers":       encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"AAAA"`, 1)),
+		"unsorted hashes": encodeJSONValue(t, strings.Replace(ok, `[1,2,3]`, `[3,2,1]`, 1)),
+		"nil bucket":      encodeJSONValue(t, strings.Replace(ok, `"buckets":[{`, `"buckets":[null,{`, 1)),
+		"object key":      encodeJSONValue(t, strings.Replace(ok, `"key":"x"`, `"key":{"a":1}`, 1)),
+		"negative count":  encodeJSONValue(t, strings.Replace(ok, `"doc_count":3`, `"doc_count":-3`, 1)),
+		"unknown sub-agg": encodeJSONValue(t, strings.Replace(ok, `"aggs":{"p":`, `"aggs":{"q":`, 1)),
+		"nil partial":     encodeJSONValue(t, strings.Replace(ok, `"n":{"type":"cardinality","sketch":{"p":14,"hashes":[1,2,3]}}`, `"n":null`, 1)),
+		"negative total":  encodeJSONValue(t, strings.Replace(ok, `"total":3`, `"total":-1`, 1)),
+	} {
+		if res, err := decodeCachedResult(raw, maxEntry, req); err == nil {
+			t.Errorf("%s: decoded %+v", name, res)
+		}
+	}
+}
+
+// TestRequestCacheForgedStoreValueIsAMiss: a corrupt value under the right key is a
+// store error, and the shard computes.
+func TestRequestCacheForgedStoreValueIsAMiss(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(30)
+	st := newMemStore()
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: st, ContentMark: testContent, Logger: quiet})
+	req := parseReq(t, `{"size":0,"aggs":{"n":{"cardinality":{"field":"brand"}}}}`)
+	rk, _ := requestCacheKey(req)
+	g := s.s.Acquire()
+	key := c.sharedKey(g.CacheIdentity(), rk)
+	g.Release()
+	if key == "" {
+		t.Fatal("no shared key")
+	}
+	st.m[key] = encodeJSONValue(t, `{"total":30,"total_relation":"eq","aggs":{"n":{"type":"cardinality","sketch":{"p":4,"registers":"AAAAAAAAAAAAAAAAAAAAAA=="}}}}`)
+	got := s.search(c, req)
+	if want := s.search(nil, req); !reflect.DeepEqual(reduceOne(req, got), reduceOne(req, want)) {
+		t.Fatal("a forged value was served")
+	}
+	if s := c.Stats(); s.StoreErrors != 1 || s.StoreHits != 0 {
+		t.Fatalf("stats %v: want one decode error", s)
+	}
+}
+
+// gatedStore is a memStore whose Gets wait for their context, or release.
+type gatedStore struct {
+	*memStore
+	release chan struct{}
+}
+
+func (s *gatedStore) Get(ctx context.Context, key string) ([]byte, error) {
+	select {
+	case <-s.release:
+		return s.memStore.Get(ctx, key)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// TestRequestCacheTimeoutsCoverWaitsAndTheStore: a search's timeout bounds its store
+// read and its wait for another identical search, and it then runs with what is left
+// of it (none), as an uncached search out of time does.
+func TestRequestCacheTimeoutsCoverWaitsAndTheStore(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(30)
+	st := &gatedStore{memStore: newMemStore(), release: make(chan struct{})}
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: st, ContentMark: testContent, Logger: quiet})
+	slow := parseReq(t, `{"size":0,"aggs":{"b":{"terms":{"field":"brand"}}}}`)
+	leader := make(chan *ShardResult, 1)
+	go func() { leader <- s.search(c, slow) }()
+	// The leader waits on the store, with no timeout; a waiter with one gives up.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		n := len(c.flights)
+		c.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the leader never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waiter := parseReq(t, `{"size":0,"timeout":"30ms","aggs":{"b":{"terms":{"field":"brand"}}}}`)
+	start := time.Now()
+	res := s.search(c, waiter)
+	close(st.release)
+	if d := time.Since(start); (!res.TimedOut && res.Total != 30) || d > 2*time.Second {
+		t.Fatalf("the waiter answered %+v after %v", res, d)
+	}
+	if got := <-leader; got.TimedOut || got.Total != 30 {
+		t.Fatalf("the leader answered %+v", got)
+	}
+
+	// A leader whose store read outlasts its timeout times out too.
+	st2 := &gatedStore{memStore: newMemStore(), release: make(chan struct{})}
+	c2 := NewRequestCache(RequestCacheOptions{Store: st2, ContentMark: testContent, Logger: quiet})
+	start = time.Now()
+	res = s.search(c2, parseReq(t, `{"size":0,"timeout":"30ms"}`))
+	if d := time.Since(start); (!res.TimedOut && res.Total != 30) || d > 2*time.Second {
+		t.Fatalf("the leader answered %+v after %v", res, d)
+	}
+	if got := c2.Stats(); got.StoreErrors != 0 {
+		t.Fatalf("stats %v: a read the search gave up on counted as a store failure", got)
+	}
+}
+
+// TestRequestCacheCloseDropsLateWrites: a store write that would start after Close is
+// dropped, and counted.
+func TestRequestCacheCloseDropsLateWrites(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(5)
+	st := newMemStore()
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 1 << 20, Store: st, ContentMark: testContent})
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.search(c, parseReq(t, `{"size":0}`)); got.Total != 5 {
+		t.Fatalf("total %d", got.Total)
+	}
+	if got := c.Stats(); got.DroppedWrites != 1 || st.writes.Load() != 0 {
+		t.Fatalf("stats %v, %d writes: want the write dropped", got, st.writes.Load())
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

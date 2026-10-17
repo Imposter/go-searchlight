@@ -54,13 +54,22 @@ func TestRequestCacheOnANode(t *testing.T) {
 	if s := n.RequestCacheStats(); s.Hits < 2 {
 		t.Fatalf("stats %v: want both shards' second search answered from memory", s)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for len(mr.Keys()) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("Redis holds %v: want both shards' results", mr.Keys())
+	// A copy's contents are named for Redis once a poll has checked its own mark;
+	// a memory hit after that writes the result there.
+	waitKeys := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for len(mr.Keys()) < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("Redis holds %v: want %d results", mr.Keys(), want)
+			}
+			if _, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
+	waitKeys(2)
 
 	res = mustWrite(t, n, "rc", upsert("late", `{"brand": "b9", "n": 100}`))
 	after, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitForSeq: res.Seq})
@@ -69,6 +78,11 @@ func TestRequestCacheOnANode(t *testing.T) {
 	}
 	if after.Total != 41 {
 		t.Fatalf("total %d after a write, want 41", after.Total)
+	}
+	// The write changed one shard: its new result is a third key, the other's stands.
+	waitKeys(3)
+	if keys := len(mr.Keys()); keys != 3 {
+		t.Fatalf("%d Redis keys, want 3", keys)
 	}
 	if err := n.Close(ctx(t)); err != nil {
 		t.Fatal(err)

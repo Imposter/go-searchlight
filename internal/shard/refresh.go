@@ -281,6 +281,9 @@ func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*
 	}
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
+	if s.opts.Published != nil {
+		s.opts.Published(g)
+	}
 }
 
 // publishSeq publishes the current segments as covering seq: a refresh with nothing

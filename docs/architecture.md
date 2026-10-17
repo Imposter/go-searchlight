@@ -163,8 +163,23 @@ data_dir/
   - The global-ordinals cache keeps, per field and segment list, the map from each
     segment's term ordinals to the shard's sorted union of them: up to 256 MiB, built
     by a terms or cardinality aggregation over many of the field's terms, at a cost
-    that grows with its distinct terms, and dropped when a refresh or merge replaces
-    the segment list.
+    that grows with its distinct terms. A refresh or merge makes a new segment list,
+    whose ordinals are derived from the old list's when that is cheaper than a full
+    merge of the dictionaries: the segments kept keep their maps (renumbered), a
+    removed segment's map and the terms it alone held go, and an added segment's
+    terms are looked up in the old dictionary in one ascending galloping pass and
+    inserted where missing, which gives exactly the full build's ordinals. A small
+    refresh segment is derived; a merge into a segment holding much of the field is
+    built in full. After each refresh or merge the fields searches used over the
+    shard in the last 10 minutes are rebuilt in the background. Every build takes a
+    slot of one pool (a quarter of the CPUs); a shard's field has at most one in
+    flight, which a newer generation's supersedes, and a closing shard cancels its
+    builds, waits for them and drops its entries. A search's build is served before
+    queued warm ones. A build runs detached from the search that asked, once for
+    every search asking: a search never waits on a queued build and on a running one
+    at most 250 ms, then merges by term, exactly, and the build finishes and is
+    cached for the next. The old
+    list's entry is dropped once the new one's is cached.
   - The OS page cache holds the mmap'd files.
 - **Format versions.** The segment format is versioned (major 3). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:

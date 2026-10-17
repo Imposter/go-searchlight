@@ -1,13 +1,16 @@
 package shard
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -172,6 +175,56 @@ type QuerySegmentView struct {
 	Live       uint32
 }
 
+// backgroundWait bounds how long a shard's shutdown waits for the background work
+// over its generations ([Generation.Background]) once it has cancelled it.
+const backgroundWait = 10 * time.Second
+
+// bgWork counts the background work over a shard's generations, for its shutdown to
+// wait on.
+type bgWork struct {
+	mu      sync.Mutex
+	n       int
+	closing bool
+	idle    chan struct{} // closed when n reaches 0 during shutdown
+}
+
+// add registers one piece of work: false once shutdown has begun.
+func (b *bgWork) add() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closing {
+		return false
+	}
+	b.n++
+	return true
+}
+
+func (b *bgWork) done() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.n--
+	if b.n == 0 && b.idle != nil {
+		close(b.idle)
+		b.idle = nil
+	}
+}
+
+// wait refuses new work and returns a channel closed once the work in flight is done.
+func (b *bgWork) wait() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closing = true
+	if b.n == 0 {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	if b.idle == nil {
+		b.idle = make(chan struct{})
+	}
+	return b.idle
+}
+
 // Generation is an immutable view of the shard: its segments and query segments, with
 // deletes, as of one refresh or merge. Acquire one with [Shard.Acquire] and Release it
 // when done; everything it exposes is valid in between, and never changes.
@@ -253,6 +306,40 @@ func (g *Generation) tryRef() bool {
 			return true
 		}
 	}
+}
+
+// Background adds a reference to a generation the caller holds, for background work
+// that outlives the caller's hold (a cache build over its segments), and registers
+// the work with the shard: its shutdown cancels Context, then waits (at most
+// backgroundWait) for the work to call release, which also drops the reference. ok is
+// false when the generation is already retired or its shard shutting down.
+func (g *Generation) Background() (release func(), ok bool) {
+	if !g.tryRef() {
+		return nil, false
+	}
+	if g.shard == nil {
+		return g.Release, true
+	}
+	if !g.shard.background.add() {
+		g.Release()
+		return nil, false
+	}
+	return sync.OnceFunc(func() {
+		g.Release()
+		g.shard.background.done()
+	}), true
+}
+
+// Shard is the shard that published the generation: for caches kept per shard.
+func (g *Generation) Shard() *Shard { return g.shard }
+
+// Context is the lifetime of the generation's shard: done once the shard shuts down
+// (Close or Abandon), for background work over the generation to stop.
+func (g *Generation) Context() context.Context {
+	if g.shard == nil || g.shard.bg == nil {
+		return context.Background()
+	}
+	return g.shard.bg
 }
 
 // Release drops the reference Acquire gave. The generation, and every bitmap and

@@ -230,6 +230,11 @@ type Options struct {
 	Logger *slog.Logger
 	Tracer trace.Tracer
 	Meter  metric.Meter
+	// Published, when set, is called with each generation a refresh or merge publishes
+	// (new segments or new deletes), once it is current, under the shard's commit lock: it
+	// must not block, and takes its own reference ([Generation.Retain]) to use the
+	// generation past the call. Search uses it to warm caches kept per segment list.
+	Published func(*Generation)
 
 	// hooks are test kill points; nil outside tests.
 	hooks *testHooks
@@ -396,6 +401,8 @@ type Shard struct {
 	// shutdownDone is closed when shutdown has finished: a second Close waits on it.
 	shutdownDone chan struct{}
 	jan          *janitor
+	// background is the work over the shard's generations its shutdown waits for.
+	background bgWork
 }
 
 // Open opens the shard copy in dir, creating dir if needed: it reads the manifest,
@@ -1011,6 +1018,13 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
+		bgTimer := time.NewTimer(backgroundWait) //nolint:forbidigo // bounds other goroutines' real work, which a test's fake clock does not drive
+		select {
+		case <-s.background.wait():
+		case <-bgTimer.C:
+			s.log.Warn("shard closed with background work over its generations still running")
+		}
+		bgTimer.Stop()
 		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()

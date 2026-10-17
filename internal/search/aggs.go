@@ -1157,7 +1157,8 @@ func (s *segExec) aggregate(hits, live *roaring.Bitmap) map[string]*AggPartial {
 // aggregateSpecs collects specs over hits, as top-level aggregations: the request's
 // over its hits, or a filter, filters or global aggregation's over a bucket's
 // documents. A stats aggregation over every document of a segment with no deletes is
-// the number column's own stats.
+// the number column's own stats. The context is checked before each aggregation, the
+// dense counts from the index included: nil once it ends (see checkCtx).
 func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) map[string]*AggPartial {
 	if len(specs) == 0 {
 		return nil
@@ -1168,6 +1169,9 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 	s.collecting = hits.GetCardinality()
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
 	for i, spec := range specs {
+		if s.checkCtx() {
+			return nil
+		}
 		if spec.wrapper() {
 			continue
 		}
@@ -1531,17 +1535,11 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 // mergeShard merges the segments' partials of specs (one map per segment searched)
 // into the shard's: by key, exactly; ordinal partials by global ordinal or by term
 // (finishOrds); and a filter, filters or global aggregation bucket by bucket, the
-// aggregations under each merged as top-level ones are. Its error is the first
-// finishOrds returned, whose aggregation is left empty; the others are merged still.
-func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) (map[string]*AggPartial, error) {
+// aggregations under each merged as top-level ones are. Once ctx ends, the rest are
+// left empty and the search cut short (prepared.cut).
+func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) map[string]*AggPartial {
 	if len(specs) == 0 {
-		return nil, nil
-	}
-	var first error
-	keep := func(err error) {
-		if first == nil {
-			first = err
-		}
+		return nil
 	}
 	out := make(map[string]*AggPartial, len(specs))
 	for _, spec := range specs {
@@ -1557,11 +1555,14 @@ func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPar
 						subs = append(subs, part.Buckets[i].Aggs)
 					}
 				}
-				var err error
-				b.Aggs, err = mergeShard(ctx, spec.subs, subs, g, p)
-				keep(err)
+				b.Aggs = mergeShard(ctx, spec.subs, subs, g, p)
 				dst.Buckets = append(dst.Buckets, b)
 			}
+			continue
+		}
+		if ctx.Err() != nil {
+			p.cut.Store(true)
+			mergePartial(dst, emptyPartial(spec), spec)
 			continue
 		}
 		var ords []*ordPartial
@@ -1574,10 +1575,10 @@ func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPar
 			mergePartial(dst, part, spec)
 		}
 		if len(ords) > 0 {
-			keep(finishOrds(ctx, dst, ords, spec, g, p))
+			finishOrds(ctx, dst, ords, spec, g, p)
 		}
 	}
-	return out, first
+	return out
 }
 
 // cutShardAggs finishes the shard's partials of specs with cutShard, the aggregations

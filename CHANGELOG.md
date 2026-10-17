@@ -30,6 +30,29 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ### Changed
 
+- **Global ordinals survive refreshes.** A refresh's or merge's new segment list
+  derives a field's global ordinals from the old list's (the kept segments' maps
+  renumbered, the new segments' terms looked up and inserted), exactly as a full
+  build would make them, when that is cheaper than merging every dictionary again;
+  after each refresh or merge the fields aggregated in the last 10 minutes are
+  rebuilt in the background. Every build, a search's or a warm's, takes a slot of
+  one pool of a quarter of the CPUs, searches' first; a search never waits on a
+  queued build, and on a running one at most 250 ms; a shard's field has one build
+  in flight, which a newer generation's supersedes; a closing shard cancels its
+  builds, waits for them and drops its entries. A build runs once for every search asking, detached from them: one a
+  search's deadline stops waiting for finishes and is cached for the next search
+  instead of being thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
+  metrics: `searchlight_search_ordinals_builds_total`,
+  `searchlight_search_ordinals_build_duration_seconds` and
+  `searchlight_search_ordinals_lookups_total`.
+- **`timeout` bounds each shard's whole search.** The deadline (the earlier of
+  `timeout` and `request_timeout`) now covers each shard's merge of its segments'
+  aggregations and the dense counts from the index, not only the segment scan:
+  segments stop a tenth of the budget (1 ms to 1 s) early, an aggregation whose
+  global ordinals are still building merges by term rather than wait past the
+  deadline, and only one the deadline cuts off even so is answered empty, with
+  `timed_out: true` ([docs/api.md](docs/api.md#search-and-count)). A search
+  cancelled during the merge returns its cancellation.
 - `stats`' `min` and `max` read `-0` as `0`, as `min`, `max` and every bucket key do.
 - A deadline that passes while a shard reads its hits again for breadth-first
   sub-aggregations leaves that `terms` aggregation empty on the shard, with

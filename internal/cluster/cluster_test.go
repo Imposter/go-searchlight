@@ -80,6 +80,27 @@ func waitCopies(t testing.TB, st store.Store, index string, shards, want int, d 
 	})
 }
 
+// waitRoutes waits until tn's own view of the registry, which it routes reads by,
+// lists want serving copies of every shard of index, its own included. waitCopies reads
+// the registry itself, which a node's view may trail by a refresh: a test that fails a
+// read on purpose and counts on its retry on another copy waits for both.
+func waitRoutes(t testing.TB, tn *tnode, index string, shards, want int, d time.Duration) {
+	t.Helper()
+	eventually(t, d, fmt.Sprintf("node %d routes to %d copies per shard of %s", tn.i, want, index), func() error {
+		for s := range shards {
+			id := store.ShardID{Index: index, Shard: s}
+			n := len(tn.n.candidates(id))
+			if _, ok := tn.n.Hosted(id); ok {
+				n++
+			}
+			if n != want {
+				return fmt.Errorf("shard %d: %d copies in its view", s, n)
+			}
+		}
+		return nil
+	})
+}
+
 // TestJoinAllocateAndServe: three nodes join over one database; an index with the
 // default target (every node) gets a copy on each, writes through every node land on
 // every copy, and health turns green.

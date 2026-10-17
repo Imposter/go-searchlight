@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -12,8 +13,8 @@ import (
 
 // TestTimeoutBoundsWallTime: over a large index, a search with a tiny timeout, many
 // cardinality aggregations and a big terms aggregation over high-cardinality fields
-// (global ordinals cold) answers within its timeout plus the reserve and a little
-// slack, timed out, with the shard work, its merge and the reduce included.
+// (global ordinals cold) answers within its timeout and a little slack, timed out,
+// with the shard work, its merge and the reduce included.
 func TestTimeoutBoundsWallTime(t *testing.T) {
 	clearOrdsCache(t)
 	defer clearOrdsCache(t)
@@ -38,9 +39,7 @@ func TestTimeoutBoundsWallTime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		rctx, cancel := ReduceContext(context.Background(), time.Since(start), r)
-		defer cancel()
-		resp := Reduce(rctx, []*ShardResult{res}, r)
+		resp := Reduce(context.Background(), []*ShardResult{res}, r)
 		return resp, time.Since(start)
 	}
 	_, untimed := search(0)
@@ -49,7 +48,7 @@ func TestTimeoutBoundsWallTime(t *testing.T) {
 	timeout := max(untimed/20, 5*time.Millisecond)
 	resp, took := search(timeout)
 	slack := 150 * time.Millisecond * testtier.RaceSlowdown
-	bound := timeout + 2*DeadlineReserve(timeout) + slack
+	bound := timeout + slack
 	t.Logf("timeout %v: took %v (bound %v), timed out %v", timeout, took, bound, resp.TimedOut)
 	if took > bound {
 		t.Errorf("a search with timeout %v took %v, past %v", timeout, took, bound)
@@ -63,45 +62,98 @@ func TestTimeoutBoundsWallTime(t *testing.T) {
 	}
 }
 
-// TestReduceHonoursDeadline: a reduce whose context has ended answers every
-// aggregation, empty, and is timed out; ReduceContext outlives the request's own
-// deadline by the reserve, and ends with its cancellation.
-func TestReduceHonoursDeadline(t *testing.T) {
-	r := &Request{Aggs: map[string]Agg{
-		"t": {Type: AggTerms, Field: "brand"},
-		"f": {Type: AggFilter, Filter: &query.All{}, Aggs: map[string]Agg{"c": {Type: AggCardinality, Field: "brand"}}},
-	}}
-	parts := []*ShardResult{{Aggs: map[string]*AggPartial{"t": {Type: AggTerms, Buckets: []*BucketPartial{{Key: "a", DocCount: 2}}}}}}
-	ended, cancel := context.WithCancel(context.Background())
-	cancel()
-	resp := Reduce(ended, parts, r)
-	if !resp.TimedOut || resp.Aggs["t"] == nil || len(resp.Aggs["t"].Buckets) != 0 || resp.Aggs["f"] == nil {
-		t.Fatalf("reduce past its deadline: timed out %v, aggs %+v", resp.TimedOut, resp.Aggs)
+// holdBuilders takes every global ordinals build slot until the returned function
+// gives them back: builds queue meanwhile.
+func holdBuilders(t testing.TB) func() {
+	t.Helper()
+	for range cap(ordsBuilders) {
+		ordsBuilders <- struct{}{}
 	}
-	if resp := Reduce(context.Background(), parts, r); resp.TimedOut || len(resp.Aggs["t"].Buckets) != 1 {
-		t.Fatalf("reduce in time: %+v", resp)
+	var once bool
+	return func() {
+		if !once {
+			once = true
+			for range cap(ordsBuilders) {
+				<-ordsBuilders
+			}
+		}
 	}
+}
 
-	parent, stop := context.WithDeadline(context.Background(), time.Now().Add(20*time.Millisecond))
-	defer stop()
-	rctx, done := ReduceContext(parent, 0, &Request{Timeout: time.Hour})
-	defer done()
-	<-parent.Done()
-	if rctx.Err() != nil {
-		t.Fatal("the reduce context ended with the request's deadline, leaving the reduce no time")
+// ordsCorpus is a shard of a few segments of high-cardinality keyword and list
+// values.
+func ordsCorpus(t testing.TB) *cluster {
+	t.Helper()
+	c := newCluster(t, 1)
+	for round := range 3 {
+		for i := range 2000 {
+			c.upsert(fmt.Sprintf("o%d-%d", round, i), fmt.Sprintf(`{"brand":"v%d","tags":["a%d","b%d"]}`, round*2000+i, i, i%97))
+		}
+		c.refreshAll()
 	}
-	select {
-	case <-rctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("the reduce context outlived the request's deadline by more than the reserve")
+	return c
+}
+
+// TestDeadlineWithoutOrdinalsMergesByTerm: a dense terms or cardinality aggregation
+// whose global ordinals are still building when its search's deadline nears is
+// merged by term, exactly and in time, not left empty.
+func TestDeadlineWithoutOrdinalsMergesByTerm(t *testing.T) {
+	clearOrdsCache(t)
+	defer clearOrdsCache(t)
+	defer func(d uint64) { globalOrdsDensity = d }(globalOrdsDensity)
+	globalOrdsDensity = 1 << 40
+	c := ordsCorpus(t)
+	aggs := map[string]Agg{
+		"t": {Type: AggTerms, Field: "brand", Size: 5, ShardSize: 100},
+		"n": {Type: AggCardinality, Field: "tags"},
 	}
-	parent, stop = context.WithCancel(context.Background())
-	rctx, done = ReduceContext(parent, 0, &Request{Timeout: time.Hour})
-	defer done()
-	stop()
+	want, err := c.search(&Request{Query: &query.All{}, Aggs: aggs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clearOrdsCache(t)
+	release := holdBuilders(t)
+	defer release()
+	got, err := c.search(&Request{Query: &query.All{}, Aggs: aggs, Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TimedOut {
+		t.Error("a search that merged by term in time is timed out")
+	}
+	for name := range aggs {
+		if d := diffAgg(got.Aggs[name], want.Aggs[name], name); d != "" {
+			t.Error(d)
+		}
+	}
+}
+
+// TestCancelDuringMergeIsAnError: a search cancelled while its shard merge waits on a
+// global ordinals build returns the cancellation, not a timed-out answer.
+func TestCancelDuringMergeIsAnError(t *testing.T) {
+	clearOrdsCache(t)
+	defer clearOrdsCache(t)
+	defer func(d uint64) { globalOrdsDensity = d }(globalOrdsDensity)
+	globalOrdsDensity = 1 << 40
+	c := ordsCorpus(t)
+	release := holdBuilders(t)
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	g := c.shards[0].Acquire()
+	defer g.Release()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := ExecuteShard(ctx, g, &Request{Query: &query.All{}, Aggs: map[string]Agg{"n": {Type: AggCardinality, Field: "brand"}}})
+		errc <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
 	select {
-	case <-rctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("the reduce context outlived its request's cancellation")
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled search: %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a cancelled search kept waiting on its build")
 	}
 }

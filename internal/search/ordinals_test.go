@@ -260,8 +260,7 @@ func TestOrdinalsWarm(t *testing.T) {
 	}
 	g.Release()
 	globalOrdsCache.mu.Lock()
-	el := globalOrdsCache.items[ordsKey(g, "tags", true).id()]
-	el.Value.(*ordsEntry).used = time.Now().Add(-time.Hour).UnixNano() //nolint:forcetypeassert,errcheck // only entries
+	entryOf(globalOrdsCache.items[ordsKey(g, "tags", true)]).line.used = time.Now().Add(-time.Hour).UnixNano()
 	globalOrdsCache.mu.Unlock()
 
 	for i := range 50 {
@@ -357,5 +356,63 @@ func BenchmarkOrdinalsAfterRefresh(b *testing.B) {
 				deriveGlobalOrds(context.Background(), f.base, g, f.name, f.entries)
 			}
 		})
+	}
+}
+
+// TestOrdinalsBuildsBounded: every build, a search's included, waits for a slot of
+// the one pool; a newer generation's build supersedes a queued older one of the same
+// shard and field, so only the newer runs; a build over a generation older than the
+// line's newest is refused; and closing the shard waits for its builds.
+func TestOrdinalsBuildsBounded(t *testing.T) {
+	clearOrdsCache(t)
+	defer clearOrdsCache(t)
+	c := ordsCorpus(t)
+	s := c.shards[0]
+	release := holdBuilders(t)
+	defer release()
+	g1 := s.Acquire()
+	defer g1.Release()
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	globalOrdinals(expired, g1, "brand", false)
+	time.Sleep(20 * time.Millisecond)
+	if ordsBuilding.Load() != 1 {
+		t.Fatalf("%d builds in flight, want 1 queued", ordsBuilding.Load())
+	}
+	globalOrdsCache.mu.Lock()
+	e1 := entryOf(globalOrdsCache.items[ordsKey(g1, "brand", false)])
+	started := e1.started
+	globalOrdsCache.mu.Unlock()
+	if started {
+		t.Fatal("a search's build started without a slot")
+	}
+
+	c.upsert("late", `{"brand":"zz"}`)
+	c.refreshAll()
+	g2 := s.Acquire()
+	defer g2.Release()
+	globalOrdinals(expired, g2, "brand", false)
+	<-e1.done
+	if e1.ords != nil {
+		t.Fatal("the queued older build was not superseded")
+	}
+	if o := globalOrdinals(expired, g1, "brand", false); o != nil || ordsBuilding.Load() != 1 {
+		t.Fatalf("a build over the older generation was not refused (%d in flight)", ordsBuilding.Load())
+	}
+	release()
+	waitOrdsIdle(t)
+	if globalOrdsCache.cached(context.Background(), ordsKey(g2, "brand", false)) == nil {
+		t.Fatal("the newer build was not cached")
+	}
+
+	clearOrdsCache(t)
+	hold := holdBuilders(t)
+	defer hold()
+	globalOrdinals(expired, g2, "tags", true)
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := ordsBuilding.Load(); n != 0 {
+		t.Fatalf("the shard closed with %d builds over its generations in flight", n)
 	}
 }

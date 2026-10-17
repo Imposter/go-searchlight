@@ -22,10 +22,6 @@ import (
 // finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that failed) is skipped. With
 // track_total false there is no bound to cut the total at: it is what the shards
 // confirmed.
-//
-// The aggregations are reduced one by one while ctx lasts; once it ends, the rest are
-// returned empty and the response is timed out. A coordinator gives it
-// [ReduceContext], which lasts a little past the request's deadline.
 func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	start := time.Now()
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.reduce", trace.WithAttributes(
@@ -70,10 +66,8 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 		for i, sr := range live {
 			shards[i] = sr.Aggs
 		}
-		var cut bool
-		resp.Aggs, cut = reduceAggsWithin(ctx, specs, shards)
+		resp.Aggs = reduceAggs(specs, shards)
 		boundBuckets(specs, resp.Aggs)
-		resp.TimedOut = resp.TimedOut || cut
 	}
 	instruments().recordPhase(ctx, r.Index, "reduce", time.Since(start))
 	span.SetAttributes(attribute.Int64("total", resp.Total), attribute.Int("hits", len(resp.Hits)))
@@ -165,21 +159,6 @@ func reduceAggs(specs []*aggSpec, shards []map[string]*AggPartial) map[string]*A
 		out[spec.name] = reduceAgg(parts, spec)
 	}
 	return out
-}
-
-// reduceAggsWithin is reduceAggs while ctx lasts: once it ends, the aggregations not
-// yet reduced are finished empty, and cut is true.
-func reduceAggsWithin(ctx context.Context, specs []*aggSpec, shards []map[string]*AggPartial) (out map[string]*AggResult, cut bool) {
-	out = make(map[string]*AggResult, len(specs))
-	for _, spec := range specs {
-		if ctx.Err() != nil {
-			cut = true
-			out[spec.name] = reduceAgg(nil, spec)
-			continue
-		}
-		maps.Copy(out, reduceAggs([]*aggSpec{spec}, shards))
-	}
-	return out, cut
 }
 
 // reduceAgg merges the shards' partials of one aggregation and finishes them.

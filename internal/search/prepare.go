@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"math"
@@ -47,6 +48,11 @@ type prepared struct {
 	// cut is set when the shard's merge of the segments' partials ran out of time and
 	// left aggregations empty: the result is timed out.
 	cut atomic.Bool
+	// mergeCtx is the context of the shard's merge of its segments' partials (ExecuteShard
+	// sets it before the merge): it lasts the shard's whole deadline, while the
+	// segments' own (segExec.ctx) ends deadlineReserve earlier. Work done during the
+	// merge (finishing or replaying partials) checks it, not a segment's.
+	mergeCtx context.Context //nolint:containedctx // the merge phase's deadline, for the finish code that runs in it
 }
 
 // ordField names one field's global ordinals: its values, or its list entries.

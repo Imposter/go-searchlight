@@ -13,20 +13,23 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   renumbered, the new segments' terms looked up and inserted), exactly as a full
   build would make them, when that is cheaper than merging every dictionary again;
   after each refresh or merge the fields aggregated in the last 10 minutes are
-  rebuilt in the background, a few at a time and cancelled when the shard closes. A
-  build runs once for every search asking, detached from them: one cut short by a
-  search's deadline finishes and is cached for the next search instead of being
-  thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
+  rebuilt in the background. Every build, a search's or a warm's, takes a slot of
+  one pool of a quarter of the CPUs; a shard's field has one build in flight, which
+  a newer generation's supersedes; a closing shard cancels its builds and waits for
+  them. A build runs once for every search asking, detached from them: one a
+  search's deadline stops waiting for finishes and is cached for the next search
+  instead of being thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
   metrics: `searchlight_search_ordinals_builds_total`,
   `searchlight_search_ordinals_build_duration_seconds` and
   `searchlight_search_ordinals_lookups_total`.
-- **`timeout` bounds the whole search.** The deadline (the earlier of `timeout` and
-  `request_timeout`) now covers each shard's merge of its segments' aggregations,
-  the dense counts from the index, and the coordinating node's reduce, not only the
-  segment scan: segments stop a tenth of the budget (1 ms to 1 s) early, an
-  aggregation still unmerged at the deadline is answered empty, and the reduce stops
-  that reserve past it, each cut with `timed_out: true`
-  ([docs/api.md](docs/api.md#search-and-count)).
+- **`timeout` bounds each shard's whole search.** The deadline (the earlier of
+  `timeout` and `request_timeout`) now covers each shard's merge of its segments'
+  aggregations and the dense counts from the index, not only the segment scan:
+  segments stop a tenth of the budget (1 ms to 1 s) early, an aggregation whose
+  global ordinals are still building merges by term rather than wait past the
+  deadline, and only one the deadline cuts off even so is answered empty, with
+  `timed_out: true` ([docs/api.md](docs/api.md#search-and-count)). A search
+  cancelled during the merge returns its cancellation.
 
 ## [1.1.0] - 2026-10-17
 

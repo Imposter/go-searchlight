@@ -401,6 +401,8 @@ type Shard struct {
 	// shutdownDone is closed when shutdown has finished: a second Close waits on it.
 	shutdownDone chan struct{}
 	jan          *janitor
+	// background is the work over the shard's generations its shutdown waits for.
+	background bgWork
 }
 
 // Open opens the shard copy in dir, creating dir if needed: it reads the manifest,
@@ -1016,6 +1018,11 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
+		select {
+		case <-s.background.wait():
+		case <-s.opts.Clock.After(backgroundWait):
+			s.log.Warn("shard closed with background work over its generations still running")
+		}
 		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()

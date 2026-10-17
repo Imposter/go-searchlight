@@ -171,11 +171,13 @@ data_dir/
     inserted where missing, which gives exactly the full build's ordinals. A small
     refresh segment is derived; a merge into a segment holding much of the field is
     built in full. After each refresh or merge the fields searches used over the
-    shard in the last 10 minutes are rebuilt in the background (a few at a time,
-    cancelled when the shard closes), and a build runs detached from the search that
-    asked, once for every search asking: a search whose deadline passes stops
-    waiting, and the build finishes and is cached for the next. The old list's
-    entries are dropped once the new one's is cached.
+    shard in the last 10 minutes are rebuilt in the background. Every build takes a
+    slot of one pool (a quarter of the CPUs); a shard's field has at most one in
+    flight, which a newer generation's supersedes, and a closing shard cancels its
+    builds and waits for them. A build runs detached from the search that asked,
+    once for every search asking: a search waits at most half its time left, then
+    merges by term, and the build finishes and is cached for the next. The old
+    list's entry is dropped once the new one's is cached.
   - The OS page cache holds the mmap'd files.
 - **Format versions.** The segment format is versioned (major 3). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:

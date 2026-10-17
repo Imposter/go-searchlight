@@ -560,17 +560,25 @@ func (g *globalOrds) term(gen *shard.Generation, field string, gl uint32, entrie
 
 // The cache and its builds.
 //
+// The cache keeps, per shard and field, a line: the latest build cached, the build in
+// flight, and when a search last used the field's ordinals over the shard. A line has
+// at most one build in flight. A build over a newer generation supersedes the line's
+// older one: a build still queued is cancelled, and one already running finishes and
+// is cached first, so the newer derives from it (see Incremental global ordinals). A
+// build over a generation older than the line's newest is refused (its searches merge
+// by term).
+//
 // Builds run on their own goroutine, detached from the search that asked (they hold
-// their own reference on the generation, and stop only when its shard shuts down),
-// once per segment list however many searches ask at the same time: a search waits for
-// the build until its deadline, and one cut short leaves the build running, so the
-// next search finds it cached. A build derives the ordinals from the cached ones of an
-// overlapping list when that is cheaper (see Incremental global ordinals).
+// their own reference on the generation, which the shard's shutdown cancels and waits
+// for), once however many searches ask at the same time, and every one of them, a
+// search's or a warm's, takes a slot of ordsBuilders first: at most that many run at
+// once across the process. A search waits for a build only part of its time (see
+// finishOrds) and merges by term meanwhile; the build goes on, and the next search
+// finds it cached.
 //
 // After each refresh or merge, WarmOrdinals (shard.Options.Published) starts the
-// builds of the fields searches used over the shard within ordsWarmWindow, at most
-// ordsWarmers at once across the process: the first search after a refresh finds them
-// built or building. A search that waits on a queued warm build lets it start at once.
+// builds of the fields searches used over the shard within ordsWarmWindow, so the
+// first search after a refresh finds them built or building.
 
 // globalOrdsCacheBytes bounds the global ordinals kept across searches. A variable so
 // tests can make it small.
@@ -580,96 +588,141 @@ var globalOrdsCacheBytes int64 = 256 << 20
 // for a refresh or merge to rebuild them in the background.
 var ordsWarmWindow = 10 * time.Minute
 
-// ordsWarmers bounds the warm builds running at once, across shards.
-var ordsWarmers = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/4))
+// ordsBuilders bounds the builds running at once, across shards: a quarter of the
+// CPUs, at least one.
+var ordsBuilders = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/4))
 
 // ordsBuilding counts the builds in flight, for tests to wait on.
 var ordsBuilding atomic.Int64
 
-// ordsCache is the LRU of global ordinals, by field, kind and segment list.
+// ordsCache is the LRU of global ordinals, by shard, field, kind and segment list.
 type ordsCache struct {
 	mu    sync.Mutex
 	lru   list.List // of *ordsEntry, most recent first
-	items map[string]*list.Element
+	items map[ordsCacheKey]*list.Element
 	bytes int64
+	// lines are each shard's fields' lines.
+	lines map[*shard.Shard]map[ordsField]*ordsLine
 }
 
-// ordsEntry is one cached build. done closes once ords is set (nil: the build was
-// cancelled, and the entry already removed); charged is what the entry adds to the
-// cache's bytes, used when a search last used it (Unix nanoseconds), hurried whether a
-// search waits on it, started whether its build has begun: all set and read under the
-// cache's lock.
+// ordsField is one field's values or list entries.
+type ordsField struct {
+	field   string
+	entries bool
+}
+
+// ordsLine is one shard's field's builds: the latest cached (nil: none), the one in
+// flight (nil: none), and when a search last used them (Unix nanoseconds).
+type ordsLine struct {
+	cached   *list.Element
+	building *ordsEntry
+	used     int64
+}
+
+// ordsEntry is one build. done closes once ords is set (nil: the build was cancelled
+// or failed, and the entry already removed); charged is what the entry adds to the
+// cache's bytes, started whether the build has begun (taken its slot): both set and
+// read under the cache's lock.
 type ordsEntry struct {
 	key     ordsCacheKey
+	line    *ordsLine
 	gen     uint64 // the generation built over (Generation.Gen)
 	warm    bool   // started by WarmOrdinals, not a search
 	done    chan struct{}
 	ords    *globalOrds
 	charged int64
-	used    int64
-	hurried bool
 	started bool
-	// urgent closes when a search waits on a warm build: it starts without a slot.
-	urgent chan struct{}
-	cancel context.CancelFunc
+	cancel  context.CancelFunc
 }
 
-// ordsCacheKey names a build: a field's values or entries over one segment list.
+// ordsCacheKey names a build: a shard's field's values or entries over one segment
+// list.
 type ordsCacheKey struct {
+	shard    *shard.Shard
 	field    string
 	entries  bool
 	segments string // the segment IDs, NUL-separated, in generation order
 }
 
-var globalOrdsCache = &ordsCache{items: map[string]*list.Element{}}
+var globalOrdsCache = &ordsCache{items: map[ordsCacheKey]*list.Element{}, lines: map[*shard.Shard]map[ordsField]*ordsLine{}}
 
 func ordsKey(g *shard.Generation, field string, entries bool) ordsCacheKey {
-	return ordsCacheKey{field: field, entries: entries, segments: strings.Join(segmentIDs(g), "\x00")}
+	return ordsCacheKey{shard: g.Shard(), field: field, entries: entries, segments: strings.Join(segmentIDs(g), "\x00")}
 }
 
-func (k ordsCacheKey) id() string {
-	kind := "k"
-	if k.entries {
-		kind = "l"
+func entryOf(el *list.Element) *ordsEntry {
+	return el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
+}
+
+func (e *ordsEntry) finished() bool {
+	select {
+	case <-e.done:
+		return true
+	default:
+		return false
 	}
-	return k.field + "\x00" + kind + "\x00" + k.segments
 }
 
-// cached returns key's finished build, or nil (none, or one still building).
+// line returns key's line, made when missing. The caller holds c.mu.
+func (c *ordsCache) line(key ordsCacheKey) *ordsLine {
+	fields := c.lines[key.shard]
+	if fields == nil {
+		fields = map[ordsField]*ordsLine{}
+		c.lines[key.shard] = fields
+	}
+	f := ordsField{key.field, key.entries}
+	ln := fields[f]
+	if ln == nil {
+		ln = &ordsLine{}
+		fields[f] = ln
+	}
+	return ln
+}
+
+// prune drops key's line once it holds nothing and was not used within the warm
+// window. The caller holds c.mu.
+func (c *ordsCache) prune(key ordsCacheKey, ln *ordsLine) {
+	if ln.cached != nil || ln.building != nil || ln.used >= time.Now().Add(-ordsWarmWindow).UnixNano() {
+		return
+	}
+	fields := c.lines[key.shard]
+	delete(fields, ordsField{key.field, key.entries})
+	if len(fields) == 0 {
+		delete(c.lines, key.shard)
+	}
+}
+
+// cached returns key's finished build, or nil (none, or one still building), as a
+// search prepares.
 func (c *ordsCache) cached(ctx context.Context, key ordsCacheKey) *globalOrds {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	el, ok := c.items[key.id()]
-	if !ok {
+	el, ok := c.items[key]
+	if !ok || !entryOf(el).finished() {
+		ordsMetrics().lookup(ctx, "absent")
 		return nil
 	}
-	e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-	select {
-	case <-e.done:
-		c.lru.MoveToFront(el)
-		e.used = time.Now().UnixNano()
-		ordsMetrics().lookup(ctx, "hit")
-		return e.ords
-	default:
-		return nil
-	}
+	c.lru.MoveToFront(el)
+	e := entryOf(el)
+	e.line.used = time.Now().UnixNano()
+	ordsMetrics().lookup(ctx, "hit")
+	return e.ords
 }
 
 // globalOrdinals returns field's global ordinals over g's segments, from the cache or
 // built (once, however many searches ask at the same time; the others wait for it).
-// Nil when ctx ends first: the build goes on, and is cached when done.
+// Nil when ctx ends first (the build goes on, and is cached when done), or when the
+// shard's line holds a build over a newer generation.
 func globalOrdinals(ctx context.Context, g *shard.Generation, field string, entries bool) *globalOrds {
 	key := ordsKey(g, field, entries)
 	c := globalOrdsCache
 	c.mu.Lock()
 	e, result := c.entry(key, g, false, time.Now().UnixNano()) //nolint:contextcheck // the build outlives the search: it runs for its shard's lifetime
-	select {
-	case <-e.done:
-	default:
-		e.hurry()
-	}
 	c.mu.Unlock()
 	ordsMetrics().lookup(ctx, result)
+	if e == nil {
+		return nil
+	}
 	select {
 	case <-e.done:
 		return e.ords
@@ -679,83 +732,118 @@ func globalOrdinals(ctx context.Context, g *shard.Generation, field string, entr
 }
 
 // entry returns key's entry, starting its build over g when there is none: with
-// whether it was finished (hit), building (shared) or started (miss). used is when a
-// search used it (0 for a warm). The caller holds c.mu.
+// whether it was finished (hit), building (shared), started (miss) or refused (stale:
+// nil, the line has a newer generation's). used is when a search used it (0 for a
+// warm). The caller holds c.mu.
 func (c *ordsCache) entry(key ordsCacheKey, g *shard.Generation, warm bool, used int64) (*ordsEntry, string) {
-	if el, ok := c.items[key.id()]; ok {
+	ln := c.line(key)
+	ln.used = max(ln.used, used)
+	if el, ok := c.items[key]; ok {
 		c.lru.MoveToFront(el)
-		e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-		e.used = max(e.used, used)
-		select {
-		case <-e.done:
-			return e, "hit"
-		default:
-			return e, "shared"
+		if entryOf(el).finished() {
+			return entryOf(el), "hit"
+		}
+		return entryOf(el), "shared"
+	}
+	if ln.cached != nil && entryOf(ln.cached).gen > g.Gen() {
+		return nil, "stale"
+	}
+	prev := ln.building
+	if prev != nil {
+		if prev.gen > g.Gen() {
+			return nil, "stale"
+		}
+		if !prev.started {
+			prev.cancel()
 		}
 	}
-	e := &ordsEntry{key: key, gen: g.Gen(), warm: warm, done: make(chan struct{}), used: used, urgent: make(chan struct{})}
+	e := &ordsEntry{key: key, line: ln, gen: g.Gen(), warm: warm, done: make(chan struct{})}
 	el := c.lru.PushFront(e)
-	c.items[key.id()] = el
-	c.start(el, e, g)
+	c.items[key] = el
+	ln.building = e
+	c.start(el, e, g, prev)
 	return e, "miss"
 }
 
-// hurry lets a queued warm build start at once: a search waits on it. The caller holds
-// the cache's lock.
-func (e *ordsEntry) hurry() {
-	if !e.hurried {
-		e.hurried = true
-		close(e.urgent)
-	}
-}
-
-// start runs e's build over g on its own goroutine, holding its own reference on g.
-// The caller holds c.mu.
-func (c *ordsCache) start(el *list.Element, e *ordsEntry, g *shard.Generation) {
-	if !g.Retain() {
-		c.remove(el)
-		close(e.done)
-		return
-	}
+// start runs e's build over g on its own goroutine, holding g as background work of
+// its shard: after prev (the line's older build, still running) ends, once a slot of
+// ordsBuilders is free. The caller holds c.mu.
+func (c *ordsCache) start(el *list.Element, e *ordsEntry, g *shard.Generation, prev *ordsEntry) {
 	ctx, cancel := context.WithCancel(g.Context())
 	e.cancel = cancel
+	release, ok := g.Background()
+	if !ok {
+		cancel()
+		c.drop(el, e)
+		return
+	}
 	ordsBuilding.Add(1)
 	go func() {
 		var ords *globalOrds
+		started := false
 		defer func() {
 			if r := recover(); r != nil {
 				slog.Default().Error("search: recovered a panic building global ordinals", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 				ords = nil
+				ordsMetrics().build(ctx, "unknown", e.trigger(), "panic", 0)
+			} else if !started {
+				ordsMetrics().build(ctx, "unstarted", e.trigger(), "superseded", 0)
 			}
 			cancel()
 			c.finish(el, e, ords)
-			g.Release()
+			release()
 			ordsBuilding.Add(-1)
 		}()
-		if e.warm {
+		if prev != nil {
 			select {
-			case ordsWarmers <- struct{}{}:
-				defer func() { <-ordsWarmers }()
-			case <-e.urgent:
+			case <-prev.done:
 			case <-ctx.Done():
 				return
 			}
 		}
+		select {
+		case ordsBuilders <- struct{}{}:
+			defer func() { <-ordsBuilders }()
+		case <-ctx.Done():
+			return
+		}
 		c.mu.Lock()
 		e.started = true
 		c.mu.Unlock()
+		started = true
 		ords = c.build(ctx, e, g)
 	}()
 }
 
-// build makes e's ordinals over g: derived from the cached build that shares the most
-// segments with g's list when worthDeriving, else in full. Nil when ctx ends first.
-func (c *ordsCache) build(ctx context.Context, e *ordsEntry, g *shard.Generation) *globalOrds {
-	base := c.baseFor(e.key)
-	kind, trigger := "full", "search"
+func (e *ordsEntry) trigger() string {
 	if e.warm {
-		trigger = "warm"
+		return "warm"
 	}
+	return "search"
+}
+
+// drop removes e, whose build never started, and closes done. The caller holds c.mu.
+func (c *ordsCache) drop(el *list.Element, e *ordsEntry) {
+	if e.line.building == e {
+		e.line.building = nil
+	}
+	if c.items[e.key] == el {
+		c.remove(el)
+	}
+	close(e.done)
+	c.prune(e.key, e.line)
+}
+
+// build makes e's ordinals over g: derived from the line's cached build when
+// worthDeriving, else in full. Nil when ctx ends first.
+func (c *ordsCache) build(ctx context.Context, e *ordsEntry, g *shard.Generation) *globalOrds {
+	c.mu.Lock()
+	var base *globalOrds
+	if e.line.cached != nil {
+		base = entryOf(e.line.cached).ords
+	}
+	c.mu.Unlock()
+	kind := "full"
 	start := time.Now()
 	var ords *globalOrds
 	if base != nil && worthDeriving(base, g, e.key.field, e.key.entries) {
@@ -764,144 +852,82 @@ func (c *ordsCache) build(ctx context.Context, e *ordsEntry, g *shard.Generation
 	} else {
 		ords = buildGlobalOrds(ctx, g, e.key.field, e.key.entries)
 	}
-	ordsMetrics().build(ctx, kind, trigger, ords != nil, time.Since(start))
+	result := "done"
+	if ords == nil {
+		result = "cancelled"
+	}
+	ordsMetrics().build(ctx, kind, e.trigger(), result, time.Since(start))
 	return ords
 }
 
-// baseFor returns the finished build of key's field and kind whose segment list shares
-// the most segments with key's, or nil.
-func (c *ordsCache) baseFor(key ordsCacheKey) *globalOrds {
-	segs := map[string]bool{}
-	for _, id := range strings.Split(key.segments, "\x00") {
-		segs[id] = true
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var best *globalOrds
-	bestShared := 0
-	for el := c.lru.Front(); el != nil; el = el.Next() {
-		e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-		if e.ords == nil || e.key.field != key.field || e.key.entries != key.entries {
-			continue
-		}
-		shared := 0
-		for _, id := range e.ords.ids {
-			if segs[id] {
-				shared++
-			}
-		}
-		if shared > bestShared {
-			best, bestShared = e.ords, shared
-		}
-	}
-	return best
-}
-
-// finish records e's build and closes done. A finished build is cached unless its
-// entry went meanwhile, or a build over a later generation of the same shard (a list
-// sharing segments, of a higher Gen) is cached already: then it serves only the
-// searches that waited for it. Caching it drops the shard's earlier lists' builds.
+// finish records e's build and closes done. A finished build becomes its line's
+// cached one, replacing (and dropping) the older, unless the line has a newer
+// generation's cached: then it serves only the searches that waited for it.
 func (c *ordsCache) finish(el *list.Element, e *ordsEntry, ords *globalOrds) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e.ords = ords
+	ln := e.line
+	if ln.building == e {
+		ln.building = nil
+	}
 	switch {
-	case c.items[e.key.id()] != el:
-	case ords == nil || c.supersede(e, el):
+	case c.items[e.key] != el:
+	case ords == nil || (ln.cached != nil && entryOf(ln.cached).gen > e.gen):
 		c.remove(el)
 	default:
+		if ln.cached != nil {
+			c.remove(ln.cached)
+		}
+		ln.cached = el
 		e.charged = ords.size
 		c.bytes += e.charged
-		for c.bytes > globalOrdsCacheBytes && c.lru.Len() > 1 {
-			c.remove(c.lru.Back())
+		for it := c.lru.Back(); it != nil && c.bytes > globalOrdsCacheBytes; {
+			prev := it.Prev()
+			if o := entryOf(it); it != el && o.ords != nil {
+				c.remove(it)
+				c.prune(o.key, o.line)
+			}
+			it = prev
 		}
 	}
 	close(e.done)
+	c.prune(e.key, ln)
 }
 
-// supersede removes the finished entries of e's field and kind over an earlier
-// generation of the same shard (a segment list sharing a segment with e's, of a lower
-// Gen), which e's list replaced, and inherits the latest use among them: or, when one
-// is of a later generation, removes none and reports that e is stale. The caller holds
-// c.mu.
-func (c *ordsCache) supersede(e *ordsEntry, keep *list.Element) bool {
-	mine := map[string]bool{}
-	for _, id := range e.ords.ids {
-		mine[id] = true
-	}
-	var stale []*list.Element
-	for el := c.lru.Front(); el != nil; el = el.Next() {
-		o := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-		if el == keep || o.ords == nil || o.key.field != e.key.field || o.key.entries != e.key.entries ||
-			!slices.ContainsFunc(o.ords.ids, func(id string) bool { return mine[id] }) {
-			continue
-		}
-		if o.gen > e.gen {
-			return true
-		}
-		stale = append(stale, el)
-	}
-	for _, el := range stale {
-		o := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-		e.used = max(e.used, o.used)
-		c.remove(el)
-	}
-	return false
-}
-
-// remove drops el; the caller holds c.mu.
+// remove drops el, leaving its line for the caller to prune; the caller holds c.mu.
 func (c *ordsCache) remove(el *list.Element) {
-	e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
+	e := entryOf(el)
 	c.lru.Remove(el)
-	delete(c.items, e.key.id())
+	delete(c.items, e.key)
 	c.bytes -= e.charged
 	e.charged = 0
+	if e.line.cached == el {
+		e.line.cached = nil
+	}
 }
 
 // WarmOrdinals starts background builds, over g's segment list, of the global
-// ordinals searches used over g's shard (the cached builds over a list sharing a
-// segment with g's) within ordsWarmWindow, so the first search after a refresh or
-// merge finds them built or building. A warm build still queued for an earlier list
-// of the same shard is cancelled; one already running finishes, and the next warm
-// derives from it. It returns at once: install it as shard.Options.Published.
+// ordinals searches used over g's shard within ordsWarmWindow, so the first search
+// after a refresh or merge finds them built or building. A build still queued for an
+// earlier list of the shard is cancelled; one already running finishes, and the new
+// one derives from it. It returns at once: install it as shard.Options.Published.
 func WarmOrdinals(g *shard.Generation) {
-	if g == nil || len(g.Segments) == 0 {
+	if g == nil || g.Shard() == nil || len(g.Segments) == 0 {
 		return
-	}
-	segs := make(map[string]bool, len(g.Segments))
-	for i := range g.Segments {
-		segs[g.Segments[i].ID] = true
-	}
-	overlaps := func(ids []string) bool { return slices.ContainsFunc(ids, func(id string) bool { return segs[id] }) }
-	type fieldKind struct {
-		field   string
-		entries bool
 	}
 	since := time.Now().Add(-ordsWarmWindow).UnixNano()
 	c := globalOrdsCache
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	want := map[fieldKind]int64{}
-	for el := c.lru.Front(); el != nil; el = el.Next() {
-		e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-		if e.ords != nil && e.used >= since && overlaps(e.ords.ids) {
-			k := fieldKind{e.key.field, e.key.entries}
-			want[k] = max(want[k], e.used)
-		}
-	}
-	for k, used := range want {
-		key := ordsKey(g, k.field, k.entries)
-		if _, ok := c.items[key.id()]; ok {
+	for f, ln := range c.lines[g.Shard()] {
+		if ln.used < since {
 			continue
 		}
-		for el := c.lru.Front(); el != nil; el = el.Next() {
-			e := el.Value.(*ordsEntry) //nolint:forcetypeassert,errcheck // only entries
-			if e.warm && !e.hurried && !e.started && e.gen < g.Gen() && e.key.field == k.field && e.key.entries == k.entries &&
-				overlaps(strings.Split(e.key.segments, "\x00")) {
-				e.cancel()
-			}
+		key := ordsKey(g, f.field, f.entries)
+		if _, ok := c.items[key]; !ok {
+			c.entry(key, g, true, 0)
 		}
-		c.entry(key, g, true, used)
 	}
 }
 
@@ -916,16 +942,16 @@ func (in *ordsInstruments) lookup(ctx context.Context, result string) {
 	in.lookups.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(attribute.String("result", result))))
 }
 
-func (in *ordsInstruments) build(ctx context.Context, kind, trigger string, done bool, d time.Duration) {
-	result := "done"
-	if !done {
-		result = "cancelled"
-	}
+// build counts one build: kind full or incremental, with its duration; unstarted (one
+// superseded or cancelled before it began) or unknown (one that panicked), without.
+func (in *ordsInstruments) build(ctx context.Context, kind, trigger, result string, d time.Duration) {
 	ctx = context.WithoutCancel(ctx)
 	in.builds.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
 		attribute.String("kind", kind), attribute.String("trigger", trigger), attribute.String("result", result))))
-	in.duration.Record(ctx, d.Seconds(), metric.WithAttributeSet(attribute.NewSet(
-		attribute.String("kind", kind), attribute.String("trigger", trigger))))
+	if kind == "full" || kind == "incremental" {
+		in.duration.Record(ctx, d.Seconds(), metric.WithAttributeSet(attribute.NewSet(
+			attribute.String("kind", kind), attribute.String("trigger", trigger))))
+	}
 }
 
 // ordsMetrics come from the global meter provider, as the search metrics do.
@@ -971,9 +997,11 @@ func (p *ordPartial) used() uint64 {
 
 // finishOrds merges the segments' ordinal partials of spec into dst: by global
 // ordinal when the ordinals cached at prepare, or built now because the partials are
-// dense enough, are there; by term otherwise. When ctx ends while the build runs, the
-// shard's partial of spec is left empty and the search cut short (prepared.cut): the
-// build goes on, for the next search.
+// dense enough, are there; by term otherwise, exactly too. A search with a deadline
+// waits for a build at most half of what is left of it, then merges by term (the
+// build goes on, for the next search). Only when ctx ends before the merge by term
+// is done is the shard's partial of spec left empty and the search cut short
+// (prepared.cut).
 func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, p *prepared) {
 	entries, _ := ordKind(spec.ftype)
 	ords := p.ords[ordField{spec.field, entries}]
@@ -986,12 +1014,13 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 			total += uint64(numTerms(g.Segments[i].Reader, spec.field, entries))
 		}
 		if used*globalOrdsDensity >= total {
-			ords = globalOrdinals(ctx, g, spec.field, entries)
-			if ords == nil && ctx.Err() != nil {
-				p.cut.Store(true)
-				mergePartial(dst, emptyPartial(spec), spec)
-				return
+			wait := ctx
+			if deadline, ok := ctx.Deadline(); ok {
+				var cancel context.CancelFunc
+				wait, cancel = context.WithTimeout(ctx, time.Until(deadline)/2)
+				defer cancel()
 			}
+			ords = globalOrdinals(wait, g, spec.field, entries)
 		}
 	}
 	switch {
@@ -999,10 +1028,17 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 		finishTerms(dst, parts, spec, g, ords, entries)
 	case ords != nil:
 		finishCardinality(dst, parts, spec, ords)
-	case spec.typ == AggTerms:
-		finishTermsByKey(dst, parts, spec, g, entries)
 	default:
-		finishCardinalityByKey(dst, parts, spec, g, entries)
+		var done bool
+		if spec.typ == AggTerms {
+			done = finishTermsByKey(ctx, dst, parts, spec, g, entries)
+		} else {
+			done = finishCardinalityByKey(ctx, dst, parts, spec, g, entries)
+		}
+		if !done {
+			p.cut.Store(true)
+			mergePartial(dst, emptyPartial(spec), spec)
+		}
 	}
 }
 
@@ -1062,11 +1098,15 @@ func finishTerms(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.G
 
 // finishTermsByKey merges the segments' ordinal partials of a terms aggregation into
 // dst by term: each segment's ordinals with documents read and merged by key; the
-// shard's cut is cutShard's.
-func finishTermsByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) {
+// shard's cut is cutShard's. False, merging nothing, when ctx ends first (checked
+// before each segment's partial).
+func finishTermsByKey(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) bool {
 	byKey := map[string]*BucketPartial{}
 	out := &AggPartial{Type: AggTerms}
 	for _, p := range parts {
+		if ctx.Err() != nil {
+			return false
+		}
 		var ords []uint32
 		for o, n := range p.counts {
 			if n > 0 {
@@ -1091,6 +1131,7 @@ func finishTermsByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *sh
 		}
 	}
 	mergePartial(dst, out, spec)
+	return true
 }
 
 // finishCardinality merges the segments' seen ordinals into dst's sketch: each global
@@ -1121,10 +1162,14 @@ func finishCardinality(dst *AggPartial, parts []*ordPartial, spec *aggSpec, ords
 }
 
 // finishCardinalityByKey merges the segments' seen ordinals into dst's sketch by
-// term: each segment's seen terms read and hashed.
-func finishCardinalityByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) {
+// term: each segment's seen terms read and hashed. False, merging nothing, when ctx
+// ends first (checked before each segment's partial).
+func finishCardinalityByKey(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) bool {
 	var hashes []uint64
 	for _, p := range parts {
+		if ctx.Err() != nil {
+			return false
+		}
 		var ords []uint32
 		for w, word := range p.seen {
 			for word != 0 {
@@ -1138,6 +1183,7 @@ func finishCardinalityByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec,
 	}
 	slices.Sort(hashes)
 	mergePartial(dst, &AggPartial{Type: AggCardinality, Sketch: sketchOf(spec.precision, slices.Compact(hashes))}, spec)
+	return true
 }
 
 // segmentTerms reads the terms of ords (ascending local ordinals) of field in r: one

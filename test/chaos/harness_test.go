@@ -416,9 +416,9 @@ type doc struct {
 
 // model is what the acknowledged writes left: every live document at its last
 // acknowledged version, and the newest acknowledged seq. A batch whose answer never
-// came (the load stopped mid-request) may or may not have committed: each of its
-// operations is a possible outcome for its id until an acknowledged write supersedes
-// it.
+// came (the balancer gave up on it at its deadline) may or may not have committed: each
+// of its operations is a possible outcome for its id until an acknowledged write
+// supersedes it.
 type model struct {
 	mu    sync.Mutex
 	docs  map[string]doc
@@ -543,7 +543,10 @@ func (c *cluster) startLoad(m *model, writers, readers int) *load {
 	return l
 }
 
-// stop stops the load and waits for its requests to finish.
+// stop stops the load and waits for its requests to finish. A writer's batch in flight
+// runs to its answer rather than being cut: a cut batch may still commit, after the
+// newest acknowledged seq that settle and verify wait for, and land on one copy before
+// another refreshes it.
 func (l *load) stop() {
 	l.cancel()
 	l.wg.Wait()
@@ -593,7 +596,7 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			fmt.Fprintf(&body, "{\"upsert\": {\"id\": %q}}\n{\"w\": \"w%d\", \"k\": %d, \"v\": %d, \"n\": %d, \"brand\": %q, \"title\": \"item %d version %d\"}\n",
 				id, g, k, v, g*keysPerWriter+k, o.brand, k, v)
 		}
-		a, err := c.lb.do(ctx, http.MethodPost, "/indexes/"+index+"/_bulk", body.String(), 3*time.Minute, true)
+		a, err := c.lb.do(context.WithoutCancel(ctx), http.MethodPost, "/indexes/"+index+"/_bulk", body.String(), 3*time.Minute, true)
 		if err != nil {
 			l.m.mu.Lock()
 			for _, o := range ops {
@@ -834,7 +837,7 @@ func (c *cluster) verify(m *model) {
 		if first == nil {
 			first = got
 		} else if !maps.Equal(first, got) {
-			c.t.Errorf("%s serves other documents than %s", mb.NodeID(), c.members[0].NodeID())
+			c.t.Errorf("%s serves other documents than %s: %v", mb.NodeID(), c.members[0].NodeID(), head5(differences(first, got)))
 		}
 		for b := range 7 {
 			brand := fmt.Sprintf("b%d", b)
@@ -859,6 +862,25 @@ func (c *cluster) verify(m *model) {
 		c.t.Errorf("client-visible error: %s", viol)
 	}
 	c.t.Logf("acknowledged %d write operations; retried: %v", m.acked, c.lb.retries)
+}
+
+// differences are the ids served differently by two scans: absent from one, or at
+// another version.
+func differences(a, b map[string]int) []string {
+	var out []string
+	for id, va := range a {
+		if vb, ok := b[id]; !ok {
+			out = append(out, fmt.Sprintf("%s (v%d, then absent)", id, va))
+		} else if va != vb {
+			out = append(out, fmt.Sprintf("%s (v%d, then v%d)", id, va, vb))
+		}
+	}
+	for id, vb := range b {
+		if _, ok := a[id]; !ok {
+			out = append(out, fmt.Sprintf("%s (absent, then v%d)", id, vb))
+		}
+	}
+	return out
 }
 
 func head5(s []string) []string {

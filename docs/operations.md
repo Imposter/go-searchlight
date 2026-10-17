@@ -358,6 +358,7 @@ unless `insecure_no_auth` is set.
 | `max_body_bytes` | `16MiB` | largest request body (at most 32 MiB less 1 KiB) |
 | `max_doc_bytes` | `4MiB` | largest document or saved query JSON, in a PUT or a `_bulk` line |
 | `max_bulk_ops` | `10000` | most operations in one `_bulk` |
+| `max_result_window` | `10000` | most a search's `from + size` reaches (Elasticsearch's `index.max_result_window`, here per node), at most 1,000,000; past it the search is a 400, and deeper pages use `search_after`. Each shard holds `from + size` hits of such a search, and the coordinator merges them all. The node that takes the search applies its own, so set it alike on every node. With `from` 0 it bounds `size` too, as in Elasticsearch: below 10,000 it refuses a `size` above it, which was answered before. A search with a `from` reserves about 1 KiB per hit of its window from `max_inflight_read_bytes` (at most half of it) while it runs |
 | `max_index_fields` | `1000` | most fields in one index's mapping |
 | `request_timeout` | `30s` | every API request's deadline |
 | `read_timeout` | `1m` | how long reading a request's headers and body may take (slow clients are cut off) |

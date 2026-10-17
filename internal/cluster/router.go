@@ -363,6 +363,9 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 		if reply.Level < wr.Needs {
 			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (%s): %w; retry once the upgrade is done", reply.Level, wr.Needs, levelNeeds(wr.Needs), errOlderLevel)}
 		}
+		if len(reply.Result.Hits) > r.From+r.Size {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered with %d hits, past the %d of from + size", len(reply.Result.Hits), r.From+r.Size)}
+		}
 		t.noteStale(c, reply.Stale)
 		return nil
 	})

@@ -36,6 +36,16 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   values are collected. Patterns on number, date and bool fields, patterns that
   cannot fold faithfully (`[ß]`, `[^A-Z]`), Lucene's other operators and partitions
   are refused with a 400 at their `loc`; a null `include` or `exclude` is none.
+- **`from` on `_search`**, Elasticsearch's offset paging
+  ([docs/api.md](docs/api.md#search-and-count)): `"from": 40, "size": 20` skips the
+  first 40 hits in sort order. `from + size` is at most the new `max_result_window`
+  setting (10,000 by default, as Elasticsearch's `index.max_result_window`; at most
+  1,000,000), past which the search is a 400 at `loc` `from` pointing to
+  `search_after`; a `from` past 0 with `search_after` is a 400 at `from`. Each shard
+  returns its best `from + size` without bodies, the coordinator drops the first
+  `from`, and only the page's bodies are read. `next` is the page's cursor as
+  before, so a client can switch to `search_after` at any page; `total` and the
+  aggregations are the whole search's.
 
 ### Changed
 
@@ -75,6 +85,14 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 - Likewise a search with a `terms` `include` or `exclude` (search wire level 2) is
   refused with a 503 rather than read from a node of an earlier release, which would
   count every value.
+- Likewise a search with a `from` past 0 (search wire level 3) is refused with a 503
+  rather than read from a node of an earlier release, which would ignore `from` and
+  answer with the first page. Searches without `from` are unaffected. The new
+  `max_result_window` setting applies on the node that takes the search; set it
+  alike on every node.
+- `max_result_window` bounds `from + size`, so with `from` 0 it bounds `size` too, as
+  Elasticsearch's does: lowering it below 10,000 refuses (400 at `size`) searches
+  with a `size` above it that were answered before.
 
 ## [1.0.0] - 2026-10-14
 

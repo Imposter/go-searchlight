@@ -49,6 +49,9 @@ type HitRef struct {
 // ShardResult is one shard's answer: its own top hits (bodies fetched), its exact
 // total, and partial aggregations for [Reduce].
 type ShardResult struct {
+	// Hits are the shard's best Request.From+Size, in order: the reduce needs every
+	// one's place to know which make the page (a query phase, NoBodies, reads none of
+	// their bodies).
 	Hits []Hit `json:"hits"`
 	// Total is how many live documents matched: exact when TotalRelation is
 	// RelationEq; with RelationGte a lower bound, because the shard stopped verifying

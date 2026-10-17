@@ -63,24 +63,29 @@ const codeStale = "stale_copy"
 // decoder drops what it does not know: level 1 adds post_filter and the filter, filters
 // and global aggregations, which a level-0 peer would ignore or refuse, and level 2 a
 // terms aggregation's include and exclude (levelTermsFilter), which a lower peer
-// would ignore, counting every value. A request says
-// the level it needs (wireRequest.Needs), and goes to that level's endpoint
-// (searchPath), and a reply the level it was answered at (searchReply.Level): a peer
-// refuses a request past its level, and the coordinator a reply below the request's,
-// so a search is never answered with a part of it unread.
+// would ignore, counting every value, and level 3 from (levelFrom), which a lower peer
+// would ignore, answering with the first page. A request says the level it needs
+// (wireRequest.Needs), and goes to that level's endpoint (searchPath), and a reply
+// the level it was answered at (searchReply.Level): a peer refuses a request past its
+// level, and the coordinator a reply below the request's, so a search is never
+// answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelTermsFilter
+const searchLevel = levelFrom
 
 // The search wire levels of the additions a peer must not ignore.
 const (
 	levelFilterAggs  = 1
 	levelTermsFilter = 2
+	levelFrom        = 3
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
-	if needs >= levelTermsFilter {
+	switch {
+	case needs >= levelFrom:
+		return "from, a page past the first"
+	case needs >= levelTermsFilter:
 		return "a terms aggregation's include or exclude"
 	}
 	return "post_filter, or a filter, filters or global aggregation"
@@ -107,6 +112,7 @@ type wireRequest struct {
 	PostFilter  json.RawMessage    `json:"post_filter,omitempty"`
 	Sort        []search.SortField `json:"sort,omitempty"`
 	Size        int                `json:"size"`
+	From        int                `json:"from,omitempty"`
 	SearchAfter []any              `json:"search_after,omitempty"`
 	TrackTotal  int                `json:"track_total"`
 	Aggs        map[string]wireAgg `json:"aggs,omitempty"`
@@ -116,7 +122,7 @@ type wireRequest struct {
 	NoBodies    bool               `json:"no_bodies,omitempty"`
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
-	// for a terms aggregation's include or exclude.
+	// for a terms aggregation's include or exclude, 3 for a from past 0.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -135,7 +141,7 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		return nil, fmt.Errorf("cluster: encoding the query: %w", err)
 	}
 	w := &wireRequest{
-		Query: q, Sort: r.Sort, Size: r.Size, SearchAfter: r.SearchAfter, TrackTotal: r.TrackTotal,
+		Query: q, Sort: r.Sort, Size: r.Size, From: r.From, SearchAfter: r.SearchAfter, TrackTotal: r.TrackTotal,
 		Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies,
 	}
 	if r.PostFilter != nil {
@@ -147,6 +153,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		return nil, err
 	}
 	switch {
+	case r.From > 0 && r.Size > 0:
+		w.Needs = levelFrom
 	case termsFilters(r.Aggs):
 		w.Needs = levelTermsFilter
 	case r.PostFilter != nil || filterAggs(r.Aggs):
@@ -191,7 +199,7 @@ func (w *wireRequest) decode() (*search.Request, error) {
 		return nil, api.Invalid("the query is invalid", problems...)
 	}
 	r := &search.Request{
-		Query: q, Sort: w.Sort, Size: w.Size, SearchAfter: w.SearchAfter, TrackTotal: w.TrackTotal,
+		Query: q, Sort: w.Sort, Size: w.Size, From: w.From, SearchAfter: w.SearchAfter, TrackTotal: w.TrackTotal,
 		Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies,
 	}
 	if w.PostFilter != nil {

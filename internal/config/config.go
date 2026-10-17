@@ -146,6 +146,11 @@ type Config struct {
 	MaxDocBytes int64
 	// MaxBulkOps caps the operations of one _bulk request.
 	MaxBulkOps int
+	// MaxResultWindow caps a search's from + size (Elasticsearch's
+	// index.max_result_window): each shard finds that many hits and the coordinator
+	// merges them all, so a deeper page is refused, to be read with search_after. At
+	// most MaxResultWindowLimit.
+	MaxResultWindow int
 	// RequestTimeout is every public API request's deadline: a search past it
 	// answers with what it has (timed_out), a wait past it gives up.
 	RequestTimeout time.Duration
@@ -192,6 +197,10 @@ type Config struct {
 // body can carry a document a refresh would refuse.
 const MaxBodyLimit = 32<<20 - 1<<10
 
+// MaxResultWindowLimit is the largest max_result_window: the most hits of one search
+// a shard keeps (search.MaxResultWindow is it).
+const MaxResultWindowLimit = 1_000_000
+
 // Default returns the production defaults. StoreURL is empty because it has
 // no default.
 func Default() Config {
@@ -217,6 +226,7 @@ func Default() Config {
 		MaxBodyBytes:          16 << 20,
 		MaxDocBytes:           4 << 20,
 		MaxBulkOps:            10_000,
+		MaxResultWindow:       10_000,
 		RequestTimeout:        30 * time.Second,
 		ReadTimeout:           time.Minute,
 		SearchQueue:           1000,
@@ -489,6 +499,19 @@ var settings = []setting{
 		name: "max_bulk_ops", usage: "most operations in one _bulk request",
 		parse:  func(c *Config, v string) error { return positiveInt(&c.MaxBulkOps, v) },
 		format: func(c *Config) string { return strconv.Itoa(c.MaxBulkOps) },
+	},
+	{
+		name: "max_result_window", usage: "most a search's from + size reaches (at most 1000000); deeper pages use search_after",
+		parse: func(c *Config, v string) error {
+			if err := positiveInt(&c.MaxResultWindow, v); err != nil {
+				return err
+			}
+			if c.MaxResultWindow > MaxResultWindowLimit {
+				return fmt.Errorf("want at most %d, got %q", MaxResultWindowLimit, v)
+			}
+			return nil
+		},
+		format: func(c *Config) string { return strconv.Itoa(c.MaxResultWindow) },
 	},
 	{
 		name: "request_timeout", usage: "deadline of every API request",

@@ -56,10 +56,11 @@ segments.
 | One document, or one saved query's body | `max_doc_bytes` (4 MiB) | 413 |
 | Operations in one `_bulk` | `max_bulk_ops` (10,000) | 413 |
 | Reads in progress | `search_queue` (1,000) | 429 with `Retry-After` |
-| Heap of in-flight requests | `max_inflight_write_bytes`, `max_inflight_read_bytes` | 429 with `Retry-After` |
+| Heap of in-flight requests (a search with `from` also reserves about 1 KiB per hit of `from + size`) | `max_inflight_write_bytes`, `max_inflight_read_bytes` | 429 with `Retry-After` |
 | A shard copy's write buffer full | (backpressure) | 429 with `Retry-After` |
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
 | Query size | 4 levels of `all`/`any`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
+| A search's `from + size` | `max_result_window` (10,000) | 400 with `loc` `from` (`size` when `from` is 0): page deeper with `search_after` |
 | Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
 | Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
 | Ranges in a `range` aggregation | 100 | 400 with `loc` |
@@ -230,9 +231,21 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   `{"field": {"order": "desc"}}`. `_id` breaks ties.
   - At most 16 keys, each field once.
   - Nothing after `_id`: ids are unique, so no later key could break a tie.
-- **Paging.** `size` is 10 by default, at most 10,000. To page, pass the previous
-  response's `next` as `search_after`. `next` is null on a short page. There is no
-  `from`.
+- **Paging.** `size` is 10 by default, at most 10,000. There are two ways to page,
+  as in Elasticsearch:
+  - **`from`** skips that many hits in sort order (0 by default): `"from": 40,
+    "size": 20` is the third page of 20. `from + size` is at most
+    `max_result_window` (10,000 by default); past it the search is a 400 at `loc`
+    `from`, and deeper pages use `search_after`. Each shard finds its best `from +
+    size`, so a deep `from` costs more the deeper it goes; only the page's bodies are
+    read. The `total` and the aggregations are the whole search's, whatever `from` is.
+  - **`search_after`**: pass the previous response's `next`. A cursor costs the same
+    at any depth, and has no window. `from` must then be 0 (a 400 at `from`
+    otherwise).
+
+  `next` is the page's last hit's `sort` when the page is full, and null on a short
+  page, with `from` too: a client can switch from `from` to `search_after` at any
+  page by passing it on.
 - **`track_total`.**
   - `true` counts exactly.
   - `false` counts no further than the hits.
@@ -333,7 +346,7 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     float64, or a calendar interval cannot date it) refuses the search as too many
     buckets, rather than drop a counted document from every bucket.
 - **`post_filter`**, a query, narrows the hits once the aggregations are counted:
-  `hits`, `total`, the sort, `search_after` and `next` are those of the documents
+  `hits`, `total`, the sort, `from`, `search_after` and `next` are those of the documents
   `query` and `post_filter` both match, while every aggregation but `global` counts
   `query`'s. It is checked as `query` is, at `post_filter...`.
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.

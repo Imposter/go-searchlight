@@ -202,6 +202,9 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 	if coord == nil {
 		t.Fatal("every node hosts every shard: no search reads a peer")
 	}
+	if err := coord.n.SyncCatalog(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
 
 	bound := func(v float64) *float64 { return &v }
 	aggs := map[string]search.Agg{
@@ -565,6 +568,16 @@ func TestOlderPeerRefusedForTermsFilter(t *testing.T) {
 	}
 }
 
+// TestOlderPeerRefusedForFrom: a peer at wire level 2 (include and exclude, no from),
+// with no endpoint for a level-3 search or answering it at level 2 with the first
+// page, is not trusted with a from past 0: the search is unavailable (503), while the
+// level-1 and level-2 features it has, and a from with size 0, are answered.
+func TestOlderPeerRefusedForFrom(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelTermsFilter) })
+	}
+}
+
 func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
 		o.hooks.olderPeer, o.hooks.olderLevel = older, level
@@ -579,6 +592,9 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	}
 	var coord *tnode
 	for _, tn := range c.live() {
+		if err := tn.n.SyncCatalog(tctx(t)); err != nil {
+			t.Fatal(err)
+		}
 		for s := range 4 {
 			if _, ok := tn.n.Hosted(store.ShardID{Index: "lv", Shard: s}); !ok {
 				coord = tn
@@ -593,6 +609,9 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
 	}
 	refused := map[string]*search.Request{
+		"from": {Query: &query.All{}, Sort: []search.SortField{{Field: "price"}}, Size: 5, From: 5},
+	}
+	levelTwo := map[string]*search.Request{
 		"include": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Include: &search.TermsFilter{Pattern: "b[0-2]"}}}},
 		"exclude": {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap, Aggs: map[string]search.Agg{
 			"b": {Type: search.AggTerms, Field: "brand", Exclude: &search.TermsFilter{Values: []any{"b1"}}},
@@ -602,14 +621,19 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 		"post_filter": {Query: &query.All{}, PostFilter: cheap, Size: 20, TrackTotal: search.TrackTotalAll},
 		"filter":      {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap}}},
 	}
-	if level < levelFilterAggs {
-		maps.Copy(refused, levelOne)
-	} else {
-		for name, r := range levelOne {
+	for below, rs := range map[int]map[string]*search.Request{levelFilterAggs: levelOne, levelTermsFilter: levelTwo} {
+		if level < below {
+			maps.Copy(refused, rs)
+			continue
+		}
+		for name, r := range rs {
 			if res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last}); err != nil {
 				t.Fatalf("%s through a level-%d peer: %v, %v", name, level, res, err)
 			}
 		}
+	}
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, From: 5, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
+		t.Fatalf("a from with size 0 through a level-%d peer: %v, %v", level, res, err)
 	}
 	for name, r := range refused {
 		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last})

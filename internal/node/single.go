@@ -32,9 +32,9 @@
 // # Searches
 //
 // A search holds one generation of each shard's copy from the query to the fetch:
-// with one shard it runs once with bodies; with several it runs the query phase on
-// each (NoBodies), reduces, then fetches the bodies of the winning hits alone from the
-// copies that found them (a peer pins its generation between the two). A copy lost
+// with one shard (and no from) it runs once with bodies; otherwise it runs the query
+// phase on each (NoBodies), reduces, then fetches the bodies of the page's hits alone
+// from the copies that found them (a peer pins its generation between the two). A copy lost
 // between the phases makes the search run again.
 package node
 

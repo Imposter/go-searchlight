@@ -37,7 +37,7 @@ import (
 //
 //	POST   /_internal/hint                      push hints: wake the named copies' tailers
 //	POST   /_internal/search                    a shard's query (or whole search) on this node's copy
-//	POST   /_internal/search/{level}            the same, for a search of wire level 1 or 2 (searchPath)
+//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 3 (searchPath)
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
@@ -259,7 +259,12 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 			if level = h.olderLevel; level < levelFilterAggs {
 				req.PostFilter = nil
 			}
-			dropTermsFilters(req.Aggs)
+			if level < levelTermsFilter {
+				dropTermsFilters(req.Aggs)
+			}
+			if level < levelFrom {
+				req.From = 0
+			}
 		}
 	}
 	t, err := p.target(r, msg.shardRef)

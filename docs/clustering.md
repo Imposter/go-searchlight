@@ -187,8 +187,9 @@ not:
    shard, not surfaced to the client. With two or more copies of every shard, one node
    failing is not a client-visible error (architecture.md's
    [Routing](architecture.md#routing)). When every copy the coordinator knew of has
-   failed, it reads the copy table once more and tries the serving copies it had not
-   seen: its view can trail the registry by a refresh.
+   failed, it reads the copy table once more, within a share of the request's time,
+   and tries the serving copies it has not tried: its view can trail the registry by a
+   refresh.
 
 ## Shards and copies
 

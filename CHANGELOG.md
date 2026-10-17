@@ -14,10 +14,13 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   one failed, a search, percolation, get or count answered 503 "no copy of shard N of
   index X answered" though another copy was serving. Once every copy it knows of has
   failed (or refused it for an older wire level), a read now reads the copy table again,
-  once per shard and within its deadline (shards of the request share a read), and
-  tries the serving copies it has not tried; date math stays resolved once and
-  `wait_for_seq` holds. `searchlight_cluster_read_rereads_total` counts the re-reads, by
-  `op` and `result` (`found`, `none`).
+  once per shard (shards of the request, and concurrent reads, share one read), and
+  tries the serving copies it has not tried, a peer back at a new address included. The
+  re-read gets at most a quarter of the request's remaining time and 1 s, so a slow
+  database leaves time for the coordinator's own stale copy to answer instead; waiting
+  for the routing reads' turn now gives up at the request's deadline too. Date math
+  stays resolved once and `wait_for_seq` holds. `searchlight_cluster_read_rereads_total`
+  counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
 
 ## [1.2.0] - 2026-10-17
 

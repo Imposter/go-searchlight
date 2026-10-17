@@ -313,8 +313,11 @@ type Node struct {
 	refusedWarned sync.Map
 	ars           *ars
 	view          atomic.Pointer[view]
-	missMu        sync.Mutex
-	missReadAt    time.Time
+	// miss is the one slot of the routing misses' registry read (refreshSince), a
+	// channel so that a read waiting its turn gives up at its deadline; missReadAt is
+	// read and written only while holding it.
+	miss       chan struct{}
+	missReadAt time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
@@ -388,6 +391,7 @@ func New(ctx context.Context, o Options) (*Node, error) {
 		lc:          leaseClock{c: o.Clock, epoch: o.Clock.Now()},
 		leases:      map[store.ShardID]*lease{},
 		quarantines: map[store.ShardID]quarantine{},
+		miss:        make(chan struct{}, 1),
 		scheme:      "http",
 		startedAt:   o.Clock.Now(),
 	}

@@ -363,12 +363,20 @@ Any node takes any request.
   selection on measured latency, like Elasticsearch's ARS. A failed or timed-out attempt
   (10 s) is retried on another copy, so with two or more copies, one node failing is not
   a client error. The copies a read knows of come from this node's view of the registry,
-  which can trail it by a refresh: when every one of them has failed, the read reads the
-  copy table again, once per shard (a view read since by another shard of the request,
-  or by the view loop, serves instead), and tries the serving copies it did not try
-  yet. It stays within the request's deadline; when nothing new turns up the shard is a
-  503. `searchlight_cluster_read_rereads_total` counts these re-reads, by `op` and
-  `result` (`found`, `none`).
+  which can trail it by a refresh. When every one of them has failed (or refused the read
+  for an older wire level), the read reads the copy table again, once per shard, and
+  tries the serving copies it has not tried, a node at a new address included. A view
+  read since the shard was routed (by another shard of the request, or the view loop)
+  serves without a read, and concurrent re-reads share one. A re-read gets at most a
+  quarter of the request's remaining time, and 1 s: one stuck behind a slow database
+  gives up, so the read still has time for the copies it finds and for this node's own
+  copy, which a read falls back to (stale) when no copy elsewhere answers. When nothing
+  new turns up, the copies that refused only for being stale are asked once more,
+  accepting a stale answer, and then the shard is a 503.
+  `searchlight_cluster_read_rereads_total` counts each shard's re-read (whether it read
+  the database or took a newer view), by `op` and `result`: `found`, `none`, or
+  `timeout` (it gave up first). Routing's own read for a shard with no copy in view is
+  not counted, and stands for the shard's one re-read.
 - **Peer traffic** (reads, hints, snapshots) uses the internal API under `/_internal/` on
   the same listener. It is authenticated by `cluster_token`, and runs over TLS when
   `tls_cert` is set, with peers verified against `peer_ca_file`.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -80,67 +80,111 @@ func (d *downTap) count(addr string) int {
 	return d.asked[addr]
 }
 
-// rereadRig is three nodes over one database and an index of one shard with two
-// copies: coord holds none, and reads it from b or c.
+// quiet is a coordinator that reads the registry only when routing asks it to: its
+// view, heartbeat, allocation, catalogue and pruning loops wait an hour.
+func quiet(o *Options) {
+	o.ViewInterval = time.Hour
+	o.HeartbeatInterval = time.Hour
+	o.CatalogInterval = time.Hour
+	o.PruneInterval = time.Hour
+	o.LeaseTTL = 2 * time.Hour
+	o.DeadAfter = 3 * time.Hour
+	o.PeerTimeout = time.Second
+}
+
+// rereadRig is two nodes holding every copy, b and c, and a quiet coordinator holding
+// none, started while each shard had its one copy on b: its view lists b alone, though
+// c serves a copy of every shard too (trailing, saved to put back). b plays a peer of
+// an older release that has no endpoint for a percolation of date math.
+//
+// The indexes: rr (one shard, a document x and a saved query q), rm (four shards, a
+// document each) and rd (one shard with a date field, a document and a saved query).
 type rereadRig struct {
-	tap     *downTap
-	readers map[int]*sdkmetric.ManualReader
-	coord   *tnode
-	b, c    *tnode
-	id      store.ShardID
-	seq     int64
+	tap      *downTap
+	reader   *sdkmetric.ManualReader
+	coord    *tnode
+	b, c     *tnode
+	id       store.ShardID
+	seq      int64
+	trailing *view
 }
 
 func newRereadRig(t *testing.T) *rereadRig {
-	r := &rereadRig{tap: &downTap{base: http.DefaultTransport}, readers: map[int]*sdkmetric.ManualReader{}}
+	r := &rereadRig{tap: &downTap{base: http.DefaultTransport}, reader: sdkmetric.NewManualReader()}
 	r.tap.set()
 	cl := newCluster(t, sqliteDB(t), func(i int, o *Options) {
 		o.Transport = r.tap
-		reader := sdkmetric.NewManualReader()
-		r.readers[i] = reader
-		o.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter(telemetry.ScopeName)
+		switch i {
+		case 0:
+			quiet(o)
+			o.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(r.reader)).Meter(telemetry.ScopeName)
+		case 1:
+			o.hooks.olderPeer = olderNoEndpoint
+		}
 	})
-	nodes := []*tnode{cl.start(0), cl.start(1), cl.start(2)}
-	createIndex(t, nodes[0].n, "rr", 1, 2)
-	waitCopies(t, nodes[0].st, "rr", 1, 2, time.Minute)
-	r.id = store.ShardID{Index: "rr", Shard: 0}
-	var holders []*tnode
-	for _, tn := range nodes {
-		if _, ok := tn.n.Hosted(r.id); ok {
-			holders = append(holders, tn)
-		} else {
-			r.coord = tn
+	r.b = cl.start(1)
+	createIndex(t, r.b.n, "rr", 1, 1)
+	createIndex(t, r.b.n, "rm", 4, 1)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": schema.Date}},
+		Settings: api.IndexSettings{Shards: 1, ReplicasPerShard: 1},
+	}
+	if _, err := r.b.n.CreateIndex(tctx(t), "rd", spec); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, r.b.n, "rr", upsertOp("x", 1), api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
+	for k := range 8 {
+		mustWrite(t, r.b.n, "rm", upsertOp(fmt.Sprintf("m%d", k), k))
+	}
+	r.seq = mustWrite(t, r.b.n, "rd", api.WriteOp{Kind: api.OpUpsert, ID: "d", Body: json.RawMessage(`{"seen": 1900000000000}`)},
+		api.WriteOp{Kind: api.OpQueryUpsert, ID: "recent", Query: json.RawMessage(`{"field": "seen", "op": "gte", "value": "now-7d"}`)})
+	waitCopies(t, r.b.st, "rm", 4, 1, time.Minute)
+	waitCopies(t, r.b.st, "rd", 1, 1, time.Minute)
+	r.c = cl.start(2)
+	r.coord = cl.start(0)
+	two := 2
+	for _, index := range []string{"rr", "rm", "rd"} {
+		if _, err := r.b.n.PatchSettings(tctx(t), index, api.SettingsPatch{ReplicasPerShard: &two}); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if r.coord == nil || len(holders) != 2 {
-		t.Fatalf("%d nodes hold the shard, want 2 and a coordinator without it", len(holders))
-	}
-	r.b, r.c = holders[0], holders[1]
-	waitRoutes(t, r.coord, "rr", 1, 2, time.Minute)
-	r.seq = mustWrite(t, r.coord.n, "rr", upsertOp("x", 1),
-		api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
-	waitCount(t, r.b.n, "rr", r.seq, 1)
+	waitCopies(t, r.b.st, "rr", 1, 2, time.Minute)
+	waitCopies(t, r.b.st, "rm", 4, 2, time.Minute)
+	waitCopies(t, r.b.st, "rd", 1, 2, time.Minute)
 	waitCount(t, r.c.n, "rr", r.seq, 1)
+	waitCount(t, r.c.n, "rm", r.seq, 8)
+	r.id = store.ShardID{Index: "rr", Shard: 0}
+	r.trailing = r.coord.n.view.Load()
+	for _, id := range []store.ShardID{r.id, {Index: "rm", Shard: 3}, {Index: "rd", Shard: 0}} {
+		if c := r.coord.n.candidates(id); len(c) != 1 || c[0].addr != r.b.addr {
+			t.Fatalf("the coordinator routes %s to %v, want b alone", id, c)
+		}
+	}
 	return r
 }
 
-// target is a read of the shard routed with a view that lists only cands, as a view
-// one refresh behind the registry does: routed is that view's read, so a re-read must
-// read the registry again (or take a view read since).
-func (r *rereadRig) target(cands ...*tnode) *remoteTarget {
+// reset puts the coordinator's trailing view back, and the peers up.
+func (r *rereadRig) reset(down ...string) {
+	r.coord.n.view.Store(r.trailing)
+	r.tap.set(down...)
+}
+
+// target is a read of rr's shard routed to cands, by a view read when the published
+// one was: a re-read reads the registry again (or takes a view read since).
+func (r *rereadRig) target(cands ...candidate) *remoteTarget {
 	_, routed := r.coord.n.route(r.id)
-	t := &remoteTarget{n: r.coord.n, id: r.id, waitSeq: r.seq, routed: routed}
-	for _, tn := range cands {
-		t.cands = append(t.cands, candidate{node: tn.n.ID(), addr: tn.addr, shard: r.id})
-	}
-	return t
+	return &remoteTarget{n: r.coord.n, id: r.id, waitSeq: r.seq, routed: routed, cands: cands}
+}
+
+func (r *rereadRig) at(tn *tnode) candidate {
+	return candidate{node: tn.n.ID(), addr: tn.addr, shard: r.id}
 }
 
 // rereads is the coordinator's copy table re-reads of op so far, by result.
 func (r *rereadRig) rereads(t *testing.T, op, result string) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
-	if err := r.readers[r.coord.i].Collect(context.Background(), &rm); err != nil {
+	if err := r.reader.Collect(context.Background(), &rm); err != nil {
 		t.Fatal(err)
 	}
 	want := attribute.NewSet(attribute.String("op", op), attribute.String("result", result))
@@ -161,7 +205,12 @@ func (r *rereadRig) rereads(t *testing.T, op, result string) int64 {
 	return total
 }
 
-// rereadOps are the remote shard reads that share routing, each run on a target.
+// allRereads is every re-read of op so far.
+func (r *rereadRig) allRereads(t *testing.T, op string) int64 {
+	return r.rereads(t, op, "found") + r.rereads(t, op, "none") + r.rereads(t, op, "timeout")
+}
+
+// rereadOps are the remote shard reads that share routing, each run on a target of rr.
 var rereadOps = []struct {
 	op  string
 	run func(ctx context.Context, rt *remoteTarget) error
@@ -198,16 +247,18 @@ var rereadOps = []struct {
 }
 
 // TestReadRereadsTheCopyTable (sb-0y2e.15): a coordinator whose view lists one copy of
-// a shard, which fails, while the registry shows a second one serving: every remote
-// read (search, percolate, get, counts) reads the copy table again once and is
-// answered by the second copy, not a 503. A percolation carries the same now to both.
+// a shard, which fails, while the registry shows a second one serving.
 func TestReadRereadsTheCopyTable(t *testing.T) {
 	r := newRereadRig(t)
+
+	// Every remote read (search, percolate, get, counts) reads the copy table again
+	// once and is answered by the second copy, not a 503. A percolation carries the
+	// same now to both.
 	for _, tc := range rereadOps {
 		t.Run(tc.op, func(t *testing.T) {
-			r.tap.set(r.b.addr)
+			r.reset(r.b.addr)
 			before := r.rereads(t, tc.op, "found")
-			if err := tc.run(tctx(t), r.target(r.b)); err != nil {
+			if err := tc.run(tctx(t), r.target(r.at(r.b))); err != nil {
 				t.Fatalf("a read whose one known copy failed: %v", err)
 			}
 			if b, c := r.tap.count(r.b.addr), r.tap.count(r.c.addr); b != 1 || c < 1 {
@@ -226,18 +277,119 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 			}
 		})
 	}
+
+	// Routed by the engine (Remote, through the trailing view), a search of every
+	// shard of rm at once: each shard's copy on b fails, each shard re-reads, and
+	// they share one read of the copy table.
+	t.Run("shards in parallel", func(t *testing.T) {
+		r.reset(r.b.addr)
+		before := r.rereads(t, "search", "found")
+		reads := r.coord.wrap.tableReads.Load()
+		got, err := count(tctx(t), r.coord.n, "rm", r.seq)
+		if err != nil || got != 8 {
+			t.Fatalf("a search of rm with b down: %d, %v; want 8", got, err)
+		}
+		if n := r.rereads(t, "search", "found") - before; n != 4 {
+			t.Fatalf("%d shards re-read and found a copy, want 4", n)
+		}
+		if n := r.coord.wrap.tableReads.Load() - reads; n != 1 {
+			t.Fatalf("the four shards read the copy table %d times, want once", n)
+		}
+	})
+
+	// A shard whose view was read after it was routed takes that view: no read.
+	t.Run("a view read since", func(t *testing.T) {
+		r.tap.set()
+		if err := r.coord.n.refreshView(tctx(t)); err != nil {
+			t.Fatal(err)
+		}
+		reads := r.coord.wrap.tableReads.Load()
+		cands, _ := r.coord.n.rerouteCandidates(tctx(t), r.id, r.trailing.readBegan)
+		if len(cands) != 2 {
+			t.Fatalf("the newer view routes to %v, want both copies", cands)
+		}
+		if n := r.coord.wrap.tableReads.Load() - reads; n != 0 {
+			t.Fatalf("the copy table was read %d times with a newer view at hand", n)
+		}
+	})
+
+	// A copy of an older release refusing a percolation of date math (errOlderLevel)
+	// is as a failed one: the read re-reads and moves on.
+	t.Run("older wire level", func(t *testing.T) {
+		r.reset()
+		before := r.rereads(t, "percolate", "found")
+		res, err := r.coord.n.Percolate(tctx(t), "rd", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))}}, api.ReadOptions{WaitForSeq: r.seq})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(res.Results[0].Queries); got != `["recent"]` {
+			t.Fatalf("the percolation matched %s", got)
+		}
+		if n := r.rereads(t, "percolate", "found") - before; n != 1 {
+			t.Fatalf("%d re-reads found a copy, want 1", n)
+		}
+	})
+
+	// A copy that has not reached wait_for_seq answers in time with a timeout: the
+	// read re-reads, and the copy that has it answers.
+	t.Run("lagging copy under wait_for_seq", func(t *testing.T) {
+		r.reset()
+		stall := make(chan struct{})
+		r.b.wrap.stallTail.Store(&stall)
+		released := false
+		release := func() {
+			if !released {
+				released = true
+				r.b.wrap.stallTail.Store(nil)
+				close(stall)
+			}
+		}
+		defer release()
+		eventually(t, 10*time.Second, "b's tailer is held", func() error {
+			if r.b.wrap.stalled.Load() == 0 {
+				return errors.New("no poll held yet")
+			}
+			return nil
+		})
+		seq := mustWrite(t, r.coord.n, "rr", upsertOp("late", 2))
+		waitCount(t, r.c.n, "rr", seq, 2)
+		before := r.rereads(t, "search", "found")
+		got, err := count(tctx(t), r.coord.n, "rr", seq)
+		if err != nil || got != 2 {
+			t.Fatalf("a wait_for_seq search with b behind: %d, %v; want 2", got, err)
+		}
+		if n := r.rereads(t, "search", "found") - before; n != 1 {
+			t.Fatalf("%d re-reads found a copy, want 1", n)
+		}
+		release()
+		waitCount(t, r.b.n, "rr", seq, 2)
+	})
+
+	// A peer that restarted with the same node id at a new address is another copy:
+	// the read routed to its old address tries it at the new one.
+	t.Run("new address", func(t *testing.T) {
+		r.reset(r.c.addr)
+		gone := candidate{node: r.b.n.ID(), addr: "127.0.0.1:1", shard: r.id}
+		if _, found, err := r.target(gone).Get(tctx(t), "x"); err != nil || !found {
+			t.Fatalf("a get routed to b's old address: %v, %v", found, err)
+		}
+		if n := r.tap.count(r.b.addr); n != 1 {
+			t.Fatalf("b at its new address was asked %d times, want 1", n)
+		}
+	})
 }
 
 // TestRereadFindingNothingNewIsUnavailable: when every copy fails, the read re-reads
-// the copy table once, tries only the copies it did not try yet, and answers 503; a
-// second call of the same read re-reads no more.
+// the copy table once, tries only the copies it has not tried, and answers 503; a
+// second call of the same read re-reads no more, nor does a read whose routing
+// already read the registry again.
 func TestRereadFindingNothingNewIsUnavailable(t *testing.T) {
 	r := newRereadRig(t)
 	for _, tc := range rereadOps {
 		t.Run(tc.op, func(t *testing.T) {
-			r.tap.set(r.b.addr, r.c.addr)
-			before := r.rereads(t, tc.op, "none") + r.rereads(t, tc.op, "found")
-			rt := r.target(r.b)
+			r.reset(r.b.addr, r.c.addr)
+			before := r.allRereads(t, tc.op)
+			rt := r.target(r.at(r.b))
 			err := tc.run(tctx(t), rt)
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
@@ -246,7 +398,7 @@ func TestRereadFindingNothingNewIsUnavailable(t *testing.T) {
 			if b, c := r.tap.count(r.b.addr), r.tap.count(r.c.addr); b != 1 || c != 1 {
 				t.Fatalf("the copies were asked %d and %d times, want once each", b, c)
 			}
-			if got := r.rereads(t, tc.op, "none") + r.rereads(t, tc.op, "found") - before; got != 1 {
+			if got := r.allRereads(t, tc.op) - before; got != 1 {
 				t.Fatalf("%d re-reads, want 1", got)
 			}
 			if err := tc.run(tctx(t), rt); err == nil {
@@ -255,15 +407,18 @@ func TestRereadFindingNothingNewIsUnavailable(t *testing.T) {
 			if b, c := r.tap.count(r.b.addr), r.tap.count(r.c.addr); b != 2 || c != 2 {
 				t.Fatalf("on the second call the copies were asked %d and %d times in all, want twice each", b, c)
 			}
-			if got := r.rereads(t, tc.op, "none") + r.rereads(t, tc.op, "found") - before; got != 1 {
+			if got := r.allRereads(t, tc.op) - before; got != 1 {
 				t.Fatalf("%d re-reads after the second call, want still 1", got)
 			}
 		})
 	}
 	t.Run("all known", func(t *testing.T) {
-		r.tap.set(r.b.addr, r.c.addr)
+		r.reset(r.b.addr, r.c.addr)
+		if err := r.coord.n.refreshView(tctx(t)); err != nil {
+			t.Fatal(err)
+		}
 		before := r.rereads(t, "get", "none")
-		if err := rereadOps[2].run(tctx(t), r.target(r.b, r.c)); err == nil {
+		if err := rereadOps[2].run(tctx(t), r.target(r.at(r.b), r.at(r.c))); err == nil {
 			t.Fatal("a get with every copy down answered")
 		}
 		if b, c := r.tap.count(r.b.addr), r.tap.count(r.c.addr); b != 1 || c != 1 {
@@ -273,36 +428,104 @@ func TestRereadFindingNothingNewIsUnavailable(t *testing.T) {
 			t.Fatalf("%d re-reads found nothing new, want 1", got)
 		}
 	})
+	// An index created after the coordinator's view was read: routing finds no copy,
+	// reads the registry, and finds one; when that one fails the read does not read it
+	// a second time.
+	t.Run("routing already re-read", func(t *testing.T) {
+		r.reset()
+		createIndex(t, r.b.n, "late", 1, 1)
+		waitCopies(t, r.b.st, "late", 1, 1, time.Minute)
+		r.reset(r.b.addr, r.c.addr)
+		id := store.ShardID{Index: "late", Shard: 0}
+		if c := r.coord.n.candidates(id); len(c) != 0 {
+			t.Fatalf("the trailing view routes the new index to %v", c)
+		}
+		before := r.allRereads(t, "counts")
+		reads := r.coord.wrap.tableReads.Load()
+		_, _, err := (&clusterHooks{n: r.coord.n}).Counts(tctx(t), id)
+		var ae *api.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+			t.Fatalf("counts of a shard whose one copy fails: %v, want a 503", err)
+		}
+		if n := r.coord.wrap.tableReads.Load() - reads; n != 1 {
+			t.Fatalf("the copy table was read %d times, want once (routing's)", n)
+		}
+		if n := r.allRereads(t, "counts") - before; n != 0 {
+			t.Fatalf("%d re-reads after routing's", n)
+		}
+		if n := r.tap.count(r.b.addr) + r.tap.count(r.c.addr); n != 1 {
+			t.Fatalf("the copies were asked %d times, want once", n)
+		}
+	})
 }
 
-// TestRereadKeepsTheDeadline: a re-read waits on the request's deadline, not past it:
-// held by the routing misses' spacing, it gives up when the request does, and the
-// read fails with the deadline without asking another copy.
-func TestRereadKeepsTheDeadline(t *testing.T) {
+// TestRereadKeepsTheRequestBudget: a re-read waiting its turn behind a slow registry
+// read gives up within its share of the request's time: the read answers 503 while
+// the request still has time (for the coordinator's own copy, when it holds one), and
+// asks no other copy.
+func TestRereadKeepsTheRequestBudget(t *testing.T) {
 	r := newRereadRig(t)
-	r.tap.set(r.b.addr)
+	r.reset(r.b.addr)
 	n := r.coord.n
-	n.missMu.Lock()
-	n.missReadAt = n.clock.Now().Add(time.Hour)
-	n.missMu.Unlock()
-	t.Cleanup(func() {
-		n.missMu.Lock()
-		n.missReadAt = time.Time{}
-		n.missMu.Unlock()
-	})
-	rt := r.target(r.b)
-	rt.routed = math.MaxInt64
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	n.miss <- struct{}{}
+	defer func() { <-n.miss }()
+	before := r.rereads(t, "get", "timeout")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, _, err := rt.Get(ctx, "x")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("a read whose re-read outlived its deadline: %v, want the deadline", err)
+	_, _, err := r.target(r.at(r.b)).Get(ctx, "x")
+	var ae *api.Error
+	if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || ctx.Err() != nil {
+		t.Fatalf("a read whose re-read is held: %v (request %v), want a 503 in time", err, ctx.Err())
 	}
-	if took := time.Since(start); took > 10*time.Second {
-		t.Fatalf("the read took %s past its 300ms deadline", took)
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("the read took %s of its 2s", took)
+	}
+	if got := r.rereads(t, "get", "timeout") - before; got != 1 {
+		t.Fatalf("%d re-reads timed out, want 1", got)
 	}
 	if c := r.tap.count(r.c.addr); c != 0 {
 		t.Fatalf("the copy the re-read would find was asked %d times", c)
+	}
+}
+
+// TestRereadLeavesTimeForTheLocalCopy: a coordinator whose own copy is stale (paused)
+// reads
+// another; when every other copy fails and the re-read is held behind a slow registry
+// read, the search still falls back to the coordinator's copy within its deadline.
+func TestRereadLeavesTimeForTheLocalCopy(t *testing.T) {
+	tap := &downTap{base: http.DefaultTransport}
+	tap.set()
+	cl := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.Transport = tap
+	})
+	a, b, c := cl.start(0), cl.start(1), cl.start(2)
+	createIndex(t, a.n, "lf", 1, 0)
+	waitCopies(t, a.st, "lf", 1, 3, time.Minute)
+	waitRoutes(t, a, "lf", 1, 3, time.Minute)
+	seq := mustWrite(t, a.n, "lf", upsertOp("x", 1))
+	waitCount(t, a.n, "lf", seq, 1)
+
+	cp, ok := a.n.Hosted(store.ShardID{Index: "lf", Shard: 0})
+	if !ok {
+		t.Fatal("a holds no copy")
+	}
+	if err := a.n.PauseCopy(tctx(t), cp); err != nil {
+		t.Fatal(err)
+	}
+	tap.set(b.addr, c.addr)
+	a.n.miss <- struct{}{}
+	defer func() { <-a.n.miss }()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	res, err := a.n.Search(ctx, "lf", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{})
+	if err != nil {
+		t.Fatalf("a search with every other copy down and the re-read held: %v", err)
+	}
+	if !res.Stale || res.Total != 1 {
+		t.Fatalf("the search answered %d, stale %v; want the stale copy's 1", res.Total, res.Stale)
+	}
+	if tap.count(b.addr)+tap.count(c.addr) == 0 {
+		t.Fatal("no other copy was asked first")
 	}
 }

@@ -68,13 +68,9 @@ func (i *instruments) retry(ctx context.Context, op string) {
 	i.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op)))
 }
 
-// reread counts a shard read's copy table re-read: found when it showed a serving copy
-// the read had not tried yet, none when it did not.
-func (i *instruments) reread(ctx context.Context, op string, found bool) {
-	result := "none"
-	if found {
-		result = "found"
-	}
+// reread counts a shard read's copy table re-read by its result: found (a serving copy
+// the read has not tried), none, or timeout (it ran out of its time first).
+func (i *instruments) reread(ctx context.Context, op, result string) {
 	i.rereads.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op), attribute.String("result", result)))
 }
 

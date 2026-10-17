@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"slices"
 	"strings"
@@ -85,12 +86,15 @@ func TestAnalyzePoints(t *testing.T) {
 	for body, want := range map[string][]Point{
 		`{"p": [3, 4]}`:   {{3, 4}},
 		`{"p": [[3, 4]]}`: {{3, 4}},
-		`{"p": [[5, 1], [3, 4], [5, 0], [3, 4]]}`:                  {{3, 4}, {5, 0}, {5, 1}},
-		`{"p": [[-0, -0.0]]}`:                                      {{0, 0}},
-		`{"p": [[1e400, 1], [1, "2"], [1], [1, 2, 3], 7, [2, 2]]}`: {{2, 2}},
-		`{"p": []}`:         nil,
-		`{"p": "here"}`:     nil,
-		`{"p": [1e400, 1]}`: nil,
+		`{"p": [[5, 1], [3, 4], [5, 0], [3, 4]]}`:               {{3, 4}, {5, 0}, {5, 1}},
+		`{"p": [[-0, -0.0]]}`:                                   {{0, 0}},
+		`{"p": [[1e400, 1], [1, "2"], [1], [1, 2, 3], [2, 2]]}`: {{2, 2}},
+		`{"p": [1, [2, 3]]}`:                                    nil,
+		`{"p": [[2, 3], 7]}`:                                    nil,
+		`{"p": [1, 2, 3]}`:                                      nil,
+		`{"p": []}`:                                             nil,
+		`{"p": "here"}`:                                         nil,
+		`{"p": [1e400, 1]}`:                                     nil,
 		`{"d": [["2026-10-01", 1], [1767225600000, 2], ["2026-10-01T00:00:00.5Z", 3]]}`: {{1767225600000, 2}, {1790812800000, 1}, {1790812800500, 3}},
 	} {
 		doc, _, err := Analyze(m, "a", []byte(body))
@@ -112,13 +116,14 @@ func TestAnalyzePoints(t *testing.T) {
 			}
 		}
 	}
-	many := make([]string, MaxPoints+5)
-	for i := range many {
-		many[i] = "[1, " + strings.Repeat("1", 1) + "]"
+	// The cap counts valid pairs, after the invalid ones are passed over.
+	pairs := []string{"[1e400, 0]", `["x", 0]`}
+	for i := range MaxPoints + 5 {
+		pairs = append(pairs, fmt.Sprintf("[%d, 0]", i))
 	}
-	doc, _, err := Analyze(m, "a", []byte(`{"p": [`+strings.Join(many, ",")+`]}`))
-	if err != nil || len(doc.Fields["p"].Points) != 1 {
-		t.Fatalf("many repeats: %v, %v", doc.Fields["p"], err)
+	doc, _, err := Analyze(m, "a", []byte(`{"p": [`+strings.Join(pairs, ",")+`]}`))
+	if got := doc.Fields["p"].Points; err != nil || len(got) != MaxPoints || got[MaxPoints-1].X != MaxPoints-1 {
+		t.Fatalf("past the cap: %d points, %v", len(got), err)
 	}
 }
 

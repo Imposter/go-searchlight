@@ -171,14 +171,15 @@ type Records struct {
 // arguments (index, shard, slot, node_id, epoch) naming one incarnation of a
 // copy.
 type Registry struct {
-	// Heartbeat: (node_id, address, version, capacity, body_codecs) inserts the
-	// node with heartbeat_at and started_at NOW, or updates its address,
-	// version, capacity, body_codecs and heartbeat_at.
+	// Heartbeat: (node_id, address, version, capacity, body_codecs,
+	// mapping_types) inserts the node with heartbeat_at and started_at NOW, or
+	// updates its address, version, capacity, body_codecs, mapping_types and
+	// heartbeat_at.
 	Heartbeat string
 	// RemoveNode: (node_id).
 	RemoveNode string
 	// Nodes: () -> node_id, address, version, capacity, body_codecs,
-	// heartbeat_at, started_at, NOW, by node_id.
+	// mapping_types, heartbeat_at, started_at, NOW, by node_id.
 	Nodes string
 	// Features: () -> name, enabled_at of sl_features.
 	Features string

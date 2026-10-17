@@ -29,6 +29,11 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     503 until the upgrade is done.
   - The request cache keys a box by its resolved bounds; a box reading `now`
     unrounded is never cached, as any such date math is.
+  - Schema migration 4 adds `sl_nodes.mapping_types`, the mapping field types each
+    node reads. A point field (at index creation or by a mapping patch) is refused
+    with a 409 naming them while a node of an earlier release is live, which could not
+    decode the mapping. Once a point field exists, no node can be downgraded below
+    this release ([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)).
 
 ### Fixed
 

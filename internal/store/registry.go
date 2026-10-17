@@ -35,10 +35,10 @@ func (g *registry) Heartbeat(ctx context.Context, n Node) (err error) {
 	if err := validNode(n.ID); err != nil {
 		return err
 	}
-	if n.Capacity < 0 || n.BodyCodecs < 0 {
-		return invalidf("capacity %d, body codecs %d", n.Capacity, n.BodyCodecs)
+	if n.Capacity < 0 || n.BodyCodecs < 0 || n.MappingTypes < 0 {
+		return invalidf("capacity %d, body codecs %d, mapping types %d", n.Capacity, n.BodyCodecs, n.MappingTypes)
 	}
-	_, err = s.w.ExecContext(ctx, s.d.Registry.Heartbeat, n.ID, n.Address, n.Version, n.Capacity, n.BodyCodecs)
+	_, err = s.w.ExecContext(ctx, s.d.Registry.Heartbeat, n.ID, n.Address, n.Version, n.Capacity, n.BodyCodecs, n.MappingTypes)
 	return err
 }
 
@@ -99,7 +99,7 @@ func (g *registry) Nodes(ctx context.Context) (out []Node, err error) {
 	for rows.Next() {
 		var n Node
 		var hb, started, now int64
-		if err := rows.Scan(&n.ID, &n.Address, &n.Version, &n.Capacity, &n.BodyCodecs, &hb, &started, &now); err != nil {
+		if err := rows.Scan(&n.ID, &n.Address, &n.Version, &n.Capacity, &n.BodyCodecs, &n.MappingTypes, &hb, &started, &now); err != nil {
 			return nil, err
 		}
 		n.HeartbeatAt, n.StartedAt = millis(hb), millis(started)

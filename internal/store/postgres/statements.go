@@ -264,10 +264,10 @@ var records = dialect.Records{
 }
 
 var registry = dialect.Registry{
-	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, heartbeat_at, started_at) VALUES ($1, $2, $3, $4, $5, NOW, NOW)
-ON CONFLICT (node_id) DO UPDATE SET address = EXCLUDED.address, version = EXCLUDED.version, capacity = EXCLUDED.capacity, body_codecs = EXCLUDED.body_codecs, heartbeat_at = EXCLUDED.heartbeat_at`),
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at) VALUES ($1, $2, $3, $4, $5, $6, NOW, NOW)
+ON CONFLICT (node_id) DO UPDATE SET address = EXCLUDED.address, version = EXCLUDED.version, capacity = EXCLUDED.capacity, body_codecs = EXCLUDED.body_codecs, mapping_types = EXCLUDED.mapping_types, heartbeat_at = EXCLUDED.heartbeat_at`),
 	RemoveNode:    "DELETE FROM sl_nodes WHERE node_id = $1",
-	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
 	Features:      "SELECT name, enabled_at FROM sl_features",
 	EnableFeature: withNow("INSERT INTO sl_features (name, enabled_at) VALUES ($1, NOW) ON CONFLICT (name) DO NOTHING"),
 	IndexExists:   "SELECT COUNT(*) FROM sl_indexes WHERE name = $1",

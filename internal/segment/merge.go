@@ -55,7 +55,10 @@ const mergeCheckDocs = 4096
 // Merge holds no document and no posting in memory: each field's term dictionaries are
 // a merge of the inputs' (already sorted) dictionaries, and stored records and ids
 // stream from the inputs, in order, as the merged file is written. What it accumulates
-// is per document: presence and marks, numbers, and each value and entry ordinal.
+// is per document: presence and marks, numbers, and each value and entry ordinal; and
+// per point of a point field, every surviving one, 24 bytes each (a k-d tree is built
+// over all of a field's points at once): about 240 MB for a field of 10M points, on
+// top of the per-document state. Nothing bounds it but the segment's size.
 func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOptions) (Meta, error) {
 	threads := opts.Threads
 	if threads < 1 {

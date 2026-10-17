@@ -432,35 +432,41 @@ type Point struct {
 	X, Y float64
 }
 
-// MaxPoints is the most points one value of a point field holds; the pairs past it are
-// not read.
+// MaxPoints is the most points one value of a point field holds: its first MaxPoints
+// valid pairs, in document order (counted before repeats are dropped); the pairs past
+// them are not read.
 const MaxPoints = 10_000
 
-// pointList reads a point field's value: an array of [x, y] pairs, or one pair. A
-// number axis takes what a number field does, a date axis what a date field does
-// (Unix milliseconds, or a date string). A pair that is not two such coordinates is no
-// point, as a non-finite number is no number: the field is present still, with the
-// pairs that are. The points are sorted and distinct.
+// pointList reads a point field's value: an array of [x, y] pairs, or one pair (an
+// array of two members neither of which is an array). A number axis takes what a
+// number field does, a date axis what a date field does (Unix milliseconds, or a date
+// string). A pair that is not two such coordinates is no point, as a non-finite number
+// is no number: the field is present still, with the pairs that are. A list some of
+// whose members are not arrays ([1, [2, 3]]) is neither one pair nor a list of pairs,
+// and holds no point. The points are sorted and distinct.
 func pointList(t FieldType, value any) []Point {
 	list, ok := value.([]any)
 	if !ok || len(list) == 0 {
 		return nil
 	}
 	xAxis, yAxis := t.Axes()
-	if !isArray(list[0]) && len(list) == 2 && !isArray(list[1]) {
+	if !slices.ContainsFunc(list, isArray) {
 		if p, ok := readPoint(list, xAxis, yAxis); ok {
 			return []Point{p}
 		}
 		return nil
 	}
+	if !all(list, isArray) {
+		return nil
+	}
 	var out []Point
-	for _, member := range list[:min(len(list), MaxPoints)] {
-		pair, ok := member.([]any)
-		if !ok {
-			continue
-		}
+	for _, member := range list {
+		pair, _ := member.([]any) // every member is an array
 		if p, ok := readPoint(pair, xAxis, yAxis); ok {
 			out = append(out, p)
+			if len(out) == MaxPoints {
+				break
+			}
 		}
 	}
 	if len(out) < 2 {
@@ -476,6 +482,15 @@ func ComparePoints(a, b Point) int {
 		return c
 	}
 	return cmp.Compare(a.Y, b.Y)
+}
+
+func all(list []any, f func(any) bool) bool {
+	for _, v := range list {
+		if !f(v) {
+			return false
+		}
+	}
+	return true
 }
 
 func isArray(v any) bool {

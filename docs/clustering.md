@@ -383,6 +383,12 @@ each search has a wire level, the level a peer must speak to answer it exactly.
 - A percolation of an index whose mapping has a [point field](api.md#point-fields)
   needs percolate level 2, and its endpoint, in the same way: a node of an earlier
   release reads neither the mapping nor saved `box` conditions.
+- A mapping is decoded by every node, so a point field is not admitted while any node
+  of an earlier release is live: each node heartbeats the mapping field types it reads
+  (`sl_nodes.mapping_types`), and creating an index with a point field, or patching one
+  in, is a 409 naming the nodes that read none, while they heartbeat within the fence or
+  hold a live lease. Once a point field exists, the cluster cannot be downgraded below
+  the release that added them ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
 - Saving a query with date math is not refused while older nodes serve: no request
   can tell which releases hold a shard's copies. A 1.0.0 node percolating its own
   copies (a request it coordinates, or a copy it rebuilt after a rollback) matches no

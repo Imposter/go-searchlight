@@ -128,7 +128,14 @@ axes, each `number` or `date`:
   or a bare `YYYY-MM-DD`). A pair that is not two finite coordinates of its axes' types
   (`[1e400, 1]`, `["x", 1]`, `[1, 2, 3]`) is no point, as a non-finite number is no
   number: the field is present still (`exists` matches it), with the pairs that are.
-  Repeated points count once, and at most 10,000 pairs of one value are read.
+  A list whose members are not all arrays (`[1, [2, 3]]`) is neither one pair nor a
+  list of pairs, and holds no point. Repeated points count once. A value holds at most
+  10,000 points: its first 10,000 valid pairs, in document order; the pairs past them
+  are not read.
+- **Upgrades.** An index cannot gain a point field (at creation or by a mapping patch)
+  while a node of a release before point fields serves: the request is a 409 naming
+  those nodes. Once one exists, no node can be downgraded below the release that added
+  them ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
 - **Typing.** Dynamic mapping never types a point (a list of pairs is a
   `keyword_list`): map the field first, at creation or with `PATCH .../mapping`. A
   point's axes are part of its type, so `point(number, date)` cannot become

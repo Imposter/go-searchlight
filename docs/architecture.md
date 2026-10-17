@@ -231,7 +231,8 @@ data_dir/
     The one box the sorted scan wins is a bound on x alone, which reads only its
     matches there, where the tree also scans the leaves along the bound. An estimate
     from the node boxes takes 0.5 µs.
-- **Format versions.** The segment format is versioned (major 3). A copy whose files
+- **Format versions.** The segment format is versioned (major 4, minor 1 for a segment holding a
+  point field; a binary reads its own major and the one before). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:
   `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
   served. A copy of a newer format (`segment.ErrNewerFormat`) is refused and left as it

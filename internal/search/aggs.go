@@ -256,7 +256,13 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		}
 		return c
 	case AggTerms:
-		return &termsColl{s: s, spec: spec, src: src, allow: s.termMask(spec, src)}
+		c := &termsColl{s: s, spec: spec, src: src}
+		if s.lazyTerms(spec, src) {
+			c.lazy = &lazyFilter{f: spec.terms, src: src, seen: map[uint32]bool{}}
+		} else {
+			c.allow = s.termMask(spec, src)
+		}
+		return c
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
 	default:
@@ -443,16 +449,21 @@ type termsColl struct {
 	counts  []int64       // by ordinal (keyword, list) or 0/1 (bool)
 	subs    [][]collector // by ordinal, made on first use
 	numbers map[float64]*histBucket
-	// allow is the filter of include and exclude over the ordinals (or bool keys): nil
-	// without them, and for a number field, whose values are checked as first seen.
+	// allow is the filter of include and exclude over the ordinals (or bool keys), or
+	// lazy decides it ordinal by ordinal (few hits over a large dictionary): both nil
+	// without them, and for a number field, whose values are checked directly.
 	allow *termMask
+	lazy  *lazyFilter
 }
 
-// excludedBucket marks a number a terms aggregation's include or exclude leaves out.
-var excludedBucket = &histBucket{}
-
 func (c *termsColl) allowed(o uint32) bool {
-	return c.allow == nil || c.allow.has(o)
+	switch {
+	case c.allow != nil:
+		return c.allow.has(o)
+	case c.lazy != nil:
+		return c.lazy.allows(o)
+	}
+	return true
 }
 
 func (c *termsColl) slot(o uint32) {
@@ -514,14 +525,10 @@ func (c *termsColl) collect(d uint32) {
 			b := c.numbers[v]
 			if b == nil {
 				if c.spec.terms != nil && !c.spec.terms.number(v) {
-					c.numbers[v] = excludedBucket
 					return
 				}
 				b = &histBucket{subs: c.s.newSubs(c.spec)}
 				c.numbers[v] = b
-			}
-			if b == excludedBucket {
-				return
 			}
 			b.count++
 			collectSubs(b.subs, d)
@@ -533,7 +540,7 @@ func (c *termsColl) collect(d uint32) {
 // document frequencies, minus the documents not hit: cheaper than reading every hit's
 // value when most of the segment matches.
 func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
-	if len(c.spec.subs) > 0 || !c.src.ordinal() {
+	if len(c.spec.subs) > 0 || !c.src.ordinal() || c.lazy != nil {
 		return false
 	}
 	if c.allow != nil && c.allow.listed {
@@ -556,9 +563,6 @@ func (c *termsColl) partial() *AggPartial {
 	switch {
 	case c.src.kind == srcNumber:
 		for v, b := range c.numbers {
-			if b == excludedBucket {
-				continue
-			}
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
 	case c.src.ordinal():
@@ -934,6 +938,7 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 	colls := make([]collector, len(specs))
 	var perDoc []int
 	var notHit *roaring.Bitmap
+	s.collecting = hits.GetCardinality()
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
 	for i, spec := range specs {
 		if spec.wrapper() {

@@ -148,7 +148,7 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
 - **Missing fields** match nothing except `exists:false`, `empty` and `ne`.
 - **Errors** are problem JSON with `loc` paths such as `query.all.2.any.0.value`.
 - **Aggregations** (v1):
-  - `terms` (size, min_doc_count, include and exclude: exact values compared normalized as the field's, or an anchored pattern in a subset of Lucene's regexp syntax run as RE2, decided per segment once per dictionary term before any shard cut), `range`, `histogram`, `date_histogram`, `stats`, `cardinality` (HyperLogLog++);
+  - `terms` (size, min_doc_count, include and exclude: exact values compared normalized as the field's, or an anchored pattern in a subset of Lucene's regexp syntax, folded as values are, run as RE2; decided per segment once per dictionary term, or per collected value when the hits are few, before any shard cut), `range`, `histogram`, `date_histogram`, `stats`, `cardinality` (HyperLogLog++);
   - nested one level: a bucket aggregation with metric sub-aggregations;
   - `filter` (a query), `filters` (keyed queries, with an optional other bucket) and `global` (every live document, top level only): buckets holding any other aggregation, each with its metric sub-aggregations. Their filters go through the plan and the filter cache as the query does; their partials merge bucket by bucket, the aggregations under each reduced as top-level ones are (terms error bounds and bucket limits included);
   - `post_filter`: a query the hits, total and paging obey but the aggregations (all but `global`) do not, so a facet panel is one search.

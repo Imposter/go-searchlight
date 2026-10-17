@@ -30,10 +30,12 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   1,000 exact values, compared normalized as the field's values are, or a pattern of
   at most 1,000 characters over the whole normalized key, in a subset of Lucene's
   regular expressions (literals, `.`, classes, `*` `+` `?` `{n,m}`, `|`, groups) run
-  as RE2. Exclude wins; both apply before `size` and `shard_size`, so the top buckets,
+  as RE2 and folded as values are (`"Nike.*"` is `nike.*`). Exclude wins; both apply before `size` and `shard_size`, so the top buckets,
   `sum_other_doc_count` and the error bounds are the chosen values'. Each segment
-  decides them once per dictionary term. Patterns on number, date and bool fields,
-  Lucene's other operators and partitions are refused with a 400 at their `loc`.
+  decides them once per distinct value, from its dictionary or, with few hits, as
+  values are collected. Patterns on number, date and bool fields, patterns that
+  cannot fold faithfully (`[ß]`, `[^A-Z]`), Lucene's other operators and partitions
+  are refused with a 400 at their `loc`; a null `include` or `exclude` is none.
 
 ### Changed
 

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -340,5 +341,32 @@ func BenchmarkWords(b *testing.B) {
 func BenchmarkSimilarity(b *testing.B) {
 	for b.Loop() {
 		_ = similarity("nike air max 90", "nike air max 270")
+	}
+}
+
+// TestFoldRune: FoldRune is Normalize of one code point (but whitespace), and
+// FoldChanged lists exactly the code points it changes.
+func TestFoldRune(t *testing.T) {
+	changed := map[rune]bool{}
+	for _, r := range FoldChanged(0, unicode.MaxRune) {
+		changed[r] = true
+	}
+	for r := rune(0); r <= 0x2ffff; r++ {
+		if IsSpace(r) || (r >= 0xd800 && r < 0xe000) {
+			continue
+		}
+		f := FoldRune(r)
+		if f != Normalize(string(r)) {
+			t.Fatalf("FoldRune(%U) = %q, Normalize %q", r, f, Normalize(string(r)))
+		}
+		if (f != string(r)) != changed[r] {
+			t.Fatalf("%U: folds to %q, FoldChanged says changed %t", r, f, changed[r])
+		}
+	}
+	if got := FoldChanged('A', 'C'); len(got) != 3 || got[0] != 'A' {
+		t.Fatalf("FoldChanged(A, C) = %q", got)
+	}
+	if got := FoldChanged('a', 'z'); len(got) != 0 {
+		t.Fatalf("FoldChanged(a, z) = %q", got)
 	}
 }

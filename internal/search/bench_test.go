@@ -440,6 +440,22 @@ func BenchmarkTermsAggPrefixInclude(b *testing.B) {
 	})
 }
 
+// BenchmarkTermsAggSparsePattern: a pattern include (".*foo") over a field of unique
+// values (sku) under a query of three hits, the filter decided over each segment's
+// whole dictionary (as it is for dense hits) or lazily, per collected ordinal.
+func BenchmarkTermsAggSparsePattern(b *testing.B) {
+	for name, ratio := range map[string]uint64{"dictionary": 1 << 40, "lazy": lazyTermsRatio} {
+		b.Run(name, func(b *testing.B) {
+			defer func(r uint64) { lazyTermsRatio = r }(lazyTermsRatio)
+			lazyTermsRatio = ratio
+			runBench(b, func(rng *rand.Rand) *Request {
+				skus := []string{fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs())), fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs())), fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs()))}
+				return &Request{Query: leaf("sku", query.OpIn, skus), Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10, Include: &TermsFilter{Pattern: ".*foo"}}}}
+			})
+		})
+	}
+}
+
 // facetPicks are a facet panel's picks: two brands and a category, over a price range.
 func facetPicks(c *corpus, rng *rand.Rand) (q, brands, category query.Node) {
 	lo := float64(rng.IntN(200))

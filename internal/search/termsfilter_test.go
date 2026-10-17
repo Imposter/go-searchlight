@@ -93,6 +93,10 @@ func randomTermsFilters(rng *rand.Rand, field string, seed func() string) (*Term
 		case schema.Bool:
 			return &TermsFilter{Values: pick(rng, [][]any{{}, {true}, {false}, {true, false}})}
 		}
+		if raw := []rune(seed()); rng.IntN(4) == 0 && !slices.ContainsFunc(raw, analysis.IsSpace) {
+			typed := string(raw[:rng.IntN(len(raw)+1)])
+			return &TermsFilter{Pattern: oraclePattern(luceneQuote(typed)+".*", regexp.QuoteMeta(analysis.Clean(analysis.Normalize(typed)))+".*")}
+		}
 		if rng.IntN(2) == 0 {
 			key := func() string { return analysis.Clean(analysis.Normalize(seed())) }
 			return &TermsFilter{Pattern: randomPattern(rng, key(), key())}
@@ -193,7 +197,20 @@ func TestPatternSubset(t *testing.T) {
 		{`[-a]`, "", []string{"-", "a"}, []string{"b"}},
 		{`[a-]`, "", []string{"-", "a"}, []string{"b"}},
 		{`[.*+]`, "", []string{".", "*", "+"}, []string{"x"}},
-		{"straße.*", "straße", []string{"straße", "straßen"}, []string{"strasse"}},
+		{"straße.*", "strasse", []string{"strasse", "strassen"}, []string{"straße"}},
+		{"Nike.*", "nike", []string{"nike", "nikes"}, []string{"Nike"}},
+		{"NI(KE|kon)", "nik", []string{"nike", "nikon"}, []string{"niKE"}},
+		{"tea \t  cup", "tea cup", []string{"tea cup"}, []string{"tea  cup"}},
+		{"  nike  |  puma", "", []string{"nike", "puma"}, []string{" nike", "nike "}},
+		{`a\ \ b`, "a b", []string{"a b"}, []string{"a  b"}},
+		{`" A  B "`, "a b", []string{"a b"}, []string{" a b "}},
+		{"x +y", "x", []string{"x y", "x  y"}, []string{"xy"}},
+		{"ΣΊΣΥΦΟΣ", "σίσυφοσ", []string{"σίσυφοσ"}, []string{"ΣΊΣΥΦΟΣ"}},
+		{"a\x00b", "a�b", []string{"a�b"}, []string{"a\x00b"}},
+		{"[A-C]x", "", []string{"ax", "cx"}, []string{"dx"}},
+		{"[ÀÉ]", "", []string{"à", "é"}, []string{"a"}},
+		{"[\t]x", "", []string{" x"}, []string{"x"}},
+		{"[^a-c ]", "", []string{"d"}, []string{"a", " "}},
 		{"tea cup", "tea cup", []string{"tea cup"}, []string{"teacup"}},
 		{"(red|blue) .*", "", []string{"red cup", "blue pot"}, []string{"green pan"}},
 		{"a|", "", []string{"a", ""}, []string{"b"}},
@@ -260,6 +277,10 @@ func TestPatternSubset(t *testing.T) {
 		{"]", 0, "closes nothing"},
 		{strings.Repeat("(", maxPatternDepth+1) + "a" + strings.Repeat(")", maxPatternDepth+1), maxPatternDepth, "nest"},
 		{"((a{1000}){1000}){1000}", -1, "too complex"},
+		{"x[ß]", 2, "more than one character"},
+		{"[À-ÿ]", 1, "more than one character"},
+		{"[^A-Z]", 2, "negated class"},
+		{"[^\t]", 2, "negated class"},
 		{strings.Repeat("[a-z]{1000}", 11), -1, "too complex"},
 	} {
 		_, err := compilePattern(tc.pattern)
@@ -288,7 +309,6 @@ func TestTermsFilterProblems(t *testing.T) {
 		{`{"aggs":{"b":{"terms":{"field":"brand","include":"^ni"}}}}`, "aggs.b.terms.include"},
 		{`{"aggs":{"b":{"terms":{"field":"brand","exclude":"a~b"}}}}`, "aggs.b.terms.exclude"},
 		{`{"aggs":{"b":{"terms":{"field":"brand","include":7}}}}`, "aggs.b.terms.include"},
-		{`{"aggs":{"b":{"terms":{"field":"brand","include":null}}}}`, "aggs.b.terms.include"},
 		{`{"aggs":{"b":{"terms":{"field":"brand","include":{"partition":0,"num_partitions":4}}}}}`, "aggs.b.terms.include"},
 		{`{"aggs":{"b":{"terms":{"field":"brand","include":{"x":1}}}}}`, "aggs.b.terms.include"},
 		{`{"aggs":{"b":{"terms":{"field":"brand","include":["a",{"x":1}]}}}}`, "aggs.b.terms.include.1"},
@@ -332,6 +352,34 @@ func TestTermsFilterProblems(t *testing.T) {
 		prepareAgg("x", a, testMapping, "aggs.x", "", &ps)
 		if len(ps) > 0 {
 			t.Errorf("%+v refused: %v", a, ps)
+		}
+	}
+}
+
+// TestTermsFilterCompiledOnce: a parsed or decoded request's pattern compiles once,
+// however many shards prepare it (and the reduce); a null include is no include.
+func TestTermsFilterCompiledOnce(t *testing.T) {
+	t.Parallel()
+	r, ps := ParseRequest([]byte(`{"aggs":{"b":{"terms":{"field":"brand","include":"ni.*","exclude":null}}}}`))
+	if len(ps) > 0 {
+		t.Fatal(ps)
+	}
+	a := r.Aggs["b"]
+	if a.Exclude != nil {
+		t.Fatalf("a null exclude read as %+v", a.Exclude)
+	}
+	var decoded TermsFilter
+	if err := json.Unmarshal([]byte(`"ni.*"`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []*TermsFilter{a.Include, &decoded} {
+		var res []*regexp.Regexp
+		for range 3 {
+			s := prepareAgg("b", Agg{Type: AggTerms, Field: "brand", Include: f}, testMapping, "aggs.b", "", new(problems))
+			res = append(res, s.terms.include.re)
+		}
+		if res[0] == nil || res[0] != res[1] || res[1] != res[2] {
+			t.Fatalf("the pattern compiled more than once: %p %p %p", res[0], res[1], res[2])
 		}
 	}
 }
@@ -408,7 +456,7 @@ func TestTermsFilterSemantics(t *testing.T) {
 		{Agg{Type: AggTerms, Field: "brand", Size: 1, Include: &TermsFilter{Values: []any{"nike", "puma"}}, Exclude: &TermsFilter{Values: []any{"puma"}}}, "[nike:9]", 0},
 		{Agg{Type: AggTerms, Field: "brand", Size: 10, Exclude: &TermsFilter{Pattern: "n.*|a.*"}}, "[puma:15]", 0},
 		{Agg{Type: AggTerms, Field: "brand", Size: 10, Include: &TermsFilter{Values: []any{}}}, "[]", 0},
-		{Agg{Type: AggTerms, Field: "brand", Size: 10, Include: &TermsFilter{Pattern: "Ni.*"}}, "[]", 0},
+		{Agg{Type: AggTerms, Field: "brand", Size: 10, Include: &TermsFilter{Pattern: "Ni.*"}}, "[nike:9 nikon:7 nissan:5 niche:3]", 0},
 		{Agg{Type: AggTerms, Field: "brand", Size: 10, MinDocCount: ptr(6), Include: &TermsFilter{Pattern: "n.*"}}, "[nike:9 nikon:7]", 8},
 		{Agg{Type: AggTerms, Field: "price", Size: 10, Include: &TermsFilter{Values: []any{1.0, json.Number("3"), math.Copysign(0, -1)}}, Exclude: &TermsFilter{Values: []any{3}}}, "[0:15 1:15]", 0},
 		{Agg{Type: AggTerms, Field: "active", Size: 10, Exclude: &TermsFilter{Values: []any{false}}}, "[true:20]", 0},
@@ -498,7 +546,7 @@ func TestTermsFilterEveryPath(t *testing.T) {
 	rng := rand.New(rand.NewPCG(seed, seed^0x7f17))
 	c := revCorpus(t, rng, 2, 4, testtier.Pick(800, 2500))
 	docs := c.docs()
-	defer func() { aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8 }()
+	defer func() { aggChunkMin, aggChunk, globalOrdsDensity, lazyTermsRatio = 1<<15, 1<<16, 8, 16 }()
 	seedText := func() string {
 		return pick(rng, []string{fmt.Sprintf("B%03d", rng.IntN(40)), fmt.Sprintf("t%02d", rng.IntN(60)), "red cup 1", "7"})
 	}
@@ -515,8 +563,9 @@ func TestTermsFilterEveryPath(t *testing.T) {
 			aggChunkMin, aggChunk = 1, 1+rng.Uint32N(700)
 		}
 		globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40})
+		lazyTermsRatio = pick(rng, []uint64{0, 16, 1 << 40})
 		got, err := c.search(&Request{Query: q, Aggs: map[string]Agg{"a": a}})
-		aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8
+		aggChunkMin, aggChunk, globalOrdsDensity, lazyTermsRatio = 1<<15, 1<<16, 8, 16
 		if err != nil {
 			t.Fatalf("%s %+v: %v", raw, a, err)
 		}

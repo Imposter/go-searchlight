@@ -280,8 +280,14 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     takes, bools as `true` or `false`. A value no document holds makes no bucket. An
     empty array includes nothing (Elasticsearch's numeric fields read it as no
     include).
-  - **A pattern**, a string, matches the whole normalized key, so write it in lowercase:
-    `"ni.*"` is every key starting with `ni`. It takes this subset of Lucene's regular
+  - **A pattern**, a string, matches the whole normalized key, and is folded as a value
+    is: `"Nike.*"` is `nike.*`, every key starting with `nike`, and `"tea  cup"` is
+    `tea cup`. Each literal character is casefolded (`ß` reads `ss`), whitespace runs
+    are one space and none at either end, and a class takes its members' folded forms
+    too (`[A-C]` matches `a` to `c`). What cannot fold faithfully is refused: a class
+    member that folds to more than one character (`[ß]`), and a negated class of
+    characters that fold (`[^A-Z]`: write `[^a-z]`). `.` is one character of the
+    folded key. It takes this subset of Lucene's regular
     expressions: characters as themselves, `\` before a punctuation character for it
     literally, `"..."` for a literal run, `.` for any character, classes `[abc]`,
     `[a-z]` and `[^a-z]`, repetition `*`, `+`, `?`, `{n}`, `{n,}` and `{n,m}` (n and m at
@@ -292,9 +298,11 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     a pattern is refused.
   - Elasticsearch's partitions (`{"partition": 0, "num_partitions": 10}`) are refused.
 
-  Each segment decides the filter once per distinct value, from its dictionary (a
-  pattern reads only the terms after its literal prefix, exact values are looked up),
-  so its cost follows the field's distinct values, not the hits.
+  Each segment decides the filter once per distinct value: exact values are looked up
+  in its dictionary; a pattern, or an `exclude` alone, reads the dictionary (only the
+  terms after a pattern's literal prefix) when the hits are many, and with few hits
+  for its dictionary decides each value as it is collected. Its cost follows the
+  field's distinct values or the hits, whichever is less.
 
   Bounds, each refused with a 400 whose `loc` names the place:
   - At most 100 aggregations per search (`loc` `aggs`, or `aggregations` as the body
@@ -362,7 +370,7 @@ A facet with no pick of its own is a `filter` of every pick, or a plain aggregat
 while nothing is picked.
 
 **Facet type-ahead, and the picks outside the top buckets.** A facet's search box is a
-pattern `include` of what was typed, lowercased; the picks are counted in the same
+pattern `include` of what was typed; the picks are counted in the same
 search by an exact `include`, even when they fall outside the top 10:
 
 ```json

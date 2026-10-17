@@ -174,7 +174,10 @@ type segExec struct {
 	// masks are the terms aggregations' filters over this segment's ordinals, shared
 	// by the forks as buckets is.
 	masks *termMasks
-	err   error
+	// collecting is how many documents the aggregations being made collect, which
+	// chooses how a terms filter is decided (lazyTerms).
+	collecting uint64
+	err        error
 }
 
 // lazyState is a segment's lazy verification: the root's maybe documents, those

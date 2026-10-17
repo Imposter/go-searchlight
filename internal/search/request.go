@@ -725,10 +725,15 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			default:
 				a.Precision = n
 			}
-		case "include":
-			a.Include = parseTermsFilter(val, at, ps)
-		case "exclude":
-			a.Exclude = parseTermsFilter(val, at, ps)
+		case "include", "exclude":
+			if string(bytes.TrimSpace(val)) == "null" {
+				continue
+			}
+			if key == "include" {
+				a.Include = parseTermsFilter(val, at, ps)
+			} else {
+				a.Exclude = parseTermsFilter(val, at, ps)
+			}
 		case "min_doc_count":
 			n, ok := intOf(val)
 			if !ok || n < 0 {

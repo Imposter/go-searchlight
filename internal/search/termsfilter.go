@@ -8,10 +8,10 @@ import (
 	"math"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -33,13 +33,16 @@ import (
 // string the field takes; a bool as true or false.
 //
 // A pattern applies to text keys only, and to the normalized key: the subset of
-// Lucene's regular expressions in [compilePattern]'s doc, always matching the whole
-// key, run as RE2 (linear in the key's length).
+// Lucene's regular expressions in [compilePattern]'s doc, folded as values are,
+// always matching the whole key, run as RE2 (linear in the key's length) and
+// compiled once per parsed or decoded request.
 //
 // Per segment, a keyword or list field's filter is a bitmap over the dictionary's
-// ordinals, decided once per term (only the terms after a pattern's literal prefix
-// are read, and exact values are looked up), so it costs the distinct values, not the
-// hits; a number field's is decided once per distinct value collected.
+// ordinals, decided once per term (exact values looked up, only the terms after a
+// pattern's literal prefix read), or, with few documents collected for the
+// dictionary (lazyTermsRatio), decided per ordinal as it is collected; so it costs the
+// distinct values or the hits, whichever is less. A number field's values are
+// checked directly.
 
 // Bounds of include and exclude.
 const (
@@ -64,6 +67,27 @@ type TermsFilter struct {
 	Values []any
 	// Pattern matches whole normalized keys (see compilePattern).
 	Pattern string
+
+	// compiled is Pattern compiled, once for every shard a parsed or decoded request
+	// searches (nil for one built by hand, compiled at each use).
+	compiled *patternCache
+}
+
+// patternCache compiles a TermsFilter's pattern once.
+type patternCache struct {
+	once sync.Once
+	re   *compiledPattern
+	err  error
+}
+
+// pattern is f's Pattern compiled.
+func (f *TermsFilter) pattern() (*compiledPattern, error) {
+	c := f.compiled
+	if c == nil {
+		return compilePattern(f.Pattern)
+	}
+	c.once.Do(func() { c.re, c.err = compilePattern(f.Pattern) })
+	return c.re, c.err
 }
 
 // MarshalJSON writes f as an array of values or a pattern string. A float64 is
@@ -87,7 +111,7 @@ func (f *TermsFilter) MarshalJSON() ([]byte, error) {
 func (f *TermsFilter) UnmarshalJSON(raw []byte) error {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) > 0 && raw[0] == '"' {
-		*f = TermsFilter{}
+		*f = TermsFilter{compiled: &patternCache{}}
 		return json.Unmarshal(raw, &f.Pattern)
 	}
 	var values []any
@@ -109,11 +133,12 @@ func parseTermsFilter(raw json.RawMessage, loc string, ps *problems) *TermsFilte
 			ps.add(loc, "a pattern is text")
 			return nil
 		}
-		if _, err := compilePattern(pattern); err != nil {
+		f := &TermsFilter{Pattern: pattern, compiled: &patternCache{}}
+		if _, err := f.pattern(); err != nil {
 			ps.add(loc, "%s", err.Error())
 			return nil
 		}
-		return &TermsFilter{Pattern: pattern}
+		return f
 	case len(trimmed) > 0 && trimmed[0] == '[':
 		var items []json.RawMessage
 		if json.Unmarshal(trimmed, &items) != nil {
@@ -233,7 +258,7 @@ func compileTermSet(src *TermsFilter, t schema.FieldType, loc string, ps *proble
 			ps.add(loc, "a pattern chooses text keys, and this field is a %s: give an array of values", t)
 			return set
 		}
-		re, err := compilePattern(src.Pattern)
+		re, err := src.pattern()
 		if err != nil {
 			ps.add(loc, "%s", err.Error())
 			return set
@@ -256,7 +281,7 @@ func compileTermSet(src *TermsFilter, t schema.FieldType, loc string, ps *proble
 			}
 			set.addNumber(n)
 		case schema.Date:
-			n, ok := dateValue(v)
+			n, ok := schema.DateMillis(v)
 			if !ok {
 				ps.add(at, "the field is a date: a value is Unix milliseconds, an RFC 3339 time or a date (2026-10-02)")
 				continue
@@ -289,20 +314,6 @@ func (t *termSet) addNumber(v float64) {
 		t.numbers = map[float64]struct{}{}
 	}
 	t.numbers[positiveZero(v)] = struct{}{}
-}
-
-// dateValue reads a date include or exclude value as a date field takes it: Unix
-// milliseconds, an RFC 3339 time or a bare date (midnight UTC).
-func dateValue(v any) (float64, bool) {
-	if s, ok := v.(string); ok {
-		for _, layout := range []string{time.RFC3339Nano, time.DateOnly} {
-			if at, err := time.Parse(layout, s); err == nil {
-				return float64(at.UnixMilli()), true
-			}
-		}
-		return 0, false
-	}
-	return toFloat(v)
 }
 
 // termMask is a terms filter over one segment's keys: bit o of bits set when ordinal
@@ -384,6 +395,44 @@ func (f *termsFilter) boolMask() *termMask {
 	return &termMask{bits: []uint64{w}}
 }
 
+// lazyTermsRatio: a pattern or exclude-only filter over a dictionary at least this many
+// times the documents collected is decided ordinal by ordinal as they are collected,
+// rather than over the whole dictionary. A variable so tests can force either way.
+var lazyTermsRatio uint64 = 16
+
+// lazyTerms reports whether spec's filter over src is decided lazily: a keyword or
+// list field's pattern or exclude-only filter, with few documents collected for its
+// dictionary. Exact includes are looked up, which costs the values, not the terms.
+func (s *segExec) lazyTerms(spec *aggSpec, src *fieldSrc) bool {
+	f := spec.terms
+	if f == nil || !src.ordinal() || (f.include != nil && f.include.re == nil) {
+		return false
+	}
+	return s.collecting*lazyTermsRatio < uint64(src.numTerms())
+}
+
+// lazyFilter decides a terms filter one ordinal at a time, each once.
+type lazyFilter struct {
+	f    *termsFilter
+	src  *fieldSrc
+	seen map[uint32]bool
+	buf  []byte
+}
+
+func (l *lazyFilter) allows(o uint32) bool {
+	if ok, done := l.seen[o]; done {
+		return ok
+	}
+	if l.src.kind == srcList {
+		l.buf = l.src.mc.AppendTerm(l.buf[:0], o)
+	} else {
+		l.buf = l.src.kc.AppendTerm(l.buf[:0], o)
+	}
+	ok := l.f.text(l.buf)
+	l.seen[o] = ok
+	return ok
+}
+
 // termMasks are a segment's terms filters by aggregation, made once and shared by the
 // forks that collect parts of the segment apart.
 type termMasks struct {
@@ -447,6 +496,13 @@ func (e *patternError) Error() string {
 //   - x* x+ x? x{n} x{n,} x{n,m} repeat (n and m at most 1,000);
 //   - x|y is either, and (x) groups.
 //
+// A pattern is folded as text is normalized, so it reads as an exact value does
+// ("Nike.*" is "nike.*"): each literal character casefolded (ß is ss), whitespace runs
+// one space and none at either end, and a class holds each member's folded form too
+// ([A-C] takes a to c). What cannot fold faithfully is refused: a class member that
+// folds to more than one character, and a negated class of characters casefolding
+// changes (write them as they fold).
+//
 // Lucene's other operators (~ complement, & intersection, <n-m> numeric ranges, @ any
 // string, # the empty language) are refused, as are ^ and $: a pattern is anchored
 // already, so neither is an anchor. Escape any of them for the character itself. A
@@ -505,12 +561,18 @@ func literalPrefix(re *syntax.Regexp) string {
 	return ""
 }
 
-// patternParser translates a pattern into RE2 syntax, every literal quoted.
+// patternParser translates a pattern into RE2 syntax, folded, every literal quoted.
 type patternParser struct {
 	src   []rune
 	pos   int
 	out   []byte
 	depth int
+	// space is set while out ends in a literal space a further one folds into, which
+	// began at spaceAt; edge is set at the start of a top-level alternative, where
+	// whitespace folds away.
+	space   bool
+	spaceAt int
+	edge    bool
 }
 
 func (p *patternParser) fail(format string, args ...any) error {
@@ -520,17 +582,26 @@ func (p *patternParser) fail(format string, args ...any) error {
 func (p *patternParser) more() bool { return p.pos < len(p.src) }
 
 func (p *patternParser) alternation() error {
-	if err := p.concatenation(); err != nil {
-		return err
-	}
-	for p.more() && p.src[p.pos] == '|' {
-		p.pos++
-		p.out = append(p.out, '|')
+	for first := true; first || (p.more() && p.src[p.pos] == '|'); first = false {
+		if !first {
+			p.pos++
+			p.out = append(p.out, '|')
+		}
+		p.space, p.edge = false, p.depth == 0
 		if err := p.concatenation(); err != nil {
 			return err
 		}
+		if p.depth == 0 && p.space {
+			p.out = p.out[:p.spaceAt]
+		}
+		p.space = false
 	}
 	return nil
+}
+
+// quantified reports whether a quantifier follows the atom ending before position at.
+func (p *patternParser) quantified(at int) bool {
+	return at < len(p.src) && strings.ContainsRune("*+?{", p.src[at])
 }
 
 func (p *patternParser) concatenation() error {
@@ -564,7 +635,7 @@ func (p *patternParser) atom() error {
 		}
 		open := p.pos
 		p.pos++
-		p.out = append(p.out, "(?:"...)
+		p.opaque("(?:")
 		if err := p.alternation(); err != nil {
 			return err
 		}
@@ -574,22 +645,29 @@ func (p *patternParser) atom() error {
 		}
 		p.pos++
 		p.depth--
-		p.out = append(p.out, ')')
+		p.opaque(")")
 	case '[':
 		return p.class()
 	case '.':
 		p.pos++
-		p.out = append(p.out, '.')
+		p.opaque(".")
 	case '"':
-		open := p.pos
-		p.pos++
-		for p.more() && p.src[p.pos] != '"' {
-			p.literal(p.src[p.pos])
-			p.pos++
+		end := p.pos + 1
+		for end < len(p.src) && p.src[end] != '"' {
+			end++
 		}
-		if !p.more() {
-			p.pos = open
+		if end == len(p.src) {
 			return p.fail(`a " never closed`)
+		}
+		q := p.quantified(end + 1)
+		if q {
+			p.opaque("")
+		}
+		for p.pos++; p.pos < end; p.pos++ {
+			p.literal(p.src[p.pos], false)
+		}
+		if q {
+			p.space = false
 		}
 		p.pos++
 	case '\\':
@@ -597,7 +675,7 @@ func (p *patternParser) atom() error {
 		if err != nil {
 			return err
 		}
-		p.literal(r)
+		p.literal(r, p.quantified(p.pos))
 	case '*', '+', '?', '{':
 		return p.fail("%c repeats nothing: escape it (\\%c) for the character", c, c)
 	case '}', ']':
@@ -608,9 +686,15 @@ func (p *patternParser) atom() error {
 		return p.fail("a pattern matches the whole key already, so %c is no anchor: escape it (\\%c) for the character", c, c)
 	default:
 		p.pos++
-		p.literal(c)
+		p.literal(c, p.quantified(p.pos))
 	}
 	return nil
+}
+
+// opaque appends s, after which no whitespace folds away.
+func (p *patternParser) opaque(s string) {
+	p.out = append(p.out, s...)
+	p.space, p.edge = false, false
 }
 
 // escaped reads \x at p.pos: x, which must not be a letter or digit.
@@ -628,8 +712,75 @@ func (p *patternParser) escaped() (rune, error) {
 	return r, nil
 }
 
-func (p *patternParser) literal(r rune) {
-	p.out = append(p.out, regexp.QuoteMeta(string(r))...)
+// literal appends r folded: casefolded, a NUL as U+FFFD (as text is cleaned), and
+// whitespace as one space, dropped next to another (unless quantified) or at a
+// top-level edge.
+func (p *patternParser) literal(r rune, quantified bool) {
+	switch {
+	case analysis.IsSpace(r):
+		if !quantified && (p.space || p.edge) {
+			return
+		}
+		at := len(p.out)
+		p.out = append(p.out, ' ')
+		p.space, p.spaceAt, p.edge = !quantified, at, false
+		return
+	case r == 0:
+		r = utf8.RuneError
+	}
+	p.opaque(regexp.QuoteMeta(analysis.FoldRune(r)))
+}
+
+// spaces are the code points Normalize folds to a space, ascending.
+var spaces = sync.OnceValue(func() []rune {
+	var out []rune
+	for r := range rune(0x3001) {
+		if analysis.IsSpace(r) {
+			out = append(out, r)
+		}
+	}
+	return out
+})
+
+// foldClassRange appends to the class being written what range lo-hi folds to beyond
+// itself: each member casefolding changes as it folds, a space for whitespace, U+FFFD
+// for a NUL. In a negated class a member that folds is refused, as is, anywhere, one
+// that folds to more than one character.
+func (p *patternParser) foldClassRange(lo, hi rune, negated bool, at int) error {
+	changed := analysis.FoldChanged(lo, hi)
+	i, _ := slices.BinarySearch(spaces(), lo)
+	j, _ := slices.BinarySearch(spaces(), hi+1)
+	ws := spaces()[i:max(i, j)]
+	if negated {
+		for _, r := range ws {
+			if r != ' ' {
+				changed = append(changed, r)
+			}
+		}
+		if lo == 0 {
+			changed = append(changed, 0)
+		}
+		if len(changed) > 0 {
+			p.pos = at
+			return p.fail("a negated class of characters that fold (%q) cannot be matched against casefolded keys: write them as they fold, in lowercase", changed[0])
+		}
+		return nil
+	}
+	for _, r := range changed {
+		f := []rune(analysis.FoldRune(r))
+		if len(f) != 1 {
+			p.pos = at
+			return p.fail("%q folds to %q, more than one character, which a class cannot hold: write it outside the class", r, string(f))
+		}
+		p.out = append(p.out, classRune(f[0])...)
+	}
+	if len(ws) > 0 {
+		p.out = append(p.out, classRune(' ')...)
+	}
+	if lo == 0 {
+		p.out = append(p.out, classRune(utf8.RuneError)...)
+	}
+	return nil
 }
 
 func classRune(r rune) string { return `\x{` + strconv.FormatInt(int64(r), 16) + `}` }
@@ -638,8 +789,9 @@ func classRune(r rune) string { return `\x{` + strconv.FormatInt(int64(r), 16) +
 func (p *patternParser) class() error {
 	open := p.pos
 	p.pos++
-	p.out = append(p.out, '[')
-	if p.more() && p.src[p.pos] == '^' {
+	p.opaque("[")
+	negated := p.more() && p.src[p.pos] == '^'
+	if negated {
 		p.pos++
 		p.out = append(p.out, '^')
 	}
@@ -675,6 +827,9 @@ func (p *patternParser) class() error {
 		p.out = append(p.out, classRune(lo)...)
 		if hi != lo {
 			p.out = append(append(p.out, '-'), classRune(hi)...)
+		}
+		if err := p.foldClassRange(lo, hi, negated, at); err != nil {
+			return err
 		}
 		items++
 	}

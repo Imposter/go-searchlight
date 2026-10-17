@@ -403,8 +403,9 @@ func TestAggregationsEqualBruteForce(t *testing.T) {
 				aggChunkMin, aggChunk = 1, 1+rng.Uint32N(40) // segments collected in parts
 			}
 			globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40}) // merged by term, either, by global ordinal
+			lazyTermsRatio = pick(rng, []uint64{0, 16, 1 << 40})   // terms filters decided per ordinal, either, over the dictionary
 			got, err := c.search(&Request{Query: q, Aggs: aggs})
-			aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8
+			aggChunkMin, aggChunk, globalOrdsDensity, lazyTermsRatio = 1<<15, 1<<16, 8, 16
 			if err != nil {
 				t.Fatalf("%s %+v: %v", raw, aggs, err)
 			}

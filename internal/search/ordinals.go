@@ -377,8 +377,9 @@ func (p *ordPartial) used() uint64 {
 // finishOrds merges the segments' ordinal partials of spec into dst: by global
 // ordinal when the ordinals cached at prepare, or built now within ctx because the
 // partials are dense enough, are there; by term otherwise. Its error is a deferred
-// part's, read again (keptSubs): dst then holds every count, and the
-// sub-aggregations collected before it.
+// part's, read again within ctx (keptSubs): dst is then left empty, as an aggregation
+// whose shard merge ctx cut short, rather than hold counts its sub-aggregations do
+// not match.
 func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, p *prepared) error {
 	entries, _ := ordKind(spec.ftype)
 	ords := p.ords[ordField{spec.field, entries}]
@@ -396,11 +397,11 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 	}
 	switch {
 	case ords != nil && spec.typ == AggTerms:
-		return finishTerms(dst, parts, spec, g, ords, entries)
+		return finishTerms(ctx, dst, parts, spec, g, ords, entries)
 	case ords != nil:
 		finishCardinality(dst, parts, spec, ords)
 	case spec.typ == AggTerms:
-		return finishTermsByKey(dst, parts, spec, g, entries)
+		return finishTermsByKey(ctx, dst, parts, spec, g, entries)
 	default:
 		finishCardinalityByKey(dst, parts, spec, g, entries)
 	}
@@ -411,7 +412,7 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 // counts added up by global ordinal, then the shard's cut to shard_size (most
 // documents first, then by key), whose terms alone are read and whose buckets alone
 // have their sub-aggregations merged (keptSubs).
-func finishTerms(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, ords *globalOrds, entries bool) error {
+func finishTerms(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, ords *globalOrds, entries bool) error {
 	counts := make([]int64, len(ords.hashes))
 	for _, p := range parts {
 		m := ords.segs[p.seg]
@@ -448,7 +449,6 @@ func finishTerms(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.G
 	for i, gl := range kept {
 		out.Buckets[i] = &BucketPartial{Key: ords.term(g, spec.field, gl, entries), DocCount: counts[gl]}
 	}
-	var err error
 	if len(spec.subs) > 0 {
 		bucket := make([]int32, len(ords.hashes)) // each global ordinal's kept bucket, plus one
 		for i, gl := range kept {
@@ -466,17 +466,19 @@ func finishTerms(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.G
 			}
 			sels[i] = sel
 		}
-		err = keptSubs(out.Buckets, parts, sels, spec)
+		if err := keptSubs(ctx, out.Buckets, parts, sels, spec); err != nil {
+			return err
+		}
 	}
 	adopt(dst, out, spec)
-	return err
+	return nil
 }
 
 // finishTermsByKey merges the segments' ordinal partials of a terms aggregation into
 // dst by term: each segment's ordinals with documents read and merged by key, then the
 // shard's cut made (cutShard), whose buckets alone have their sub-aggregations merged
 // (keptSubs).
-func finishTermsByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) error {
+func finishTermsByKey(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, entries bool) error {
 	byKey := map[string]int32{}
 	var buckets []*BucketPartial
 	// ords are each part's ordinals with documents, and at their buckets.
@@ -502,7 +504,6 @@ func finishTermsByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *sh
 	}
 	out := &AggPartial{Type: AggTerms, Buckets: slices.Clone(buckets)}
 	cutShard(out, spec)
-	var err error
 	if len(spec.subs) > 0 {
 		pos := make(map[*BucketPartial]int32, len(out.Buckets))
 		for i, b := range out.Buckets {
@@ -524,10 +525,12 @@ func finishTermsByKey(dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *sh
 			}
 			sels[i] = sel
 		}
-		err = keptSubs(out.Buckets, parts, sels, spec)
+		if err := keptSubs(ctx, out.Buckets, parts, sels, spec); err != nil {
+			return err
+		}
 	}
 	adopt(dst, out, spec)
-	return err
+	return nil
 }
 
 // adopt merges a shard's finished partial out into dst, taking out's buckets as they
@@ -544,21 +547,22 @@ func adopt(dst, out *AggPartial, spec *aggSpec) {
 
 // keptSubs fills the kept buckets' sub-aggregation partials from every part, in part
 // order: a depth-first part's collectors of each kept ordinal, and a deferred part's
-// documents read again (replay) for the kept ordinals alone. sels[i] maps part i's
-// local ordinals to their bucket, -1 for one not kept. On a replay's error the
-// deferred parts are left out.
-func keptSubs(buckets []*BucketPartial, parts []*ordPartial, sels [][]int32, spec *aggSpec) error {
+// documents read again (replay) within ctx for the kept ordinals alone. sels[i] maps
+// part i's local ordinals to their bucket, -1 for one not kept. It returns a replay's
+// error, the buckets then unfinished.
+func keptSubs(ctx context.Context, buckets []*BucketPartial, parts []*ordPartial, sels [][]int32, spec *aggSpec) error {
+	replayed, err := replay(ctx, parts, sels, len(buckets), spec)
+	if err != nil {
+		return err
+	}
 	for _, b := range buckets {
 		b.Aggs = emptySubs(spec)
 	}
-	replayed, err := replay(parts, sels, len(buckets), spec)
 	for i, p := range parts {
 		if p.deferred != nil {
-			if err == nil {
-				for _, stretch := range replayed[i] {
-					for j, sub := range spec.subs {
-						stretch[j].mergeInto(buckets, sub)
-					}
+			for _, stretch := range replayed[i] {
+				for j, sub := range spec.subs {
+					stretch[j].mergeInto(buckets, sub)
 				}
 			}
 			continue
@@ -571,13 +575,18 @@ func keptSubs(buckets []*BucketPartial, parts []*ordPartial, sels [][]int32, spe
 			}
 		}
 	}
-	return err
+	return nil
 }
+
+// replayHook, when set (by tests), runs as a replay starts, with its context.
+var replayHook func(ctx context.Context)
 
 // replay reads the deferred parts' documents again, in stretches on the search pool
 // (stretches), collecting spec's sub-aggregations for the ordinals sels keeps: per
-// part, per stretch in document order, each sub-aggregation's metrics by bucket.
-func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([][][]bucketMetrics, error) {
+// part, per stretch in document order, each sub-aggregation's metrics by bucket. It
+// runs within ctx, the shard merge's, not the segments' own: any stretch it leaves
+// unread is its error.
+func replay(ctx context.Context, parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([][][]bucketMetrics, error) {
 	type task struct {
 		part int
 		docs *roaring.Bitmap
@@ -595,11 +604,15 @@ func replay(parts []*ordPartial, sels [][]int32, buckets int, spec *aggSpec) ([]
 	if len(tasks) == 0 {
 		return out, nil
 	}
+	if replayHook != nil {
+		replayHook(ctx)
+	}
 	got := make([][]bucketMetrics, len(tasks))
 	errs := make([]error, len(tasks))
 	err := runParallel(len(tasks), func(k int) {
 		t := tasks[k]
 		s := parts[t.part].deferred.s.fork()
+		s.ctx = ctx
 		got[k] = s.replaySubs(spec, t.docs, sels[t.part], buckets)
 		errs[k] = s.err
 	})

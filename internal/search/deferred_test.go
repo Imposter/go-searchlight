@@ -1,9 +1,12 @@
 package search
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 )
@@ -262,5 +265,55 @@ func TestReduceKeepsShardResults(t *testing.T) {
 	first := string(mustJSON(Reduce(t.Context(), parts, r).Aggs))
 	if again := string(mustJSON(Reduce(t.Context(), parts, r).Aggs)); again != first {
 		t.Fatalf("reduced again:\n%s\nfirst:\n%s", again, first)
+	}
+}
+
+// TestReplayCutShort: a deadline that passes while a shard reads its hits again for
+// breadth-first sub-aggregations leaves that terms aggregation empty, TimedOut set,
+// rather than counts its sub-aggregations do not match; the shard's other
+// aggregations are merged still. A cancel then is the search's error, not a timeout.
+func TestReplayCutShort(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 300 {
+		c.upsert(fmt.Sprintf("d%03d", i), fmt.Sprintf(`{"tags":["t%d","t%d"],"price":%d}`, i%13, i%7, i))
+		if i%100 == 99 {
+			c.refreshAll()
+		}
+	}
+	r := func(timeout time.Duration) *Request {
+		return &Request{Query: &query.All{}, Timeout: timeout, Aggs: map[string]Agg{
+			"t": {Type: AggTerms, Field: "tags", Size: 3, CollectMode: CollectBreadthFirst, Aggs: map[string]Agg{"s": {Type: AggStats, Field: "price"}}},
+			"s": {Type: AggStats, Field: "price"},
+		}}
+	}
+	defer func() { replayHook = nil }()
+	g := c.shards[0].Acquire()
+	defer g.Release()
+
+	replayHook = func(ctx context.Context) { <-ctx.Done() }
+	res, err := ExecuteShard(t.Context(), g, r(300*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.TimedOut || len(res.Aggs["t"].Buckets) != 0 || res.Aggs["s"].Stats.Count != 300 {
+		t.Fatalf("cut short: timed out %v, %d terms buckets, stats %+v", res.TimedOut, len(res.Aggs["t"].Buckets), res.Aggs["s"].Stats)
+	}
+	for _, b := range Reduce(t.Context(), []*ShardResult{res}, r(0)).Aggs["t"].Buckets {
+		if b.Aggs["s"].Count != b.DocCount {
+			t.Fatalf("bucket %v: %d documents, stats of %d", b.Key, b.DocCount, b.Aggs["s"].Count)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	replayHook = func(context.Context) { cancel() }
+	if res, err := ExecuteShard(ctx, g, r(0)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled during the replay: %+v, %v; want context.Canceled", res, err)
+	}
+
+	replayHook = nil
+	res, err = ExecuteShard(t.Context(), g, r(0))
+	if err != nil || res.TimedOut || len(res.Aggs["t"].Buckets) != 13 {
+		t.Fatalf("uncut: %+v, %v", res, err)
 	}
 }

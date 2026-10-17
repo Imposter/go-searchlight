@@ -259,7 +259,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - `date_histogram`, with `fixed_interval`, `calendar_interval`, `offset` and
     `min_doc_count`;
   - `stats`;
-  - `min` and `max`, `{"value": x}`, or `{"value": null}` when no document has one;
+  - `min` and `max`, `{"value": x}`, or `{"value": null}` when no document has one.
+    On a `date` field the value is Unix milliseconds, as `stats` gives it. `-0` is
+    `0` to them and to `stats`' `min` and `max`, as it is to every bucket key;
   - `cardinality` (HyperLogLog++), with `precision`, or `threshold` (1 to 65,536) for
     an exact answer to "are there at least n values?": `{"value": v}` is the number of
     distinct values when there are fewer than `threshold`, else `threshold`. Each

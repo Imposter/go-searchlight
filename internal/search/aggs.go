@@ -82,7 +82,9 @@ type StatsPartial struct {
 	Max   float64 `json:"max"`
 }
 
+// add counts v; -0 is 0, as min and max and every bucket key take it.
 func (s *StatsPartial) add(v float64) {
+	v = positiveZero(v)
 	if s.Count == 0 || v < s.Min {
 		s.Min = v
 	}
@@ -1183,7 +1185,7 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 		if sc, ok := c.(*statsColl); ok && s.sv.Deletes.IsEmpty() && hits.GetCardinality() == uint64(s.n) && sc.src.kind == srcNumber {
 			st := sc.src.nc.Stats()
 			if st.Count > 0 {
-				sc.st = StatsPartial{Count: int64(st.Count), Sum: st.Sum, Min: st.Min, Max: st.Max}
+				sc.st = StatsPartial{Count: int64(st.Count), Sum: st.Sum, Min: positiveZero(st.Min), Max: positiveZero(st.Max)}
 			}
 			continue
 		}
@@ -1530,7 +1532,7 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 // into the shard's: by key, exactly; ordinal partials by global ordinal or by term
 // (finishOrds); and a filter, filters or global aggregation bucket by bucket, the
 // aggregations under each merged as top-level ones are. Its error is the first
-// finishOrds returned, with every partial merged still.
+// finishOrds returned, whose aggregation is left empty; the others are merged still.
 func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) (map[string]*AggPartial, error) {
 	if len(specs) == 0 {
 		return nil, nil

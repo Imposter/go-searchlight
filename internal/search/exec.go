@@ -476,6 +476,8 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	aggs, err := mergeShard(ctx, p.aggs, segAggs, g, p)
 	switch {
+	case errors.Is(parent.Err(), context.Canceled):
+		return fail(parent.Err(), "cancelled")
 	case isCtxErr(err):
 		res.TimedOut = true
 	case err != nil:

@@ -9,7 +9,8 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 ### Added
 
 - **`min` and `max` aggregations**, Elasticsearch's: `{"value": x}`, or `{"value":
-  null}` when no document has one, at the top level, under `filter`, `filters` and
+  null}` when no document has one (Unix milliseconds on a `date` field, as `stats`
+  gives them), at the top level, under `filter`, `filters` and
   `global`, and as a bucket aggregation's sub-aggregation. Each keeps one value per
   bucket; over a dense hit set it reads the point index from the end sought until a
   block holds a hit ([docs/api.md](docs/api.md#search-and-count)).
@@ -29,6 +30,11 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ### Changed
 
+- `stats`' `min` and `max` read `-0` as `0`, as `min`, `max` and every bucket key do.
+- A deadline that passes while a shard reads its hits again for breadth-first
+  sub-aggregations leaves that `terms` aggregation empty on the shard, with
+  `timed_out`, rather than counts its sub-aggregations do not match; a client's
+  cancel then is the search's error.
 - **Faster `terms` over many values.** A shard keeps its `shard_size` best terms by
   selection rather than a sort of every term (the reduce its `size` likewise); the
   parts of a large segment collected apart share count arrays, one per part counted

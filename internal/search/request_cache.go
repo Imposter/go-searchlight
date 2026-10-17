@@ -78,7 +78,7 @@ import (
 
 // requestCacheFormat versions the request key and the shared store's values: a
 // change to either raises it, so an upgraded node never reads an old encoding.
-const requestCacheFormat = 2
+const requestCacheFormat = 3
 
 // requestCacheWrites bounds the shared-store writes in flight; past it a result is
 // not written (the next miss writes it).
@@ -743,7 +743,8 @@ func partialsBytes(m map[string]*AggPartial) int64 {
 }
 
 // partialBytes estimates one partial: its fixed part, buckets with their keys and
-// sub-aggregations, stats and sketch. A field added to AggPartial that holds memory
+// sub-aggregations, stats, sketch, a min or max value, and a thresholded
+// cardinality's distinct hashes (up to MaxThreshold, 8 bytes each). A field added to AggPartial that holds memory
 // belongs here.
 func partialBytes(p *AggPartial) int64 {
 	n := int64(112)
@@ -762,6 +763,10 @@ func partialBytes(p *AggPartial) int64 {
 	if s := p.Sketch; s != nil {
 		n += 64 + 8*int64(cap(s.Hashes)) + int64(cap(s.Registers))
 	}
+	if p.Value != nil {
+		n += 8
+	}
+	n += 8 * int64(cap(p.Distinct))
 	return n
 }
 
@@ -818,11 +823,12 @@ func decodeCachedResult(raw []byte, maxEntry int64, r *Request) (res *ShardResul
 	if err := h.Decode(raw[1:]); err != nil {
 		return nil, err
 	}
-	limit := uint64(unsizedDecodeLimit)
+	most := uint64(decodedPerStored * maxEntry) //nolint:gosec // maxEntry is positive
+	limit := min(uint64(unsizedDecodeLimit), most)
 	if h.HasFCS {
 		limit = h.FrameContentSize
 	}
-	if limit > uint64(decodedPerStored*maxEntry) { //nolint:gosec // maxEntry is positive
+	if limit > most {
 		return nil, fmt.Errorf("%w: its decoded size is too large", errBadCachedResult)
 	}
 	// The decoder's cap limit holds the output to dst's capacity.
@@ -859,6 +865,9 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 		if !ok || p == nil || p.Type != a.Type || p.DocCountError < 0 || p.OtherDocCount < 0 {
 			return fmt.Errorf("%w: aggregation %q", errBadCachedResult, name)
 		}
+		if err := validShape(p, &a); err != nil {
+			return fmt.Errorf("%w: aggregation %q's %w", errBadCachedResult, name, err)
+		}
 		if s := p.Sketch; s != nil {
 			prec := a.Precision
 			if prec == 0 {
@@ -883,6 +892,43 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validShape checks the members p holds are those of a's type: a min or max holds
+// at most its value; a cardinality with a threshold its distinct hashes (sorted,
+// unique, at most the threshold) and no sketch, one without a threshold no hashes;
+// no other type holds a value or hashes.
+func validShape(p *AggPartial, a *Agg) error {
+	switch a.Type {
+	case AggMin, AggMax:
+		if p.Buckets != nil || p.Stats != nil || p.Sketch != nil || p.Distinct != nil {
+			return errors.New("min or max shape")
+		}
+		return nil
+	case AggCardinality:
+		if p.Value != nil || p.Buckets != nil {
+			return errors.New("cardinality shape")
+		}
+		if a.Threshold == 0 {
+			if p.Distinct != nil {
+				return errors.New("distinct hashes without a threshold")
+			}
+			return nil
+		}
+		if p.Sketch != nil || len(p.Distinct) > a.Threshold {
+			return errors.New("distinct hashes past the threshold")
+		}
+		for i := 1; i < len(p.Distinct); i++ {
+			if p.Distinct[i] <= p.Distinct[i-1] {
+				return errors.New("distinct hashes not sorted and unique")
+			}
+		}
+		return nil
+	}
+	if p.Value != nil || p.Distinct != nil {
+		return errors.New("value or distinct hashes")
 	}
 	return nil
 }

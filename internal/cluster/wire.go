@@ -127,7 +127,7 @@ type wireRequest struct {
 	Index       string             `json:"index"`
 	NoBodies    bool               `json:"no_bodies,omitempty"`
 	// NoRequestCache is search.Request's. It needs no wire level: a peer that ignores
-	// it caches nothing anyway (request caches came after level 3).
+	// it caches nothing anyway (request caches came after level 4).
 	NoRequestCache bool `json:"no_request_cache,omitempty"`
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2

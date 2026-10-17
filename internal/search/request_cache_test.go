@@ -127,6 +127,20 @@ func parseReq(t testing.TB, raw string) *Request {
 	return r
 }
 
+// sameResult reports whether a and b are the same result, as peers would send them.
+func sameResult(t testing.TB, a, b *ShardResult) bool {
+	t.Helper()
+	ja, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bytes.Equal(ja, jb)
+}
+
 func reduceOne(r *Request, res *ShardResult) *Response {
 	return Reduce(context.Background(), []*ShardResult{res}, r)
 }
@@ -146,7 +160,7 @@ func TestRequestCacheHitIsIdentical(t *testing.T) {
 	first := s.search(c, req)
 	second := s.search(c, parseReq(t, rcAggs))
 	wantStats(t, c, 1, 1)
-	if !reflect.DeepEqual(first, second) {
+	if !sameResult(t, first, second) {
 		t.Fatalf("the hit differs from the miss:\n%+v\n%+v", first, second)
 	}
 	uncached := s.search(nil, req)
@@ -175,6 +189,12 @@ func TestRequestCacheKeyIgnoresTimeoutAndIndexLabel(t *testing.T) {
 		`{"size":0,"post_filter":{"field":"price","op":"lt","value":5},"aggs":{"b":{"terms":{"field":"brand"}}}}`,
 		`{"size":0,"aggs":{"b":{"filter":{"field":"price","op":"lt","value":5}}}}`,
 		`{"size":0,"aggs":{"b":{"filter":{"field":"price","op":"lt","value":6}}}}`,
+		`{"size":0,"aggs":{"b":{"terms":{"field":"brand","collect_mode":"breadth_first"}}}}`,
+		`{"size":0,"aggs":{"b":{"min":{"field":"price"}}}}`,
+		`{"size":0,"aggs":{"b":{"max":{"field":"price"}}}}`,
+		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand"}}}}`,
+		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand","threshold":2}}}}`,
+		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand","threshold":3}}}}`,
 	} {
 		k, ok := requestCacheKey(parseReq(t, raw))
 		if !ok || bytes.Equal(k, ka) {
@@ -190,7 +210,7 @@ func TestRequestCacheRefreshWriteMisses(t *testing.T) {
 	req := parseReq(t, `{"size":0,"aggs":{"brands":{"terms":{"field":"brand"}}}}`)
 	before := s.search(c, req)
 	s.put("new", `{"brand":"zeta","price":1}`)
-	if got := s.search(c, req); !reflect.DeepEqual(got, before) {
+	if got := s.search(c, req); !sameResult(t, got, before) {
 		t.Fatal("an unrefreshed write changed the result")
 	}
 	wantStats(t, c, 1, 1)
@@ -372,7 +392,7 @@ func TestRequestCacheComputesOnce(t *testing.T) {
 	wg.Wait()
 	wantStats(t, c, n-1, 1)
 	for i := 1; i < n; i++ {
-		if !reflect.DeepEqual(results[i], results[0]) {
+		if !sameResult(t, results[i], results[0]) {
 			t.Fatalf("result %d differs", i)
 		}
 	}
@@ -443,7 +463,12 @@ func TestNilRequestCacheExecutes(t *testing.T) {
 func TestCachedResultEncodingRoundTrips(t *testing.T) {
 	s := newRCShard(t)
 	s.fill(300)
-	for _, raw := range []string{rcAggs, `{"size":0,"track_total":true}`, `{"size":0,"aggs":{"g":{"global":{},"aggs":{"n":{"cardinality":{"field":"brand"}}}}}}`} {
+	for _, raw := range []string{
+		rcAggs, `{"size":0,"track_total":true}`, `{"size":0,"aggs":{"g":{"global":{},"aggs":{"n":{"cardinality":{"field":"brand"}}}}}}`,
+		`{"size":0,"aggs":{"lo":{"min":{"field":"price"}},"hi":{"max":{"field":"created"}},"none":{"min":{"field":"desc_n"}},
+			"few":{"cardinality":{"field":"tags","threshold":3}},"all":{"cardinality":{"field":"tags","threshold":1000}},
+			"b":{"terms":{"field":"brand","collect_mode":"breadth_first"},"aggs":{"lo":{"min":{"field":"price"}},"n":{"cardinality":{"field":"tags","threshold":2}}}}}}`,
+	} {
 		req := parseReq(t, raw)
 		res := s.search(nil, req)
 		enc, err := encodeCachedResult(res, 8<<20)
@@ -696,27 +721,29 @@ func TestCachedResultDecodeRefusesForgeries(t *testing.T) {
 	}
 	big := `{"total":1,"total_relation":"eq","pad":"` + strings.Repeat("x", 100_000) + `"}`
 	for name, raw := range map[string][]byte{
-		"empty":           nil,
-		"other format":    append([]byte{requestCacheFormat + 1}, encodeJSONValue(t, ok)[1:]...),
-		"not zstd":        append([]byte{requestCacheFormat}, "garbage"...),
-		"not json":        encodeJSONValue(t, `{"total":`),
-		"past max entry":  append(encodeJSONValue(t, ok), make([]byte, maxEntry)...),
-		"decodes too big": encodeJSONValue(t, big),
-		"timed out":       encodeJSONValue(t, strings.Replace(ok, `"timed_out":false`, `"timed_out":true`, 1)),
-		"hits":            encodeJSONValue(t, strings.Replace(ok, `"hits":null`, `"hits":[{"id":"a","sort":null}]`, 1)),
-		"bad relation":    encodeJSONValue(t, strings.Replace(ok, `"eq"`, `"lt"`, 1)),
-		"unknown agg":     encodeJSONValue(t, strings.Replace(ok, `"n":{`, `"zz":{`, 1)),
-		"wrong type":      encodeJSONValue(t, strings.Replace(ok, `"type":"cardinality"`, `"type":"terms"`, 1)),
-		"precision":       encodeJSONValue(t, strings.Replace(ok, `"p":14`, `"p":12`, 1)),
-		"registers":       encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"AAAA"`, 1)),
-		"unsorted hashes": encodeJSONValue(t, strings.Replace(ok, `[1,2,3]`, `[3,2,1]`, 1)),
-		"register range":  encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"`+base64.StdEncoding.EncodeToString(append(make([]byte, 1<<14-1), 60))+`"`, 1)),
-		"nil bucket":      encodeJSONValue(t, strings.Replace(ok, `"buckets":[{`, `"buckets":[null,{`, 1)),
-		"object key":      encodeJSONValue(t, strings.Replace(ok, `"key":"x"`, `"key":{"a":1}`, 1)),
-		"negative count":  encodeJSONValue(t, strings.Replace(ok, `"doc_count":3`, `"doc_count":-3`, 1)),
-		"unknown sub-agg": encodeJSONValue(t, strings.Replace(ok, `"aggs":{"p":`, `"aggs":{"q":`, 1)),
-		"nil partial":     encodeJSONValue(t, strings.Replace(ok, `"n":{"type":"cardinality","sketch":{"p":14,"hashes":[1,2,3]}}`, `"n":null`, 1)),
-		"negative total":  encodeJSONValue(t, strings.Replace(ok, `"total":3`, `"total":-1`, 1)),
+		"empty":                        nil,
+		"other format":                 append([]byte{requestCacheFormat + 1}, encodeJSONValue(t, ok)[1:]...),
+		"not zstd":                     append([]byte{requestCacheFormat}, "garbage"...),
+		"not json":                     encodeJSONValue(t, `{"total":`),
+		"past max entry":               append(encodeJSONValue(t, ok), make([]byte, maxEntry)...),
+		"decodes too big":              encodeJSONValue(t, big),
+		"timed out":                    encodeJSONValue(t, strings.Replace(ok, `"timed_out":false`, `"timed_out":true`, 1)),
+		"hits":                         encodeJSONValue(t, strings.Replace(ok, `"hits":null`, `"hits":[{"id":"a","sort":null}]`, 1)),
+		"bad relation":                 encodeJSONValue(t, strings.Replace(ok, `"eq"`, `"lt"`, 1)),
+		"unknown agg":                  encodeJSONValue(t, strings.Replace(ok, `"n":{`, `"zz":{`, 1)),
+		"wrong type":                   encodeJSONValue(t, strings.Replace(ok, `"type":"cardinality"`, `"type":"terms"`, 1)),
+		"precision":                    encodeJSONValue(t, strings.Replace(ok, `"p":14`, `"p":12`, 1)),
+		"registers":                    encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"AAAA"`, 1)),
+		"unsorted hashes":              encodeJSONValue(t, strings.Replace(ok, `[1,2,3]`, `[3,2,1]`, 1)),
+		"register range":               encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"`+base64.StdEncoding.EncodeToString(append(make([]byte, 1<<14-1), 60))+`"`, 1)),
+		"nil bucket":                   encodeJSONValue(t, strings.Replace(ok, `"buckets":[{`, `"buckets":[null,{`, 1)),
+		"object key":                   encodeJSONValue(t, strings.Replace(ok, `"key":"x"`, `"key":{"a":1}`, 1)),
+		"negative count":               encodeJSONValue(t, strings.Replace(ok, `"doc_count":3`, `"doc_count":-3`, 1)),
+		"unknown sub-agg":              encodeJSONValue(t, strings.Replace(ok, `"aggs":{"p":`, `"aggs":{"q":`, 1)),
+		"nil partial":                  encodeJSONValue(t, strings.Replace(ok, `"n":{"type":"cardinality","sketch":{"p":14,"hashes":[1,2,3]}}`, `"n":null`, 1)),
+		"negative total":               encodeJSONValue(t, strings.Replace(ok, `"total":3`, `"total":-1`, 1)),
+		"value on cardinality":         encodeJSONValue(t, strings.Replace(ok, `"type":"cardinality",`, `"type":"cardinality","value":3,`, 1)),
+		"distinct without a threshold": encodeJSONValue(t, strings.Replace(ok, `"type":"cardinality",`, `"type":"cardinality","distinct":[1],`, 1)),
 	} {
 		if res, err := decodeCachedResult(raw, maxEntry, req); err == nil {
 			t.Errorf("%s: decoded %+v", name, res)
@@ -864,5 +891,33 @@ func TestRequestCacheCloseDropsLateWrites(t *testing.T) {
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCachedResultDecodeChecksNewPartials: a min or max partial holds a value and
+// nothing else; a thresholded cardinality's hashes are sorted, unique and at most
+// the threshold, with no sketch.
+func TestCachedResultDecodeChecksNewPartials(t *testing.T) {
+	req := parseReq(t, `{"size":0,"aggs":{"lo":{"min":{"field":"price"}},"n":{"cardinality":{"field":"brand","threshold":3}}}}`)
+	ok := `{"total":3,"total_relation":"eq","aggs":{"lo":{"type":"min","value":1.5},"n":{"type":"cardinality","distinct":[1,5,9]}}}`
+	if _, err := decodeCachedResult(encodeJSONValue(t, ok), 4096, req); err != nil {
+		t.Fatalf("a valid value: %v", err)
+	}
+	for name, js := range map[string]string{
+		"past the threshold": strings.Replace(ok, `[1,5,9]`, `[1,5,9,11]`, 1),
+		"unsorted":           strings.Replace(ok, `[1,5,9]`, `[5,1,9]`, 1),
+		"duplicate":          strings.Replace(ok, `[1,5,9]`, `[1,5,5]`, 1),
+		"sketch too":         strings.Replace(ok, `"distinct":[1,5,9]`, `"distinct":[1],"sketch":{"p":14}`, 1),
+		"min with buckets":   strings.Replace(ok, `"value":1.5`, `"value":1.5,"buckets":[{"key":"x","doc_count":1}]`, 1),
+		"min with stats":     strings.Replace(ok, `"value":1.5`, `"stats":{"count":1,"sum":1,"min":1,"max":1}`, 1),
+		"min with distinct":  strings.Replace(ok, `"value":1.5`, `"distinct":[1]`, 1),
+	} {
+		if res, err := decodeCachedResult(encodeJSONValue(t, js), 4096, req); err == nil {
+			t.Errorf("%s: decoded %+v", name, res)
+		}
+	}
+	terms := parseReq(t, `{"size":0,"aggs":{"b":{"terms":{"field":"brand"}}}}`)
+	if _, err := decodeCachedResult(encodeJSONValue(t, `{"total":1,"total_relation":"eq","aggs":{"b":{"type":"terms","value":2}}}`), 4096, terms); err == nil {
+		t.Error("a terms partial with a value decoded")
 	}
 }

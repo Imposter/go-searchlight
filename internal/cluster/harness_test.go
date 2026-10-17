@@ -618,6 +618,11 @@ type faultStore struct {
 	// context ends: the node's tailers stay where they are, serving and current by
 	// their own measure.
 	stallTail atomic.Pointer[chan struct{}]
+	// tableReads counts the reads of every index's copies: the copy table read whole.
+	tableReads atomic.Int64
+	// holdTable, when set, runs at the start of every read of the whole copy table:
+	// a slow database.
+	holdTable atomic.Pointer[func(ctx context.Context)]
 	// stalled counts the ChangesAfter calls stallTail holds now.
 	stalled atomic.Int32
 }
@@ -817,6 +822,12 @@ func (r *faultRegistry) Nodes(ctx context.Context) ([]store.Node, error) {
 }
 
 func (r *faultRegistry) Copies(ctx context.Context, index string) ([]store.Copy, error) {
+	if index == "" {
+		r.f.tableReads.Add(1)
+		if hold := r.f.holdTable.Load(); hold != nil {
+			(*hold)(ctx)
+		}
+	}
 	if r.f.isDown() {
 		return nil, errPartitioned
 	}

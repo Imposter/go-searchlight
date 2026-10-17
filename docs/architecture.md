@@ -362,7 +362,25 @@ Any node takes any request.
   serving copy elsewhere whose lag is within `max_lag`, chosen by adaptive replica
   selection on measured latency, like Elasticsearch's ARS. A failed or timed-out attempt
   (10 s) is retried on another copy, so with two or more copies, one node failing is not
-  a client error.
+  a client error. The copies a read knows of come from this node's view of the registry,
+  which can trail it by a refresh. When every one of them has failed (or refused the read
+  for an older wire level), the read reads the copy table again, once per shard, and
+  tries the serving copies it has not tried, a node at a new address included. A view
+  read since the shard was routed (by another shard of the request, or the view loop)
+  serves without a read, and concurrent re-reads share one. A read waits on its re-read
+  for at most a quarter of the request's remaining time, and 1 s, so it still has time
+  for the copies it finds and for this node's own copy, which a read falls back to
+  (stale) when no copy elsewhere answers. The registry read goes on (up to 2 s) after a
+  read stops waiting, and its view serves the reads after it. Registry reads for
+  routing are 75 ms apart, so a re-read that needs one realistically needs 400 ms or
+  more left on the request; one with less mostly gives up, and a later read benefits.
+  When nothing
+  new turns up, the copies that refused only for being stale are asked once more,
+  accepting a stale answer, and then the shard is a 503.
+  `searchlight_cluster_read_rereads_total` counts each shard's re-read (whether it read
+  the database or took a newer view), by `op` and `result`: `found`, `none`, or
+  `timeout` (it gave up first). Routing's own read for a shard with no copy in view is
+  not counted, and stands for the shard's one re-read.
 - **Peer traffic** (reads, hints, snapshots) uses the internal API under `/_internal/` on
   the same listener. It is authenticated by `cluster_token`, and runs over TLS when
   `tls_cert` is set, with peers verified against `peer_ca_file`.

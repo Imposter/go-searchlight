@@ -64,25 +64,30 @@ const codeStale = "stale_copy"
 // and global aggregations, which a level-0 peer would ignore or refuse, and level 2 a
 // terms aggregation's include and exclude (levelTermsFilter), which a lower peer
 // would ignore, counting every value, and level 3 from (levelFrom), which a lower peer
-// would ignore, answering with the first page. A request says the level it needs
+// would ignore, answering with the first page, and level 4 the min and max
+// aggregations (levelMetrics), which a lower peer would refuse as unknown. A request
+// says the level it needs
 // (wireRequest.Needs), and goes to that level's endpoint (searchPath), and a reply
 // the level it was answered at (searchReply.Level): a peer refuses a request past its
 // level, and the coordinator a reply below the request's, so a search is never
 // answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelFrom
+const searchLevel = levelMetrics
 
 // The search wire levels of the additions a peer must not ignore.
 const (
 	levelFilterAggs  = 1
 	levelTermsFilter = 2
 	levelFrom        = 3
+	levelMetrics     = 4
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelMetrics:
+		return "a min or max aggregation"
 	case needs >= levelFrom:
 		return "from, a page past the first"
 	case needs >= levelTermsFilter:
@@ -122,7 +127,8 @@ type wireRequest struct {
 	NoBodies    bool               `json:"no_bodies,omitempty"`
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
-	// for a terms aggregation's include or exclude, 3 for a from past 0.
+	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
+	// or max aggregation.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -153,6 +159,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		return nil, err
 	}
 	switch {
+	case metricAggs(r.Aggs):
+		w.Needs = levelMetrics
 	case r.From > 0 && r.Size > 0:
 		w.Needs = levelFrom
 	case termsFilters(r.Aggs):
@@ -428,6 +436,17 @@ func filterAggs(aggs map[string]search.Agg) bool {
 	return false
 }
 
+// metricAggs reports whether aggs hold a min or max aggregation, at any level.
+func metricAggs(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Type == search.AggMin || a.Type == search.AggMax || metricAggs(a.Aggs) {
+			return true
+		}
+	}
+	return false
+}
+
 // termsFilters reports whether aggs hold a terms aggregation with an include or an
 // exclude, at any level.
 func termsFilters(aggs map[string]search.Agg) bool {
@@ -438,6 +457,21 @@ func termsFilters(aggs map[string]search.Agg) bool {
 		}
 	}
 	return false
+}
+
+// dropMetrics removes every min and max aggregation from aggs, in place: what a peer
+// of a level below levelMetrics leaves of a search holding them, had it not refused
+// it (testHooks.olderPeer).
+func dropMetrics(aggs map[string]search.Agg) {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Type == search.AggMin || a.Type == search.AggMax {
+			delete(aggs, name)
+			continue
+		}
+		dropMetrics(a.Aggs)
+		aggs[name] = a
+	}
 }
 
 // dropTermsFilters removes every include and exclude from aggs, in place: what a peer

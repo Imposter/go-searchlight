@@ -95,10 +95,28 @@ const (
 	AggDateHistogram = "date_histogram"
 	AggStats         = "stats"
 	AggCardinality   = "cardinality"
+	AggMin           = "min"
+	AggMax           = "max"
 	AggFilter        = "filter"
 	AggFilters       = "filters"
 	AggGlobal        = "global"
 )
+
+// The collect modes of a terms aggregation with sub-aggregations (Agg.CollectMode).
+const (
+	// CollectDepthFirst collects the sub-aggregations of every term as the documents
+	// are read, whether or not the term makes the shard's cut.
+	CollectDepthFirst = "depth_first"
+	// CollectBreadthFirst counts the terms first, cuts the shard's list, then reads
+	// the hits again for the sub-aggregations of the terms kept alone.
+	CollectBreadthFirst = "breadth_first"
+)
+
+// metricType reports whether typ is a metric aggregation: stats, cardinality, min or max,
+// which a bucket aggregation holds as sub-aggregations.
+func metricType(typ string) bool {
+	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax
+}
 
 // singleBucket reports whether typ is a filter, filters or global aggregation: buckets
 // of documents chosen by query (or every live document), each holding the aggregations
@@ -175,8 +193,8 @@ type SortField struct {
 }
 
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
-// date_histogram) may hold metric sub-aggregations (stats, cardinality) in Aggs, one
-// level deep. A filter, filters or global aggregation (global only at the top level)
+// date_histogram) may hold metric sub-aggregations (stats, cardinality, min, max) in
+// Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
 // holds any other aggregation in Aggs, each with its own metric sub-aggregations: its
 // buckets are sets of documents, which the aggregations under it count as top-level
 // ones count the search's matches.
@@ -205,6 +223,12 @@ type Agg struct {
 	// excludes none.
 	Include *TermsFilter `json:",omitempty"`
 	Exclude *TermsFilter `json:",omitempty"`
+	// CollectMode is how a terms aggregation collects its sub-aggregations,
+	// CollectDepthFirst or CollectBreadthFirst. Empty chooses per segment: breadth
+	// first when the segment's field holds more distinct values than ShardSize, so
+	// that most of them would be collected for buckets the shard then drops; depth
+	// first otherwise. Either answers the same; only the cost differs.
+	CollectMode string `json:",omitempty"`
 
 	// Ranges are a range aggregation's buckets: From inclusive, To exclusive, either
 	// open when nil.
@@ -275,7 +299,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //     MaxResultWindow here; the API holds it to max_result_window);
 //   - track_total: true (exact) or a count;
 //   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
-//     (terms also takes include and exclude, an array of values or a pattern), or
+//     (terms also takes include and exclude, an array of values or a pattern, and
+//     collect_mode), or
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
@@ -527,7 +552,7 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 			switch key {
 			case "aggs", "aggregations":
 				subs, subsKey = val, key
-			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality:
+			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality, AggMin, AggMax:
 				typed++
 				a.Type = key
 				parseAggBody(&a, val, at+"."+key, ps)
@@ -544,7 +569,7 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 				a.Type = key
 				parseGlobal(val, at+"."+key, ps)
 			default:
-				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats, cardinality, filter, filters or global")
+				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats, cardinality, min, max, filter, filters or global")
 			}
 		}
 		if subs != nil {
@@ -719,11 +744,13 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude"},
+		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode"},
 		AggRange:         {"field", "ranges"},
 		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
 		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
 		AggStats:         {"field"},
+		AggMin:           {"field"},
+		AggMax:           {"field"},
 		AggCardinality:   {"field", "precision"},
 	}[a.Type]
 	for _, key := range slices.Sorted(maps.Keys(body)) {
@@ -751,6 +778,10 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 				a.ShardSize = n
 			default:
 				a.Precision = n
+			}
+		case "collect_mode":
+			if json.Unmarshal(val, &a.CollectMode) != nil || (a.CollectMode != CollectDepthFirst && a.CollectMode != CollectBreadthFirst) {
+				ps.add(at, "collect_mode is %q or %q", CollectDepthFirst, CollectBreadthFirst)
 			}
 		case "include", "exclude":
 			if string(bytes.TrimSpace(val)) == "null" {

@@ -290,6 +290,11 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			lo, hi, avg := st.Min, st.Max, st.Sum/float64(st.Count)
 			res.Min, res.Max, res.Avg = &lo, &hi, &avg
 		}
+	case AggMin, AggMax:
+		if p.Value != nil {
+			v := *p.Value
+			res.Number = &v
+		}
 	case AggCardinality:
 		if p.Sketch != nil {
 			res.Value = p.Sketch.Estimate()

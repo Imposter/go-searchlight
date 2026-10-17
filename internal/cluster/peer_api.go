@@ -265,6 +265,9 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 			if level < levelFrom {
 				req.From = 0
 			}
+			if level < levelMetrics {
+				dropMetrics(req.Aggs)
+			}
 		}
 	}
 	t, err := p.target(r, msg.shardRef)

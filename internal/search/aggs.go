@@ -49,6 +49,8 @@ type AggPartial struct {
 	OtherDocCount int64         `json:"other_doc_count,omitempty"`
 	Stats         *StatsPartial `json:"stats,omitempty"`
 	Sketch        *Sketch       `json:"sketch,omitempty"`
+	// Value is a min or max aggregation's least or greatest value, nil with none.
+	Value *float64 `json:"value,omitempty"`
 
 	// ords are a segment's partials by local ordinal (a keyword or list field's terms
 	// or cardinality, one per part of the segment collected apart), which the shard
@@ -249,6 +251,8 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 	switch spec.typ {
 	case AggStats:
 		return &statsColl{src: src}
+	case AggMin, AggMax:
+		return &extremeColl{src: src, max: spec.typ == AggMax}
 	case AggCardinality:
 		c := &cardColl{s: s, src: src, sketch: NewSketch(spec.precision)}
 		if top && src.ordinal() {
@@ -256,7 +260,7 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		}
 		return c
 	case AggTerms:
-		c := &termsColl{s: s, spec: spec, src: src}
+		c := &termsColl{s: s, spec: spec, src: src, deferred: deferSubs(spec, src)}
 		if s.lazyTerms(spec, src) {
 			c.lazy = &lazyFilter{f: spec.terms, src: src, seen: map[uint32]bool{}}
 		} else {
@@ -321,6 +325,75 @@ func (c *statsColl) collect(d uint32) {
 func (c *statsColl) partial() *AggPartial {
 	st := c.st
 	return &AggPartial{Type: AggStats, Stats: &st}
+}
+
+// extremeColl keeps a min or max aggregation's least or greatest value; -0 is 0.
+type extremeColl struct {
+	src *fieldSrc
+	max bool
+	has bool
+	v   float64
+}
+
+func (c *extremeColl) collect(d uint32) {
+	if v, ok := c.src.number(d); ok {
+		c.add(v)
+	}
+}
+
+func (c *extremeColl) add(v float64) {
+	v = positiveZero(v)
+	if !c.has || (c.max && v > c.v) || (!c.max && v < c.v) {
+		c.v, c.has = v, true
+	}
+}
+
+// countDense finds the extreme of a dense hit set from the point index: its blocks in
+// value order from the end sought, each block's documents in value order, until the
+// first block holding a hit, whose hits hold the extreme.
+func (c *extremeColl) countDense(notHit *roaring.Bitmap) bool {
+	if c.src.kind != srcNumber {
+		return false
+	}
+	nc := c.src.nc
+	var docs []uint32
+	nc.EachBlock(negInf, posInf, c.max, func(pb segment.PointBlock) bool {
+		docs = pb.Docs(docs[:0])
+		for _, d := range docs {
+			if !notHit.Contains(d) {
+				if v, ok := nc.Value(d); ok {
+					c.add(v)
+				}
+			}
+		}
+		return !c.has
+	})
+	return true
+}
+
+func (c *extremeColl) partial() *AggPartial {
+	p := &AggPartial{Type: AggMin}
+	if c.max {
+		p.Type = AggMax
+	}
+	if c.has {
+		v := c.v
+		p.Value = &v
+	}
+	return p
+}
+
+// mergeExtreme keeps in *dst the least (or, with greatest, the greatest) of *dst and
+// src; either may be nil, for no value.
+func mergeExtreme(dst **float64, src *float64, greatest bool) {
+	switch {
+	case src == nil:
+	case *dst == nil:
+		v := *src
+		*dst = &v
+	case (greatest && *src > **dst) || (!greatest && *src < **dst):
+		**dst = *src
+	}
 }
 
 type cardColl struct {
@@ -449,11 +522,43 @@ type termsColl struct {
 	counts  []int64       // by ordinal (keyword, list) or 0/1 (bool)
 	subs    [][]collector // by ordinal, made on first use
 	numbers map[float64]*histBucket
+	// deferred is set when the sub-aggregations wait for the shard's cut (breadth
+	// first, see deferSubs): the collector counts alone, and docs are the documents it
+	// counts, read again once the shard knows the buckets it keeps.
+	deferred bool
+	docs     *roaring.Bitmap
 	// allow is the filter of include and exclude over the ordinals (or bool keys), or
 	// lazy decides it ordinal by ordinal (few hits over a large dictionary): both nil
 	// without them, and for a number field, whose values are checked directly.
 	allow *termMask
 	lazy  *lazyFilter
+}
+
+// deferSubs reports whether a terms aggregation over src collects its
+// sub-aggregations breadth first: counting first, then, once the shard has cut its
+// list, reading the hits again for the buckets it keeps alone (Elasticsearch's
+// collect_mode breadth_first). Only a keyword or list field defers, as its terms are
+// counted by ordinal; with collect_mode unset, when the segment's field holds more
+// distinct values than shard_size, so most of the buckets collected depth first would
+// be dropped.
+func deferSubs(spec *aggSpec, src *fieldSrc) bool {
+	if len(spec.subs) == 0 || !src.ordinal() {
+		return false
+	}
+	switch spec.collect {
+	case CollectDepthFirst:
+		return false
+	case CollectBreadthFirst:
+		return true
+	}
+	return uint64(src.numTerms()) > uint64(spec.shardSize) //nolint:gosec // shardSize is positive
+}
+
+// deferTo gives a deferred terms collector the documents it collects.
+func deferTo(c collector, docs *roaring.Bitmap) {
+	if tc, ok := c.(*termsColl); ok && tc.deferred {
+		tc.docs = docs
+	}
 }
 
 func (c *termsColl) allowed(o uint32) bool {
@@ -473,7 +578,7 @@ func (c *termsColl) slot(o uint32) {
 			n = c.src.numTerms()
 		}
 		c.counts = make([]int64, n)
-		if len(c.spec.subs) > 0 {
+		if len(c.spec.subs) > 0 && !c.deferred {
 			c.subs = make([][]collector, n)
 		}
 	}
@@ -536,11 +641,11 @@ func (c *termsColl) collect(d uint32) {
 	}
 }
 
-// countDense counts a dense hit set (no sub-aggregations) from the dictionary's
-// document frequencies, minus the documents not hit: cheaper than reading every hit's
-// value when most of the segment matches.
+// countDense counts a dense hit set (no sub-aggregations, or deferred ones) from the
+// dictionary's document frequencies, minus the documents not hit: cheaper than reading
+// every hit's value when most of the segment matches.
 func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
-	if len(c.spec.subs) > 0 || !c.src.ordinal() || c.lazy != nil {
+	if (len(c.spec.subs) > 0 && !c.deferred) || !c.src.ordinal() || c.lazy != nil {
 		return false
 	}
 	if c.allow != nil && c.allow.listed {
@@ -566,7 +671,11 @@ func (c *termsColl) partial() *AggPartial {
 			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: b.count, Aggs: subPartials(c.spec, b.subs)})
 		}
 	case c.src.ordinal():
-		p.ords = []*ordPartial{{seg: c.s.seg, counts: c.counts, subs: c.subs}}
+		op := &ordPartial{seg: c.s.seg, counts: c.counts, subs: c.subs}
+		if c.deferred && c.counts != nil {
+			op.deferred = &deferredPart{s: c.s, docs: c.docs}
+		}
+		p.ords = []*ordPartial{op}
 	default:
 		for o, n := range c.counts {
 			if n == 0 {
@@ -945,6 +1054,7 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 			continue
 		}
 		c := s.newCollector(spec, true)
+		deferTo(c, hits)
 		colls[i] = c
 		if dc, ok := c.(denseCounter); ok && dense {
 			if notHit == nil {
@@ -1065,6 +1175,7 @@ func (s *segExec) collectChunked(hits *roaring.Bitmap, specs []*aggSpec) []*AggP
 		colls := make([]collector, len(specs))
 		for j, spec := range specs {
 			colls[j] = cs.newCollector(spec, true)
+			deferTo(colls[j], docs)
 		}
 		cs.collect(docs, colls)
 		if cs.err != nil {
@@ -1120,6 +1231,8 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 			dst.Stats = &StatsPartial{}
 		}
 		dst.Stats.merge(src.Stats)
+	case AggMin, AggMax:
+		mergeExtreme(&dst.Value, src.Value, spec.typ == AggMax)
 	case AggCardinality:
 		if dst.Sketch == nil {
 			dst.Sketch = NewSketch(spec.precision)
@@ -1221,10 +1334,17 @@ func cutShard(p *AggPartial, spec *aggSpec) {
 // mergeShard merges the segments' partials of specs (one map per segment searched)
 // into the shard's: by key, exactly; ordinal partials by global ordinal or by term
 // (finishOrds); and a filter, filters or global aggregation bucket by bucket, the
-// aggregations under each merged as top-level ones are.
-func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) map[string]*AggPartial {
+// aggregations under each merged as top-level ones are. Its error is the first
+// finishOrds returned, with every partial merged still.
+func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPartial, g *shard.Generation, p *prepared) (map[string]*AggPartial, error) {
 	if len(specs) == 0 {
-		return nil
+		return nil, nil
+	}
+	var first error
+	keep := func(err error) {
+		if first == nil {
+			first = err
+		}
 	}
 	out := make(map[string]*AggPartial, len(specs))
 	for _, spec := range specs {
@@ -1240,7 +1360,9 @@ func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPar
 						subs = append(subs, part.Buckets[i].Aggs)
 					}
 				}
-				b.Aggs = mergeShard(ctx, spec.subs, subs, g, p)
+				var err error
+				b.Aggs, err = mergeShard(ctx, spec.subs, subs, g, p)
+				keep(err)
 				dst.Buckets = append(dst.Buckets, b)
 			}
 			continue
@@ -1255,10 +1377,10 @@ func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPar
 			mergePartial(dst, part, spec)
 		}
 		if len(ords) > 0 {
-			finishOrds(ctx, dst, ords, spec, g, p)
+			keep(finishOrds(ctx, dst, ords, spec, g, p))
 		}
 	}
-	return out
+	return out, first
 }
 
 // cutShardAggs finishes the shard's partials of specs with cutShard, the aggregations
@@ -1309,6 +1431,8 @@ type AggResult struct {
 	Min, Max, Avg *float64
 	// Value is a cardinality's estimate.
 	Value int64
+	// Number is a min or max aggregation's value: nil when no document has one.
+	Number *float64
 	// DocCount and Aggs are a filter or global aggregation's one bucket: its documents
 	// and the results of the aggregations under it. A filters aggregation's buckets
 	// are Buckets, keyed by filter.
@@ -1352,6 +1476,10 @@ func (a *AggResult) MarshalJSON() ([]byte, error) {
 		return json.Marshal(struct {
 			Value int64 `json:"value"`
 		}{a.Value})
+	case AggMin, AggMax:
+		return json.Marshal(struct {
+			Value *float64 `json:"value"`
+		}{a.Number})
 	case AggFilter, AggGlobal:
 		return json.Marshal(inlineBucket(a.DocCount, a.Aggs))
 	case AggFilters:

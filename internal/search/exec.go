@@ -98,6 +98,10 @@ func SetThreads(n int) {
 	slots.Store(&ch)
 }
 
+// poolSize is how many calls runParallel makes at once at most: the search pool's
+// goroutines and the caller's.
+func poolSize() int { return cap(*slots.Load()) + 1 }
+
 // runParallel calls fn(0..n-1), on the calling goroutine and on as many pool
 // goroutines as are free, and returns when every call has. A panic in fn is recovered,
 // logged with its stack, and returned as an error: it never takes the process down.
@@ -470,7 +474,13 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		}
 		segAggs = append(segAggs, sr.aggs)
 	}
-	aggs := mergeShard(ctx, p.aggs, segAggs, g, p)
+	aggs, err := mergeShard(ctx, p.aggs, segAggs, g, p)
+	switch {
+	case isCtxErr(err):
+		res.TimedOut = true
+	case err != nil:
+		return fail(err, "aggregation failed")
+	}
 	buckets := 0
 	if spec := cutShardAggs(p.aggs, aggs, &buckets); spec != nil {
 		return fail(tooManyBuckets(spec), "too many buckets")

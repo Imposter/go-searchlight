@@ -568,6 +568,16 @@ func TestOlderPeerRefusedForTermsFilter(t *testing.T) {
 	}
 }
 
+// TestOlderPeerRefusedForMetrics: a peer at wire level 3 (from, no min or max), with
+// no endpoint for a level-4 search or answering it at level 3 without its min and max
+// aggregations, is not trusted with them: the search is unavailable (503), while the
+// features of the levels below are answered.
+func TestOlderPeerRefusedForMetrics(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelFrom) })
+	}
+}
+
 // TestOlderPeerRefusedForFrom: a peer at wire level 2 (include and exclude, no from),
 // with no endpoint for a level-3 search or answering it at level 2 with the first
 // page, is not trusted with a from past 0: the search is unavailable (503), while the
@@ -608,7 +618,14 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
 		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
 	}
-	refused := map[string]*search.Request{
+	refused := map[string]*search.Request{}
+	levelFour := map[string]*search.Request{
+		"min": {Query: &query.All{}, Aggs: map[string]search.Agg{"lo": {Type: search.AggMin, Field: "price"}}},
+		"max": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{
+			"hi": {Type: search.AggMax, Field: "price"},
+		}}}},
+	}
+	levelThree := map[string]*search.Request{
 		"from": {Query: &query.All{}, Sort: []search.SortField{{Field: "price"}}, Size: 5, From: 5},
 	}
 	levelTwo := map[string]*search.Request{
@@ -621,7 +638,7 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 		"post_filter": {Query: &query.All{}, PostFilter: cheap, Size: 20, TrackTotal: search.TrackTotalAll},
 		"filter":      {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap}}},
 	}
-	for below, rs := range map[int]map[string]*search.Request{levelFilterAggs: levelOne, levelTermsFilter: levelTwo} {
+	for below, rs := range map[int]map[string]*search.Request{levelFilterAggs: levelOne, levelTermsFilter: levelTwo, levelFrom: levelThree, levelMetrics: levelFour} {
 		if level < below {
 			maps.Copy(refused, rs)
 			continue

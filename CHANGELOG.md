@@ -4,6 +4,29 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Added
+
+- **`min` and `max` aggregations**, Elasticsearch's: `{"value": x}`, or `{"value":
+  null}` when no document has one, at the top level, under `filter`, `filters` and
+  `global`, and as a bucket aggregation's sub-aggregation. Each keeps one value per
+  bucket; over a dense hit set it reads the point index from the end sought until a
+  block holds a hit ([docs/api.md](docs/api.md#search-and-count)).
+- **`collect_mode` on `terms`**, `depth_first` or `breadth_first`, as Elasticsearch's.
+  Breadth first counts the values, makes each shard's `shard_size` cut, then reads
+  the hits again for the sub-aggregations of the values kept alone. Unset, a segment
+  whose field holds more distinct values than `shard_size` collects breadth first;
+  results are the same either way. A `terms` over a field of 150,000 values with a
+  `stats` sub-aggregation, over a million documents, went from 190 ms to 57 ms.
+
+### Upgrading
+
+- A search with a `min` or `max` aggregation (search wire level 4) is refused with a
+  503 rather than read from a node of an earlier release, which would refuse it as
+  unknown. `collect_mode` needs nothing: an earlier node collects depth first, with
+  the same results.
+
 ## [1.1.0] - 2026-10-17
 
 Faceting: filter aggregations and `post_filter`, `terms` include and exclude, date math, and `from` paging.

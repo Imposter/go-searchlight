@@ -566,7 +566,7 @@ func (t *Translator) aggs(aggs map[string]search.Agg) (map[string]any, error) {
 				body["offset"] = strconv.FormatFloat(a.Offset, 'f', -1, 64) + "ms"
 			}
 			body["min_doc_count"] = minDocs(a.MinDocCount)
-		case search.AggStats:
+		case search.AggStats, search.AggMin, search.AggMax:
 		case search.AggCardinality:
 			p := a.Precision
 			if p == 0 {

@@ -14,9 +14,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   build would make them, when that is cheaper than merging every dictionary again;
   after each refresh or merge the fields aggregated in the last 10 minutes are
   rebuilt in the background. Every build, a search's or a warm's, takes a slot of
-  one pool of a quarter of the CPUs; a shard's field has one build in flight, which
-  a newer generation's supersedes; a closing shard cancels its builds and waits for
-  them. A build runs once for every search asking, detached from them: one a
+  one pool of a quarter of the CPUs, searches' first; a search never waits on a
+  queued build, and on a running one at most 250 ms; a shard's field has one build
+  in flight, which a newer generation's supersedes; a closing shard cancels its
+  builds, waits for them and drops its entries. A build runs once for every search asking, detached from them: one a
   search's deadline stops waiting for finishes and is cached for the next search
   instead of being thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
   metrics: `searchlight_search_ordinals_builds_total`,

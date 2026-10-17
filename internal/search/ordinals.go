@@ -572,9 +572,11 @@ func (g *globalOrds) term(gen *shard.Generation, field string, gl uint32, entrie
 // their own reference on the generation, which the shard's shutdown cancels and waits
 // for), once however many searches ask at the same time, and every one of them, a
 // search's or a warm's, takes a slot of ordsBuilders first: at most that many run at
-// once across the process. A search waits for a build only part of its time (see
-// finishOrds) and merges by term meanwhile; the build goes on, and the next search
-// finds it cached.
+// once across the process, and a search's build is served before warm builds queued
+// earlier. A search never waits on a build still queued, and on a running one only
+// briefly (globalOrdinals): it merges by term meanwhile, exactly; the build goes on,
+// and the next search finds it cached. A shard's shutdown cancels its builds and
+// purges its lines.
 //
 // After each refresh or merge, WarmOrdinals (shard.Options.Published) starts the
 // builds of the fields searches used over the shard within ordsWarmWindow, so the
@@ -590,7 +592,95 @@ var ordsWarmWindow = 10 * time.Minute
 
 // ordsBuilders bounds the builds running at once, across shards: a quarter of the
 // CPUs, at least one.
-var ordsBuilders = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)/4))
+var ordsBuilders = newBuildPool(max(1, runtime.GOMAXPROCS(0)/4))
+
+// ordsStartGrace is how long a search waits for a build to take its slot: one not
+// running by then is left to the background, and the search merges by term.
+var ordsStartGrace = 5 * time.Millisecond
+
+// ordsRunningWait bounds how long a search waits for a running build before it
+// merges by term: about what the merge by term of a dense field over a large shard
+// costs, so waiting longer never pays. A variable so tests can change it.
+var ordsRunningWait = 250 * time.Millisecond
+
+// buildPool is a counting semaphore whose waiters are served searches first: a
+// search's build (or a warm one a search joined) takes the next free slot before any
+// warm build queued earlier, so warm builds never hold a search back.
+type buildPool struct {
+	mu      sync.Mutex
+	free    int
+	waiters []*poolWaiter
+}
+
+// poolWaiter is one build waiting for a slot; urgent (a search's) is read and set
+// under the pool's lock.
+type poolWaiter struct {
+	ch     chan struct{}
+	urgent bool
+}
+
+func newBuildPool(n int) *buildPool { return &buildPool{free: n} }
+
+// acquire takes a slot for w, waiting its turn: false when ctx ends first.
+func (p *buildPool) acquire(ctx context.Context, w *poolWaiter) bool {
+	p.mu.Lock()
+	if p.free > 0 {
+		p.free--
+		p.mu.Unlock()
+		return true
+	}
+	p.waiters = append(p.waiters, w)
+	p.mu.Unlock()
+	select {
+	case <-w.ch:
+		return true
+	case <-ctx.Done():
+		p.mu.Lock()
+		if i := slices.Index(p.waiters, w); i >= 0 {
+			p.waiters = slices.Delete(p.waiters, i, i+1)
+			p.mu.Unlock()
+			return false
+		}
+		p.mu.Unlock()
+		p.release() // granted as ctx ended: pass it on
+		return false
+	}
+}
+
+// tryAcquire takes a free slot, if any, without waiting.
+func (p *buildPool) tryAcquire() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.free == 0 {
+		return false
+	}
+	p.free--
+	return true
+}
+
+// release gives a slot back: to the first urgent waiter, else the first waiter.
+func (p *buildPool) release() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.waiters) == 0 {
+		p.free++
+		return
+	}
+	i := slices.IndexFunc(p.waiters, func(w *poolWaiter) bool { return w.urgent })
+	if i < 0 {
+		i = 0
+	}
+	w := p.waiters[i]
+	p.waiters = slices.Delete(p.waiters, i, i+1)
+	close(w.ch)
+}
+
+// promote makes w urgent: a search joined its build.
+func (p *buildPool) promote(w *poolWaiter) {
+	p.mu.Lock()
+	w.urgent = true
+	p.mu.Unlock()
+}
 
 // ordsBuilding counts the builds in flight, for tests to wait on.
 var ordsBuilding atomic.Int64
@@ -633,6 +723,10 @@ type ordsEntry struct {
 	charged int64
 	started bool
 	cancel  context.CancelFunc
+	// waiter is the build's place in ordsBuilders' queue; running closes once the
+	// build has its slot.
+	waiter  *poolWaiter
+	running chan struct{}
 }
 
 // ordsCacheKey names a build: a shard's field's values or entries over one segment
@@ -663,12 +757,30 @@ func (e *ordsEntry) finished() bool {
 	}
 }
 
-// line returns key's line, made when missing. The caller holds c.mu.
-func (c *ordsCache) line(key ordsCacheKey) *ordsLine {
+// purge drops a closed shard's lines and cached builds; its builds in flight are
+// cancelled by the shutdown and removed as they end.
+func (c *ordsCache) purge(sh *shard.Shard) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, ln := range c.lines[sh] {
+		if ln.cached != nil {
+			c.remove(ln.cached)
+		}
+	}
+	delete(c.lines, sh)
+}
+
+// line returns key's line, made when missing (the first of g's shard purges them all
+// when the shard shuts down). The caller holds c.mu.
+func (c *ordsCache) line(key ordsCacheKey, g *shard.Generation) *ordsLine {
 	fields := c.lines[key.shard]
 	if fields == nil {
 		fields = map[ordsField]*ordsLine{}
 		c.lines[key.shard] = fields
+		if key.shard != nil {
+			sh := key.shard
+			context.AfterFunc(g.Context(), func() { c.purge(sh) })
+		}
 	}
 	f := ordsField{key.field, key.entries}
 	ln := fields[f]
@@ -710,14 +822,20 @@ func (c *ordsCache) cached(ctx context.Context, key ordsCacheKey) *globalOrds {
 }
 
 // globalOrdinals returns field's global ordinals over g's segments, from the cache or
-// built (once, however many searches ask at the same time; the others wait for it).
-// Nil when ctx ends first (the build goes on, and is cached when done), or when the
-// shard's line holds a build over a newer generation.
+// built (once, however many searches ask at the same time). A search waits only for a
+// build that runs: one not holding a slot within ordsStartGrace (queued behind
+// others) is left to the background at once, and a running one is waited for at most
+// ordsRunningWait. Nil then, when ctx ends first, or when the shard's line holds a
+// build over a newer generation: the caller merges by term, and the build goes on and
+// is cached when done.
 func globalOrdinals(ctx context.Context, g *shard.Generation, field string, entries bool) *globalOrds {
 	key := ordsKey(g, field, entries)
 	c := globalOrdsCache
 	c.mu.Lock()
 	e, result := c.entry(key, g, false, time.Now().UnixNano()) //nolint:contextcheck // the build outlives the search: it runs for its shard's lifetime
+	if e != nil && !e.started {
+		ordsBuilders.promote(e.waiter)
+	}
 	c.mu.Unlock()
 	ordsMetrics().lookup(ctx, result)
 	if e == nil {
@@ -726,6 +844,27 @@ func globalOrdinals(ctx context.Context, g *shard.Generation, field string, entr
 	select {
 	case <-e.done:
 		return e.ords
+	default:
+	}
+	start := time.NewTimer(ordsStartGrace)
+	defer start.Stop()
+	select {
+	case <-e.running:
+	case <-e.done:
+		return e.ords
+	case <-start.C:
+		ordsMetrics().lookup(ctx, "queued")
+		return nil
+	case <-ctx.Done():
+		return nil
+	}
+	wait := time.NewTimer(ordsRunningWait)
+	defer wait.Stop()
+	select {
+	case <-e.done:
+		return e.ords
+	case <-wait.C:
+		return nil
 	case <-ctx.Done():
 		return nil
 	}
@@ -736,7 +875,7 @@ func globalOrdinals(ctx context.Context, g *shard.Generation, field string, entr
 // nil, the line has a newer generation's). used is when a search used it (0 for a
 // warm). The caller holds c.mu.
 func (c *ordsCache) entry(key ordsCacheKey, g *shard.Generation, warm bool, used int64) (*ordsEntry, string) {
-	ln := c.line(key)
+	ln := c.line(key, g)
 	ln.used = max(ln.used, used)
 	if el, ok := c.items[key]; ok {
 		c.lru.MoveToFront(el)
@@ -757,7 +896,10 @@ func (c *ordsCache) entry(key ordsCacheKey, g *shard.Generation, warm bool, used
 			prev.cancel()
 		}
 	}
-	e := &ordsEntry{key: key, line: ln, gen: g.Gen(), warm: warm, done: make(chan struct{})}
+	e := &ordsEntry{
+		key: key, line: ln, gen: g.Gen(), warm: warm, done: make(chan struct{}),
+		waiter: &poolWaiter{ch: make(chan struct{}), urgent: !warm}, running: make(chan struct{}),
+	}
 	el := c.lru.PushFront(e)
 	c.items[key] = el
 	ln.building = e
@@ -787,7 +929,11 @@ func (c *ordsCache) start(el *list.Element, e *ordsEntry, g *shard.Generation, p
 				ords = nil
 				ordsMetrics().build(ctx, "unknown", e.trigger(), "panic", 0)
 			} else if !started {
-				ordsMetrics().build(ctx, "unstarted", e.trigger(), "superseded", 0)
+				result := "superseded"
+				if g.Context().Err() != nil {
+					result = "shutdown"
+				}
+				ordsMetrics().build(ctx, "unstarted", e.trigger(), result, 0)
 			}
 			cancel()
 			c.finish(el, e, ords)
@@ -801,15 +947,14 @@ func (c *ordsCache) start(el *list.Element, e *ordsEntry, g *shard.Generation, p
 				return
 			}
 		}
-		select {
-		case ordsBuilders <- struct{}{}:
-			defer func() { <-ordsBuilders }()
-		case <-ctx.Done():
+		if !ordsBuilders.acquire(ctx, e.waiter) {
 			return
 		}
+		defer ordsBuilders.release()
 		c.mu.Lock()
 		e.started = true
 		c.mu.Unlock()
+		close(e.running)
 		started = true
 		ords = c.build(ctx, e, g)
 	}()
@@ -873,7 +1018,8 @@ func (c *ordsCache) finish(el *list.Element, e *ordsEntry, ords *globalOrds) {
 	}
 	switch {
 	case c.items[e.key] != el:
-	case ords == nil || (ln.cached != nil && entryOf(ln.cached).gen > e.gen):
+	case ords == nil || (ln.cached != nil && entryOf(ln.cached).gen > e.gen) ||
+		c.lines[e.key.shard][ordsField{e.key.field, e.key.entries}] != ln: // purged: its shard closed
 		c.remove(el)
 	default:
 		if ln.cached != nil {
@@ -997,11 +1143,11 @@ func (p *ordPartial) used() uint64 {
 
 // finishOrds merges the segments' ordinal partials of spec into dst: by global
 // ordinal when the ordinals cached at prepare, or built now because the partials are
-// dense enough, are there; by term otherwise, exactly too. A search with a deadline
-// waits for a build at most half of what is left of it, then merges by term (the
-// build goes on, for the next search). Only when ctx ends before the merge by term
-// is done is the shard's partial of spec left empty and the search cut short
-// (prepared.cut).
+// dense enough, are there; by term otherwise, exactly too. A search never waits on a
+// build queued for a slot, and on a running one only briefly (see globalOrdinals),
+// then merges by term; the build goes on, for the next search. Only when ctx ends
+// before the merge by term is done is the shard's partial of spec left empty and the
+// search cut short (prepared.cut).
 func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, p *prepared) {
 	entries, _ := ordKind(spec.ftype)
 	ords := p.ords[ordField{spec.field, entries}]
@@ -1014,13 +1160,7 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 			total += uint64(numTerms(g.Segments[i].Reader, spec.field, entries))
 		}
 		if used*globalOrdsDensity >= total {
-			wait := ctx
-			if deadline, ok := ctx.Deadline(); ok {
-				var cancel context.CancelFunc
-				wait, cancel = context.WithTimeout(ctx, time.Until(deadline)/2)
-				defer cancel()
-			}
-			ords = globalOrdinals(wait, g, spec.field, entries)
+			ords = globalOrdinals(ctx, g, spec.field, entries)
 		}
 	}
 	switch {

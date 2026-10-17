@@ -358,9 +358,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - each shard scans its segments until the deadline less that reserve; a segment
     unfinished then is left out, its hits, total and aggregations with it;
   - the shard then merges its segments' aggregations until the deadline. A `terms`
-    or `cardinality` whose field's global ordinals are still building waits for them
-    at most half of the time left, then merges by term, exactly (the build goes on
-    in the background, for the next search). Only an aggregation the deadline cuts
+    or `cardinality` whose field's global ordinals are still building waits only
+    for a build already running, at most 250 ms, then merges by term, exactly (the
+    build goes on in the background, for the next search). Only an aggregation the deadline cuts
     off even so is answered empty from that shard;
   - the coordinating node merges the shards' answers once it has them all, which is
     never cut: it is bounded by what the shards sent.

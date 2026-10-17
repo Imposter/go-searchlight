@@ -226,9 +226,17 @@ func TestOrdinalsBuildOutlivesDeadline(t *testing.T) {
 	for range cap(results) {
 		go func() { results <- globalOrdinals(context.Background(), g, "tags", true) }()
 	}
-	first := <-results
-	for range cap(results) - 1 {
-		if o := <-results; o != first {
+	asked := make([]*globalOrds, 0, cap(results))
+	for range cap(results) {
+		asked = append(asked, <-results)
+	}
+	waitOrdsIdle(t)
+	built := globalOrdsCache.cached(context.Background(), ordsKey(g, "tags", true))
+	if built == nil {
+		t.Fatal("no build cached")
+	}
+	for _, o := range asked {
+		if o != nil && o != built {
 			t.Fatal("searches asking together got different builds")
 		}
 	}
@@ -255,7 +263,10 @@ func TestOrdinalsWarm(t *testing.T) {
 	}
 	c.refreshAll()
 	g := s.Acquire()
-	if globalOrdinals(context.Background(), g, "brand", false) == nil || globalOrdinals(context.Background(), g, "tags", true) == nil {
+	globalOrdinals(context.Background(), g, "brand", false)
+	globalOrdinals(context.Background(), g, "tags", true)
+	waitOrdsIdle(t)
+	if globalOrdsCache.cached(context.Background(), ordsKey(g, "brand", false)) == nil || globalOrdsCache.cached(context.Background(), ordsKey(g, "tags", true)) == nil {
 		t.Fatal("no build")
 	}
 	g.Release()
@@ -362,7 +373,8 @@ func BenchmarkOrdinalsAfterRefresh(b *testing.B) {
 // TestOrdinalsBuildsBounded: every build, a search's included, waits for a slot of
 // the one pool; a newer generation's build supersedes a queued older one of the same
 // shard and field, so only the newer runs; a build over a generation older than the
-// line's newest is refused; and closing the shard waits for its builds.
+// line's newest is refused; and closing the shard waits for its builds and purges
+// its lines.
 func TestOrdinalsBuildsBounded(t *testing.T) {
 	clearOrdsCache(t)
 	defer clearOrdsCache(t)
@@ -414,5 +426,16 @@ func TestOrdinalsBuildsBounded(t *testing.T) {
 	}
 	if n := ordsBuilding.Load(); n != 0 {
 		t.Fatalf("the shard closed with %d builds over its generations in flight", n)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		globalOrdsCache.mu.Lock()
+		_, kept := globalOrdsCache.lines[s]
+		globalOrdsCache.mu.Unlock()
+		if !kept {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a closed shard's lines were not purged")
+		}
 	}
 }

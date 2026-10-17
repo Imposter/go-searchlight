@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,17 +68,17 @@ func TestTimeoutBoundsWallTime(t *testing.T) {
 // gives them back: builds queue meanwhile.
 func holdBuilders(t testing.TB) func() {
 	t.Helper()
-	for range cap(ordsBuilders) {
-		ordsBuilders <- struct{}{}
+	n := 0
+	for ordsBuilders.tryAcquire() {
+		n++
 	}
-	var once bool
+	var once sync.Once
 	return func() {
-		if !once {
-			once = true
-			for range cap(ordsBuilders) {
-				<-ordsBuilders
+		once.Do(func() {
+			for range n {
+				ordsBuilders.release()
 			}
-		}
+		})
 	}
 }
 
@@ -114,17 +116,78 @@ func TestDeadlineWithoutOrdinalsMergesByTerm(t *testing.T) {
 	clearOrdsCache(t)
 	release := holdBuilders(t)
 	defer release()
-	got, err := c.search(&Request{Query: &query.All{}, Aggs: aggs, Timeout: 2 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.TimedOut {
-		t.Error("a search that merged by term in time is timed out")
-	}
-	for name := range aggs {
-		if d := diffAgg(got.Aggs[name], want.Aggs[name], name); d != "" {
-			t.Error(d)
+	for _, timeout := range []time.Duration{2 * time.Second, 0} {
+		start := time.Now()
+		got, err := c.search(&Request{Query: &query.All{}, Aggs: aggs, Timeout: timeout})
+		if err != nil {
+			t.Fatal(err)
 		}
+		if took := time.Since(start); took > time.Second*testtier.RaceSlowdown {
+			t.Errorf("timeout %v: a search waited %v on builds queued behind others", timeout, took)
+		}
+		if got.TimedOut {
+			t.Errorf("timeout %v: a search that merged by term in time is timed out", timeout)
+		}
+		for name := range aggs {
+			if d := diffAgg(got.Aggs[name], want.Aggs[name], name); d != "" {
+				t.Error(d)
+			}
+		}
+	}
+}
+
+// TestBuildPoolServesSearchesFirst: a freed slot goes to a search's build (or a warm
+// build a search joined, in queue order among them) before warm builds queued
+// earlier.
+func TestBuildPoolServesSearchesFirst(t *testing.T) {
+	p := newBuildPool(1)
+	if !p.tryAcquire() {
+		t.Fatal("no free slot")
+	}
+	ctx := context.Background()
+	warm1, warm2 := &poolWaiter{ch: make(chan struct{})}, &poolWaiter{ch: make(chan struct{})}
+	search := &poolWaiter{ch: make(chan struct{}), urgent: true}
+	order := make(chan string, 3)
+	var wg sync.WaitGroup
+	enqueue := func(name string, w *poolWaiter) {
+		wg.Go(func() {
+			if p.acquire(ctx, w) {
+				order <- name
+				p.release()
+			}
+		})
+		for {
+			p.mu.Lock()
+			queued := slices.Contains(p.waiters, w)
+			p.mu.Unlock()
+			if queued {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	enqueue("warm1", warm1)
+	enqueue("warm2", warm2)
+	enqueue("search", search)
+	p.promote(warm2)
+	p.release()
+	wg.Wait()
+	close(order)
+	var got []string
+	for name := range order {
+		got = append(got, name)
+	}
+	if want := []string{"warm2", "search", "warm1"}; !slices.Equal(got, want) {
+		t.Fatalf("slots went to %v, want %v", got, want)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if !p.tryAcquire() || p.acquire(cancelled, &poolWaiter{ch: make(chan struct{})}) {
+		t.Fatal("a cancelled waiter got a slot")
+	}
+	p.release()
+	if !p.tryAcquire() {
+		t.Fatal("a cancelled waiter kept its place")
 	}
 }
 
@@ -138,6 +201,8 @@ func TestCancelDuringMergeIsAnError(t *testing.T) {
 	c := ordsCorpus(t)
 	release := holdBuilders(t)
 	defer release()
+	defer func(d time.Duration) { ordsStartGrace = d }(ordsStartGrace)
+	ordsStartGrace = time.Hour // the search waits on its queued build until cancelled
 	ctx, cancel := context.WithCancel(context.Background())
 	g := c.shards[0].Acquire()
 	defer g.Release()

@@ -174,9 +174,11 @@ data_dir/
     shard in the last 10 minutes are rebuilt in the background. Every build takes a
     slot of one pool (a quarter of the CPUs); a shard's field has at most one in
     flight, which a newer generation's supersedes, and a closing shard cancels its
-    builds and waits for them. A build runs detached from the search that asked,
-    once for every search asking: a search waits at most half its time left, then
-    merges by term, and the build finishes and is cached for the next. The old
+    builds, waits for them and drops its entries. A search's build is served before
+    queued warm ones. A build runs detached from the search that asked, once for
+    every search asking: a search never waits on a queued build and on a running one
+    at most 250 ms, then merges by term, exactly, and the build finishes and is
+    cached for the next. The old
     list's entry is dropped once the new one's is cached.
   - The OS page cache holds the mmap'd files.
 - **Format versions.** The segment format is versioned (major 3). A copy whose files

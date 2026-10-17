@@ -1018,11 +1018,13 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
+		bgTimer := time.NewTimer(backgroundWait) //nolint:forbidigo // bounds other goroutines' real work, which a test's fake clock does not drive
 		select {
 		case <-s.background.wait():
-		case <-s.opts.Clock.After(backgroundWait):
+		case <-bgTimer.C:
 			s.log.Warn("shard closed with background work over its generations still running")
 		}
+		bgTimer.Stop()
 		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()

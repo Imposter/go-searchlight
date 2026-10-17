@@ -735,6 +735,7 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	if _, err := c.search(dense); err != nil {
 		t.Fatal(err)
 	}
+	waitOrdsIdle(t)
 	if globalOrdsCache.cached(context.Background(), key) == nil {
 		t.Fatal("a match-all cardinality built no global ordinals")
 	}

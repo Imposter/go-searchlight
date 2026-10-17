@@ -509,12 +509,14 @@ A node's memory is three budgets, plus the page cache:
      Every build, a search's or a warm's, takes a slot of one pool of a quarter of the
      CPUs (at least one), so builds never use more; each shard's field has at most one
      in flight, a newer generation's superseding a queued older one (a running one
-     finishes, and the newer derives from it). A search waits for a build at most
-     half its time left, then merges by term; the build finishes in the background
-     and serves the next search. `searchlight_search_ordinals_builds_total` (by
+     finishes, and the newer derives from it), and a search's build is served before
+     warm builds queued earlier. A search never waits on a build still queued, and on
+     a running one at most 250 ms, then merges by term, exactly; the build finishes in
+     the background and serves the next search. `searchlight_search_ordinals_builds_total` (by
      `kind`: full, incremental, unstarted; `trigger`: search, warm; `result`: done,
-     cancelled, superseded, panic) and `searchlight_search_ordinals_lookups_total`
-     (`hit`, `shared`, `miss`, `stale`, and `absent` at a search's start) show how
+     cancelled, superseded, shutdown, panic) and `searchlight_search_ordinals_lookups_total`
+     (`hit`, `shared`, `miss`, `queued`: left to the background, `stale`, and `absent` at a
+     search's start) show how
      often searches wait on a build.
    - The generations readers hold, and Go's own overhead.
    - **The heap floor.** Segments are mapped files, so a serving node's live heap is
@@ -763,7 +765,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Area | Metrics |
 |---|---|
 | Requests | `searchlight_http_request_duration_seconds` (by route, method, status), `searchlight_http_request_errors_total`, `searchlight_http_requests_inflight` |
-| Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total`, `searchlight_search_ordinals_builds_total` (by kind: full, incremental, unstarted; trigger: search, warm; result: done, cancelled, superseded, panic), `searchlight_search_ordinals_build_duration_seconds`, `searchlight_search_ordinals_lookups_total` (hit, shared, miss, stale, absent) |
+| Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total`, `searchlight_search_ordinals_builds_total` (by kind: full, incremental, unstarted; trigger: search, warm; result: done, cancelled, superseded, shutdown, panic), `searchlight_search_ordinals_build_duration_seconds`, `searchlight_search_ordinals_lookups_total` (hit, shared, miss, queued, stale, absent) |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
 | Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |

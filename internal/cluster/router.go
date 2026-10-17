@@ -423,12 +423,12 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 		if err := t.n.readCall(ctx, c, percolatePath(needs), msg, &reply); err != nil {
 			var ae *api.Error
 			if needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
-				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (an index with a date field, whose saved queries may hold date math): %w; retry once the upgrade is done", needs, errOlderLevel)}
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (%s): %w; retry once the upgrade is done", needs, percolateLevelNeeds(needs), errOlderLevel)}
 			}
 			return err
 		}
 		if reply.Level < needs {
-			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (an index with a date field, whose saved queries may hold date math): %w; retry once the upgrade is done", reply.Level, needs, errOlderLevel)}
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (%s): %w; retry once the upgrade is done", reply.Level, needs, percolateLevelNeeds(needs), errOlderLevel)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil

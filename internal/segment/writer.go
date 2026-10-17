@@ -213,6 +213,9 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	if v.Untyped {
 		b.untyped.Add(ord)
 	}
+	for _, p := range v.Points {
+		b.xy = append(b.xy, xyPoint{x: xyKey(p.X), y: xyKey(p.Y), doc: ord})
+	}
 	switch {
 	case v.Text != nil:
 		b.addValueTerm(ord, *v.Text)
@@ -537,7 +540,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 	w := newFileWriter(out)
 	w.abort = new(atomic.Bool)
-	w.header()
+	xyNames := pointFieldNames(names, parts)
+	minor := uint16(0)
+	if len(xyNames) > 0 {
+		minor = FormatMinor
+	}
+	w.header(minor)
 
 	empty := newFieldBuilder()
 	scratch := make(map[string]*fieldScratch, len(names))
@@ -631,6 +639,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 	w.endSection()
 
+	if len(xyNames) > 0 {
+		if err := writeXYSection(w, path, throttle, numDocs, xyNames, parts, threads); err != nil {
+			return Meta{}, err
+		}
+	}
+
 	w.beginSection(sectionMeta)
 	outs := make(map[string]*fieldOutput, len(names))
 	for _, name := range names {
@@ -675,4 +689,54 @@ func (t throttledWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return t.w.Write(p)
+}
+
+// pointFieldNames returns the names (sorted, as names is) of the fields some part holds
+// points of.
+func pointFieldNames(names []string, parts []map[string]*fieldBuilder) []string {
+	var out []string
+	for _, name := range names {
+		for _, m := range parts {
+			if b, ok := m[name]; ok && len(b.xy) > 0 {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// writeXYSection writes the XY section: each of names' tree, from every part's points
+// in canonical order, then the directory and its offset. A part's points are dropped
+// once its field's tree is built.
+func writeXYSection(w *fileWriter, path string, throttle func(n int) error, numDocs uint32, names []string, parts []map[string]*fieldBuilder, threads int) error {
+	w.beginSection(sectionXY)
+	start := w.off
+	offs := make([]uint64, len(names))
+	err := writeFieldSectionParallel(w, path, throttle, len(names), threads,
+		func(fw *fileWriter, i int) {
+			var pts []xyPoint
+			for _, m := range parts {
+				if b, ok := m[names[i]]; ok {
+					pts = append(pts, b.xy...)
+					b.xy = nil
+				}
+			}
+			writeXYTree(fw, numDocs, canonicalXY(pts))
+		},
+		func(i int, base uint64) { offs[i] = base })
+	if err != nil {
+		return err
+	}
+	var e encoder
+	e.u32(uint32(len(names))) //nolint:gosec // a segment holds far fewer than 4 billion fields
+	for i, name := range names {
+		e.bytes([]byte(name))
+		e.u64(offs[i])
+	}
+	dirOff := w.off - start
+	w.write(e.b)
+	w.u64(dirOff)
+	w.endSection()
+	return w.err
 }

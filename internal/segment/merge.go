@@ -222,6 +222,17 @@ func mergeGroup(readers []*Reader, remaps [][]int32, check func(int) error) (map
 				mergeDoc(builders[name], fv, oldOrd, uint32(newOrd))
 			}
 		}
+		for name, fi := range r.fields {
+			if fi.xy == nil {
+				continue
+			}
+			b := builders[name]
+			fi.xy.each(func(doc uint32, x, y uint64) {
+				if newOrd := remap[doc]; newOrd >= 0 {
+					b.xy = append(b.xy, xyPoint{x: x, y: y, doc: uint32(newOrd)})
+				}
+			})
+		}
 		if check != nil {
 			if err := check(0); err != nil {
 				return nil, err

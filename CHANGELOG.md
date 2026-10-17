@@ -4,6 +4,32 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Added
+
+- **Point fields and box queries**, Elasticsearch's `point` field and Lucene's
+  `XYPoint` ([docs/api.md](docs/api.md#point-fields)). A mapping types a field
+  `{"type": "point", "x": "number"|"date", "y": "number"|"date"}`, and a document gives
+  a list of `[x, y]` pairs or one pair, a date axis taking what a date field takes.
+  `{"field": "seen", "op": "box", "value": {"x": {"gte": "now-7d/d"}, "y": {"gte": 4}}}`
+  matches a document with one point inside on both axes: any of `gt`, `gte`, `lt` and
+  `lte` per axis, either axis optional, date math on a date axis (resolved once per
+  request by the coordinator, and at each percolation for a saved query). It composes
+  in `all`, `any`, `not`, `post_filter`, `filter` and `filters` aggregations and saved
+  queries; `exists` works on point fields; aggregations and sorts on them are refused.
+  - Each segment indexes a point field in a k-d tree, in a new XY section (segment
+    format 4.1, which a 4.0 reader ignores; a segment without a point field is written
+    as 4.0, byte for byte as before). A box over 10M points takes 0.2 to 0.6 ms at
+    100k matches or fewer, 1.5 to 21 times faster than a scan of the points sorted
+    by x, except for a bound on x alone ([docs/architecture.md](docs/architecture.md)).
+  - Search wire level 5 and percolate wire level 2: a box search, and a percolation of
+    an index with a point field, are not answered by a peer of an earlier release,
+    which would refuse the op or misread the mapping; with no other copy they are a
+    503 until the upgrade is done.
+  - The request cache keys a box by its resolved bounds; a box reading `now`
+    unrounded is never cached, as any such date math is.
+
 ## [1.2.0] - 2026-10-17
 
 Fast aggregations: a shard request cache (in memory, optionally Redis), breadth-first `terms`, `min`/`max`, a cardinality `threshold`, global ordinals that survive refreshes, and a `timeout` that bounds the whole shard search.

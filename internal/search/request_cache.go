@@ -704,6 +704,8 @@ func leafReadsNowUnrounded(l *query.Leaf) bool {
 	case query.ArgString:
 		scalars = []query.Scalar{l.Arg.Scalar}
 	case query.ArgList:
+	case query.ArgBox:
+		scalars = l.Arg.BoundScalars()
 	default:
 		return true
 	}

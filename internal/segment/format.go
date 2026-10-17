@@ -14,6 +14,8 @@
 //	         and docs whose value the writer marked untyped
 //	STORED   an s2 dictionary, then s2 blocks of about 4 KB of documents, each one's
 //	         id and JSON body, then a bit-packed block table
+//	XY       per point field a k-d tree of its points (xy.go); only in a segment with
+//	         a point field, which is format 4.1
 //	IDS      the primary key: every document's exact id (as given, never normalized)
 //	         to its ordinal, a term dictionary whose terms each hold one ordinal
 //	         inline, then u64 (the dictionary's index offset in the section) + 1, or
@@ -92,9 +94,10 @@ const (
 	FormatMajor = 4
 	// ReadsMajor is the oldest major Open reads: the one before FormatMajor.
 	ReadsMajor = FormatMajor - 1
-	// FormatMinor is the segment format's minor version: additions an older reader of
-	// the same major can ignore.
-	FormatMinor = 0
+	// FormatMinor is the segment format's newest minor version: additions an older
+	// reader of the same major can ignore. 4.1 adds the XY section (point fields); a
+	// segment without one is written as 4.0, byte for byte as before.
+	FormatMinor = 1
 	// FileExt is a segment file's extension.
 	FileExt = ".seg"
 )
@@ -124,6 +127,7 @@ const (
 	sectionStored
 	sectionMeta
 	sectionIDs
+	sectionXY
 )
 
 var sectionNames = map[sectionKind]string{
@@ -134,6 +138,7 @@ var sectionNames = map[sectionKind]string{
 	sectionStored:    "stored",
 	sectionMeta:      "meta",
 	sectionIDs:       "ids",
+	sectionXY:        "xy",
 }
 
 func (k sectionKind) String() string {
@@ -143,9 +148,15 @@ func (k sectionKind) String() string {
 	return fmt.Sprintf("section(%d)", uint32(k))
 }
 
-// sectionOrder is the order sections are written in.
+// sectionOrder is the order sections are written in: every one a segment holds. The
+// XY section, which only a segment with a point field holds, is written before META.
 var sectionOrder = [...]sectionKind{
 	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionIDs, sectionMeta,
+}
+
+// knownSections is every section kind this build reads, the optional ones included.
+var knownSections = [...]sectionKind{
+	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionIDs, sectionXY, sectionMeta,
 }
 
 // TermKind is which of a field's term dictionaries a term belongs to.

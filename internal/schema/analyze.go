@@ -2,10 +2,12 @@ package schema
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -44,6 +46,9 @@ type Value struct {
 	// Entries is a keyword_list field's entries, normalized and cleaned, distinct and
 	// sorted ([analysis.EntryTerms]).
 	Entries []string
+	// Points is a point field's points, distinct and sorted by x, then y: every pair of
+	// its value that is two finite coordinates of its axes' types (see [Point]).
+	Points []Point
 	// Grams says Text's 3-rune substrings ([analysis.EachGram]) are indexed, as the
 	// anchors and prefilters of contains and starts_with: true for a Text of three to
 	// MaxGramChars characters, never for the IDField. They are read from Text where they
@@ -413,8 +418,97 @@ func analyzeValue(t FieldType, value any, grams bool) Value {
 		if ms, ok := DateMillis(value); ok {
 			return Value{Present: true, Number: &ms}
 		}
+	default:
+		if t.IsPoint() {
+			return Value{Present: true, Points: pointList(t, value)}
+		}
 	}
 	return Value{Present: true}
+}
+
+// Point is one point of a point field: its x and y, each a finite float64 (a date axis
+// in Unix milliseconds). -0 is read as 0.
+type Point struct {
+	X, Y float64
+}
+
+// MaxPoints is the most points one value of a point field holds; the pairs past it are
+// not read.
+const MaxPoints = 10_000
+
+// pointList reads a point field's value: an array of [x, y] pairs, or one pair. A
+// number axis takes what a number field does, a date axis what a date field does
+// (Unix milliseconds, or a date string). A pair that is not two such coordinates is no
+// point, as a non-finite number is no number: the field is present still, with the
+// pairs that are. The points are sorted and distinct.
+func pointList(t FieldType, value any) []Point {
+	list, ok := value.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	xAxis, yAxis := t.Axes()
+	if !isArray(list[0]) && len(list) == 2 && !isArray(list[1]) {
+		if p, ok := readPoint(list, xAxis, yAxis); ok {
+			return []Point{p}
+		}
+		return nil
+	}
+	var out []Point
+	for _, member := range list[:min(len(list), MaxPoints)] {
+		pair, ok := member.([]any)
+		if !ok {
+			continue
+		}
+		if p, ok := readPoint(pair, xAxis, yAxis); ok {
+			out = append(out, p)
+		}
+	}
+	if len(out) < 2 {
+		return out
+	}
+	slices.SortFunc(out, ComparePoints)
+	return slices.Compact(out)
+}
+
+// ComparePoints orders points by x, then y.
+func ComparePoints(a, b Point) int {
+	if c := cmp.Compare(a.X, b.X); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Y, b.Y)
+}
+
+func isArray(v any) bool {
+	_, ok := v.([]any)
+	return ok
+}
+
+// readPoint reads one [x, y] pair.
+func readPoint(pair []any, xAxis, yAxis FieldType) (Point, bool) {
+	if len(pair) != 2 {
+		return Point{}, false
+	}
+	x, okX := coordinate(pair[0], xAxis)
+	y, okY := coordinate(pair[1], yAxis)
+	if !okX || !okY {
+		return Point{}, false
+	}
+	return Point{X: x, Y: y}, true
+}
+
+// coordinate reads one coordinate on an axis of type t (Number or Date); -0 reads 0.
+func coordinate(v any, t FieldType) (float64, bool) {
+	var f float64
+	var ok bool
+	if t == Date {
+		f, ok = DateMillis(v)
+	} else {
+		f, ok = analysis.Number(v)
+	}
+	if f == 0 {
+		f = 0
+	}
+	return f, ok
 }
 
 // textValue is a keyword or text field's value: its text, (text only) words (a NUL is

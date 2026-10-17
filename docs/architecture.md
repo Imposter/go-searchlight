@@ -46,7 +46,7 @@ flowchart LR
 | `internal/node` | The engine under the cluster node: the index catalogue, the write path (analysis, mapping updates, group commit), one hosted copy and tailer per shard, reads with read-your-writes, scatter-gather and reduce |
 | `internal/replica` | The tailer: keeps one shard copy in step with the changelog (recovering, tailing, halted) |
 | `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
-| `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
+| `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, k-d trees of point fields, zstd stored fields, ids. Read through mmap and checksummed |
 | `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort, `from` and `search_after` paging, aggregations, cross-shard reduce |
 | `internal/reqcache` | The shared stores behind search's shard request cache: Redis, behind a breaker |
 | `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, verification by compiled programs that mirror the exact matcher |
@@ -182,6 +182,55 @@ data_dir/
     cached for the next. The old
     list's entry is dropped once the new one's is cached.
   - The OS page cache holds the mmap'd files.
+- **Point fields** ([`xy.go`](../internal/segment/xy.go)). A segment holding a point
+  field writes an XY section (format 4.1; one without is 4.0, byte for byte as
+  before, and a 4.0 reader ignores the section): per field a static k-d tree of its
+  (x, y, document) triples, as Lucene's BKD tree indexes `XYPoint`.
+  - Coordinates are kept as sortable 64-bit keys (a float's bits turned so unsigned
+    order is numeric order, -0 read as 0), so a box is integer comparisons.
+  - The triples are split into leaves of 512. Each node of the tree covers a run of
+    leaves and splits it in half along the axis whose spread, relative to the field's
+    whole spread on that axis, is the wider (a quickselect, not a sort), so the tree
+    splits dates and scores alike whatever their units. Every node records the box
+    its points span.
+  - A leaf stores its points' x and y as frame-of-reference bit-packed deltas from
+    its own minimum, and their documents bit-packed, sorted by the axis it spreads
+    wider on: about 14 bytes per point for a date and a two-decimal score in 1M
+    documents.
+  - A box query descends only into the nodes its box meets. A node it covers whole
+    contributes its leaves' documents without a coordinate read; a leaf it meets in
+    part is two binary searches on its sorted axis, then a check of the other axis
+    only when the box cuts that one too. Documents are gathered in a list, then, past
+    1/1024 of the segment, in a dense bitset. A document matches once one of its
+    points is inside, so a document with points (1, 10) and (10, 1) never matches
+    x >= 5, y >= 5.
+  - The planner estimates a box from the node boxes alone (no leaf read), spreading
+    the points it counts over the field's documents, and caches a box's bitmap in
+    the filter cache as it does a range's.
+  - Build and Merge put a field's points in one canonical order (document, x, y)
+    before the tree is built, so a merge writes the same bytes as a rebuild of its
+    live documents; a merge reads its inputs' trees, drops deleted documents' points
+    and renumbers the rest. Building holds 24 bytes per point in memory, and
+    partitions with a quickselect per node rather than sorting.
+  - Why a tree, not the points sorted by x with each one's y beside it: the workload's
+    boxes are one-sided on both axes (x >= T, y >= c). Sorted by x, such a box reads
+    every point from T on, however few pass the y bound; the tree prunes on both
+    axes. One segment of 1M documents holding 10M points (x a date over a year, y a
+    score in [0, 100); [`xy_bench_test.go`](../internal/segment/xy_bench_test.go),
+    Ryzen 7 3700X):
+
+    | Box | Documents | Tree | Sorted by x |
+    | --- | --- | --- | --- |
+    | x >= the year's last 50%, y >= 50 | 842,888 | 11.2 ms | 24.8 ms |
+    | x >= last 10%, y >= 90 | 94,270 | 0.44 ms | 1.59 ms |
+    | x >= last 1%, y >= 90 | 10,059 | 0.17 ms | 0.26 ms |
+    | x >= last 90%, y >= 99 | 85,504 | 0.62 ms | 10.5 ms |
+    | x >= last 90%, y <= 1 | 85,919 | 0.58 ms | 12.1 ms |
+    | x >= last 0.1%, any y | 10,014 | 0.33 ms | 0.10 ms |
+
+    The one box the sorted scan wins is a bound on x alone, which reads only its
+    matches there, where the tree also scans the leaves along the bound. An estimate
+    from the node boxes takes 0.5 µs.
 - **Format versions.** The segment format is versioned (major 3). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:
   `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
@@ -204,6 +253,7 @@ data_dir/
      in neither.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
+   - A box leaf is collected from its field's k-d tree, exactly: no residual check.
    - A range leaf is collected from the point index, or checked on doc values when far
      fewer documents are left in question than it matches.
    - A number sort over many hits walks the point index's blocks from the cursor and

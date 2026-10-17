@@ -70,7 +70,9 @@ func (p *peerAPI) handler() http.Handler {
 	handle("POST /_internal/fetch", p.fetch)
 	handle("DELETE /_internal/pins/{id}", p.unpin)
 	handle("POST /_internal/percolate", p.percolate)
-	handle("POST /_internal/percolate/1", p.percolate)
+	for level := 1; level <= percolateLevel; level++ {
+		handle("POST "+percolatePath(level), p.percolate)
+	}
 	handle("POST /_internal/get", p.get)
 	handle("POST /_internal/wait", p.wait)
 	handle("POST /_internal/counts", p.counts)

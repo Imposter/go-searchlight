@@ -243,7 +243,7 @@ var positiveOps = []string{
 	query.OpContains, query.OpContainsAny, query.OpContainsAll, query.OpEq, query.OpIn,
 	query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween,
 	query.OpHas, query.OpHasAny, query.OpHasAll, query.OpNonempty, query.OpExists,
-	query.OpStartsWith, query.OpWordsAll, query.OpWordsAny, query.OpSimilar,
+	query.OpStartsWith, query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpBox,
 }
 
 func newGen(seed uint64) *gen { return &gen{r: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))} }
@@ -255,7 +255,7 @@ var vocab = []string{
 	"refurbished", "open box", "", " ",
 }
 
-var fields = []string{"brand", "title", "tags", "price", "stock", "seen", "extra", "_id", "missing"}
+var fields = []string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra", "_id", "missing"}
 
 var numbers = []float64{-1, 0, 0.5, 1, 2, 10, 99.99, 100, 250, 1e6, -100}
 
@@ -370,11 +370,61 @@ func (g *gen) leaf() map[string]any {
 	case query.OpSimilar:
 		mins := []any{0.1, 0.3, 0.5, 1, 0, -1, 2, "x"}
 		v = map[string]any{"text": g.phrase(3), "min": mins[g.r.IntN(len(mins))]}
+	case query.OpBox:
+		v = g.box()
 	}
 	if v != nil {
 		l["value"] = v
 	}
 	return l
+}
+
+// box is a box value: each axis left out or given one or two of its ends, a number
+// (or, rarely, a word, which is no bound).
+func (g *gen) box() map[string]any {
+	box := map[string]any{}
+	for _, axis := range []string{"x", "y"} {
+		if g.r.IntN(4) == 0 {
+			continue
+		}
+		ends := map[string]any{}
+		bound := func() any {
+			if g.r.IntN(20) == 0 {
+				return g.word()
+			}
+			return g.number()
+		}
+		switch g.r.IntN(3) {
+		case 0:
+			ends[[]string{"gt", "gte"}[g.r.IntN(2)]] = bound()
+		case 1:
+			ends[[]string{"lt", "lte"}[g.r.IntN(2)]] = bound()
+		default:
+			ends[[]string{"gt", "gte"}[g.r.IntN(2)]] = bound()
+			ends[[]string{"lt", "lte"}[g.r.IntN(2)]] = bound()
+		}
+		box[axis] = ends
+	}
+	return box
+}
+
+// points is a point field's value: one pair, or a list of up to four, an entry now
+// and then no point at all.
+func (g *gen) points() any {
+	pair := func() any {
+		if g.r.IntN(15) == 0 {
+			return []any{g.word(), g.number()}
+		}
+		return []any{g.number(), g.number()}
+	}
+	if g.r.IntN(4) == 0 {
+		return pair()
+	}
+	list := make([]any, g.r.IntN(5))
+	for i := range list {
+		list[i] = pair()
+	}
+	return list
 }
 
 func (g *gen) node(depth int) any {
@@ -464,7 +514,7 @@ func (g *gen) docJSON(i int) (string, []byte) {
 		id = ids[g.r.IntN(len(ids))]
 	}
 	doc := map[string]any{}
-	for _, f := range []string{"brand", "title", "tags", "price", "stock", "seen", "extra"} {
+	for _, f := range []string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra"} {
 		if g.r.IntN(10) < 3 {
 			continue
 		}
@@ -496,6 +546,8 @@ func (g *gen) docJSON(i int) (string, []byte) {
 			} else {
 				v = g.number()
 			}
+		case f == "spot":
+			v = g.points()
 		default:
 			v = g.scalar()
 		}

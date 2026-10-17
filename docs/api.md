@@ -91,7 +91,8 @@ curl -sS -X PUT localhost:8780/indexes/products -H "Authorization: Bearer $TOKEN
   counts searchable on this node). An existing name is a 409 `index_exists`.
 - **Field types.** `keyword`, `text`, `keyword_list`, `number`, `bool` and `date` (Unix
   milliseconds; a document may give an RFC 3339 string or a bare `YYYY-MM-DD`, midnight
-  UTC). The spec's §3 has the operators and aggregations each type supports.
+  UTC), and `point` (see [Point fields](#point-fields)). The spec's §3 has the operators
+  and aggregations each type supports.
 - **`dynamic`.**
   - `true`, the default, types a new field from its first value.
   - `false` stores a new field but does not index it.
@@ -108,6 +109,34 @@ answers `{"acknowledged": true}`.
 
 Mappings are additive. `PATCH /indexes/{index}/mapping` with `{"fields": {...}}` adds
 fields. Retyping a field is a 400, as is passing `max_index_fields`.
+
+### Point fields
+
+A point field holds points of two coordinates, as Elasticsearch's `point` field and
+Lucene's `XYPoint` do, for [box queries](#box-queries). Its type is an object naming its
+axes, each `number` or `date`:
+
+```json
+{"mapping": {"fields": {
+  "seen": {"type": "point", "x": "date", "y": "number"},
+  "spot": {"type": "point", "x": "number", "y": "number"}}}}
+```
+
+- **Values.** A list of `[x, y]` pairs, or one pair: `{"seen": [["2026-10-16", 4.5],
+  [1760000000000, 9]], "spot": [3, 4]}`. A `number` axis takes what a `number` field
+  takes; a `date` axis what a `date` field takes (Unix milliseconds, an RFC 3339 string
+  or a bare `YYYY-MM-DD`). A pair that is not two finite coordinates of its axes' types
+  (`[1e400, 1]`, `["x", 1]`, `[1, 2, 3]`) is no point, as a non-finite number is no
+  number: the field is present still (`exists` matches it), with the pairs that are.
+  Repeated points count once, and at most 10,000 pairs of one value are read.
+- **Typing.** Dynamic mapping never types a point (a list of pairs is a
+  `keyword_list`): map the field first, at creation or with `PATCH .../mapping`. A
+  point's axes are part of its type, so `point(number, date)` cannot become
+  `point(date, number)` (400).
+- **Operators.** `box` and `exists`. No aggregation takes a point field (400 at the
+  aggregation's `field`), and no sort (400 at `sort.N`).
+- **The field catalogue** gives a point field's `type` as the mapping writes it, the
+  object.
 
 `PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once, or
 `replicas_per_shard`. The allocator then places or releases copies to meet the new
@@ -448,10 +477,38 @@ search by an exact `include`, even when they fall outside the top 10:
 `_count` takes `{"query": ...}` and answers `{"count", "relation", "timed_out"}`, counting
 exactly. It refuses any other member, `post_filter` included (400 at its name).
 
+### Box queries
+
+`box` matches a document with at least one point inside a box: its x within the `x`
+bounds and its y within the `y` bounds, both of the same point. Each axis takes at most
+one lower bound (`gt` or `gte`) and one upper bound (`lt` or `lte`); an axis left out is
+unbounded, and `{}` matches every document with a point.
+
+```json
+{"all": [
+  {"field": "seen", "op": "box", "value": {"x": {"gte": "now-7d/d"}, "y": {"gte": 4}}},
+  {"not": {"field": "spot", "op": "box", "value": {"x": {"gt": 0, "lt": 10}, "y": {"lte": 0}}}}
+]}
+```
+
+- **The same point.** A document with points `(1, 10)` and `(10, 1)` does not match
+  `{"x": {"gte": 5}, "y": {"gte": 5}}`: neither point is inside on both axes.
+- **Bounds.** A `number` axis takes numbers. A `date` axis takes Unix milliseconds or a
+  string, a date or [date math](#date-math), each bound rounding as the range op of its
+  key does (`gte` and `lt` down, `gt` and `lte` up).
+- **Composition.** `box` is a condition like any other: in `all`, `any` and `not`, in
+  `post_filter`, in `filter` and `filters` aggregations, and in saved queries, whose
+  date math each percolation resolves at its own `now`.
+- **Validation.** Each problem is a 400 at its `loc`, such as `query.value.x.gte`: an
+  unknown key, both `gt` and `gte`, a bound that is no finite number, date math on a
+  `number` axis, or an axis whose bounds leave nothing between them (`{"gt": 5, "lt":
+  5}`), which is checked when neither bound reads `now`, as `between` is checked.
+
 ### Date math
 
 On a `date` field, `lt`, `lte`, `gt`, `gte` and each bound of `between` take a number
-(Unix milliseconds) or a string: a date, or Elasticsearch's date math.
+(Unix milliseconds) or a string: a date, or Elasticsearch's date math. So does each
+bound of a [box](#box-queries) on a point field's `date` axis.
 
 ```json
 {"all": [
@@ -481,7 +538,8 @@ On a `date` field, `lt`, `lte`, `gt`, `gte` and each bound of `between` take a n
 - **Time zone.** UTC. There is no `time_zone` parameter.
 - **`now`** is read once per request, to the millisecond, by the node that takes it.
   Every shard, on this node or a peer, answers at that instant: the query's, the
-  `post_filter`'s and every `filter` and `filters` aggregation's date math alike.
+  `post_filter`'s and every `filter` and `filters` aggregation's date math alike, the
+  bounds of boxes included.
 - **Saved queries** keep the expression: `GET` returns it as written. Each percolation
   (`_percolate`, `_bulk?percolate=true`) resolves it at its own `now`, so a saved
   `gte now-7d` stops matching a document once the document is a week old.

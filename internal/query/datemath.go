@@ -331,6 +331,10 @@ func hasDateText(a *Arg) bool {
 // IsDateMath reports whether l is a condition with date math: an op that takes it,
 // with a string in its value. [Validate] lets one through only on a date field.
 func (l *Leaf) IsDateMath() bool {
+	if l.Op == OpBox {
+		a := l.arg()
+		return a.Kind == ArgBox && hasDateText(&Arg{Kind: ArgList, List: a.BoundScalars()})
+	}
 	if !IsDateMathOp(l.Op) {
 		return false
 	}
@@ -446,6 +450,20 @@ var unresolved = Scalar{Kind: ArgNumber}
 func (r *resolver) leaf(l *Leaf, loc string) *Leaf {
 	a := l.arg()
 	out := &Leaf{Field: l.Field, Op: l.Op}
+	if l.Op == OpBox {
+		box := *a.Box
+		for i, iv := range box.Axes() {
+			at := join(loc, []string{BoxX, BoxY}[i])
+			for j, b := range []*Bound{&iv.Lo, &iv.Hi} {
+				if b.Set {
+					b.Value = r.bound(&b.Value, b.RoundsUp(j == 1), join(at, boundKey(b, j == 1)))
+				}
+			}
+		}
+		out.Arg = Arg{Kind: ArgBox, Box: &box}
+		out.Value = BoxJSON(&box)
+		return out
+	}
 	if l.Op != OpBetween {
 		s := r.bound(&a.Scalar, RoundsUp(l.Op), loc)
 		out.Arg = Arg{Kind: s.Kind, Scalar: s}
@@ -469,8 +487,8 @@ func (r *resolver) leaf(l *Leaf, loc string) *Leaf {
 func hasFixedBound(l *Leaf) bool {
 	a := l.arg()
 	bounds := []Scalar{a.Scalar}
-	if a.Kind == ArgList {
-		bounds = a.List
+	if a.Kind == ArgList || a.Kind == ArgBox {
+		bounds = a.BoundScalars()
 	}
 	for i := range bounds {
 		if bounds[i].Kind == ArgString {
@@ -501,6 +519,37 @@ func (r *resolver) bound(s *Scalar, roundUp bool, loc string) Scalar {
 		return unresolved
 	}
 	return Scalar{Kind: ArgNumber, Number: ms, Finite: true}
+}
+
+// BoxJSON is a box's value as JSON: {"x": {"gte": lo, "lt": hi}, "y": {...}}, an axis
+// with no bound left out, each bound a number or a string kept as written.
+func BoxJSON(b *Box) []byte {
+	out := []byte{'{'}
+	for i, iv := range b.Axes() {
+		if !iv.Lo.Set && !iv.Hi.Set {
+			continue
+		}
+		if len(out) > 1 {
+			out = append(out, ',')
+		}
+		out = append(out, '"')
+		out = append(out, []string{BoxX, BoxY}[i]...)
+		out = append(out, `":{`...)
+		for j, end := range []*Bound{&iv.Lo, &iv.Hi} {
+			if !end.Set {
+				continue
+			}
+			if j == 1 && iv.Lo.Set {
+				out = append(out, ',')
+			}
+			out = append(out, '"')
+			out = append(out, boundKey(end, j == 1)...)
+			out = append(out, `":`...)
+			out = append(out, boundJSON(&end.Value)...)
+		}
+		out = append(out, '}')
+	}
+	return append(out, '}')
 }
 
 // boundJSON is a bound as JSON: a number, or a string kept as written.

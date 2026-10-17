@@ -829,8 +829,17 @@ components:
         loc: { type: string, examples: ["query.all.2.any.0.value"] }
         message: { type: string }
     FieldType:
-      type: string
-      enum: [keyword, text, keyword_list, number, bool, date]
+      description: 'A field type: its name, or a point field (a list of [x, y] pairs, for box queries) as {"type": "point", "x": "number"|"date", "y": "number"|"date"}.'
+      oneOf:
+        - type: string
+          enum: [keyword, text, keyword_list, number, bool, date]
+        - type: object
+          additionalProperties: false
+          required: [type, x, y]
+          properties:
+            type: { type: string, const: point }
+            x: { type: string, enum: [number, date] }
+            y: { type: string, enum: [number, date] }
     Mapping:
       type: object
       additionalProperties: false
@@ -947,10 +956,10 @@ components:
             op:
               type: string
               enum: [eq, ne, in, lt, lte, gt, gte, between, exists, contains, contains_any, contains_all, starts_with,
-                words_all, words_any, similar, has, has_any, has_all, empty, nonempty]
+                words_all, words_any, similar, has, has_any, has_all, empty, nonempty, box]
             value:
-              description: 'The operand, by op (spec section 4). On a date field, lt, lte, gt, gte and each between bound take Unix milliseconds or a string: a date (RFC 3339 or YYYY-MM-DD), or date math, now or a date and ||, then +N/-N and / rounding in y M w d h H m s, in UTC (gte, lt and between''s lo round down; gt, lte and between''s hi round up). now is the request''s instant; a saved query keeps the expression and resolves it at each percolation.'
-              examples: ["Acme", 10, [5, 100], "now-7d/d", ["2026-10-01||+1M", "now"]]
+              description: 'The operand, by op (spec section 4). On a date field, lt, lte, gt, gte and each between bound take Unix milliseconds or a string: a date (RFC 3339 or YYYY-MM-DD), or date math, now or a date and ||, then +N/-N and / rounding in y M w d h H m s, in UTC (gte, lt and between''s lo round down; gt, lte and between''s hi round up). now is the request''s instant; a saved query keeps the expression and resolves it at each percolation. On a point field, box takes {"x": {...}, "y": {...}}, each axis optional with at most one of gt and gte and one of lt and lte, and matches a document with one point inside on both axes; a date axis takes dates and date math as a date field''s ranges do.'
+              examples: ["Acme", 10, [5, 100], "now-7d/d", ["2026-10-01||+1M", "now"], {"x": {"gte": "now-7d/d"}, "y": {"gte": 5}}]
     SearchRequest:
       type: object
       additionalProperties: false

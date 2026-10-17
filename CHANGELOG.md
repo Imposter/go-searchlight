@@ -27,7 +27,7 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     node and shard copy and kept across restarts. Its entries are keyed by the shard's
     newest change the copy holds, so writes to other shards and indexes leave them be,
     and by this binary's version. A Redis that is down or slow fails no search: each
-    call is bounded (50 ms by default, and by the search's `timeout`), a breaker
+    call is bounded (50 ms by default, and a tenth of the search's time left), a breaker
     skips it after 5 failures in a row, and failures are logged and counted. What is
     read back is bounded and checked; Redis is trusted as the database is.
   - Metrics: `searchlight_search_request_cache_lookups_total` (by store and result),

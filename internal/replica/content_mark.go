@@ -11,10 +11,11 @@ import "encoding/json"
 // no own mark, a state up to another seq, no change of the shard yet, or a newer
 // change of the shard than the checked one, not yet checked (a copy that applied a
 // page read across a changelog rewind holds a mix no other copy does, until the next
-// poll finds it out).
+// poll finds it out), or a change written before nonces (a reissue to the same
+// document and kind in the same millisecond would have the same mark).
 func OwnContentMark(own json.RawMessage, seq int64) json.RawMessage {
 	checked, pending := decodeOwn(own)
-	if seq <= 0 || checked.upTo <= 0 || checked.last.Seq <= 0 || checked.upTo > seq {
+	if seq <= 0 || checked.upTo <= 0 || checked.last.Seq <= 0 || checked.last.Nonce == 0 || checked.upTo > seq {
 		return nil
 	}
 	switch {

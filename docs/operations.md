@@ -402,13 +402,24 @@ the same shard contents from them, as Elasticsearch's shard request cache does
   nonce, so a database failover that reissued seqs never reads another history's
   results), this binary's version, and a hash of the request. Every copy that holds the
   shard's changes up to that change holds the same documents, whatever its segments
-  and however far writes to other shards and indexes have moved its seq, so a shard
-  nobody writes keeps its keys. A copy uses its memory cache alone until a changelog
-  poll has checked what it holds (after a write to its shard, or a rebuild, until its
-  next poll). Values are the shard result as peers send it, compressed with zstd.
+  and however far writes to other shards and indexes have moved its seq. Values are
+  the shard result as peers send it, compressed with zstd.
+- **What Redis shares, and what it does not.** A copy names its contents for Redis
+  only once a changelog poll (every `changelog_poll_interval`, 500 ms, or sooner when
+  woken) has checked the shard's newest change; until then it uses its memory cache
+  alone. A shard written to often therefore shares little: with `w` writes a second to
+  it and a poll every `P` seconds, a key exists about `e^(−w·P)` of the time. The win
+  is the quiet shards, which keep their keys whatever other shards and indexes write,
+  across nodes, copies and restarts. Two more cases have no key: a copy rebuilt from
+  the database after pruning removed its shard's newest change from the changelog (a
+  shard quiet for longer than the copies' prune floor), until the shard's next write;
+  and a shard whose newest change predates change nonces (written by a release before
+  them), until its next write.
 - **A Redis that fails costs nothing but its hits.** Each call, its dial included, is
-  bounded by `request_cache_redis_timeout` (50 ms) and the search's own `timeout`,
-  with no retries. A failed read or write is logged (once per 10 s per operation),
+  bounded by `request_cache_redis_timeout` (50 ms) and by a tenth of what is left of
+  the search's own time (`timeout`, or `request_timeout`), with no retries; a search
+  with under 20 ms left does not ask Redis. A read that runs out of its time while
+  the search has time left is Redis's failure. A failed read or write is logged (once per 10 s per operation),
   counted in `searchlight_search_request_cache_errors_total`, and the shard computes.
   After 5 failures in a row Redis is skipped for 1 s, then one call probes it; each
   failed probe doubles the wait, up to 30 s

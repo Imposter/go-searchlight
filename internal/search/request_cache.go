@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"sync"
@@ -65,7 +66,8 @@ import (
 // Concurrent identical searches of one copy compute once: the others wait for the
 // first's result, within their own timeout, and compute themselves when it cannot be
 // cached (it timed out or failed) or their time runs out first. The time a search
-// spends waiting or reading the store counts against its timeout.
+// spends waiting or reading the store counts against its timeout, and a store read
+// takes at most a tenth of what is left of it.
 //
 // Never cached: a search with hits (size above 0, or a from or search_after), a
 // request_cache: false one, one whose date math reads now unrounded (it resolves
@@ -85,6 +87,13 @@ const requestCacheWrites = 16
 // decodedPerStored bounds a stored value's decoded size, as a multiple of the store's
 // largest entry: a result whose wire form is larger is not stored.
 const decodedPerStored = 8
+
+// storeLookupShare and storeLookupFloor bound a store read by the search's time: at
+// most a tenth of what is left of it, and none when that is under 2 ms.
+const (
+	storeLookupShare = 10
+	storeLookupFloor = 2 * time.Millisecond
+)
 
 // unsizedDecodeLimit bounds the decoded size of a stored value whose frame does not
 // say it (the encoder leaves it out of the smallest ones).
@@ -288,6 +297,9 @@ func (c *RequestCache) Search(ctx context.Context, g *shard.Generation, r *Reque
 	key := memoryKey(id, rk)
 	shared := c.sharedKey(id, rk)
 	c.mu.Lock()
+	if c.closed {
+		shared = ""
+	}
 	if el, ok := c.items[key]; ok {
 		c.lru.MoveToFront(el)
 		e := el.Value.(*rcEntry) //nolint:forcetypeassert,errcheck // only entries
@@ -463,20 +475,35 @@ func (c *RequestCache) sharedKey(id shard.CacheIdentity, rk []byte) string {
 
 // storeGet reads key from the shared store for r: nil on a miss and on any failure,
 // which is counted and logged.
+//
+// The read gets at most storeLookupShare of what is left of the search's time
+// (ctx's deadline), and is skipped when that is below storeLookupFloor: a hung store
+// never takes a search's whole budget. A read that runs out of that share while the
+// search still has time is the store's failure (counted, and seen by its breaker);
+// one the search gave up on is nobody's.
 func (c *RequestCache) storeGet(ctx context.Context, key string, r *Request) *ShardResult {
 	if ctx.Err() != nil {
 		return nil
 	}
-	raw, err := c.store.Get(ctx, key)
+	lookup := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		share := time.Until(dl) / storeLookupShare
+		if share < storeLookupFloor {
+			c.skipStore(ctx)
+			return nil
+		}
+		var cancel context.CancelFunc
+		lookup, cancel = context.WithTimeout(ctx, share)
+		defer cancel()
+	}
+	raw, err := c.store.Get(lookup, key)
 	switch {
 	case errors.Is(err, reqcache.ErrOpen):
-		c.storeSkips.Add(1)
-		if c.in != nil {
-			c.in.lookupResult(ctx, c.store.Name(), "skipped")
-		}
+		c.skipStore(ctx)
 		return nil
 	case err != nil && ctx.Err() != nil:
-		// The search's own time ran out: nothing to say of the store.
+		// The search's own time ran out, or it was cancelled: nothing to say of the
+		// store.
 		return nil
 	case err != nil:
 		c.storeFailed(ctx, "get", r.Index, err)
@@ -498,6 +525,13 @@ func (c *RequestCache) storeGet(ctx context.Context, key string, r *Request) *Sh
 		c.in.lookup(ctx, c.store.Name(), true)
 	}
 	return res
+}
+
+func (c *RequestCache) skipStore(ctx context.Context) {
+	c.storeSkips.Add(1)
+	if c.in != nil {
+		c.in.lookupResult(ctx, c.store.Name(), "skipped")
+	}
 }
 
 // storeSet writes res under key in the background, unless the cache is closing or
@@ -771,7 +805,7 @@ var errBadCachedResult = errors.New("search: a cached result that is not a shard
 func decodeCachedResult(raw []byte, maxEntry int64, r *Request) (res *ShardResult, err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			res, err = nil, fmt.Errorf("%w: %v", errBadCachedResult, p)
+			res, err = nil, fmt.Errorf("%w: decoding it panicked: %v\n%s", errBadCachedResult, p, debug.Stack())
 		}
 	}()
 	if int64(len(raw)) > maxEntry {
@@ -831,7 +865,8 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 				prec = DefaultPrecision
 			}
 			if a.Type != AggCardinality || int(s.P) != prec || (s.Registers != nil && len(s.Registers) != 1<<s.P) ||
-				len(s.Hashes) > s.exactLimit() || !slices.IsSorted(s.Hashes) {
+				len(s.Hashes) > s.exactLimit() || !slices.IsSorted(s.Hashes) ||
+				slices.ContainsFunc(s.Registers, func(v uint8) bool { return int(v) > 65-prec }) {
 				return fmt.Errorf("%w: aggregation %q's sketch", errBadCachedResult, name)
 			}
 		}

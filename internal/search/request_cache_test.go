@@ -3,6 +3,7 @@ package search
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -709,6 +710,7 @@ func TestCachedResultDecodeRefusesForgeries(t *testing.T) {
 		"precision":       encodeJSONValue(t, strings.Replace(ok, `"p":14`, `"p":12`, 1)),
 		"registers":       encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"AAAA"`, 1)),
 		"unsorted hashes": encodeJSONValue(t, strings.Replace(ok, `[1,2,3]`, `[3,2,1]`, 1)),
+		"register range":  encodeJSONValue(t, strings.Replace(ok, `"hashes":[1,2,3]`, `"registers":"`+base64.StdEncoding.EncodeToString(append(make([]byte, 1<<14-1), 60))+`"`, 1)),
 		"nil bucket":      encodeJSONValue(t, strings.Replace(ok, `"buckets":[{`, `"buckets":[null,{`, 1)),
 		"object key":      encodeJSONValue(t, strings.Replace(ok, `"key":"x"`, `"key":{"a":1}`, 1)),
 		"negative count":  encodeJSONValue(t, strings.Replace(ok, `"doc_count":3`, `"doc_count":-3`, 1)),
@@ -747,7 +749,8 @@ func TestRequestCacheForgedStoreValueIsAMiss(t *testing.T) {
 	}
 }
 
-// gatedStore is a memStore whose Gets wait for their context, or release.
+// gatedStore is a memStore whose calls wait for their context (a write at most
+// 20 ms, as a store's own timeout bounds it), or release.
 type gatedStore struct {
 	*memStore
 	release chan struct{}
@@ -759,6 +762,15 @@ func (s *gatedStore) Get(ctx context.Context, key string) ([]byte, error) {
 		return s.memStore.Get(ctx, key)
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (s *gatedStore) Set(ctx context.Context, key string, v []byte) error {
+	select {
+	case <-s.release:
+		return s.memStore.Set(ctx, key, v)
+	case <-time.After(20 * time.Millisecond):
+		return context.DeadlineExceeded
 	}
 }
 
@@ -797,22 +809,45 @@ func TestRequestCacheTimeoutsCoverWaitsAndTheStore(t *testing.T) {
 	if got := <-leader; got.TimedOut || got.Total != 30 {
 		t.Fatalf("the leader answered %+v", got)
 	}
+}
 
-	// A leader whose store read outlasts its timeout times out too.
-	st2 := &gatedStore{memStore: newMemStore(), release: make(chan struct{})}
-	c2 := NewRequestCache(RequestCacheOptions{Store: st2, ContentMark: testContent, Logger: quiet})
-	start = time.Now()
-	res = s.search(c2, parseReq(t, `{"size":0,"timeout":"30ms"}`))
-	if d := time.Since(start); (!res.TimedOut && res.Total != 30) || d > 2*time.Second {
-		t.Fatalf("the leader answered %+v after %v", res, d)
+// TestRequestCacheHungStoreTakesAShareOfTheTimeout: a store that never answers
+// takes a tenth of a search's time, not all of it: the search computes its result in
+// time, the store's failure is counted, and its breaker opens. A search with too
+// little time left does not ask the store at all.
+func TestRequestCacheHungStoreTakesAShareOfTheTimeout(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(30)
+	hung := &gatedStore{memStore: newMemStore(), release: make(chan struct{})}
+	br := reqcache.NewBreaker(hung, 3, time.Hour, time.Hour)
+	c := NewRequestCache(RequestCacheOptions{Store: br, ContentMark: testContent, Logger: quiet})
+	for i := range 3 {
+		// A distinct query each time: no result in flight or stored to reuse.
+		res := s.search(c, parseReq(t, fmt.Sprintf(`{"size":0,"timeout":"200ms","query":{"field":"price","op":"gte","value":%d}}`, -i)))
+		if res.TimedOut || res.Total != 30 {
+			t.Fatalf("search %d answered %+v with the store hung", i, res)
+		}
 	}
-	if got := c2.Stats(); got.StoreErrors != 0 {
-		t.Fatalf("stats %v: a read the search gave up on counted as a store failure", got)
+	c.writes.Wait()
+	if got := c.Stats(); got.StoreErrors < 3 || !br.Open() {
+		t.Fatalf("stats %v, breaker open %v: want the store's failures counted, and the breaker open", got, br.Open())
+	}
+	skips := c.Stats().StoreSkips
+	res := s.search(c, parseReq(t, `{"size":0,"timeout":"200ms","query":{"field":"price","op":"gte","value":-9}}`))
+	if got := c.Stats(); res.TimedOut || got.StoreSkips != skips+1 {
+		t.Fatalf("stats %v: want the open breaker to skip the store", got)
+	}
+
+	idle := newMemStore()
+	c2 := NewRequestCache(RequestCacheOptions{Store: idle, ContentMark: testContent, Logger: quiet})
+	s.search(c2, parseReq(t, `{"size":0,"timeout":"10ms"}`))
+	if got := c2.Stats(); idle.gets.Load() != 0 || got.StoreSkips != 1 {
+		t.Fatalf("stats %v, %d reads: a search with 10 ms asked the store", got, idle.gets.Load())
 	}
 }
 
-// TestRequestCacheCloseDropsLateWrites: a store write that would start after Close is
-// dropped, and counted.
+// TestRequestCacheCloseDropsLateWrites: a closed cache neither reads nor writes its
+// store, and still answers.
 func TestRequestCacheCloseDropsLateWrites(t *testing.T) {
 	s := newRCShard(t)
 	s.fill(5)
@@ -824,8 +859,8 @@ func TestRequestCacheCloseDropsLateWrites(t *testing.T) {
 	if got := s.search(c, parseReq(t, `{"size":0}`)); got.Total != 5 {
 		t.Fatalf("total %d", got.Total)
 	}
-	if got := c.Stats(); got.DroppedWrites != 1 || st.writes.Load() != 0 {
-		t.Fatalf("stats %v, %d writes: want the write dropped", got, st.writes.Load())
+	if got := c.Stats(); got.DroppedWrites != 0 || st.writes.Load() != 0 || st.gets.Load() != 0 {
+		t.Fatalf("stats %v, %d reads, %d writes: a closed cache used its store", got, st.gets.Load(), st.writes.Load())
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)

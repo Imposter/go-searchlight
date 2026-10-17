@@ -18,8 +18,8 @@ const (
 )
 
 // Breaker is a [Store] in front of another that stops asking it once it fails: after
-// Failures failures in a row (errors and timeouts; ErrTooLarge and calls whose own
-// context ended are not the store's) every call is skipped with ErrOpen for a backoff,
+// Failures failures in a row (errors and timeouts, the call's own deadline
+// included; ErrTooLarge and calls their caller cancelled are not the store's) every call is skipped with ErrOpen for a backoff,
 // Backoff at first and doubling, up to Max, at each probe that fails again. Once the
 // backoff has passed, one call is let through as a probe: its success closes the
 // breaker, its failure opens it again.
@@ -102,8 +102,9 @@ func (b *Breaker) done(ctx context.Context, probe bool, err error) {
 		b.probing = false
 	}
 	switch {
-	case failed && ctx.Err() != nil:
-		// The caller gave up: it tells nothing of the store.
+	case failed && (errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled)):
+		// The caller gave up: it tells nothing of the store. A deadline that passed
+		// is the store's: it did not answer in the time it was given.
 	case !failed && (probe || b.openUntil.IsZero()):
 		b.failed, b.openUntil, b.backoff = 0, time.Time{}, b.base
 	case !failed:

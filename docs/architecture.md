@@ -48,6 +48,7 @@ flowchart LR
 | `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
 | `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
 | `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort, `from` and `search_after` paging, aggregations, cross-shard reduce |
+| `internal/reqcache` | The shared stores behind search's shard request cache: Redis, behind a breaker |
 | `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, verification by compiled programs that mirror the exact matcher |
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |

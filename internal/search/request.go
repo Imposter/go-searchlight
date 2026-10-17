@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
@@ -51,7 +52,7 @@ const (
 	// 10,000 by default as Elasticsearch's index.max_result_window, is at most this):
 	// each shard keeps that many hits of a search in memory, and the coordinator
 	// merges them all.
-	MaxResultWindow = 1_000_000
+	MaxResultWindow = config.MaxResultWindowLimit
 	// DefaultSize is the size ParseRequest gives a request that names none, as
 	// Elasticsearch's.
 	DefaultSize = 10

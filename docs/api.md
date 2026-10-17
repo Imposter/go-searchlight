@@ -56,7 +56,7 @@ segments.
 | One document, or one saved query's body | `max_doc_bytes` (4 MiB) | 413 |
 | Operations in one `_bulk` | `max_bulk_ops` (10,000) | 413 |
 | Reads in progress | `search_queue` (1,000) | 429 with `Retry-After` |
-| Heap of in-flight requests | `max_inflight_write_bytes`, `max_inflight_read_bytes` | 429 with `Retry-After` |
+| Heap of in-flight requests (a search with `from` also reserves about 1 KiB per hit of `from + size`) | `max_inflight_write_bytes`, `max_inflight_read_bytes` | 429 with `Retry-After` |
 | A shard copy's write buffer full | (backpressure) | 429 with `Retry-After` |
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
 | Query size | 4 levels of `all`/`any`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |

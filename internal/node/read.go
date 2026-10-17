@@ -189,9 +189,10 @@ func (n *Single) reacquirer(ctx context.Context, idx *index, waitSeq int64) func
 }
 
 // searchTargets searches ts, one per shard: in one pass with bodies when there is one
-// shard and no from; otherwise the query phase per shard (NoBodies), the reduce, then
-// the fetch of the page's bodies alone from the copies that found them (a hit's shard
-// is the one its id routes to): a from skips its hits' bodies, never read.
+// shard and no from (or a size of 0); otherwise the query phase per shard (NoBodies),
+// the reduce, then the fetch of the page's bodies alone from the copies that found
+// them (a hit's shard is the one its id routes to): a from skips its hits' bodies,
+// never read.
 //
 // A shard whose fetch finds its generation gone (the copy stopped, or the pin expired)
 // has its query phase run again on a target reacquire gives, which replaces it in ts,
@@ -200,7 +201,7 @@ func (n *Single) reacquirer(ctx context.Context, idx *index, waitSeq int64) func
 // bodies come from. Only the shards re-queried are fetched again. That happens at most
 // requeryRounds times, within ctx; past them the search is unavailable (503).
 func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Request, reacquire func(s int) (ShardTarget, error)) (*search.Response, error) {
-	if len(ts) == 1 && r.From == 0 {
+	if len(ts) == 1 && (r.From == 0 || r.Size == 0) {
 		sr, err := ts[0].Search(ctx, r)
 		if err != nil {
 			return nil, err

@@ -12,7 +12,6 @@ import (
 	"github.com/getkin/kin-openapi/openapi3filter"
 
 	"github.com/Imposter/go-searchlight/internal/config"
-	"github.com/Imposter/go-searchlight/internal/search"
 )
 
 // TestFromPaging: from pages a sorted search over shards as Elasticsearch's does, each
@@ -20,9 +19,6 @@ import (
 // the total and the aggregations are the whole search's; and a from past the
 // max_result_window, below 0 or with search_after is a 400 at from.
 func TestFromPaging(t *testing.T) {
-	if config.MaxResultWindowLimit != search.MaxResultWindow {
-		t.Fatalf("max_result_window is at most %d, and a shard takes at most %d", config.MaxResultWindowLimit, search.MaxResultWindow)
-	}
 	e := newEnv(t, envOpts{cfg: func(c *config.Config) { c.MaxResultWindow = 60 }})
 	e.createIndex("fp", `{"mapping": {"dynamic": "strict", "fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 3}}`)
 	lines := make([]string, 0, 140)
@@ -82,7 +78,7 @@ func TestFromPaging(t *testing.T) {
 }
 
 // TestSearchRequestSchemaTakesFrom: api/openapi.yaml's SearchRequest takes a from of 0
-// or more, alone or (as 0) with search_after, and refuses a negative one.
+// to 1,000,000, alone or (as 0) with search_after, and refuses one outside them.
 func TestSearchRequestSchemaTakesFrom(t *testing.T) {
 	router, err := specRouter()
 	if err != nil {
@@ -108,7 +104,9 @@ func TestSearchRequestSchemaTakesFrom(t *testing.T) {
 			t.Errorf("%s: %v", body, err)
 		}
 	}
-	if err := check(`{"from": -1}`); err == nil {
-		t.Errorf("a negative from passes the schema")
+	for _, body := range []string{`{"from": -1}`, `{"from": 1000001}`} {
+		if err := check(body); err == nil {
+			t.Errorf("%s passes the schema", body)
+		}
 	}
 }

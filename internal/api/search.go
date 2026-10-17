@@ -63,6 +63,13 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 		}
 		return InvalidAt(loc, "the result window is too large: from + size is %d, and max_result_window is %d; page deeper with search_after, passing the previous page's next", window, s.cfg.MaxResultWindow)
 	}
+	if req.From > 0 && req.Size > 0 {
+		cost := windowCost(s.readBytes, req.From+req.Size)
+		if !s.readBytes.reserve(cost) {
+			return overBudget(s.readBytes)
+		}
+		defer s.readBytes.release(cost)
+	}
 	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
 	if err != nil {
 		return err
@@ -119,4 +126,16 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 		out["stale"] = true
 	}
 	return writeJSON(w, http.StatusOK, out)
+}
+
+// windowHitBytes is the heap one hit of a from search's window is charged against
+// max_inflight_read_bytes: its entry in a shard's heap, its id, sort values and ref as
+// a peer's JSON reply carries them, and its place in the coordinator's merge.
+const windowHitBytes = 1 << 10
+
+// windowCost is what a search reaching window hits deep reserves from b: window hits
+// at windowHitBytes, at most half of b, so one such search fits an idle budget while
+// more of them at once are refused (429).
+func windowCost(b *budget, window int) int64 {
+	return min(int64(window)*windowHitBytes, b.limit/2)
 }

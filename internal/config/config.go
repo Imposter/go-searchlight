@@ -198,7 +198,7 @@ type Config struct {
 const MaxBodyLimit = 32<<20 - 1<<10
 
 // MaxResultWindowLimit is the largest max_result_window: the most hits of one search
-// a shard keeps (search.MaxResultWindow).
+// a shard keeps (search.MaxResultWindow is it).
 const MaxResultWindowLimit = 1_000_000
 
 // Default returns the production defaults. StoreURL is empty because it has

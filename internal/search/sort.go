@@ -354,7 +354,7 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 		hits.GetCardinality()*16 >= uint64(s.n) {
 		return s.topByIDWalk(hits, k)
 	}
-	h := &topHeap{ss: ss, entries: make([]entry, 0, k)}
+	h := &topHeap{ss: ss, entries: make([]entry, 0, capFor(k, hits))}
 	if first.kind == sortNumber && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
 		s.collectByPoints(ss, h, hits, k)
 	} else {
@@ -370,6 +370,12 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 	return s.toSegHits(ss, out)
 }
 
+// capFor is the room k best hits among hits need: no more than there are hits, so a
+// deep from does not reserve its whole window in a segment that matched a few.
+func capFor(k int, hits *roaring.Bitmap) int {
+	return int(min(uint64(k), hits.GetCardinality())) //nolint:gosec // at most k
+}
+
 // sortWalkFactor: a number sort walks the point index when hits² exceeds
 // sortWalkFactor·k·n: when the k/density documents the walk expects to visit (each a
 // membership test) cost less than reading every hit's value. A variable so tests can
@@ -380,7 +386,7 @@ var sortWalkFactor uint64 = 2
 // index than by reading every hit's value.
 func (s *segExec) walkPoints(hits *roaring.Bitmap, k int) bool {
 	c := hits.GetCardinality()
-	return c*c > sortWalkFactor*uint64(k)*uint64(s.n) //nolint:gosec // k is at most MaxSize
+	return c*c > sortWalkFactor*uint64(k)*uint64(s.n) //nolint:gosec // k is From+Size, at most MaxResultWindow: k·n stays far below 2^64
 }
 
 // collectByPoints feeds the heap from the point index's blocks in sort order, from the
@@ -485,7 +491,7 @@ func (s *segExec) topByIDWalk(hits *roaring.Bitmap, k int) []segHit {
 	if s.p.after != nil {
 		from = s.p.after[0].(string) //nolint:forcetypeassert,errcheck // prepareAfter typed it
 	}
-	out := make([]segHit, 0, k)
+	out := make([]segHit, 0, capFor(k, hits))
 	i := 0
 	s.r.IDsFrom(from, func(id []byte, ord uint32) bool {
 		i++

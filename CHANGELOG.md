@@ -90,6 +90,9 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   answer with the first page. Searches without `from` are unaffected. The new
   `max_result_window` setting applies on the node that takes the search; set it
   alike on every node.
+- `max_result_window` bounds `from + size`, so with `from` 0 it bounds `size` too, as
+  Elasticsearch's does: lowering it below 10,000 refuses (400 at `size`) searches
+  with a `size` above it that were answered before.
 
 ## [1.0.0] - 2026-10-14
 

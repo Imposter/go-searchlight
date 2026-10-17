@@ -592,6 +592,9 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	}
 	var coord *tnode
 	for _, tn := range c.live() {
+		if err := tn.n.SyncCatalog(tctx(t)); err != nil {
+			t.Fatal(err)
+		}
 		for s := range 4 {
 			if _, ok := tn.n.Hosted(store.ShardID{Index: "lv", Shard: s}); !ok {
 				coord = tn

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -227,5 +228,34 @@ func TestFromWithPostFilterAndAggs(t *testing.T) {
 	}
 	if bs := base.Aggs["brands"].Buckets; len(bs) != 3 {
 		t.Fatalf("brands %v: want all three, the post_filter aside", bucketKeys(bs))
+	}
+}
+
+// TestDeepFromReservesOnlyItsHits: a from at the end of the largest window, over a
+// shard that matched three documents, allocates for those three, not for the window.
+func TestDeepFromReservesOnlyItsHits(t *testing.T) {
+	c := newCluster(t, 1)
+	for i := range 3 {
+		c.upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"price":%d}`, i))
+	}
+	c.refreshAll()
+	g := c.shards[0].Acquire()
+	defer g.Release()
+	for _, sorts := range [][]SortField{nil, {{Field: "price"}}, {{Field: "brand", Desc: true}}} {
+		r := &Request{Query: &query.All{}, Sort: sorts, Size: 10, From: MaxResultWindow - 10, NoBodies: true}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		res, err := ExecuteShard(context.Background(), g, r)
+		runtime.ReadMemStats(&after)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Hits) != 3 {
+			t.Fatalf("sort %+v: %d hits, want the shard's 3", sorts, len(res.Hits))
+		}
+		if got := after.TotalAlloc - before.TotalAlloc; got > 4<<20 {
+			t.Errorf("sort %+v: a window of %d over 3 hits allocated %d bytes", sorts, MaxResultWindow, got)
+		}
 	}
 }

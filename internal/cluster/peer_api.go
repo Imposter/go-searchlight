@@ -262,7 +262,9 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 			if level < levelTermsFilter {
 				dropTermsFilters(req.Aggs)
 			}
-			req.From = 0
+			if level < levelFrom {
+				req.From = 0
+			}
 		}
 	}
 	t, err := p.target(r, msg.shardRef)

@@ -969,6 +969,7 @@ components:
         from:
           type: integer
           minimum: 0
+          maximum: 1000000
           default: 0
           description: Hits to skip in sort order, as Elasticsearch's from. from + size is at most the node's max_result_window (10000 by default), else a 400 at from (at size when from is 0); page deeper with search_after. 0 with search_after. The total and the aggregations are the whole search's.
         search_after:

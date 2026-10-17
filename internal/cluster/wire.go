@@ -61,13 +61,30 @@ const codeStale = "stale_copy"
 
 // searchLevel is the search wire level this binary speaks. 1.0.0 spoke 0, and its
 // decoder drops what it does not know: level 1 adds post_filter and the filter, filters
-// and global aggregations, which a level-0 peer would ignore or refuse. A request says
+// and global aggregations, which a level-0 peer would ignore or refuse, and level 2 a
+// terms aggregation's include and exclude (levelTermsFilter), which a lower peer
+// would ignore, counting every value. A request says
 // the level it needs (wireRequest.Needs), and goes to that level's endpoint
 // (searchPath), and a reply the level it was answered at (searchReply.Level): a peer
 // refuses a request past its level, and the coordinator a reply below the request's,
 // so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = 1
+const searchLevel = levelTermsFilter
+
+// The search wire levels of the additions a peer must not ignore.
+const (
+	levelFilterAggs  = 1
+	levelTermsFilter = 2
+)
+
+// levelNeeds names what a search of wire level needs carries, for the errors of a
+// peer below it.
+func levelNeeds(needs int) string {
+	if needs >= levelTermsFilter {
+		return "a terms aggregation's include or exclude"
+	}
+	return "post_filter, or a filter, filters or global aggregation"
+}
 
 // noPeerEndpoint is the detail of a peer's 404 for a path it does not serve, as every
 // release since 1.0.0 words it.
@@ -98,7 +115,8 @@ type wireRequest struct {
 	Index       string             `json:"index"`
 	NoBodies    bool               `json:"no_bodies,omitempty"`
 	// Needs is the search wire level a peer must speak to answer the request exactly
-	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation.
+	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
+	// for a terms aggregation's include or exclude.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -128,8 +146,11 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	if w.Aggs, err = encodeAggs(r.Aggs); err != nil {
 		return nil, err
 	}
-	if r.PostFilter != nil || filterAggs(r.Aggs) {
-		w.Needs = 1
+	switch {
+	case termsFilters(r.Aggs):
+		w.Needs = levelTermsFilter
+	case r.PostFilter != nil || filterAggs(r.Aggs):
+		w.Needs = levelFilterAggs
 	}
 	return w, nil
 }
@@ -397,4 +418,27 @@ func filterAggs(aggs map[string]search.Agg) bool {
 		}
 	}
 	return false
+}
+
+// termsFilters reports whether aggs hold a terms aggregation with an include or an
+// exclude, at any level.
+func termsFilters(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Include != nil || a.Exclude != nil || termsFilters(a.Aggs) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropTermsFilters removes every include and exclude from aggs, in place: what a peer
+// of a level below levelTermsFilter reads of them (testHooks.olderPeer).
+func dropTermsFilters(aggs map[string]search.Agg) {
+	for name := range aggs {
+		a := aggs[name]
+		a.Include, a.Exclude = nil, nil
+		dropTermsFilters(a.Aggs)
+		aggs[name] = a
+	}
 }

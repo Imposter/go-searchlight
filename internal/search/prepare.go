@@ -1,7 +1,6 @@
 package search
 
 import (
-	"encoding/json"
 	"fmt"
 	"maps"
 	"math"
@@ -10,6 +9,7 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/Imposter/go-searchlight/internal/analysis"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
@@ -83,7 +83,11 @@ type aggSpec struct {
 	offset    float64
 	calendar  string
 	precision uint8
-	subs      []*aggSpec
+	// terms is a terms aggregation's include and exclude, compiled; include and exclude
+	// are them as given.
+	terms            *termsFilter
+	include, exclude *TermsFilter
+	subs             []*aggSpec
 	// keys are a filter, filters or global aggregation's buckets' keys, in order: nil
 	// alone for filter and global; filters' keys sorted, then its other bucket's.
 	// queries are the filters of the buckets that have one, in keys' order, and
@@ -284,34 +288,9 @@ func prepareAfter(after []any, sorts []sortSpec, ps *problems) []any {
 	return out
 }
 
-// toFloat reads a finite number given as any Go number or json.Number.
-func toFloat(v any) (float64, bool) {
-	var f float64
-	switch x := v.(type) {
-	case float64:
-		f = x
-	case float32:
-		f = float64(x)
-	case int:
-		f = float64(x)
-	case int64:
-		f = float64(x)
-	case int32:
-		f = float64(x)
-	case uint64:
-		f = float64(x)
-	case uint32:
-		f = float64(x)
-	case json.Number:
-		var err error
-		if f, err = strconv.ParseFloat(string(x), 64); err != nil {
-			return 0, false
-		}
-	default:
-		return 0, false
-	}
-	return f, !math.IsNaN(f) && !math.IsInf(f, 0)
-}
+// toFloat reads a finite number given as any Go number or json.Number, as
+// [analysis.Number] does.
+func toFloat(v any) (float64, bool) { return analysis.Number(v) }
 
 var calendarUnits = []string{"minute", "hour", "day", "week", "month", "quarter", "year"}
 
@@ -340,6 +319,13 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
+	if a.Type != AggTerms && (a.Include != nil || a.Exclude != nil) {
+		key := "include"
+		if a.Include == nil {
+			key = "exclude"
+		}
+		ps.add(at+"."+key, "include and exclude choose a terms aggregation's values: %s takes neither", a.Type)
+	}
 	switch a.Type {
 	case AggTerms:
 		s.size = a.Size
@@ -361,6 +347,8 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 			}
 			s.minDoc = *a.MinDocCount
 		}
+		s.include, s.exclude = a.Include, a.Exclude
+		s.terms = compileTermsFilter(a.Include, a.Exclude, s.ftype, at, ps)
 	case AggRange:
 		if !numeric {
 			ps.add(at+".field", "%q is a %s: range takes a number or date field", a.Field, s.ftype)

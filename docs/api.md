@@ -63,6 +63,7 @@ segments.
 | Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
 | Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
 | Ranges in a `range` aggregation | 100 | 400 with `loc` |
+| A `terms` `include` or `exclude` | 1,000 values; a pattern of 1,000 characters, 10,000 compiled instructions | 400 with `loc` |
 | `fields` in a search | 100 | 400 with `loc` `fields` |
 | Buckets in a search response, every aggregation's together | 65,536 | 400 with `loc` when one shard passes it; `"truncated": true` on the aggregations cut when only the merged shards do |
 | Documents in one `_percolate`, `docs` and `ids` together | 10,000 | 413 `too_large` |
@@ -238,7 +239,7 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - A number counts exactly up to it (10,000 by default). Past it, `relation` is
     `gte`.
 - **Aggregations** (`aggs`, or `aggregations`):
-  - `terms`, with `size`, `shard_size` and `min_doc_count`;
+  - `terms`, with `size`, `shard_size`, `min_doc_count`, `include` and `exclude`;
   - `range`, with `ranges` of `from`/`to`/`key`;
   - `histogram`, with `interval`, `offset` and `min_doc_count`;
   - `date_histogram`, with `fixed_interval`, `calendar_interval`, `offset` and
@@ -267,6 +268,42 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   several shards reports its error bound, as Elasticsearch does, under a `filter`
   too. On one shard it is exact, and its `doc_count_error_upper_bound` is 0.
 
+  **`include` and `exclude`** choose the values a `terms` aggregation buckets, as
+  Elasticsearch's do. Each is an array of exact values or a pattern, and the two
+  combine, `exclude` winning. Values left out are never counted: the top `size` are the
+  top of the chosen values, on every shard before its `shard_size` cut, and
+  `sum_other_doc_count` and the error bounds count only chosen values. `min_doc_count`
+  applies as before.
+  - **Exact values** compare as the field's values do: keyword, text,
+    `keyword_list` and `_id` values normalized (`"NIKE"` is `nike`; a number or bool as
+    its text), numbers exactly, dates as Unix milliseconds or a date string the field
+    takes, bools as `true` or `false`. A value no document holds makes no bucket. An
+    empty array includes nothing (Elasticsearch's numeric fields read it as no
+    include).
+  - **A pattern**, a string, matches the whole normalized key, and is folded as a value
+    is: `"Nike.*"` is `nike.*`, every key starting with `nike`, and `"tea  cup"` is
+    `tea cup`. Each literal character is casefolded (`ß` reads `ss`), whitespace runs
+    are one space and none at either end, and a class takes its members' folded forms
+    too (`[A-C]` matches `a` to `c`). What cannot fold faithfully is refused: a class
+    member that folds to more than one character (`[ß]`), and a negated class of
+    characters that fold (`[^A-Z]`: write `[^a-z]`). `.` is one character of the
+    folded key. It takes this subset of Lucene's regular
+    expressions: characters as themselves, `\` before a punctuation character for it
+    literally, `"..."` for a literal run, `.` for any character, classes `[abc]`,
+    `[a-z]` and `[^a-z]`, repetition `*`, `+`, `?`, `{n}`, `{n,}` and `{n,m}` (n and m at
+    most 1,000), alternation `|` and groups `( )`. Lucene's `~`, `&`, `<n-m>`, `@` and
+    `#`, `\d`-style classes, and `^` and `$` (a pattern is anchored already) are
+    refused at the `loc`, with the character's position. Patterns run as RE2, in
+    time linear in the key. Only text keys take one: on a number, date or bool field
+    a pattern is refused.
+  - Elasticsearch's partitions (`{"partition": 0, "num_partitions": 10}`) are refused.
+
+  Each segment decides the filter once per distinct value: exact values are looked up
+  in its dictionary; a pattern, or an `exclude` alone, reads the dictionary (only the
+  terms after a pattern's literal prefix) when the hits are many, and with few hits
+  for its dictionary decides each value as it is collected. Its cost follows the
+  field's distinct values or the hits, whichever is less.
+
   Bounds, each refused with a 400 whose `loc` names the place:
   - At most 100 aggregations per search (`loc` `aggs`, or `aggregations` as the body
     spells it), sub-aggregations included,
@@ -276,6 +313,10 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - At most 100 `ranges` per `range` aggregation, and 100 `filters` per `filters`
     aggregation.
   - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.
+  - At most 1,000 values in an `include` or `exclude` array, and 1,000 characters in
+    a pattern, which compiles to at most 10,000 instructions: one whose counted
+    repetitions multiply past it is refused as too complex (`loc`
+    `aggs.<name>.terms.include`, or `.include.<i>` for one value).
   - At most 65,536 buckets per response, every aggregation's together (Elasticsearch's
     `search.max_buckets`), nested ones included: a `filter` or `global` counts one,
     a `filters` one per key. A shard whose own buckets pass it refuses the search, at
@@ -327,6 +368,18 @@ are picked, under a price range:
 
 A facet with no pick of its own is a `filter` of every pick, or a plain aggregation
 while nothing is picked.
+
+**Facet type-ahead, and the picks outside the top buckets.** A facet's search box is a
+pattern `include` of what was typed; the picks are counted in the same
+search by an exact `include`, even when they fall outside the top 10:
+
+```json
+{"size": 0,
+ "aggs": {
+   "brand_typed": {"terms": {"field": "brand", "size": 10, "include": "ni.*"}},
+   "brand_picked": {"terms": {"field": "brand", "include": ["Nike", "Puma"]}},
+   "brand_rest": {"terms": {"field": "brand", "size": 10, "exclude": ["Nike", "Puma"]}}}}
+```
 
 `_count` takes `{"query": ...}` and answers `{"count", "relation", "timed_out"}`, counting
 exactly. It refuses any other member, `post_filter` included (400 at its name).

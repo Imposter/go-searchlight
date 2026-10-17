@@ -103,6 +103,9 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 		var total int64
 		for _, d := range docs {
 			for _, v := range aggValues(d, spec.field) {
+				if !bruteKeeps(spec, v) {
+					continue
+				}
 				in[v] = append(in[v], d)
 				total++
 			}
@@ -333,6 +336,13 @@ func randomAgg(rng *rand.Rand) Agg {
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(3))
 		}
+		if rng.IntN(3) == 0 {
+			seed := func() string { return pick(rng, vocab) }
+			if a.Field == IDField {
+				seed = func() string { return pick(rng, ids) }
+			}
+			a.Include, a.Exclude = randomTermsFilters(rng, a.Field, seed)
+		}
 	case 1:
 		a = Agg{Type: AggRange, Field: pick(rng, []string{"price", "created"}), Ranges: []Range{
 			{To: ptr(5.0)}, {From: ptr(2.5), To: ptr(50.0)}, {From: ptr(10.0), Key: "ten+"}, {From: ptr(1.7e12)},
@@ -393,8 +403,9 @@ func TestAggregationsEqualBruteForce(t *testing.T) {
 				aggChunkMin, aggChunk = 1, 1+rng.Uint32N(40) // segments collected in parts
 			}
 			globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40}) // merged by term, either, by global ordinal
+			lazyTermsRatio = pick(rng, []uint64{0, 16, 1 << 40})   // terms filters decided per ordinal, either, over the dictionary
 			got, err := c.search(&Request{Query: q, Aggs: aggs})
-			aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8
+			aggChunkMin, aggChunk, globalOrdsDensity, lazyTermsRatio = 1<<15, 1<<16, 8, 16
 			if err != nil {
 				t.Fatalf("%s %+v: %v", raw, aggs, err)
 			}

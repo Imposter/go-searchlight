@@ -410,7 +410,7 @@ func analyzeValue(t FieldType, value any, grams bool) Value {
 			return Value{Present: true, Bool: &b}
 		}
 	case Date:
-		if ms, ok := dateMillis(value); ok {
+		if ms, ok := DateMillis(value); ok {
 			return Value{Present: true, Number: &ms}
 		}
 	}
@@ -457,10 +457,10 @@ func listEntries(value any) []string {
 	}
 }
 
-// dateMillis reads a date: a number is Unix milliseconds already; a string is RFC 3339
-// (2026-10-02T09:30:00Z, with or without fractional seconds) or a bare date (2026-10-02,
-// midnight UTC).
-func dateMillis(value any) (float64, bool) {
+// DateMillis reads a date as a date field takes it: a number is Unix milliseconds
+// already; a string is RFC 3339 (2026-10-02T09:30:00Z, with or without fractional
+// seconds) or a bare date (2026-10-02, midnight UTC).
+func DateMillis(value any) (float64, bool) {
 	if s, ok := value.(string); ok {
 		for _, layout := range []string{time.RFC3339Nano, time.DateOnly} {
 			if at, err := time.Parse(layout, s); err == nil {

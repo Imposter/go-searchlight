@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,8 +26,8 @@ import (
 // exactly: the reduce over a result that went through the wire equals the reduce over
 // the original, aggregations (terms, histogram, stats, cardinality, filter, filters
 // and global, with the aggregations under them) and sort values included; and the
-// decoded request, post_filter and aggregation filters included, searches as the
-// original does.
+// decoded request, post_filter, aggregation filters and terms include and exclude
+// included, searches as the original does.
 func TestWireRoundTrip(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
@@ -66,7 +67,12 @@ func TestWireRoundTrip(t *testing.T) {
 				"t1": parse(`{"field":"tags","op":"has","value":"t1"}`),
 				"t2": parse(`{"field":"tags","op":"has","value":"t2"}`),
 			}, Aggs: map[string]search.Agg{"price": {Type: search.AggStats, Field: "price"}}},
-			"all": {Type: search.AggGlobal, Aggs: map[string]search.Agg{"hist": {Type: search.AggHistogram, Field: "price", Interval: 100}}},
+			"all": {Type: search.AggGlobal, Aggs: map[string]search.Agg{
+				"hist":  {Type: search.AggHistogram, Field: "price", Interval: 100},
+				"picks": {Type: search.AggTerms, Field: "brand", Include: &search.TermsFilter{Values: []any{"B1", "b4", json.Number("5"), 6.0}}},
+			}},
+			"bs":     {Type: search.AggTerms, Field: "brand", Size: 2, Include: &search.TermsFilter{Pattern: "b[2-6]"}, Exclude: &search.TermsFilter{Values: []any{"b3"}}},
+			"prices": {Type: search.AggTerms, Field: "price", Include: &search.TermsFilter{Values: []any{20.0, json.Number("30"), 31}}, Exclude: &search.TermsFilter{Values: []any{}}},
 		},
 	}
 	wr, err := encodeRequest(r)
@@ -84,6 +90,9 @@ func TestWireRoundTrip(t *testing.T) {
 	r2, err := back.decode()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wr.Needs != levelTermsFilter || back.Needs != levelTermsFilter {
+		t.Fatalf("a search with include and exclude needs wire level %d, %d after the wire; want %d", wr.Needs, back.Needs, levelTermsFilter)
 	}
 	if !bytes.Equal(query.Canonical(r2.Query), query.Canonical(r.Query)) {
 		t.Fatalf("the query changed on the wire")
@@ -121,6 +130,39 @@ func TestWireRoundTrip(t *testing.T) {
 	}
 	if !bytes.Contains(direct, []byte(`"rest":{`)) || res.Total >= 300 {
 		t.Fatalf("the filters aggregation or the post_filter did not apply: total %d, %s", res.Total, direct)
+	}
+	var out struct {
+		Aggs map[string]json.RawMessage `json:"aggs"`
+	}
+	if err := json.Unmarshal(direct, &out); err != nil {
+		t.Fatal(err)
+	}
+	keys := func(raw json.RawMessage) string {
+		var terms struct {
+			Buckets []struct {
+				Key any `json:"key"`
+			} `json:"buckets"`
+		}
+		if err := json.Unmarshal(raw, &terms); err != nil {
+			t.Fatal(err)
+		}
+		var ks []string
+		for _, b := range terms.Buckets {
+			ks = append(ks, fmt.Sprint(b.Key))
+		}
+		slices.Sort(ks)
+		return strings.Join(ks, ",")
+	}
+	var all struct {
+		Picks json.RawMessage `json:"picks"`
+	}
+	if err := json.Unmarshal(out.Aggs["all"], &all); err != nil {
+		t.Fatal(err)
+	}
+	bs := strings.Split(keys(out.Aggs["bs"]), ",")
+	chosen := len(bs) == 2 && !slices.ContainsFunc(bs, func(k string) bool { return !slices.Contains([]string{"b2", "b4", "b5", "b6"}, k) })
+	if p, a := keys(out.Aggs["prices"]), keys(all.Picks); !chosen || p != "20,30,31" || a != "b1,b4" {
+		t.Fatalf("include and exclude did not apply: bs %v, prices %s, picks %s", bs, p, a)
 	}
 }
 

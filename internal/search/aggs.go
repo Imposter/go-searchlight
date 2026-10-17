@@ -256,7 +256,13 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 		}
 		return c
 	case AggTerms:
-		return &termsColl{s: s, spec: spec, src: src}
+		c := &termsColl{s: s, spec: spec, src: src}
+		if s.lazyTerms(spec, src) {
+			c.lazy = &lazyFilter{f: spec.terms, src: src, seen: map[uint32]bool{}}
+		} else {
+			c.allow = s.termMask(spec, src)
+		}
+		return c
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
 	default:
@@ -402,6 +408,38 @@ func (fs *fieldSrc) denseCounts(notHit *roaring.Bitmap) []int64 {
 	}
 }
 
+// listedCounts is denseCounts for the ordinals m lists alone: each one's document
+// frequency, minus the documents not hit that hold it.
+func (fs *fieldSrc) listedCounts(m *termMask, notHit *roaring.Bitmap) []int64 {
+	counts := make([]int64, fs.numTerms())
+	for i, o := range m.ords {
+		counts[o] = int64(m.dfs[i])
+	}
+	it := notHit.ManyIterator()
+	buf := make([]uint32, 512)
+	for {
+		n := it.NextMany(buf)
+		if n == 0 {
+			return counts
+		}
+		for _, d := range buf[:n] {
+			switch fs.kind {
+			case srcKeyword:
+				if o, ok := fs.kc.Ord(d); ok && m.has(o) {
+					counts[o]--
+				}
+			case srcList:
+				fs.buf = fs.mc.Ords(d, fs.buf[:0])
+				for _, o := range fs.buf {
+					if m.has(o) {
+						counts[o]--
+					}
+				}
+			}
+		}
+	}
+}
+
 // termsColl counts documents per value; -0 and 0 are one value, in one bucket.
 type termsColl struct {
 	s    *segExec
@@ -411,6 +449,21 @@ type termsColl struct {
 	counts  []int64       // by ordinal (keyword, list) or 0/1 (bool)
 	subs    [][]collector // by ordinal, made on first use
 	numbers map[float64]*histBucket
+	// allow is the filter of include and exclude over the ordinals (or bool keys), or
+	// lazy decides it ordinal by ordinal (few hits over a large dictionary): both nil
+	// without them, and for a number field, whose values are checked directly.
+	allow *termMask
+	lazy  *lazyFilter
+}
+
+func (c *termsColl) allowed(o uint32) bool {
+	switch {
+	case c.allow != nil:
+		return c.allow.has(o)
+	case c.lazy != nil:
+		return c.lazy.allows(o)
+	}
+	return true
 }
 
 func (c *termsColl) slot(o uint32) {
@@ -440,15 +493,17 @@ func (c *termsColl) withSubs(o, d uint32) {
 func (c *termsColl) collect(d uint32) {
 	switch c.src.kind {
 	case srcKeyword:
-		if o, ok := c.src.kc.Ord(d); ok {
+		if o, ok := c.src.kc.Ord(d); ok && c.allowed(o) {
 			c.slot(o)
 			c.withSubs(o, d)
 		}
 	case srcList:
 		c.src.buf = c.src.mc.Ords(d, c.src.buf[:0])
 		for _, o := range c.src.buf {
-			c.slot(o)
-			c.withSubs(o, d)
+			if c.allowed(o) {
+				c.slot(o)
+				c.withSubs(o, d)
+			}
 		}
 	case srcBool:
 		if b, ok := c.src.boolOf(d); ok {
@@ -456,8 +511,10 @@ func (c *termsColl) collect(d uint32) {
 			if b {
 				o = 1
 			}
-			c.slot(o)
-			c.withSubs(o, d)
+			if c.allowed(o) {
+				c.slot(o)
+				c.withSubs(o, d)
+			}
 		}
 	case srcNumber:
 		if v, ok := c.src.nc.Value(d); ok {
@@ -467,6 +524,9 @@ func (c *termsColl) collect(d uint32) {
 			}
 			b := c.numbers[v]
 			if b == nil {
+				if c.spec.terms != nil && !c.spec.terms.number(v) {
+					return
+				}
 				b = &histBucket{subs: c.s.newSubs(c.spec)}
 				c.numbers[v] = b
 			}
@@ -480,10 +540,21 @@ func (c *termsColl) collect(d uint32) {
 // document frequencies, minus the documents not hit: cheaper than reading every hit's
 // value when most of the segment matches.
 func (c *termsColl) countDense(notHit *roaring.Bitmap) bool {
-	if len(c.spec.subs) > 0 || !c.src.ordinal() {
+	if len(c.spec.subs) > 0 || !c.src.ordinal() || c.lazy != nil {
 		return false
 	}
+	if c.allow != nil && c.allow.listed {
+		c.counts = c.src.listedCounts(c.allow, notHit)
+		return true
+	}
 	c.counts = c.src.denseCounts(notHit)
+	if c.allow != nil {
+		for o := range c.counts {
+			if !c.allowed(uint32(o)) {
+				c.counts[o] = 0
+			}
+		}
+	}
 	return true
 }
 
@@ -867,6 +938,7 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 	colls := make([]collector, len(specs))
 	var perDoc []int
 	var notHit *roaring.Bitmap
+	s.collecting = hits.GetCardinality()
 	dense := 2*hits.GetCardinality() >= uint64(s.n)
 	for i, spec := range specs {
 		if spec.wrapper() {

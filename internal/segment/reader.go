@@ -350,6 +350,35 @@ func (r *Reader) Terms(field string, kind TermKind, prefix string, fn func(term 
 	}
 }
 
+// TermsFrom calls fn with the ordinal, bytes and document frequency of every term of
+// field's kind dictionary from the first at or after from, in order, until fn returns false or the
+// terms run out: a walk that starts at from's block, decodes each block it reads once
+// and allocates nothing. term is valid only during the call.
+func (r *Reader) TermsFrom(field string, kind TermKind, from string, fn func(ord uint32, term []byte, docFreq uint32) bool) {
+	if !kind.Valid() {
+		return
+	}
+	fi := r.fields[field]
+	if fi == nil || fi.dicts[kind] == nil {
+		return
+	}
+	dict := fi.dicts[kind]
+	fb := stringBytes(from)
+	block, ok := dict.blockFor(fb)
+	if !ok {
+		block = 0
+	}
+	it := dict.iter(block)
+	for it.next() {
+		if bytes.Compare(it.term, fb) < 0 {
+			continue
+		}
+		if !fn(it.info.ord, it.term, it.info.docFreq) {
+			return
+		}
+	}
+}
+
 // TermCursor walks one field's dictionary of one kind in term order, without
 // allocating a string per term.
 type TermCursor struct {

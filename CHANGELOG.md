@@ -24,6 +24,18 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   rounds as Elasticsearch's range query rounds it. `now` is one instant per request,
   read by the coordinating node and used by every shard and peer. A saved query keeps
   its expression and resolves it at every percolation.
+- **`include` and `exclude` on `terms`**, Elasticsearch's, for a facet's type-ahead
+  (`"include": "ni.*"`) and its picked values counted in the same search, outside the
+  top buckets too ([docs/api.md](docs/api.md#search-and-count)): an array of at most
+  1,000 exact values, compared normalized as the field's values are, or a pattern of
+  at most 1,000 characters over the whole normalized key, in a subset of Lucene's
+  regular expressions (literals, `.`, classes, `*` `+` `?` `{n,m}`, `|`, groups) run
+  as RE2 and folded as values are (`"Nike.*"` is `nike.*`). Exclude wins; both apply before `size` and `shard_size`, so the top buckets,
+  `sum_other_doc_count` and the error bounds are the chosen values'. Each segment
+  decides them once per distinct value, from its dictionary or, with few hits, as
+  values are collected. Patterns on number, date and bool fields, patterns that
+  cannot fold faithfully (`[ß]`, `[^A-Z]`), Lucene's other operators and partitions
+  are refused with a 400 at their `loc`; a null `include` or `exclude` is none.
 
 ### Changed
 
@@ -60,6 +72,9 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
     where the query then matches nothing; delete such queries, or rewrite them with
     numbers, before rolling back. Segments without such a condition are unchanged
     (format `percolate/3`).
+- Likewise a search with a `terms` `include` or `exclude` (search wire level 2) is
+  refused with a 503 rather than read from a node of an earlier release, which would
+  count every value.
 
 ## [1.0.0] - 2026-10-14
 

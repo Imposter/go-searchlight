@@ -353,7 +353,7 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 		if err := t.n.readCall(ctx, c, searchPath(wr.Needs), msg, &reply); err != nil {
 			var ae *api.Error
 			if wr.Needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
-				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (post_filter, or a filter, filters or global aggregation): %w; retry once the upgrade is done", wr.Needs, errOlderLevel)}
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (%s): %w; retry once the upgrade is done", wr.Needs, levelNeeds(wr.Needs), errOlderLevel)}
 			}
 			return err
 		}
@@ -361,7 +361,7 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 			return &peerError{node: c.node, err: errors.New("no result")}
 		}
 		if reply.Level < wr.Needs {
-			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (post_filter, or a filter, filters or global aggregation): %w; retry once the upgrade is done", reply.Level, wr.Needs, errOlderLevel)}
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (%s): %w; retry once the upgrade is done", reply.Level, wr.Needs, levelNeeds(wr.Needs), errOlderLevel)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil

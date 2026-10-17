@@ -313,8 +313,12 @@ type Node struct {
 	refusedWarned sync.Map
 	ars           *ars
 	view          atomic.Pointer[view]
-	missMu        sync.Mutex
-	missReadAt    time.Time
+	// missMu guards missFlight, the routing registry read under way (refreshSince);
+	// missReadAt, when the last one began, is read and written only by the flights,
+	// which run one after another.
+	missMu     sync.Mutex
+	missFlight *missFlight
+	missReadAt time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex

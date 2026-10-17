@@ -186,7 +186,9 @@ not:
    budget) against a chosen copy is retried against another serving copy of the same
    shard, not surfaced to the client. With two or more copies of every shard, one node
    failing is not a client-visible error (architecture.md's
-   [Routing](architecture.md#routing)).
+   [Routing](architecture.md#routing)). When every copy the coordinator knew of has
+   failed, it reads the copy table once more and tries the serving copies it had not
+   seen: its view can trail the registry by a refresh.
 
 ## Shards and copies
 

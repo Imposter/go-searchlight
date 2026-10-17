@@ -362,7 +362,13 @@ Any node takes any request.
   serving copy elsewhere whose lag is within `max_lag`, chosen by adaptive replica
   selection on measured latency, like Elasticsearch's ARS. A failed or timed-out attempt
   (10 s) is retried on another copy, so with two or more copies, one node failing is not
-  a client error.
+  a client error. The copies a read knows of come from this node's view of the registry,
+  which can trail it by a refresh: when every one of them has failed, the read reads the
+  copy table again, once per shard (a view read since by another shard of the request,
+  or by the view loop, serves instead), and tries the serving copies it did not try
+  yet. It stays within the request's deadline; when nothing new turns up the shard is a
+  503. `searchlight_cluster_read_rereads_total` counts these re-reads, by `op` and
+  `result` (`found`, `none`).
 - **Peer traffic** (reads, hints, snapshots) uses the internal API under `/_internal/` on
   the same listener. It is authenticated by `cluster_token`, and runs over TLS when
   `tls_cert` is set, with peers verified against `peer_ca_file`.

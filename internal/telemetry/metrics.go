@@ -174,6 +174,7 @@ const (
 	MetricClusterNodes            = "searchlight.cluster.nodes"
 	MetricClusterPeerDuration     = "searchlight.cluster.peer.request.duration"
 	MetricClusterReadRetries      = "searchlight.cluster.read.retries"
+	MetricClusterReadRereads      = "searchlight.cluster.read.rereads"
 
 	// Database.
 	MetricStoreOperationDuration = "searchlight.store.operation.duration"
@@ -258,6 +259,7 @@ var Catalog = []MetricSpec{
 	{MetricClusterNodes, KindGauge, "{node}", "Live nodes in the cluster, as this node reads the registry.", nil},
 	{MetricClusterPeerDuration, KindHistogram, "s", "Internal peer API request latency by route, peer and status (0: unreachable).", FastBuckets},
 	{MetricClusterReadRetries, KindCounter, "{retry}", "Shard reads retried on another copy after one failed or timed out, by operation.", nil},
+	{MetricClusterReadRereads, KindCounter, "{reread}", "Copy table re-reads by shard reads whose every known copy failed, by operation and result (found: a serving copy not yet tried; none).", nil},
 
 	{MetricStoreOperationDuration, KindHistogram, "s", "SQL store latency by operation and dialect.", FastBuckets},
 	{MetricStoreErrors, KindCounter, "{error}", "SQL store errors by operation and dialect.", nil},

@@ -45,13 +45,27 @@ var ErrNoServingCopy = errors.New("cluster: no node serves a copy of the shard")
 
 // routeCandidates is candidates, read again from a fresh view when the routing view
 // has none: the view lags the registry by up to ViewInterval, and a copy claimed
-// since (an index another node just created) is served at once.
-func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidate {
-	if c := n.candidates(id); len(c) > 0 {
-		return c
+// since (an index another node just created) is served at once. It also returns the
+// start of the read the candidates come from, and whether it read the registry again.
+func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) (c []candidate, routed time.Duration, reread bool) {
+	if c, routed = n.route(id); len(c) > 0 {
+		return c, routed, false
 	}
 	n.refreshOnMiss(ctx)
-	return n.candidates(id)
+	c, routed = n.route(id)
+	return c, routed, true
+}
+
+// rerouteCandidates is candidates from a view read after routed began: the published
+// view when one was read since (another shard of the request, or the view loop, read
+// it), and otherwise a registry read routing misses share (refreshOnMiss). It is for a
+// read whose every known copy failed: the view it was routed with can trail the
+// registry by a refresh, and miss a copy that serves.
+func (n *Node) rerouteCandidates(ctx context.Context, id store.ShardID, routed time.Duration) ([]candidate, time.Duration) {
+	if v := n.view.Load(); v == nil || v.readBegan <= routed {
+		n.refreshOnMiss(ctx)
+	}
+	return n.route(id)
 }
 
 // missRefreshEvery is the least time between two registry reads routing misses make:
@@ -88,6 +102,13 @@ func noServingCopy(id store.ShardID) *api.Error {
 // candidates lists the serving copies of id on live peers, best first (adaptive
 // replica selection).
 func (n *Node) candidates(id store.ShardID) []candidate {
+	c, _ := n.route(id)
+	return c
+}
+
+// route is candidates, with the start of the registry read the view it read them from
+// began (view.readBegan).
+func (n *Node) route(id store.ShardID) ([]candidate, time.Duration) {
 	v := n.view.Load()
 	var out []candidate
 	for i := range v.copies[id] {
@@ -102,7 +123,7 @@ func (n *Node) candidates(id store.ShardID) []candidate {
 		out = append(out, candidate{node: c.NodeID, addr: nd.Address, shard: id})
 	}
 	n.ars.order(out, len(v.live))
-	return out
+	return out, v.readBegan
 }
 
 // peerError is a transport failure reaching a peer: the peer is gone, did not answer
@@ -269,12 +290,16 @@ func decodeError(resp *http.Response) error {
 
 // remoteTarget reads a shard from a serving copy on a peer: the first call tries the
 // candidates in order until one answers (a failed or timed-out one is retried on the
-// next), and the rest go to the copy that did.
+// next), and the rest go to the copy that did. routed is when the registry read the
+// candidates come from began; reread is set once the read has read the copy table
+// again for the shard, which it does at most once.
 type remoteTarget struct {
 	n       *Node
 	id      store.ShardID
 	waitSeq int64
 	cands   []candidate
+	routed  time.Duration
+	reread  bool
 	chosen  *candidate
 	pin     string
 	stale   bool
@@ -291,11 +316,13 @@ var errOlderLevel = errors.New("it runs an older release")
 // retryable 503); the last accepts one, flagged stale, as does the coordinator's own
 // copy after it. A chosen copy refused for its wire level (errOlderLevel: an earlier
 // call of the read, a stored document's Get, needed less) is dropped, and the other
-// candidates are tried as on a first call. When none answers the read is unavailable
-// (503).
+// candidates are tried as on a first call. When every candidate failed (or was
+// refused) retryably, the copy table is read again once (rerouteCandidates), and the
+// serving copies it shows that were not tried yet are tried in turn. When none answers
+// the read is unavailable (503).
 func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx context.Context, c candidate, ref shardRef) error) error {
 	var last error
-	var refused *candidate
+	tried := map[string]bool{}
 	if t.chosen != nil {
 		ref := t.ref()
 		ref.AllowStale = true
@@ -303,33 +330,60 @@ func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx conte
 		if err == nil || !errors.Is(err, errOlderLevel) {
 			return err
 		}
-		last, refused, t.chosen = err, t.chosen, nil
+		tried[t.chosen.key()] = true
+		last, t.chosen = err, nil
 	}
-	for i, c := range t.cands {
-		if refused != nil && c.key() == refused.key() {
-			continue
+	for {
+		todo := untried(t.cands, tried)
+		for i, c := range todo {
+			tried[c.key()] = true
+			ref := t.ref()
+			ref.AllowStale = i == len(todo)-1
+			actx, cancel := context.WithTimeout(ctx, t.n.opts.PeerTimeout)
+			err := fn(actx, c, ref)
+			cancel()
+			if err == nil {
+				t.chosen = &todo[i]
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !retryable(err) {
+				return err
+			}
+			last = err
+			t.n.inst.retry(ctx, op)
+			t.n.log.DebugContext(ctx, "a peer read failed; trying another copy", slog.String("op", op), slog.String("shard", t.id.String()),
+				slog.String("peer", c.node), slog.Any("error", err))
 		}
-		ref := t.ref()
-		ref.AllowStale = i == len(t.cands)-1
-		actx, cancel := context.WithTimeout(ctx, t.n.opts.PeerTimeout)
-		err := fn(actx, c, ref)
-		cancel()
-		if err == nil {
-			t.chosen = &t.cands[i]
-			return nil
+		if t.reread {
+			break
 		}
+		t.reread = true
+		t.cands, t.routed = t.n.rerouteCandidates(ctx, t.id, t.routed)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !retryable(err) {
-			return err
+		found := len(untried(t.cands, tried)) > 0
+		t.n.inst.reread(ctx, op, found)
+		if !found {
+			break
 		}
-		last = err
-		t.n.inst.retry(ctx, op)
-		t.n.log.DebugContext(ctx, "a peer read failed; trying another copy", slog.String("op", op), slog.String("shard", t.id.String()),
-			slog.String("peer", c.node), slog.Any("error", err))
+		t.n.log.DebugContext(ctx, "every known copy failed; the copy table read again shows another", slog.String("op", op), slog.String("shard", t.id.String()))
 	}
 	return api.Unavailable(last, "no copy of shard %d of index %q answered", t.id.Shard, t.id.Index)
+}
+
+// untried lists the candidates whose copy is not in tried.
+func untried(cands []candidate, tried map[string]bool) []candidate {
+	var out []candidate
+	for _, c := range cands {
+		if !tried[c.key()] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (t *remoteTarget) ref() shardRef {
@@ -516,11 +570,11 @@ func (n *Node) closeBackground() {
 
 // Remote implements node.Cluster.
 func (h *clusterHooks) Remote(ctx context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
-	cands := h.n.routeCandidates(ctx, id)
+	cands, routed, reread := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
 		return nil, noServingCopy(id)
 	}
-	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands}, nil
+	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands, routed: routed, reread: reread}, nil
 }
 
 // Committed implements node.Cluster: a push hint to every peer holding a copy of a
@@ -558,7 +612,7 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 	}
 	cands := n.candidates(id)
 	if len(cands) == 0 && !localDone {
-		cands = n.routeCandidates(ctx, id)
+		cands, _, _ = n.routeCandidates(ctx, id)
 	}
 	if len(cands) == 0 {
 		if localDone {
@@ -670,14 +724,20 @@ func (h *clusterHooks) CopyStopped(c store.Copy, err error) {
 
 // Counts implements node.Cluster.
 func (h *clusterHooks) Counts(ctx context.Context, id store.ShardID) (uint64, uint64, error) {
-	cands := h.n.routeCandidates(ctx, id)
+	cands, routed, reread := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
 		return 0, 0, noServingCopy(id)
 	}
-	t := &remoteTarget{n: h.n, id: id, cands: cands}
+	t := &remoteTarget{n: h.n, id: id, cands: cands, routed: routed, reread: reread}
+	return t.counts(ctx)
+}
+
+// counts reads the shard's document and saved query counts from a copy.
+func (t *remoteTarget) counts(ctx context.Context) (docs, queries uint64, err error) {
 	var reply countsReply
-	err := t.attempt(ctx, "counts", func(ctx context.Context, c candidate, ref shardRef) error {
-		return h.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", ref, &reply)
+	err = t.attempt(ctx, "counts", func(ctx context.Context, c candidate, ref shardRef) error {
+		reply = countsReply{}
+		return t.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", ref, &reply)
 	})
 	return reply.Docs, reply.Queries, err
 }

@@ -4,6 +4,21 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Fixed
+
+- **A remote read no longer fails while another copy of its shard serves.** A
+  coordinator read the copy table again only when its view listed no serving copy of a
+  shard; when the view (which can trail the database by a refresh) listed one, and that
+  one failed, a search, percolation, get or count answered 503 "no copy of shard N of
+  index X answered" though another copy was serving. Once every copy it knows of has
+  failed (or refused it for an older wire level), a read now reads the copy table again,
+  once per shard and within its deadline (shards of the request share a read), and
+  tries the serving copies it has not tried; date math stays resolved once and
+  `wait_for_seq` holds. `searchlight_cluster_read_rereads_total` counts the re-reads, by
+  `op` and `result` (`found`, `none`).
+
 ## [1.2.0] - 2026-10-17
 
 Fast aggregations: a shard request cache (in memory, optionally Redis), breadth-first `terms`, `min`/`max`, a cardinality `threshold`, global ordinals that survive refreshes, and a `timeout` that bounds the whole shard search.

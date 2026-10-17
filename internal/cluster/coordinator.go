@@ -186,10 +186,11 @@ type testHooks struct {
 	pinned func(id store.ShardID, pin string)
 	// olderPeer makes the node answer peer searches and percolations past olderLevel as
 	// a release of that search wire level does: 0 is 1.0.0 (search and percolate level
-	// 0), 1 the release before include and exclude (search and percolate level 1).
-	// olderNoEndpoint gives them no endpoint, olderDropsLevel serves them with what
-	// that release lacks dropped (a search's post_filter below level 1, include and
-	// exclude below 2; a percolation's now below 1) and its level in the reply.
+	// 0), 1 the release before include and exclude (search and percolate level 1), 2
+	// the release before from (search level 2). olderNoEndpoint gives them no endpoint,
+	// olderDropsLevel serves them with what that release lacks dropped (a search's
+	// post_filter below level 1, include and exclude below 2, from below 3; a
+	// percolation's now below 1) and its level in the reply.
 	olderPeer  olderPeer
 	olderLevel int
 }

@@ -167,7 +167,7 @@ The API is in the Elasticsearch style:
 | `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` (applied at once, `-1` for on demand only) or the replica target |
 | `PUT/GET/DELETE /indexes/{i}/docs/{id}` | One document (`if_seq`, `refresh=true\|wait_for`) |
 | `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per request; `?percolate=true` also returns each upserted document's matching saved queries |
-| `POST /indexes/{i}/_search` | `{query, post_filter, sort, size, search_after, track_total, aggs, fields, timeout}` |
+| `POST /indexes/{i}/_search` | `{query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout}` |
 | `POST /indexes/{i}/_count` | Matching count |
 | `PUT/GET/DELETE /indexes/{i}/queries/{id}`, `GET /indexes/{i}/queries` | Saved queries |
 | `POST /indexes/{i}/_percolate` | Documents, or stored ids, in; matching query ids per document out |
@@ -222,7 +222,7 @@ A segment is immutable and written once at refresh or merge time. It is one file
 
 1. **Plan.** Normalize the query, then order leaves by cost (estimated from per-segment term frequencies and doc-value stats). Bitmap-able leaves become roaring operations: AND intersects smallest first, OR unions, NOT takes the complement against live-docs. Value leaves become residual filters over doc values: `contains` with a trigram prefilter, `similar` with trigram candidates and then an exact check, and ranges served by points.
 2. **Execute per segment in parallel,** with a goroutine pool sized to GOMAXPROCS. Each segment produces a hit bitmap, per-segment top-k for the sort (a heap over doc values), and partial aggregations.
-3. **Reduce** across segments, then across shards on the coordinator. `search_after` paging uses the sort values plus id. Counts are exact up to `track_total`, otherwise reported as `≥`.
+3. **Reduce** across segments, then across shards on the coordinator. `search_after` paging uses the sort values plus id. `from` paging, as Elasticsearch's query-then-fetch: each shard returns its best `from + size` without bodies, the coordinator merges them and drops the first `from`, and only the page's bodies are fetched; `from + size` is at most `max_result_window` (10,000), past which pages use `search_after`. Counts are exact up to `track_total`, otherwise reported as `≥`.
 4. **Early termination.** A sort on the index's natural order, or a `size` with no total needed, stops as soon as top-k is settled.
 
 ## 7. Percolator

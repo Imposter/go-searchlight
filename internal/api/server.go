@@ -28,6 +28,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
+	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -131,6 +132,9 @@ func NewServer(c Coordinator, t *telemetry.T, cfg config.Config, opts ...ServerO
 	}
 	if cfg.MaxBodyBytes <= 0 || cfg.MaxDocBytes <= 0 || cfg.MaxBulkOps <= 0 || cfg.RequestTimeout <= 0 {
 		return nil, errors.New("api: max_body_bytes, max_doc_bytes, max_bulk_ops and request_timeout must be positive")
+	}
+	if cfg.MaxResultWindow <= 0 || cfg.MaxResultWindow > search.MaxResultWindow {
+		return nil, fmt.Errorf("api: max_result_window must be from 1 to %d", search.MaxResultWindow)
 	}
 	in := telemetry.NewInstruments(meter)
 	s.dur = in.Histogram(telemetry.MetricHTTPRequestDuration)

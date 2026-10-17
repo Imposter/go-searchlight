@@ -172,9 +172,9 @@ func TestSearch(t *testing.T) {
 	if !hasLoc(p, "query.field") {
 		t.Errorf("an unmapped field: %v", p)
 	}
-	p = e.problem(e.do("POST", path, `{"from": 10}`), 400, "invalid_request")
-	if !hasLoc(p, "from") {
-		t.Errorf("from: %v", p)
+	p = e.problem(e.do("POST", path, `{"scroll": "1m"}`), 400, "invalid_request")
+	if !hasLoc(p, "scroll") {
+		t.Errorf("an unknown key: %v", p)
 	}
 	p = e.problem(e.do("POST", path, `{"sort": ["tags"]}`), 400, "invalid_request")
 	if !hasLoc(p, "sort.0") {

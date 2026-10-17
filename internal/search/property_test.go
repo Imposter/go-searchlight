@@ -58,16 +58,19 @@ func checkRandomSearch(t *testing.T, c *cluster, rng *rand.Rand, step int) {
 		TrackTotal: pick(rng, []int{0, 1, 5, TrackTotalAll, TrackTotalNone}),
 	}
 	want := brute(c.docs(), q, sorts)
+	if rng.IntN(2) == 0 {
+		r.From = pick(rng, []int{1, 2, 7, rng.IntN(len(want) + 3)})
+	}
 	got, err := c.search(r)
 	if err != nil {
 		t.Fatalf("step %d: search %s: %v", step, raw, err)
 	}
 	fail := func(format string, args ...any) {
 		t.Helper()
-		t.Fatalf("step %d: query %s sort %+v size %d: "+format, append([]any{step, raw, sorts, r.Size}, args...)...)
+		t.Fatalf("step %d: query %s sort %+v from %d size %d: "+format, append([]any{step, raw, sorts, r.From, r.Size}, args...)...)
 	}
 	checkTotal(t, got, int64(len(want)), r.TrackTotal, fail)
-	wantTop := want[:min(len(want), r.Size)]
+	wantTop := want[min(len(want), r.From):min(len(want), r.From+r.Size)]
 	if len(got.Hits) != len(wantTop) {
 		fail("%d hits, want %d (%v vs %v)", len(got.Hits), len(wantTop), hitIDs(got.Hits), docIDs(wantTop))
 	}
@@ -83,8 +86,18 @@ func checkRandomSearch(t *testing.T, c *cluster, rng *rand.Rand, step int) {
 			fail("hit %d (%q) body %s, want %s", i, h.ID, h.Body, d.Body)
 		}
 	}
+	if r.Size > 0 && len(wantTop) == r.Size {
+		if !reflect.DeepEqual(got.Next, got.Hits[len(got.Hits)-1].Sort) {
+			fail("next %#v, want the last hit's sort", got.Next)
+		}
+	} else if got.Next != nil {
+		fail("next %#v on a short page", got.Next)
+	}
 	if rng.IntN(3) == 0 && len(want) > 0 {
 		pageThrough(t, c, q, sorts, 1+rng.IntN(7), want, fail)
+	}
+	if rng.IntN(3) == 0 && len(want) > 0 {
+		pageByFrom(t, c, rng, q, sorts, 1+rng.IntN(7), want, fail)
 	}
 }
 
@@ -134,6 +147,50 @@ func pageThrough(t *testing.T, c *cluster, q query.Node, sorts []SortField, n in
 	}
 	if w := docIDs(want); !slices.Equal(seen, w) {
 		fail("pages of %d walk %v, want %v", n, seen, w)
+	}
+}
+
+// pageByFrom walks every page of size n by from, switching to search_after (the last
+// page's next) at a random page, and checks each page is want's slice and the walk is
+// want, exactly.
+func pageByFrom(t *testing.T, c *cluster, rng *rand.Rand, q query.Node, sorts []SortField, n int, want []*schema.Doc, fail func(string, ...any)) {
+	t.Helper()
+	switchAt := rng.IntN(len(want)/n + 2)
+	var seen []string
+	var after []any
+	from := 0
+	for pages := 0; ; pages++ {
+		if pages > len(want)+2 {
+			fail("paging by from does not end")
+		}
+		r := &Request{Query: q, Sort: sorts, Size: n, TrackTotal: TrackTotalAll}
+		if after != nil {
+			r.SearchAfter = after
+		} else {
+			r.From = from
+		}
+		got, err := c.search(r)
+		if err != nil {
+			fail("page %d from %d after %#v: %v", pages, from, after, err)
+		}
+		if after == nil {
+			if w, g := docIDs(want[min(from, len(want)):min(from+n, len(want))]), hitIDs(got.Hits); !slices.Equal(g, w) {
+				fail("page from %d size %d is %v, want %v", from, n, g, w)
+			}
+		}
+		for _, h := range got.Hits {
+			seen = append(seen, h.ID)
+		}
+		if got.Next == nil {
+			break
+		}
+		from += n
+		if pages >= switchAt {
+			after = got.Next
+		}
+	}
+	if w := docIDs(want); !slices.Equal(seen, w) {
+		fail("pages of %d by from (search_after from page %d) walk %v, want %v", n, switchAt, seen, w)
 	}
 }
 

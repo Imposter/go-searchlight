@@ -16,10 +16,10 @@ import (
 )
 
 // Reduce merges shard results (from ExecuteShard with the same r) into one response,
-// under ctx's trace (its span is a child of the request's): the best r.Size hits over
-// every shard by the request's sort (ties: _id, then the shards' order), the summed
-// total cut at TrackTotal, and the aggregations merged and finished within MaxBuckets
-// buckets (see boundBuckets). A nil result (a shard that failed) is skipped. With
+// under ctx's trace (its span is a child of the request's): the best r.Size hits after
+// the first r.From over every shard by the request's sort (ties: _id, then the
+// shards' order), the summed total cut at TrackTotal, and the aggregations merged and
+// finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that failed) is skipped. With
 // track_total false there is no bound to cut the total at: it is what the shards
 // confirmed.
 func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
@@ -57,7 +57,7 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	if track >= 0 && resp.Total > track {
 		resp.Total, resp.TotalRelation = track, RelationGte
 	}
-	resp.Hits = mergeHits(live, sorts, r.Size)
+	resp.Hits = mergeHits(live, sorts, r.From, r.Size)
 	if r.Size > 0 && len(resp.Hits) == r.Size {
 		resp.Next = slices.Clone(resp.Hits[len(resp.Hits)-1].Sort)
 	}
@@ -109,7 +109,9 @@ func (m *hitMerge) Pop() any {
 	return last
 }
 
-func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
+// mergeHits merges the shards' hits in sort order, skips the first from and returns the
+// next size.
+func mergeHits(rs []*ShardResult, sorts []sortSpec, from, size int) []Hit {
 	if size <= 0 {
 		return nil
 	}
@@ -125,7 +127,11 @@ func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
 	var out []Hit
 	for len(out) < size && m.Len() > 0 {
 		i := m.order[0]
-		out = append(out, m.lists[i][m.pos[i]])
+		if from > 0 {
+			from--
+		} else {
+			out = append(out, m.lists[i][m.pos[i]])
+		}
 		m.pos[i]++
 		if m.pos[i] == len(m.lists[i]) {
 			heap.Pop(m)

@@ -32,7 +32,7 @@ type hit struct {
 	Body json.RawMessage `json:"body,omitempty"`
 }
 
-// search serves POST /indexes/{index}/_search: {query, post_filter, sort, size,
+// search serves POST /indexes/{index}/_search: {query, post_filter, sort, size, from,
 // search_after, track_total, aggs, fields, timeout}. Past the search's timeout, or the
 // request's deadline, the response holds what the shards found by then, with timed_out
 // set.
@@ -55,6 +55,13 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	req, problems := search.ParseRequest(body)
 	if len(problems) > 0 {
 		return Invalid("the search request is invalid", problems...)
+	}
+	if window := req.From + req.Size; window > s.cfg.MaxResultWindow {
+		loc := "from"
+		if req.From == 0 {
+			loc = "size"
+		}
+		return InvalidAt(loc, "the result window is too large: from + size is %d, and max_result_window is %d; page deeper with search_after, passing the previous page's next", window, s.cfg.MaxResultWindow)
 	}
 	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
 	if err != nil {

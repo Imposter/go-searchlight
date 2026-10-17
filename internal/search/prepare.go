@@ -28,7 +28,9 @@ type prepared struct {
 	sorts []sortSpec
 	// after is SearchAfter, typed per sort key; nil when not paging.
 	after []any
-	size  int
+	// size is how many hits the shard returns: From+Size, the page and every hit
+	// before it.
+	size int
 	// need is how many matches the shard must confirm before it may stop verifying
 	// candidates (TrackTotal+1: one past proves "more than"); -1: every one; 0: none.
 	need   int64
@@ -124,6 +126,16 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 	p := &prepared{req: r, mapping: m, size: r.Size, fields: r.Fields}
 	if r.Size < 0 || r.Size > MaxSize {
 		ps.add("size", "size is from 0 to %d", MaxSize)
+	}
+	if r.From != 0 {
+		switch {
+		case r.From < 0 || r.From > MaxResultWindow-max(r.Size, 0):
+			ps.add("from", "from is at least 0, and from + size at most %d", MaxResultWindow)
+		case len(r.SearchAfter) > 0:
+			ps.add("from", "from must be 0 with search_after")
+		case r.Size > 0:
+			p.size += r.From
+		}
 	}
 	switch {
 	case r.TrackTotal == 0:

@@ -247,7 +247,9 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 	return benchShard, benchCorp
 }
 
-// runBench runs next's request b.N times on the shard and reports p50 and p99.
+// runBench runs next's request b.N times on the shard and reports p50 and p99; a
+// request with NoBodies is a query-then-fetch, the page's bodies fetched after the
+// reduce, as the node runs a from.
 func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 	s, _ := openBench(b)
 	rng := rand.New(rand.NewPCG(1, 2))
@@ -269,11 +271,18 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 		start := nanotime()
 		g := s.Acquire()
 		res, err := ExecuteShard(context.Background(), g, r)
+		if err != nil {
+			g.Release()
+			b.Fatal(err)
+		}
+		resp := Reduce(context.Background(), []*ShardResult{res}, r)
+		if r.NoBodies {
+			err = FetchShard(context.Background(), g, resp.Hits, r.Fields)
+		}
 		g.Release()
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp := Reduce(context.Background(), []*ShardResult{res}, r)
 		lat = append(lat, time.Duration(nanotime()-start))
 		total += resp.Total
 		verified += res.Scanned
@@ -384,7 +393,22 @@ func BenchmarkDeepSearchAfterByID(b *testing.B) {
 	})
 }
 
-// BenchmarkTermsAggAll: the top brands and categories over every document.
+// BenchmarkFromDeep: offset paging, from 5000 size 50 by price over every in-stock
+// document, as the node runs it: the shard's best 5,050 without bodies, the reduce
+// dropping the first 5,000, then the page's 50 bodies.
+func BenchmarkFromDeep(b *testing.B) {
+	runBench(b, func(rng *rand.Rand) *Request {
+		return &Request{
+			Query:    leaf("in_stock", query.OpEq, true),
+			Sort:     []SortField{{Field: "price", Desc: rng.IntN(2) == 0}},
+			Size:     50,
+			From:     5000,
+			NoBodies: true,
+		}
+	})
+}
+
+// BenchmarkTermsAggAll:the top brands and categories over every document.
 func BenchmarkTermsAggAll(b *testing.B) {
 	runBench(b, func(_ *rand.Rand) *Request {
 		return &Request{Query: &query.All{}, Aggs: map[string]Agg{

@@ -47,6 +47,11 @@ const (
 	TrackTotalNone = -2
 	// MaxSize is the most hits one request returns.
 	MaxSize = 10_000
+	// MaxResultWindow is the largest From+Size any node takes (its max_result_window,
+	// 10,000 by default as Elasticsearch's index.max_result_window, is at most this):
+	// each shard keeps that many hits of a search in memory, and the coordinator
+	// merges them all.
+	MaxResultWindow = 1_000_000
 	// DefaultSize is the size ParseRequest gives a request that names none, as
 	// Elasticsearch's.
 	DefaultSize = 10
@@ -113,6 +118,13 @@ type Request struct {
 	// Size is how many hits to return, at most MaxSize; 0 returns none (a count, or
 	// aggregations only).
 	Size int
+	// From skips that many hits in sort order, as Elasticsearch's from does: each
+	// shard finds its best From+Size, the reduce merges them and drops the first From,
+	// and only the page's bodies are read. From+Size is at most MaxResultWindow (the
+	// API holds it to the node's max_result_window); a deeper walk pages with
+	// SearchAfter, and From must then be 0. Aggregations count every hit whatever
+	// From is.
+	From int
 	// SearchAfter resumes after a hit: pass the previous page's Response.Next (the
 	// last hit's Sort). Each page runs on the generation current when it runs, so
 	// paging under concurrent writes is stable in this sense: a document that is
@@ -254,10 +266,12 @@ func (ps *problems) add(loc, format string, args ...any) {
 	*ps = append(*ps, query.Problem{Loc: loc, Message: fmt.Sprintf(format, args...)})
 }
 
-// ParseRequest reads a search request body: {query, post_filter, sort, size,
+// ParseRequest reads a search request body: {query, post_filter, sort, size, from,
 // search_after, track_total, aggs, fields, timeout}, Elasticsearch style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
+//   - from: how many hits to skip, 0 with search_after (from+size is at most
+//     MaxResultWindow here; the API holds it to max_result_window);
 //   - track_total: true (exact) or a count;
 //   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
 //     (terms also takes include and exclude, an array of values or a pattern), or
@@ -299,6 +313,12 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				r.Size = n
 			} else {
 				ps.add("size", "size is a whole number from 0 to %d", MaxSize)
+			}
+		case "from":
+			if n, ok := intOf(val); ok && n >= 0 && n <= MaxResultWindow {
+				r.From = n
+			} else {
+				ps.add("from", "from is a whole number from 0 to %d", MaxResultWindow)
 			}
 		case "search_after":
 			var after []any
@@ -347,8 +367,14 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.Timeout = d
 		default:
-			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, search_after, track_total, aggs, fields and timeout")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields and timeout")
 		}
+	}
+	switch {
+	case r.From > 0 && len(r.SearchAfter) > 0:
+		ps.add("from", "from must be 0 with search_after, which already starts the page after its hit")
+	case r.From > 0 && r.From+r.Size > MaxResultWindow:
+		ps.add("from", "from + size is at most %d; page deeper with search_after", MaxResultWindow)
 	}
 	if len(ps) > 0 {
 		return nil, ps

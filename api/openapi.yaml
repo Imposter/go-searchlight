@@ -22,7 +22,8 @@ info:
     buffer is full, or that trails its writes, answers writes with 429 and
     `Retry-After`; so does a node with `search_queue` reads in progress. Every request
     has a deadline (`request_timeout`): a search past it answers what it found with
-    `timed_out`, a wait past it is 504.
+    `timed_out`, a wait past it is 504. A search whose `from + size` passes
+    `max_result_window` is a 400: page deeper with `search_after`.
 
     **Auth.** Bearer tokens from `tokens_file`, read-only or read-write. `/healthz` and
     `/readyz` need none.
@@ -956,7 +957,7 @@ components:
       properties:
         query: { $ref: "#/components/schemas/Query" }
         post_filter:
-          description: A query the hits, total, sort, search_after and next obey once the aggregations are counted; every aggregation but global counts the query's documents.
+          description: A query the hits, total, sort, from, search_after and next obey once the aggregations are counted; every aggregation but global counts the query's documents.
           allOf:
             - $ref: "#/components/schemas/Query"
         sort:
@@ -965,9 +966,14 @@ components:
           maxItems: 16
           items: {}
         size: { type: integer, minimum: 0, maximum: 10000, default: 10 }
+        from:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Hits to skip in sort order, as Elasticsearch's from. from + size is at most the node's max_result_window (10000 by default), else a 400 at from (at size when from is 0); page deeper with search_after. 0 with search_after. The total and the aggregations are the whole search's.
         search_after:
           type: array
-          description: The previous page's next.
+          description: The previous page's next. from must then be 0.
           items: {}
         track_total:
           description: true counts exactly, false not past the hits, a number exactly up to it (default 10000).

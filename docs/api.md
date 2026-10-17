@@ -362,8 +362,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     buckets are never cut), and each aggregation cut says `"truncated": true`. A cut `terms`
     aggregation counts the documents of its cut buckets in `sum_other_doc_count`.
   - A histogram's empty buckets (`min_doc_count` 0) are filled in only while the
-    response stays within 65,536 buckets. A histogram left without them says
-    `"truncated": true`.
+    response stays within 65,536 buckets, and while each bucket's index (intervals from
+    `offset`) is within 2^53 of 0, where a float64 still tells neighbouring buckets apart.
+    A histogram left without them says `"truncated": true`.
   - A value a histogram cannot place in a bucket (its bucket's key overflows a
     float64, or a calendar interval cannot date it) refuses the search as too many
     buckets, rather than drop a counted document from every bucket.

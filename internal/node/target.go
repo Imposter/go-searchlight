@@ -20,12 +20,13 @@ type localTarget struct {
 	c     *copyState
 	g     *shard.Generation
 	stale bool
+	rc    *search.RequestCache // nil: none
 }
 
 var _ ShardTarget = (*localTarget)(nil)
 
 func (t *localTarget) Search(ctx context.Context, r *search.Request) (*search.ShardResult, error) {
-	return search.ExecuteShard(ctx, t.g, r)
+	return t.rc.Search(ctx, t.g, r)
 }
 
 func (t *localTarget) Fetch(ctx context.Context, hits []search.Hit, fields []string) error {
@@ -300,7 +301,7 @@ func (n *Single) localTarget(ctx context.Context, idx *index, c *copyState, wait
 	if err != nil {
 		return nil, err
 	}
-	return &localTarget{c: c, g: g, stale: n.copyStale(c)}, nil
+	return &localTarget{c: c, g: g, stale: n.copyStale(c), rc: n.rcache}, nil
 }
 
 // waitCopy waits, under ctx's deadline, until copy c of idx has seq searchable: a 504

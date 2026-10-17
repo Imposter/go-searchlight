@@ -155,6 +155,11 @@ type Request struct {
 	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
+	// NoRequestCache keeps the search out of the shard request cache
+	// ([RequestCache]), as Elasticsearch's request_cache: false does: each shard
+	// computes its result, and stores none. Only searches with Size 0 are cached in
+	// any case.
+	NoRequestCache bool
 
 	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
 	// ("" reads as aggs).
@@ -268,7 +273,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 }
 
 // ParseRequest reads a search request body: {query, post_filter, sort, size, from,
-// search_after, track_total, aggs, fields, timeout}, Elasticsearch style:
+// search_after, track_total, aggs, fields, timeout, request_cache}, Elasticsearch
+// style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
 //   - from: how many hits to skip, 0 with search_after (from+size is at most
@@ -278,7 +284,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //     (terms also takes include and exclude, an array of values or a pattern), or
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
-//   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
+//   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
+//   - request_cache: false keeps a size-0 search out of the shard request cache.
 //
 // A missing query matches every document, and a missing size is DefaultSize. It
 // returns every problem found, each with its loc ("sort.1",
@@ -360,6 +367,15 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Fields = fields
+		case "request_cache":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				r.NoRequestCache = false
+			case "false":
+				r.NoRequestCache = true
+			default:
+				ps.add("request_cache", "request_cache is true or false")
+			}
 		case "timeout":
 			d, ok := parseTimeout(val)
 			if !ok {
@@ -368,7 +384,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.Timeout = d
 		default:
-			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields and timeout")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout and request_cache")
 		}
 	}
 	switch {

@@ -352,6 +352,17 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
   Past it, the answer holds what was found, with `timed_out: true`.
+- **`request_cache`** (`true` by default), Elasticsearch's shard request cache. A search
+  with `size` 0 (a count, or aggregations only) is answered, shard by shard, from what an
+  identical search of the same shard contents computed, and is computed and stored
+  otherwise. It is keyed by the request (its queries with [date math](#date-math)
+  resolved, its aggregations, `track_total`; not its `timeout`) and by what each shard
+  holds, so a refresh that writes, a delete, a merge or a mapping change misses: a hit
+  is exactly what the search would have computed. `now` is read to the millisecond, so
+  a bound like `now-7d` misses every time, while `now-7d/d` hits all day. `false` keeps
+  the search out of the cache. A search with hits is never cached, nor a result that
+  timed out. `_count` is cached as a size-0 search is. See
+  [the request cache](operations.md#request-cache) for its memory and Redis.
 
 **A facet panel in one search.** Each facet counts under every pick but its own, and
 the hits obey every pick: put the picks in `post_filter`, and make each facet a

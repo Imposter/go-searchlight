@@ -4,6 +4,32 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Added
+
+- **The shard request cache**, Elasticsearch's, for counts and aggregation-only
+  searches ([docs/operations.md](docs/operations.md#request-cache)): a search with
+  `size` 0 is answered shard by shard from an identical search's result over the same
+  shard contents, and stored otherwise. Keys hold the request (date math resolved,
+  never its `timeout`) and what the shard holds, so a refresh that writes, a delete, a
+  merge or a remap misses and no hit is ever stale; concurrent identical searches
+  compute once. A timed-out result is never stored, nor a search with hits.
+  - `request_cache: false` on `_search` keeps a search out of it
+    ([docs/api.md](docs/api.md#search-and-count)). It travels to peers without a new
+    wire level: an older peer has no cache to keep it out of.
+  - In memory, up to `request_cache_size` (128 MiB by default; `0` for none).
+  - Optionally in front of a Redis (`request_cache_redis_url`, with
+    `request_cache_redis_password`, `_prefix`, `_ttl`, `_timeout` and
+    `_max_entry_bytes`; the URL and the password also from `_FILE`), shared by every
+    node and shard copy and kept across restarts. Its entries are keyed by the shard's
+    applied seq, the mark of the change at it, and this binary's version. A Redis that
+    is down or slow fails no search: each call is bounded (50 ms by default), and
+    failures are logged and counted.
+  - Metrics: `searchlight_search_request_cache_lookups_total` (by store and result),
+    `_errors_total`, `_evictions_total`, `_stored_bytes_total`, `_size_bytes` and
+    `_entries`.
+
 ## [1.1.0] - 2026-10-17
 
 Faceting: filter aggregations and `post_filter`, `terms` include and exclude, date math, and `from` paging.

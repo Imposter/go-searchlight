@@ -4,10 +4,10 @@
 //
 // Every setting has one snake_case name, used everywhere: the flag is
 // --<name> and the environment variable is SEARCHLIGHT_<NAME>. A flag wins
-// over the environment, which wins over the default. Secrets (store_url and
-// cluster_token) can also come from a file named by SEARCHLIGHT_<NAME>_FILE,
-// so container secrets never have to sit in the environment. Only store_url
-// is required.
+// over the environment, which wins over the default. Secrets (store_url,
+// cluster_token and the request cache's Redis URL and password) can also come
+// from a file named by SEARCHLIGHT_<NAME>_FILE, so container secrets never have
+// to sit in the environment. Only store_url is required.
 package config
 
 import (
@@ -189,6 +189,26 @@ type Config struct {
 	// it behind a TLS-terminating proxy.
 	TLSCert string
 	TLSKey  string
+
+	// RequestCacheSize bounds the shard request cache in memory: the shard results
+	// of size-0 searches (counts, aggregations), kept until what the shard holds
+	// changes. 0 keeps none in memory.
+	RequestCacheSize int64
+	// RequestCacheRedisURL, when set, puts a Redis behind the memory cache
+	// (redis://[user:password@]host:port[/db], or rediss:// for TLS), shared by every
+	// node that reaches it and kept across restarts.
+	RequestCacheRedisURL string
+	// RequestCacheRedisPassword, when set, replaces the URL's password.
+	RequestCacheRedisPassword string
+	// RequestCacheRedisPrefix starts every key the cache writes to Redis.
+	RequestCacheRedisPrefix string
+	// RequestCacheRedisTTL is how long a Redis entry lives.
+	RequestCacheRedisTTL time.Duration
+	// RequestCacheRedisTimeout bounds each Redis dial, read and write: a slow or
+	// unreachable Redis delays a search by at most about this much.
+	RequestCacheRedisTimeout time.Duration
+	// RequestCacheRedisMaxEntryBytes is the largest encoded result written to Redis.
+	RequestCacheRedisMaxEntryBytes int64
 }
 
 // MaxBodyLimit is the largest max_body_bytes: 32 MiB less 1 KiB, so a body
@@ -241,6 +261,12 @@ func Default() Config {
 		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               128 << 20,
+		RequestCacheRedisPrefix:        "searchlight:rc:",
+		RequestCacheRedisTTL:           24 * time.Hour,
+		RequestCacheRedisTimeout:       50 * time.Millisecond,
+		RequestCacheRedisMaxEntryBytes: 8 << 20,
 	}
 }
 
@@ -583,6 +609,59 @@ var settings = []setting{
 		parse:  func(c *Config, v string) error { c.TLSKey = v; return nil },
 		format: func(c *Config) string { return c.TLSKey },
 	},
+	{
+		name: "request_cache_size", usage: "memory for the shard request cache of size-0 searches, e.g. 128MiB (0 = none in memory)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.RequestCacheSize = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.RequestCacheSize) },
+	},
+	{
+		name: "request_cache_redis_url", secret: true, usage: "Redis behind the request cache, shared by the nodes (redis:// or rediss://; empty = memory only)",
+		parse:  func(c *Config, v string) error { c.RequestCacheRedisURL = v; return nil },
+		format: func(c *Config) string { return c.RequestCacheRedisURL },
+		display: func(c *Config) string {
+			if u, err := url.Parse(c.RequestCacheRedisURL); err == nil {
+				return u.Redacted()
+			}
+			return redacted(c.RequestCacheRedisURL)
+		},
+	},
+	{
+		name: "request_cache_redis_password", secret: true, usage: "Redis password, in place of the URL's",
+		parse:   func(c *Config, v string) error { c.RequestCacheRedisPassword = v; return nil },
+		format:  func(c *Config) string { return c.RequestCacheRedisPassword },
+		display: func(c *Config) string { return redacted(c.RequestCacheRedisPassword) },
+	},
+	{
+		name: "request_cache_redis_prefix", usage: "prefix of every request cache key in Redis",
+		parse:  func(c *Config, v string) error { c.RequestCacheRedisPrefix = v; return nil },
+		format: func(c *Config) string { return c.RequestCacheRedisPrefix },
+	},
+	{
+		name: "request_cache_redis_ttl", usage: "how long a request cache entry lives in Redis",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestCacheRedisTTL, v) },
+		format: func(c *Config) string { return c.RequestCacheRedisTTL.String() },
+	},
+	{
+		name: "request_cache_redis_timeout", usage: "bound of each Redis dial, read and write (a slow Redis delays a search by about this much)",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestCacheRedisTimeout, v) },
+		format: func(c *Config) string { return c.RequestCacheRedisTimeout.String() },
+	},
+	{
+		name: "request_cache_redis_max_entry_bytes", usage: "largest encoded shard result written to Redis, e.g. 8MiB",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			if err == nil && n == 0 {
+				return fmt.Errorf("want a positive byte size such as 8MiB, got %q", v)
+			}
+			c.RequestCacheRedisMaxEntryBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.RequestCacheRedisMaxEntryBytes) },
+	},
 }
 
 // Load builds the configuration from the command-line arguments (without the
@@ -732,6 +811,13 @@ func (c *Config) validate() []error {
 			errs = append(errs, fmt.Errorf("%s: want at least max_body_bytes times inflight_amplification (%d), got %d", b.name, floor, b.n))
 		}
 	}
+	if c.RequestCacheRedisURL != "" {
+		if err := validRedisURL(c.RequestCacheRedisURL); err != nil {
+			errs = append(errs, fmt.Errorf("request_cache_redis_url: %w", err))
+		}
+	} else if c.RequestCacheRedisPassword != "" {
+		errs = append(errs, errors.New("request_cache_redis_password: is set without request_cache_redis_url"))
+	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		errs = append(errs, errors.New("tls_cert: tls_cert and tls_key are set together"))
 	}
@@ -743,6 +829,27 @@ func (c *Config) validate() []error {
 		}
 	}
 	return errs
+}
+
+// validRedisURL checks request_cache_redis_url's shape, without quoting it: it may
+// hold a password.
+func validRedisURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("is not a valid URL")
+	}
+	if s := strings.ToLower(u.Scheme); s != "redis" && s != "rediss" {
+		return fmt.Errorf("scheme must be redis or rediss, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("names no host (redis://host:port/db)")
+	}
+	if db := strings.Trim(u.Path, "/"); db != "" {
+		if n, err := strconv.Atoi(db); err != nil || n < 0 {
+			return fmt.Errorf("the path is the database number, got %q", db)
+		}
+	}
+	return nil
 }
 
 // validStoreURL checks store_url's shape. An unparsable URL is reported without
@@ -817,7 +924,7 @@ func Usage(w io.Writer) {
 	def := Default()
 	fmt.Fprintf(w, "Usage: searchlight [--setting=value ...]\n\n")
 	fmt.Fprintf(w, "Each setting is a flag or a %s* environment variable; flags win.\n", EnvPrefix)
-	fmt.Fprintf(w, "store_url and cluster_token may also be read from <VAR>_FILE.\n\n")
+	fmt.Fprintf(w, "store_url, cluster_token, request_cache_redis_url and request_cache_redis_password may also be read from <VAR>_FILE.\n\n")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "SETTING\tENVIRONMENT\tDEFAULT\tMEANING")
 	for i := range settings {

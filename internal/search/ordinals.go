@@ -682,7 +682,8 @@ func (p *buildPool) promote(w *poolWaiter) {
 	p.mu.Unlock()
 }
 
-// ordsBuilding counts the builds in flight, for tests to wait on.
+// ordsBuilding counts the builds in flight, for tests to wait on. A build leaves it
+// before it releases its generation.
 var ordsBuilding atomic.Int64
 
 // ordsCache is the LRU of global ordinals, by shard, field, kind and segment list.
@@ -937,8 +938,10 @@ func (c *ordsCache) start(el *list.Element, e *ordsEntry, g *shard.Generation, p
 			}
 			cancel()
 			c.finish(el, e, ords)
-			release()
+			// Counted out before the generation is let go: a shard's Close, which waits
+			// for release, then never returns with the build still counted.
 			ordsBuilding.Add(-1)
+			release()
 		}()
 		if prev != nil {
 			select {

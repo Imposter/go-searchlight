@@ -112,6 +112,9 @@ const (
 	MetricSearchFilterCacheLooks = "searchlight.search.filter_cache.lookups"
 	MetricSearchDocsScanned      = "searchlight.search.documents.scanned"
 	MetricSearchDocsMatched      = "searchlight.search.documents.matched"
+	MetricSearchOrdinalsBuilds   = "searchlight.search.ordinals.builds"
+	MetricSearchOrdinalsDuration = "searchlight.search.ordinals.build.duration"
+	MetricSearchOrdinalsLookups  = "searchlight.search.ordinals.lookups"
 
 	// Percolation.
 	MetricPercolateDuration      = "searchlight.percolate.duration"
@@ -190,6 +193,9 @@ var Catalog = []MetricSpec{
 	{MetricSearchFilterCacheLooks, KindCounter, "{lookup}", "Filter cache lookups by index and result (hit or miss).", nil},
 	{MetricSearchDocsScanned, KindCounter, "{document}", "Documents a shard search checked one at a time (residual verification), by index.", nil},
 	{MetricSearchDocsMatched, KindCounter, "{document}", "Documents a shard search matched, by index.", nil},
+	{MetricSearchOrdinalsBuilds, KindCounter, "{build}", "Global ordinals builds, by kind (full or incremental), trigger (search or warm) and result (done or cancelled).", nil},
+	{MetricSearchOrdinalsDuration, KindHistogram, "s", "Global ordinals build time, by kind (full or incremental) and trigger (search or warm).", SlowBuckets},
+	{MetricSearchOrdinalsLookups, KindCounter, "{lookup}", "Global ordinals cache lookups by result: hit (built), shared (a build in progress joined) or miss (a build started).", nil},
 
 	{MetricPercolateDuration, KindHistogram, "s", "Percolation time per document by phase (probe, verify) and index.", FastBuckets},
 	{MetricPercolateCandidates, KindHistogram, "{query}", "Candidate queries per percolated document, by index.", CountBuckets},

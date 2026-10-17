@@ -4,6 +4,23 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Global ordinals survive refreshes.** A refresh's or merge's new segment list
+  derives a field's global ordinals from the old list's (the kept segments' maps
+  renumbered, the new segments' terms looked up and inserted), exactly as a full
+  build would make them, when that is cheaper than merging every dictionary again;
+  after each refresh or merge the fields aggregated in the last 10 minutes are
+  rebuilt in the background, a few at a time and cancelled when the shard closes. A
+  build runs once for every search asking, detached from them: one cut short by a
+  search's deadline finishes and is cached for the next search instead of being
+  thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
+  metrics: `searchlight_search_ordinals_builds_total`,
+  `searchlight_search_ordinals_build_duration_seconds` and
+  `searchlight_search_ordinals_lookups_total`.
+
 ## [1.1.0] - 2026-10-17
 
 Faceting: filter aggregations and `post_filter`, `terms` include and exclude, date math, and `from` paging.

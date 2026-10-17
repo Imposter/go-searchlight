@@ -89,8 +89,23 @@ func newCluster(t testing.TB, n int) *cluster {
 		for _, s := range c.shards {
 			_ = s.Close(context.Background())
 		}
+		waitOrdsIdle(t)
 	})
 	return c
+}
+
+// waitOrdsIdle waits until no global ordinals build runs: a build holds its
+// generation's segments mapped, which Windows will not let a test's directory be
+// removed under. A closed shard cancels its builds.
+func waitOrdsIdle(t testing.TB) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); ordsBuilding.Load() > 0; {
+		if time.Now().After(deadline) {
+			t.Errorf("%d global ordinals builds still running", ordsBuilding.Load())
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (c *cluster) route(id string) int {

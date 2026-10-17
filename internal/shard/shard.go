@@ -230,6 +230,11 @@ type Options struct {
 	Logger *slog.Logger
 	Tracer trace.Tracer
 	Meter  metric.Meter
+	// Published, when set, is called with each generation a refresh or merge publishes
+	// (new segments or new deletes), once it is current, under the shard's commit lock: it
+	// must not block, and takes its own reference ([Generation.Retain]) to use the
+	// generation past the call. Search uses it to warm caches kept per segment list.
+	Published func(*Generation)
 
 	// hooks are test kill points; nil outside tests.
 	hooks *testHooks

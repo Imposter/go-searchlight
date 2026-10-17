@@ -441,7 +441,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	n := len(g.Segments)
 	p.segments = n
-	loadOrds(g, p)
+	loadOrds(ctx, g, p)
 	results := make([]segResult, n)
 	if err := runParallel(n, func(i int) { results[i] = runSegment(ctx, p, g, i) }); err != nil {
 		return fail(err, "segment panicked")

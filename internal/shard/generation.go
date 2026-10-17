@@ -1,6 +1,7 @@
 package shard
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -253,6 +254,20 @@ func (g *Generation) tryRef() bool {
 			return true
 		}
 	}
+}
+
+// Retain adds a reference to a generation the caller holds, for work that outlives the
+// caller's hold (a background build over its segments): false when the generation is
+// already retired. Each true is dropped with its own Release.
+func (g *Generation) Retain() bool { return g.tryRef() }
+
+// Context is the lifetime of the generation's shard: done once the shard shuts down
+// (Close or Abandon), for background work over the generation to stop.
+func (g *Generation) Context() context.Context {
+	if g.shard == nil || g.shard.bg == nil {
+		return context.Background()
+	}
+	return g.shard.bg
 }
 
 // Release drops the reference Acquire gave. The generation, and every bitmap and

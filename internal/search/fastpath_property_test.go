@@ -727,7 +727,7 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	g := c.shards[0].Acquire()
 	key := ordsKey(g, "brand", false)
 	g.Release()
-	if globalOrdsCache.cached(key) != nil {
+	if globalOrdsCache.cached(context.Background(), key) != nil {
 		t.Fatal("a one-hit cardinality built global ordinals")
 	}
 	t.Logf("one hit of %d unique terms: %v", n+1, took)
@@ -735,7 +735,7 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	if _, err := c.search(dense); err != nil {
 		t.Fatal(err)
 	}
-	if globalOrdsCache.cached(key) == nil {
+	if globalOrdsCache.cached(context.Background(), key) == nil {
 		t.Fatal("a match-all cardinality built no global ordinals")
 	}
 }

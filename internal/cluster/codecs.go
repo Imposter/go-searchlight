@@ -56,8 +56,8 @@ func (n *Node) everyNodeReadsCodecs(v *view) bool {
 		return ok && nd.BodyCodecs >= store.BodyCodecs
 	}
 	fence := n.opts.DeadAfter + n.opts.LeaseTTL
-	for _, nd := range v.nodes {
-		if !reads(nd.ID) && nd.HeartbeatAge <= fence {
+	for id := range v.nodes {
+		if nd := v.nodes[id]; !reads(nd.ID) && nd.HeartbeatAge <= fence {
 			return false
 		}
 	}

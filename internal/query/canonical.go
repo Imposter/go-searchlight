@@ -28,7 +28,9 @@ import (
 //     contains_any, contains_all, words_any, words_all: each is a set) is sorted and
 //     deduplicated after normalizing. between's [lo, hi] is ordered and keeps its
 //     shape, and so does similar's {text, min}, whose members are encoded by name.
-//   - Date math (a string bound of lt, lte, gt, gte or between) encodes parsed
+//   - box encodes each axis's ends in order (x's lower and upper, then y's), each
+//     absent or its inclusiveness and bound.
+//   - Date math (a string bound of lt, lte, gt, gte, between or box) encodes parsed
 //     ([ParseDateMath]), never normalized: now-1M (a month) and now-1m (a minute)
 //     differ. The expression is kept, not resolved, so a saved query's form is the same
 //     at every instant; a search resolves its query ([Resolve]) before it is planned,
@@ -109,6 +111,7 @@ const (
 	valNever // a condition that never holds
 	valDate  // date math, parsed (a string that is none: valText)
 	valText  // a string as written, not normalized
+	valBox   // box's bounds: per axis, per end, absent or (inclusive, bound)
 )
 
 // appendLeafValue appends a leaf's value, canonically: {exists} and {exists: true}
@@ -125,6 +128,9 @@ func appendLeafValue(buf []byte, l *Leaf) []byte {
 	}
 	if IsDateMathOp(l.Op) && hasDateText(&a) {
 		return appendDateValue(buf, &a)
+	}
+	if l.Op == OpBox && a.Kind == ArgBox && a.Box != nil {
+		return appendBox(buf, a.Box)
 	}
 	switch a.Kind {
 	case ArgBool, ArgNumber, ArgString:
@@ -244,6 +250,28 @@ func appendDateValue(buf []byte, a *Arg) []byte {
 	buf = binary.AppendUvarint(buf, uint64(len(a.List)))
 	for i := range a.List {
 		buf = appendDateBound(buf, &a.List[i])
+	}
+	return buf
+}
+
+// appendBox appends a box's bounds: per axis (x, y) and end (lower, upper), 0 for
+// none, or 1, whether it is inclusive, and the bound, a number or date math parsed.
+func appendBox(buf []byte, b *Box) []byte {
+	buf = append(buf, valBox)
+	for _, iv := range b.Axes() {
+		for _, end := range []*Bound{&iv.Lo, &iv.Hi} {
+			if !end.Set {
+				buf = append(buf, 0)
+				continue
+			}
+			buf = append(buf, 1)
+			if end.Inclusive {
+				buf = append(buf, 1)
+			} else {
+				buf = append(buf, 0)
+			}
+			buf = appendDateBound(buf, &end.Value)
+		}
 	}
 	return buf
 }

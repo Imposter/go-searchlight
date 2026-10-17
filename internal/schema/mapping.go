@@ -29,6 +29,15 @@ const (
 	Bool
 	// Date is Unix milliseconds, given as a number or an RFC 3339 string.
 	Date
+
+	// The point types: a list of [x, y] pairs, each axis a number or a date, as
+	// Elasticsearch's point field and Lucene's XYPoint, for box queries. A mapping writes
+	// one as {"type": "point", "x": "number", "y": "date"}; [PointType] makes one and
+	// [FieldType.Axes] reads its axes back.
+	pointNumberNumber
+	pointNumberDate
+	pointDateNumber
+	pointDateDate
 )
 
 var typeNames = [...]string{
@@ -40,33 +49,87 @@ var typeNames = [...]string{
 	Date:        "date",
 }
 
-// Valid reports whether t is one of the field types.
-func (t FieldType) Valid() bool {
-	return t >= Keyword && t <= Date
+// PointTypeName is how a mapping names a point field's type.
+const PointTypeName = "point"
+
+// PointType returns the point type of axes x and y, each [Number] or [Date]; 0 (no type)
+// for any other axis.
+func PointType(x, y FieldType) FieldType {
+	axis := func(t FieldType) (FieldType, bool) {
+		switch t {
+		case Number:
+			return 0, true
+		case Date:
+			return 1, true
+		}
+		return 0, false
+	}
+	xi, okX := axis(x)
+	yi, okY := axis(y)
+	if !okX || !okY {
+		return 0
+	}
+	return pointNumberNumber + 2*xi + yi
 }
 
-// String returns the type's name as a mapping spells it ("keyword", "keyword_list", ...).
+// IsPoint reports whether t is a point type.
+func (t FieldType) IsPoint() bool { return t >= pointNumberNumber && t <= pointDateDate }
+
+// Axes returns a point type's axes, each [Number] or [Date]; (0, 0) for any other type.
+func (t FieldType) Axes() (x, y FieldType) {
+	if !t.IsPoint() {
+		return 0, 0
+	}
+	i := t - pointNumberNumber
+	axis := func(bit FieldType) FieldType {
+		if bit != 0 {
+			return Date
+		}
+		return Number
+	}
+	return axis(i & 2), axis(i & 1)
+}
+
+// Valid reports whether t is one of the field types.
+func (t FieldType) Valid() bool {
+	return t >= Keyword && t <= pointDateDate
+}
+
+// String returns the type's name as a mapping spells it ("keyword", "keyword_list", ...),
+// and a point type as point(x, y) with its axes' names: point(number, date).
 func (t FieldType) String() string {
-	if !t.Valid() {
+	switch {
+	case t.IsPoint():
+		x, y := t.Axes()
+		return fmt.Sprintf("%s(%s, %s)", PointTypeName, x, y)
+	case !t.Valid():
 		return fmt.Sprintf("FieldType(%d)", uint8(t))
 	}
 	return typeNames[t]
 }
 
-// ParseFieldType returns the type a mapping names.
+// fieldTypesHint lists the types a mapping names, for errors.
+var fieldTypesHint = strings.Join(typeNames[Keyword:], ", ") + `, or {"type": "point", "x": "number"|"date", "y": "number"|"date"}`
+
+// ParseFieldType returns the type a mapping names as a string: every type but a point,
+// which a mapping writes as an object ([FieldType.UnmarshalJSON]).
 func ParseFieldType(name string) (FieldType, error) {
 	for t := Keyword; t <= Date; t++ {
 		if typeNames[t] == name {
 			return t, nil
 		}
 	}
-	return 0, fmt.Errorf("unknown field type %q: use one of %s", name, strings.Join(typeNames[Keyword:], ", "))
+	if name == PointTypeName {
+		return 0, fmt.Errorf(`a point field names its axes: {"type": "point", "x": "number"|"date", "y": "number"|"date"}`)
+	}
+	return 0, fmt.Errorf("unknown field type %q: use one of %s", name, fieldTypesHint)
 }
 
-// MarshalText implements encoding.TextMarshaler.
+// MarshalText implements encoding.TextMarshaler, for every type but a point, which has
+// no text form ([FieldType.MarshalJSON] writes it).
 func (t FieldType) MarshalText() ([]byte, error) {
-	if !t.Valid() {
-		return nil, fmt.Errorf("invalid field type %d", uint8(t))
+	if !t.Valid() || t.IsPoint() {
+		return nil, fmt.Errorf("field type %s has no text form", t)
 	}
 	return []byte(typeNames[t]), nil
 }
@@ -78,6 +141,64 @@ func (t *FieldType) UnmarshalText(text []byte) error {
 		return err
 	}
 	*t = parsed
+	return nil
+}
+
+// pointJSON is a point type as a mapping writes it.
+type pointJSON struct {
+	Type string `json:"type"`
+	X    string `json:"x"`
+	Y    string `json:"y"`
+}
+
+// MarshalJSON writes a type's name as a string, and a point type as
+// {"type": "point", "x": "number"|"date", "y": "number"|"date"}.
+func (t FieldType) MarshalJSON() ([]byte, error) {
+	if t.IsPoint() {
+		x, y := t.Axes()
+		return json.Marshal(pointJSON{Type: PointTypeName, X: x.String(), Y: y.String()})
+	}
+	text, err := t.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(string(text))
+}
+
+// UnmarshalJSON reads what MarshalJSON writes. A point type's object holds type, x
+// and y, nothing else, each axis "number" or "date".
+func (t *FieldType) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || data[0] != '{' {
+		var name string
+		if err := json.Unmarshal(data, &name); err != nil {
+			return fmt.Errorf("a field type is a name (%s)", fieldTypesHint)
+		}
+		return t.UnmarshalText([]byte(name))
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var p pointJSON
+	if err := dec.Decode(&p); err != nil {
+		return fmt.Errorf(`a point type is {"type": "point", "x": "number"|"date", "y": "number"|"date"}: %w`, err)
+	}
+	if p.Type != PointTypeName {
+		return fmt.Errorf(`a field type written as an object is a point, {"type": "point", ...}, not %q`, p.Type)
+	}
+	var axes [2]FieldType
+	for i, name := range []string{p.X, p.Y} {
+		switch name {
+		case "number":
+			axes[i] = Number
+		case "date":
+			axes[i] = Date
+		case "":
+			return fmt.Errorf(`a point type needs its %s axis: "number" or "date"`, []string{"x", "y"}[i])
+		default:
+			return fmt.Errorf(`a point's %s axis is "number" or "date", not %q`, []string{"x", "y"}[i], name)
+		}
+	}
+	*t = PointType(axes[0], axes[1])
 	return nil
 }
 

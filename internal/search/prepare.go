@@ -259,6 +259,10 @@ func prepareSorts(fields []SortField, m *schema.Mapping, ps *problems) []sortSpe
 			continue
 		}
 		spec := sortSpec{field: f.Field, desc: f.Desc}
+		if t := fieldType(m, f.Field); t.IsPoint() {
+			ps.add(fmt.Sprintf("sort.%d", i), "cannot sort on %q: a point field has many points of two coordinates", f.Field)
+			continue
+		}
 		switch f.Field {
 		case IDField:
 			spec.kind = sortID
@@ -346,6 +350,10 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 	wrapper := singleBucket(a.Type)
 	if a.Field == "" && !wrapper {
 		ps.add(at+".field", "an aggregation needs a field")
+		return nil
+	}
+	if s.ftype.IsPoint() && !wrapper {
+		ps.add(at+".field", "%q is a point field: no aggregation takes one (filter on it with box, in a filter aggregation)", a.Field)
 		return nil
 	}
 	isMetric := metricType(a.Type)

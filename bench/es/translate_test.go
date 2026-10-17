@@ -105,7 +105,14 @@ func TestTranslateQueryGolden(t *testing.T) {
 	golden(t, "queries", got)
 }
 
-// TestEveryOpTranslated checks that the golden cases cover every Searchlight operator.
+// untranslatedOps are the operators no dataset field takes, so no benchmark sends them
+// to Elasticsearch, with why.
+var untranslatedOps = map[string]string{
+	query.OpBox: "box takes a point field, which no dataset holds",
+}
+
+// TestEveryOpTranslated checks that the golden cases cover every Searchlight operator
+// but untranslatedOps.
 func TestEveryOpTranslated(t *testing.T) {
 	seen := map[string]bool{}
 	for _, c := range queryCases {
@@ -121,7 +128,7 @@ func TestEveryOpTranslated(t *testing.T) {
 		})
 	}
 	for _, op := range query.Ops {
-		if !seen[op] {
+		if _, skip := untranslatedOps[op]; !seen[op] && !skip {
 			t.Errorf("no golden case translates %s", op)
 		}
 	}
@@ -135,6 +142,7 @@ func TestTranslateRefusals(t *testing.T) {
 		`{"field": "_id", "op": "starts_with", "value": "p"}`,
 		`{"field": "title", "op": "similar", "value": {"text": "drill", "min": 0.5}}`, // no doc values
 		`{"bogus": 1}`,
+		`{"field": "price", "op": "box", "value": {"x": {"gte": 1}}}`, // no point field
 	} {
 		if _, err := tr.ParseQuery([]byte(q)); err == nil {
 			t.Errorf("%s was translated; want an error", q)

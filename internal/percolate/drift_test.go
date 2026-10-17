@@ -19,6 +19,7 @@ var opSamples = map[string]string{
 	query.OpStartsWith: `"ab"`, query.OpWordsAll: `["a b"]`, query.OpWordsAny: `["a b"]`,
 	query.OpSimilar: `{"text":"abc","min":0.5}`,
 	query.OpHas:     `"a"`, query.OpHasAny: `["a"]`, query.OpHasAll: `["a"]`,
+	query.OpBox: `{"x":{"gte":1},"y":{"lt":5}}`,
 }
 
 // unanchorableOps are the ops the positive generator leaves out: they never anchor.

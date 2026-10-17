@@ -11,6 +11,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/node/nodetest"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -39,6 +40,8 @@ func (p *restartingPeer) Allocate(ctx context.Context, index string) error {
 }
 
 func (*restartingPeer) CopyStopped(store.Copy, error) {}
+
+func (*restartingPeer) AdmitFields(context.Context, map[string]schema.FieldType) error { return nil }
 
 func (*restartingPeer) Counts(context.Context, store.ShardID) (uint64, uint64, error) {
 	return 0, 0, errors.New("no peer")

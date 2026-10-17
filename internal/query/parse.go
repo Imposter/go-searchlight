@@ -258,6 +258,9 @@ func decodeArg(v any, op string, at func(sub ...string) string, ps *problems) Ar
 		}
 		return Arg{Kind: ArgList, List: list}
 	case map[string]any:
+		if op == OpBox {
+			return decodeBox(x, at, ps)
+		}
 		keys := slices.Sorted(maps.Keys(x))
 		switch {
 		case op == OpSimilar:
@@ -297,6 +300,63 @@ func decodeArg(v any, op string, at func(sub ...string) string, ps *problems) Ar
 		}
 		return Arg{Kind: s.Kind, Scalar: s}
 	}
+}
+
+// decodeBox decodes box's value: {"x": axis, "y": axis}, either one optional, each
+// axis an object of at most one lower bound (gt or gte) and one upper (lt or lte),
+// each a number or a string.
+func decodeBox(m map[string]any, at func(sub ...string) string, ps *problems) Arg {
+	box := &Box{}
+	for _, key := range slices.Sorted(maps.Keys(m)) {
+		var iv *Interval
+		switch key {
+		case BoxX:
+			iv = &box.X
+		case BoxY:
+			iv = &box.Y
+		default:
+			ps.addf(at(key), "unknown key %q: box takes {x, y}, each {gt|gte, lt|lte}", key)
+			continue
+		}
+		axis, ok := m[key].(map[string]any)
+		if !ok {
+			ps.addf(at(key), "box's %s is an object of bounds: {gt|gte, lt|lte}", key)
+			continue
+		}
+		if len(axis) == 0 {
+			ps.addf(at(key), "box's %s needs a bound (gt, gte, lt or lte): leave %s out for no bound", key, key)
+			continue
+		}
+		for _, side := range slices.Sorted(maps.Keys(axis)) {
+			b, upper := &iv.Lo, false
+			switch side {
+			case BoxGt, BoxGte:
+			case BoxLt, BoxLte:
+				b, upper = &iv.Hi, true
+			default:
+				ps.addf(at(key, side), "unknown bound %q: an axis takes gt or gte, and lt or lte", side)
+				continue
+			}
+			if b.Set {
+				which := "gt or gte"
+				if upper {
+					which = "lt or lte"
+				}
+				ps.addf(at(key, side), "box's %s takes %s, not both", key, which)
+				continue
+			}
+			s, ok := scalar(axis[side])
+			if !ok || s.Kind == ArgBool {
+				ps.add(at(key, side), "a box bound is a number, or on a date axis a date or date math")
+				continue
+			}
+			if msg := s.problem(); msg != "" {
+				ps.add(at(key, side), msg)
+			}
+			*b = Bound{Set: true, Inclusive: side == BoxGte || side == BoxLte, Value: s}
+		}
+	}
+	return Arg{Kind: ArgBox, Box: box}
 }
 
 // scalar decodes one bool, number or string; false for anything else. A Go number, as

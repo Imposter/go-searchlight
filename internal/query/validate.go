@@ -28,7 +28,7 @@ const maxNamedFields = 20
 //     non-blank text for contains, starts_with and has (one entry, so no comma); a
 //     non-empty list of non-blank texts for contains_*, has_* and words_* (each of a
 //     words_* list holding a word); {text, min} with a non-blank text and
-//     0 < min <= 1 for similar;
+//     0 < min <= 1 for similar; for box on a point field, x and y bounds ([boxProblem]);
 //
 // and, as [Parse] checks them, the tree's shape and bounds and every text's length and
 // NUL, so a tree built by hand is held to the same rules. Problems are in tree order; a
@@ -105,6 +105,12 @@ func checkLeaf(ps *problems, loc string, l *Leaf, m *schema.Mapping) {
 	}
 	if msg := boundedProblem(&a); msg != "" {
 		ps.add(at, msg)
+		return
+	}
+	if l.Op == OpBox {
+		if sub, msg := boxProblem(&a, t); msg != "" {
+			ps.add(at+sub, msg)
+		}
 		return
 	}
 	if t == schema.Date && IsDateMathOp(l.Op) {
@@ -198,7 +204,87 @@ func boundedProblem(a *Arg) string {
 			return msg
 		}
 	}
+	if a.Kind == ArgBox {
+		for _, s := range a.BoundScalars() {
+			if msg := s.problem(); msg != "" {
+				return msg
+			}
+		}
+	}
 	return ""
+}
+
+// boxProblem is why a is not what box takes on a point field of type t, and the loc
+// below the value it is at; "" when it is. Each axis's bounds are numbers, or on a date
+// axis numbers or date math ([ParseDateMath]); an axis whose bounds leave no value
+// between them at every now (neither reads now, or both are now plus a fixed length)
+// is refused, as between's lo past its hi is.
+func boxProblem(a *Arg, t schema.FieldType) (string, string) {
+	if a.Kind != ArgBox || a.Box == nil {
+		return "", `box needs {"x": {"gte": lo, "lt": hi}, "y": {...}}: gt or gte and lt or lte per axis, either axis optional`
+	}
+	xAxis, yAxis := t.Axes()
+	for i, iv := range a.Box.Axes() {
+		name, axis := BoxX, xAxis
+		if i == 1 {
+			name, axis = BoxY, yAxis
+		}
+		var ends [2]float64
+		relative, constant := 0, 0
+		for j, b := range []*Bound{&iv.Lo, &iv.Hi} {
+			if !b.Set {
+				continue
+			}
+			sub := "." + name + "." + boundKey(b, j == 1)
+			s := &b.Value
+			switch {
+			case s.Kind == ArgString && axis == schema.Date:
+				d, why := checkDateMath(s.Text)
+				if why != "" {
+					return sub, why
+				}
+				ms, _ := d.Resolve(0, b.RoundsUp(j == 1))
+				ends[j] = float64(ms)
+				if d.Relative() {
+					relative++
+				}
+				if d.constantOffset() {
+					constant++
+				}
+			case s.Kind == ArgString:
+				return sub, fmt.Sprintf("%s is a number axis: its bounds are numbers; date math is for a date axis", name)
+			case s.Kind != ArgNumber || !s.Finite:
+				if axis == schema.Date {
+					return sub, "a box bound on a date axis is a number (Unix milliseconds), a date or date math"
+				}
+				return sub, "a box bound is a finite number"
+			default:
+				ends[j] = s.Number
+			}
+		}
+		if iv.Lo.Set && iv.Hi.Set && (relative == 0 || constant == 2) {
+			lo, hi := ends[0], ends[1]
+			if lo > hi || lo == hi && (!iv.Lo.Inclusive || !iv.Hi.Inclusive) {
+				return "." + name, fmt.Sprintf("box's %s holds no value: its lower bound is not below its upper", name)
+			}
+		}
+	}
+	return "", ""
+}
+
+// boundKey is how a box value names bound b: gt or gte for a lower bound, lt or lte
+// for an upper.
+func boundKey(b *Bound, upper bool) string {
+	switch {
+	case upper && b.Inclusive:
+		return BoxLte
+	case upper:
+		return BoxLt
+	case b.Inclusive:
+		return BoxGte
+	default:
+		return BoxGt
+	}
 }
 
 // sortOf is what a value compared with a field of type t is: "number", "bool" or "text".

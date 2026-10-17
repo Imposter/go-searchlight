@@ -56,7 +56,7 @@ func TestNoRequestCacheOnTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.NoRequestCache || back.Needs != searchLevel {
-		t.Fatalf("a min search: NoRequestCache %v, needs level %d (want %d)", r.NoRequestCache, back.Needs, searchLevel)
+	if !r.NoRequestCache || back.Needs != levelMetrics {
+		t.Fatalf("a min search: NoRequestCache %v, needs level %d (want %d)", r.NoRequestCache, back.Needs, levelMetrics)
 	}
 }

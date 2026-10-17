@@ -2,6 +2,7 @@ package segment
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sync/atomic"
 
@@ -18,6 +19,7 @@ type fieldInfo struct {
 	keywordCol    *keywordColumn
 	multiCol      *multiColumn
 	numberCol     *numberColumn
+	xy            *xyIndex
 
 	// v3Marks and v3Truncated split a format-3 field's truncated bitmap, at Open.
 	v3Marks, v3Truncated *roaring.Bitmap
@@ -96,6 +98,11 @@ func openData(path string, data []byte) (*Reader, error) {
 	}
 	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
+	}
+	if sec, ok := footer.sections[sectionXY]; ok {
+		if err := r.openXYSection(sec); err != nil {
+			return nil, &CorruptError{Path: path, Section: "xy", Reason: err.Error()}
+		}
 	}
 	cache, err := newStoredCache(&r.stored)
 	if err != nil {
@@ -610,4 +617,38 @@ func (r *Reader) Close() error {
 		return nil
 	}
 	return r.m.release()
+}
+
+// openXYSection reads the XY section's directory and opens every point field's tree. A
+// tree names a field of META, at most once.
+func (r *Reader) openXYSection(sec sectionEntry) error {
+	if sec.n < 8 {
+		return errShort
+	}
+	dirOff := binary.LittleEndian.Uint64(r.data[sec.off+sec.n-8:])
+	if dirOff > sec.n-8 {
+		return errShort
+	}
+	d := decoder{b: r.data[sec.off+dirOff : sec.off+sec.n-8]}
+	count := d.u32()
+	for range count {
+		name := d.bytes(d.uvarint())
+		off := d.u64()
+		if d.err != nil {
+			return d.err
+		}
+		fi := r.fields[string(name)]
+		if fi == nil || fi.xy != nil || off >= dirOff {
+			return errors.New("the directory names a field twice, or one META does not")
+		}
+		t, err := openXY(r.data[:sec.off+dirOff], sec.off+off, r.numDocs)
+		if err != nil {
+			return err
+		}
+		fi.xy = t
+	}
+	if d.err != nil || d.pos != len(d.b) {
+		return errShort
+	}
+	return nil
 }

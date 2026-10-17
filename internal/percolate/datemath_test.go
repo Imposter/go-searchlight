@@ -333,8 +333,8 @@ func TestOlderBuildsAndDateMathSegments(t *testing.T) {
 	if FormatName != "percolate/3" || formatVersion != 3 {
 		t.Fatalf("format %s (%d): the upgrade note describes percolate/3", FormatName, formatVersion)
 	}
-	if pDate != numProgTags-1 {
-		t.Fatal("pDate is not the newest program tag")
+	if pDate != pBox-1 || pBox != numProgTags-1 {
+		t.Fatal("pDate and pBox are not the newest program tags, in that order")
 	}
 	build := func(raws ...string) *Segment {
 		t.Helper()

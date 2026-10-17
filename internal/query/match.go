@@ -1,6 +1,7 @@
 package query
 
 import (
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ const (
 	opHas // has, has_any, has_all
 	opEmpty
 	opNonempty
+	opBox
 )
 
 var opCodes = map[string]opCode{
@@ -77,6 +79,7 @@ var opCodes = map[string]opCode{
 	OpSimilar: opSimilar,
 	OpHas:     opHas, OpHasAny: opHas, OpHasAll: opHas,
 	OpEmpty: opEmpty, OpNonempty: opNonempty,
+	OpBox: opBox,
 }
 
 type nodeKind uint8
@@ -231,6 +234,73 @@ type cleaf struct {
 	texts           []string // contains_*, starts_with (one), has_* (sorted, distinct), words_*
 	keys            []uint64 // similar: the text's trigram keys
 	minimum         float64  // similar
+	box             BoxBounds
+}
+
+// BoxBounds is a box condition's bounds, compiled: per axis, the closed or open
+// interval a coordinate must lie in, an absent bound an infinite one.
+type BoxBounds struct {
+	XLo, XHi, YLo, YHi             float64
+	XLoInc, XHiInc, YLoInc, YHiInc bool
+}
+
+// Holds reports whether point p lies in the box.
+func (b *BoxBounds) Holds(p schema.Point) bool {
+	return within(p.X, b.XLo, b.XHi, b.XLoInc, b.XHiInc) && within(p.Y, b.YLo, b.YHi, b.YLoInc, b.YHiInc)
+}
+
+// Any reports whether one of points lies in the box.
+func (b *BoxBounds) Any(points []schema.Point) bool {
+	for _, p := range points {
+		if b.Holds(p) {
+			return true
+		}
+	}
+	return false
+}
+
+func within(v, lo, hi float64, incLo, incHi bool) bool {
+	return (v > lo || incLo && v == lo) && (v < hi || incHi && v == hi)
+}
+
+// CompileBox returns a box value's bounds, false when the box holds no point: a bound
+// that is no finite number (date math not resolved, 1e400), or an axis whose bounds
+// leave nothing between them.
+func CompileBox(a *Arg) (BoxBounds, bool) {
+	if a.Kind != ArgBox || a.Box == nil {
+		return BoxBounds{}, false
+	}
+	var out BoxBounds
+	var ok bool
+	if out.XLo, out.XHi, out.XLoInc, out.XHiInc, ok = compileInterval(&a.Box.X); !ok {
+		return BoxBounds{}, false
+	}
+	if out.YLo, out.YHi, out.YLoInc, out.YHiInc, ok = compileInterval(&a.Box.Y); !ok {
+		return BoxBounds{}, false
+	}
+	return out, true
+}
+
+// compileInterval is one axis of CompileBox: its ends, -Inf and +Inf (inclusive) where
+// unbounded.
+func compileInterval(iv *Interval) (lo, hi float64, loInc, hiInc, ok bool) {
+	lo, hi, loInc, hiInc = math.Inf(-1), math.Inf(1), true, true
+	if iv.Lo.Set {
+		if !iv.Lo.Value.isNumber() {
+			return 0, 0, false, false, false
+		}
+		lo, loInc = iv.Lo.Value.Number, iv.Lo.Inclusive
+	}
+	if iv.Hi.Set {
+		if !iv.Hi.Value.isNumber() {
+			return 0, 0, false, false, false
+		}
+		hi, hiInc = iv.Hi.Value.Number, iv.Hi.Inclusive
+	}
+	if lo > hi || lo == hi && (!loInc || !hiInc) {
+		return 0, 0, false, false, false
+	}
+	return lo, hi, loInc, hiInc, true
 }
 
 // compileLeaf compiles one condition. exists wants presence unless its value is false,
@@ -312,6 +382,13 @@ func compileLeaf(l *Leaf) cnode {
 		}
 		slices.Sort(c.texts)
 		c.texts = slices.Compact(c.texts)
+		cost = costLookup
+	case opBox:
+		box, ok := CompileBox(&a)
+		if !ok {
+			return never
+		}
+		c.box = box
 		cost = costLookup
 	default:
 		return never
@@ -442,6 +519,8 @@ func (c *cleaf) match(fields map[string]schema.Value) bool {
 		return c.has(v.Entries)
 	case opNonempty:
 		return len(v.Entries) > 0
+	case opBox:
+		return c.box.Any(v.Points)
 	default:
 		return false
 	}

@@ -112,14 +112,16 @@ func (w *fileWriter) endSection() {
 	w.sections = append(w.sections, sectionEntry{kind: w.secKind, off: w.secStart, n: w.off - w.secStart, crc: w.secCRC})
 }
 
-// header writes the file header.
-func (w *fileWriter) header() { w.headerMajor(FormatMajor) }
+// header writes the file header of a segment of the given minor version.
+func (w *fileWriter) header(minor uint16) { w.headerVersion(FormatMajor, minor) }
 
-func (w *fileWriter) headerMajor(major uint16) {
+func (w *fileWriter) headerMajor(major uint16) { w.headerVersion(major, 0) }
+
+func (w *fileWriter) headerVersion(major, minor uint16) {
 	w.write(magic[:])
 	var b [8]byte
 	binary.LittleEndian.PutUint16(b[0:], major)
-	binary.LittleEndian.PutUint16(b[2:], FormatMinor)
+	binary.LittleEndian.PutUint16(b[2:], minor)
 	w.write(b[:])
 }
 
@@ -202,7 +204,7 @@ func verifyFileSections(path string, data []byte, required []sectionKind) (parse
 		footer.sections[s.kind] = s
 	}
 	if got != want {
-		for _, kind := range sectionOrder {
+		for _, kind := range knownSections {
 			s, ok := footer.sections[kind]
 			if ok && crc32c(data[s.off:s.off+s.n]) != s.crc {
 				return parsedFooter{}, corrupt(kind.String(), "checksum mismatch")

@@ -69,6 +69,7 @@ const (
 	OpHasAll      = "has_all"
 	OpEmpty       = "empty"
 	OpNonempty    = "nonempty"
+	OpBox         = "box"
 )
 
 // Ops is every operator, in the order messages list them.
@@ -76,7 +77,7 @@ var Ops = []string{
 	OpContains, OpContainsAny, OpContainsAll, OpEq, OpNe, OpIn,
 	OpLt, OpLte, OpGt, OpGte, OpBetween,
 	OpHas, OpHasAny, OpHasAll, OpNonempty, OpEmpty, OpExists,
-	OpStartsWith, OpWordsAll, OpWordsAny, OpSimilar,
+	OpStartsWith, OpWordsAll, OpWordsAny, OpSimilar, OpBox,
 }
 
 // IsOp reports whether op is one of [Ops].
@@ -101,9 +102,15 @@ var opsByType = map[schema.FieldType][]string{
 	schema.Bool:        {OpEq, OpNe, OpExists},
 }
 
+// pointOps are the operators a point field takes, in [Ops] order.
+var pointOps = []string{OpExists, OpBox}
+
 // OpsFor returns the operators a field of type t takes, in [Ops] order (nil for no
 // valid type). The caller must not change the slice.
 func OpsFor(t schema.FieldType) []string {
+	if t.IsPoint() {
+		return pointOps
+	}
 	return opsByType[t]
 }
 
@@ -154,6 +161,8 @@ const (
 	ArgList
 	// ArgObject is an object of scalars (similar's {text, min}).
 	ArgObject
+	// ArgBox is box's bounds, {"x": {"gte": 1}, "y": {"lt": 5}} ([Box]).
+	ArgBox
 )
 
 // Arg is a condition's value, decoded.
@@ -165,6 +174,72 @@ type Arg struct {
 	List []Scalar
 	// Object is the members when Kind is ArgObject.
 	Object map[string]Scalar
+	// Box is the bounds when Kind is ArgBox.
+	Box *Box
+}
+
+// Box is a box condition's value: an interval per axis, X and Y. A document matches
+// when one of its points lies in both, its x in X and its y in Y.
+type Box struct {
+	X, Y Interval
+}
+
+// Interval is one axis of a box: a lower bound (gt or gte) and an upper one (lt or
+// lte), either of which may be absent (unbounded).
+type Interval struct {
+	Lo, Hi Bound
+}
+
+// Bound is one end of an [Interval]. Value is a number, or on a date axis a string
+// (a date, or date math, until [Resolve] resolves it).
+type Bound struct {
+	Set       bool
+	Inclusive bool
+	Value     Scalar
+}
+
+// Axes returns the box's intervals, x then y, for the callers that treat both alike.
+func (b *Box) Axes() [2]*Interval { return [2]*Interval{&b.X, &b.Y} }
+
+// The keys of a box's value.
+const (
+	BoxX   = "x"
+	BoxY   = "y"
+	BoxGt  = "gt"
+	BoxGte = "gte"
+	BoxLt  = "lt"
+	BoxLte = "lte"
+)
+
+// RoundsUp reports whether date math at this end (an upper bound when upper) rounds
+// up, as a range op's does: a gt lower bound and an lte upper bound round up, gte and
+// lt down.
+func (b *Bound) RoundsUp(upper bool) bool { return upper == b.Inclusive }
+
+// BoundScalars returns the scalars of a value a date math bound may be among: the
+// scalar, a list's entries, or a box's set bounds. Nil for any other value.
+func (a *Arg) BoundScalars() []Scalar {
+	switch a.Kind {
+	case ArgBool, ArgNumber, ArgString:
+		return []Scalar{a.Scalar}
+	case ArgList:
+		return a.List
+	case ArgBox:
+		if a.Box == nil {
+			return nil
+		}
+		var out []Scalar
+		for _, iv := range a.Box.Axes() {
+			for _, b := range []*Bound{&iv.Lo, &iv.Hi} {
+				if b.Set {
+					out = append(out, b.Value)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 // Scalar is one bool, number or string of a value.

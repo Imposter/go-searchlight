@@ -141,6 +141,11 @@ func (s *segExec) candidates(lp *leafPlan) cands {
 			return empty
 		}
 		return cands{sure: roaring.New(), maybe: s.similarCandidates(lp)}
+	case query.OpBox:
+		if lp.never {
+			return empty
+		}
+		return cands{sure: r.XY(f).Box(lp.box)}
 	default:
 		return empty
 	}

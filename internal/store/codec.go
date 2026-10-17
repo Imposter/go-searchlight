@@ -26,6 +26,11 @@ const codecZstd byte = 0x01
 // heartbeat (sl_nodes.body_codecs): 1 reads zstd. A node from before codecs is at 0.
 const BodyCodecs = 1
 
+// MappingTypes is the mapping field types this binary reads, as a level its nodes
+// heartbeat (sl_nodes.mapping_types): 1 reads point fields. A node from before them
+// is at 0, and cannot decode a mapping holding one.
+const MappingTypes = 1
+
 // FeatureZstdBodies is the sl_features row that lets Apply store zstd bodies: the
 // cluster's leader records it once every registered node reads them (or has been
 // dead past the fence time), and it is never removed.

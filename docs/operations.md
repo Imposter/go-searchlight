@@ -50,11 +50,11 @@ deployment needs, none of which needs a checkout of the repository:
 From a release:
 
 ```sh
-base=https://github.com/Imposter/go-searchlight/releases/download/v1.0.0
-curl -fsSLO "$base/searchlight-1.0.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
+base=https://github.com/Imposter/go-searchlight/releases/download/v1.1.0
+curl -fsSLO "$base/searchlight-1.1.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS
-tar -xzf searchlight-1.0.0-linux-amd64.tar.gz
-install searchlight-1.0.0-linux-amd64/searchlight /usr/local/bin/
+tar -xzf searchlight-1.1.0-linux-amd64.tar.gz
+install searchlight-1.1.0-linux-amd64/searchlight /usr/local/bin/
 ```
 
 Each archive also holds `LICENSE` and `THIRD_PARTY_NOTICES`, the licences of Go and of
@@ -72,7 +72,7 @@ or, after macOS refuses to run it once, choose **Open Anyway** in System Setting
 Privacy & Security (on macOS 14 and earlier, Finder's right-click **Open** also works);
 macOS remembers the choice.
 
-Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.0.0`
+Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.1.0`
 also works, and reports its version), then run it:
 
 ```sh
@@ -111,7 +111,7 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
     misconfigured store, a SQLite store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
 - **`searchlight version`** (or `--version`) prints the version it was built as, with its
-  Go version and platform: `searchlight v1.0.0 (go1.25.14, linux/amd64)`.
+  Go version and platform: `searchlight v1.1.0 (go1.25.14, linux/amd64)`.
 - **`searchlight healthcheck [--live]`** probes the node on this host, for container
   healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
   where an empty or unspecified host means `127.0.0.1`. It waits at most 2 s, and exits 0
@@ -120,20 +120,20 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 ### Docker
 
 Each release publishes `ghcr.io/imposter/searchlight`, for linux/amd64 and linux/arm64,
-tagged with its version (`1.0.0`). Its minor (`1.0`) and major (`1`) lines, and `latest`,
+tagged with its version (`1.1.0`). Its minor (`1.1`) and major (`1`) lines, and `latest`,
 point at the newest stable release of each: they only move forward, so a patch to an
 older line moves its own `<major>.<minor>` tag and nothing else. Pin the full version in
 production. The `sha-<commit>` tags are where the release workflow stages an image
 before it is tested; do not deploy them.
 
 ```sh
-docker pull ghcr.io/imposter/searchlight:1.0.0
+docker pull ghcr.io/imposter/searchlight:1.1.0
 docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
   -v searchlight-data:/var/lib/searchlight \
   -v "$PWD/secrets:/run/secrets/searchlight:ro" \
   -e SEARCHLIGHT_STORE_URL_FILE=/run/secrets/searchlight/store_url \
   -e SEARCHLIGHT_TOKENS_FILE=/run/secrets/searchlight/tokens \
-  ghcr.io/imposter/searchlight:1.0.0
+  ghcr.io/imposter/searchlight:1.1.0
 ```
 
 - **User.** It runs as uid/gid 65532.
@@ -142,7 +142,7 @@ docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
 - **Labels.** It carries the OCI labels (version, revision, created, source).
 - **Licences.** `/usr/share/doc/searchlight` holds `LICENSE` and `THIRD_PARTY_NOTICES`.
 - **Provenance.** The published image carries a SLSA provenance attestation and an SBOM:
-  `docker buildx imagetools inspect ghcr.io/imposter/searchlight:1.0.0 --format '{{json .Provenance}}'`
+  `docker buildx imagetools inspect ghcr.io/imposter/searchlight:1.1.0 --format '{{json .Provenance}}'`
   (or `.SBOM`).
 - **`HEALTHCHECK`.** It runs `searchlight healthcheck` (readiness) every 5 s, with a
   2-minute start period. The image has no shell, so the binary probes itself.
@@ -171,8 +171,8 @@ every path relative to the compose file:
 - [`compose.sqlite.yml`](../deploy/compose.sqlite.yml): one node on SQLite.
 
 ```sh
-curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.0.0/searchlight-deploy-1.0.0.tar.gz | tar -xz
-cd searchlight-deploy-1.0.0
+curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.1.0/searchlight-deploy-1.1.0.tar.gz | tar -xz
+cd searchlight-deploy-1.1.0
 cp .env.example .env                                                       # optional
 docker compose -f compose.postgres.yml up -d
 docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens   # the API tokens

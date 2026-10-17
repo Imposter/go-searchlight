@@ -44,6 +44,9 @@ type prepared struct {
 	// ords are the global ordinals of the keyword and list fields the aggregations
 	// count by ordinal: top-level terms, and every cardinality.
 	ords map[ordField]*globalOrds
+	// cut is set when the shard's merge of the segments' partials ran out of time and
+	// left aggregations empty: the result is timed out.
+	cut atomic.Bool
 }
 
 // ordField names one field's global ordinals: its values, or its list entries.

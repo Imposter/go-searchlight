@@ -20,6 +20,13 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   metrics: `searchlight_search_ordinals_builds_total`,
   `searchlight_search_ordinals_build_duration_seconds` and
   `searchlight_search_ordinals_lookups_total`.
+- **`timeout` bounds the whole search.** The deadline (the earlier of `timeout` and
+  `request_timeout`) now covers each shard's merge of its segments' aggregations,
+  the dense counts from the index, and the coordinating node's reduce, not only the
+  segment scan: segments stop a tenth of the budget (1 ms to 1 s) early, an
+  aggregation still unmerged at the deadline is answered empty, and the reduce stops
+  that reserve past it, each cut with `timed_out: true`
+  ([docs/api.md](docs/api.md#search-and-count)).
 
 ## [1.1.0] - 2026-10-17
 

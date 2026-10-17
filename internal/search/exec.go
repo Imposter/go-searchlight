@@ -61,8 +61,9 @@ type ShardResult struct {
 	TotalRelation string                 `json:"total_relation"`
 	Aggs          map[string]*AggPartial `json:"aggs,omitempty"`
 	// TimedOut is set when the search ran out of time (Request.Timeout or the
-	// context's deadline) before every segment finished: the hits, total and
-	// aggregations are those of the segments that did.
+	// context's deadline) before every segment finished, or before the shard merged
+	// every aggregation: the hits, total and aggregations are those of the segments
+	// that did, and an aggregation left unmerged is empty.
 	TimedOut bool `json:"timed_out"`
 	// Segments is how many segments the shard searched; Scanned how many candidates
 	// it verified one at a time (residual checks): the per-query work the index could
@@ -401,11 +402,16 @@ func isCtxErr(err error) bool {
 // operations per segment, in two phases: the index's candidates first, then residual
 // checks where the index cannot decide alone, made only as the top hits and the total
 // need them (all of them when there are aggregations, or TrackTotal is
-// TrackTotalAll). Segments run in parallel on the search pool ([SetThreads]). When the
-// request's Timeout or ctx's deadline passes, segments stop where they are and the
-// result holds what the finished ones found, with TimedOut set; a cancelled ctx
-// returns its error. A request the mapping refuses (an unknown aggregation type, a
-// sort on a list, ...) is a *RequestError.
+// TrackTotalAll). Segments run in parallel on the search pool ([SetThreads]).
+//
+// The shard's deadline is the earlier of ctx's and r.Timeout from the call; the
+// segments get it less [DeadlineReserve], and the merge of their partials the rest.
+// When the segments' deadline passes, they stop where they are and the result holds
+// what the finished ones found, with TimedOut set; an aggregation whose shard merge
+// the deadline cuts short (a global ordinals build still running, say) is left empty,
+// also with TimedOut set. The hits found are still fetched. A cancelled ctx returns its
+// error. A request the mapping refuses (an unknown aggregation type, a sort on a list,
+// ...) is a *RequestError.
 func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardResult, error) {
 	if g == nil || r == nil {
 		return nil, errNoGeneration
@@ -434,16 +440,19 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	planned := time.Now()
 	parent := ctx
-	if r.Timeout > 0 {
+	segCtx := ctx
+	if deadline, ok := shardDeadline(ctx, start, r.Timeout); ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+		segCtx, cancel = context.WithDeadline(ctx, deadline.Add(-DeadlineReserve(deadline.Sub(start))))
 		defer cancel()
 	}
 	n := len(g.Segments)
 	p.segments = n
 	loadOrds(ctx, g, p)
 	results := make([]segResult, n)
-	if err := runParallel(n, func(i int) { results[i] = runSegment(ctx, p, g, i) }); err != nil {
+	if err := runParallel(n, func(i int) { results[i] = runSegment(segCtx, p, g, i) }); err != nil {
 		return fail(err, "segment panicked")
 	}
 	if err := parent.Err(); errors.Is(err, context.Canceled) {
@@ -476,6 +485,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		return fail(tooManyBuckets(spec), "too many buckets")
 	}
 	res.Aggs = aggs
+	res.TimedOut = res.TimedOut || p.cut.Load()
 	if res.TimedOut || !complete {
 		res.TotalRelation = RelationGte
 	}
@@ -517,6 +527,47 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 			slog.Int64("scanned", res.Scanned), slog.Float64(telemetry.KeyDuration, float64(time.Since(start).Microseconds())/1000))
 	}
 	return res, nil
+}
+
+// shardDeadline is when a shard search started at start must be done: the earlier of
+// ctx's deadline and start+timeout (a timeout of 0 adds none).
+func shardDeadline(ctx context.Context, start time.Time, timeout time.Duration) (time.Time, bool) {
+	deadline, ok := ctx.Deadline()
+	if timeout > 0 {
+		if d := start.Add(timeout); !ok || d.Before(deadline) {
+			deadline, ok = d, true
+		}
+	}
+	return deadline, ok
+}
+
+// DeadlineReserve is how much of a search's time budget is kept for the work after
+// its main phase: a shard keeps it from its segments for the merge of their partials,
+// and the coordinator gives it to the reduce past the request's deadline
+// ([ReduceContext]). A tenth of the budget, between 1 ms and 1 s.
+func DeadlineReserve(budget time.Duration) time.Duration {
+	return min(max(budget/10, time.Millisecond), time.Second)
+}
+
+// ReduceContext returns the context a coordinator gives [Reduce] for a search that
+// started elapsed ago: one that ends [DeadlineReserve] after the search's deadline
+// (the earlier of ctx's and r.Timeout from its start), or when ctx is cancelled, but
+// not at ctx's own deadline, so the shards' results that arrived by it are still
+// reduced. Without a deadline it is ctx. Call the cancel function when the reduce is
+// done.
+func ReduceContext(ctx context.Context, elapsed time.Duration, r *Request) (context.Context, context.CancelFunc) {
+	began := time.Now().Add(-elapsed)
+	deadline, ok := shardDeadline(ctx, began, r.Timeout)
+	if !ok {
+		return ctx, func() {}
+	}
+	rc, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline.Add(DeadlineReserve(deadline.Sub(began))))
+	stop := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			cancel()
+		}
+	})
+	return rc, func() { stop(); cancel() }
 }
 
 // warnLimiter lets one warning per key through per interval, counting the rest.

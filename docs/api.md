@@ -351,7 +351,21 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   `query`'s. It is checked as `query` is, at `post_filter...`.
 - **`fields`** limits each hit's `body` to those members, at most 100 of them.
 - **`timeout`** (`"250ms"`, or milliseconds) caps this search below `request_timeout`.
-  Past it, the answer holds what was found, with `timed_out: true`.
+  Past it, the answer holds what was found, with `timed_out: true`. The deadline (the
+  earlier of `timeout` and `request_timeout`) bounds the whole search, not only its
+  scan, and keeps a tenth of the budget (1 ms to 1 s) for the work after the scan:
+  - each shard scans its segments until the deadline less that reserve; a segment
+    unfinished then is left out, its hits, total and aggregations with it;
+  - the shard then merges its segments' aggregations until the deadline: one still
+    unmerged then (a `terms` or `cardinality` waiting on the field's global ordinals,
+    say) is answered empty from that shard. A global ordinals build cut short goes
+    on in the background, so the next search finds it;
+  - the coordinating node merges the shards' answers until the reserve has passed
+    the deadline too, leaving any aggregation still unmerged empty.
+
+  Every cut sets `timed_out: true`, and the answer is never later than the deadline
+  plus the reserve, the hits' bodies and writing the response. The hits found are
+  fetched past the deadline.
 
 **A facet panel in one search.** Each facet counts under every pick but its own, and
 the hits obey every pick: put the picks in `post_filter`, and make each facet a

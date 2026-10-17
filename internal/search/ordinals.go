@@ -972,7 +972,8 @@ func (p *ordPartial) used() uint64 {
 // finishOrds merges the segments' ordinal partials of spec into dst: by global
 // ordinal when the ordinals cached at prepare, or built now because the partials are
 // dense enough, are there; by term otherwise. When ctx ends while the build runs, the
-// partials are merged by term: the build goes on, for the next search.
+// shard's partial of spec is left empty and the search cut short (prepared.cut): the
+// build goes on, for the next search.
 func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec *aggSpec, g *shard.Generation, p *prepared) {
 	entries, _ := ordKind(spec.ftype)
 	ords := p.ords[ordField{spec.field, entries}]
@@ -986,6 +987,11 @@ func finishOrds(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec 
 		}
 		if used*globalOrdsDensity >= total {
 			ords = globalOrdinals(ctx, g, spec.field, entries)
+			if ords == nil && ctx.Err() != nil {
+				p.cut.Store(true)
+				mergePartial(dst, emptyPartial(spec), spec)
+				return
+			}
 		}
 	}
 	switch {

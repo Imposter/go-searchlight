@@ -200,15 +200,24 @@ func (n *Single) reacquirer(ctx context.Context, idx *index, waitSeq int64) func
 // hits, their order, the total and the aggregations are those of the results the
 // bodies come from. Only the shards re-queried are fetched again. That happens at most
 // requeryRounds times, within ctx; past them the search is unavailable (503).
+//
+// The reduce runs under [search.ReduceContext]: it ends a little past the search's
+// deadline (r.Timeout from the start, or ctx's), so a search answers with what it has,
+// timed out, rather than run on past it.
 func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Request, reacquire func(s int) (ShardTarget, error)) (*search.Response, error) {
+	began := n.clock.Now()
+	reduce := func(results []*search.ShardResult, q *search.Request) *search.Response {
+		rctx, cancel := search.ReduceContext(ctx, n.clock.Since(began), q)
+		defer cancel()
+		return search.Reduce(rctx, results, q)
+	}
 	if len(ts) == 1 && (r.From == 0 || r.Size == 0) {
 		sr, err := ts[0].Search(ctx, r)
 		if err != nil {
 			return nil, err
 		}
-		return search.Reduce(ctx, []*search.ShardResult{sr}, r), nil
+		return reduce([]*search.ShardResult{sr}, r), nil
 	}
-	began := n.clock.Now()
 	q := *r
 	q.NoBodies = true
 	results := make([]*search.ShardResult, len(ts))
@@ -217,7 +226,7 @@ func (n *Single) searchTargets(ctx context.Context, ts targets, r *search.Reques
 	}
 	bodies := make([]map[search.HitRef]json.RawMessage, len(ts))
 	for round := 0; ; round++ {
-		resp := search.Reduce(ctx, results, &q)
+		resp := reduce(results, &q)
 		lost, err := fetchHits(ctx, ts, resp, r.Fields, bodies)
 		if err != nil {
 			return nil, err

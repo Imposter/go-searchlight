@@ -74,6 +74,12 @@ func TestLoadDefaults(t *testing.T) {
 		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               128 << 20,
+		RequestCacheRedisPrefix:        "searchlight:rc:",
+		RequestCacheRedisTTL:           24 * time.Hour,
+		RequestCacheRedisTimeout:       50 * time.Millisecond,
+		RequestCacheRedisMaxEntryBytes: 8 << 20,
 	}
 	if c != want {
 		t.Errorf("defaults:\n got %+v\nwant %+v", c, want)
@@ -166,6 +172,12 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		BundleInterval:        30 * time.Minute,
 		BundleRetention:       3,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               128 << 20,
+		RequestCacheRedisPrefix:        "searchlight:rc:",
+		RequestCacheRedisTTL:           24 * time.Hour,
+		RequestCacheRedisTimeout:       50 * time.Millisecond,
+		RequestCacheRedisMaxEntryBytes: 8 << 20,
 	}
 	if c != want {
 		t.Errorf("env overrides:\n got %+v\nwant %+v", c, want)
@@ -270,6 +282,14 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"bundle_retention", map[string]string{"SEARCHLIGHT_BUNDLE_RETENTION": "0"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_KEY": "key.pem"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_CERT": filepath.Join(t.TempDir(), "nope.pem"), "SEARCHLIGHT_TLS_KEY": filepath.Join(t.TempDir(), "nope.key")}, nil},
+		{"request_cache_size", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_SIZE": "big"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "memcached://cache:11211"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "redis:///0"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "redis://cache:6379/first"}, nil},
+		{"request_cache_redis_password", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD": "x"}, nil},
+		{"request_cache_redis_ttl", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_TTL": "0s"}, nil},
+		{"request_cache_redis_timeout", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_TIMEOUT": "fast"}, nil},
+		{"request_cache_redis_max_entry_bytes", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_MAX_ENTRY_BYTES": "0"}, nil},
 		{"search_threads", nil, []string{"--search_threads=-2"}},
 		{"data_dir", nil, []string{"--data_dir="}},
 		{"bogus", nil, []string{"--bogus=1"}},
@@ -373,6 +393,41 @@ func TestLogValueRedactsSecrets(t *testing.T) {
 	for _, want := range []string{`"store_url":"postgres://sl:xxxxx@db/sl"`, `"refresh_interval":"1s"`, `"merge_budget":"64MiB"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log %s is missing %s", out, want)
+		}
+	}
+}
+
+func TestLoadRequestCache(t *testing.T) {
+	c, err := Load(nil, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestCacheSize != 128<<20 || c.RequestCacheRedisURL != "" || c.RequestCacheRedisTTL != 24*time.Hour ||
+		c.RequestCacheRedisTimeout != 50*time.Millisecond || c.RequestCacheRedisPrefix != "searchlight:rc:" ||
+		c.RequestCacheRedisMaxEntryBytes != 8<<20 {
+		t.Fatalf("request cache defaults %+v", c)
+	}
+	path := filepath.Join(t.TempDir(), "redis-password")
+	if err := os.WriteFile(path, []byte("s3same\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load([]string{"--request_cache_size=0"}, envOf(map[string]string{
+		"SEARCHLIGHT_STORE_URL":                         sqliteURL,
+		insecure:                                        "true",
+		"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL":           "rediss://user:hunter2@cache:6380/2",
+		"SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD_FILE": path,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestCacheSize != 0 || c.RequestCacheRedisPassword != "s3same" {
+		t.Fatalf("request_cache_size %d, password %q", c.RequestCacheSize, c.RequestCacheRedisPassword)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", c)
+	for _, secret := range []string{"hunter2", "s3same"} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("log leaks %q: %s", secret, buf.String())
 		}
 	}
 }

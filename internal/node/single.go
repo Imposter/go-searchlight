@@ -133,6 +133,7 @@ type Single struct {
 	clock      clock.Clock
 	budget     *shard.MergeBudget
 	cache      *shard.FilterCache
+	rcache     *search.RequestCache // nil: no request cache
 	maxLag     int64
 	openFailed metric.Int64Counter
 	splits     percolate.SplitBudget
@@ -493,6 +494,11 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		absent:   absentIndexes{clock: o.Clock},
 		reserved: map[string]bool{},
 	}
+	rc, err := newRequestCache(o)
+	if err != nil {
+		return nil, err
+	}
+	n.rcache = rc
 	in := telemetry.NewInstruments(o.Meter)
 	n.openFailed = in.Counter(telemetry.MetricShardOpenFailed)
 	if err := in.Err(); err != nil {
@@ -874,6 +880,7 @@ func (n *Single) Close(ctx context.Context) error {
 			n.bgCancel()
 		}
 		n.bg.Wait()
+		errs = append(errs, n.rcache.Close())
 		n.closeErr = errors.Join(errs...)
 		n.log.InfoContext(ctx, "node engine closed")
 	})

@@ -8,6 +8,33 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ### Added
 
+- **The shard request cache**, Elasticsearch's, for counts and aggregation-only
+  searches ([docs/operations.md](docs/operations.md#request-cache)): a search with
+  `size` 0 is answered shard by shard from an identical search's result over the same
+  shard contents, and stored otherwise. Keys hold the request (date math resolved,
+  never its `timeout`) and what the shard holds, so a refresh that writes, a delete, a
+  merge or a remap misses and no hit is ever stale; concurrent identical searches
+  compute once, each waiting within its own `timeout`. Never cached: a search with
+  hits, a `from` or a `search_after`; date math reading `now` unrounded (`now-7d`;
+  `now-7d/d` is cached); a result that timed out.
+  - `request_cache: false` on `_search` keeps a search out of it
+    ([docs/api.md](docs/api.md#search-and-count)). It travels to peers without a new
+    wire level: an older peer has no cache to keep it out of.
+  - In memory, up to `request_cache_size` (128 MiB by default; `0` for none).
+  - Optionally in front of a Redis (`request_cache_redis_url`, with
+    `request_cache_redis_password`, `_prefix`, `_ttl`, `_timeout` and
+    `_max_entry_bytes`; the URL and the password also from `_FILE`), shared by every
+    node and shard copy and kept across restarts. Its entries are keyed by the shard's
+    newest change the copy holds, so writes to other shards and indexes leave them be,
+    and by this binary's version. A Redis that is down or slow fails no search: each
+    call is bounded (50 ms by default, and a tenth of the search's time left), a breaker
+    skips it after 5 failures in a row, and failures are logged and counted. What is
+    read back is bounded and checked; Redis is trusted as the database is.
+  - Metrics: `searchlight_search_request_cache_lookups_total` (by store and result),
+    `_errors_total`, `_evictions_total`, `_stored_bytes_total`,
+    `_writes_dropped_total`, `_store_open_ratio`, `_size_bytes` and `_entries`.
+- The benchmark sends Searchlight's searches with `request_cache: false`, as it does
+  Elasticsearch's.
 - **`min` and `max` aggregations**, Elasticsearch's: `{"value": x}`, or `{"value":
   null}` when no document has one (Unix milliseconds on a `date` field, as `stats`
   gives them), at the top level, under `filter`, `filters` and

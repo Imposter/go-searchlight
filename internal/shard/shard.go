@@ -326,6 +326,8 @@ type Shard struct {
 	log  *slog.Logger
 	tr   trace.Tracer
 	inst *instruments
+	// copyID tells this open copy from every other the process opened (CacheIdentity).
+	copyID uint64
 	// spanAttrs label every span: the index and shard.
 	spanAttrs []attribute.KeyValue
 
@@ -439,6 +441,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s := &Shard{
 		dir:         dir,
 		opts:        opts,
+		copyID:      copyIDs.Add(1),
 		log:         opts.Logger.With(telemetry.KeyIndex, opts.Index, telemetry.KeyShard, opts.Shard),
 		tr:          opts.Tracer,
 		buf:         newBuffer(),

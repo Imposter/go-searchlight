@@ -389,6 +389,19 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
 
   Any cut sets `timed_out: true`. The hits found are fetched past the deadline, and
   the response written after it.
+- **`request_cache`** (`true` by default), Elasticsearch's shard request cache. A search
+  with `size` 0 (a count, or aggregations only; no `from` or `search_after`) is
+  answered, shard by shard, from what an identical search of the same shard contents
+  computed, and is computed and stored otherwise. It is keyed by the request (its
+  queries with [date math](#date-math) resolved, its aggregations, `track_total`; not
+  its `timeout` or `sort`) and by what each shard holds, so a refresh that writes, a
+  delete, a merge or a mapping change misses: a hit has the counts and buckets the
+  search would compute (a float sum may differ in its last bits, as between two
+  copies). Date math that reads `now` with no rounding (`now-7d`) resolves to another
+  instant every millisecond, so such a search is never cached; a rounded one
+  (`now-7d/d`) hits until the rounding moves on. `false` keeps the search out of the
+  cache. A result that timed out is never stored. `_count` is cached as a size-0 search
+  is. See [the request cache](operations.md#request-cache) for its memory and Redis.
 
 **A facet panel in one search.** Each facet counts under every pick but its own, and
 the hits obey every pick: put the picks in `post_filter`, and make each facet a

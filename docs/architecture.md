@@ -48,6 +48,7 @@ flowchart LR
 | `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
 | `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
 | `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort, `from` and `search_after` paging, aggregations, cross-shard reduce |
+| `internal/reqcache` | The shared stores behind search's shard request cache: Redis, behind a breaker |
 | `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, verification by compiled programs that mirror the exact matcher |
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
@@ -195,6 +196,12 @@ data_dir/
      smallest first, `any` unions, and `not` complements against the live documents.
    - The rest become residual checks over doc values: `contains` behind a trigram
      prefilter, `similar` behind trigram candidates, and ranges served by points.
+   - A search with `size` 0 first asks the shard request cache
+     ([`request_cache.go`](../internal/search/request_cache.go)): an LRU in memory
+     keyed by the copy's generation, then, when one is configured, a Redis shared by
+     every copy and node, keyed by the shard's newest change the copy holds (as its
+     changelog poll checked it). A complete result is stored in both, a timed-out one
+     in neither.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
    - A range leaf is collected from the point index, or checked on doc values when far

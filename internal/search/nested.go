@@ -134,20 +134,37 @@ func (s *segExec) checkNested(np *nestedPlan, d uint32) bool {
 	return false
 }
 
+// parentBody is one document's nested field as its stored body holds it, decoded:
+// the objects of a document that are checked in turn read it once.
+type parentBody struct {
+	set    bool
+	doc    uint32
+	lo, hi uint32
+	value  any
+}
+
 // objectValue reads sub-field field of object obj from its document's stored body,
 // as Analyze reads it: the residual's source for what an object segment does not keep.
-func (s *segExec) objectValue(field string, obj uint32) (any, bool, error) {
-	doc := s.nv.Parent(obj)
-	lo, _ := s.nv.Range(doc)
-	body, err := s.parent.r.Stored(doc)
-	if err != nil {
-		return nil, false, err
+// c holds the last document read, decoded, and is read again only for an object of
+// another document.
+func (s *segExec) objectValue(field string, obj uint32, c *parentBody) (any, bool, error) {
+	if !c.set || obj < c.lo || obj >= c.hi {
+		doc := s.nv.Parent(obj)
+		if c.set && obj >= c.hi {
+			doc = s.nv.ParentFrom(c.doc, obj)
+		}
+		body, err := s.parent.r.Stored(doc)
+		if err != nil {
+			return nil, false, err
+		}
+		value, _, err := schema.FieldValue(body, s.path)
+		if err != nil {
+			return nil, false, err
+		}
+		lo, hi := s.nv.Range(doc)
+		*c = parentBody{set: true, doc: doc, lo: lo, hi: hi, value: value}
 	}
-	value, ok, err := schema.FieldValue(body, s.path)
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	v, ok := schema.ObjectFieldValue(value, int(obj-lo), strings.TrimPrefix(field, s.path+"."))
+	v, ok := schema.ObjectFieldValue(c.value, int(obj-c.lo), strings.TrimPrefix(field, s.path+"."))
 	return v, ok, nil
 }
 

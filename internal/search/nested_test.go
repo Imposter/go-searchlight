@@ -662,3 +662,29 @@ func TestRequestCacheNested(t *testing.T) {
 		t.Fatalf("a where reading now unrounded: %v, cache off %v", ps, r.NoRequestCache)
 	}
 }
+
+// A phrase inside a nested node reads its document's body once for all of its
+// candidate objects, not once per object: a document of 8,000 variants, every one a
+// candidate, is checked in one parse, verified whole and lazily for the top hits.
+func TestNestedPhraseReadsEachBodyOnce(t *testing.T) {
+	c := newCluster(t, 1)
+	members := make([]string, 8000)
+	for i := range members {
+		members[i] = `{"color": "red tea blue"}`
+	}
+	members[len(members)-1] = `{"color": "red blue tea"}`
+	c.upsert("big", `{"_v": [`+strings.Join(members, ",")+`]}`)
+	c.upsert("none", `{"_v": [{"color": "tea red"}]}`)
+	c.refreshAll()
+	q := mustParse(t, `{"nested": {"path": "_v", "query": {"field": "_v.color", "op": "words_all", "value": ["red blue"]}}}`)
+	for _, r := range []*Request{
+		{Query: q, Size: 10, TrackTotal: TrackTotalAll},
+		{Query: q, Size: 1, TrackTotal: TrackTotalNone},
+	} {
+		start := time.Now()
+		got, err := c.search(r)
+		if took := time.Since(start); err != nil || len(got.Hits) != 1 || got.Hits[0].ID != "big" || took > time.Second {
+			t.Fatalf("%v hits in %v, %v; want big alone, in well under a second", got, took, err)
+		}
+	}
+}

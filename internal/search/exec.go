@@ -197,7 +197,10 @@ type segExec struct {
 	parent *segExec
 	nv     *segment.Nested
 	path   string
-	err    error
+	// lastBody is the last document body an object's one-at-a-time check read
+	// (verifyDoc), kept for the document's next object.
+	lastBody parentBody
+	err      error
 }
 
 // lazyState is a segment's lazy verification: the root's maybe documents, those

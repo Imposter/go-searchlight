@@ -58,8 +58,9 @@ func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
 	ords := cand.ToArray()
 	keep := make([]bool, len(ords))
 	err := s.parallelChunks(len(ords), func(lo, hi int) error {
+		var c parentBody
 		for k := lo; k < hi; k++ {
-			ok, err := s.bodyMatches(lp, ords[k])
+			ok, err := s.bodyMatches(lp, ords[k], &c)
 			if err != nil {
 				return err
 			}
@@ -82,13 +83,14 @@ func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
 }
 
 // bodyMatches checks a words condition against document ord's stored body, or, for
-// an object, against its member of its document's body.
-func (s *segExec) bodyMatches(lp *leafPlan, ord uint32) (bool, error) {
+// an object, against its member of its document's body, which c keeps decoded for the
+// next object of the same document (candidates come in ascending order).
+func (s *segExec) bodyMatches(lp *leafPlan, ord uint32, c *parentBody) (bool, error) {
 	var v any
 	var present bool
 	var err error
 	if s.parent != nil {
-		v, present, err = s.objectValue(lp.field, ord)
+		v, present, err = s.objectValue(lp.field, ord, c)
 	} else {
 		var body []byte
 		if body, err = s.r.Stored(ord); err == nil {
@@ -113,7 +115,7 @@ func (s *segExec) verifyDoc(lp *leafPlan, d uint32) bool {
 	}
 	s.scanned++
 	if lp.needsBody {
-		ok, err := s.bodyMatches(lp, d)
+		ok, err := s.bodyMatches(lp, d, &s.lastBody)
 		if err != nil {
 			s.fail(err)
 			return false

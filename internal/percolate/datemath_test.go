@@ -325,13 +325,13 @@ func TestFixedDateMathIndexesAsARange(t *testing.T) {
 	}
 }
 
-// The upgrade note's claim: a query segment holding no date math is one an older build
-// (v1.0.0, which knew the program tags below pDate) reads as it is, in the same format;
+// The upgrade note's claim, of the program tags: a query segment holding no date math is
+// one whose programs an older build (v1.0.0, which knew the tags below pDate) reads;
 // one holding a now-relative condition has a program that build refuses, so it treats
 // the file as corrupt.
 func TestOlderBuildsAndDateMathSegments(t *testing.T) {
-	if FormatName != "percolate/3" || formatVersion != 3 {
-		t.Fatalf("format %s (%d): the upgrade note describes percolate/3", FormatName, formatVersion)
+	if FormatName != "percolate/4" || formatVersion != 4 {
+		t.Fatalf("format %s (%d): the upgrade note describes percolate/4", FormatName, formatVersion)
 	}
 	if pDate != pBox-1 || pBox != pNested-1 || pNested != numProgTags-1 {
 		t.Fatal("pDate, pBox and pNested are not the newest program tags, in that order")

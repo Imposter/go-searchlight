@@ -33,14 +33,15 @@ var changelog = dialect.Changelog{
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
 	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2), (SELECT uid FROM sl_indexes WHERE name = $3) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = $4 LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $5 AND shard = $6 AND seq <= $7) WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = $1",
-	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
-	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	DocumentState:   "SELECT seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
+	QueryState:      "SELECT seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	Tombstone:       "SELECT version FROM sl_tombstones WHERE index_name = $1 AND shard = $2 AND kind = $3 AND id = $4",
 	Write:           write,
 	Limits:          limits,
 	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq > $3 ORDER BY seq LIMIT $4",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = $1 AND shard = $2",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 ORDER BY id",
-	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = $1 AND shard = $2 ORDER BY id",
+	ScanQueries:     "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 ORDER BY id",
 }
 
 // writeSQL is the whole of an Apply's (or a mapping change's) write as one
@@ -60,19 +61,26 @@ const writeSQL = `WITH changes AS (
 	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce)
 	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bytea[], $8::bigint[], $9::text[], $10::bigint[], $31::bigint[])
 ), documents AS (
-	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq)
-	SELECT * FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[])
-	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq
+	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version)
+	SELECT * FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[], $32::bigint[])
+	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq, version = EXCLUDED.version
 ), queries AS (
-	INSERT INTO sl_queries (index_name, shard, id, query, meta, seq)
-	SELECT * FROM unnest($17::text[], $18::int[], $19::text[], $20::text[], $21::text[], $22::bigint[])
-	ON CONFLICT (index_name, shard, id) DO UPDATE SET query = EXCLUDED.query, meta = EXCLUDED.meta, seq = EXCLUDED.seq
+	INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version)
+	SELECT * FROM unnest($17::text[], $18::int[], $19::text[], $20::text[], $21::text[], $22::bigint[], $33::bigint[])
+	ON CONFLICT (index_name, shard, id) DO UPDATE SET query = EXCLUDED.query, meta = EXCLUDED.meta, seq = EXCLUDED.seq, version = EXCLUDED.version
 ), document_deletes AS (
 	DELETE FROM sl_documents d USING unnest($23::text[], $24::int[], $25::text[]) AS k (index_name, shard, id)
 	WHERE d.index_name = k.index_name AND d.shard = k.shard AND d.id = k.id
 ), query_deletes AS (
 	DELETE FROM sl_queries q USING unnest($26::text[], $27::int[], $28::text[]) AS k (index_name, shard, id)
 	WHERE q.index_name = k.index_name AND q.shard = k.shard AND q.id = k.id
+), tombstones AS (
+	INSERT INTO sl_tombstones (index_name, shard, kind, id, version)
+	SELECT * FROM unnest($34::text[], $35::int[], $36::text[], $37::text[], $38::bigint[])
+	ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = EXCLUDED.version
+), tombstone_deletes AS (
+	DELETE FROM sl_tombstones t USING unnest($39::text[], $40::int[], $41::text[], $42::text[]) AS k (index_name, shard, kind, id)
+	WHERE t.index_name = k.index_name AND t.shard = k.shard AND t.kind = k.kind AND t.id = k.id
 ), counter AS (
 	UPDATE sl_counter SET value = $29 WHERE id = 1
 )
@@ -81,7 +89,7 @@ SELECT pg_notify('` + notifyChannel + `', payload) FROM unnest($30::text[]) AS p
 // limits is the engine's: one write statement carries at most 64 MB of
 // payload, well below the 1 GB a single array value (and a protocol message)
 // may hold. A batch beyond it is written in several statements of the same
-// text. Bind parameters never limit it: writeSQL always takes 31.
+// text. Bind parameters never limit it: writeSQL always takes 42.
 var limits = dialect.Limits{Bytes: 64 << 20}
 
 // write spells w in parts of about l.Bytes payload bytes: one, unless the
@@ -109,6 +117,8 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 		if p == 0 {
 			a.dDel = keys(w.DocumentDeletes)
 			a.qDel = keys(w.QueryDeletes)
+			a.t = tombstoneRows(w.Tombstones)
+			a.tDel = tombstoneRows(w.TombstoneDeletes)
 		}
 		var notify []string
 		if p == parts-1 {
@@ -171,10 +181,11 @@ type writeArgs struct {
 	d                      keyColumns
 	dBody                  []string
 	dBodyZ                 [][]byte
-	dSeq                   []int64
+	dSeq, dVersion         []int64
 	q                      keyColumns
 	qQuery, qMeta          []string
-	qSeq                   []int64
+	qSeq, qVersion         []int64
+	t, tDel                tombstoneColumns
 	dDel, qDel             keyColumns
 }
 
@@ -200,6 +211,7 @@ func (a *writeArgs) documents(rows []dialect.DocumentRow) {
 		a.dBody = append(a.dBody, r.Body)
 		a.dBodyZ = append(a.dBodyZ, r.BodyZ)
 		a.dSeq = append(a.dSeq, r.Seq)
+		a.dVersion = append(a.dVersion, r.Version)
 	}
 }
 
@@ -210,10 +222,11 @@ func (a *writeArgs) queries(rows []dialect.QueryRow) {
 		a.qQuery = append(a.qQuery, r.Query)
 		a.qMeta = append(a.qMeta, r.Meta)
 		a.qSeq = append(a.qSeq, r.Seq)
+		a.qVersion = append(a.qVersion, r.Version)
 	}
 }
 
-// args returns writeSQL's 31 arguments. Every array is non-nil: pgx sends a
+// args returns writeSQL's 42 arguments. Every array is non-nil: pgx sends a
 // nil slice as NULL, and unnest(NULL) is no rows too, but an empty array says
 // what is meant.
 func (a *writeArgs) args(counter int64, notify []string) []any {
@@ -226,6 +239,9 @@ func (a *writeArgs) args(counter int64, notify []string) []any {
 		counter,
 		strs(notify),
 		ints64(a.cNonce),
+		ints64(a.dVersion), ints64(a.qVersion),
+		strs(a.t.index), ints(a.t.shard), strs(a.t.kind), strs(a.t.id), ints64(a.t.version),
+		strs(a.tDel.index), ints(a.tDel.shard), strs(a.tDel.kind), strs(a.tDel.id),
 	}
 }
 
@@ -258,9 +274,10 @@ func ints64(s []int64) []int64 {
 }
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
-	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
-	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = $1 AND id > $2 ORDER BY id LIMIT $3",
+	GetDocument:       "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
+	GetQuery:          "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	ListQueries:       "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id > $3 ORDER BY id LIMIT $4",
+	ListQueryVersions: "SELECT id, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id > $3 ORDER BY id LIMIT $4",
 }
 
 var registry = dialect.Registry{
@@ -332,6 +349,7 @@ VALUES ($1, $2, $3, 1, NOW, 1, $4) RETURNING ` + indexColumns)},
 	DropData: []string{
 		"DELETE FROM sl_documents WHERE index_name = $1",
 		"DELETE FROM sl_queries WHERE index_name = $1",
+		"DELETE FROM sl_tombstones WHERE index_name = $1",
 		"DELETE FROM sl_changes WHERE index_name = $1",
 		"DELETE FROM sl_pruned WHERE index_name = $1",
 		"DELETE FROM sl_shard_copies WHERE index_name = $1",
@@ -356,4 +374,23 @@ ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = GREATEST(sl_pruned.bel
 	// and every later query queues behind it meanwhile.
 	MigrateLockTimeout: "SET LOCAL lock_timeout = '1s'",
 	LockTimedOut:       lockTimedOut,
+}
+
+// tombstoneColumns are sl_tombstones rows as the arrays writeSQL takes.
+type tombstoneColumns struct {
+	index, kind, id []string
+	shard           []int
+	version         []int64
+}
+
+func tombstoneRows(rows []dialect.TombstoneRow) tombstoneColumns {
+	var t tombstoneColumns
+	for _, r := range rows {
+		t.index = append(t.index, r.Index)
+		t.shard = append(t.shard, r.Shard)
+		t.kind = append(t.kind, r.Kind)
+		t.id = append(t.id, r.ID)
+		t.version = append(t.version, r.Version)
+	}
+	return t
 }

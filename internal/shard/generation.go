@@ -495,7 +495,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	for _, ms := range man.QuerySegments {
-		if ms.Format != s.opts.QueryIndex.Format() {
+		if ms.Format != s.opts.QueryIndex.Format() && !reads(s.opts.QueryIndex, ms.Format) {
 			return fail(fmt.Errorf("shard: query segment %s is in format %q, the query index builds %q: %w", ms.ID, ms.Format, s.opts.QueryIndex.Format(),
 				queryFormatError(ms.Format, s.opts.QueryIndex.Format())))
 		}
@@ -562,4 +562,10 @@ func queryFormatError(found, builds string) error {
 		}
 	}
 	return segment.ErrOlderFormat
+}
+
+// reads reports whether qi opens query segments of format, an older one it reads.
+func reads(qi QueryIndexBuilder, format string) bool {
+	r, ok := qi.(FormatReader)
+	return ok && r.Reads(format)
 }

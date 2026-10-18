@@ -341,9 +341,25 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   is a 409 `conflict` carrying `current_seq`, which gives optimistic concurrency.
 - **`op_type=create`.** Applies only if the document does not exist yet (409
   otherwise).
+- **`version=N`**, Elasticsearch's external versioning (`version_type=external`): the
+  client's own version of the document, 1 to 2^62. The write applies only when N is
+  higher than the stored version, and answers `{"id", "seq", "version"}`; otherwise it is
+  a noop, `{"id", "version", "result": "noop"}` (200, no `seq`), and writes nothing. It
+  excludes `if_seq` and `op_type=create` (400 at `params.version`).
+  - The stored version is the document's (0 when its last write named none) or, while
+    it does not exist, the version its last versioned delete kept. A versioned delete
+    keeps its version as a tombstone, of a document that does not exist too (which is
+    still a 404), so a replay of an older write after it is a noop as well; a versioned
+    write above it replaces it. A write without `version` stores version 0 and leaves a
+    tombstone as it is.
+  - `GET` returns the document's `version` (absent for 0), as `_bulk` items and
+    percolation matches do.
+  - Replays and reconciles are harmless: send the same versioned writes again, and each
+    one already applied is a noop.
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
 - **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
-  is a 404 `document_not_found` with `result: "not_found"`, and writes nothing.
+  is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the
+  version of a versioned one).
 - **Stale reads.** While the database cannot be reached, `GET` answers from this node's
   copy with `stale: true` and no `seq`.
 
@@ -377,6 +393,25 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 - **Actions.** Each operation is an action line, `upsert`, `create` or `delete`,
   followed by the document for an upsert or a create. `index` is an alias of `upsert`,
   and `_id` of `id`.
+- **Saved queries.** `query_upsert` is followed by the saved query, as `PUT
+  .../queries/{id}` takes it (`{"query": ..., "meta": {...}}`; a line of another shape
+  refuses the whole request), and `query_delete` takes none. Documents and saved queries
+  mix in one request, in one transaction; a document percolates against the saved
+  queries written before it, those of the same request included:
+
+  ```
+  {"query_upsert": {"id": "s7", "version": 3}}
+  {"query": {"field": "brand", "op": "eq", "value": "acme"}, "meta": {"search_id": 7}}
+  {"upsert": {"id": "sku-1", "version": 12}}
+  {"brand": "Acme", "price": 30}
+  {"query_delete": {"id": "s8", "version": 5}}
+  ```
+
+- **`version`** in an action's metadata is the [`version=N`](#documents) of its op, on
+  documents and saved queries alike: an item at or below the stored version answers
+  `{"status": 200, "version": N, "result": "noop"}`, with no `seq` and, under
+  `percolate=true`, no `queries`. It excludes `if_seq` and `create` (400 at
+  `line.N.<action>.version`).
 - **Partial failure.** An operation refused on its own (an invalid document, a failed
   `if_seq`) is reported in its item, with `errors` set, and the rest commit.
 - **Whole-request refusal.** A malformed action line, a line over `max_doc_bytes`, or
@@ -758,8 +793,21 @@ curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: B
   `query.field`.
 - **`meta`** is an opaque object of at most 16 KiB, returned as given. scrape-bot keeps
   its search id there.
-- **Writes** take the same `if_seq`, `op_type` and `refresh` parameters as documents.
-- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`.
+- **Writes** take the same `if_seq`, `op_type`, `refresh` and [`version`](#documents)
+  parameters as documents, and so do `_bulk`'s `query_upsert` and `query_delete`
+  ([Bulk](#bulk)). `GET` returns the query's `version` (absent for 0), and every
+  percolation copy indexes it with the query.
+- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`. Each page reads
+  every shard's next queries in its primary key's order and merges them by id, so a page
+  costs what it returns whatever the index holds.
+  - **`fields`**, a comma-separated list of `id`, `seq`, `version`, `query` and `meta`,
+    keeps those members of each query (`id` always). Without `query` and `meta`, their
+    trees and meta are never read: `?fields=id,version&size=1000` pages a reconcile of
+    100,000 queries in 100 requests of ids and versions (`version` 0 for none):
+
+    ```json
+    {"queries": [{"id": "s7", "version": 3}, {"id": "s8", "version": 0}], "next": "s8"}
+    ```
 
 ## Percolation
 

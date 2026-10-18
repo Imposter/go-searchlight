@@ -108,6 +108,17 @@ type Change struct {
 	// Apply then refuses the change, as for a missing index
 	// (*IndexNotFoundError), when the index is another incarnation now.
 	IndexUID string
+	// Version is the client's version of the document or saved query (Elasticsearch's
+	// external versioning), 0 for none. A change with one applies only when it is higher
+	// than the stored version: the target's, or, while it is absent, the version its
+	// last versioned delete kept (a tombstone). Otherwise it is a noop, skipped inside
+	// the transaction (no seq, Noop set), as the changes after it see it. A versioned
+	// upsert stores it and replaces the tombstone; a versioned delete keeps it as one,
+	// even of a target that is absent (an IfExists delete of nothing then writes only
+	// the tombstone). A change without one stores version 0 and leaves tombstones be.
+	Version int64
+	// Noop is set by Apply on a change its Version made a noop.
+	Noop bool
 	// MappingVersion is the index's mapping version when the change committed,
 	// set by the store. The KindMapping change of that version precedes it in
 	// the shard's changelog (Update and Apply both hold the counter lock, so a
@@ -203,16 +214,18 @@ type ScanPoint struct {
 	Mark, ShardMark ChangeMark
 }
 
-// QueryPayload is the payload of a saved-query upsert: the query DSL tree and
-// its opaque meta object, stored in sl_queries' query and meta columns.
+// QueryPayload is the payload of a saved-query upsert: the query DSL tree, its opaque
+// meta object, stored in sl_queries' query and meta columns, and its client version
+// (Change.Version), which copies index with it.
 type QueryPayload struct {
-	Query json.RawMessage `json:"query"`
-	Meta  json.RawMessage `json:"meta,omitempty"`
+	Query   json.RawMessage `json:"query"`
+	Meta    json.RawMessage `json:"meta,omitempty"`
+	Version int64           `json:"version,omitempty"`
 }
 
 // EncodeQueryPayload builds a KindQueryUpsert payload.
-func EncodeQueryPayload(query, meta json.RawMessage) ([]byte, error) {
-	return json.Marshal(QueryPayload{Query: query, Meta: meta})
+func EncodeQueryPayload(query, meta json.RawMessage, version int64) ([]byte, error) {
+	return json.Marshal(QueryPayload{Query: query, Meta: meta, Version: version})
 }
 
 // DecodeQueryPayload splits a KindQueryUpsert payload.
@@ -250,8 +263,10 @@ type Record struct {
 	Body []byte
 	// Meta is the saved query's meta object (nil for documents).
 	Meta []byte
-	// Seq is the seq of the change that last wrote the record.
-	Seq int64
+	// Seq is the seq of the change that last wrote the record, and Version the client
+	// version it named (0 for none).
+	Seq     int64
+	Version int64
 	// IndexUID is Index's incarnation as of this scan (see Change.IndexUID).
 	IndexUID string
 	// MappingVersion is the index's mapping version as of this scan.

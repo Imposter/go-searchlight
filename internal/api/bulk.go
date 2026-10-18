@@ -16,11 +16,13 @@ import (
 
 var errItemCount = errors.New("api: the coordinator answered a different number of items than ops")
 
-// bulkMeta is an action line's metadata: {"upsert": {"id": "a", "if_seq": 3}}.
+// bulkMeta is an action line's metadata: {"upsert": {"id": "a", "if_seq": 3}} or
+// {"query_upsert": {"id": "q", "version": 7}}.
 type bulkMeta struct {
-	ID    json.RawMessage `json:"id"`
-	AltID json.RawMessage `json:"_id"`
-	IfSeq *int64          `json:"if_seq"`
+	ID      json.RawMessage `json:"id"`
+	AltID   json.RawMessage `json:"_id"`
+	IfSeq   *int64          `json:"if_seq"`
+	Version *int64          `json:"version"`
 }
 
 // bulkItem is one op's outcome in a _bulk response.
@@ -29,6 +31,10 @@ type bulkItem struct {
 	ID     string `json:"id"`
 	Status int    `json:"status"`
 	Seq    int64  `json:"seq,omitempty"`
+	// Version is the op's client version, when it named one; Result is "noop" when it
+	// was not above the stored one.
+	Version int64  `json:"version,omitempty"`
+	Result  string `json:"result,omitempty"`
 	// Queries are the upserted document's matching saved queries, with
 	// percolate=true.
 	Queries *json.RawMessage `json:"queries,omitempty"`
@@ -53,11 +59,18 @@ type bulkResponse struct {
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
-// document for an upsert:
+// document for an upsert, or the saved query for a query_upsert:
 //
 //	{"upsert": {"id": "a"}}            (also "index"; "create" requires it to be new)
 //	{"title": "...", "price": 3}
 //	{"delete": {"id": "b", "if_seq": 12}}
+//	{"query_upsert": {"id": "q", "version": 7}}
+//	{"query": {...}, "meta": {...}}
+//	{"query_delete": {"id": "r", "version": 8}}
+//
+// A version (Elasticsearch's external versioning) makes an op apply only when it is
+// higher than the stored one; otherwise its item's result is noop, and nothing is
+// written for it.
 //
 // Every op commits in one transaction. An op refused on its own (an invalid document,
 // a failed if_seq) is reported in its item, with errors set, and the rest commit; a
@@ -102,12 +115,15 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	id := info(r.Context()).id
 	for i := range ops {
 		it := &res.Items[i]
-		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Seq: it.Seq}
+		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Seq: it.Seq, Version: it.Version}
+		if it.Noop {
+			item.Result = resultNoop
+		}
 		if it.Err != nil {
 			pe := ProblemFor(it.Err)
 			item.Status, item.Seq, item.Error = pe.Status, 0, problemBody(pe, id)
 			out.Errors = true
-		} else if perc && res.Percolated && ops[i].Kind == OpUpsert {
+		} else if perc && res.Percolated && ops[i].Kind == OpUpsert && !it.Noop {
 			q := it.Queries
 			if len(q) == 0 {
 				q = json.RawMessage(emptyArray)
@@ -159,15 +175,24 @@ func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 		if e != nil {
 			return nil, e
 		}
-		if op.Kind == OpUpsert {
+		switch op.Kind {
+		case OpUpsert, OpQueryUpsert:
 			doc, ok, err := next()
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
-				return nil, InvalidAt(fmt.Sprintf("line.%d", line), "the upsert of %q has no document line after it", op.ID)
+				return nil, InvalidAt(fmt.Sprintf("line.%d", line), "the %s of %q has no line after it", op.Kind, op.ID)
 			}
-			op.Body = doc
+			if op.Kind == OpUpsert {
+				op.Body = doc
+				break
+			}
+			var q queryBody
+			if err := decodeJSONObject(doc, &q, false); err != nil || len(q.Query) == 0 || string(q.Query) == "null" {
+				return nil, InvalidAt(fmt.Sprintf("line.%d", line), `a query_upsert's line is {"query": ..., "meta": {...}}`)
+			}
+			op.Query, op.Meta = q.Query, q.Meta
 		}
 		ops = append(ops, op)
 	}
@@ -212,7 +237,7 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 	loc := fmt.Sprintf("line.%d", line)
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || len(obj) != 1 {
-		return WriteOp{}, InvalidAt(loc, `an action line is one of {"upsert": {"id": ...}}, {"create": {...}} or {"delete": {...}}`)
+		return WriteOp{}, InvalidAt(loc, `an action line is one of {"upsert": {"id": ...}}, {"create": {...}}, {"delete": {...}}, {"query_upsert": {...}} or {"query_delete": {...}}`)
 	}
 	var op WriteOp
 	var metaRaw json.RawMessage
@@ -223,16 +248,20 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 			op.Kind = OpUpsert
 		case "create":
 			op.Kind, op.IfSeq = OpUpsert, IfAbsent
+		case "query_upsert":
+			op.Kind = OpQueryUpsert
+		case "query_delete":
+			op.Kind = OpQueryDelete
 		case "delete":
 			op.Kind = OpDelete
 		default:
-			return WriteOp{}, InvalidAt(loc+"."+key, "unknown action: use upsert, create or delete")
+			return WriteOp{}, InvalidAt(loc+"."+key, "unknown action: use upsert, create, delete, query_upsert or query_delete")
 		}
 		loc += "." + key
 	}
 	var meta bulkMeta
 	if err := strictDecode(metaRaw, &meta); err != nil {
-		return WriteOp{}, InvalidAt(loc, `an action's metadata is {"id": "...", "if_seq": n}: %v`, err)
+		return WriteOp{}, InvalidAt(loc, `an action's metadata is {"id": "...", "if_seq": n} or {"id": "...", "version": n}: %v`, err)
 	}
 	idRaw := meta.ID
 	switch {
@@ -257,6 +286,12 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 			return WriteOp{}, InvalidAt(loc+".if_seq", "if_seq is a seq of at least 1, and not with create")
 		}
 		op.IfSeq = *meta.IfSeq
+	}
+	if meta.Version != nil {
+		if *meta.Version < 1 || *meta.Version > MaxVersion || op.IfSeq != 0 {
+			return WriteOp{}, InvalidAt(loc+".version", "version is a whole number from 1 to %d, and excludes if_seq and create", int64(MaxVersion))
+		}
+		op.Version = *meta.Version
 	}
 	return op, nil
 }

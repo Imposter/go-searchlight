@@ -15,8 +15,28 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   sub-aggregation's own `where`). A `terms` there is exact, never cut per shard; its
   buckets count towards the response's 65,536. Search wire level 7 keeps them off
   peers of an earlier release (503 with no other copy).
+- **Client versions** ([docs/api.md](docs/api.md#documents)), Elasticsearch's external
+  versioning, on documents and saved queries: `version=N` on `PUT` and `DELETE`, and
+  `"version": N` in a `_bulk` action, applies only when N is higher than the stored
+  version, and is otherwise a noop (`"result": "noop"`, no seq), never a 409. A versioned
+  delete keeps its version as a tombstone, so a replay of an older write after it is a
+  noop too. `GET`, listings and `_bulk` items return `version`. Schema migration 5 adds
+  `version` to `sl_documents` and `sl_queries` and the table `sl_tombstones`.
+- **Saved queries in `_bulk`**: `query_upsert` (followed by `{"query": ..., "meta":
+  ...}`) and `query_delete` actions beside the documents, in one transaction, with
+  per-item results; a document percolates against the queries written before it.
+- **A lean saved-query listing**: `GET .../queries?fields=id,version` pages ids and
+  versions without reading the queries' trees or meta.
 
 ### Changed
+
+- **Saved-query listings page each shard in its primary key's order** and merge them by
+  id, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
+  query of the index by id before).
+- **Query segments are format `percolate/4`**, which keeps each saved query's version.
+  Segments of `percolate/3` open as they are, their queries with no version, until
+  merges rewrite them; a release before this one refuses a `percolate/4` segment, so a
+  copy that has written one cannot be downgraded.
 
 - **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes
   of one path giving one `inner_hits` name, in the query and the `post_filter`, share

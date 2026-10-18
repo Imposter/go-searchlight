@@ -220,7 +220,10 @@ func added(base, grown *schema.Mapping) map[string]schema.FieldType {
 // reaches the changelog, where it would halt the copy. A delete of nothing is a 404
 // and writes no change.
 func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepDoc bool) (prepared, *schema.Mapping, error) {
-	c := store.Change{Index: idx.name, ID: op.ID, IfSeq: op.IfSeq}
+	c := store.Change{Index: idx.name, ID: op.ID, IfSeq: op.IfSeq, Version: op.Version}
+	if op.Version < 0 || (op.Version > 0 && op.IfSeq != 0) {
+		return prepared{}, m, api.InvalidAt("version", "a version is at least 1, and excludes if_seq and create")
+	}
 	if err := schema.ValidateID(op.ID); err != nil {
 		msg := err.Error()
 		var ve *schema.ValidationError
@@ -315,7 +318,7 @@ func queryPayload(op *api.WriteOp, m *schema.Mapping, now time.Time) ([]byte, er
 	if err := (percolate.Index{}).Check(&shard.StoredQuery{ID: op.ID, Query: node, Meta: meta}); err != nil {
 		return nil, api.InvalidAt("query", "the percolator cannot index the query: %v", err)
 	}
-	payload, err := store.EncodeQueryPayload(op.Query, meta)
+	payload, err := store.EncodeQueryPayload(op.Query, meta, op.Version)
 	if err != nil {
 		return nil, api.InvalidAt("query", "%v", err)
 	}
@@ -369,7 +372,8 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 // commit commits batch through the group committer. An op whose if_seq fails, or
 // that the store refuses on its own, is answered in its item and the rest commit
 // without it. It returns the committed ops, with their seqs. A delete of nothing
-// (IfExists) is skipped in the transaction: it takes no seq and is a 404.
+// (IfExists) is skipped in the transaction: it takes no seq and is a 404. A versioned
+// op whose version is not above the stored one is a noop: no seq, and no error.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
@@ -389,6 +393,10 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 		case err == nil:
 			var applied []prepared
 			for i := range batch {
+				if changes[i].Noop {
+					items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
+					continue
+				}
 				if changes[i].Seq == 0 {
 					items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
 					continue
@@ -401,7 +409,7 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 				return nil, nil
 			}
 			for i := range batch {
-				items[batch[i].pos].Seq = batch[i].change.Seq
+				items[batch[i].pos].Seq, items[batch[i].pos].Version = batch[i].change.Seq, batch[i].change.Version
 				sl := idx.shards[batch[i].change.Shard]
 				raise(&sl.written, batch[i].change.Seq)
 				if k := batch[i].change.Kind; k == store.KindQueryUpsert || k == store.KindQueryDelete {

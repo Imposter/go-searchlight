@@ -54,8 +54,8 @@ type Coordinator interface {
 	// to opts.WaitForSeq in it.
 	GetQuery(ctx context.Context, index, id string, opts ReadOptions) (*SavedQuery, error)
 	// ListQueries pages an index's saved queries by id: up to size of them with ids
-	// above after.
-	ListQueries(ctx context.Context, index, after string, size int) ([]*SavedQuery, error)
+	// above after. With lean, each holds its id, seq and version alone.
+	ListQueries(ctx context.Context, index, after string, size int, lean bool) ([]*SavedQuery, error)
 
 	// Search runs a search over every shard of index.
 	Search(ctx context.Context, index string, r *search.Request, opts ReadOptions) (*SearchResult, error)
@@ -243,6 +243,11 @@ type WriteOp struct {
 	// Query and Meta are a saved query's DSL tree and opaque meta object.
 	Query json.RawMessage
 	Meta  json.RawMessage
+	// Version is the client's version of the document or saved query (Elasticsearch's
+	// external versioning), 0 for none: the op applies only when it is higher than the
+	// stored one (the target's, or the version a versioned delete of it kept), and is
+	// otherwise a noop (ItemResult.Noop). It excludes IfSeq.
+	Version int64
 	// IfSeq makes the op conditional: a positive IfSeq requires the target's current
 	// seq to equal it, IfAbsent requires it not to exist, 0 applies unconditionally.
 	IfSeq int64
@@ -297,6 +302,11 @@ type WriteResult struct {
 type ItemResult struct {
 	// Seq is the op's seq when it committed.
 	Seq int64
+	// Noop is set when the op's Version was not above the stored one: nothing was
+	// written, and Seq is 0.
+	Noop bool
+	// Version is the op's Version, when it had one.
+	Version int64
 	// Err is why the op was refused (an *Error), nil when it committed.
 	Err error
 	// Queries are the ids of the saved queries the upserted document matches, with
@@ -315,8 +325,10 @@ type ReadOptions struct {
 type Document struct {
 	ID string `json:"id"`
 	// Seq is the change that last wrote it; 0 (omitted) on a stale read.
-	Seq  int64           `json:"seq,omitempty"`
-	Body json.RawMessage `json:"body"`
+	Seq int64 `json:"seq,omitempty"`
+	// Version is the client version its last write named (omitted for none).
+	Version int64           `json:"version,omitempty"`
+	Body    json.RawMessage `json:"body"`
 	// Stale is set when the database could not be reached and the document was
 	// read from this node's copy instead: it may trail the latest write.
 	Stale bool `json:"stale,omitempty"`
@@ -324,10 +336,12 @@ type Document struct {
 
 // SavedQuery is a stored saved query.
 type SavedQuery struct {
-	ID    string          `json:"id"`
-	Seq   int64           `json:"seq"`
-	Query json.RawMessage `json:"query"`
-	Meta  json.RawMessage `json:"meta"`
+	ID  string `json:"id"`
+	Seq int64  `json:"seq"`
+	// Version is the client version its last write named (omitted for none).
+	Version int64           `json:"version,omitempty"`
+	Query   json.RawMessage `json:"query,omitempty"`
+	Meta    json.RawMessage `json:"meta,omitempty"`
 	// Stale is set when it was read from this node's copy because the database
 	// could not be reached.
 	Stale bool `json:"stale,omitempty"`

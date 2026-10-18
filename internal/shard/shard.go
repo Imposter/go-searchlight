@@ -104,8 +104,10 @@ type Change struct {
 	QueryID string
 	// Query is a QueryUpsert's parsed query ([query.Parse]); the shard keeps it.
 	Query query.Node
-	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes].
-	Meta []byte
+	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes], and QueryVersion
+	// its client version (store.Change.Version; 0 for none).
+	Meta         []byte
+	QueryVersion int64
 	// Mapping and MappingVersion are a Remap's mapping and its version (the store's
 	// mapping version, increasing with every mapping change of the index).
 	Mapping        *schema.Mapping
@@ -788,7 +790,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		case Delete:
 			s.buf.putDoc(c.id(), c.Seq, nil)
 		case QueryUpsert:
-			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Query: c.Query, Meta: c.Meta})
+			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Version: c.QueryVersion, Query: c.Query, Meta: c.Meta})
 		case QueryDelete:
 			s.buf.putQuery(c.QueryID, c.Seq, nil)
 		}

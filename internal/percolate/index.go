@@ -55,6 +55,7 @@ import (
 //	nodes      24 bytes per interval tree node: center, left, right, record start and count
 //	bylo       20 bytes per tree record (lo, hi, rank), each node's sorted by lo ascending
 //	byhi       the same records, each node's sorted by hi descending
+//	versions   u64 per query: its client version, 0 for none (format 4; a format 3 segment has none)
 //
 // The dictionary is an open-addressing hash table over (kind, field, term) with a
 // stable hash (64-bit FNV-1a), so a probe is a hash and one or two term compares with
@@ -100,12 +101,16 @@ import (
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.
-	FormatName = "percolate/3"
+	FormatName = "percolate/4"
 	// FileExt is a query segment file's extension.
 	FileExt = ".perc"
 
-	formatVersion = 3
-	numSections   = 19
+	formatVersion = 4
+	// formatV3 is the format before client versions: numSectionsV3 sections, all but
+	// versions. Open reads it, each query with no version.
+	formatV3      = 3
+	numSectionsV3 = 19
+	numSections   = 20
 	entrySize     = 32
 	filteredSize  = 24
 	nodeSize      = 24
@@ -145,11 +150,12 @@ const (
 	secNodes
 	secByLo
 	secByHi
+	secVersions
 )
 
 var sectionNames = [numSections]string{
 	"meta", "fields", "offsets", "records", "verify", "ids", "idtext", "programs", "slots", "entries",
-	"terms", "postings", "filtered", "partners", "pairs", "always", "nodes", "bylo", "byhi",
+	"terms", "postings", "filtered", "partners", "pairs", "always", "nodes", "bylo", "byhi", "versions",
 }
 
 // CorruptError is a query segment file that fails its checksum or does not parse.
@@ -173,6 +179,10 @@ var _ shard.QueryIndexBuilder = Index{}
 
 // Format implements [shard.QueryIndexBuilder].
 func (Index) Format() string { return FormatName }
+
+// Reads implements [shard.FormatReader]: percolate/3, the format before client
+// versions.
+func (Index) Reads(format string) bool { return format == "percolate/3" }
 
 // Check implements [shard.QueryIndexBuilder]: the query must survive a round trip
 // through its JSON form unchanged, which is how the segment stores it.
@@ -613,6 +623,9 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 	}
 	sec[secByLo] = appendIntervals(byLo)
 	sec[secByHi] = appendIntervals(byHi)
+	for i := range queries {
+		sec[secVersions] = binary.LittleEndian.AppendUint64(sec[secVersions], uint64(queries[i].Version)) //nolint:gosec // a version is positive
+	}
 
 	size := len(fileMagic) + 8 + 4
 	for _, s := range sec {
@@ -771,6 +784,9 @@ type Segment struct {
 	nodes     []byte
 	byLo      []byte
 	byHi      []byte
+	// versions are each query's client version (u64 by ordinal), nil in a segment of
+	// format 3, whose queries have none.
+	versions []byte
 
 	classes    []uint32
 	anyEscaped bool
@@ -810,16 +826,21 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if len(body) < len(fileMagic)+8 || !bytes.Equal(body[:len(fileMagic)], fileMagic[:]) {
 		return nil, corrupt("bad magic")
 	}
-	if v := u32(body, len(fileMagic)); v != formatVersion {
+	v := u32(body, len(fileMagic))
+	if v != formatVersion && v != formatV3 {
 		return nil, fmt.Errorf("percolate: query segment %s: format version %d, this build reads %d: %w",
 			path, v, formatVersion, segment.FormatError(uint64(v), formatVersion))
 	}
-	if c := u32(body, len(fileMagic)+4); c != numSections {
-		return nil, corrupt("%d sections, want %d", c, numSections)
+	sections := uint32(numSections)
+	if v == formatV3 {
+		sections = numSectionsV3
+	}
+	if c := u32(body, len(fileMagic)+4); c != sections {
+		return nil, corrupt("%d sections, want %d", c, sections)
 	}
 	var sec [numSections][]byte
 	rest := body[len(fileMagic)+8:]
-	for i := range sec {
+	for i := range sections {
 		if len(rest) < 8 {
 			return nil, corrupt("section %s: truncated", sectionNames[i])
 		}
@@ -846,7 +867,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		offsets: sec[secOffsets], records: sec[secRecords], verifies: sec[secVerify], ids: sec[secIDs], idText: sec[secIDText], programs: sec[secPrograms],
 		slots: sec[secSlots], entries: sec[secEntries], terms: sec[secTerms], postings: sec[secPostings], filtered: sec[secFiltered],
 		partners: sec[secPartners], pairs: sec[secPairs],
-		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi],
+		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi], versions: sec[secVersions],
 	}
 	sizes := []struct {
 		sec  int
@@ -863,6 +884,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		{secByHi, recordSize * uint64(numRecs)},
 		{secPartners, 8 * uint64(numEntries)},
 		{secPairs, pairSize * uint64(numPairs)},
+		{secVersions, versionsSize(v, n)},
 	}
 	for _, sz := range sizes {
 		if uint64(len(sec[sz.sec])) != sz.want {
@@ -1187,7 +1209,7 @@ func (s *Segment) Query(ord uint32) (shard.StoredQuery, error) {
 	if len(meta) > 0 {
 		m = bytes.Clone(meta)
 	}
-	return shard.StoredQuery{ID: string(id), Seq: seq, Query: n, Meta: m}, nil
+	return shard.StoredQuery{ID: string(id), Seq: seq, Version: s.Version(ord), Query: n, Meta: m}, nil
 }
 
 // Close implements [shard.QuerySegment]: it unmaps the file. Nothing the segment
@@ -1680,4 +1702,21 @@ func writeNested(buf *bytes.Buffer, n *query.Nested) error {
 	}
 	buf.WriteString("}}")
 	return nil
+}
+
+// versionsSize is the size of the versions section of a segment of format v and n
+// queries.
+func versionsSize(v, n uint32) uint64 {
+	if v == formatV3 {
+		return 0
+	}
+	return 8 * uint64(n)
+}
+
+// Version implements [shard.QuerySegment].
+func (s *Segment) Version(ord uint32) int64 {
+	if len(s.versions) == 0 || ord >= s.n {
+		return 0
+	}
+	return int64(u64(s.versions, 8*int(ord))) //nolint:gosec // written from an int64
 }

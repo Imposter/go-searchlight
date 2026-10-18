@@ -305,6 +305,7 @@ paths:
       summary: Create or replace a document.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       requestBody:
@@ -346,6 +347,7 @@ paths:
       summary: Delete a document.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       responses:
@@ -492,6 +494,10 @@ paths:
           in: query
           schema: { type: string }
           description: The previous page's `next`.
+        - name: fields
+          in: query
+          schema: { type: string }
+          description: "A comma-separated list of the members each query carries: id, seq, version, query, meta (id always). Without query and meta, their trees and meta are never read: id,version pages a reconcile cheaply."
         - name: size
           in: query
           schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
@@ -508,7 +514,10 @@ paths:
                 properties:
                   queries:
                     type: array
-                    items: { $ref: "#/components/schemas/SavedQuery" }
+                    items:
+                      anyOf:
+                        - $ref: "#/components/schemas/SavedQuery"
+                        - $ref: "#/components/schemas/SavedQueryFields"
                   next:
                     type: [string, "null"]
                     description: Pass as `after` for the next page; null on the last.
@@ -527,6 +536,7 @@ paths:
       summary: Create or replace a saved query.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       requestBody:
@@ -576,6 +586,7 @@ paths:
       summary: Delete a saved query.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       responses:
@@ -700,6 +711,11 @@ components:
       in: query
       description: Apply only if the target's current seq is this one (409 otherwise).
       schema: { type: integer, minimum: 1 }
+    Version:
+      name: version
+      in: query
+      description: "The client's version of the document or saved query (Elasticsearch's external versioning, 1 to 2^62): the write applies only when it is higher than the stored one (the target's, or, while it is absent, the version its last versioned delete kept), and is otherwise a noop, answered with result noop and no seq. Excludes if_seq and op_type=create."
+      schema: { type: integer, minimum: 1, maximum: 4611686018427387904 }
     OpType:
       name: op_type
       in: query
@@ -901,15 +917,18 @@ components:
       properties:
         id: { type: string }
         seq: { type: integer, description: The seq of the change that last wrote it; pass it as if_seq. Absent on a stale read. }
+        version: { type: integer, description: "The client version its last write named; absent for none." }
         body: { $ref: "#/components/schemas/DocumentBody" }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy, which may trail the latest write." }
     WriteResponse:
       type: object
       additionalProperties: false
-      required: [id, seq]
+      required: [id]
       properties:
         id: { type: string }
-        seq: { type: integer, description: The seq the write committed; pass it as wait_for_seq. }
+        seq: { type: integer, description: "The seq the write committed; pass it as wait_for_seq. Absent for a noop." }
+        version: { type: integer, description: "The write's client version, when it named one." }
+        result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, and nothing was written." }
         timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
     BulkResponse:
       type: object
@@ -934,10 +953,12 @@ components:
             additionalProperties: false
             required: [op, id, status]
             properties:
-              op: { type: string, enum: [upsert, delete] }
+              op: { type: string, enum: [upsert, delete, query_upsert, query_delete] }
               id: { type: string }
               status: { type: integer }
               seq: { type: integer }
+              version: { type: integer, description: "The op's client version, when it named one." }
+              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one; nothing was written (and nothing percolated)." }
               queries:
                 type: array
                 items: { type: string }
@@ -1099,9 +1120,21 @@ components:
       properties:
         id: { type: string }
         seq: { type: integer }
+        version: { type: integer, description: "The client version its last write named; absent for none." }
         query: { $ref: "#/components/schemas/Query" }
         meta: { type: object }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy." }
+    SavedQueryFields:
+      type: object
+      additionalProperties: false
+      required: [id]
+      description: A saved query as a listing's fields name its members (version 0 for none).
+      properties:
+        id: { type: string }
+        seq: { type: integer }
+        version: { type: integer }
+        query: { $ref: "#/components/schemas/Query" }
+        meta: { type: object }
     PercolateResult:
       type: object
       additionalProperties: false

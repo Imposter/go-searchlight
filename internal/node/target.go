@@ -57,7 +57,7 @@ func (t *localTarget) GetQuery(_ context.Context, id string) (*api.SavedQuery, b
 	if err != nil {
 		return nil, false, err
 	}
-	return &api.SavedQuery{ID: id, Seq: sq.Seq, Query: q, Meta: sq.Meta}, true, nil
+	return &api.SavedQuery{ID: id, Seq: sq.Seq, Version: sq.Version, Query: q, Meta: sq.Meta}, true, nil
 }
 
 func (t *localTarget) Stale() bool { return t.stale }

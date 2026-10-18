@@ -560,7 +560,7 @@ func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.Read
 	if err != nil {
 		return nil, err
 	}
-	return &api.Document{ID: id, Seq: r.Seq, Body: r.Body}, nil
+	return &api.Document{ID: id, Seq: r.Seq, Version: r.Version, Body: r.Body}, nil
 }
 
 // GetQuery implements [api.Coordinator]: read from the store, so realtime; from a
@@ -588,7 +588,7 @@ func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOpt
 	if err != nil {
 		return nil, err
 	}
-	return &api.SavedQuery{ID: id, Seq: r.Seq, Query: r.Body, Meta: r.Meta}, nil
+	return &api.SavedQuery{ID: id, Seq: r.Seq, Version: r.Version, Query: r.Body, Meta: r.Meta}, nil
 }
 
 // recordTimeout bounds a realtime read of one record: past it (a database that hangs
@@ -682,17 +682,17 @@ func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKin
 }
 
 // ListQueries implements [api.Coordinator]: read from the store, so realtime.
-func (n *Single) ListQueries(ctx context.Context, name, after string, size int) ([]*api.SavedQuery, error) {
+func (n *Single) ListQueries(ctx context.Context, name, after string, size int, lean bool) ([]*api.SavedQuery, error) {
 	if _, err := n.lookupForRead(ctx, name, 0); err != nil {
 		return nil, err
 	}
-	recs, err := n.records.ListQueries(ctx, name, after, size)
+	recs, err := n.records.ListQueries(ctx, name, after, size, lean)
 	if err != nil {
 		return nil, storeError(err, name)
 	}
 	out := make([]*api.SavedQuery, len(recs))
 	for i := range recs {
-		out[i] = &api.SavedQuery{ID: recs[i].ID, Seq: recs[i].Seq, Query: recs[i].Body, Meta: recs[i].Meta}
+		out[i] = &api.SavedQuery{ID: recs[i].ID, Seq: recs[i].Seq, Version: recs[i].Version, Query: recs[i].Body, Meta: recs[i].Meta}
 	}
 	return out, nil
 }

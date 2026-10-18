@@ -188,6 +188,7 @@ type item struct {
 	id      string
 	body    []byte          // a document's JSON, or a saved query's DSL tree
 	meta    []byte          // a saved query's meta
+	qver    int64           // a saved query's client version
 	mapping *schema.Mapping // a Remap's
 	version int64           // the mapping version it was written under (a Remap's own)
 	uid     string
@@ -208,7 +209,7 @@ func itemFromChange(c *store.Change) item {
 		if err != nil {
 			it.bad, it.why = err, ReasonQuery
 		}
-		it.body, it.meta = q.Query, q.Meta
+		it.body, it.meta, it.qver = q.Query, q.Meta, q.Version
 	case store.KindQueryDelete:
 		it.kind = shard.QueryDelete
 	case store.KindMapping:
@@ -230,7 +231,7 @@ func itemFromRecord(r *store.Record) item {
 	case store.RecordDocument:
 		it.kind = shard.Upsert
 	case store.RecordQuery:
-		it.kind, it.meta = shard.QueryUpsert, r.Meta
+		it.kind, it.meta, it.qver = shard.QueryUpsert, r.Meta, r.Version
 	case store.RecordMapping:
 		it.kind, it.seq = shard.Remap, 0
 		m, err := parseMapping(r.Body)
@@ -351,7 +352,7 @@ func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema
 			if len(problems) > 0 {
 				limit, fail = i, &failure{pos: i, reason: ReasonQuery, err: fmt.Errorf("the query does not parse: %s", problems[0])}
 			}
-			c.QueryID, c.Query, c.Meta = it.id, n, normalizeMeta(it.meta)
+			c.QueryID, c.Query, c.Meta, c.QueryVersion = it.id, n, normalizeMeta(it.meta), it.qver
 		case shard.QueryDelete:
 			c.QueryID = it.id
 		case shard.Remap:

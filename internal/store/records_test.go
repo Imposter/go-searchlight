@@ -15,9 +15,11 @@ func TestRecordReader(t *testing.T) {
 		if !ok {
 			t.Fatalf("%T does not implement RecordReader", st)
 		}
-		mustCreateIndex(t, st, "rec")
+		if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "rec", Settings: []byte(`{"shards": 2}`)}); err != nil {
+			t.Fatal(err)
+		}
 		payload := func(q string) []byte {
-			p, err := EncodeQueryPayload([]byte(q), []byte(`{"owner":"x"}`))
+			p, err := EncodeQueryPayload([]byte(q), []byte(`{"owner":"x"}`), 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -53,7 +55,7 @@ func TestRecordReader(t *testing.T) {
 		var ids []string
 		after := ""
 		for {
-			page, err := rr.ListQueries(ctx, "rec", after, 2)
+			page, err := rr.ListQueries(ctx, "rec", after, 2, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,7 +70,11 @@ func TestRecordReader(t *testing.T) {
 		if fmt.Sprint(ids) != "[q1@0 q2@1 q3@0]" {
 			t.Errorf("ListQueries pages = %v", ids)
 		}
-		if _, err := rr.ListQueries(ctx, "rec", "", MaxListLimit+1); !errors.Is(err, ErrInvalid) {
+		lean, err := rr.ListQueries(ctx, "rec", "q1", 10, true)
+		if err != nil || len(lean) != 2 || lean[0].ID != "q2" || lean[0].Shard != 1 || lean[0].Body != nil || lean[0].Meta != nil || lean[0].Seq == 0 {
+			t.Errorf("lean ListQueries after q1 = %+v, %v", lean, err)
+		}
+		if _, err := rr.ListQueries(ctx, "rec", "", MaxListLimit+1, false); !errors.Is(err, ErrInvalid) {
 			t.Errorf("limit over the maximum: err = %v, want ErrInvalid", err)
 		}
 	})

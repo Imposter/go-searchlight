@@ -30,13 +30,14 @@ var changelog = dialect.Changelog{
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
 	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?), (SELECT uid FROM sl_indexes WHERE name = ?) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
-	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	DocumentState:   "SELECT seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryState:      "SELECT seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	Tombstone:       "SELECT version FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?",
 	Write:           write,
 	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
-	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanQueries:     "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
 // write spells w one row a statement; see the package comment for why.
@@ -51,11 +52,11 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 	}
 	for i := range w.Documents {
 		r := &w.Documents[i]
-		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq}})
+		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version}})
 	}
 	for i := range w.Queries {
 		r := &w.Queries[i]
-		out = append(out, dialect.Stmt{What: "upsert queries", SQL: upsertQuery, Args: []any{r.Index, r.Shard, r.ID, r.Query, r.Meta, r.Seq}})
+		out = append(out, dialect.Stmt{What: "upsert queries", SQL: upsertQuery, Args: []any{r.Index, r.Shard, r.ID, r.Query, r.Meta, r.Seq, r.Version}})
 	}
 	for _, g := range w.DocumentDeletes {
 		for _, id := range g.IDs {
@@ -67,21 +68,32 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 			out = append(out, dialect.Stmt{What: "delete queries", SQL: deleteQuery, Args: []any{g.Index, g.Shard, id}})
 		}
 	}
+	for i := range w.Tombstones {
+		r := &w.Tombstones[i]
+		out = append(out, dialect.Stmt{What: "upsert tombstones", SQL: upsertTombstone, Args: []any{r.Index, r.Shard, r.Kind, r.ID, r.Version}})
+	}
+	for i := range w.TombstoneDeletes {
+		r := &w.TombstoneDeletes[i]
+		out = append(out, dialect.Stmt{What: "delete tombstones", SQL: deleteTombstone, Args: []any{r.Index, r.Shard, r.Kind, r.ID}})
+	}
 	return append(out, dialect.Stmt{What: "advance counter", SQL: "UPDATE sl_counter SET value = ? WHERE id = 1", Args: []any{w.Counter}})
 }
 
 const (
-	insertChange   = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	upsertDocument = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq"
-	upsertQuery    = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq"
-	deleteDocument = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
-	deleteQuery    = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
+	insertChange    = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	upsertDocument  = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq, version = excluded.version"
+	upsertQuery     = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq, version = excluded.version"
+	upsertTombstone = "INSERT INTO sl_tombstones (index_name, shard, kind, id, version) VALUES (?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = excluded.version"
+	deleteTombstone = "DELETE FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?"
+	deleteDocument  = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
+	deleteQuery     = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
 )
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?",
+	GetDocument:       "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:          "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	ListQueries:       "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id > ? ORDER BY id LIMIT ?",
+	ListQueryVersions: "SELECT id, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id > ? ORDER BY id LIMIT ?",
 }
 
 var registry = dialect.Registry{
@@ -153,6 +165,7 @@ VALUES (?, ?, ?, 1, NOW, 1, ?) RETURNING ` + indexColumns)},
 	DropData: []string{
 		"DELETE FROM sl_documents WHERE index_name = ?",
 		"DELETE FROM sl_queries WHERE index_name = ?",
+		"DELETE FROM sl_tombstones WHERE index_name = ?",
 		"DELETE FROM sl_changes WHERE index_name = ?",
 		"DELETE FROM sl_pruned WHERE index_name = ?",
 		"DELETE FROM sl_shard_copies WHERE index_name = ?",

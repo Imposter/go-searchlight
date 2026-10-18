@@ -65,24 +65,42 @@ func Blob(b []byte) any {
 }
 
 // DocumentRow is a document's new state: its body in Body (text) or BodyZ (body_z;
-// see ChangeRow). An upsert sets both columns.
+// see ChangeRow), and the client version its write named (0 for none). An upsert
+// sets every column.
 type DocumentRow struct {
-	Index string
-	Shard int
-	ID    string
-	Body  string
-	BodyZ []byte
-	Seq   int64
+	Index   string
+	Shard   int
+	ID      string
+	Body    string
+	BodyZ   []byte
+	Seq     int64
+	Version int64
 }
 
 // QueryRow is a saved query's new state.
 type QueryRow struct {
-	Index string
-	Shard int
-	ID    string
-	Query string
-	Meta  string
-	Seq   int64
+	Index   string
+	Shard   int
+	ID      string
+	Query   string
+	Meta    string
+	Seq     int64
+	Version int64
+}
+
+// Tombstone kinds: what a tombstone keeps the version of.
+const (
+	TombstoneDocument = "d"
+	TombstoneQuery    = "q"
+)
+
+// TombstoneRow is the version a versioned delete keeps of an id (sl_tombstones).
+type TombstoneRow struct {
+	Index   string
+	Shard   int
+	Kind    string
+	ID      string
+	Version int64
 }
 
 // DeleteGroup is the ids of one shard of one index to delete.
@@ -95,16 +113,20 @@ type DeleteGroup struct {
 // Write is everything a transaction holding the counter lock writes once
 // the store has allocated its seqs: the changelog rows, the net effect on
 // sl_documents and sl_queries (at most one entry per key across the upserts
-// and deletes of a table), the counter's new value, and the notification
-// payloads (only when the dialect has Listen).
+// and deletes of a table), the tombstones versioned deletes keep and those
+// versioned upserts replace (at most one entry per key across both), the
+// counter's new value, and the notification payloads (only when the dialect has
+// Listen).
 type Write struct {
-	Changes         []ChangeRow
-	Documents       []DocumentRow
-	Queries         []QueryRow
-	DocumentDeletes []DeleteGroup
-	QueryDeletes    []DeleteGroup
-	Counter         int64
-	Notify          []string
+	Changes          []ChangeRow
+	Documents        []DocumentRow
+	Queries          []QueryRow
+	DocumentDeletes  []DeleteGroup
+	QueryDeletes     []DeleteGroup
+	Tombstones       []TombstoneRow
+	TombstoneDeletes []TombstoneRow
+	Counter          int64
+	Notify           []string
 }
 
 // Changelog is the write-ahead log and the documents and saved queries it
@@ -130,9 +152,11 @@ type Changelog struct {
 	ReadTip string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
-	// DocumentSeq and QuerySeq: (index, shard, id) -> seq.
-	DocumentSeq string
-	QuerySeq    string
+	// DocumentState and QueryState: (index, shard, id) -> seq, version.
+	DocumentState string
+	QueryState    string
+	// Tombstone: (index, shard, kind, id) -> version of sl_tombstones.
+	Tombstone string
 	// Write returns the statements that store w, in order, inside the
 	// transaction holding the counter lock, splitting a batch so that no
 	// statement passes l. The store prepares a statement text that runs
@@ -150,19 +174,22 @@ type Changelog struct {
 	Horizon string
 	// ScanDocuments: (index, shard) -> id, body, body_z, seq, by id.
 	ScanDocuments string
-	// ScanQueries: (index, shard) -> id, query, meta, seq, by id.
+	// ScanQueries: (index, shard) -> id, query, meta, seq, version, by id.
 	ScanQueries string
 }
 
 // Records reads the system of record directly.
 type Records struct {
-	// GetDocument: (index, shard, id) -> body, body_z, seq.
+	// GetDocument: (index, shard, id) -> body, body_z, seq, version.
 	GetDocument string
-	// GetQuery: (index, shard, id) -> query, meta, seq.
+	// GetQuery: (index, shard, id) -> query, meta, seq, version.
 	GetQuery string
-	// ListQueries: (index, after, limit) -> shard, id, query, meta, seq of the
-	// index's saved queries with id > after, by id.
+	// ListQueries: (index, shard, after, limit) -> id, query, meta, seq, version of
+	// the shard's saved queries with id > after, by id: the primary key's order.
 	ListQueries string
+	// ListQueryVersions: (index, shard, after, limit) -> id, seq, version of the
+	// same queries, reading neither their trees nor their meta.
+	ListQueryVersions string
 }
 
 // Registry is the cluster registry: sl_nodes and the shard-copy slots of
@@ -290,7 +317,7 @@ type Indexes struct {
 	Update string
 	// Drop: (name) deletes the index's row.
 	Drop string
-	// DropData: each (name), deletes the index's documents, queries,
+	// DropData: each (name), deletes the index's documents, queries, tombstones,
 	// changes, prune horizons and shard copies.
 	DropData []string
 }

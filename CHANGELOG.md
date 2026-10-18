@@ -53,6 +53,18 @@ Point fields and box queries, and reads that retry a serving copy their view had
   reads' turn now gives up at the request's deadline too. Date math
   stays resolved once and `wait_for_seq` holds. `searchlight_cluster_read_rereads_total`
   counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
+- **A rejected negated pattern no longer changes how later patterns fold.** Compiling a
+  `terms` include or exclude pattern with a negated class (`[^\t]`) appended to the
+  process-wide table of case-folded code points, so a later `[A-C]` stopped matching
+  `a` until the process restarted, and concurrent searches raced on the table.
+
+### Known issues
+
+- **Windows nodes:** a Go runtime bug ([golang/go#79249](https://github.com/golang/go/issues/79249),
+  fixed for Go 1.28) can resume a thread with corrupt registers after an asynchronous
+  preemption lands during exception handling, crashing with an access violation. Run
+  Windows nodes with `GODEBUG=asyncpreemptoff=1` until a release is built with a fixed
+  Go ([docs/operations.md](docs/operations.md)). Linux and macOS are not affected.
 
 ## [1.2.0] - 2026-10-17
 

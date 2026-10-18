@@ -22,7 +22,8 @@ whose WAL checkpoints, merges, renames and large files behave differently on NTF
 On Windows the Go runtime can corrupt a thread's registers when it preempts it during
 exception handling ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed in
 Go 1.28), so Windows binaries, test binaries included, are linked with async preemption
-off: the make targets pass the flags of [tools/ldflags.sh](tools/ldflags.sh), and CI's
+off: the make targets pass the flags of [tools/ldflags.sh](tools/ldflags.sh) (so `make`
+needs `sh` on PATH; on Windows, Git Bash's), and CI's
 Windows job runs `go test -ldflags "$(sh tools/ldflags.sh -godebug)"`. A bare `go test` on
 Windows runs with preemption on; pass those flags, or set `GODEBUG=asyncpreemptoff=1`.
 

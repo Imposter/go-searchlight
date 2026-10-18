@@ -80,11 +80,20 @@ and the node then crashes with an access violation at a small address. The fix i
 Go 1.28, and no release carries it yet. The release binaries have the setting built in;
 there is nothing to set. It costs nothing beyond a goroutine in a long, call-free loop
 sometimes waiting for its next function call to yield. An `asyncpreemptoff` of your own
-in `GODEBUG` wins: `GODEBUG=asyncpreemptoff=0` turns preemption back on. A binary built
-another way (`go install`, or `go build` without [tools/ldflags.sh](../tools/ldflags.sh)'s
-flags) starts itself again as a child process with the setting, passing on its
-arguments, console and exit code; build with `make build` or those flags to keep it one
-process.
+in `GODEBUG` wins: `GODEBUG=asyncpreemptoff=0` turns preemption back on. To see what a
+binary runs with, run it with `SEARCHLIGHT_DIAG_ASYNC_PREEMPT=1`: instead of starting a
+node it prints `asyncpreemptoff=1` (off) or `asyncpreemptoff=0` (on) after a second or
+so, and exits. `go version -m` does not show the setting.
+
+A Windows binary built another way (`go install`, or `go build` without
+[tools/ldflags.sh](../tools/ldflags.sh)'s flags) cannot change the setting once running,
+so it starts itself again with it and runs as two processes: a wrapper, which only
+waits, and the node, its child, which gets its arguments, environment, standard streams
+and console (none if the wrapper has none) and whose exit code the wrapper exits with. A
+service manager or supervisor tracks the wrapper's process id, and its stop still
+reaches the node: Ctrl+C and Ctrl+Break through the shared console, a stop sent to a
+wrapper with no console passed on to the node, and a killed wrapper takes the node with
+it (a job object). Build with `make build` or those flags to run as one process.
 
 Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.2.0`
 also works, and reports its version), then run it:

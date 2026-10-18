@@ -11,7 +11,10 @@
 # fix. So a Windows build links asyncpreemptoff=1 into runtime.godebugDefault, the
 # defaults the runtime applies before $GODEBUG: async preemption is off unless the
 # operator sets GODEBUG=asyncpreemptoff=0. This -X replaces the one the go command passes
-# (the last -X of a symbol wins), so it repeats the go command's own defaults first.
+# (the linker keeps the last -X of a symbol, as it does today, and the go command puts
+# its own first), so it repeats the go command's own defaults first. The build info
+# (go version -m) still shows the go command's DefaultGODEBUG, without asyncpreemptoff;
+# SEARCHLIGHT_DIAG_ASYNC_PREEMPT=1 makes the binary report what it runs with.
 # main.asyncPreemptLinked tells the binary it was built so; one built without it starts
 # itself again with the setting (cmd/searchlight/preempt_windows.go).
 #

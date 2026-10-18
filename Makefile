@@ -18,6 +18,7 @@
 #
 # The binary's -ldflags come from tools/ldflags.sh, as the release's do. On Windows they
 # also turn async preemption off by default (golang/go#79249), for the test binaries too.
+# So make needs sh on PATH (on Windows, Git Bash's), and stops if the script fails.
 
 GO            ?= go
 GOLANGCI_LINT ?= golangci-lint
@@ -26,8 +27,11 @@ BENCH         ?= .
 SCRAPE_BOT    ?= E:/code/scrape_bot
 SCRAPE_BOT_REF ?= 325c3345ec8f8f892e895ea9edc0e0f81d0a7fcb
 VERSION       ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS        = $(shell sh tools/ldflags.sh $(VERSION))
-TEST_LDFLAGS   = $(shell sh tools/ldflags.sh -godebug)
+LDFLAGS        = $(call run-ldflags,$(VERSION))
+TEST_LDFLAGS   = $(call run-ldflags,-godebug)
+# $(call run-ldflags,<arg>) is tools/ldflags.sh's output, or an error when it fails.
+run-ldflags    = $(call ldflags-checked,$(1),$(shell sh tools/ldflags.sh $(1) && echo ldflags-ok))
+ldflags-checked = $(if $(filter ldflags-ok,$(lastword $(2))),$(filter-out ldflags-ok,$(2)),$(error tools/ldflags.sh $(1) failed: make needs sh (on Windows, Git Bash's) and go on PATH))
 IMAGE         ?= searchlight:dev
 DOCKER        ?= docker
 

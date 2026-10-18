@@ -53,11 +53,13 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
 - **A Windows node no longer needs `GODEBUG=asyncpreemptoff=1` set.** The Go runtime can
   corrupt a thread's registers when it preempts that thread while Windows is handling an
-  exception on it ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed in
-  Go 1.28 only), and the node then crashes with an access violation at a small address.
+  exception on it ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed
+  upstream for Go 1.28, in no release yet), and the node then crashes with an access
+  violation at a small address.
   The Windows release binary now links `asyncpreemptoff=1` in as the runtime's default
   ([tools/ldflags.sh](tools/ldflags.sh), also used by `make build`), and a Windows binary
-  built without it, such as by `go install`, starts itself again with the setting. An
+  built without it, such as by `go install`, starts itself again with the setting, as a
+  second process. `make` now needs `sh` on PATH (on Windows, Git Bash's). An
   `asyncpreemptoff` in `GODEBUG` still wins, so `GODEBUG=asyncpreemptoff=0` turns
   preemption back on ([docs/operations.md](docs/operations.md#the-binary)).
 

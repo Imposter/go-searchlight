@@ -1,6 +1,7 @@
 package search
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -629,5 +631,34 @@ func TestNestedInnerHitsKeysAcrossQueries(t *testing.T) {
 	r.PostFilter = mustParse(t, `{"nested":{"path":"_v","inner_hits":{"name":"other"}}}`)
 	if ps := ValidateQueries(r, testMapping); len(ps) > 0 {
 		t.Fatalf("two keys: %v", ps)
+	}
+}
+
+// The request cache keys a nested node by its path and inner query, and an
+// aggregation by its where; a where reading now unrounded turns the cache off.
+func TestRequestCacheNested(t *testing.T) {
+	key := func(raw string) []byte {
+		t.Helper()
+		k, ok := requestCacheKey(parseReq(t, raw))
+		if !ok {
+			t.Fatalf("%s is not cacheable", raw)
+		}
+		return k
+	}
+	q := func(size string) string {
+		return `{"size":0,"query":{"nested":{"path":"_v","query":{"field":"_v.size","op":"eq","value":"` + size + `"}}}}`
+	}
+	if !bytes.Equal(key(q("L")), key(q("l"))) || bytes.Equal(key(q("L")), key(q("M"))) {
+		t.Fatal("nested nodes' keys")
+	}
+	where := func(size string) string {
+		return `{"size":0,"aggs":{"t":{"terms":{"field":"_v.size","where":{"field":"_v.size","op":"eq","value":"` + size + `"}}}}}`
+	}
+	if bytes.Equal(key(where("L")), key(where("M"))) || bytes.Equal(key(where("L")), key(`{"size":0,"aggs":{"t":{"terms":{"field":"_v.size"}}}}`)) {
+		t.Fatal("an aggregation's where is not in its key")
+	}
+	r := parseReq(t, `{"size":0,"aggs":{"t":{"terms":{"field":"_v.size","where":{"field":"_v.at","op":"gte","value":"now-1d"}}}}}`)
+	if ps := ResolveQueries(r, time.Now()); len(ps) > 0 || !r.NoRequestCache {
+		t.Fatalf("a where reading now unrounded: %v, cache off %v", ps, r.NoRequestCache)
 	}
 }

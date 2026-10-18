@@ -6,6 +6,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-18
+
+Nested fields: one document per product with its variants, queried, counted and sorted per variant.
+
 ### Added
 
 - **Nested fields**, Elasticsearch's `nested` type ([docs/api.md](docs/api.md#nested-fields)):
@@ -406,6 +410,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.4.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.1.0

@@ -362,7 +362,7 @@ func (n *Single) PatchMapping(ctx context.Context, name string, fields map[strin
 		return nil, err
 	}
 	if n.cl != nil {
-		if err := n.cl.AdmitFields(ctx, fields); err != nil {
+		if err := n.cl.AdmitFields(ctx, admitted(idx.meta.Load().mapping, fields)); err != nil {
 			return nil, err
 		}
 	}
@@ -425,4 +425,17 @@ func (n *Single) adoptSettings(idx *index, s api.IndexSettings) {
 		default:
 		}
 	}
+}
+
+// admitted is fields as the cluster admits them under mapping m: a sub-field given by
+// its full name alone (_v.colour, a nested field's new sub-field) brings its nested
+// field with it, whose type is what an older node cannot read.
+func admitted(m *schema.Mapping, fields map[string]schema.FieldType) map[string]schema.FieldType {
+	out := maps.Clone(fields)
+	for name := range fields {
+		if path, ok := m.NestedPath(name); ok {
+			out[path] = schema.Nested
+		}
+	}
+	return out
 }

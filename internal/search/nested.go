@@ -2,6 +2,7 @@ package search
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -412,6 +413,21 @@ func innerSpecs(r *Request) []innerSpec {
 	return out
 }
 
+// MaxInnerHitsObjects bounds the inner hits one response holds: a search's size times
+// the sizes of its inner_hits together (InnerHitsObjects) is at most it, else the
+// search is refused ([ValidateQueries]).
+const MaxInnerHitsObjects = 10_000
+
+// InnerHitsObjects is the most inner hit objects a response to r holds: its size times
+// the sizes of the inner hits its query and post_filter ask for.
+func InnerHitsObjects(r *Request) int {
+	n := 0
+	for _, spec := range innerSpecs(r) {
+		n += spec.size
+	}
+	return n * max(r.Size, 0)
+}
+
 // HasInnerHits reports whether r's query or post_filter asks for inner hits.
 func HasInnerHits(r *Request) bool { return len(innerSpecs(r)) > 0 }
 
@@ -435,13 +451,16 @@ func InnerHitsFields(r *Request) []string {
 // post_filter that asks for them, from its body, read under mapping m as the hit was
 // indexed: each member that satisfies the node's query, in array order. Each body is
 // then limited to fields (the request's own, before [InnerHitsFields] widened them),
-// when set.
-func FillInnerHits(hits []Hit, r *Request, m *schema.Mapping, fields []string) error {
+// when set. It stops at ctx's end, with its error.
+func FillInnerHits(ctx context.Context, hits []Hit, r *Request, m *schema.Mapping, fields []string) error {
 	specs := innerSpecs(r)
 	if len(specs) == 0 {
 		return nil
 	}
 	for i := range hits {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		h := &hits[i]
 		if h.Body == nil {
 			continue

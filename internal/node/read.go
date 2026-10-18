@@ -179,7 +179,7 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 		return nil, err
 	}
 	if inner {
-		if err := search.FillInnerHits(resp.Hits, r, idx.meta.Load().mapping, fields); err != nil {
+		if err := search.FillInnerHits(ctx, resp.Hits, r, idx.meta.Load().mapping, fields); err != nil {
 			return nil, err
 		}
 	}

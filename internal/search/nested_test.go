@@ -3,6 +3,7 @@ package search
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -519,7 +520,7 @@ func TestNestedInnerHits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", raw, err)
 		}
-		if err := FillInnerHits(got.Hits, &wide, testMapping, r.Fields); err != nil {
+		if err := FillInnerHits(context.Background(), got.Hits, &wide, testMapping, r.Fields); err != nil {
 			t.Fatalf("%s: %v", raw, err)
 		}
 		innerNode, _ := query.Parse([]byte(inner))

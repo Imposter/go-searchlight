@@ -17,7 +17,8 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   - `{"nested": {"path": "_v", "query": ...}}` holds when one object satisfies the whole
     query (a `not` inside applies per object), in queries, `post_filter`, filter
     aggregations and saved queries; `inner_hits` returns each hit's matching members,
-    by offset, with the sub-fields asked for.
+    by offset, with the sub-fields asked for (at most 10,000 inner hit objects per
+    response: `size` times the `inner_hits` sizes).
   - `terms`, `stats`, `min`, `max` and `cardinality` on a sub-field, with an optional
     `where` choosing the objects: `terms` counts each document once per value. A sort
     on a sub-field orders hits by the least or greatest value among their objects

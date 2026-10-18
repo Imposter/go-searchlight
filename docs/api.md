@@ -61,7 +61,7 @@ segments.
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
 | Query size | 4 levels of `all`/`any`/`nested`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
 | Members of a [nested field](#nested-fields) in one document | 10,000 | 400 |
-| A nested node's `inner_hits` | `size` 1,000, `fields` 100 | 400 with `loc` |
+| A nested node's `inner_hits` | `size` 1,000, `fields` 100; 10,000 inner hit objects per response (`size` × the `inner_hits` sizes) | 400 with `loc` |
 | A search's `from + size` | `max_result_window` (10,000) | 400 with `loc` `from` (`size` when `from` is 0): page deeper with `search_after` |
 | Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
 | Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
@@ -170,7 +170,8 @@ point:
   `_v` is a 400 at `mapping.fields._v.size`, one making a field nested over names
   mapped under it a 400 too.
 - **Growing.** `PATCH .../mapping` with `{"fields": {"_v": {"type": "nested", "fields":
-  {"sku": "keyword"}}}}` adds sub-fields; retyping one is a 400, as retyping a field
+  {"sku": "keyword"}}}}` adds sub-fields (so does `{"fields": {"_v.sku": "keyword"}}`,
+  naming one by its full name); retyping one is a 400, as retyping a field
   is. Dynamic typing never makes a field nested (an array of objects is a
   `keyword_list` of nothing): map it first. Under `dynamic: true` a new sub-field is
   typed from its first value, as a new field is; `false` keeps it unindexed, and
@@ -226,7 +227,10 @@ The key is `name`, or the path. They are read from each hit's stored body once t
 page is fetched (a `fields` limit applies after), and a hit matched by another branch
 of an `any` has them too, maybe with a `total` of 0. `inner_hits` under a `not` (a
 document a `not` matches has no object to show), in an aggregation's filter, or twice
-under one key is a 400 at its `loc`.
+under one key is a 400 at its `loc`. A response holds at most 10,000 inner hit objects:
+a search whose `size` times its `inner_hits` sizes (added up) passes that is a 400 at
+`size`, and the objects it may hold count against `max_inflight_read_bytes` (1 KiB
+each) while it runs.
 
 **Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
 `min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at
@@ -256,9 +260,10 @@ missing value does:
                         "where": {"field": "_v.in_stock", "op": "eq", "value": true}}}]}
 ```
 
-`search_after` pages on it as on any key. A `mode` other than `min` or `max`, `mode` or
-`where` on a field that is no sub-field, and a sort on a `bool` or `keyword_list`
-sub-field or on the nested field itself are 400s at `sort.N`.
+`search_after` pages on it as on any key. A `mode` other than `min` or `max` is a 400 at
+`sort.N.<field>.mode`; `mode` or `where` on a field that is no sub-field, and a sort on
+a `bool` or `keyword_list` sub-field or on the nested field itself, are 400s at
+`sort.N`.
 
 `PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once, or
 `replicas_per_shard`. The allocator then places or releases copies to meet the new

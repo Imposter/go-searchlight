@@ -90,7 +90,8 @@ func TestPointFieldsWaitForEveryNode(t *testing.T) {
 
 // While a node of the release before nested fields (which reads point fields)
 // heartbeats, a nested field is refused (409, naming the node) and a point field is
-// not; once the node is gone, the nested field goes through.
+// not; once the node is gone, the nested field goes through, and while it serves
+// again a sub-field given by its full name alone is refused too.
 func TestNestedFieldsWaitForEveryNode(t *testing.T) {
 	db := sqliteDB(t)
 	c := newCluster(t, db, func(int, *Options) {})
@@ -118,5 +119,12 @@ func TestNestedFieldsWaitForEveryNode(t *testing.T) {
 	}
 	if _, err := a.n.PatchMapping(tctx(t), "plain", nested); err != nil {
 		t.Fatalf("patching in a nested field once every node reads it: %v", err)
+	}
+	if err := a.st.Registry().Heartbeat(tctx(t), old); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.n.PatchMapping(tctx(t), "plain", map[string]schema.FieldType{"_v.colour": schema.Keyword})
+	if !errors.As(err, &ae) || ae.Status != http.StatusConflict || !strings.Contains(ae.Detail, "node-old (1.3.0)") {
+		t.Fatalf("a sub-field by its full name while an older node serves: %v; want a 409", err)
 	}
 }

@@ -728,13 +728,17 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 // aggregation that holds it), which ask for no inner hits, and as
 // [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
 // field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
-// query and post_filter ask for no inner hits under one key. It sets r.Nested when r
-// reads a nested field's objects.
+// query and post_filter ask for no inner hits under one key, and at most
+// MaxInnerHitsObjects together (InnerHitsObjects). It sets r.Nested when r reads a
+// nested field's objects.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
 		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
 		ps = append(ps, sharedInnerHits(r.Query, r.PostFilter)...)
+	}
+	if n := InnerHitsObjects(r); n > MaxInnerHitsObjects {
+		ps = append(ps, query.Problem{Loc: "size", Message: fmt.Sprintf("size times the inner_hits sizes is %d: a response holds at most %d inner hit objects", n, MaxInnerHitsObjects)})
 	}
 	for i, f := range r.Sort {
 		if f.Where == nil {

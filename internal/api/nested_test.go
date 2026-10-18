@@ -116,6 +116,7 @@ func TestNestedFields(t *testing.T) {
 		{`{"aggs": {"t": {"terms": {"field": "_v.size", "where": {"field": "title", "op": "exists"}}}}}`, "aggs.t.terms.where.field", "sub-fields"},
 		{`{"sort": [{"_v.price": {"mode": "avg"}}]}`, "sort.0._v.price.mode", "min"},
 		{`{"sort": [{"title": {"mode": "min"}}]}`, "sort.0", "sub-field"},
+		{`{"size": 20, "query": {"nested": {"path": "_v", "inner_hits": {"size": 1000}}}}`, "size", "at most 10000 inner hit objects"},
 	} {
 		p := e.problem(e.do("POST", "/indexes/shop/_search", tc.body), http.StatusBadRequest, "invalid_request")
 		if got := locs(p); len(got) != 1 || got[0] != tc.loc || !strings.Contains(fmt.Sprint(p["problems"]), tc.says) {

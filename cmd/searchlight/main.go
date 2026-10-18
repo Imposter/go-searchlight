@@ -28,6 +28,9 @@
 //
 // "searchlight version" (or "searchlight --version") prints the version the binary was
 // built as, with its Go version and platform, and exits 0.
+//
+// On Windows it runs with async preemption off (GODEBUG=asyncpreemptoff=1) unless GODEBUG
+// sets asyncpreemptoff, working around golang/go#79249 (preempt_windows.go).
 package main
 
 import (
@@ -71,6 +74,15 @@ const (
 )
 
 func main() {
+	ensureAsyncPreemptOff()
+	if os.Getenv(envDiagAsyncPreempt) != "" {
+		off := 0
+		if asyncPreemptionOff() {
+			off = 1
+		}
+		fmt.Printf("asyncpreemptoff=%d\n", off)
+		return
+	}
 	version = moduleVersion(version, debug.ReadBuildInfo)
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -80,12 +92,21 @@ func main() {
 			os.Exit(printVersion(os.Args[2:], os.Stdout, os.Stderr))
 		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// A stop from the parent that started this node again (preempt_windows.go) stops it
+	// as a first signal does. A signal after that one is ignored rather than ending the
+	// process at once: the parent and the node may both be sent the same shutdown.
+	ctx, cancel := context.WithCancel(sigCtx)
 	go func() {
-		<-ctx.Done()
-		stop()
+		select {
+		case <-sigCtx.Done():
+			stop()
+		case <-parentStopped():
+			cancel()
+		}
 	}()
 	err := run(ctx, os.Args[1:], os.Getenv, os.Stderr)
+	cancel()
 	stop()
 	switch {
 	case errors.Is(err, flag.ErrHelp):

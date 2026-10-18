@@ -4,7 +4,7 @@
 # searchlight-deploy-<version>.tar.gz with .env.example and nginx/searchlight.conf, and
 # every path in it is relative to this file.
 #
-#   tar -xzf searchlight-deploy-1.2.0.tar.gz && cd searchlight-deploy-1.2.0
+#   tar -xzf searchlight-deploy-1.3.0.tar.gz && cd searchlight-deploy-1.3.0
 #   cp .env.example .env              # optional: the defaults are the example's values
 #   docker compose -f compose.postgres.yml up -d
 #   docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens
@@ -48,7 +48,7 @@
 name: searchlight
 
 x-searchlight: &searchlight
-  image: ghcr.io/imposter/searchlight:${SEARCHLIGHT_VERSION:-1.2.0}
+  image: ghcr.io/imposter/searchlight:${SEARCHLIGHT_VERSION:-1.3.0}
   restart: unless-stopped
   depends_on:
     postgres:

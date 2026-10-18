@@ -574,7 +574,6 @@ func TestNestedRefusals(t *testing.T) {
 		`{"not":{"nested":{"path":"_v","query":{"all":[]},"inner_hits":{}}}}`:                                      "query.not.nested.inner_hits",
 		`{"nested":{"path":"_v","query":{"nested":{"path":"_v","query":{"all":[]}}}}}`:                             "query.nested.query.nested",
 		`{"nested":{"path":"_v","inner_hits":{"fields":["brand"]}}}`:                                               "query.nested.inner_hits.fields.0",
-		`{"all":[{"nested":{"path":"_v","inner_hits":{}}},{"nested":{"path":"_v","inner_hits":{}}}]}`:              "query.all.1.nested.inner_hits",
 		`{"nested":{"path":"_v","query":{"field":"_v.size","op":"lt","value":3}}}`:                                 "query.nested.query.op",
 		`{"nested":{"path":"_v","query":{"all":[{"field":"_v.price","op":"lt","value":3},{"any":[{"all":[]}]}]}}}`: "query.nested.query.all.1.any.0.all",
 	} {
@@ -622,17 +621,126 @@ func asRequestError(err error, re **RequestError) bool {
 	return ok
 }
 
-// The query and the post_filter cannot ask for inner hits under one key.
+// The query and the post_filter give one key to one path's nodes alone: those of one
+// path share it, and those of another are refused.
 func TestNestedInnerHitsKeysAcrossQueries(t *testing.T) {
+	m := &schema.Mapping{Fields: maps.Clone(testMapping.Fields)}
+	m.Fields["_w"], m.Fields["_w.size"] = schema.Nested, schema.Keyword
 	hits := mustParse(t, `{"nested":{"path":"_v","inner_hits":{}}}`)
 	r := &Request{Query: hits, PostFilter: &query.All{Children: []query.Node{hits}}}
-	ps := ValidateQueries(r, testMapping)
-	if len(ps) != 1 || ps[0].Loc != "post_filter.all.0.nested.inner_hits" {
+	if ps := ValidateQueries(r, m); len(ps) > 0 {
+		t.Fatalf("one path's key: %v", ps)
+	}
+	r.PostFilter = mustParse(t, `{"all":[{"nested":{"path":"_w","inner_hits":{"name":"_v"}}}]}`)
+	ps := ValidateQueries(r, m)
+	if len(ps) != 1 || ps[0].Loc != "post_filter.all.0.nested.inner_hits" || !strings.Contains(ps[0].Message, "one path alone") {
 		t.Fatalf("problems %v", ps)
 	}
-	r.PostFilter = mustParse(t, `{"nested":{"path":"_v","inner_hits":{"name":"other"}}}`)
-	if ps := ValidateQueries(r, testMapping); len(ps) > 0 {
+	r.PostFilter = mustParse(t, `{"nested":{"path":"_w","inner_hits":{"name":"other"}}}`)
+	if ps := ValidateQueries(r, m); len(ps) > 0 {
 		t.Fatalf("two keys: %v", ps)
+	}
+}
+
+// TestNestedInnerHitsMerged: nested nodes sharing an inner_hits name, in the query and
+// the post_filter, answer one set of inner hits under it, against brute force: every
+// member satisfying any of their queries once, in array order, the first of them by
+// the largest size, as objects of the sub-fields any node names (all of them when one
+// names none); the response's objects are bounded by that size alone.
+func TestNestedInnerHitsMerged(t *testing.T) {
+	seed := testSeed(t)
+	rng := rand.New(rand.NewPCG(seed, seed^0x3e26))
+	c := variantCluster(t, rng, 500)
+	byID := map[string]*schema.Doc{}
+	for _, d := range c.docs() {
+		byID[d.ID] = d
+	}
+	fieldSets := [][]string{{"_v._key"}, {"_v.price"}, {"_v._key", "_v.size"}, nil}
+	for range 60 {
+		n := 2 + rng.IntN(2)
+		var nodes []string
+		var inners []*query.Compiled
+		size, every := 0, false
+		var union []string
+		for range n {
+			inner := randomInnerJSON(rng, 0)
+			innerNode, ps := query.Parse([]byte(inner))
+			if len(ps) > 0 {
+				continue
+			}
+			s := rng.IntN(4)
+			fields := pick(rng, fieldSets)
+			hits := fmt.Sprintf(`{"name":"picked","size":%d`, s)
+			if fields != nil {
+				hits += `,"fields":["` + strings.Join(fields, `","`) + `"]`
+			}
+			nodes = append(nodes, `{"nested":{"path":"_v","query":`+inner+`,"inner_hits":`+hits+`}}}`)
+			inners = append(inners, query.Compile(innerNode))
+			size = max(size, s)
+			if fields == nil {
+				every = true
+			}
+			for _, f := range fields {
+				if !slices.Contains(union, f) {
+					union = append(union, f)
+				}
+			}
+		}
+		if len(nodes) < 2 {
+			continue
+		}
+		raw := `{"any":[` + strings.Join(nodes[1:], ",") + `,{"field":"brand","op":"exists"}]}`
+		q, ok := parseValid(t, raw)
+		if !ok {
+			continue
+		}
+		post, ok := parseValid(t, nodes[0])
+		if !ok {
+			continue
+		}
+		r := &Request{Query: q, PostFilter: post, Size: 40, Fields: []string{"brand"}}
+		if ps := ValidateQueries(r, testMapping); len(ps) > 0 {
+			t.Fatalf("%s: %v", raw, ps)
+		}
+		if got, want := InnerHitsObjects(r), 40*size; got != want {
+			t.Fatalf("%s: %d inner hit objects, want %d", raw, got, want)
+		}
+		wide := *r
+		wide.Fields = InnerHitsFields(r)
+		got, err := c.search(&wide)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		if err := FillInnerHits(context.Background(), got.Hits, &wide, testMapping, r.Fields); err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		for _, h := range got.Hits {
+			if len(h.InnerHits) != 1 {
+				t.Fatalf("%s: hit %s has inner hits %v, want one key", raw, h.ID, slices.Collect(maps.Keys(h.InnerHits)))
+			}
+			var offsets []int
+			objects := byID[h.ID].Fields["_v"].Objects
+			for k := range objects {
+				if slices.ContainsFunc(inners, func(m *query.Compiled) bool { return m.MatchObject(&objects[k]) }) {
+					offsets = append(offsets, k)
+				}
+			}
+			ih := h.InnerHits["picked"]
+			if ih == nil || ih.Total != len(offsets) || !slices.Equal(ih.Offsets, offsets[:min(size, len(offsets))]) || len(ih.Objects) != len(ih.Offsets) {
+				t.Fatalf("%s: hit %s's inner hits %+v, want offsets %v of size %d", raw, h.ID, ih, offsets, size)
+			}
+			for _, obj := range ih.Objects {
+				var o map[string]any
+				if err := json.Unmarshal(obj, &o); err != nil {
+					t.Fatal(err)
+				}
+				for k := range o {
+					if !every && !slices.Contains(union, "_v."+k) {
+						t.Fatalf("%s: inner hit %s holds %q, which no node asks for (%v)", raw, obj, k, union)
+					}
+				}
+			}
+		}
 	}
 }
 

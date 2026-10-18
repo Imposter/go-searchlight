@@ -375,42 +375,79 @@ func (n *nestCol) key(c *sortCol, d uint32) part {
 	return best
 }
 
-// InnerHits are one hit's inner hits for one nested node: how many members of its
-// path satisfy the node's query (Total), and the first of them (inner_hits' size) by
-// their offsets in the array and as objects of the sub-fields asked for.
+// InnerHits are one hit's inner hits under one key: how many members of its path
+// satisfy the query of a nested node asking for them under it (Total, each member
+// once), and the first of them (inner_hits' size) by their offsets in the array, in
+// array order, and as objects of the sub-fields asked for.
 type InnerHits struct {
 	Total   int               `json:"total"`
 	Offsets []int             `json:"offsets"`
 	Objects []json.RawMessage `json:"objects"`
 }
 
-// innerSpec is one nested node's inner hits, compiled.
+// innerSpec is the inner hits of one key, compiled: those of every nested node asking
+// for them under it (all of one path), merged.
 type innerSpec struct {
-	key    string
-	path   string
+	key  string
+	path string
+	// size is the largest of the nodes' sizes, and fields the sub-fields any of them
+	// names (nil, every one, when one names none).
 	size   int
 	fields []string
-	match  *query.Compiled
+	// matches are the nodes' queries: a member is an inner hit when it satisfies one.
+	matches []*query.Compiled
 }
 
-// innerSpecs are the inner hits r's query and post_filter ask for.
+// innerSpecs are the inner hits r's query and post_filter ask for, one per key in the
+// order the keys first appear: the nodes sharing a key (one path's, [ValidateQueries])
+// merged.
 func innerSpecs(r *Request) []innerSpec {
 	var out []innerSpec
+	at := map[string]int{}
 	for _, n := range []query.Node{r.Query, r.PostFilter} {
 		if n == nil {
 			continue
 		}
 		query.Walk(n, func(_ string, node query.Node) bool {
-			if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
-				out = append(out, innerSpec{
-					key: x.InnerHits.Key(x.Path), path: x.Path, size: x.InnerHits.Size,
-					fields: x.InnerHits.Fields, match: query.Compile(x.Query),
-				})
+			x, ok := node.(*query.Nested)
+			if !ok || x.InnerHits == nil {
+				return true
+			}
+			h, key := x.InnerHits, x.InnerHits.Key(x.Path)
+			i, seen := at[key]
+			if !seen {
+				at[key] = len(out)
+				out = append(out, innerSpec{key: key, path: x.Path, size: h.Size, fields: slices.Clone(h.Fields), matches: []*query.Compiled{query.Compile(x.Query)}})
+				return true
+			}
+			spec := &out[i]
+			spec.size = max(spec.size, h.Size)
+			spec.matches = append(spec.matches, query.Compile(x.Query))
+			switch {
+			case len(spec.fields) == 0:
+			case len(h.Fields) == 0:
+				spec.fields = nil
+			default:
+				for _, f := range h.Fields {
+					if !slices.Contains(spec.fields, f) {
+						spec.fields = append(spec.fields, f)
+					}
+				}
 			}
 			return true
 		})
 	}
 	return out
+}
+
+// match reports whether obj satisfies one of spec's queries.
+func (spec *innerSpec) match(obj *schema.Object) bool {
+	for _, m := range spec.matches {
+		if m.MatchObject(obj) {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxInnerHitsObjects bounds the inner hits one response holds: a search's size times
@@ -447,11 +484,11 @@ func InnerHitsFields(r *Request) []string {
 	return out
 }
 
-// FillInnerHits sets each hit's inner hits, for every nested node of r's query and
-// post_filter that asks for them, from its body, read under mapping m as the hit was
-// indexed: each member that satisfies the node's query, in array order. Each body is
-// then limited to fields (the request's own, before [InnerHitsFields] widened them),
-// when set. It stops at ctx's end, with its error.
+// FillInnerHits sets each hit's inner hits, for every key r's query and post_filter
+// ask for them under, from its body, read under mapping m as the hit was indexed: each
+// member that satisfies the query of a nested node under the key, in array order. Each
+// body is then limited to fields (the request's own, before [InnerHitsFields] widened
+// them), when set. It stops at ctx's end, with its error.
 func FillInnerHits(ctx context.Context, hits []Hit, r *Request, m *schema.Mapping, fields []string) error {
 	specs := innerSpecs(r)
 	if len(specs) == 0 {
@@ -479,7 +516,7 @@ func FillInnerHits(ctx context.Context, hits []Hit, r *Request, m *schema.Mappin
 			}
 			ih := &InnerHits{Offsets: []int{}, Objects: []json.RawMessage{}}
 			for k := range objects[spec.path] {
-				if !spec.match.MatchObject(&objects[spec.path][k]) {
+				if !spec.match(&objects[spec.path][k]) {
 					continue
 				}
 				ih.Total++

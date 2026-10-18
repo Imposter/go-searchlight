@@ -728,9 +728,9 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 // aggregation that holds it), which ask for no inner hits, and as
 // [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
 // field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
-// query and post_filter ask for no inner hits under one key, and at most
-// MaxInnerHitsObjects together (InnerHitsObjects). It sets r.Nested when r reads a
-// nested field's objects.
+// query and post_filter give one key to one path's nodes alone, and ask for at most
+// MaxInnerHitsObjects inner hits together (InnerHitsObjects). It sets r.Nested when r
+// reads a nested field's objects.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
@@ -754,19 +754,24 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 }
 
 // sharedInnerHits reports each nested node of post that asks for inner hits under a key
-// one of q's takes already: a hit has one set of inner hits per key.
+// one of q's takes already for another path: nodes of one path share a key, and its
+// inner hits, across the query and post_filter as within either.
 func sharedInnerHits(q, post query.Node) []query.Problem {
-	keys := map[string]bool{}
+	keys := map[string]string{}
 	query.Walk(q, func(_ string, node query.Node) bool {
 		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
-			keys[x.InnerHits.Key(x.Path)] = true
+			if key := x.InnerHits.Key(x.Path); keys[key] == "" {
+				keys[key] = x.Path
+			}
 		}
 		return true
 	})
 	var ps []query.Problem
 	query.Walk(post, func(at string, node query.Node) bool {
-		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil && keys[x.InnerHits.Key(x.Path)] {
-			ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits take the key %q already: name one otherwise (name)", x.InnerHits.Key(x.Path))})
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			if path := keys[x.InnerHits.Key(x.Path)]; path != "" && path != x.Path {
+				ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits %q are nested field %q's: nodes share inner hits by name on one path alone (name these otherwise)", x.InnerHits.Key(x.Path), path)})
+			}
 		}
 		return true
 	})

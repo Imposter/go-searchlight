@@ -226,11 +226,29 @@ their own names (every member when `fields` is empty; at most 100):
 The key is `name`, or the path. They are read from each hit's stored body once the
 page is fetched (a `fields` limit applies after), and a hit matched by another branch
 of an `any` has them too, maybe with a `total` of 0. `inner_hits` under a `not` (a
-document a `not` matches has no object to show), in an aggregation's filter, or twice
-under one key is a 400 at its `loc`. A response holds at most 10,000 inner hit objects:
-a search whose `size` times its `inner_hits` sizes (added up) passes that is a 400 at
-`size`, and the objects it may hold count against `max_inflight_read_bytes` (1 KiB
-each) while it runs.
+document a `not` matches has no object to show), or in an aggregation's filter, is a
+400 at its `loc`.
+
+**Merged by name.** Nested nodes of one path that give one key, in the query and the
+`post_filter` alike, share one set of inner hits under it: the members satisfying any
+of their queries, each once (`total` counts them exactly), the first of them by the
+largest of their `size`s, with the sub-fields any of them names (every member when one
+names none). "A variant in size L under 150, or in size M under 120" is one list:
+
+```json
+{"any": [
+  {"nested": {"path": "_v", "query": {"all": [{"field": "_v.size", "op": "eq", "value": "L"},
+    {"field": "_v.price", "op": "lt", "value": 15000}]}, "inner_hits": {"name": "picked", "size": 10}}},
+  {"nested": {"path": "_v", "query": {"all": [{"field": "_v.size", "op": "eq", "value": "M"},
+    {"field": "_v.price", "op": "lt", "value": 12000}]}, "inner_hits": {"name": "picked", "size": 10}}}]}
+```
+
+A key given to nodes of two paths is a 400 at the second one's `inner_hits`.
+
+A response holds at most 10,000 inner hit objects: a search whose `size` times its
+`inner_hits` sizes (added up, a merged key's once) passes that is a 400 at `size`, and
+the objects it may hold count against `max_inflight_read_bytes` (1 KiB each) while it
+runs.
 
 **Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
 `min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at

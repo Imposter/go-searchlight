@@ -6,6 +6,15 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+### Changed
+
+- **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes
+  of one path giving one `inner_hits` name, in the query and the `post_filter`, share
+  one set of inner hits: every member satisfying any of their queries once, `total`
+  exact, by the largest of their sizes. Such a request was a 400; a name given to
+  nodes of two paths still is. Peers need no new wire level: only the coordinating
+  node checks names and reads inner hits.
+
 ## [1.4.0] - 2026-10-18
 
 Nested fields: one document per product with its variants, queried, counted and sorted per variant.

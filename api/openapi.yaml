@@ -976,7 +976,7 @@ components:
                   type: object
                   additionalProperties: false
                   properties:
-                    name: { type: string, description: "The key of the hits' inner hits: the path by default. Two inner_hits take two keys." }
+                    name: { type: string, description: "The key of the hits' inner hits: the path by default. Nodes of one path under one key share one set of inner hits (the members satisfying any of their queries, by their largest size, with the sub-fields any of them names); one key on two paths is a 400." }
                     size: { type: integer, minimum: 0, maximum: 1000, default: 3, description: How many matching members each hit shows. }
                     fields:
                       type: array
@@ -1075,7 +1075,7 @@ components:
               body: { type: object }
               inner_hits:
                 type: object
-                description: 'Per nested node with inner_hits, by its key: {"total": n, "offsets": [...], "objects": [...]}, the members of its path that satisfy its query (n of them), the first size by their offsets in the array and as objects of the sub-fields asked for, by their own names.'
+                description: 'Per inner_hits key (merging the nested nodes sharing it): {"total": n, "offsets": [...], "objects": [...]}, the members of its path that satisfy its query (n of them), the first size by their offsets in the array and as objects of the sub-fields asked for, by their own names.'
                 additionalProperties:
                   type: object
                   additionalProperties: false

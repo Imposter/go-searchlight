@@ -17,6 +17,8 @@ func nestedMapping() *schema.Mapping {
 		"_v.price":    schema.Number,
 		"_v.in_stock": schema.Bool,
 		"_v.seen":     schema.Date,
+		"_w":          schema.Nested,
+		"_w.size":     schema.Keyword,
 	}}
 }
 
@@ -123,8 +125,8 @@ func TestNestedParse(t *testing.T) {
 
 // Validate's nested rules: the path is a nested field, conditions name its sub-fields
 // inside and never outside, no nested node nests, inner_hits ask for sub-fields, under
-// no not and with keys of their own; ValidateInner holds an aggregation's or a sort's
-// where to the inner rules.
+// no not and with a key no other path's take; ValidateInner holds an aggregation's or a
+// sort's where to the inner rules.
 func TestNestedValidate(t *testing.T) {
 	m := nestedMapping()
 	for _, c := range []struct{ raw, loc, want string }{
@@ -134,7 +136,8 @@ func TestNestedValidate(t *testing.T) {
 		{`{"nested": {"path": "_v", "query": {"nested": {"path": "_v"}}}}`, "query.nested.query.nested", "not inside another"},
 		{`{"not": {"all": [{"nested": {"path": "_v", "inner_hits": {}}}]}}`, "query.not.all.0.nested.inner_hits", "under a not"},
 		{`{"nested": {"path": "_v", "inner_hits": {"fields": ["brand"]}}}`, "query.nested.inner_hits.fields.0", "not a sub-field"},
-		{`{"any": [{"nested": {"path": "_v", "inner_hits": {}}}, {"nested": {"path": "_v", "inner_hits": {}}}]}`, "query.any.1.nested.inner_hits", "two inner_hits"},
+		{`{"any": [{"nested": {"path": "_v", "inner_hits": {"name": "hits"}}}, {"nested": {"path": "_w", "inner_hits": {"name": "hits"}}}]}`, "query.any.1.nested.inner_hits", "are nested field \"_v\"'s already"},
+		{`{"any": [{"nested": {"path": "_v", "inner_hits": {"name": "_w"}}}, {"nested": {"path": "_w", "inner_hits": {}}}]}`, "query.any.1.nested.inner_hits", "on one path alone"},
 		{`{"nested": {"path": "_v", "query": {"field": "_v.size", "op": "lt", "value": 3}}}`, "query.nested.query.op", "use contains"},
 		{`{"field": "_v", "op": "eq", "value": 3}`, "query.op", "use exists"},
 	} {
@@ -148,6 +151,8 @@ func TestNestedValidate(t *testing.T) {
 	}
 	for _, raw := range []string{
 		`{"any": [{"nested": {"path": "_v", "inner_hits": {}}}, {"nested": {"path": "_v", "inner_hits": {"name": "other"}}}]}`,
+		`{"any": [{"nested": {"path": "_v", "inner_hits": {}}}, {"nested": {"path": "_v", "inner_hits": {"size": 5}}}]}`,
+		`{"all": [{"nested": {"path": "_v", "inner_hits": {"name": "x"}}}, {"any": [{"nested": {"path": "_v", "inner_hits": {"name": "x"}}}, {"nested": {"path": "_w", "inner_hits": {}}}]}]}`,
 		`{"all": [{"field": "_v", "op": "exists"}, {"not": {"nested": {"path": "_v", "query": {"not": {"field": "_v.price", "op": "gt", "value": 1}}}}}]}`,
 	} {
 		n, ps := Parse([]byte(raw))

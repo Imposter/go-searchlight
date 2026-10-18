@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
@@ -67,14 +68,15 @@ const codeStale = "stale_copy"
 // would ignore, answering with the first page, and level 4 the min and max
 // aggregations and a cardinality's threshold (levelMetrics), which a lower peer would
 // refuse as unknown or ignore, estimating past it, and level 5 the box query on point
-// fields (levelBox), which a lower peer would refuse as an unknown op. A request
-// says the level it needs
-// (wireRequest.Needs), and goes to that level's endpoint (searchPath), and a reply
-// the level it was answered at (searchReply.Level): a peer refuses a request past its
-// level, and the coordinator a reply below the request's, so a search is never
-// answered with a part of it unread.
+// fields (levelBox), which a lower peer would refuse as an unknown op. Level 6 reads
+// nested fields' objects (levelNested): a nested node, an aggregation or sort on a
+// sub-field, which a lower peer would refuse, or answer reading the sub-field as a
+// field of no document. A request says the level it needs (wireRequest.Needs), and
+// goes to that level's endpoint (searchPath), and a reply the level it was answered at
+// (searchReply.Level): a peer refuses a request past its level, and the coordinator a
+// reply below the request's, so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelBox
+const searchLevel = levelNested
 
 // The search wire levels of the additions a peer must not ignore.
 const (
@@ -83,12 +85,15 @@ const (
 	levelFrom        = 3
 	levelMetrics     = 4
 	levelBox         = 5
+	levelNested      = 6
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelNested:
+		return "a nested field's objects: a nested query, or an aggregation or sort on a sub-field"
 	case needs >= levelBox:
 		return "a box query on a point field"
 	case needs >= levelMetrics:
@@ -118,9 +123,11 @@ func searchPath(needs int) string {
 
 // wireRequest is a search.Request on the wire: the queries as their DSL JSON.
 type wireRequest struct {
-	Query       json.RawMessage    `json:"query"`
-	PostFilter  json.RawMessage    `json:"post_filter,omitempty"`
-	Sort        []search.SortField `json:"sort,omitempty"`
+	Query      json.RawMessage    `json:"query"`
+	PostFilter json.RawMessage    `json:"post_filter,omitempty"`
+	Sort       []search.SortField `json:"sort,omitempty"`
+	// SortWhere are the sort keys' wheres as their DSL JSON, by key (null for none).
+	SortWhere   []json.RawMessage  `json:"sort_where,omitempty"`
 	Size        int                `json:"size"`
 	From        int                `json:"from,omitempty"`
 	SearchAfter []any              `json:"search_after,omitempty"`
@@ -136,7 +143,8 @@ type wireRequest struct {
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
 	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
-	// or max aggregation or a cardinality's threshold, 5 for a box query.
+	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
+	// nested field's objects (search.Request.Nested, or a nested node).
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -145,6 +153,7 @@ type wireRequest struct {
 type wireAgg struct {
 	search.Agg
 	Filter  json.RawMessage            `json:"Filter,omitempty"`
+	Where   json.RawMessage            `json:"Where,omitempty"`
 	Filters map[string]json.RawMessage `json:"Filters,omitempty"`
 	Aggs    map[string]wireAgg         `json:"Aggs,omitempty"`
 }
@@ -167,7 +176,20 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	if w.Aggs, err = encodeAggs(r.Aggs); err != nil {
 		return nil, err
 	}
+	for i, f := range r.Sort {
+		if f.Where == nil {
+			continue
+		}
+		if w.SortWhere == nil {
+			w.SortWhere = make([]json.RawMessage, len(r.Sort))
+		}
+		if w.SortWhere[i], err = percolate.EncodeQuery(f.Where); err != nil {
+			return nil, fmt.Errorf("cluster: encoding sort key %q's where: %w", f.Field, err)
+		}
+	}
 	switch {
+	case r.Nested || nestedQueries(r):
+		w.Needs = levelNested
 	case boxQueries(r):
 		w.Needs = levelBox
 	case metricAggs(r.Aggs):
@@ -194,6 +216,11 @@ func encodeAggs(aggs map[string]search.Agg) (map[string]wireAgg, error) {
 		if a.Filter != nil {
 			if w.Filter, err = percolate.EncodeQuery(a.Filter); err != nil {
 				return nil, fmt.Errorf("cluster: encoding aggregation %q's filter: %w", name, err)
+			}
+		}
+		if a.Where != nil {
+			if w.Where, err = percolate.EncodeQuery(a.Where); err != nil {
+				return nil, fmt.Errorf("cluster: encoding aggregation %q's where: %w", name, err)
 			}
 		}
 		if a.Filters != nil {
@@ -227,6 +254,17 @@ func (w *wireRequest) decode() (*search.Request, error) {
 			return nil, api.Invalid("the post_filter is invalid", problems...)
 		}
 	}
+	if len(w.SortWhere) > 0 && len(w.SortWhere) != len(r.Sort) {
+		return nil, api.Invalid("the sort holds " + strconv.Itoa(len(r.Sort)) + " keys and " + strconv.Itoa(len(w.SortWhere)) + " wheres")
+	}
+	for i, raw := range w.SortWhere {
+		if len(raw) == 0 || string(raw) == "null" {
+			continue
+		}
+		if r.Sort[i].Where, problems = query.Parse(raw); len(problems) > 0 {
+			return nil, api.Invalid("sort key "+r.Sort[i].Field+"'s where is invalid", problems...)
+		}
+	}
 	aggs, err := decodeAggs(w.Aggs)
 	if err != nil {
 		return nil, err
@@ -247,6 +285,11 @@ func decodeAggs(aggs map[string]wireAgg) (map[string]search.Agg, error) {
 		if w.Filter != nil {
 			if a.Filter, problems = query.Parse(w.Filter); len(problems) > 0 {
 				return nil, api.Invalid("aggregation "+name+"'s filter is invalid", problems...)
+			}
+		}
+		if w.Where != nil {
+			if a.Where, problems = query.Parse(w.Where); len(problems) > 0 {
+				return nil, api.Invalid("aggregation "+name+"'s where is invalid", problems...)
 			}
 		}
 		if w.Filters != nil {
@@ -301,13 +344,16 @@ type fetchReply struct {
 // endpoint (percolatePath), which a 1.0.0 peer does not serve; a reply below it is
 // refused, so the shard's next copy answers, or none does (503). Level 2 adds point
 // fields and their box queries: a percolation under a mapping holding a point field
-// needs it, as a lower peer reads neither the mapping nor the saved boxes.
-const percolateLevel = 2
+// needs it, as a lower peer reads neither the mapping nor the saved boxes. Level 3
+// adds nested fields: a percolation under a mapping holding one needs it, for the
+// same reasons.
+const percolateLevel = 3
 
 // Percolate wire levels of the additions a peer must not ignore.
 const (
 	percolateDates  = 1
 	percolatePoints = 2
+	percolateNested = 3
 )
 
 // percolatePath is the peer path of a percolation needing wire level needs.
@@ -319,9 +365,10 @@ func percolatePath(needs int) string {
 }
 
 // percolateNeeds is the percolate wire level a percolation under mapping (the
-// catalogue's JSON) needs: 2 when it holds a point field (or a point axis is a date),
-// 1 when it holds a date field, whose saved conditions may hold date math; 0
-// otherwise. A mapping it cannot read needs percolateLevel.
+// catalogue's JSON) needs: 3 when it holds a nested field, 2 when it holds a point
+// field (or a point axis is a date), 1 when it holds a date field, whose saved
+// conditions may hold date math; 0 otherwise. A mapping it cannot read needs
+// percolateLevel.
 func percolateNeeds(mapping json.RawMessage) int {
 	var m schema.Mapping
 	if len(mapping) > 0 && json.Unmarshal(mapping, &m) != nil {
@@ -330,10 +377,12 @@ func percolateNeeds(mapping json.RawMessage) int {
 	needs := 0
 	for _, t := range m.Fields {
 		switch {
+		case t == schema.Nested:
+			return percolateNested
 		case t.IsPoint():
-			return percolatePoints
+			needs = max(needs, percolatePoints)
 		case t == schema.Date:
-			needs = percolateDates
+			needs = max(needs, percolateDates)
 		}
 	}
 	return needs
@@ -342,6 +391,9 @@ func percolateNeeds(mapping json.RawMessage) int {
 // percolateLevelNeeds names what a percolation of wire level needs carries, for the
 // errors of a peer below it.
 func percolateLevelNeeds(needs int) string {
+	if needs >= percolateNested {
+		return "an index with a nested field, whose saved queries may hold nested conditions"
+	}
 	if needs >= percolatePoints {
 		return "an index with a point field, whose saved queries may hold box conditions"
 	}
@@ -473,12 +525,32 @@ func filterAggs(aggs map[string]search.Agg) bool {
 // boxQueries reports whether r's query, post_filter or any filter or filters
 // aggregation's queries hold a box condition.
 func boxQueries(r *search.Request) bool {
+	return queriesHold(r, func(node query.Node) bool {
+		l, ok := node.(*query.Leaf)
+		return ok && l.Op == query.OpBox
+	})
+}
+
+// nestedQueries reports whether r's query, post_filter or any filter or filters
+// aggregation's queries hold a nested node, or a where of an aggregation or a sort is
+// given.
+func nestedQueries(r *search.Request) bool {
+	if slices.ContainsFunc(r.Sort, func(f search.SortField) bool { return f.Where != nil || f.Mode != "" }) || aggWheres(r.Aggs) {
+		return true
+	}
+	return queriesHold(r, func(node query.Node) bool {
+		_, ok := node.(*query.Nested)
+		return ok
+	})
+}
+
+// queriesHold reports whether holds holds of a node of r's query, post_filter or any
+// filter or filters aggregation's queries.
+func queriesHold(r *search.Request, holds func(query.Node) bool) bool {
 	found := false
 	check := func(n query.Node) {
 		query.Walk(n, func(_ string, node query.Node) bool {
-			if l, ok := node.(*query.Leaf); ok && l.Op == query.OpBox {
-				found = true
-			}
+			found = found || holds(node)
 			return !found
 		})
 	}
@@ -552,4 +624,15 @@ func dropTermsFilters(aggs map[string]search.Agg) {
 		dropTermsFilters(a.Aggs)
 		aggs[name] = a
 	}
+}
+
+// aggWheres reports whether aggs hold an aggregation with a where, at any level.
+func aggWheres(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Where != nil || aggWheres(a.Aggs) {
+			return true
+		}
+	}
+	return false
 }

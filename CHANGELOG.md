@@ -4,6 +4,40 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
+## [Unreleased]
+
+### Added
+
+- **Nested fields**, Elasticsearch's `nested` type ([docs/api.md](docs/api.md#nested-fields)):
+  one document per product with its variants, each matched apart. A mapping types a
+  field `{"type": "nested", "fields": {"size": "keyword", "price": "number", ...}}`
+  (sub-fields of any type but a point, added later by a mapping patch), and a document
+  gives an array of objects, at most 10,000 members. Sub-fields are named by their full
+  names (`_v.size`) everywhere.
+  - `{"nested": {"path": "_v", "query": ...}}` holds when one object satisfies the whole
+    query (a `not` inside applies per object), in queries, `post_filter`, filter
+    aggregations and saved queries; `inner_hits` returns each hit's matching members,
+    by offset, with the sub-fields asked for (at most 10,000 inner hit objects per
+    response: `size` times the `inner_hits` sizes).
+  - `terms`, `stats`, `min`, `max` and `cardinality` on a sub-field, with an optional
+    `where` choosing the objects: `terms` counts each document once per value. A sort
+    on a sub-field orders hits by the least or greatest value among their objects
+    (`mode`, `where`), a hit with none last.
+  - Each segment indexes a nested field's objects as an object segment of their own,
+    in a NESTED section (segment format 4.2; a segment without one is written as
+    before, byte for byte); documents, deletes, totals and caches stay the documents'.
+  - Search wire level 6 and percolate wire level 3 keep nested reads off peers of an
+    earlier release (503 with no other copy). Nodes heartbeat mapping types 2: a
+    nested field is refused (409, naming the nodes) while a node of an earlier release
+    is live, and once one exists no node can be downgraded below this release
+    ([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)).
+
+### Changed
+
+- A mapping's or a `PATCH .../mapping`'s invalid field type is now a 400 located at the
+  field (`mapping.fields.<name>`, `fields.<name>`), not at `mapping` or `fields`.
+- The request cache's key format is 4: entries of earlier releases are not read.
+
 ## [1.3.0] - 2026-10-17
 
 Point fields and box queries, and reads that retry a serving copy their view had not listed yet.

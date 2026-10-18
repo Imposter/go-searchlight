@@ -163,6 +163,12 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 		return nil, api.Invalid("the query is invalid", problems...)
 	}
 	r.Index = name
+	fields, inner := r.Fields, search.HasInnerHits(r)
+	if inner {
+		wide := *r
+		wide.Fields = search.InnerHitsFields(r)
+		r = &wide
+	}
 	ts, err := n.acquireTargets(ctx, idx, opts.WaitForSeq, false)
 	if err != nil {
 		return nil, err
@@ -171,6 +177,11 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 	resp, err := n.searchTargets(ctx, ts, r, n.reacquirer(ctx, idx, opts.WaitForSeq))
 	if err != nil {
 		return nil, err
+	}
+	if inner {
+		if err := search.FillInnerHits(ctx, resp.Hits, r, idx.meta.Load().mapping, fields); err != nil {
+			return nil, err
+		}
 	}
 	return &api.SearchResult{Response: resp, Stale: ts.stale() || n.stale()}, nil
 }

@@ -78,7 +78,7 @@ import (
 
 // requestCacheFormat versions the request key and the shared store's values: a
 // change to either raises it, so an upgraded node never reads an old encoding.
-const requestCacheFormat = 3
+const requestCacheFormat = 4
 
 // requestCacheWrites bounds the shared-store writes in flight; past it a result is
 // not written (the next miss writes it).
@@ -625,21 +625,22 @@ func appendOptionalNode(b []byte, n query.Node) []byte {
 	return appendKeyBytes(append(b, 1), query.Canonical(n))
 }
 
-// appendAggsKey appends aggs by name: each one's settings, its filters' canonical
-// queries and its sub-aggregations.
+// appendAggsKey appends aggs by name: each one's settings, its filters' and where's
+// canonical queries and its sub-aggregations.
 func appendAggsKey(b []byte, aggs map[string]Agg) ([]byte, bool) {
 	b = binary.AppendUvarint(b, uint64(len(aggs)))
 	for _, name := range slices.Sorted(maps.Keys(aggs)) {
 		a := aggs[name]
 		b = appendKeyBytes(b, []byte(name))
 		flat := a
-		flat.Filter, flat.Filters, flat.Aggs = nil, nil, nil
+		flat.Filter, flat.Filters, flat.Aggs, flat.Where = nil, nil, nil, nil
 		settings, err := json.Marshal(flat)
 		if err != nil {
 			return nil, false
 		}
 		b = appendKeyBytes(b, settings)
 		b = appendOptionalNode(b, a.Filter)
+		b = appendOptionalNode(b, a.Where)
 		b = binary.AppendUvarint(b, uint64(len(a.Filters)))
 		for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
 			b = appendKeyBytes(b, []byte(key))
@@ -679,12 +680,20 @@ func readsNowUnrounded(r *Request) bool {
 	if r.PostFilter != nil {
 		check(r.PostFilter)
 	}
+	for _, f := range r.Sort {
+		if f.Where != nil {
+			check(f.Where)
+		}
+	}
 	var aggs func(map[string]Agg)
 	aggs = func(m map[string]Agg) {
 		for name := range m {
 			a := m[name]
 			if a.Filter != nil {
 				check(a.Filter)
+			}
+			if a.Where != nil {
+				check(a.Where)
 			}
 			for _, f := range a.Filters {
 				check(f)

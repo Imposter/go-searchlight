@@ -14,12 +14,13 @@ import (
 	"github.com/Imposter/go-searchlight/internal/analysis"
 )
 
-// Parse reads a query from JSON. It checks the tree's shape (every node one of the four,
-// with no other key; no empty group but the root {"all": []}), each condition's field,
-// op and value as JSON (a value is a scalar, a list of at most MaxListItems scalars, or
-// similar's {text, min}; no text longer than MaxValueChars characters or holding a NUL),
-// and the bounds MaxDepth, MaxLeaves and MaxNodes. Whether the fields exist and take the
-// ops and values given is [Validate]'s, against a mapping.
+// Parse reads a query from JSON. It checks the tree's shape (every node one of the five,
+// with no other key; no empty group but the root {"all": []}, and a nested node's
+// query), each condition's field, op and value as JSON (a value is a scalar, a list of
+// at most MaxListItems scalars, or similar's {text, min}; no text longer than
+// MaxValueChars characters or holding a NUL), a nested node's inner_hits, and the
+// bounds MaxDepth, MaxLeaves and MaxNodes. Whether the fields exist and take the ops
+// and values given is [Validate]'s, against a mapping.
 //
 // It returns the tree and no problem, or nil and every problem found (up to a limit), each
 // with its loc below [RootLoc]. A key given twice keeps its last value, as Python's json
@@ -118,6 +119,9 @@ func (p *parser) node(v any) Node {
 	if child, ok := m["not"]; ok {
 		return p.not(m, child)
 	}
+	if body, ok := m["nested"]; ok {
+		return p.nested(m, body)
+	}
 	if !p.enter(false) {
 		return nil
 	}
@@ -141,6 +145,99 @@ func (p *parser) not(m map[string]any, child any) Node {
 		return nil
 	}
 	return &Not{Child: inner}
+}
+
+// nested reads {"nested": {"path": field, "query": node, "inner_hits": {...}}}: a
+// level, as a group is. A missing query, or {"all": []}, holds of every object.
+func (p *parser) nested(m map[string]any, body any) Node {
+	if !p.enter(true) {
+		return nil
+	}
+	defer p.leave()
+	p.extra(m, `a nested node holds only "nested"`, "nested")
+	p.push("nested")
+	defer p.pop()
+	b, ok := body.(map[string]any)
+	if !ok {
+		p.problems.add(p.at(), `nested is {"path": field, "query": node, "inner_hits": {...}}`)
+		return nil
+	}
+	p.unknown(b, "nested takes path, query and inner_hits", "path", "query", "inner_hits")
+	n := &Nested{Query: &All{}}
+	switch path := b["path"].(type) {
+	case string:
+		if msg := fieldProblem(path); msg != "" {
+			p.problems.add(p.at("path"), msg)
+		}
+		n.Path = path
+	case nil:
+		p.problems.add(p.at("path"), "a nested node needs the path of its nested field")
+	default:
+		p.problems.add(p.at("path"), "a nested path is a field name")
+	}
+	if q, ok := b["query"]; ok && !isEverything(q) {
+		p.push("query")
+		n.Query = p.node(q)
+		p.pop()
+		if p.exceeded != "" {
+			return nil
+		}
+	}
+	if raw, ok := b["inner_hits"]; ok {
+		p.push("inner_hits")
+		n.InnerHits = p.innerHits(raw)
+		p.pop()
+	}
+	return n
+}
+
+// innerHits reads inner_hits: {"name": text, "size": count, "fields": [sub-field,
+// ...]}, every key optional.
+func (p *parser) innerHits(raw any) *InnerHits {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		p.problems.add(p.at(), `inner_hits is {"name": text, "size": count, "fields": [sub-field, ...]}`)
+		return nil
+	}
+	p.unknown(m, "inner_hits takes name, size and fields", "name", "size", "fields")
+	h := &InnerHits{Size: DefaultInnerHitsSize}
+	if v, ok := m["name"]; ok {
+		name, isText := v.(string)
+		if !isText || name == "" {
+			p.problems.add(p.at("name"), "an inner_hits name is a non-empty text")
+		} else if msg := textProblem(name); msg != "" {
+			p.problems.add(p.at("name"), msg)
+		}
+		h.Name = name
+	}
+	if v, ok := m["size"]; ok {
+		n, isNumber := v.(json.Number)
+		size, err := n.Int64()
+		if !isNumber || err != nil || size < 0 || size > MaxInnerHitsSize {
+			p.problems.addf(p.at("size"), "an inner_hits size is a whole number from 0 to %d", MaxInnerHitsSize)
+		} else {
+			h.Size = int(size)
+		}
+	}
+	if v, ok := m["fields"]; ok {
+		list, isList := v.([]any)
+		if !isList || len(list) > MaxInnerHitsFields {
+			p.problems.addf(p.at("fields"), "inner_hits fields is a list of at most %d sub-field names", MaxInnerHitsFields)
+			return h
+		}
+		for i, f := range list {
+			name, isText := f.(string)
+			if !isText {
+				p.problems.add(p.at("fields", strconv.Itoa(i)), "a field name is a string")
+				continue
+			}
+			if msg := fieldProblem(name); msg != "" {
+				p.problems.add(p.at("fields", strconv.Itoa(i)), msg)
+			}
+			h.Fields = append(h.Fields, name)
+		}
+	}
+	return h
 }
 
 func (p *parser) group(m map[string]any, key string) Node {
@@ -175,11 +272,16 @@ func (p *parser) group(m map[string]any, key string) Node {
 	return &Any{Children: children}
 }
 
-// extra reports each key of m but allowed, in order.
+// extra is unknown, for an m holding more keys than allowed.
 func (p *parser) extra(m map[string]any, message string, allowed ...string) {
 	if len(m) <= len(allowed) {
 		return
 	}
+	p.unknown(m, message, allowed...)
+}
+
+// unknown reports each key of m but allowed, in order.
+func (p *parser) unknown(m map[string]any, message string, allowed ...string) {
 	for _, key := range slices.Sorted(maps.Keys(m)) {
 		if !slices.Contains(allowed, key) {
 			p.problems.add(p.at(key), "unknown key: "+message)
@@ -413,6 +515,17 @@ func sizeOf(n Node) size {
 		}
 		inner := sizeOf(x.Child)
 		inner.nodes++
+		return inner
+	case *Nested:
+		if x == nil {
+			return size{}
+		}
+		var inner size
+		if !isEveryObject(x.Query) {
+			inner = sizeOf(x.Query)
+		}
+		inner.nodes++
+		inner.depth++
 		return inner
 	case *All:
 		if x == nil {

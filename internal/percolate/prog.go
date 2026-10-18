@@ -43,6 +43,9 @@ import (
 //	             box              per end (x's lower and upper, then y's) a byte, 0 for
 //	                              none, 1 exclusive, 2 inclusive, then the bound as a date
 //	                              bound is written
+//	nested     tag, the nested field (uvarint), the sub-fields its query reads (count,
+//	           then each, uvarints), then its query: held when one object of the field
+//	           does, its sub-fields read from the object
 //
 // where a string is a uvarint length and its bytes, and numbers are little-endian. The
 // compiler mirrors [query.Compile] exactly (the same folding of constant conditions,
@@ -80,6 +83,7 @@ const (
 	pHasAll
 	pDate
 	pBox
+	pNested
 
 	numProgTags
 )
@@ -150,9 +154,47 @@ func (pc *progCompiler) node(n query.Node) pnode {
 			return progNever
 		}
 		return pc.leaf(x)
+	case *query.Nested:
+		if x == nil {
+			return progNever
+		}
+		return pc.nested(x)
 	default:
 		return progNever
 	}
+}
+
+// nested compiles a nested node: its query, and the fields that query reads (each a
+// sub-field), which evaluation fills from each object in turn. A query that never
+// holds makes the node never hold; one that always does holds of any object.
+func (pc *progCompiler) nested(n *query.Nested) pnode {
+	child := pc.node(n.Query)
+	if child.tag == pFalse {
+		return progNever
+	}
+	var fields []uint32
+	var collect func(p *pnode)
+	collect = func(p *pnode) {
+		switch p.tag {
+		case pTrue, pFalse:
+		case pAll, pAny, pNot:
+			for i := range p.children {
+				collect(&p.children[i])
+			}
+		default:
+			if !slices.Contains(fields, p.field) {
+				fields = append(fields, p.field)
+			}
+		}
+	}
+	collect(&child)
+	slices.Sort(fields)
+	out := pnode{tag: pNested, cost: costScan + child.cost, field: pc.field(n.Path), children: []pnode{child}}
+	out.operands = binary.AppendUvarint(out.operands, uint64(len(fields)))
+	for _, f := range fields {
+		out.operands = binary.AppendUvarint(out.operands, uint64(f))
+	}
+	return out
 }
 
 // group folds constant children away (all: a false child is false, true children drop
@@ -543,6 +585,10 @@ func appendProg(dst []byte, n *pnode) []byte {
 		}
 	case pNot:
 		dst = appendProg(dst, &n.children[0])
+	case pNested:
+		dst = binary.AppendUvarint(dst, uint64(n.field))
+		dst = append(dst, n.operands...)
+		dst = appendProg(dst, &n.children[0])
 	default:
 		dst = binary.AppendUvarint(dst, uint64(n.field))
 		dst = append(dst, n.operands...)
@@ -594,6 +640,8 @@ func (sc *scratch) eval(p []byte) bool {
 		return all
 	case pNot:
 		return !sc.eval(p)
+	case pNested:
+		return sc.nested(p)
 	}
 	f, p := uv(p)
 	v := &sc.vals[f]
@@ -647,6 +695,47 @@ func (sc *scratch) eval(p []byte) bool {
 	default:
 		return false
 	}
+}
+
+// nested is a nested node's verdict (p past its tag): whether one object of its field
+// satisfies its query, each object's sub-fields put in their slots of sc.vals while its
+// query runs (and similar's keys of them computed again), the slots emptied after: a
+// document's own fields never hold a sub-field's name.
+func (sc *scratch) nested(p []byte) bool {
+	f, p := uv(p)
+	n, p := uv(p)
+	subs := p
+	for range n {
+		_, p = uv(p)
+	}
+	child := p
+	objects := sc.vals[f].Objects
+	defer func() {
+		q := subs
+		for range n {
+			var s int
+			s, q = uv(q)
+			sc.vals[s] = schema.Value{}
+			sc.simDone[s] = false
+		}
+	}()
+	for i := range objects {
+		o := &objects[i]
+		if !o.IsObject() {
+			continue
+		}
+		q := subs
+		for range n {
+			var s int
+			s, q = uv(q)
+			sc.vals[s] = o.Fields[sc.fields[s].name]
+			sc.simDone[s] = false
+		}
+		if sc.eval(child) {
+			return true
+		}
+	}
+	return false
 }
 
 func equals(tag byte, p []byte, v *schema.Value) bool {
@@ -866,6 +955,24 @@ func progNode(p []byte, numFields uint32, tags byte, depth int) (int, error) {
 			r.p = r.p[size:]
 		}
 	case pNot:
+		got, err := progNode(r.p, numFields, tags, depth+1)
+		if err != nil {
+			return 0, err
+		}
+		r.p = r.p[got:]
+	case pNested:
+		if tag >= tags || r.uvarint() >= uint64(numFields) {
+			return 0, errBadProgram
+		}
+		n := r.uvarint()
+		for i := uint64(0); i < n && r.ok; i++ {
+			if r.uvarint() >= uint64(numFields) {
+				return 0, errBadProgram
+			}
+		}
+		if !r.ok {
+			return 0, errBadProgram
+		}
 		got, err := progNode(r.p, numFields, tags, depth+1)
 		if err != nil {
 			return 0, err

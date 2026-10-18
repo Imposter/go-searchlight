@@ -231,8 +231,53 @@ data_dir/
     The one box the sorted scan wins is a bound on x alone, which reads only its
     matches there, where the tree also scans the leaves along the bound. An estimate
     from the node boxes takes 0.5 µs.
-- **Format versions.** The segment format is versioned (major 4, minor 1 for a segment holding a
-  point field; a binary reads its own major and the one before). A copy whose files
+- **Nested fields** ([`nested.go`](../internal/segment/nested.go)). A segment whose
+  documents hold a nested field's members writes a NESTED section (format 4.2; one
+  without is written in the minor before, byte for byte as before): per field an
+  *object segment* and the documents' *starts*.
+  - The object segment is a whole segment image (header to footer, with its own
+    checksums) over object ordinals, flagged as one and holding no STORED and no IDS
+    section. Its fields are the nested field's own name, present for each member that
+    is an object, and the sub-fields by their full names (`_v.size`): built by the
+    builders documents are built by (every term dictionary, column and point index of
+    a sub-field is the one a document field of its type would have) and read by the
+    same `Reader`.
+  - The starts are each document's first object ordinal, then the object count,
+    bit-packed: document d's objects are `[starts[d], starts[d+1])`, in array order. A
+    member that is no object holds its ordinal and nothing else.
+  - The documents are untouched: their ordinals, ids, stored bodies, deletes and
+    every structure of their own fields (the nested field itself is only present) are
+    what they would be without the section. An object is live while its document is.
+    Build numbers objects in document order, across parallel build ranges, and a merge
+    keeps the live documents' objects in that order, merging the object segments as
+    it merges segments, so a merge writes the same bytes as a rebuild.
+  - A nested query runs its inner query over the object segment through an execution
+    of its own (`segExec.inner`): the same candidates, residual checks, cost order and
+    two-phase approximation, its "every document" the members that are objects, so a
+    `not` inside negates per object. Its approximation comes back to documents through
+    the starts (`Nested.Parents`, galloping from the last document found): a document
+    surely matches when one of its objects surely does, may when one may, and a maybe
+    document is decided by its maybe objects' residual checks; a phrase's residual
+    reads the object's member of its document's stored body. With few documents in
+    question the inner query runs over their objects alone. The filter cache, the
+    request cache, totals and sorts stay the documents'.
+  - An aggregation on a sub-field collects the objects of the hits (those its `where`
+    matches); `terms` counts a document once per value with each value's last
+    counted document, and its partial is keyed by value, never by ordinal. A sort on
+    a sub-field reads, per document, the least or greatest value among its chosen
+    objects, from a bitset of them. Inner hits are read at the coordinator from each
+    fetched body, by the inner query's compiled matcher on each member.
+  - The percolator compiles a nested node to a program (`pNested`) holding its
+    sub-fields' slots: each object of the document fills them in turn while the inner
+    program runs. A saved nested query anchors as always-check.
+  - On BenchmarkNested*/Flat* (20,000 products of five variants, one merged segment,
+    Ryzen 7 3700X), the correlated query "size L, in stock, under 150" takes 0.67 ms
+    nested against 0.21 ms over one document per variant; a `terms` with a `where`
+    1.4 ms against 0.24 ms (which counts from the dictionary); a sort by the cheapest
+    in-stock variant 1.3 ms against 0.1 ms (which walks the point index).
+- **Format versions.** The segment format is versioned (major 4, minor 1 for a segment
+  holding a point field, 2 for one holding a nested field's objects; a binary reads its
+  own major and the one before). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:
   `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
   served. A copy of a newer format (`segment.ErrNewerFormat`) is refused and left as it

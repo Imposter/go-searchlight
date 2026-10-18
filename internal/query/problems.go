@@ -42,7 +42,7 @@ func (ps *problems) addf(loc, format string, args ...any) {
 
 // Messages shared by Parse and Validate.
 const (
-	msgNode       = "a node is {all: [...]}, {any: [...]}, {not: node} or a condition"
+	msgNode       = "a node is {all: [...]}, {any: [...]}, {not: node}, {nested: {path, query}} or a condition"
 	msgEmptyGroup = "an empty group matches nothing: give it a condition or remove it"
 	msgNUL        = "a value cannot hold a NUL character"
 )

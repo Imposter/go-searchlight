@@ -7,7 +7,10 @@
 //   - {"all": [node, ...]}: every child holds;
 //   - {"any": [node, ...]}: at least one child holds;
 //   - {"not": node}: the child does not hold;
-//   - {"field": "brand", "op": "eq", "value": "Acme"}: a condition, the leaf.
+//   - {"field": "brand", "op": "eq", "value": "Acme"}: a condition, the leaf;
+//   - {"nested": {"path": "_v", "query": node, "inner_hits": {...}}}: one object of
+//     nested field _v satisfies the whole inner query, whose conditions name its
+//     sub-fields (_v.size) by their full names ([Nested]).
 //
 // The root {"all": []} matches every document; any other empty group is refused. The
 // semantics are scrape-bot's (its conditions, search_query and search oracle modules),
@@ -28,8 +31,8 @@ import (
 
 // Bounds on one query (spec section 4).
 const (
-	// MaxDepth is how deep all/any groups nest; the root group is depth 1, and a not
-	// adds no level.
+	// MaxDepth is how deep all/any groups nest; the root group is depth 1, a nested
+	// node adds a level as a group does, and a not adds none.
 	MaxDepth = 4
 	// MaxLeaves is the most conditions one query holds.
 	MaxLeaves = 50
@@ -105,16 +108,22 @@ var opsByType = map[schema.FieldType][]string{
 // pointOps are the operators a point field takes, in [Ops] order.
 var pointOps = []string{OpExists, OpBox}
 
+// nestedOps are the operators a nested field itself takes: whether it holds a value.
+var nestedOps = []string{OpExists}
+
 // OpsFor returns the operators a field of type t takes, in [Ops] order (nil for no
 // valid type). The caller must not change the slice.
 func OpsFor(t schema.FieldType) []string {
-	if t.IsPoint() {
+	switch {
+	case t.IsPoint():
 		return pointOps
+	case t.IsNested():
+		return nestedOps
 	}
 	return opsByType[t]
 }
 
-// Node is one node of a query tree: *[All], *[Any], *[Not] or *[Leaf].
+// Node is one node of a query tree: *[All], *[Any], *[Not], *[Nested] or *[Leaf].
 type Node interface{ isNode() }
 
 // All holds when every child does; with no children (only as the root) it always holds.
@@ -139,10 +148,53 @@ type Leaf struct {
 	Arg Arg
 }
 
-func (*All) isNode()  {}
-func (*Any) isNode()  {}
-func (*Not) isNode()  {}
-func (*Leaf) isNode() {}
+// Nested holds when one object of nested field Path satisfies Query, its every
+// condition read on that object alone: "size L and in stock" holds of one variant
+// that is both, never of one L variant and another in stock. A not inside applies per
+// object. Query's conditions name Path's sub-fields (Path.name), and nothing else; a
+// Query of {"all": []} holds of any object. InnerHits, when set, asks each hit for the
+// objects that satisfy Query.
+type Nested struct {
+	Path      string
+	Query     Node
+	InnerHits *InnerHits
+}
+
+// InnerHits is what a nested node's inner_hits asks of each hit: the members of its
+// path that satisfy the nested query, by their offsets in the array, the first Size of
+// them with their sub-fields Fields (full names; every member when empty). It is no
+// part of what the query matches.
+type InnerHits struct {
+	// Name keys the hit's inner hits: the path when empty.
+	Name   string   `json:"name,omitempty"`
+	Size   int      `json:"size"`
+	Fields []string `json:"fields,omitempty"`
+}
+
+// Key is the name the hit's inner hits are given under: Name, or else path.
+func (h *InnerHits) Key(path string) string {
+	if h.Name != "" {
+		return h.Name
+	}
+	return path
+}
+
+// Bounds of a nested node's inner_hits.
+const (
+	// DefaultInnerHitsSize is how many objects inner_hits returns when it names no
+	// size, as Elasticsearch's.
+	DefaultInnerHitsSize = 3
+	// MaxInnerHitsSize is the most objects inner_hits returns per hit.
+	MaxInnerHitsSize = 1000
+	// MaxInnerHitsFields is the most sub-fields inner_hits names.
+	MaxInnerHitsFields = 100
+)
+
+func (*All) isNode()    {}
+func (*Any) isNode()    {}
+func (*Not) isNode()    {}
+func (*Leaf) isNode()   {}
+func (*Nested) isNode() {}
 
 // ArgKind is the JSON shape of a value.
 type ArgKind uint8

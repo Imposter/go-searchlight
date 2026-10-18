@@ -426,6 +426,11 @@ func (r *resolver) node(n Node, loc string) Node {
 			return n
 		}
 		return &Not{Child: r.node(x.Child, join(loc, "not"))}
+	case *Nested:
+		if x == nil {
+			return n
+		}
+		return &Nested{Path: x.Path, Query: r.node(x.Query, join(loc, "nested.query")), InnerHits: x.InnerHits}
 	case *Leaf:
 		if x == nil || !x.IsDateMath() || r.fixedOnly && !hasFixedBound(x) {
 			return x

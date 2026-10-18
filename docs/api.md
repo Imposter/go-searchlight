@@ -59,7 +59,9 @@ segments.
 | Heap of in-flight requests (a search with `from` also reserves about 1 KiB per hit of `from + size`) | `max_inflight_write_bytes`, `max_inflight_read_bytes` | 429 with `Retry-After` |
 | A shard copy's write buffer full | (backpressure) | 429 with `Retry-After` |
 | Request deadline | `request_timeout` (30 s) | A search answers what it found with `timed_out: true`; a wait gives 504 |
-| Query size | 4 levels of `all`/`any`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
+| Query size | 4 levels of `all`/`any`/`nested`, 50 conditions, 100 nodes, strings of 500 characters, lists of 200 | 400 with `loc` |
+| Members of a [nested field](#nested-fields) in one document | 10,000 | 400 |
+| A nested node's `inner_hits` | `size` 1,000, `fields` 100; 10,000 inner hit objects per response (`size` × the `inner_hits` sizes) | 400 with `loc` |
 | A search's `from + size` | `max_result_window` (10,000) | 400 with `loc` `from` (`size` when `from` is 0): page deeper with `search_after` |
 | Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
 | Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
@@ -91,8 +93,9 @@ curl -sS -X PUT localhost:8780/indexes/products -H "Authorization: Bearer $TOKEN
   counts searchable on this node). An existing name is a 409 `index_exists`.
 - **Field types.** `keyword`, `text`, `keyword_list`, `number`, `bool` and `date` (Unix
   milliseconds; a document may give an RFC 3339 string or a bare `YYYY-MM-DD`, midnight
-  UTC), and `point` (see [Point fields](#point-fields)). The spec's §3 has the operators
-  and aggregations each type supports.
+  UTC), `point` (see [Point fields](#point-fields)) and `nested` (see
+  [Nested fields](#nested-fields)). The spec's §3 has the operators and aggregations
+  each type supports.
 - **`dynamic`.**
   - `true`, the default, types a new field from its first value.
   - `false` stores a new field but does not index it.
@@ -144,6 +147,123 @@ axes, each `number` or `date`:
   aggregation's `field`), and no sort (400 at `sort.N`).
 - **The field catalogue** gives a point field's `type` as the mapping writes it, the
   object.
+
+### Nested fields
+
+A nested field holds an array of objects, each matched apart, as Elasticsearch's
+`nested` type: "size L, in stock and under 150" holds of a product only when one of its
+variants is all three. It is written with its sub-fields, each of any type but a
+point:
+
+```json
+{"mapping": {"fields": {
+  "title": "text",
+  "_v": {"type": "nested", "fields": {
+    "_key": "keyword", "color": "keyword", "size": "keyword",
+    "price": "number", "regular_price": "number", "in_stock": "bool"}}}}}
+```
+
+- **Names.** A sub-field is named by its full name, the path, a dot and its own name:
+  `_v.size` in queries, aggregations, sorts, `inner_hits` and the field catalogue (which
+  lists `_v` as `nested`, then each sub-field). A nested field's name holds no dot, and
+  no other field takes a name under it: a mapping giving `_v.size` beside a nested
+  `_v` is a 400 at `mapping.fields._v.size`, one making a field nested over names
+  mapped under it a 400 too.
+- **Growing.** `PATCH .../mapping` with `{"fields": {"_v": {"type": "nested", "fields":
+  {"sku": "keyword"}}}}` adds sub-fields (so does `{"fields": {"_v.sku": "keyword"}}`,
+  naming one by its full name); retyping one is a 400, as retyping a field
+  is. Dynamic typing never makes a field nested (an array of objects is a
+  `keyword_list` of nothing): map it first. Under `dynamic: true` a new sub-field is
+  typed from its first value, as a new field is; `false` keeps it unindexed, and
+  `"strict"` refuses the document, naming `_v.<name>`.
+- **Values.** An array of objects, or one object alone: `{"_v": [{"_key": "SKU-1",
+  "size": "L", "price": 12999, "in_stock": true}, {"_key": "SKU-2", ...}]}`. Each
+  object's members are read as a document's are (a member's value by its sub-field's
+  type, `null` as absent). A member that is no object (`"x"`, `null`, `3`) keeps its
+  place in the array, for `inner_hits` offsets, and matches nothing. At most 10,000
+  members per document (a 400 past it). A top-level member named under a nested field
+  (`"_v.size": "M"`) is kept in the body but never indexed: that name is the
+  sub-field's.
+- **Upgrades.** An index cannot gain a nested field, or a sub-field, while a node of a
+  release before nested fields serves: a 409 naming those nodes, as for point fields.
+  Once one exists, no node can be downgraded below 1.4
+  ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
+
+**Nested queries.** `{"nested": {"path": "_v", "query": node}}` holds when one object of
+`_v` satisfies the whole `query`, whose conditions name `_v`'s sub-fields:
+
+```json
+{"nested": {"path": "_v", "query": {"all": [
+  {"field": "_v.size", "op": "eq", "value": "L"},
+  {"field": "_v.in_stock", "op": "eq", "value": true},
+  {"field": "_v.price", "op": "lt", "value": 15000}]},
+  "inner_hits": {"size": 50, "fields": ["_v._key"]}}}
+```
+
+- A `not` inside applies per object: `{"nested": {"path": "_v", "query": {"not":
+  {"field": "_v.size", "op": "eq", "value": "L"}}}}` is "a variant that is not L". A
+  `not` of a nested node is "no variant that ...". A missing `query`, or
+  `{"all": []}`, holds of any object, and `{"field": "_v", "op": "exists"}` of any
+  document holding a value of `_v` at all.
+- The node composes like any other: in `all`, `any` and `not`, in `post_filter`, in
+  `filter` and `filters` aggregations, and in saved queries. It counts one level
+  towards the 4 levels (a `not` counts none), and its conditions towards the 50.
+- A sub-field outside a nested node, any other field inside one, a nested node inside
+  another, and a `path` that is no nested field are each a 400 at their `loc`
+  (`query.field`, `query.nested.query.all.0.field`, `query.nested.path`).
+
+**Inner hits.** `inner_hits` gives each hit, under `inner_hits.<key>`, the members of the
+path that satisfy the nested query: `{"total": n, "offsets": [...], "objects":
+[...]}`, `n` of them, the first `size` (3 by default, at most 1,000) by their offsets in
+the array, in array order, and as objects holding the sub-fields `fields` names, by
+their own names (every member when `fields` is empty; at most 100):
+
+```json
+{"id": "p1", "sort": ["p1"], "body": {"title": "Tee"},
+ "inner_hits": {"_v": {"total": 1, "offsets": [1], "objects": [{"_key": "SKU-2"}]}}}
+```
+
+The key is `name`, or the path. They are read from each hit's stored body once the
+page is fetched (a `fields` limit applies after), and a hit matched by another branch
+of an `any` has them too, maybe with a `total` of 0. `inner_hits` under a `not` (a
+document a `not` matches has no object to show), in an aggregation's filter, or twice
+under one key is a 400 at its `loc`. A response holds at most 10,000 inner hit objects:
+a search whose `size` times its `inner_hits` sizes (added up) passes that is a 400 at
+`size`, and the objects it may hold count against `max_inflight_read_bytes` (1 KiB
+each) while it runs.
+
+**Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
+`min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at
+the top level or under `filter`, `filters` and `global`, with no sub-aggregations. They
+collect the objects of the hits; `"where"`, a query of the sub-fields, keeps the objects
+it matches:
+
+```json
+{"aggs": {
+  "sizes": {"terms": {"field": "_v.size", "where": {"field": "_v.in_stock", "op": "eq", "value": true}}},
+  "cheapest": {"min": {"field": "_v.price", "where": {"field": "_v.in_stock", "op": "eq", "value": true}}}}}
+```
+
+`terms` counts each hit once per value, however many of its objects hold it: a
+product with two L variants is one L. `stats`, `min`, `max` and `cardinality` read
+every chosen object's value. Any other aggregation on a sub-field, one under a bucket
+aggregation, a sub-aggregation of one, and a `where` on a field that is no sub-field
+are each a 400 at their `loc`.
+
+**Sorts** on a sub-field (a number, date, keyword or text) order the hits by the least
+(`"mode": "min"`, ascending's default) or greatest (`"max"`, descending's) value among
+their objects, of those `"where"` matches when given; a hit with none sorts last, as a
+missing value does:
+
+```json
+{"sort": [{"_v.price": {"order": "asc", "mode": "min",
+                        "where": {"field": "_v.in_stock", "op": "eq", "value": true}}}]}
+```
+
+`search_after` pages on it as on any key. A `mode` other than `min` or `max` is a 400 at
+`sort.N.<field>.mode`; `mode` or `where` on a field that is no sub-field, and a sort on
+a `bool` or `keyword_list` sub-field or on the nested field itself, are 400s at
+`sort.N`.
 
 `PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once, or
 `replicas_per_shard`. The allocator then places or releases copies to meet the new
@@ -255,9 +375,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
           "bands": {"buckets": ["..."]}}}
 ```
 
-- **The query language** is a tree of `all`, `any`, `not` and conditions
-  `{"field", "op", "value"}`. `{"all": []}`, the default, matches every document, and
-  `_id` refers to the document id. The spec's §4 lists every operator.
+- **The query language** is a tree of `all`, `any`, `not`, [`nested`](#nested-fields)
+  and conditions `{"field", "op", "value"}`. `{"all": []}`, the default, matches every
+  document, and `_id` refers to the document id. The spec's §4 lists every operator.
   - Matching is boolean. There is no relevance scoring.
   - Text compares normalized, so `"acme"` matches `"ACME"`. This is byte-for-byte
     compatible with scrape-bot.

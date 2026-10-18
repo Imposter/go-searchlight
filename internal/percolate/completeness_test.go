@@ -236,6 +236,7 @@ type gen struct {
 	positive bool // rarely negate: no ne, empty or exists:false, few nots
 	dense    bool // draw words from a tiny vocabulary
 	filters  bool // root conjunctions of a term anchor and conditions posting filters carry
+	nested   bool // drawing a nested node's inner query: conditions on v's sub-fields
 }
 
 // positiveOps are the ops a positive generator draws: the anchorable ones.
@@ -256,6 +257,9 @@ var vocab = []string{
 }
 
 var fields = []string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra", "_id", "missing"}
+
+// subFields are the conditions' fields inside a nested node: v's sub-fields, one unmapped.
+var subFields = []string{"v.brand", "v.title", "v.tags", "v.price", "v.stock", "v.seen", "v.extra"}
 
 var numbers = []float64{-1, 0, 0.5, 1, 2, 10, 99.99, 100, 250, 1e6, -100}
 
@@ -333,7 +337,11 @@ func (g *gen) leaf() map[string]any {
 	if g.positive {
 		op = positiveOps[g.r.IntN(len(positiveOps))]
 	}
-	l := map[string]any{"field": g.pick(fields), "op": op}
+	f := g.pick(fields)
+	if g.nested {
+		f = g.pick(subFields)
+	}
+	l := map[string]any{"field": f, "op": op}
 	var v any
 	switch op {
 	case query.OpEq, query.OpNe:
@@ -429,6 +437,11 @@ func (g *gen) points() any {
 
 func (g *gen) node(depth int) any {
 	switch r := g.r.IntN(10); {
+	case r == 9 && depth > 0 && !g.nested && !g.filters:
+		g.nested = true
+		inner := g.node(depth - 1)
+		g.nested = false
+		return map[string]any{"nested": map[string]any{"path": "v", "query": inner}}
 	case r < 2 && depth > 0 && (!g.positive || g.r.IntN(5) == 0):
 		inner := g.node(depth)
 		if g.r.IntN(4) == 0 {
@@ -513,8 +526,30 @@ func (g *gen) docJSON(i int) (string, []byte) {
 	if g.r.IntN(4) == 0 {
 		id = ids[g.r.IntN(len(ids))]
 	}
+	doc := g.object([]string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra"})
+	if g.r.IntN(3) > 0 {
+		members := make([]any, g.r.IntN(5))
+		for k := range members {
+			if g.r.IntN(8) == 0 {
+				members[k] = g.wrongValue()
+			} else {
+				members[k] = g.object([]string{"brand", "title", "tags", "price", "stock", "seen", "extra"})
+			}
+		}
+		doc["v"] = members
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+	return id, body
+}
+
+// object is a document's members, or a nested object's, of names: each present or
+// not, of its type or of another.
+func (g *gen) object(names []string) map[string]any {
 	doc := map[string]any{}
-	for _, f := range []string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra"} {
+	for _, f := range names {
 		if g.r.IntN(10) < 3 {
 			continue
 		}
@@ -553,11 +588,7 @@ func (g *gen) docJSON(i int) (string, []byte) {
 		}
 		doc[f] = v
 	}
-	body, err := json.Marshal(doc)
-	if err != nil {
-		panic(err)
-	}
-	return id, body
+	return doc
 }
 
 func (g *gen) wrongValue() any {

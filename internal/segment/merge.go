@@ -58,7 +58,9 @@ const mergeCheckDocs = 4096
 // is per document: presence and marks, numbers, and each value and entry ordinal; and
 // per point of a point field, every surviving one, 24 bytes each (a k-d tree is built
 // over all of a field's points at once): about 240 MB for a field of 10M points, on
-// top of the per-document state. Nothing bounds it but the segment's size.
+// top of the per-document state. A nested field's objects merge as documents do, each
+// object's per-document state and a 4-byte remap held for the field while it is merged.
+// Nothing bounds it but the segment's size.
 func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOptions) (Meta, error) {
 	threads := opts.Threads
 	if threads < 1 {
@@ -111,9 +113,16 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 	if opts.MarksUntyped {
 		flags |= flagMarksUntyped
 	}
+	nested, err := mergeNested(inputs, remaps, total, threads, check, flags)
+	if err != nil {
+		return Meta{}, err
+	}
+	img := &image{
+		numDocs: uint32(total), flags: flags, names: names, parts: parts, dicts: readersDicts(inputs, remaps),
+		stored: storedFromReaders(inputs, remaps), ids: idsFromReaders(inputs, remaps), nested: nested,
+	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, uint32(total), flags, names, parts, readersDicts(inputs, remaps), storedFromReaders(inputs, remaps),
-		idsFromReaders(inputs, remaps), threads, check, true, !opts.NoDirSync)
+	meta, err := writeSegmentParts(path, img, threads, check, true, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}

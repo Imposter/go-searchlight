@@ -28,6 +28,8 @@ import (
 //     contains_any, contains_all, words_any, words_all: each is a set) is sorted and
 //     deduplicated after normalizing. between's [lo, hi] is ordered and keeps its
 //     shape, and so does similar's {text, min}, whose members are encoded by name.
+//   - A nested node encodes its path and query; its inner_hits are left out, as they
+//     change what a hit shows, never what matches.
 //   - box encodes each axis's ends in order (x's lower and upper, then y's), each
 //     absent or its inclusiveness and bound.
 //   - Date math (a string bound of lt, lte, gt, gte, between or box) encodes parsed
@@ -46,6 +48,7 @@ const (
 	tagAny
 	tagNot
 	tagLeaf
+	tagNested
 )
 
 // appendNode appends n's canonical encoding to buf; a nil node, typed or not, is
@@ -73,6 +76,12 @@ func appendNode(buf []byte, n Node) []byte {
 			return append(buf, tagNil)
 		}
 		return appendLeaf(buf, x)
+	case *Nested:
+		if x == nil {
+			return append(buf, tagNil)
+		}
+		buf = appendString(append(buf, tagNested), x.Path)
+		return appendNode(buf, x.Query)
 	default:
 		return append(buf, tagNil)
 	}

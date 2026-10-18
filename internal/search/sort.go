@@ -70,6 +70,8 @@ type sortCol struct {
 	nc   segment.NumericColumn
 	kc   segment.KeywordColumn
 	t, f *roaring.Bitmap
+	// nest reads a sort on a sub-field, nc or kc being its object segment's column.
+	nest *nestCol
 }
 
 // segSorter is one segment's sort state.
@@ -89,14 +91,21 @@ func newSegSorter(s *segExec) *segSorter {
 	ss := &segSorter{s: s, idCol: -1}
 	for i, spec := range s.p.sorts {
 		c := sortCol{spec: spec}
+		r := s.r
+		if spec.nested != nil {
+			var in *segExec
+			if c.nest, in = s.nestCol(spec); in != nil {
+				r = in.r
+			}
+		}
 		switch spec.kind {
 		case sortNumber:
-			c.nc = s.r.Numbers(spec.field)
+			c.nc = r.Numbers(spec.field)
 		case sortKeyword:
-			c.kc = s.r.Keywords(spec.field)
+			c.kc = r.Keywords(spec.field)
 		case sortBool:
-			c.t = s.r.Postings(spec.field, kindValue, "true")
-			c.f = s.r.Postings(spec.field, kindValue, "false")
+			c.t = r.Postings(spec.field, kindValue, "true")
+			c.f = r.Postings(spec.field, kindValue, "false")
 		case sortID:
 			ss.idCol = i
 		}
@@ -112,6 +121,9 @@ func newSegSorter(s *segExec) *segSorter {
 // key reads document d's value for key i.
 func (ss *segSorter) key(d uint32, i int) part {
 	c := &ss.cols[i]
+	if c.nest != nil {
+		return c.nest.key(c, d)
+	}
 	switch c.spec.kind {
 	case sortNumber:
 		v, ok := c.nc.Value(d)
@@ -355,7 +367,7 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 		return s.topByIDWalk(hits, k)
 	}
 	h := &topHeap{ss: ss, entries: make([]entry, 0, capFor(k, hits))}
-	if first.kind == sortNumber && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
+	if first.kind == sortNumber && ss.cols[0].nest == nil && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
 		s.collectByPoints(ss, h, hits, k)
 	} else {
 		ss.collect(h, hits, k)

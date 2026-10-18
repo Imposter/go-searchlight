@@ -50,15 +50,23 @@ func longMode() bool {
 }
 
 var testMapping = &schema.Mapping{Fields: map[string]schema.FieldType{
-	"title":   schema.Text,
-	"brand":   schema.Keyword,
-	"tags":    schema.KeywordList,
-	"price":   schema.Number,
-	"created": schema.Date,
-	"active":  schema.Bool,
-	"desc":    schema.Text,
-	"spot":    schema.PointType(schema.Number, schema.Number),
-	"when":    schema.PointType(schema.Date, schema.Number),
+	"title":    schema.Text,
+	"brand":    schema.Keyword,
+	"tags":     schema.KeywordList,
+	"price":    schema.Number,
+	"created":  schema.Date,
+	"active":   schema.Bool,
+	"desc":     schema.Text,
+	"spot":     schema.PointType(schema.Number, schema.Number),
+	"when":     schema.PointType(schema.Date, schema.Number),
+	"_v":       schema.Nested,
+	"_v._key":  schema.Keyword,
+	"_v.size":  schema.Keyword,
+	"_v.color": schema.Text,
+	"_v.price": schema.Number,
+	"_v.stock": schema.Bool,
+	"_v.tags":  schema.KeywordList,
+	"_v.at":    schema.Date,
 }}
 
 var quiet = slog.New(slog.DiscardHandler)

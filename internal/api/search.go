@@ -27,9 +27,10 @@ type total struct {
 
 // hit is a search hit as the API shows it: never the internal segment reference.
 type hit struct {
-	ID   string          `json:"id"`
-	Sort []any           `json:"sort"`
-	Body json.RawMessage `json:"body,omitempty"`
+	ID        string                       `json:"id"`
+	Sort      []any                        `json:"sort"`
+	Body      json.RawMessage              `json:"body,omitempty"`
+	InnerHits map[string]*search.InnerHits `json:"inner_hits,omitempty"`
 }
 
 // search serves POST /indexes/{index}/_search: {query, post_filter, sort, size, from,
@@ -70,6 +71,13 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 		}
 		defer s.readBytes.release(cost)
 	}
+	if objects := search.InnerHitsObjects(req); objects > 0 {
+		cost := windowCost(s.readBytes, min(objects, search.MaxInnerHitsObjects))
+		if !s.readBytes.reserve(cost) {
+			return overBudget(s.readBytes)
+		}
+		defer s.readBytes.release(cost)
+	}
 	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
 	if err != nil {
 		return err
@@ -84,7 +92,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
-		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body}
+		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body, InnerHits: h.InnerHits}
 	}
 	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)
@@ -130,7 +138,8 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 
 // windowHitBytes is the heap one hit of a from search's window is charged against
 // max_inflight_read_bytes: its entry in a shard's heap, its id, sort values and ref as
-// a peer's JSON reply carries them, and its place in the coordinator's merge.
+// a peer's JSON reply carries them, and its place in the coordinator's merge; and so is
+// each inner hit object a response may hold (search.InnerHitsObjects).
 const windowHitBytes = 1 << 10
 
 // windowCost is what a search reaching window hits deep reserves from b: window hits

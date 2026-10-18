@@ -39,7 +39,7 @@ func TestOlderMappingReaders(t *testing.T) {
 			for _, c := range tc.copies {
 				v.copies[c.Shard] = append(v.copies[c.Shard], c)
 			}
-			if got := olderMappingReaders(tc.nodes, v, fence); !slices.Equal(got, tc.want) {
+			if got := olderMappingReaders(tc.nodes, v, fence, store.MappingTypesPoint); !slices.Equal(got, tc.want) {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})
@@ -85,5 +85,46 @@ func TestPointFieldsWaitForEveryNode(t *testing.T) {
 	}
 	if _, err := a.n.CreateIndex(tctx(t), "pts", api.IndexSpec{Mapping: &schema.Mapping{Fields: map[string]schema.FieldType{"spot": point}}, Settings: api.IndexSettings{Shards: 1}}); err != nil {
 		t.Fatalf("creating a point index once every node reads it: %v", err)
+	}
+}
+
+// While a node of the release before nested fields (which reads point fields)
+// heartbeats, a nested field is refused (409, naming the node) and a point field is
+// not; once the node is gone, the nested field goes through, and while it serves
+// again a sub-field given by its full name alone is refused too.
+func TestNestedFieldsWaitForEveryNode(t *testing.T) {
+	db := sqliteDB(t)
+	c := newCluster(t, db, func(int, *Options) {})
+	a := c.start(0)
+	createIndex(t, a.n, "plain", 1, 0)
+	old := store.Node{ID: "node-old", Address: "127.0.0.1:1", Version: "1.3.0", BodyCodecs: store.BodyCodecs, MappingTypes: store.MappingTypesPoint}
+	if err := a.st.Registry().Heartbeat(tctx(t), old); err != nil {
+		t.Fatal(err)
+	}
+	nested := map[string]schema.FieldType{"_v": schema.Nested, "_v.size": schema.Keyword}
+	_, err := a.n.PatchMapping(tctx(t), "plain", nested)
+	var ae *api.Error
+	if !errors.As(err, &ae) || ae.Status != http.StatusConflict || !strings.Contains(ae.Detail, "node-old (1.3.0)") || !strings.Contains(ae.Detail, "_v") {
+		t.Fatalf("patching in a nested field while an older node serves: %v; want a 409 naming it", err)
+	}
+	_, err = a.n.CreateIndex(tctx(t), "nst", api.IndexSpec{Mapping: &schema.Mapping{Fields: nested}, Settings: api.IndexSettings{Shards: 1}})
+	if !errors.As(err, &ae) || ae.Status != http.StatusConflict {
+		t.Fatalf("creating an index with a nested field while an older node serves: %v; want a 409", err)
+	}
+	if _, err := a.n.PatchMapping(tctx(t), "plain", map[string]schema.FieldType{"spot": schema.PointType(schema.Number, schema.Number)}); err != nil {
+		t.Fatalf("a point field while a node that reads points serves: %v", err)
+	}
+	if err := a.st.Registry().RemoveNode(tctx(t), old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.n.PatchMapping(tctx(t), "plain", nested); err != nil {
+		t.Fatalf("patching in a nested field once every node reads it: %v", err)
+	}
+	if err := a.st.Registry().Heartbeat(tctx(t), old); err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.n.PatchMapping(tctx(t), "plain", map[string]schema.FieldType{"_v.colour": schema.Keyword})
+	if !errors.As(err, &ae) || ae.Status != http.StatusConflict || !strings.Contains(ae.Detail, "node-old (1.3.0)") {
+		t.Fatalf("a sub-field by its full name while an older node serves: %v; want a 409", err)
 	}
 }

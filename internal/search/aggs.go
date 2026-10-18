@@ -1172,7 +1172,7 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 		if s.checkCtx() {
 			return nil
 		}
-		if spec.wrapper() {
+		if spec.wrapper() || spec.nested != "" {
 			continue
 		}
 		c := s.newCollector(spec, true)
@@ -1220,6 +1220,8 @@ func (s *segExec) aggregateSpecs(specs []*aggSpec, hits, live *roaring.Bitmap) m
 		switch {
 		case spec.wrapper():
 			out[spec.name] = s.bucketPartial(spec, hits, live)
+		case spec.nested != "":
+			out[spec.name] = s.nestedPartial(spec, hits)
 		case out[spec.name] == nil:
 			out[spec.name] = colls[i].partial()
 		}

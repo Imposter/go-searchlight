@@ -587,7 +587,9 @@ A node's memory is three budgets, plus the page cache:
    second, not memory). The merge policy caps a merged segment at 1 GiB, and a point
    takes about 14 bytes there, so a merge holds at most about 1.8 GiB of points (75M),
    and that only for a segment of little but points; `merge_threads` merges can run
-   at once.
+   at once. A [nested field](api.md#nested-fields)'s objects merge as documents do:
+   each surviving object costs its per-document state, plus a 4-byte remap of every
+   input object, held for the field while it is merged.
 4. **Caches and the runtime.**
    - The filter cache.
    - The search rank cache: up to 256 MiB, at most 64 MiB of it for one segment (a
@@ -839,6 +841,22 @@ Notes:
     manifest or recovery bundle that carries it), and a point field cannot be removed.
     Drop the index (or restore the database) before a rollback.
   - Segments without a point field are still written as format 4.0, byte for byte.
+- **Upgrading to nested fields** (segment format 4.2, mapping types 2; no schema
+  migration) is a rolling upgrade: each upgraded node heartbeats mapping types 2 in
+  `sl_nodes.mapping_types`.
+  - Creating an index with a [nested field](api.md#nested-fields), or patching one into
+    a mapping (a new sub-field of an existing one included), is refused (409, naming
+    the nodes) while any node of an earlier release heartbeats within the fence or
+    holds a copy under a live lease, as point fields were.
+  - **Once a nested field exists, no node can be downgraded below 1.4**: an older
+    binary cannot decode the mapping (its copies halt, and it cannot open a manifest
+    or recovery bundle that carries it), and a nested field cannot be removed. Drop
+    the index (or restore the database) before a rollback.
+  - Searches that read nested objects need search wire level 6, and percolations of a
+    nested index percolate wire level 3: an older peer is never sent one
+    ([clustering](clustering.md)).
+  - Segments without a nested field's objects are still written in the minor before
+    (4.1 with points, 4.0 without), byte for byte.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

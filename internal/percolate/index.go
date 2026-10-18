@@ -1444,6 +1444,11 @@ func writeQuery(buf *bytes.Buffer, n query.Node) error {
 		}
 		buf.WriteByte('}')
 		return nil
+	case *query.Nested:
+		if x == nil {
+			return errors.New("a nil nested node cannot be stored")
+		}
+		return writeNested(buf, x)
 	default:
 		return fmt.Errorf("query node %T cannot be stored", n)
 	}
@@ -1651,3 +1656,28 @@ func (s *Segment) pairAt(r int) (partner uint32, posts []byte) {
 
 // NumEntries is how many terms the segment's dictionary holds.
 func (s *Segment) NumEntries() uint32 { return uint32(len(s.entries) / entrySize) } //nolint:gosec // validated against a u32 count
+
+// writeNested writes a nested node: {"nested": {"path": ..., "query": ...,
+// "inner_hits": ...}}.
+func writeNested(buf *bytes.Buffer, n *query.Nested) error {
+	path, err := json.Marshal(n.Path)
+	if err != nil {
+		return err
+	}
+	buf.WriteString(`{"nested":{"path":`)
+	buf.Write(path)
+	buf.WriteString(`,"query":`)
+	if err := writeQuery(buf, n.Query); err != nil {
+		return err
+	}
+	if n.InnerHits != nil {
+		hits, err := json.Marshal(n.InnerHits)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(`,"inner_hits":`)
+		buf.Write(hits)
+	}
+	buf.WriteString("}}")
+	return nil
+}

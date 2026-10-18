@@ -73,6 +73,19 @@ type sortSpec struct {
 	field string
 	desc  bool
 	kind  sortKind
+	// nested is a sort on a nested field's sub-field: by the least or greatest value
+	// among each document's objects (nestCol).
+	nested *nestedSort
+}
+
+// nestedSort is a sort key on a sub-field of nested field path: by the greatest value
+// among a document's objects when max, else the least, of the objects its where
+// chooses (whereNode, compiled into where; every object without one).
+type nestedSort struct {
+	path      string
+	max       bool
+	whereNode query.Node
+	where     *pnode
 }
 
 // aggSpec is one aggregation, checked.
@@ -113,6 +126,12 @@ type aggSpec struct {
 	queries  []query.Node
 	filters  []*pnode
 	hasOther bool
+	// nested is the nested field an aggregation on a sub-field collects the objects of,
+	// "" for any other; where is its where, which chooses them, and wherePlan that
+	// compiled (nil: every object).
+	nested    string
+	where     query.Node
+	wherePlan *pnode
 }
 
 // wrapper reports whether the aggregation is a filter, filters or global one.
@@ -192,6 +211,11 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		p.post = compileNode(r.PostFilter, id)
 	}
 	compileFilters(p.aggs, id)
+	for i := range p.sorts {
+		if ns := p.sorts[i].nested; ns != nil && ns.whereNode != nil {
+			ns.where = compileNode(ns.whereNode, id)
+		}
+	}
 	shareThresholds(p.aggs)
 	return p, nil
 }
@@ -211,11 +235,15 @@ func shareThresholds(specs []*aggSpec) {
 	}
 }
 
-// compileFilters compiles the filters of specs' filter and filters aggregations.
+// compileFilters compiles the filters of specs' filter and filters aggregations, and
+// the where of each aggregation on a sub-field.
 func compileFilters(specs []*aggSpec, req uint64) {
 	for _, s := range specs {
 		for _, q := range s.queries {
 			s.filters = append(s.filters, compileNode(q, req))
+		}
+		if s.where != nil {
+			s.wherePlan = compileNode(s.where, req)
 		}
 		compileFilters(s.subs, req)
 	}
@@ -259,9 +287,27 @@ func prepareSorts(fields []SortField, m *schema.Mapping, ps *problems) []sortSpe
 			continue
 		}
 		spec := sortSpec{field: f.Field, desc: f.Desc}
-		if t := fieldType(m, f.Field); t.IsPoint() {
-			ps.add(fmt.Sprintf("sort.%d", i), "cannot sort on %q: a point field has many points of two coordinates", f.Field)
+		loc := fmt.Sprintf("sort.%d", i)
+		t := fieldType(m, f.Field)
+		path, sub := m.NestedPath(f.Field)
+		switch {
+		case t.IsPoint():
+			ps.add(loc, "cannot sort on %q: a point field has many points of two coordinates", f.Field)
 			continue
+		case t == schema.Nested:
+			ps.add(loc, "cannot sort on %q: a nested field sorts by one of its sub-fields (%s.name)", f.Field, f.Field)
+			continue
+		case m != nil && !sub && (f.Mode != "" || f.Where != nil):
+			ps.add(loc, "mode and where sort by a nested field's sub-field, and %q is none", f.Field)
+			continue
+		case sub && f.Mode != "" && f.Mode != SortModeMin && f.Mode != SortModeMax:
+			ps.add(loc+"."+f.Field+".mode", "mode is %q or %q", SortModeMin, SortModeMax)
+			continue
+		case sub && t != schema.Number && t != schema.Date && t != schema.Keyword && t != schema.Text:
+			ps.add(loc, "cannot sort on %q: a sub-field sorts by number, date, keyword or text, not %s", f.Field, t)
+			continue
+		case sub:
+			spec.nested = &nestedSort{path: path, max: f.Mode == SortModeMax || (f.Mode == "" && f.Desc), whereNode: f.Where}
 		}
 		switch f.Field {
 		case IDField:
@@ -354,6 +400,27 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 	}
 	if s.ftype.IsPoint() && !wrapper {
 		ps.add(at+".field", "%q is a point field: no aggregation takes one (filter on it with box, in a filter aggregation)", a.Field)
+		return nil
+	}
+	if s.ftype == schema.Nested && !wrapper {
+		ps.add(at+".field", "%q is a nested field: aggregate one of its sub-fields (%s.name)", a.Field, a.Field)
+		return nil
+	}
+	if path, sub := m.NestedPath(a.Field); sub && !wrapper {
+		switch {
+		case a.Type != AggTerms && a.Type != AggStats && a.Type != AggMin && a.Type != AggMax && a.Type != AggCardinality:
+			ps.add(at+".field", "%q is a nested field's sub-field: terms, stats, min, max and cardinality aggregate one, %s does not", a.Field, a.Type)
+			return nil
+		case parent != "" && !singleBucket(parent):
+			ps.add(loc, "an aggregation on a sub-field is top-level, or under filter, filters or global: a bucket's metrics aggregate its documents' own fields")
+			return nil
+		case len(a.Aggs) > 0:
+			ps.add(loc+"."+aggsLoc(a.aggsKey), "an aggregation on a sub-field holds no sub-aggregations")
+			return nil
+		}
+		s.nested, s.where = path, a.Where
+	} else if a.Where != nil && m != nil {
+		ps.add(at+".where", "where chooses a nested field's objects: %q is no sub-field of one", a.Field)
 		return nil
 	}
 	isMetric := metricType(a.Type)

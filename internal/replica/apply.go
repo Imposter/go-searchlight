@@ -19,6 +19,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -265,15 +266,14 @@ func normalizeMeta(meta []byte) []byte {
 // mapping the field would analyze it differently. A value inference does not type (an
 // empty list, an object) analyzes as presence alone whatever the field's type, and is
 // not marked. Segments keep the marks in a bitmap of their own
-// (segment.Reader.Untyped, shard.SegmentView.MarksUntyped).
+// (segment.Reader.Untyped, shard.SegmentView.MarksUntyped). An unmapped sub-field of a
+// nested field is marked in each object holding it (schema.MarkUntyped).
 func analyzeDoc(view *schema.Mapping, dynamic schema.DynamicMode, id string, body []byte) (doc schema.Doc, unmapped bool, err error) {
 	doc, upd, err := schema.Analyze(view, id, body)
 	if err != nil {
 		return doc, false, err
 	}
-	for f := range upd.Fields {
-		doc.Fields[f] = schema.Value{Present: true, Untyped: true}
-	}
+	schema.MarkUntyped(&doc, view, upd.Fields)
 	return doc, !upd.Empty() && dynamic != schema.DynamicFalse, nil
 }
 
@@ -506,7 +506,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 					if err := applyRunTo(i); err != nil {
 						return err
 					}
-					rebuild, err := t.remapReanalyzes(ctx, sh, m, fields)
+					rebuild, err := t.remapReanalyzes(ctx, sh, m, it.mapping, fields)
 					if err != nil {
 						return err
 					}
@@ -541,8 +541,10 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 // it does not type ([] or {}) analyzes as presence alone, typed or not, so mapping the
 // field changes nothing for it, and the copy adopts the mapping in place. In a segment
 // that does not mark, any holder counts. It is a bitmap check, after a refresh puts the
-// buffer in segments.
-func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old *schema.Mapping, fields []string) (bool, error) {
+// buffer in segments. A sub-field of a field old maps as nested is held by the
+// documents whose objects hold it. A field newer maps as nested counts any holder: an
+// object ({}), which inference does not type, is a nested field's member.
+func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old, newer *schema.Mapping, fields []string) (bool, error) {
 	if err := sh.Refresh(ctx); err != nil {
 		return false, err
 	}
@@ -553,9 +555,21 @@ func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old *sche
 	defer g.Release()
 	for _, sv := range g.Segments {
 		for _, f := range fields {
-			p := sv.Reader.Present(f)
-			if _, mapped := old.Type(f); !mapped && sv.MarksUntyped && f != schema.IDField {
-				p = sv.Reader.Untyped(f)
+			r := sv.Reader
+			var nv *segment.Nested
+			if path, sub := old.NestedPath(f); sub {
+				if nv = r.Nested(path); nv == nil {
+					continue
+				}
+				r = nv.Objects()
+			}
+			p := r.Present(f)
+			now, _ := newer.Type(f)
+			if _, mapped := old.Type(f); !mapped && sv.MarksUntyped && f != schema.IDField && !now.IsNested() {
+				p = r.Untyped(f)
+			}
+			if nv != nil {
+				p = nv.Parents(p)
 			}
 			if p == nil || p.IsEmpty() {
 				continue

@@ -264,7 +264,7 @@ func TestXYMinorVersion(t *testing.T) {
 		}
 		want := uint16(0)
 		if name == "with" {
-			want = FormatMinor
+			want = minorXY
 		}
 		if got := binary.LittleEndian.Uint16(data[10:]); got != want {
 			t.Fatalf("a segment %s points: minor %d, want %d", name, got, want)

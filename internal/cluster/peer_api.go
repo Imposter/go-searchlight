@@ -37,11 +37,11 @@ import (
 //
 //	POST   /_internal/hint                      push hints: wake the named copies' tailers
 //	POST   /_internal/search                    a shard's query (or whole search) on this node's copy
-//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 4 (searchPath)
+//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 5 (searchPath)
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
-//	POST   /_internal/percolate/1               the same, for a percolation of wire level 1 (percolatePath)
+//	POST   /_internal/percolate/{level}         the same, for a percolation of wire level 1 or 2 (percolatePath)
 //	POST   /_internal/get                       a stored document or saved query from a copy
 //	POST   /_internal/wait                      wait until a copy has a seq searchable
 //	POST   /_internal/counts                    a copy's live documents and saved queries
@@ -70,7 +70,9 @@ func (p *peerAPI) handler() http.Handler {
 	handle("POST /_internal/fetch", p.fetch)
 	handle("DELETE /_internal/pins/{id}", p.unpin)
 	handle("POST /_internal/percolate", p.percolate)
-	handle("POST /_internal/percolate/1", p.percolate)
+	for level := 1; level <= percolateLevel; level++ {
+		handle("POST "+percolatePath(level), p.percolate)
+	}
 	handle("POST /_internal/get", p.get)
 	handle("POST /_internal/wait", p.wait)
 	handle("POST /_internal/counts", p.counts)

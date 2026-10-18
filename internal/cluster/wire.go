@@ -66,14 +66,15 @@ const codeStale = "stale_copy"
 // would ignore, counting every value, and level 3 from (levelFrom), which a lower peer
 // would ignore, answering with the first page, and level 4 the min and max
 // aggregations and a cardinality's threshold (levelMetrics), which a lower peer would
-// refuse as unknown or ignore, estimating past it. A request
+// refuse as unknown or ignore, estimating past it, and level 5 the box query on point
+// fields (levelBox), which a lower peer would refuse as an unknown op. A request
 // says the level it needs
 // (wireRequest.Needs), and goes to that level's endpoint (searchPath), and a reply
 // the level it was answered at (searchReply.Level): a peer refuses a request past its
 // level, and the coordinator a reply below the request's, so a search is never
 // answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelMetrics
+const searchLevel = levelBox
 
 // The search wire levels of the additions a peer must not ignore.
 const (
@@ -81,12 +82,15 @@ const (
 	levelTermsFilter = 2
 	levelFrom        = 3
 	levelMetrics     = 4
+	levelBox         = 5
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelBox:
+		return "a box query on a point field"
 	case needs >= levelMetrics:
 		return "a min or max aggregation, or a cardinality threshold"
 	case needs >= levelFrom:
@@ -132,7 +136,7 @@ type wireRequest struct {
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
 	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
-	// or max aggregation or a cardinality's threshold.
+	// or max aggregation or a cardinality's threshold, 5 for a box query.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -164,6 +168,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		return nil, err
 	}
 	switch {
+	case boxQueries(r):
+		w.Needs = levelBox
 	case metricAggs(r.Aggs):
 		w.Needs = levelMetrics
 	case r.From > 0 && r.Size > 0:
@@ -293,8 +299,16 @@ type fetchReply struct {
 // percolateMsg.Now. Level 1 adds both. A percolation of an index whose mapping holds a
 // date field (the only fields date math applies to) needs it, and goes to its level's
 // endpoint (percolatePath), which a 1.0.0 peer does not serve; a reply below it is
-// refused, so the shard's next copy answers, or none does (503).
-const percolateLevel = 1
+// refused, so the shard's next copy answers, or none does (503). Level 2 adds point
+// fields and their box queries: a percolation under a mapping holding a point field
+// needs it, as a lower peer reads neither the mapping nor the saved boxes.
+const percolateLevel = 2
+
+// Percolate wire levels of the additions a peer must not ignore.
+const (
+	percolateDates  = 1
+	percolatePoints = 2
+)
 
 // percolatePath is the peer path of a percolation needing wire level needs.
 func percolatePath(needs int) string {
@@ -305,19 +319,33 @@ func percolatePath(needs int) string {
 }
 
 // percolateNeeds is the percolate wire level a percolation under mapping (the
-// catalogue's JSON) needs: 1 when it holds a date field, whose saved conditions may
-// hold date math; 0 otherwise. A mapping it cannot read needs 1.
+// catalogue's JSON) needs: 2 when it holds a point field (or a point axis is a date),
+// 1 when it holds a date field, whose saved conditions may hold date math; 0
+// otherwise. A mapping it cannot read needs percolateLevel.
 func percolateNeeds(mapping json.RawMessage) int {
 	var m schema.Mapping
 	if len(mapping) > 0 && json.Unmarshal(mapping, &m) != nil {
-		return 1
+		return percolateLevel
 	}
+	needs := 0
 	for _, t := range m.Fields {
-		if t == schema.Date {
-			return 1
+		switch {
+		case t.IsPoint():
+			return percolatePoints
+		case t == schema.Date:
+			needs = percolateDates
 		}
 	}
-	return 0
+	return needs
+}
+
+// percolateLevelNeeds names what a percolation of wire level needs carries, for the
+// errors of a peer below it.
+func percolateLevelNeeds(needs int) string {
+	if needs >= percolatePoints {
+		return "an index with a point field, whose saved queries may hold box conditions"
+	}
+	return "an index with a date field, whose saved queries may hold date math"
 }
 
 // percolateMsg asks a peer to percolate documents, analyzed under Mapping (the
@@ -440,6 +468,39 @@ func filterAggs(aggs map[string]search.Agg) bool {
 		}
 	}
 	return false
+}
+
+// boxQueries reports whether r's query, post_filter or any filter or filters
+// aggregation's queries hold a box condition.
+func boxQueries(r *search.Request) bool {
+	found := false
+	check := func(n query.Node) {
+		query.Walk(n, func(_ string, node query.Node) bool {
+			if l, ok := node.(*query.Leaf); ok && l.Op == query.OpBox {
+				found = true
+			}
+			return !found
+		})
+	}
+	check(r.Query)
+	if r.PostFilter != nil {
+		check(r.PostFilter)
+	}
+	var aggs func(map[string]search.Agg)
+	aggs = func(m map[string]search.Agg) {
+		for name := range m {
+			a := m[name]
+			if a.Filter != nil {
+				check(a.Filter)
+			}
+			for _, f := range a.Filters {
+				check(f)
+			}
+			aggs(a.Aggs)
+		}
+	}
+	aggs(r.Aggs)
+	return found
 }
 
 // metricAggs reports whether aggs hold a min or max aggregation, or a cardinality

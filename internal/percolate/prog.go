@@ -40,6 +40,9 @@ import (
 //	                              (two for between) a kind byte and a float64 (0), or now's
 //	                              date math steps (1: count, then per step its unit, round and
 //	                              N), applied to the percolation's now
+//	             box              per end (x's lower and upper, then y's) a byte, 0 for
+//	                              none, 1 exclusive, 2 inclusive, then the bound as a date
+//	                              bound is written
 //
 // where a string is a uvarint length and its bytes, and numbers are little-endian. The
 // compiler mirrors [query.Compile] exactly (the same folding of constant conditions,
@@ -76,6 +79,7 @@ const (
 	pHas
 	pHasAll
 	pDate
+	pBox
 
 	numProgTags
 )
@@ -187,6 +191,9 @@ func (pc *progCompiler) group(tag byte, nodes []query.Node) pnode {
 func (pc *progCompiler) leaf(l *query.Leaf) pnode {
 	a := l.Decoded()
 	out := pnode{cost: costCompare, field: pc.field(l.Field)}
+	if l.Op == query.OpBox {
+		return boxLeaf(&a, out)
+	}
 	if l.IsDateMath() {
 		fixed, _ := query.ResolveFixed(l).(*query.Leaf)
 		if fixed.IsDateMath() {
@@ -352,6 +359,75 @@ func dateLeaf(op string, a *query.Arg, out pnode) pnode {
 		out.operands = binary.AppendUvarint(append(out.operands, dateNow), uint64(len(steps)))
 		for _, st := range steps {
 			out.operands = binary.AppendVarint(append(out.operands, st.Unit, boolByte(st.Round)), st.N)
+		}
+	}
+	return out
+}
+
+// Box end states.
+const (
+	boxNone      = 0
+	boxExclusive = 1
+	boxInclusive = 2
+)
+
+// boxLeaf compiles a box: each end's bound a number, a date resolved here when it does
+// not read now (as [query.ResolveFixed] resolves it), or now's date math steps, applied
+// at each evaluation. A box that holds no point at every now (a bound that is no
+// finite number, or, with no bound reading now, an axis whose bounds leave nothing
+// between them) never holds, as the matcher compiles it.
+func boxLeaf(a *query.Arg, out pnode) pnode {
+	if a.Kind != query.ArgBox || a.Box == nil {
+		return progNever
+	}
+	out.tag, out.cost = pBox, costLookup
+	fixed := query.Box{}
+	relative := false
+	for i, iv := range a.Box.Axes() {
+		fixedAxis := fixed.Axes()[i]
+		fixedEnds := [2]*query.Bound{&fixedAxis.Lo, &fixedAxis.Hi}
+		for j, end := range []*query.Bound{&iv.Lo, &iv.Hi} {
+			if !end.Set {
+				out.operands = append(out.operands, boxNone)
+				continue
+			}
+			out.operands = append(out.operands, pick[byte](end.Inclusive, boxInclusive, boxExclusive))
+			roundUp := end.RoundsUp(j == 1)
+			s := &end.Value
+			var bound query.Scalar
+			switch {
+			case s.Kind != query.ArgString:
+				if !finite(s) {
+					return progNever
+				}
+				bound = *s
+			default:
+				d, why := query.ParseDateMath(s.Text)
+				if why != "" {
+					return progNever
+				}
+				if d.Relative() {
+					relative = true
+					steps := d.Steps()
+					out.operands = binary.AppendUvarint(append(out.operands, dateNow), uint64(len(steps)))
+					for _, st := range steps {
+						out.operands = binary.AppendVarint(append(out.operands, st.Unit, boolByte(st.Round)), st.N)
+					}
+					continue
+				}
+				ms, ok := d.Resolve(0, roundUp)
+				if !ok {
+					return progNever
+				}
+				bound = query.Scalar{Kind: query.ArgNumber, Number: float64(ms), Finite: true}
+			}
+			out.operands = appendF64(append(out.operands, dateNumber), bound.Number)
+			*fixedEnds[j] = query.Bound{Set: true, Inclusive: end.Inclusive, Value: bound}
+		}
+	}
+	if !relative {
+		if _, ok := query.CompileBox(&query.Arg{Kind: query.ArgBox, Box: &fixed}); !ok {
+			return progNever
 		}
 	}
 	return out
@@ -564,6 +640,8 @@ func (sc *scratch) eval(p []byte) bool {
 		return has(v.Entries, p, tag == pHasAll)
 	case pDate:
 		return v.Number != nil && sc.date(*v.Number, p)
+	case pBox:
+		return len(v.Points) > 0 && sc.box(v.Points, p)
 	case pNonempty:
 		return len(v.Entries) > 0
 	default:
@@ -686,6 +764,33 @@ func (sc *scratch) date(n float64, p []byte) bool {
 			return n >= at
 		}
 	}
+}
+
+// box is a box leaf's verdict on points, its bounds resolved at sc.now; a bound that
+// cannot be resolved holds for nothing, as the matcher reads a resolved tree.
+func (sc *scratch) box(points []schema.Point, p []byte) bool {
+	var b query.BoxBounds
+	ends := [4]struct {
+		at  *float64
+		inc *bool
+	}{{&b.XLo, &b.XLoInc}, {&b.XHi, &b.XHiInc}, {&b.YLo, &b.YLoInc}, {&b.YHi, &b.YHiInc}}
+	for i, e := range ends {
+		state := p[0]
+		p = p[1:]
+		if state == boxNone {
+			*e.at, *e.inc = math.Inf(2*(i%2)-1), true
+			continue
+		}
+		inclusive := state == boxInclusive
+		upper := i%2 == 1
+		at, ok := sc.dateBound(p, upper == inclusive)
+		if !ok {
+			return false
+		}
+		*e.at, *e.inc = at, inclusive
+		p = skipBound(p)
+	}
+	return b.Any(points)
 }
 
 func (sc *scratch) dateBound(p []byte, roundUp bool) (float64, bool) {
@@ -838,6 +943,18 @@ func (r *progReader) operands(tag byte) {
 		r.skip(8 * r.uvarint())
 	case pDate:
 		r.date()
+	case pBox:
+		for range 4 {
+			if !r.ok || len(r.p) == 0 || r.p[0] > boxInclusive {
+				r.ok = false
+				return
+			}
+			state := r.p[0]
+			r.skip(1)
+			if state != boxNone {
+				r.bound()
+			}
+		}
 	default:
 		r.ok = false
 	}
@@ -852,32 +969,37 @@ func (r *progReader) date() {
 	bounds := pick(r.p[0] == 4, 2, 1)
 	r.skip(1)
 	for range bounds {
-		if !r.ok || len(r.p) == 0 {
-			r.ok = false
-			return
-		}
-		kind := r.p[0]
-		r.skip(1)
-		switch kind {
-		case dateNumber:
-			r.skip(8)
-		case dateNow:
-			steps := r.uvarint()
-			for i := uint64(0); i < steps && r.ok; i++ {
-				if len(r.p) < 2 || !query.IsDateUnit(r.p[0]) || r.p[1] > 1 {
-					r.ok = false
-					return
-				}
-				r.skip(2)
-				v, k := binary.Varint(r.p)
-				if k <= 0 || v < math.MinInt32 || v > math.MaxInt32 {
-					r.ok = false
-					return
-				}
-				r.skip(uint64(k))
+		r.bound()
+	}
+}
+
+// bound reads one date bound: its kind, then a float64 or now's steps.
+func (r *progReader) bound() {
+	if !r.ok || len(r.p) == 0 {
+		r.ok = false
+		return
+	}
+	kind := r.p[0]
+	r.skip(1)
+	switch kind {
+	case dateNumber:
+		r.skip(8)
+	case dateNow:
+		steps := r.uvarint()
+		for i := uint64(0); i < steps && r.ok; i++ {
+			if len(r.p) < 2 || !query.IsDateUnit(r.p[0]) || r.p[1] > 1 {
+				r.ok = false
+				return
 			}
-		default:
-			r.ok = false
+			r.skip(2)
+			v, k := binary.Varint(r.p)
+			if k <= 0 || v < math.MinInt32 || v > math.MaxInt32 {
+				r.ok = false
+				return
+			}
+			r.skip(uint64(k))
 		}
+	default:
+		r.ok = false
 	}
 }

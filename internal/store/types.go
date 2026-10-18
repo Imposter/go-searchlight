@@ -326,6 +326,9 @@ type Node struct {
 	// BodyCodecs is the stored-body codecs the node reads ([BodyCodecs]); 0 for a
 	// node from before codecs, whose heartbeat leaves the column at its default.
 	BodyCodecs int
+	// MappingTypes is the field types the node reads ([MappingTypes]); 0 for a node
+	// from before point fields, whose heartbeat leaves the column at its default.
+	MappingTypes int
 	// HeartbeatAt is the last heartbeat by the database clock, and
 	// HeartbeatAge how long ago that was, also by the database clock, so a
 	// caller judges liveness without comparing clocks.

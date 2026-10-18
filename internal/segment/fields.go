@@ -41,6 +41,10 @@ type fieldBuilder struct {
 	// builder only ever sees documents in ascending order, so a plain append-only
 	// slice is already sorted - no sort is needed to keep it that way).
 	numDocs []docFloat
+
+	// xy is this builder's points (a point field's), in no particular order: the
+	// writer puts every part's together in canonical order (canonicalXY).
+	xy []xyPoint
 }
 
 type docFloat struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
 	"testing"
 	"unsafe"
@@ -133,6 +134,19 @@ func exerciseReader(r *Reader) {
 		consumeBitmap(r.Present(name))
 		consumeBitmap(r.Truncated(name))
 		consumeBitmap(r.Untyped(name))
+
+		xy := r.XY(name)
+		_, _ = xy.Exists(), xy.NumPoints()
+		inf := math.Inf(1)
+		for _, b := range []XYBox{
+			{XLo: -inf, XHi: inf, YLo: -inf, YHi: inf, XLoInc: true, XHiInc: true, YLoInc: true, YHiInc: true},
+			{XLo: 0, XHi: 10, YLo: -inf, YHi: 3, XHiInc: true, YLoInc: true},
+		} {
+			consumeBitmap(xy.Box(b))
+			_ = xy.EstimatePoints(b)
+		}
+		points := 0
+		xy.Each(func(uint32, [2]float64) { points++ })
 	}
 	_, _ = r.MarksUntyped(), r.FormatMajor()
 	_ = r.DiskUsage()
@@ -183,6 +197,7 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, nil),
 		buildFile(tb, markedDocs(tb, 40)),
 		buildFile(tb, genCorpus(40)),
+		buildFile(tb, xyDocs(tb, rand.New(rand.NewPCG(9, 9)), 150, 8)), // a point tree of a few leaves
 	}
 	seeds = append(seeds, buildWithStoredDict(tb, genCorpus(40)))
 	for _, craft := range craftedCases() {

@@ -130,11 +130,12 @@ func TestMixedVersionWrites(t *testing.T) {
 		if _, err := s.w.ExecContext(ctx, rebind(s, old.heartbeat), "old", "10.0.0.1:9200", "0.9", 1); err != nil {
 			t.Fatal(err)
 		}
-		if err := st.Registry().Heartbeat(ctx, Node{ID: "new", Version: "1.0", BodyCodecs: BodyCodecs}); err != nil {
+		if err := st.Registry().Heartbeat(ctx, Node{ID: "new", Version: "1.0", BodyCodecs: BodyCodecs, MappingTypes: MappingTypes}); err != nil {
 			t.Fatal(err)
 		}
 		nodes, err := st.Registry().Nodes(ctx)
-		if err != nil || len(nodes) != 2 || nodes[0].ID != "new" || nodes[0].BodyCodecs != BodyCodecs || nodes[1].BodyCodecs != 0 {
+		if err != nil || len(nodes) != 2 || nodes[0].ID != "new" || nodes[0].BodyCodecs != BodyCodecs || nodes[1].BodyCodecs != 0 ||
+			nodes[0].MappingTypes != MappingTypes || nodes[1].MappingTypes != 0 {
 			t.Fatalf("nodes %+v %v", nodes, err)
 		}
 	})

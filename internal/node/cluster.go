@@ -41,6 +41,11 @@ type Cluster interface {
 	// Counts returns the live documents and saved queries of a serving copy of id on
 	// another node.
 	Counts(ctx context.Context, id store.ShardID) (docs, queries uint64, err error)
+	// AdmitFields refuses (a 409 *api.Error naming them) fields some live node of the
+	// cluster could not decode in a mapping: a point field while a node of an earlier
+	// release, which reads no point type, is live or holds a copy. It is called before
+	// an index is created or its mapping patched.
+	AdmitFields(ctx context.Context, fields map[string]schema.FieldType) error
 }
 
 // ShardTarget is the copy one read uses for one shard: this node's own, or a serving

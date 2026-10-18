@@ -19,7 +19,7 @@ import (
 // segment.Merge streams: it merges its inputs' term dictionaries, stored bodies and
 // ids straight into the merged file, holding only per-document state in memory (a few
 // hundred bytes a document: about 0.6 GiB of heap at peak for a million of the
-// benchmark's products). Both its phases check the budget's throttle, and through it
+// benchmark's products), and 24 bytes per point of each point field. Both its phases check the budget's throttle, and through it
 // the context: a cancelled merge (Close) stops at its next check, within a few thousand
 // documents read or a thousand terms written, and removes its temp files.
 //

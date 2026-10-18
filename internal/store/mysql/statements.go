@@ -75,10 +75,10 @@ var records = dialect.Records{
 }
 
 var registry = dialect.Registry{
-	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, heartbeat_at, started_at) VALUES (?, ?, ?, ?, ?, NOW, NOW)
-AS new ON DUPLICATE KEY UPDATE address = new.address, version = new.version, capacity = new.capacity, body_codecs = new.body_codecs, heartbeat_at = new.heartbeat_at`),
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at) VALUES (?, ?, ?, ?, ?, ?, NOW, NOW)
+AS new ON DUPLICATE KEY UPDATE address = new.address, version = new.version, capacity = new.capacity, body_codecs = new.body_codecs, mapping_types = new.mapping_types, heartbeat_at = new.heartbeat_at`),
 	RemoveNode:    "DELETE FROM sl_nodes WHERE node_id = ?",
-	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
 	Features:      "SELECT name, enabled_at FROM sl_features",
 	EnableFeature: withNow("INSERT IGNORE INTO sl_features (name, enabled_at) VALUES (?, NOW)"),
 	IndexExists:   "SELECT COUNT(*) FROM sl_indexes WHERE name = ?",

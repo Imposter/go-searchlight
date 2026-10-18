@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -955,6 +956,7 @@ func identityCorpora(t *testing.T) map[string][]schema.Doc {
 		"singleDoc":  sparseDocs(t, 1),
 		"singleDoc2": testDocs(t)[:1],
 		"noDocs":     nil,
+		"points":     xyDocs(t, rand.New(rand.NewPCG(1, 2)), 1200, 6),
 	}
 }
 

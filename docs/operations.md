@@ -558,7 +558,13 @@ A node's memory is three budgets, plus the page cache:
    per-document state, under 1 KiB a document, plus up to 8 MiB for each field it
    writes at once (one per thread it runs on). A merge of a million of the benchmark's
    products peaks at about 0.6 GiB of heap on 4 threads and 0.7 GiB on 16.
-   `merge_threads` merges can run at once.
+   A [point field](api.md#point-fields) adds 24 bytes per point the merged segment
+   keeps, held whole while its k-d tree is built: about 240 MB for 10M points (1M
+   documents of 10). No setting bounds it (`merge_budget` limits bytes written per
+   second, not memory). The merge policy caps a merged segment at 1 GiB, and a point
+   takes about 14 bytes there, so a merge holds at most about 1.8 GiB of points (75M),
+   and that only for a segment of little but points; `merge_threads` merges can run
+   at once.
 4. **Caches and the runtime.**
    - The filter cache.
    - The search rank cache: up to 256 MiB, at most 64 MiB of it for one segment (a
@@ -794,6 +800,22 @@ Notes:
     `store: database schema is newer than this binary` until it runs the new image:
     finish the rollout rather than waiting on it. For the same reason a rollback means
     restoring the database, as above.
+- **Upgrading to point fields** (schema migration 4, segment format 4.1) is a rolling
+  upgrade. The migration only adds a column, `sl_nodes.mapping_types` (an INTEGER,
+  0 for a node that has not heartbeated since), in which each node records the
+  mapping field types it reads; nothing is rewritten. As with migrations 2 and 3, an
+  old binary refuses to start once the first node has migrated, so finish the rollout.
+  - Creating an index with a [point field](api.md#point-fields), or patching one into a
+    mapping, is refused (409, naming the nodes) while any node that reads no point type
+    heartbeats within the fence (`dead_after` plus `lease_ttl`) or holds a copy under a
+    live lease: such a node could not decode the mapping, so its copies would halt at
+    the change and its recoveries would fail. Retry once every node runs the new
+    binary.
+  - **Once a point field exists, no node can be downgraded below this release**: an
+    older binary cannot decode the mapping (its copies halt, and it cannot open a
+    manifest or recovery bundle that carries it), and a point field cannot be removed.
+    Drop the index (or restore the database) before a rollback.
+  - Segments without a point field are still written as format 4.0, byte for byte.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

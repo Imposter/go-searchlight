@@ -148,7 +148,7 @@ func (s *Server) patchMapping(w http.ResponseWriter, r *http.Request, _ params) 
 	for name, raw := range req.Fields {
 		var t schema.FieldType
 		if err := json.Unmarshal(raw, &t); err != nil {
-			return InvalidAt("fields."+name, "a field type is keyword, text, keyword_list, number, bool or date")
+			return InvalidAt("fields."+name, `a field type is keyword, text, keyword_list, number, bool, date or {"type": "point", "x": "number"|"date", "y": "number"|"date"}: %v`, err)
 		}
 		fields[name] = t
 	}

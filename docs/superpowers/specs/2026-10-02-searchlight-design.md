@@ -103,6 +103,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `number` | float64 doc values, plus a BKD-style point index for ranges | comparisons, `between`, `exists`; range, histogram and stats aggs, sort |
 | `bool` | term | `eq`, `ne`, `exists`; terms agg |
 | `date` | Unix milliseconds, same as `number` | comparisons; date histogram, sort |
+| `point` (operator decision, 2026-10-17) | `{"type": "point", "x": "number"\|"date", "y": ...}`: a list of `[x, y]` pairs per document, each axis a number or a date, in a per-segment k-d tree | `box`, `exists`; no aggregation, no sort |
 
 - **Dynamic mapping** (the default) types a field from its first value. Strict mapping refuses unmapped fields. Mapping changes are additive only.
 - **Normalization is byte-for-byte compatible with scrape-bot:**
@@ -135,7 +136,8 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
   - `words_all`, `words_any`;
   - `similar` (`{text, min}`, trigram similarity compatible with pg_trgm);
   - `has`, `has_any`, `has_all`;
-  - `empty`, `nonempty`.
+  - `empty`, `nonempty`;
+  - `box` on a `point` field (`{"x": {"gte": a, "lt": b}, "y": {...}}`, any of `gt`, `gte`, `lt`, `lte` per axis, either axis optional): a document with one point inside on both axes. A date axis takes date math as a date field's ranges do, each bound rounding as the op of its key; a box search needs search wire level 5, a percolation of an index with a point field percolate wire level 2.
 - **The `_id` pseudo-field** refers to the document id.
 - **Date math** (operator decision, 2026-10-16), Elasticsearch's, on `date` fields:
   - `lt`, `lte`, `gt`, `gte` and each `between` bound take a number or a string: `now` or a date (RFC 3339 or `YYYY-MM-DD`; a date followed by `||` before any math), then `+N`/`-N` steps and `/` rounding in `y M w d h H m s`. Months and years add as java.time does (`2026-01-31||+1M` is 2026-02-28). UTC only: no `time_zone`.

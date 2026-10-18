@@ -633,7 +633,7 @@ func cheapest(sets []aset) aset {
 func (e *extractor) leaf(l *query.Leaf) aset {
 	a := l.Decoded()
 	f := l.Field
-	if l.IsDateMath() {
+	if l.IsDateMath() || l.Op == query.OpBox {
 		return e.term(AtomPresent, f, "")
 	}
 	switch l.Op {

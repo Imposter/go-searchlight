@@ -91,6 +91,8 @@ type leafPlan struct {
 	phrases [][]string
 	never   bool
 	every   bool
+	// box is a box condition's bounds, as the segments' point indexes take them.
+	box segment.XYBox
 }
 
 func compileNode(n query.Node, req uint64) *pnode {
@@ -145,6 +147,15 @@ func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 		if lp.arg.Kind == query.ArgString {
 			lp.texts = []string{lp.arg.Scalar.Norm}
 		}
+	case query.OpBox:
+		if b, ok := query.CompileBox(&lp.arg); ok {
+			lp.box = segment.XYBox{
+				XLo: b.XLo, XHi: b.XHi, YLo: b.YLo, YHi: b.YHi,
+				XLoInc: b.XLoInc, XHiInc: b.XHiInc, YLoInc: b.YLoInc, YHiInc: b.YHiInc,
+			}
+		} else {
+			lp.never = true
+		}
 	case query.OpWordsAll, query.OpWordsAny:
 		lp.every = l.Op == query.OpWordsAll
 		lp.needsBody = true
@@ -166,7 +177,7 @@ func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 	switch l.Op {
 	case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween, query.OpIn,
 		query.OpContains, query.OpContainsAny, query.OpContainsAll, query.OpStartsWith,
-		query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpEmpty, query.OpNonempty:
+		query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpEmpty, query.OpNonempty, query.OpBox:
 		lp.cacheable = true
 	case query.OpHasAny, query.OpHasAll:
 		lp.cacheable = len(lp.texts) > 1
@@ -399,6 +410,8 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 		return estimate{card: min(c, n), residual: true}
 	case query.OpSimilar:
 		return estimate{card: present(), residual: true}
+	case query.OpBox:
+		return estimate{card: s.boxEstimate(lp, present)}
 	case query.OpNonempty:
 		return estimate{card: present()}
 	case query.OpEmpty:
@@ -406,6 +419,23 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 	default:
 		return estimate{}
 	}
+}
+
+// boxEstimate estimates a box's matches from its field's point index: the points its
+// node boxes put in it, spread over the field's documents as evenly as the field's
+// points are.
+func (s *segExec) boxEstimate(lp *leafPlan, present func() uint64) uint64 {
+	if lp.never {
+		return 0
+	}
+	xy := s.r.XY(lp.field)
+	points := xy.EstimatePoints(lp.box)
+	if points == 0 {
+		return 0
+	}
+	docs := present()
+	share := float64(points) / float64(max(xy.NumPoints(), 1))
+	return max(1, min(docs, uint64(math.Ceil(share*float64(docs)))))
 }
 
 // gramEstimate bounds a needle's matches by its rarest gram (or the field's presence

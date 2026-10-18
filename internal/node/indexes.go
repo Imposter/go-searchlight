@@ -41,6 +41,11 @@ func (n *Single) CreateIndex(ctx context.Context, name string, spec api.IndexSpe
 	if err := spec.Settings.Validate(); err != nil {
 		return nil, err
 	}
+	if n.cl != nil {
+		if err := n.cl.AdmitFields(ctx, m.Fields); err != nil {
+			return nil, err
+		}
+	}
 	mapping, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
@@ -355,6 +360,11 @@ func (n *Single) PatchMapping(ctx context.Context, name string, fields map[strin
 	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
+	}
+	if n.cl != nil {
+		if err := n.cl.AdmitFields(ctx, fields); err != nil {
+			return nil, err
+		}
 	}
 	_, err = n.updateCatalog(ctx, idx, func(st *indexState) (*schema.Mapping, api.IndexSettings, error) {
 		merged, err := st.mapping.Merge(schema.MappingUpdate{Fields: fields})

@@ -400,5 +400,6 @@ func testMapping() *schema.Mapping {
 		"price": schema.Number,
 		"stock": schema.Bool,
 		"seen":  schema.Date,
+		"spot":  schema.PointType(schema.Number, schema.Date),
 	}}
 }

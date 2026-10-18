@@ -201,7 +201,7 @@ func (n *Node) dropLease(l *lease) {
 func (n *Node) heartbeat(ctx context.Context) error {
 	err := n.reg.Heartbeat(ctx, store.Node{
 		ID: n.id, Address: n.cfg.AdvertiseAddress, Version: n.opts.Version, Capacity: n.opts.Capacity,
-		BodyCodecs: store.BodyCodecs,
+		BodyCodecs: store.BodyCodecs, MappingTypes: store.MappingTypes,
 	})
 	n.NoteDB(err)
 	return err
@@ -531,8 +531,9 @@ func (n *Node) refreshView(ctx context.Context) error {
 		return err
 	}
 	v := &view{at: n.clock.Now(), readBegan: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
-	for _, nd := range nodes {
-		v.nodes[nd.ID] = nd
+	for i := range nodes {
+		nd := &nodes[i]
+		v.nodes[nd.ID] = *nd
 		if nd.HeartbeatAge < n.opts.DeadAfter {
 			v.live[nd.ID] = true
 		}

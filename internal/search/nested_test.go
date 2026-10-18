@@ -16,6 +16,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 var variantFields = []string{"_v._key", "_v.size", "_v.color", "_v.price", "_v.stock", "_v.tags", "_v.at"}
@@ -684,7 +685,7 @@ func TestNestedPhraseReadsEachBodyOnce(t *testing.T) {
 	} {
 		start := time.Now()
 		got, err := c.search(r)
-		if took := time.Since(start); err != nil || len(got.Hits) != 1 || got.Hits[0].ID != "big" || took > time.Second {
+		if took := time.Since(start); err != nil || len(got.Hits) != 1 || got.Hits[0].ID != "big" || took > time.Second*testtier.RaceSlowdown {
 			t.Fatalf("%v hits in %v, %v; want big alone, in well under a second", got, took, err)
 		}
 	}

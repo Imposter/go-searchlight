@@ -41,7 +41,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 ### Non-goals (v1)
 
 - BM25 relevance scoring and full-text ranking. Matching is boolean, sorting is by field. This is on the v2 roadmap.
-- Nested documents and parent/child joins.
+- Parent/child joins, and nested documents deeper than one level (nested fields, one level, came in 1.4).
 - Interfaces beyond HTTP/JSON: NATS, a SQL dialect, pgwire.
 - Stateful alerting. Matching is stateless; clients keep their own match state.
 - History and time-series conditions (scrape-bot keeps them).

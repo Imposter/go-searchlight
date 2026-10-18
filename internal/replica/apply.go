@@ -506,7 +506,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 					if err := applyRunTo(i); err != nil {
 						return err
 					}
-					rebuild, err := t.remapReanalyzes(ctx, sh, m, fields)
+					rebuild, err := t.remapReanalyzes(ctx, sh, m, it.mapping, fields)
 					if err != nil {
 						return err
 					}
@@ -542,8 +542,9 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 // field changes nothing for it, and the copy adopts the mapping in place. In a segment
 // that does not mark, any holder counts. It is a bitmap check, after a refresh puts the
 // buffer in segments. A sub-field of a field old maps as nested is held by the
-// documents whose objects hold it.
-func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old *schema.Mapping, fields []string) (bool, error) {
+// documents whose objects hold it. A field newer maps as nested counts any holder: an
+// object ({}), which inference does not type, is a nested field's member.
+func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old, newer *schema.Mapping, fields []string) (bool, error) {
 	if err := sh.Refresh(ctx); err != nil {
 		return false, err
 	}
@@ -563,7 +564,8 @@ func (t *Tailer) remapReanalyzes(ctx context.Context, sh *shard.Shard, old *sche
 				r = nv.Objects()
 			}
 			p := r.Present(f)
-			if _, mapped := old.Type(f); !mapped && sv.MarksUntyped && f != schema.IDField {
+			now, _ := newer.Type(f)
+			if _, mapped := old.Type(f); !mapped && sv.MarksUntyped && f != schema.IDField && !now.IsNested() {
 				p = r.Untyped(f)
 			}
 			if nv != nil {

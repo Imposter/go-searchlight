@@ -4,7 +4,9 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-17
+
+Point fields and box queries, and reads that retry a serving copy their view had not listed yet.
 
 ### Added
 
@@ -51,6 +53,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   reads' turn now gives up at the request's deadline too. Date math
   stays resolved once and `wait_for_seq` holds. `searchlight_cluster_read_rereads_total`
   counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
+- **A rejected negated pattern no longer changes how later patterns fold.** Compiling a
+  `terms` include or exclude pattern with a negated class (`[^\t]`) appended to the
+  process-wide table of case-folded code points, so a later `[A-C]` stopped matching
+  `a` until the process restarted, and concurrent searches raced on the table.
 - **A Windows node no longer needs `GODEBUG=asyncpreemptoff=1` set.** The Go runtime can
   corrupt a thread's registers when it preempts that thread while Windows is handling an
   exception on it ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed
@@ -366,6 +372,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.3.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.2.0
 [1.1.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.0.0

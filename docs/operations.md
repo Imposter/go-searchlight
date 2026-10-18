@@ -68,6 +68,15 @@ to open "searchlight". Clear the quarantine flag:
 xattr -d com.apple.quarantine searchlight
 ```
 
+**Windows.** Run the node with `GODEBUG=asyncpreemptoff=1` in its environment. The Go
+runtime can corrupt a thread's registers when it preempts that thread while Windows is
+handling an exception on it, such as a page fault in a mapped segment
+([golang/go#79249](https://github.com/golang/go/issues/79249)). The node then crashes
+with an access violation at a small address in code that is otherwise correct. The fix
+is in Go 1.28, and no release carries it yet. The setting costs nothing beyond a
+goroutine in a long, call-free loop sometimes waiting for its next function call to
+yield. Drop it once a release is built with the fixed toolchain.
+
 or, after macOS refuses to run it once, choose **Open Anyway** in System Settings ›
 Privacy & Security (on macOS 14 and earlier, Finder's right-click **Open** also works);
 macOS remembers the choice.

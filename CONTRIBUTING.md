@@ -19,6 +19,13 @@ built, run and restarted in `TestSmokeBinary`; every benchmark workload against 
 in `TestEndToEndBinary`) and the heavy tier of `store`, `shard` and `segment`,
 whose WAL checkpoints, merges, renames and large files behave differently on NTFS.
 
+On Windows the Go runtime can corrupt a thread's registers when it preempts it during
+exception handling ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed in
+Go 1.28), so Windows binaries, test binaries included, are linked with async preemption
+off: the make targets pass the flags of [tools/ldflags.sh](tools/ldflags.sh), and CI's
+Windows job runs `go test -ldflags "$(sh tools/ldflags.sh -godebug)"`. A bare `go test` on
+Windows runs with preemption on; pass those flags, or set `GODEBUG=asyncpreemptoff=1`.
+
 The T7 harnesses (`TestT7RefreshPhases`, `TestT7Diag`) are diagnostics, not checks: they run
 only with `SEARCHLIGHT_T7DIAG=1` and outside `-short`.
 

@@ -28,6 +28,9 @@
 //
 // "searchlight version" (or "searchlight --version") prints the version the binary was
 // built as, with its Go version and platform, and exits 0.
+//
+// On Windows it runs with async preemption off (GODEBUG=asyncpreemptoff=1) unless GODEBUG
+// sets asyncpreemptoff, working around golang/go#79249 (preempt_windows.go).
 package main
 
 import (
@@ -71,6 +74,15 @@ const (
 )
 
 func main() {
+	ensureAsyncPreemptOff()
+	if os.Getenv(envTestPreemptProbe) != "" {
+		off := 0
+		if asyncPreemptionOff() {
+			off = 1
+		}
+		fmt.Printf("asyncpreemptoff=%d\n", off)
+		return
+	}
 	version = moduleVersion(version, debug.ReadBuildInfo)
 	if len(os.Args) > 1 {
 		switch os.Args[1] {

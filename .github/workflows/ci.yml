@@ -91,16 +91,11 @@ jobs:
   windows:
     name: build, test -short, smoke and NTFS heavy (Windows, SQLite)
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     env:
-      # golang/go#79249: on Windows, the runtime can inject an async preemption into a
-      # thread that is inside exception handling (a page fault, or one of the nil
-      # dereferences the tests recover from), and the thread resumes with corrupt
-      # registers: an access violation at a small address in code with no unsafe in it
-      # (sb-0y2e.21, TestWordsCacheKeysKeepPhrases faulting on mapaccess's result).
-      # Fixed by golang/go@0042b27 for Go 1.28, in no release yet. Lift this once the
-      # toolchain in go.mod carries it.
-      GODEBUG: asyncpreemptoff=1
-      # A fault that is not that one dumps every goroutine, the runtime's frames among them.
+      # A fault dumps every goroutine, the runtime's frames among them.
       GOTRACEBACK: system
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -109,17 +104,30 @@ jobs:
           go-version-file: go.mod
       - name: build
         run: go build ./...
+      # golang/go#79249: tools/ldflags.sh links asyncpreemptoff=1 into the test binaries'
+      # runtime defaults, as it does into the release binary and the binaries the smoke
+      # tests build (slproc.Build). GODEBUG is not set here.
       - name: test
         # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
-        run: go test -short ./...
+        run: |
+          ldflags=$(sh tools/ldflags.sh -godebug)
+          go test -ldflags "$ldflags" -short ./...
       - name: smoke
         # From the heavy tier: the binary built, run, interrupted and restarted
-        # (TestSmokeBinary), and every benchmark workload driven against the binary run
-        # as its own process (TestEndToEndBinary).
-        run: go test -run '^(TestSmokeBinary|TestEndToEndBinary)$' ./cmd/searchlight ./bench/cmd/slbench
+        # (TestSmokeBinary), every benchmark workload driven against the binary run as its
+        # own process (TestEndToEndBinary), the binary built as the release builds it and
+        # as "go install" does, each running with async preemption off
+        # (TestWindowsBinaryAsyncPreemptOff), and the latter, which starts itself again,
+        # stopped and killed with and without a console (TestWindowsRerun).
+        run: |
+          ldflags=$(sh tools/ldflags.sh -godebug)
+          go test -ldflags "$ldflags" -run '^(TestSmokeBinary|TestEndToEndBinary|TestWindowsBinaryAsyncPreemptOff|TestWindowsRerun)$' \
+            ./cmd/searchlight ./bench/cmd/slbench
       - name: heavy tier of the NTFS-sensitive packages
         # WAL checkpointing, merge-and-rename and large-file I/O on a real NTFS volume.
-        run: go test -timeout 20m ./internal/store/... ./internal/shard/... ./internal/segment/...
+        run: |
+          ldflags=$(sh tools/ldflags.sh -godebug)
+          go test -ldflags "$ldflags" -timeout 20m ./internal/store/... ./internal/shard/... ./internal/segment/...
 
   docker:
     name: image, compose and Kubernetes manifests

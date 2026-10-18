@@ -9,12 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/slproc"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
@@ -34,18 +34,13 @@ func TestSmokeBinary(t *testing.T) {
 	if ok, why := canInterrupt(); !ok {
 		t.Skip(why)
 	}
-	goTool, err := exec.LookPath("go")
-	if err != nil {
+	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("no go tool on PATH to build the binary with")
 	}
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "searchlight")
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
-	}
-	build := exec.CommandContext(t.Context(), goTool, "build", "-trimpath", "-ldflags", "-X main.version=smoke", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
+	bin, err := slproc.Build(t.Context(), dir, "smoke")
+	if err != nil {
+		t.Fatal(err)
 	}
 	for _, arg := range []string{"version", "--version"} {
 		out, err := exec.CommandContext(t.Context(), bin, arg).Output()
@@ -186,11 +181,18 @@ type binaryNode struct {
 
 func startBinary(t *testing.T, bin string, args []string) *binaryNode {
 	t.Helper()
+	return startBinaryWith(t, bin, args, prepareInterrupt)
+}
+
+// startBinaryWith is startBinary with prepare, instead of prepareInterrupt, setting up
+// the process before it starts.
+func startBinaryWith(t *testing.T, bin string, args []string, prepare func(*exec.Cmd)) *binaryNode {
+	t.Helper()
 	logs := newLogWatch()
 	cmd := exec.Command(bin, args...)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "SEARCHLIGHT_") })
 	cmd.Stderr = logs
-	prepareInterrupt(cmd)
+	prepare(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

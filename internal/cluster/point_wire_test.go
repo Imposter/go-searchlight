@@ -66,8 +66,8 @@ func TestWireBox(t *testing.T) {
 			t.Errorf("%s: the query changed on the wire", name)
 		}
 	}
-	if levelNeeds(levelBox) == levelNeeds(levelMetrics) || searchLevel != levelBox {
-		t.Error("level 5 is not the newest search level, or its errors name level 4's needs")
+	if levelNeeds(levelBox) == levelNeeds(levelMetrics) || searchLevel < levelBox {
+		t.Error("level 5 is past the search level, or its errors name level 4's needs")
 	}
 	for mapping, want := range map[string]int{
 		`{"fields": {"p": {"type": "point", "x": "date", "y": "number"}, "d": "date"}}`: percolatePoints,

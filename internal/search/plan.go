@@ -60,12 +60,22 @@ const (
 	nAny
 	nNot
 	nLeaf
+	nNested
 )
 
 type pnode struct {
 	kind     nodeKind
 	children []*pnode
 	leaf     *leafPlan
+	nested   *nestedPlan
+}
+
+// nestedPlan is a nested node, compiled: its inner query runs over the path's
+// objects as a query runs over documents ([segExec.inner]), and an object's match is
+// its document's.
+type nestedPlan struct {
+	path  string
+	inner *pnode
 }
 
 // leafPlan is one condition, compiled.
@@ -128,6 +138,11 @@ func compileNode(n query.Node, req uint64) *pnode {
 			return &pnode{kind: nFalse}
 		}
 		return &pnode{kind: nLeaf, leaf: compileLeaf(x, req)}
+	case *query.Nested:
+		if x == nil {
+			return &pnode{kind: nFalse}
+		}
+		return &pnode{kind: nNested, nested: &nestedPlan{path: x.Path, inner: compileNode(x.Query, req)}}
 	default:
 		return &pnode{kind: nFalse}
 	}
@@ -299,6 +314,13 @@ func (s *segExec) estimate(n *pnode) estimate {
 			out.residual = out.residual || e.residual
 		}
 		return out
+	case nNested:
+		in := s.inner(n.nested.path)
+		if in == nil {
+			return estimate{}
+		}
+		e := in.estimate(n.nested.inner)
+		return estimate{card: min(e.card, uint64(s.n)), residual: e.residual}
 	default:
 		return s.estimateLeaf(n.leaf)
 	}
@@ -552,6 +574,8 @@ func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 		}
 		maybe.AndNot(sure)
 		return approx{sure: sure, maybe: maybe}
+	case nNested:
+		return s.approximateNested(n.nested, scope)
 	default:
 		return s.approximateLeaf(n.leaf, scope)
 	}
@@ -652,6 +676,9 @@ func (s *segExec) resolve(n *pnode, d *roaring.Bitmap) *roaring.Bitmap {
 			m.AndNot(got)
 		}
 		return sure
+	case nNested:
+		sure.Or(s.resolveNested(n.nested, m))
+		return sure
 	default:
 		return sure
 	}
@@ -690,6 +717,8 @@ func (s *segExec) check(n *pnode, d uint32) bool {
 			}
 		}
 		return false
+	case nNested:
+		return s.checkNested(n.nested, d)
 	default:
 		return false
 	}

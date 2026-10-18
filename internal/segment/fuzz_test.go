@@ -210,7 +210,7 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, markedDocs(tb, 40)),
 		buildFile(tb, genCorpus(40)),
 		buildFile(tb, xyDocs(tb, rand.New(rand.NewPCG(9, 9)), 150, 8)), // a point tree of a few leaves
-		buildFile(tb, nestedDocs(tb, rand.New(rand.NewPCG(9, 9)), 60)),  // a nested field's objects
+		buildFile(tb, nestedDocs(tb, rand.New(rand.NewPCG(9, 9)), 60)), // a nested field's objects
 	}
 	seeds = append(seeds, buildWithStoredDict(tb, genCorpus(40)))
 	for _, craft := range craftedCases() {

@@ -81,13 +81,20 @@ func (s *segExec) verifyBodies(lp *leafPlan, cand, out *roaring.Bitmap) {
 	}
 }
 
-// bodyMatches checks a words condition against document ord's stored body.
+// bodyMatches checks a words condition against document ord's stored body, or, for
+// an object, against its member of its document's body.
 func (s *segExec) bodyMatches(lp *leafPlan, ord uint32) (bool, error) {
-	body, err := s.r.Stored(ord)
-	if err != nil {
-		return false, err
+	var v any
+	var present bool
+	var err error
+	if s.parent != nil {
+		v, present, err = s.objectValue(lp.field, ord)
+	} else {
+		var body []byte
+		if body, err = s.r.Stored(ord); err == nil {
+			v, present, err = schema.FieldValue(body, lp.field)
+		}
 	}
-	v, present, err := schema.FieldValue(body, lp.field)
 	if err != nil {
 		return false, err
 	}

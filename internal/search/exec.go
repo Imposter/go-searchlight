@@ -37,6 +37,9 @@ type Hit struct {
 	Body json.RawMessage `json:"body,omitempty"`
 	// Ref locates the hit in the generation that found it, for [FetchShard].
 	Ref *HitRef `json:"ref,omitempty"`
+	// InnerHits are the hit's inner hits, by key ([query.InnerHits.Key]): set by
+	// [FillInnerHits] once the hit's body is fetched, for each nested node that asks.
+	InnerHits map[string]*InnerHits `json:"inner_hits,omitempty"`
 }
 
 // HitRef is where a hit lives: a segment of the generation that found it, and the
@@ -185,7 +188,16 @@ type segExec struct {
 	// collecting is how many documents the aggregations being made collect, which
 	// chooses how a terms filter is decided (lazyTerms).
 	collecting uint64
-	err        error
+	// inners are the executions over the segment's nested fields' objects, by path,
+	// made on first use (inner); nil for a field the segment holds no member of.
+	inners map[string]*segExec
+	// parent, in an execution over a nested field's objects, is its segment's: nv and
+	// path are that field's, r its object segment, and allDocs the members that are
+	// objects.
+	parent *segExec
+	nv     *segment.Nested
+	path   string
+	err    error
 }
 
 // lazyState is a segment's lazy verification: the root's maybe documents, those
@@ -347,7 +359,7 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 	default:
 		s.lazy = &lazyState{maybe: a.maybe, checked: roaring.New()}
 		p.confirmed.Add(card(a.sure))
-		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size)
+		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		rest := roaring.AndNot(a.maybe, s.lazy.checked)
 		var tried, matched int64
 		for !rest.IsEmpty() && p.confirmed.Load() < p.need && !s.checkCtx() {
@@ -376,7 +388,7 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 		}
 		out.hits = card(matched)
 		p.confirmed.Add(out.hits)
-		out.top = s.topK(matched, p.size)
+		out.top = s.topK(matched, p.size) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		if s.err == nil {
 			out.aggs = s.aggregate(hits, live) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		}

@@ -48,6 +48,9 @@ type scratch struct {
 	key      []byte
 	lo, hi   uint32
 	now      int64 // the percolation's now, in Unix ms: what date math resolves at
+	// fields are the segment's field table, which vals follows: a nested program reads
+	// its sub-fields' names there.
+	fields []fieldInfo
 }
 
 const (
@@ -206,6 +209,7 @@ func (s *Segment) collect(d *schema.Doc, sc *scratch) { s.collectIn(d, sc, 0, s.
 // windows do not.
 func (s *Segment) collectIn(d *schema.Doc, sc *scratch, lo, hi uint32) {
 	sc.lo, sc.hi = lo, hi
+	sc.fields = s.fields
 	for fi := range s.fields {
 		sc.vals[fi] = d.Fields[s.fields[fi].name]
 	}

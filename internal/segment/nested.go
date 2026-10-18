@@ -56,8 +56,8 @@ type nestedPart struct {
 func nestedStarts(docs []schema.Doc) ([]nestedPart, error) {
 	paths := map[string]bool{}
 	for d := range docs {
-		for name, v := range docs[d].Fields {
-			if len(v.Objects) > 0 {
+		for name := range docs[d].Fields {
+			if len(docs[d].Fields[name].Objects) > 0 {
 				paths[name] = true
 			}
 		}
@@ -67,8 +67,8 @@ func nestedStarts(docs []schema.Doc) ([]nestedPart, error) {
 		starts := make([]uint32, len(docs)+1)
 		var next uint64
 		for d := range docs {
-			starts[d] = uint32(next) //nolint:gosec // checked below, before the next round
-			next += uint64(len(docs[d].Fields[path].Objects))
+			starts[d] = uint32(next)
+			next += uint64(len(docs[d].Fields[path].Objects)) //nolint:gosec // a length
 			if next > math.MaxUint32 {
 				return nil, fmt.Errorf("segment: nested field %q holds over %d objects", path, uint32(math.MaxUint32))
 			}
@@ -148,7 +148,7 @@ func mergeNested(inputs []*Reader, remaps [][]int32, total uint64, threads int, 
 			for old, newOrd := range remaps[i] {
 				var lo, hi uint32
 				if nv != nil {
-					lo, hi = nv.Range(uint32(old)) //nolint:gosec // remap has one entry per document ordinal
+					lo, hi = nv.Range(uint32(old))
 				}
 				if newOrd < 0 {
 					for o := lo; o < hi; o++ {
@@ -159,9 +159,9 @@ func mergeNested(inputs []*Reader, remaps [][]int32, total uint64, threads int, 
 				if next+uint64(hi-lo) > math.MaxInt32 {
 					return nil, fmt.Errorf("segment: merge produces over %d objects of nested field %q", math.MaxInt32, path)
 				}
-				starts[newOrd] = uint32(next) //nolint:gosec // below MaxInt32, checked above
+				starts[newOrd] = uint32(next)
 				for o := lo; o < hi; o++ {
-					objRemap[o] = int32(next) //nolint:gosec // below MaxInt32, checked above
+					objRemap[o] = int32(next)
 					next++
 				}
 			}
@@ -173,7 +173,7 @@ func mergeNested(inputs []*Reader, remaps [][]int32, total uint64, threads int, 
 		if next == 0 {
 			continue
 		}
-		starts[total] = uint32(next) //nolint:gosec // below MaxInt32, checked above
+		starts[total] = uint32(next)
 		groups := splitReaderRanges(len(readers), threads)
 		parts := make([]map[string]*fieldBuilder, len(groups))
 		errs := make([]error, len(groups))

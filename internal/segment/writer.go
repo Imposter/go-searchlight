@@ -199,11 +199,11 @@ func buildPartsParallel(docs []schema.Doc, ranges []docRange, nested []nestedPar
 func buildPart(docs []schema.Doc, rg docRange, part int, nested []nestedPart) map[string]*fieldBuilder {
 	builders := make(map[string]*fieldBuilder)
 	for ord := rg.start; ord < rg.end; ord++ {
-		for name, v := range docs[ord].Fields {
-			if !v.Present {
-				continue
+		fields := docs[ord].Fields
+		for name := range fields {
+			if v := fields[name]; v.Present {
+				addValue(builderFor(builders, name), ord, v)
 			}
-			addValue(builderFor(builders, name), ord, v)
 		}
 	}
 	for _, b := range builders {
@@ -220,10 +220,10 @@ func buildPart(docs []schema.Doc, rg docRange, part int, nested []nestedPart) ma
 				if !o.IsObject() {
 					continue
 				}
-				obj := base + uint32(k) //nolint:gosec // k < MaxObjects
+				obj := base + uint32(k)
 				addValue(builderFor(objects, np.path), obj, schema.Value{Present: true})
-				for sub, sv := range o.Fields {
-					if sv.Present {
+				for sub := range o.Fields {
+					if sv := o.Fields[sub]; sv.Present {
 						addValue(builderFor(objects, sub), obj, sv)
 					}
 				}

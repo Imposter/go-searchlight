@@ -5,7 +5,6 @@ package schema
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -461,7 +460,7 @@ func ParseFields(raw map[string]json.RawMessage) (map[string]FieldType, error) {
 		if !isNestedObject(data) {
 			var t FieldType
 			if err := json.Unmarshal(data, &t); err != nil {
-				return nil, fmt.Errorf("field %q: %w", name, err)
+				return nil, &ValidationError{Field: name, Message: err.Error()}
 			}
 			out[name] = t
 			continue
@@ -542,7 +541,7 @@ func checkFieldName(name string) error {
 }
 
 type mappingJSON struct {
-	Dynamic *DynamicMode    `json:"dynamic,omitempty"`
+	Dynamic *DynamicMode   `json:"dynamic,omitempty"`
 	Fields  map[string]any `json:"fields"`
 }
 
@@ -590,11 +589,7 @@ func (m *Mapping) UnmarshalJSON(data []byte) error {
 	}
 	fields, err := ParseFields(raw.Fields)
 	if err != nil {
-		var ve *ValidationError
-		if errors.As(err, &ve) {
-			return err
-		}
-		return fmt.Errorf("mapping: %w", err)
+		return err
 	}
 	parsed := Mapping{Fields: fields}
 	if raw.Dynamic != nil {

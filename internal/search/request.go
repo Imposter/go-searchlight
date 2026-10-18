@@ -181,6 +181,10 @@ type Request struct {
 	// SearchAfter) are cached in any case; [ResolveQueries] sets it for date math
 	// that reads now unrounded.
 	NoRequestCache bool
+	// Nested is set by [ValidateQueries] when the request reads a nested field's
+	// objects: a nested node in a query, or an aggregation or sort on a sub-field. A
+	// peer answers such a request only from the release that reads them.
+	Nested bool `json:"-"`
 
 	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
 	// ("" reads as aggs).
@@ -195,10 +199,24 @@ type Request struct {
 var requestSerials atomic.Uint64
 
 // SortField is one sort key: a field (or IDField), ascending unless Desc.
+//
+// A nested field's sub-field sorts each document by the least (Mode SortModeMin) or
+// greatest (SortModeMax) value among its objects, of those Where (an inner query of
+// the field, [query.ValidateInner]) matches when set: Mode defaults to min ascending,
+// max descending, as Elasticsearch's. A document with no such value sorts after every
+// one with one.
 type SortField struct {
 	Field string
 	Desc  bool
+	Mode  string     `json:",omitempty"`
+	Where query.Node `json:"-"`
 }
+
+// The modes of a sort on a sub-field (SortField.Mode).
+const (
+	SortModeMin = "min"
+	SortModeMax = "max"
+)
 
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
 // date_histogram) may hold metric sub-aggregations (stats, cardinality, min, max) in
@@ -211,6 +229,12 @@ type SortField struct {
 // whitespace folded). That includes the _id field, a normalized keyword for queries
 // and aggregations alike (the parity rules), so terms and cardinality over _id count
 // ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
+//
+// A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max and
+// cardinality alone, at the top level or under filter, filters and global, with no
+// sub-aggregations: over the objects of the hits that Where chooses. terms counts
+// each document once per value, however many of its objects hold it; the metrics
+// read every chosen object's value.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string
@@ -260,6 +284,12 @@ type Agg struct {
 	// counting once it has seen Threshold values, and so do the shard's others. It is
 	// not Elasticsearch's precision_threshold, and takes no Precision.
 	Threshold int `json:",omitempty"`
+
+	// Where, on an aggregation of a nested field's sub-field (terms, stats, min, max
+	// or cardinality), chooses the objects it collects: an inner query of the field
+	// ([query.ValidateInner]); every object of the hits when nil. Its owner encodes it
+	// on the wire.
+	Where query.Node `json:"-"`
 
 	// Filter is a filter aggregation's query: its one bucket holds the documents both
 	// the search's query and Filter match. Its owner encodes it (as query DSL) on the
@@ -490,26 +520,33 @@ func parseSort(raw json.RawMessage, ps *problems) []SortField {
 		}
 		for field, spec := range obj {
 			var order string
+			sf := SortField{Field: field}
 			if json.Unmarshal(spec, &order) != nil {
 				var o struct {
-					Order string `json:"order"`
+					Order string          `json:"order"`
+					Mode  string          `json:"mode"`
+					Where json.RawMessage `json:"where"`
 				}
 				dec := json.NewDecoder(bytes.NewReader(spec))
 				dec.DisallowUnknownFields()
 				if dec.Decode(&o) != nil {
-					ps.add(loc+"."+field, `a sort order is "asc", "desc" or {"order": ...}`)
+					ps.add(loc+"."+field, `a sort order is "asc", "desc" or {"order": ..., "mode": "min"|"max", "where": query}`)
 					continue
 				}
-				order = o.Order
+				order, sf.Mode = o.Order, o.Mode
+				if o.Where != nil {
+					sf.Where = parseQueryAt(o.Where, loc+"."+field+".where", ps)
+				}
 			}
 			switch order {
 			case "asc", "":
-				out = append(out, SortField{Field: field})
 			case "desc":
-				out = append(out, SortField{Field: field, Desc: true})
+				sf.Desc = true
 			default:
 				ps.add(loc+"."+field, `a sort order is "asc" or "desc"`)
+				continue
 			}
+			out = append(out, sf)
 		}
 	}
 	return out
@@ -686,24 +723,95 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 
 // ValidateQueries reports every problem with r's queries as queries of an index with
 // mapping m, as [query.Validate] finds them: the query's (at query...), post_filter's
-// (at post_filter...), and each filter and filters aggregation's (at
+// (at post_filter...), each filter and filters aggregation's (at
 // aggs.<name>.filter... and aggs.<name>.filters.filters.<key>..., under the
-// aggregation that holds it).
+// aggregation that holds it), which ask for no inner hits, and as
+// [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
+// field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). It
+// sets r.Nested when r reads a nested field's objects.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
 		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
 	}
-	return append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
+	for i, f := range r.Sort {
+		if f.Where == nil {
+			continue
+		}
+		if path, ok := m.NestedPath(f.Field); ok {
+			ps = append(ps, relocate(query.ValidateInner(f.Where, m, path), fmt.Sprintf("sort.%d.%s.where", i, f.Field))...)
+		}
+	}
+	ps = append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
+	r.Nested = readsNested(r, m)
+	return ps
+}
+
+// readsNested reports whether r reads a nested field's objects under m: a nested node
+// in any of its queries, or an aggregation or a sort on a sub-field.
+func readsNested(r *Request, m *schema.Mapping) bool {
+	if hasNestedNode(r.Query) || hasNestedNode(r.PostFilter) {
+		return true
+	}
+	for _, f := range r.Sort {
+		if _, ok := m.NestedPath(f.Field); ok {
+			return true
+		}
+	}
+	var aggs func(map[string]Agg) bool
+	aggs = func(as map[string]Agg) bool {
+		for name := range as {
+			a := as[name]
+			if _, ok := m.NestedPath(a.Field); ok || hasNestedNode(a.Filter) || aggs(a.Aggs) {
+				return true
+			}
+			for _, f := range a.Filters {
+				if hasNestedNode(f) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return aggs(r.Aggs)
+}
+
+// hasNestedNode reports whether n holds a nested node.
+func hasNestedNode(n query.Node) bool {
+	found := false
+	if n != nil {
+		query.Walk(n, func(_ string, node query.Node) bool {
+			_, found = node.(*query.Nested)
+			return !found
+		})
+	}
+	return found
+}
+
+// noInnerHits reports each nested node of n, a query with no hits of its own (an
+// aggregation's filter), that asks for inner hits, at its loc under loc.
+func noInnerHits(n query.Node, loc string) []query.Problem {
+	var ps []query.Problem
+	if n == nil {
+		return nil
+	}
+	query.Walk(n, func(at string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: "inner_hits show a hit's objects: an aggregation's filter has no hits"})
+		}
+		return true
+	})
+	return relocate(ps, loc)
 }
 
 // ResolveQueries resolves the date math of r's queries at now, as [query.Resolve]
-// does: the query, post_filter and each filter and filters aggregation's, replaced in
-// r (the aggregation maps are copied, never changed). Problems are located as
-// ValidateQueries locates them. The coordinator calls it once per request, so every
-// shard and peer reads the same instant. Date math that reads now with no rounding
-// (now-7d, not now-7d/d) turns r's request cache off (NoRequestCache): it resolves
-// to another instant every millisecond.
+// does: the query, post_filter, each filter and filters aggregation's and each where of
+// an aggregation or a sort, replaced in r (the aggregation maps and the sort are copied,
+// never changed). Problems are located as ValidateQueries locates them. The
+// coordinator calls it once per request, so every shard and peer reads the same
+// instant. Date math that reads now with no rounding (now-7d, not now-7d/d) turns r's
+// request cache off (NoRequestCache): it resolves to another instant every
+// millisecond.
 func ResolveQueries(r *Request, now time.Time) []query.Problem {
 	if readsNowUnrounded(r) {
 		r.NoRequestCache = true
@@ -714,6 +822,17 @@ func ResolveQueries(r *Request, now time.Time) []query.Problem {
 		var more []query.Problem
 		r.PostFilter, more = query.Resolve(r.PostFilter, now)
 		ps = append(ps, relocate(more, "post_filter")...)
+	}
+	if slices.ContainsFunc(r.Sort, func(f SortField) bool { return f.Where != nil }) {
+		sorts := slices.Clone(r.Sort)
+		for i := range sorts {
+			if sorts[i].Where != nil {
+				var more []query.Problem
+				sorts[i].Where, more = query.Resolve(sorts[i].Where, now)
+				ps = append(ps, relocate(more, fmt.Sprintf("sort.%d.%s.where", i, sorts[i].Field))...)
+			}
+		}
+		r.Sort = sorts
 	}
 	var more []query.Problem
 	r.Aggs, more = resolveAggQueries(r.Aggs, aggsLoc(r.aggsKey), now)
@@ -742,6 +861,10 @@ func resolveAggQueries(aggs map[string]Agg, loc string, now time.Time) (map[stri
 			}
 			a.Filters = filters
 		}
+		if a.Where != nil {
+			a.Where, more = query.Resolve(a.Where, now)
+			ps = append(ps, relocate(more, at+"."+a.Type+".where")...)
+		}
 		a.Aggs, more = resolveAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), now)
 		ps = append(ps, more...)
 		out[name] = a
@@ -757,10 +880,15 @@ func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []qu
 		switch a.Type {
 		case AggFilter:
 			ps = append(ps, relocate(query.Validate(a.Filter, m), at+"."+AggFilter)...)
+			ps = append(ps, noInnerHits(a.Filter, at+"."+AggFilter)...)
 		case AggFilters:
 			for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
 				ps = append(ps, relocate(query.Validate(a.Filters[key], m), at+".filters.filters."+key)...)
+				ps = append(ps, noInnerHits(a.Filters[key], at+".filters.filters."+key)...)
 			}
+		}
+		if path, ok := m.NestedPath(a.Field); ok && a.Where != nil {
+			ps = append(ps, relocate(query.ValidateInner(a.Where, m, path), at+"."+a.Type+".where")...)
 		}
 		ps = append(ps, validateAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), m)...)
 	}
@@ -774,14 +902,14 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode"},
+		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "where"},
 		AggRange:         {"field", "ranges"},
 		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
 		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
-		AggStats:         {"field"},
-		AggMin:           {"field"},
-		AggMax:           {"field"},
-		AggCardinality:   {"field", "precision", "threshold"},
+		AggStats:         {"field", "where"},
+		AggMin:           {"field", "where"},
+		AggMax:           {"field", "where"},
+		AggCardinality:   {"field", "precision", "threshold", "where"},
 	}[a.Type]
 	for _, key := range slices.Sorted(maps.Keys(body)) {
 		val := body[key]
@@ -795,6 +923,8 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			if json.Unmarshal(val, &a.Field) != nil || a.Field == "" {
 				ps.add(at, "field is a field name")
 			}
+		case "where":
+			a.Where = parseQueryAt(val, at, ps)
 		case "size", "shard_size", "precision", "threshold":
 			n, ok := intOf(val)
 			if !ok || n < 1 {

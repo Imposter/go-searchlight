@@ -27,9 +27,10 @@ type total struct {
 
 // hit is a search hit as the API shows it: never the internal segment reference.
 type hit struct {
-	ID   string          `json:"id"`
-	Sort []any           `json:"sort"`
-	Body json.RawMessage `json:"body,omitempty"`
+	ID        string                       `json:"id"`
+	Sort      []any                        `json:"sort"`
+	Body      json.RawMessage              `json:"body,omitempty"`
+	InnerHits map[string]*search.InnerHits `json:"inner_hits,omitempty"`
 }
 
 // search serves POST /indexes/{index}/_search: {query, post_filter, sort, size, from,
@@ -84,7 +85,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
-		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body}
+		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body, InnerHits: h.InnerHits}
 	}
 	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)

@@ -144,13 +144,13 @@ func (s *Server) patchMapping(w http.ResponseWriter, r *http.Request, _ params) 
 	if len(req.Fields) == 0 {
 		return InvalidAt("fields", "fields names at least one field to add")
 	}
-	fields := make(map[string]schema.FieldType, len(req.Fields))
-	for name, raw := range req.Fields {
-		var t schema.FieldType
-		if err := json.Unmarshal(raw, &t); err != nil {
-			return InvalidAt("fields."+name, `a field type is keyword, text, keyword_list, number, bool, date or {"type": "point", "x": "number"|"date", "y": "number"|"date"}: %v`, err)
+	fields, err := schema.ParseFields(req.Fields)
+	if err != nil {
+		var ve *schema.ValidationError
+		if errors.As(err, &ve) {
+			return InvalidAt("fields."+ve.Field, "%s", ve.Message)
 		}
-		fields[name] = t
+		return InvalidAt("fields", "%s", err.Error())
 	}
 	info, err := s.c.PatchMapping(r.Context(), r.PathValue("index"), fields)
 	if err != nil {

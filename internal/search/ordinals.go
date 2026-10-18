@@ -84,7 +84,7 @@ type ordRef struct{ seg, ord uint32 }
 func loadOrds(ctx context.Context, g *shard.Generation, p *prepared) {
 	var want func(spec *aggSpec, top bool)
 	want = func(spec *aggSpec, top bool) {
-		if entries, ok := ordKind(spec.ftype); ok && (spec.typ == AggCardinality || (top && spec.typ == AggTerms)) {
+		if entries, ok := ordKind(spec.ftype); ok && spec.nested == "" && (spec.typ == AggCardinality || (top && spec.typ == AggTerms)) {
 			k := ordField{spec.field, entries}
 			if _, seen := p.ords[k]; !seen {
 				if p.ords == nil {

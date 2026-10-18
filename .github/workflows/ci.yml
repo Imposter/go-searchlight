@@ -105,10 +105,8 @@ jobs:
       - name: build
         run: go build ./...
       # golang/go#79249: tools/ldflags.sh links asyncpreemptoff=1 into the test binaries'
-      # runtime defaults, as it does into the release binary. GODEBUG is not set here, so
-      # the binaries the smoke tests build without those flags turn it off themselves
-      # (cmd/searchlight/preempt_windows.go), and TestWindowsBinaryAsyncPreemptOff checks
-      # both ways.
+      # runtime defaults, as it does into the release binary and the binaries the smoke
+      # tests build (slproc.Build). GODEBUG is not set here.
       - name: test
         # -race needs cgo, and Searchlight is pure Go; Linux covers -race.
         run: |
@@ -117,12 +115,13 @@ jobs:
       - name: smoke
         # From the heavy tier: the binary built, run, interrupted and restarted
         # (TestSmokeBinary), every benchmark workload driven against the binary run as its
-        # own process (TestEndToEndBinary), and the binary built as the release builds it
-        # and as "go install" does, each running with async preemption off
-        # (TestWindowsBinaryAsyncPreemptOff).
+        # own process (TestEndToEndBinary), the binary built as the release builds it and
+        # as "go install" does, each running with async preemption off
+        # (TestWindowsBinaryAsyncPreemptOff), and the latter, which starts itself again,
+        # stopped and killed with and without a console (TestWindowsRerun).
         run: |
           ldflags=$(sh tools/ldflags.sh -godebug)
-          go test -ldflags "$ldflags" -run '^(TestSmokeBinary|TestEndToEndBinary|TestWindowsBinaryAsyncPreemptOff)$' \
+          go test -ldflags "$ldflags" -run '^(TestSmokeBinary|TestEndToEndBinary|TestWindowsBinaryAsyncPreemptOff|TestWindowsRerun)$' \
             ./cmd/searchlight ./bench/cmd/slbench
       - name: heavy tier of the NTFS-sensitive packages
         # WAL checkpointing, merge-and-rename and large-file I/O on a real NTFS volume.

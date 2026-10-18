@@ -34,8 +34,9 @@ var asyncPreemptLinked string
 // with the operator's own asyncpreemptoff. Otherwise it runs the binary again, with the
 // same arguments, standard streams and environment plus asyncpreemptoff=1 in GODEBUG,
 // and exits with the child's exit code. Ctrl+C and Ctrl+Break reach the child through
-// the console they share, and this process ignores them; the child is in a job object
-// that ends it if this process is killed. If the child cannot be started, it says so on
+// the console they share, and this process ignores them; with no console, neither has
+// one, and a stop this process is sent goes on to the child (envParentStopEvent). The
+// child is in a job object that ends it if this process is killed. If the child cannot be started, it says so on
 // standard error and returns, and the node runs with async preemption on.
 func ensureAsyncPreemptOff() {
 	godebug := os.Getenv("GODEBUG")
@@ -60,6 +61,22 @@ func godebugSets(godebug, key string) bool {
 	return false
 }
 
+// envParentStopEvent names the event a parent with no console sets to stop the node it
+// started again (rerunWithAsyncPreemptOff); the node treats it as a signal to stop.
+const envParentStopEvent = "SEARCHLIGHT_PARENT_STOP_EVENT"
+
+var (
+	modKernel32               = windows.NewLazySystemDLL("kernel32.dll")
+	procGetConsoleProcessList = modKernel32.NewProc("GetConsoleProcessList")
+)
+
+// hasConsole reports whether this process is attached to a console.
+func hasConsole() bool {
+	var pids [4]uint32
+	n, _, _ := procGetConsoleProcessList.Call(uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids)))
+	return n != 0
+}
+
 func rerunWithAsyncPreemptOff(godebug string) (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -81,6 +98,24 @@ func rerunWithAsyncPreemptOff(godebug string) (int, error) {
 	if os.Stderr != nil {
 		cmd.Stderr = os.Stderr
 	}
+	// The child starts suspended, and runs only once it is in the job that ends it with
+	// this process: killed before then, this process leaves no node running.
+	flags := uint32(windows.CREATE_SUSPENDED)
+	// With a console, the child shares it, and its Ctrl+C, Ctrl+Break and close reach
+	// the child directly. Without one (a detached process, a service host), the child
+	// gets none either, rather than a console window of its own, and this process passes
+	// a stop it is sent on through an event.
+	var stopEvent windows.Handle
+	if !hasConsole() {
+		flags |= windows.DETACHED_PROCESS
+		name := fmt.Sprintf(`Local\searchlight-stop-%d`, os.Getpid())
+		stopEvent, err = windows.CreateEvent(nil, 1, 0, windows.StringToUTF16Ptr(name))
+		if err != nil {
+			return 0, fmt.Errorf("stop event: %w", err)
+		}
+		cmd.Env = append(cmd.Env, envParentStopEvent+"="+name)
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: flags}
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	if err := cmd.Start(); err != nil {
@@ -89,6 +124,19 @@ func rerunWithAsyncPreemptOff(godebug string) (int, error) {
 	}
 	if err := endWithThisProcess(cmd.Process.Pid); err != nil {
 		fmt.Fprintf(os.Stderr, "searchlight: the node may outlive this process if it is killed: %v\n", err)
+	}
+	if err := resumeProcess(uint32(cmd.Process.Pid)); err != nil { //nolint:gosec // a process id
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		signal.Stop(signals)
+		return 0, fmt.Errorf("resume the node: %w", err)
+	}
+	if stopEvent != 0 {
+		go func() {
+			for range signals {
+				_ = windows.SetEvent(stopEvent)
+			}
+		}()
 	}
 	err = cmd.Wait()
 	var exit *exec.ExitError
@@ -128,4 +176,62 @@ func endWithThisProcess(pid int) error {
 		return fmt.Errorf("assign the node to a job object: %w", err)
 	}
 	return nil
+}
+
+// resumeProcess resumes every thread of the suspended process pid: os/exec keeps no
+// handle to the thread CreateProcess suspended, so it is found by its owner.
+func resumeProcess(pid uint32) error {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snap) //nolint:errcheck // a handle only used here
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	resumed := 0
+	for err = windows.Thread32First(snap, &entry); err == nil; err = windows.Thread32Next(snap, &entry) {
+		if entry.OwnerProcessID != pid {
+			continue
+		}
+		t, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, entry.ThreadID)
+		if err != nil {
+			return err
+		}
+		_, err = windows.ResumeThread(t)
+		_ = windows.CloseHandle(t)
+		if err != nil {
+			return err
+		}
+		resumed++
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return err
+	}
+	if resumed == 0 {
+		return fmt.Errorf("no thread of process %d", pid)
+	}
+	return nil
+}
+
+// parentStopped returns a channel closed when the parent that started this node again
+// with async preemption off, having no console to pass signals through, asks it to stop;
+// nil (never ready) when there is no such parent.
+func parentStopped() <-chan struct{} {
+	name := os.Getenv(envParentStopEvent)
+	if name == "" {
+		return nil
+	}
+	_ = os.Unsetenv(envParentStopEvent)
+	event, err := windows.OpenEvent(windows.SYNCHRONIZE, false, windows.StringToUTF16Ptr(name))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "searchlight: open the parent's stop event: %v\n", err)
+		return nil
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer windows.CloseHandle(event) //nolint:errcheck // a handle only used here
+		if ev, err := windows.WaitForSingleObject(event, windows.INFINITE); err == nil && ev == windows.WAIT_OBJECT_0 {
+			close(stopped)
+		}
+	}()
+	return stopped
 }

@@ -327,8 +327,8 @@ jobs:
           # golang/go#79249: the Windows binary runs with async preemption off unless
           # GODEBUG says otherwise (tools/ldflags.sh).
           if [ "$OS" = windows ]; then
-            test "$(env -u GODEBUG SEARCHLIGHT_TEST_PREEMPT_PROBE=1 "$bin")" = asyncpreemptoff=1
-            test "$(GODEBUG=asyncpreemptoff=0 SEARCHLIGHT_TEST_PREEMPT_PROBE=1 "$bin")" = asyncpreemptoff=0
+            test "$(env -u GODEBUG SEARCHLIGHT_DIAG_ASYNC_PREEMPT=1 "$bin")" = asyncpreemptoff=1
+            test "$(GODEBUG=asyncpreemptoff=0 SEARCHLIGHT_DIAG_ASYNC_PREEMPT=1 "$bin")" = asyncpreemptoff=0
           fi
           work=$(mktemp -d)
           echo "WORK=$work" >> "$GITHUB_ENV"

@@ -5,11 +5,13 @@ import (
 	"sync/atomic"
 )
 
-// envTestPreemptProbe, set to anything, makes the binary report whether the Go runtime
-// preempts goroutines asynchronously, as "asyncpreemptoff=1" or "asyncpreemptoff=0", and
-// exit 0. Test-only: CI and the release's smoke test check the Windows binary with it
-// (golang/go#79249, preempt_windows.go).
-const envTestPreemptProbe = "SEARCHLIGHT_TEST_PREEMPT_PROBE"
+// envDiagAsyncPreempt, set to anything, makes the binary a diagnostic instead of a node:
+// it reports whether the Go runtime preempts goroutines asynchronously, as
+// "asyncpreemptoff=1" or "asyncpreemptoff=0", taking a second or so, and exits 0. It
+// reads nothing and changes nothing. CI and the release's smoke test check the Windows
+// binary with it (golang/go#79249, preempt_windows.go), and docs/operations.md gives it
+// to operators.
+const envDiagAsyncPreempt = "SEARCHLIGHT_DIAG_ASYNC_PREEMPT"
 
 // asyncPreemptionOff reports whether async preemption is off, by observing it: a garbage
 // collection stops the world, and a goroutine in a loop with no function calls stops

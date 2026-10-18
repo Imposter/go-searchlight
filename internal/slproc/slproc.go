@@ -33,19 +33,33 @@ import (
 	"time"
 )
 
-// Build compiles cmd/searchlight into dir and returns the binary's path. It runs the go
-// tool on PATH from the current directory, which must be inside this module.
+// Build compiles cmd/searchlight into dir as the release does, with the -ldflags of
+// tools/ldflags.sh for version (on Windows, async preemption off as the runtime's
+// default, so the node runs as one process), and returns the binary's path. It runs the
+// go tool and sh on PATH from the current directory, which must be inside this module.
 func Build(ctx context.Context, dir, version string) (string, error) {
 	goTool, err := exec.LookPath("go")
 	if err != nil {
 		return "", fmt.Errorf("slproc: no go tool on PATH to build searchlight with: %w", err)
 	}
+	gomod, err := exec.CommandContext(ctx, goTool, "env", "GOMOD").Output()
+	if err != nil {
+		return "", fmt.Errorf("slproc: go env GOMOD: %w", err)
+	}
+	root := filepath.Dir(strings.TrimSpace(string(gomod)))
+	script := exec.CommandContext(ctx, "sh", "tools/ldflags.sh", version)
+	script.Dir = root
+	ldflags, err := script.Output()
+	if err != nil {
+		return "", fmt.Errorf("slproc: sh tools/ldflags.sh: %w", err)
+	}
 	bin := filepath.Join(dir, "searchlight")
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
-	cmd := exec.CommandContext(ctx, goTool, "build", "-trimpath", "-ldflags", "-X main.version="+version, "-o", bin,
+	cmd := exec.CommandContext(ctx, goTool, "build", "-trimpath", "-ldflags", strings.TrimSpace(string(ldflags)), "-o", bin,
 		"github.com/Imposter/go-searchlight/cmd/searchlight")
+	cmd.Dir = root
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("slproc: go build: %w\n%s", err, out)
 	}

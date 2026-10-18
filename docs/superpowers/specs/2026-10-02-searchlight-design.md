@@ -104,6 +104,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `bool` | term | `eq`, `ne`, `exists`; terms agg |
 | `date` | Unix milliseconds, same as `number` | comparisons; date histogram, sort |
 | `point` (operator decision, 2026-10-17) | `{"type": "point", "x": "number"\|"date", "y": ...}`: a list of `[x, y]` pairs per document, each axis a number or a date, in a per-segment k-d tree | `box`, `exists`; no aggregation, no sort |
+| `nested` (operator decision, 2026-10-18) | `{"type": "nested", "fields": {"size": "keyword", ...}}`: an array of objects per document (at most 10,000), each object's sub-fields (any type but `point`, named `path.name`) indexed in a per-segment object segment with each document's run of objects | `exists`; `{"nested": {"path", "query", "inner_hits"}}` over its sub-fields; terms, stats, min, max and cardinality on a sub-field (with `where`); sort by a sub-field's min or max |
 
 - **Dynamic mapping** (the default) types a field from its first value. Strict mapping refuses unmapped fields. Mapping changes are additive only.
 - **Normalization is byte-for-byte compatible with scrape-bot:**
@@ -126,7 +127,7 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
 ```
 
 - **Root.** `{"all": []}` matches every document.
-- **Bounds:** at most 4 levels deep (only `all`/`any` count), 50 conditions and 100 nodes. Strings are at most 500 characters with no NUL, and lists at most 200 entries.
+- **Bounds:** at most 4 levels deep (only `all`/`any` and `nested` count), 50 conditions and 100 nodes. Strings are at most 500 characters with no NUL, and lists at most 200 entries.
 - **Operators:**
   - `eq`, `ne`, `in`;
   - `lt`, `lte`, `gt`, `gte`, `between`;
@@ -138,6 +139,7 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
   - `has`, `has_any`, `has_all`;
   - `empty`, `nonempty`;
   - `box` on a `point` field (`{"x": {"gte": a, "lt": b}, "y": {...}}`, any of `gt`, `gte`, `lt`, `lte` per axis, either axis optional): a document with one point inside on both axes. A date axis takes date math as a date field's ranges do, each bound rounding as the op of its key; a box search needs search wire level 5, a percolation of an index with a point field percolate wire level 2.
+- **Nested nodes** (operator decision, 2026-10-18): `{"nested": {"path": "_v", "query": node}}` holds when one object of nested field `_v` satisfies the whole query, whose conditions name `_v`'s sub-fields; a `not` inside applies per object. `inner_hits` returns each hit's matching members. A search reading nested objects needs search wire level 6, a percolation of an index with a nested field percolate wire level 3.
 - **The `_id` pseudo-field** refers to the document id.
 - **Date math** (operator decision, 2026-10-16), Elasticsearch's, on `date` fields:
   - `lt`, `lte`, `gt`, `gte` and each `between` bound take a number or a string: `now` or a date (RFC 3339 or `YYYY-MM-DD`; a date followed by `||` before any math), then `+N`/`-N` steps and `/` rounding in `y M w d h H m s`. Months and years add as java.time does (`2026-01-31||+1M` is 2026-02-28). UTC only: no `time_zone`.
@@ -471,7 +473,8 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | `similar` anchoring | trigram keys (union) when min > 0 |
 | Conjunctive anchors | pairs of two `all` children, at most 16 per group, probed in linear time |
 | History ops | stay in scrape-bot |
-| BM25 / nested documents | v2 |
+| BM25 | v2 |
+| Nested documents | `nested` fields (1.4, operator decision 2026-10-18), one level deep |
 | Go | 1.25 |
 | System of record | SQL for document indexes; no embedded consensus database |
 | T6 disk | A deliberate trade-off: 3-grams on every keyword and text field cost more disk than Elasticsearch's index; the bench reports node-local disk but grades only resident memory |

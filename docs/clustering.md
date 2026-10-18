@@ -364,6 +364,11 @@ each search has a wire level, the level a peer must speak to answer it exactly.
   `post_filter`, or a `filter` or `filters` aggregation) needs level 5, and its
   endpoint, in the same way: a node of level 0 to 4 knows no `box` op and no point
   field.
+- A search that reads a [nested field](api.md#nested-fields)'s objects (a `nested`
+  node anywhere, an aggregation or a sort on a sub-field, or a `where`) needs level 6,
+  and its endpoint, in the same way: a node of level 0 to 5 would refuse the node, or
+  read the sub-field as a field no document holds and answer empty. The coordinator
+  marks a search that reads one as it checks the queries against the mapping.
 - Each reply says the level it was answered at, and the coordinator refuses one below
   the search's; a node refuses (503) a search past its own level. A later wire
   addition raises the level, so it is never silently ignored either.
@@ -383,12 +388,15 @@ each search has a wire level, the level a peer must speak to answer it exactly.
 - A percolation of an index whose mapping has a [point field](api.md#point-fields)
   needs percolate level 2, and its endpoint, in the same way: a node of an earlier
   release reads neither the mapping nor saved `box` conditions.
-- A mapping is decoded by every node, so a point field is not admitted while any node
-  of an earlier release is live: each node heartbeats the mapping field types it reads
-  (`sl_nodes.mapping_types`), and creating an index with a point field, or patching one
-  in, is a 409 naming the nodes that read none, while they heartbeat within the fence or
-  hold a live lease. Once a point field exists, the cluster cannot be downgraded below
-  the release that added them ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
+- A percolation of an index whose mapping has a [nested field](api.md#nested-fields)
+  needs percolate level 3, and its endpoint, in the same way.
+- A mapping is decoded by every node, so a point or nested field is not admitted while
+  any node of an earlier release is live: each node heartbeats the mapping field types
+  it reads (`sl_nodes.mapping_types`: 1 from point fields on, 2 from nested fields on),
+  and creating an index with such a field, or patching one in, is a 409 naming the
+  nodes that read none, while they heartbeat within the fence or hold a live lease.
+  Once one exists, the cluster cannot be downgraded below the release that added its
+  type ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
 - Saving a query with date math is not refused while older nodes serve: no request
   can tell which releases hold a shard's copies. A 1.0.0 node percolating its own
   copies (a request it coordinates, or a copy it rebuilt after a rollback) matches no

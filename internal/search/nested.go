@@ -92,7 +92,10 @@ func (s *segExec) approximateNested(np *nestedPlan, scope *roaring.Bitmap) appro
 	a := in.approximate(np.inner, objScope)
 	s.adopt(in)
 	sure := roaring.And(in.nv.Parents(a.sure), scope)
-	maybe := roaring.And(in.nv.Parents(a.possible()), scope)
+	if a.maybe.IsEmpty() {
+		return approx{sure: sure, maybe: roaring.New()}
+	}
+	maybe := roaring.And(in.nv.Parents(a.maybe), scope)
 	maybe.AndNot(sure)
 	return approx{sure: sure, maybe: maybe}
 }
@@ -148,8 +151,8 @@ func (s *segExec) objectValue(field string, obj uint32) (any, bool, error) {
 	return v, ok, nil
 }
 
-// parentCursor finds the documents of ascending objects, searching only when an object
-// passes the last one's document.
+// parentCursor finds the documents of ascending objects, each sought from the last
+// one's, and only when an object passes the last one's document.
 type parentCursor struct {
 	nv     *segment.Nested
 	doc    uint32
@@ -159,7 +162,7 @@ type parentCursor struct {
 
 func (c *parentCursor) of(obj uint32) uint32 {
 	if !c.looked || obj >= c.hi {
-		c.doc = c.nv.Parent(obj)
+		c.doc = c.nv.ParentFrom(c.doc, obj)
 		_, c.hi = c.nv.Range(c.doc)
 		c.looked = true
 	}
@@ -299,7 +302,7 @@ func boolOrd(b bool) uint32 {
 // greatest value among its objects in q (those the key's where chooses).
 type nestCol struct {
 	nv  *segment.Nested
-	q   *roaring.Bitmap
+	q   []uint64 // the chosen objects, a bitset
 	max bool
 }
 
@@ -315,7 +318,9 @@ func (s *segExec) nestCol(spec sortSpec) (*nestCol, *segExec) {
 	if spec.nested.where != nil {
 		q = in.matches(spec.nested.where, in.allDocs)
 	}
-	return &nestCol{nv: in.nv, q: q, max: spec.nested.max}, in
+	words := make([]uint64, (uint64(in.n)+63)/64)
+	q.WriteDenseTo(words)
+	return &nestCol{nv: in.nv, q: words, max: spec.nested.max}, in
 }
 
 // key is document d's value of c's sort key, as part: a number, or twice a keyword's
@@ -327,7 +332,7 @@ func (n *nestCol) key(c *sortCol, d uint32) part {
 	}
 	lo, hi := n.nv.Range(d)
 	for o := lo; o < hi; o++ {
-		if !n.q.Contains(o) {
+		if n.q[o>>6]&(1<<(o&63)) == 0 {
 			continue
 		}
 		var v float64

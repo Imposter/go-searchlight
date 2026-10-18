@@ -240,19 +240,48 @@ func (n *Nested) Parent(obj uint32) uint32 {
 	return lo
 }
 
-// Parents returns the documents holding an object of objs.
+// Parents returns the documents holding an object of objs. The documents ascend with
+// the objects, so each is sought from the last one found, at steps that double.
 func (n *Nested) Parents(objs *roaring.Bitmap) *roaring.Bitmap {
 	out := roaring.New()
 	it := objs.Iterator()
+	buf := make([]uint32, 0, 256)
+	d := uint32(0)
 	for it.HasNext() {
-		d := n.Parent(it.Next())
-		if d >= n.numDocs {
+		obj := it.Next()
+		if d = n.ParentFrom(d, obj); d >= n.numDocs {
 			break
 		}
-		out.Add(d)
+		if buf = append(buf, d); len(buf) == cap(buf) {
+			out.AddMany(buf)
+			buf = buf[:0]
+		}
 		it.AdvanceIfNeeded(n.start(d + 1))
 	}
+	out.AddMany(buf)
 	return out
+}
+
+// ParentFrom is Parent of obj, sought from document from on, at steps that double:
+// obj must not be before from's objects. Ascending objects find their documents
+// ascending, each from the last.
+func (n *Nested) ParentFrom(from, obj uint32) uint32 {
+	lo, step := from, uint32(1)
+	hi := lo
+	for hi < n.numDocs && n.start(hi+1) <= obj {
+		lo = hi + 1
+		hi = min(n.numDocs, lo+step)
+		step *= 2
+	}
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if n.start(mid+1) <= obj {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
 }
 
 // ObjectsOf returns the objects of docs' documents.

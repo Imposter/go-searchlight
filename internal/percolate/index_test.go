@@ -394,12 +394,19 @@ func TestHashKeyIsHashTerm(t *testing.T) {
 
 func testMapping() *schema.Mapping {
 	return &schema.Mapping{Fields: map[string]schema.FieldType{
-		"brand": schema.Keyword,
-		"title": schema.Text,
-		"tags":  schema.KeywordList,
-		"price": schema.Number,
-		"stock": schema.Bool,
-		"seen":  schema.Date,
-		"spot":  schema.PointType(schema.Number, schema.Date),
+		"brand":   schema.Keyword,
+		"title":   schema.Text,
+		"tags":    schema.KeywordList,
+		"price":   schema.Number,
+		"stock":   schema.Bool,
+		"seen":    schema.Date,
+		"spot":    schema.PointType(schema.Number, schema.Date),
+		"v":       schema.Nested,
+		"v.brand": schema.Keyword,
+		"v.title": schema.Text,
+		"v.tags":  schema.KeywordList,
+		"v.price": schema.Number,
+		"v.stock": schema.Bool,
+		"v.seen":  schema.Date,
 	}}
 }

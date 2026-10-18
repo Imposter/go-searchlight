@@ -239,7 +239,7 @@ paths:
       tags: [indexes]
       operationId: patchMapping
       summary: Add fields to the mapping (additive only).
-      description: A field that exists with another type is a 400, as is passing max_index_fields. The change is logged to every shard; on an index with `dynamic` false, documents that already hold a newly mapped field become searchable on it once their copy is rebuilt under the new mapping (reads of that copy answer 503 meanwhile).
+      description: 'A field that exists with another type is a 400, as is passing max_index_fields. A nested field takes new sub-fields when given again with them, {"_v": {"type": "nested", "fields": {"colour": "keyword"}}}. The change is logged to every shard; on an index with `dynamic` false, documents that already hold a newly mapped field become searchable on it once their copy is rebuilt under the new mapping (reads of that copy answer 503 meanwhile).'
       requestBody:
         required: true
         content:
@@ -251,7 +251,7 @@ paths:
               properties:
                 fields:
                   type: object
-                  additionalProperties: { $ref: "#/components/schemas/FieldType" }
+                  additionalProperties: { $ref: "#/components/schemas/MappingField" }
       responses:
         "200":
           description: The index.
@@ -829,10 +829,10 @@ components:
         loc: { type: string, examples: ["query.all.2.any.0.value"] }
         message: { type: string }
     FieldType:
-      description: 'A field type: its name, or a point field (a list of [x, y] pairs, for box queries) as {"type": "point", "x": "number"|"date", "y": "number"|"date"}.'
+      description: 'A field type: its name, or a point field (a list of [x, y] pairs, for box queries) as {"type": "point", "x": "number"|"date", "y": "number"|"date"}. The field catalogue lists a nested field as "nested", and each of its sub-fields under its full name (path.name).'
       oneOf:
         - type: string
-          enum: [keyword, text, keyword_list, number, bool, date]
+          enum: [keyword, text, keyword_list, number, bool, date, nested]
         - type: object
           additionalProperties: false
           required: [type, x, y]
@@ -840,6 +840,18 @@ components:
             type: { type: string, const: point }
             x: { type: string, enum: [number, date] }
             y: { type: string, enum: [number, date] }
+    MappingField:
+      description: 'A mapping''s field: a field type, or a nested field, an array of objects (one object alone is one; at most 10000 members per document) each matched apart by nested queries, as {"type": "nested", "fields": {"name": type, ...}}, its sub-fields of any type but a point, queried, aggregated and sorted on by their full names (path.name). A nested field''s name holds no dot, and no field of the index takes a name under it. Dynamic typing never makes a field nested.'
+      oneOf:
+        - $ref: "#/components/schemas/FieldType"
+        - type: object
+          additionalProperties: false
+          required: [type, fields]
+          properties:
+            type: { type: string, const: nested }
+            fields:
+              type: object
+              additionalProperties: { $ref: "#/components/schemas/FieldType" }
     Mapping:
       type: object
       additionalProperties: false
@@ -852,7 +864,7 @@ components:
               enum: ["true", "false", strict]
         fields:
           type: object
-          additionalProperties: { $ref: "#/components/schemas/FieldType" }
+          additionalProperties: { $ref: "#/components/schemas/MappingField" }
     RefreshInterval:
       description: A positive duration ("1s", "250ms"), or -1 to refresh only on demand.
       oneOf:
@@ -950,6 +962,29 @@ components:
             not: { $ref: "#/components/schemas/Query" }
         - type: object
           additionalProperties: false
+          required: [nested]
+          description: 'One object of nested field path satisfies the whole query, each of its conditions naming a sub-field of path (path.name) and read on that object alone; a not inside applies per object, and a missing query (or {"all": []}) holds of any object. No condition outside a nested node names a sub-field, and no nested node nests in another. inner_hits, never under a not, gives each hit the members satisfying the query.'
+          properties:
+            nested:
+              type: object
+              additionalProperties: false
+              required: [path]
+              properties:
+                path: { type: string }
+                query: { $ref: "#/components/schemas/Query" }
+                inner_hits:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    name: { type: string, description: "The key of the hits' inner hits: the path by default. Two inner_hits take two keys." }
+                    size: { type: integer, minimum: 0, maximum: 1000, default: 3, description: How many matching members each hit shows. }
+                    fields:
+                      type: array
+                      maxItems: 100
+                      items: { type: string }
+                      description: The sub-fields (path.name) each shown member holds; every one when empty.
+        - type: object
+          additionalProperties: false
           required: [field, op]
           properties:
             field: { type: string }
@@ -970,7 +1005,7 @@ components:
           allOf:
             - $ref: "#/components/schemas/Query"
         sort:
-          description: 'Field names or {"field": "asc"|"desc"}; the _id breaks ties. Each field once, and nothing after _id.'
+          description: 'Field names or {"field": "asc"|"desc"} or {"field": {"order": "asc"|"desc"}}; the _id breaks ties. Each field once, and nothing after _id. A nested field''s sub-field (path.name, a number, date, keyword or text) sorts each hit by the least ("mode": "min", ascending''s default) or greatest ("max", descending''s) value among its objects, of those "where" (a query of the sub-fields) matches when given; a hit with none sorts last.'
           type: array
           maxItems: 16
           items: {}
@@ -994,7 +1029,7 @@ components:
         aggs:
           type: object
           maxProperties: 100
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, min, max ({"value": x}, null with no value), cardinality (precision, or threshold: exact up to it, the threshold past it), with metric sub-aggregations one level deep (terms takes collect_mode, depth_first or breadth_first, the same results either way; and include and exclude: an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are; exclude wins, and both apply before size and shard_size; partitions are refused); and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, min, max ({"value": x}, null with no value), cardinality (precision, or threshold: exact up to it, the threshold past it), with metric sub-aggregations one level deep (a nested field''s sub-field, path.name, is aggregated by terms, stats, min, max and cardinality alone, with no sub-aggregations, at the top level or under filter, filters and global: over the objects of the hits, those its "where" query of the sub-fields matches when given; terms counts each hit once per value however many of its objects hold it) (terms takes collect_mode, depth_first or breadth_first, the same results either way; and include and exclude: an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are; exclude wins, and both apply before size and shard_size; partitions are refused); and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
         aggregations:
           type: object
           maxProperties: 100
@@ -1038,6 +1073,17 @@ components:
               id: { type: string }
               sort: { type: array, items: {} }
               body: { type: object }
+              inner_hits:
+                type: object
+                description: 'Per nested node with inner_hits, by its key: {"total": n, "offsets": [...], "objects": [...]}, the members of its path that satisfy its query (n of them), the first size by their offsets in the array and as objects of the sub-fields asked for, by their own names.'
+                additionalProperties:
+                  type: object
+                  additionalProperties: false
+                  required: [total, offsets, objects]
+                  properties:
+                    total: { type: integer }
+                    offsets: { type: array, items: { type: integer } }
+                    objects: { type: array, items: { type: object } }
         next:
           type: [array, "null"]
           description: The search_after of the next page; null on a short page.

@@ -162,7 +162,7 @@ func (p *parser) nested(m map[string]any, body any) Node {
 		p.problems.add(p.at(), `nested is {"path": field, "query": node, "inner_hits": {...}}`)
 		return nil
 	}
-	p.extra(b, "nested takes path, query and inner_hits", "path", "query", "inner_hits")
+	p.unknown(b, "nested takes path, query and inner_hits", "path", "query", "inner_hits")
 	n := &Nested{Query: &All{}}
 	switch path := b["path"].(type) {
 	case string:
@@ -199,7 +199,7 @@ func (p *parser) innerHits(raw any) *InnerHits {
 		p.problems.add(p.at(), `inner_hits is {"name": text, "size": count, "fields": [sub-field, ...]}`)
 		return nil
 	}
-	p.extra(m, "inner_hits takes name, size and fields", "name", "size", "fields")
+	p.unknown(m, "inner_hits takes name, size and fields", "name", "size", "fields")
 	h := &InnerHits{Size: DefaultInnerHitsSize}
 	if v, ok := m["name"]; ok {
 		name, isText := v.(string)
@@ -272,11 +272,16 @@ func (p *parser) group(m map[string]any, key string) Node {
 	return &Any{Children: children}
 }
 
-// extra reports each key of m but allowed, in order.
+// extra is unknown, for an m holding more keys than allowed.
 func (p *parser) extra(m map[string]any, message string, allowed ...string) {
 	if len(m) <= len(allowed) {
 		return
 	}
+	p.unknown(m, message, allowed...)
+}
+
+// unknown reports each key of m but allowed, in order.
+func (p *parser) unknown(m map[string]any, message string, allowed ...string) {
 	for _, key := range slices.Sorted(maps.Keys(m)) {
 		if !slices.Contains(allowed, key) {
 			p.problems.add(p.at(key), "unknown key: "+message)

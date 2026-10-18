@@ -727,12 +727,14 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 // aggs.<name>.filter... and aggs.<name>.filters.filters.<key>..., under the
 // aggregation that holds it), which ask for no inner hits, and as
 // [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
-// field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). It
-// sets r.Nested when r reads a nested field's objects.
+// field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
+// query and post_filter ask for no inner hits under one key. It sets r.Nested when r
+// reads a nested field's objects.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
 		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
+		ps = append(ps, sharedInnerHits(r.Query, r.PostFilter)...)
 	}
 	for i, f := range r.Sort {
 		if f.Where == nil {
@@ -745,6 +747,26 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps = append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
 	r.Nested = readsNested(r, m)
 	return ps
+}
+
+// sharedInnerHits reports each nested node of post that asks for inner hits under a key
+// one of q's takes already: a hit has one set of inner hits per key.
+func sharedInnerHits(q, post query.Node) []query.Problem {
+	keys := map[string]bool{}
+	query.Walk(q, func(_ string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			keys[x.InnerHits.Key(x.Path)] = true
+		}
+		return true
+	})
+	var ps []query.Problem
+	query.Walk(post, func(at string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil && keys[x.InnerHits.Key(x.Path)] {
+			ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits take the key %q already: name one otherwise (name)", x.InnerHits.Key(x.Path))})
+		}
+		return true
+	})
+	return relocate(ps, "post_filter")
 }
 
 // readsNested reports whether r reads a nested field's objects under m: a nested node

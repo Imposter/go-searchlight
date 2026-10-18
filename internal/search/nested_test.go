@@ -617,3 +617,17 @@ func asRequestError(err error, re **RequestError) bool {
 	*re = e
 	return ok
 }
+
+// The query and the post_filter cannot ask for inner hits under one key.
+func TestNestedInnerHitsKeysAcrossQueries(t *testing.T) {
+	hits := mustParse(t, `{"nested":{"path":"_v","inner_hits":{}}}`)
+	r := &Request{Query: hits, PostFilter: &query.All{Children: []query.Node{hits}}}
+	ps := ValidateQueries(r, testMapping)
+	if len(ps) != 1 || ps[0].Loc != "post_filter.all.0.nested.inner_hits" {
+		t.Fatalf("problems %v", ps)
+	}
+	r.PostFilter = mustParse(t, `{"nested":{"path":"_v","inner_hits":{"name":"other"}}}`)
+	if ps := ValidateQueries(r, testMapping); len(ps) > 0 {
+		t.Fatalf("two keys: %v", ps)
+	}
+}

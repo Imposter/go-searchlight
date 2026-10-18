@@ -71,27 +71,32 @@ const codeStale = "stale_copy"
 // fields (levelBox), which a lower peer would refuse as an unknown op. Level 6 reads
 // nested fields' objects (levelNested): a nested node, an aggregation or sort on a
 // sub-field, which a lower peer would refuse, or answer reading the sub-field as a
-// field of no document. A request says the level it needs (wireRequest.Needs), and
-// goes to that level's endpoint (searchPath), and a reply the level it was answered at
+// field of no document. Level 7 collects sub-aggregations under a terms aggregation
+// on a sub-field (levelNestedSubAggs), which a lower peer would refuse. A request says
+// the level it needs (wireRequest.Needs), and goes to that level's endpoint
+// (searchPath), and a reply the level it was answered at
 // (searchReply.Level): a peer refuses a request past its level, and the coordinator a
 // reply below the request's, so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelNested
+const searchLevel = levelNestedSubAggs
 
 // The search wire levels of the additions a peer must not ignore.
 const (
-	levelFilterAggs  = 1
-	levelTermsFilter = 2
-	levelFrom        = 3
-	levelMetrics     = 4
-	levelBox         = 5
-	levelNested      = 6
+	levelFilterAggs    = 1
+	levelTermsFilter   = 2
+	levelFrom          = 3
+	levelMetrics       = 4
+	levelBox           = 5
+	levelNested        = 6
+	levelNestedSubAggs = 7
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelNestedSubAggs:
+		return "sub-aggregations under a terms aggregation on a nested field's sub-field"
 	case needs >= levelNested:
 		return "a nested field's objects: a nested query, or an aggregation or sort on a sub-field"
 	case needs >= levelBox:
@@ -144,7 +149,9 @@ type wireRequest struct {
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
 	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
 	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
-	// nested field's objects (search.Request.Nested, or a nested node).
+	// nested field's objects (search.Request.Nested, or a nested node), 7 for
+	// sub-aggregations under a terms aggregation on a sub-field
+	// (search.Request.NestedSubAggs).
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -188,6 +195,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		}
 	}
 	switch {
+	case r.NestedSubAggs:
+		w.Needs = levelNestedSubAggs
 	case r.Nested || nestedQueries(r):
 		w.Needs = levelNested
 	case boxQueries(r):

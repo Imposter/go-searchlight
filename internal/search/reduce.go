@@ -367,7 +367,8 @@ func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
 // order, when they fit in what is left; one whose do not is marked Truncated. The
 // aggregations under a filter, filters or global aggregation's buckets are bounded in
 // turn, right after it; its own buckets (one, or at most MaxFilters+1) count but are
-// never cut.
+// never cut. A terms aggregation's terms sub-aggregations (under a terms on a
+// sub-field) are bounded right after its own buckets, bucket by bucket.
 func boundBuckets(specs []*aggSpec, results map[string]*AggResult) {
 	left := MaxBuckets
 	cutBuckets(specs, results, &left)
@@ -398,6 +399,11 @@ func cutBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
 			res.Buckets, res.Truncated = res.Buckets[:*left], true
 		}
 		*left -= len(res.Buckets)
+		if spec.typ == AggTerms {
+			for _, b := range res.Buckets {
+				cutBuckets(spec.subs, b.Aggs, left)
+			}
+		}
 	}
 }
 

@@ -263,7 +263,13 @@ data_dir/
     request cache, totals and sorts stay the documents'.
   - An aggregation on a sub-field collects the objects of the hits (those its `where`
     matches); `terms` counts a document once per value with each value's last
-    counted document, and its partial is keyed by value, never by ordinal. A sort on
+    counted document, and its partial is keyed by value, never by ordinal. Each of its
+    buckets holds its sub-aggregations' collectors, made at the bucket's first object:
+    one on a top-level field built on the parent segment and fed each document once
+    (when the bucket first counts it), one on a sub-field built on the object segment
+    and fed each object (those its own `where` matches, a bitmap computed once per
+    segment). A `terms` there is keyed by value too and never cut by a shard, so the
+    shards' lists merge by key exactly. A sort on
     a sub-field reads, per document, the least or greatest value among its chosen
     objects, from a bitset of them. Inner hits are read at the coordinator from each
     fetched body, by the inner query's compiled matcher on each member.

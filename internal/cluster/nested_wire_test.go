@@ -83,8 +83,8 @@ func TestWireNested(t *testing.T) {
 	if q, ok := nestedNode(t, nestedL).(*query.Nested); !ok || q.InnerHits == nil {
 		t.Fatal("no inner hits")
 	}
-	if searchLevel != levelNested || levelNeeds(levelNested) == levelNeeds(levelBox) {
-		t.Error("level 6 is not the newest search level, or its errors name level 5's needs")
+	if levelNeeds(levelNested) == levelNeeds(levelBox) {
+		t.Error("level 6's errors name level 5's needs")
 	}
 	for mapping, want := range map[string]int{
 		`{"fields": {"_v": {"type": "nested", "fields": {"seen": "date"}}, "p": {"type": "point", "x": "number", "y": "number"}}}`: percolateNested,
@@ -218,6 +218,80 @@ func TestOlderPeerRefusedForNested(t *testing.T) {
 			coord, seq = nestedCluster(t, older, percolatePoints)
 			_, err = percolateNestedDoc(t, coord, seq)
 			unavailable(t, "a percolation of a nested index", err)
+		})
+	}
+}
+
+// nestedSubAggs is a terms aggregation on a sub-field with sub-aggregations of both
+// kinds: the bucket's documents' price, and its objects' prices.
+func nestedSubAggs() map[string]search.Agg {
+	return map[string]search.Agg{"sizes": {Type: search.AggTerms, Field: "_v.size", Aggs: map[string]search.Agg{
+		"lowest": {Type: search.AggMin, Field: "price"},
+		"prices": {Type: search.AggStats, Field: "_v.price"},
+		"by":     {Type: search.AggTerms, Field: "price", Size: 3},
+	}}}
+}
+
+// A request ValidateQueries marked as holding sub-aggregations under a terms on a
+// sub-field needs search wire level 7, the newest, and its sub-aggregations cross the
+// wire; through a peer they answer as on the node itself, and a peer of level 6 is
+// not trusted with them (503 with no other copy).
+func TestWireNestedSubAggs(t *testing.T) {
+	r := &search.Request{Query: &query.All{}, Aggs: nestedSubAggs(), Nested: true, NestedSubAggs: true}
+	wr, err := encodeRequest(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(wr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back wireRequest
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	got, err := back.decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wr.Needs != levelNestedSubAggs || len(got.Aggs["sizes"].Aggs) != 3 {
+		t.Fatalf("needs %d, sub-aggregations %v", wr.Needs, got.Aggs["sizes"].Aggs)
+	}
+	if searchLevel != levelNestedSubAggs || levelNeeds(levelNestedSubAggs) == levelNeeds(levelNested) {
+		t.Error("level 7 is not the newest search level, or its errors name level 6's needs")
+	}
+
+	coord, seq := nestedCluster(t, olderNone, 0)
+	res, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitForSeq: seq})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range res.Aggs["sizes"].Buckets {
+		lowest, prices, by := b.Aggs["lowest"], b.Aggs["prices"], b.Aggs["by"]
+		switch b.Key {
+		case "l":
+			if b.DocCount != 20 || *lowest.Number != 0 || prices.Count != 20 || prices.Sum != 190 || len(by.Buckets) != 3 || by.SumOtherDocCount != 17 {
+				t.Fatalf("L: %d, lowest %v, prices %+v, by %+v", b.DocCount, *lowest.Number, prices, by)
+			}
+		case "m":
+			if b.DocCount != 20 || *lowest.Number != 0 || prices.Count != 20 || prices.Sum != 0 {
+				t.Fatalf("M: %d, lowest %v, prices %+v", b.DocCount, *lowest.Number, prices)
+			}
+		default:
+			t.Fatalf("bucket %v", b.Key)
+		}
+	}
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) {
+			coord, seq := nestedCluster(t, older, levelNested)
+			if _, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"t": {Type: search.AggTerms, Field: "_v.size"}}}, api.ReadOptions{WaitForSeq: seq}); err != nil {
+				t.Fatalf("a level-6 search through a level-6 peer: %v", err)
+			}
+			_, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitForSeq: seq})
+			var ae *api.Error
+			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+				t.Fatalf("nested sub-aggregations through an older peer: %v; want a 503", err)
+			}
 		})
 	}
 }

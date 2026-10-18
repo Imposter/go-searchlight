@@ -252,9 +252,8 @@ runs.
 
 **Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
 `min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at
-the top level or under `filter`, `filters` and `global`, with no sub-aggregations. They
-collect the objects of the hits; `"where"`, a query of the sub-fields, keeps the objects
-it matches:
+the top level or under `filter`, `filters` and `global`. They collect the objects of
+the hits; `"where"`, a query of the sub-fields, keeps the objects it matches:
 
 ```json
 {"aggs": {
@@ -264,9 +263,46 @@ it matches:
 
 `terms` counts each hit once per value, however many of its objects hold it: a
 product with two L variants is one L. `stats`, `min`, `max` and `cardinality` read
-every chosen object's value. Any other aggregation on a sub-field, one under a bucket
-aggregation, a sub-aggregation of one, and a `where` on a field that is no sub-field
-are each a 400 at their `loc`.
+every chosen object's value.
+
+**Sub-aggregations under a `terms` on a sub-field.** Such a `terms` holds `stats`,
+`min`, `max`, `cardinality` and `terms` sub-aggregations (the `terms` holding none of
+its own), each bucket collecting them over:
+
+- **its documents**, for a sub-aggregation on a top-level field: each hit holding a
+  chosen object with the bucket's value, once;
+- **its objects**, for one on a sub-field of the same nested field: the chosen objects
+  (by the outer `where`) holding the bucket's value, narrowed by the sub-aggregation's
+  own `where` when it has one. A `terms` there counts documents, each once per value
+  among those objects.
+
+```json
+{"aggs": {"sizes": {"terms": {"field": "_v.size", "where": {"field": "_v.in_stock", "op": "eq", "value": true}},
+  "aggs": {
+    "sample": {"min": {"field": "item_no"}},
+    "price": {"stats": {"field": "_v.price"}},
+    "colors": {"terms": {"field": "_v.color", "size": 20}}}}}}
+```
+
+```json
+{"sizes": {"buckets": [{"key": "l", "doc_count": 12,
+  "sample": {"value": 1042},
+  "price": {"count": 15, "min": 8999, "max": 15999, "avg": 12100, "sum": 181500},
+  "colors": {"buckets": [{"key": "red", "doc_count": 7, "doc_count_error_upper_bound": 0}], "sum_other_doc_count": 0, "doc_count_error_upper_bound": 0}}]}}
+```
+
+A `terms` sub-aggregation is exact: no shard cuts its list (no `shard_size`, an error
+bound of 0); the response keeps its `size` buckets, as `min_doc_count`, `include` and
+`exclude` choose them, and counts the rest in `sum_other_doc_count`. Its buckets count
+towards the 65,536 of a response, those under the buckets the response holds, right
+after their own aggregation's.
+
+Any other aggregation on a sub-field, a sub-aggregation of a `stats`, `min`, `max` or
+`cardinality` on one, one on a sub-field under any other bucket aggregation or of
+another nested field, any other sub-aggregation type under a `terms` on a sub-field,
+and a `where` on a field that is no sub-field are each a 400 at their `loc`. A search
+holding sub-aggregations under a `terms` on a sub-field reaches only nodes of 1.5 or
+later (search wire level 7), a 503 while only older copies serve a shard.
 
 **Sorts** on a sub-field (a number, date, keyword or text) order the hits by the least
 (`"mode": "min"`, ascending's default) or greatest (`"max"`, descending's) value among

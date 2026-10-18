@@ -185,6 +185,10 @@ type Request struct {
 	// objects: a nested node in a query, or an aggregation or sort on a sub-field. A
 	// peer answers such a request only from the release that reads them.
 	Nested bool `json:"-"`
+	// NestedSubAggs is set by [ValidateQueries] when a terms aggregation on a
+	// sub-field holds sub-aggregations, which a peer answers only from the release
+	// that collects them.
+	NestedSubAggs bool `json:"-"`
 
 	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
 	// ("" reads as aggs).
@@ -231,10 +235,14 @@ const (
 // ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
 //
 // A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max and
-// cardinality alone, at the top level or under filter, filters and global, with no
-// sub-aggregations: over the objects of the hits that Where chooses. terms counts
-// each document once per value, however many of its objects hold it; the metrics
-// read every chosen object's value.
+// cardinality alone, at the top level or under filter, filters and global: over the
+// objects of the hits that Where chooses. terms counts each document once per value,
+// however many of its objects hold it; the metrics read every chosen object's value.
+// A terms on a sub-field holds metric and terms sub-aggregations (those terms holding
+// none): one on a top-level field reads the bucket's documents, each once; one on a
+// sub-field of the same nested field reads the bucket's objects, the chosen ones
+// holding its value that its own Where chooses. A terms sub-aggregation there is
+// exact: no shard cuts it.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string
@@ -730,7 +738,8 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 // field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
 // query and post_filter give one key to one path's nodes alone, and ask for at most
 // MaxInnerHitsObjects inner hits together (InnerHitsObjects). It sets r.Nested when r
-// reads a nested field's objects.
+// reads a nested field's objects, and r.NestedSubAggs when a terms aggregation on a
+// sub-field holds sub-aggregations.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
@@ -750,6 +759,7 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	}
 	ps = append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
 	r.Nested = readsNested(r, m)
+	r.NestedSubAggs = nestedSubAggs(r.Aggs, m)
 	return ps
 }
 
@@ -1108,4 +1118,16 @@ func aggsLoc(key string) string {
 		return "aggs"
 	}
 	return key
+}
+
+// nestedSubAggs reports whether aggs hold, at any level, a terms aggregation on a
+// sub-field of m's with sub-aggregations.
+func nestedSubAggs(aggs map[string]Agg, m *schema.Mapping) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if _, sub := m.NestedPath(a.Field); (sub && a.Type == AggTerms && len(a.Aggs) > 0) || nestedSubAggs(a.Aggs, m) {
+			return true
+		}
+	}
+	return false
 }

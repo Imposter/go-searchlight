@@ -588,7 +588,6 @@ func TestNestedRefusals(t *testing.T) {
 	for name, r := range map[string]*Request{
 		"a histogram on a sub-field":   {Query: &query.All{}, Aggs: map[string]Agg{"h": {Type: AggHistogram, Field: "_v.price", Interval: 1}}},
 		"a sub-field under terms":      {Query: &query.All{}, Aggs: map[string]Agg{"t": {Type: AggTerms, Field: "brand", Aggs: map[string]Agg{"m": {Type: AggMin, Field: "_v.price"}}}}},
-		"sub-aggregations of one":      {Query: &query.All{}, Aggs: map[string]Agg{"t": {Type: AggTerms, Field: "_v.size", Aggs: map[string]Agg{"m": {Type: AggMin, Field: "price"}}}}},
 		"a where on a top-level field": {Query: &query.All{}, Aggs: map[string]Agg{"t": {Type: AggTerms, Field: "brand", Where: &query.All{}}}},
 		"the nested field itself":      {Query: &query.All{}, Aggs: map[string]Agg{"t": {Type: AggTerms, Field: "_v"}}},
 		"a sort on the nested field":   {Query: &query.All{}, Sort: []SortField{{Field: "_v"}}},

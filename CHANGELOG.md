@@ -6,6 +6,16 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-aggregations under a `terms` on a sub-field**
+  ([docs/api.md](docs/api.md#nested-fields)): `stats`, `min`, `max`, `cardinality` and
+  one level of `terms`, per bucket over its documents (a top-level field, each document
+  once) or over its objects (a sub-field of the same nested field, narrowed by the
+  sub-aggregation's own `where`). A `terms` there is exact, never cut per shard; its
+  buckets count towards the response's 65,536. Search wire level 7 keeps them off
+  peers of an earlier release (503 with no other copy).
+
 ### Changed
 
 - **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes

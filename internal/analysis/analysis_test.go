@@ -370,3 +370,14 @@ func TestFoldRune(t *testing.T) {
 		t.Fatalf("FoldChanged(a, z) = %q", got)
 	}
 }
+
+// TestFoldChangedAppendKeepsTable: appending to a FoldChanged result (as a negated
+// pattern class does with its whitespace) leaves the shared table, and so every later
+// FoldChanged, as it was.
+func TestFoldChangedAppendKeepsTable(t *testing.T) {
+	_ = append(FoldChanged(0, ' '), '\t', 0)
+	_ = append(FoldChanged('A', 'B'), 'x')
+	if got := FoldChanged('A', 'D'); string(got) != "ABCD" {
+		t.Fatalf("FoldChanged(A, D) after appends = %q, want \"ABCD\"", got)
+	}
+}

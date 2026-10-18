@@ -131,12 +131,15 @@ func FoldRune(r rune) string {
 }
 
 // FoldChanged returns, ascending, the code points from lo to hi that str.casefold()
-// changes: those whose [FoldRune] is not themselves.
+// changes: those whose [FoldRune] is not themselves. The result shares the
+// process-wide table but has no spare capacity, so a caller's append copies it rather
+// than writing over the table's next entries.
 func FoldChanged(lo, hi rune) []rune {
 	all := foldChanged()
 	i, _ := slices.BinarySearch(all, lo)
 	j, _ := slices.BinarySearch(all, hi+1)
-	return all[i:max(i, j)]
+	j = max(i, j)
+	return all[i:j:j]
 }
 
 // foldChanged is every code point str.casefold() changes, ascending.

@@ -295,6 +295,26 @@ func TestPatternSubset(t *testing.T) {
 	}
 }
 
+// TestPatternNegatedClassKeepsFolding: a refused negated class with whitespace in it
+// (whose fold check appends to the code points FoldChanged returned) leaves the folding
+// of later patterns as it was: [A-C] still takes the a that A folds to.
+func TestPatternNegatedClassKeepsFolding(t *testing.T) {
+	for _, pattern := range []string{"[^\t]", "[^\x00-\t]"} {
+		if _, err := compilePattern(pattern); err == nil {
+			t.Fatalf("%q: compiled, want the negated class refused", pattern)
+		}
+	}
+	re, err := compilePattern("[A-C]x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"ax", "bx", "cx"} {
+		if !re.re.MatchString(s) {
+			t.Errorf("after negated classes, %q does not match %q", "[A-C]x", s)
+		}
+	}
+}
+
 // TestTermsFilterProblems: include and exclude are refused at their own locs, at
 // parse (their shape, a pattern's syntax, the bounds, partitions) and against the
 // mapping (a pattern on a field without text keys, a value its type cannot hold, either

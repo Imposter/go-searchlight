@@ -608,7 +608,10 @@ func writeFieldPresence(w *fileWriter, parts []*fieldBuilder, out *fieldOutput) 
 const (
 	// flagMarksUntyped: the writer marked every untyped value (BuildOptions.MarksUntyped).
 	flagMarksUntyped = 1 << 0
-	flagsKnown       = flagMarksUntyped
+	// flagObjects: an object segment, a nested field's objects' index inside a
+	// segment's NESTED section, with no stored records and no ids (nested.go).
+	flagObjects = 1 << 1
+	flagsKnown  = flagMarksUntyped | flagObjects
 )
 
 // writeMeta writes the META section: numDocs, the segment flags, the stored index's

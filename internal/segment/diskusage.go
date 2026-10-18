@@ -81,6 +81,10 @@ func (r *Reader) DiskUsage() DiskUsage {
 		_, total := r.ids.usage()
 		add("", "ids", total)
 	}
+	for path, n := range r.nested {
+		add(path, "nested starts", uint64(len(n.starts)))
+		u.Parts = append(u.Parts, n.objects.DiskUsage().Parts...)
+	}
 	if s, ok := footer.sections[sectionStored]; ok {
 		dict := uint64(len(r.stored.dict))
 		table := uint64(len(r.stored.firstOrds)+len(r.stored.offs)+len(r.stored.raws)) + storedIndexHeaderLen

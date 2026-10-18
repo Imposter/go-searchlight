@@ -54,8 +54,9 @@ type Reader struct {
 	numDocs   uint32
 	fields    map[string]*fieldInfo
 	stored    storedIndex
-	ids       *termDict // the IDS section; nil for a segment with no documents
-	numTerms  uint64    // every field's terms, all kinds, added up
+	ids       *termDict          // the IDS section; nil for a segment with no documents
+	nested    map[string]*Nested // the NESTED section, by nested field; nil without one
+	numTerms  uint64             // every field's terms, all kinds, added up
 	cache     *storedCache
 	ownsCache bool
 	closed    atomic.Bool
@@ -96,12 +97,20 @@ func openData(path string, data []byte) (*Reader, error) {
 	if err := r.parseMeta(metaBytes, footer); err != nil {
 		return nil, err
 	}
+	if r.flags&flagObjects != 0 {
+		return nil, &CorruptError{Path: path, Section: "meta", Reason: "an object segment, which only a NESTED section holds"}
+	}
 	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
 	}
 	if sec, ok := footer.sections[sectionXY]; ok {
 		if err := r.openXYSection(sec); err != nil {
 			return nil, &CorruptError{Path: path, Section: "xy", Reason: err.Error()}
+		}
+	}
+	if sec, ok := footer.sections[sectionNested]; ok {
+		if err := r.openNestedSection(sec); err != nil {
+			return nil, &CorruptError{Path: path, Section: "nested", Reason: err.Error()}
 		}
 	}
 	cache, err := newStoredCache(&r.stored)
@@ -236,6 +245,9 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	}
 	if d.err != nil {
 		return corrupt()
+	}
+	if r.flags&flagObjects != 0 {
+		return nil
 	}
 	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase, footer.sections[sectionStored].n, r.numDocs, r.major)
 	if err != nil {
@@ -586,6 +598,7 @@ func (r *Reader) Retain() *Reader {
 		fields:  r.fields,
 		stored:  r.stored,
 		ids:     r.ids,
+		nested:  r.nested,
 
 		numTerms: r.numTerms,
 	}

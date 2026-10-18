@@ -1,9 +1,9 @@
 package query
 
 // Walk calls fn for n and every node below it, depth first and left to right, with each
-// node's path: its loc from [RootLoc] (query.all.2.any.0). When fn returns false, Walk
-// does not descend into that node's children, and goes on with its next sibling. Nil
-// nodes are skipped.
+// node's path: its loc from [RootLoc] (query.all.2.any.0, and query.nested.query for a
+// nested node's query). When fn returns false, Walk does not descend into that node's
+// children, and goes on with its next sibling. Nil nodes are skipped.
 func Walk(n Node, fn func(path string, n Node) bool) {
 	walk(n, RootLoc, fn)
 }
@@ -25,6 +25,8 @@ func walk(n Node, path string, fn func(string, Node) bool) {
 		}
 	case *Not:
 		walk(x.Child, join(path, "not"), fn)
+	case *Nested:
+		walk(x.Query, join(path, "nested.query"), fn)
 	}
 }
 
@@ -41,7 +43,16 @@ func isNil(n Node) bool {
 		return x == nil
 	case *Leaf:
 		return x == nil
+	case *Nested:
+		return x == nil
 	default:
 		return false
 	}
+}
+
+// isEveryObject reports whether n is a nested node's query of every object: {"all":
+// []}.
+func isEveryObject(n Node) bool {
+	all, ok := n.(*All)
+	return ok && all != nil && len(all.Children) == 0
 }

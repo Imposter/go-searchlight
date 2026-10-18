@@ -36,7 +36,8 @@ func Compile(n Node) *Compiled {
 // matches nothing but exists:false, empty and ne; a value of the wrong type for its
 // field (Present with no typed part) is invisible to every op that reads a typed part;
 // text ops compare the full normalized text, never grams, so a value too long for grams
-// matches as any other. A nil d is a document with no field. Match allocates nothing.
+// matches as any other; a nested node holds when one object of its field satisfies its
+// whole query. A nil d is a document with no field. Match allocates nothing.
 func (c *Compiled) Match(d *schema.Doc) bool {
 	var fields map[string]schema.Value
 	if d != nil {
@@ -91,14 +92,16 @@ const (
 	kindAny
 	kindNot
 	kindLeaf
+	kindNested // one object of path satisfies children[0]
 )
 
 // cnode is a compiled node.
 type cnode struct {
 	kind     nodeKind
 	cost     int
-	children []cnode // all, any; not's one child
+	children []cnode // all, any; not's and nested's one child
 	leaf     *cleaf
+	path     string // nested
 }
 
 var (
@@ -126,6 +129,14 @@ func (n *cnode) match(fields map[string]schema.Value) bool {
 		return false
 	case kindNot:
 		return !n.children[0].match(fields)
+	case kindNested:
+		v := fields[n.path]
+		for i := range v.Objects {
+			if o := &v.Objects[i]; o.IsObject() && n.children[0].match(o.Fields) {
+				return true
+			}
+		}
+		return false
 	case kindTrue:
 		return true
 	default:
@@ -164,9 +175,26 @@ func compileNode(n Node) cnode {
 			return never
 		}
 		return compileLeaf(x)
+	case *Nested:
+		if x == nil {
+			return never
+		}
+		child := compileNode(x.Query)
+		if child.kind == kindFalse {
+			return never
+		}
+		return cnode{kind: kindNested, cost: costScan + child.cost, children: []cnode{child}, path: x.Path}
 	default:
 		return never
 	}
+}
+
+// MatchObject reports whether one object of a nested field satisfies the query, the
+// query being a nested node's inner query (its conditions naming sub-fields by their
+// full names): what a nested node asks of each object. A member that is no object
+// never matches.
+func (c *Compiled) MatchObject(o *schema.Object) bool {
+	return o.IsObject() && c.root.match(o.Fields)
 }
 
 // compileGroup folds constant children away (all: a false child is false, true children

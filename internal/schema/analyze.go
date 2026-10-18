@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -49,6 +50,10 @@ type Value struct {
 	// Points is a point field's points, distinct and sorted by x, then y: every pair of
 	// its value that is two finite coordinates of its axes' types (see [Point]).
 	Points []Point
+	// Objects is a nested field's members, in array order (one object given alone is
+	// one member): each an object's analyzed sub-fields, or, for a member that is no
+	// object, an Object with no Fields, which holds its place and nothing else.
+	Objects []Object
 	// Grams says Text's 3-rune substrings ([analysis.EachGram]) are indexed, as the
 	// anchors and prefilters of contains and starts_with: true for a Text of three to
 	// MaxGramChars characters, never for the IDField. They are read from Text where they
@@ -66,6 +71,16 @@ type Value struct {
 	// so a segment can tell a mapping change that needs a rebuild from one that does not.
 	Untyped bool
 }
+
+// Object is one member of a nested field's value. Fields holds its present
+// sub-fields by their full names (path.name), analyzed as a document's fields are; it
+// is nil for a member that is no object, which no nested query matches.
+type Object struct {
+	Fields map[string]Value
+}
+
+// IsObject reports whether the member is an object.
+func (o *Object) IsObject() bool { return o.Fields != nil }
 
 // Doc is an analyzed document. Fields holds every present field, by name, and the
 // pseudo-field [IDField] (the id as a keyword); Body is the document as it was given,
@@ -112,6 +127,15 @@ func ValidateID(id string) error {
 // has typed the field. With DynamicFalse it is kept in Body but not indexed. With
 // DynamicStrict the document is refused, naming the smallest unmapped field name.
 // Errors are *ValidationError, naming the field.
+//
+// A nested field's value is an array of objects (or one object), at most MaxObjects
+// members; a member that is no object holds its place in [Value.Objects] and nothing
+// else. Each object's members are its sub-fields, named path.name, read as top-level
+// members are (a name cleaned, null as absent, an unmapped one by the dynamic mode, a
+// strict refusal naming path.name); of two names that coincide once cleaned, the first
+// non-null one in name order wins. A top-level member named under a nested field
+// (_v.size, with _v nested) is kept in Body but never indexed: that name is its
+// sub-field's. Dynamic typing never makes a field nested: one is mapped first.
 //
 // Body is a copy of body (with invalid UTF-8 replaced): Analyze never keeps the caller's
 // buffer, so a caller may reuse it, and a document sliced out of a large request does
@@ -208,6 +232,9 @@ type analyzer struct {
 	update    MappingUpdate
 	claimed   map[string]bool // cleaned names taken so far, when names hold NULs
 	unmapped  string          // the smallest unmapped name, under DynamicStrict
+	// presenceOnly analyzes an unmapped field as present and of no type, inferring
+	// none ([AnalyzeObjects]).
+	presenceOnly bool
 }
 
 // member analyzes one top-level member. A name that is empty once cleaned, or longer
@@ -221,6 +248,9 @@ func (a *analyzer) member(name string, value any) error {
 	if name == "" || utf8.RuneCountInString(name) > MaxFieldChars {
 		return nil
 	}
+	if _, sub := a.mapping.NestedPath(name); sub {
+		return nil
+	}
 	if value == nil {
 		return nil
 	}
@@ -230,32 +260,124 @@ func (a *analyzer) member(name string, value any) error {
 		}
 		a.claimed[name] = true
 	}
-	t, mapped := a.mapping.Fields[name]
-	if !mapped {
-		switch a.mapping.Dynamic {
-		case DynamicFalse:
-			return nil
-		case DynamicStrict:
-			if a.unmapped == "" || name < a.unmapped {
-				a.unmapped = name
-			}
-			return nil
-		default:
-			inferred, ok := infer(value)
-			if !ok {
-				if !a.typesOnly {
-					a.doc.Fields[name] = Value{Present: true}
-				}
-				return nil
-			}
-			t = inferred
-			a.update.add(name, t)
+	t, index, typed := a.typeOf(name, value)
+	switch {
+	case !index:
+		return nil
+	case t == Nested:
+		v, err := a.nested(name, value)
+		if err != nil {
+			return err
 		}
-	}
-	if !a.typesOnly {
+		if !a.typesOnly {
+			a.doc.Fields[name] = v
+		}
+	case a.typesOnly:
+	case !typed:
+		a.doc.Fields[name] = Value{Present: true}
+	default:
 		a.doc.Fields[name] = analyzeValue(t, value, a.grams)
 	}
 	return nil
+}
+
+// typeOf is the type field (a top-level field, or a nested object's sub-field by its
+// full name) is analyzed by: its mapped type, or, unmapped, what the dynamic mode makes
+// of it. index is false for a value that is not indexed (dynamic false, or strict, which
+// notes the name); typed is false for a present value of no type (dynamic true, of a
+// value inference does not type). A type inferred for the field is added to the
+// update, and read from it again for the document's other values of the field.
+func (a *analyzer) typeOf(field string, value any) (t FieldType, index, typed bool) {
+	if t, mapped := a.mapping.Fields[field]; mapped {
+		return t, true, true
+	}
+	if t, inferred := a.update.Fields[field]; inferred {
+		return t, true, true
+	}
+	if a.presenceOnly {
+		return 0, true, false
+	}
+	switch a.mapping.Dynamic {
+	case DynamicFalse:
+		return 0, false, false
+	case DynamicStrict:
+		if a.unmapped == "" || field < a.unmapped {
+			a.unmapped = field
+		}
+		return 0, false, false
+	}
+	inferred, ok := infer(value)
+	if !ok {
+		return 0, true, false
+	}
+	a.update.add(field, inferred)
+	return inferred, true, true
+}
+
+// nested analyzes a nested field's value: its members, each object's sub-fields
+// typed and analyzed as top-level fields are (see Analyze).
+func (a *analyzer) nested(path string, value any) (Value, error) {
+	list := nestedMembers(value)
+	if len(list) > MaxObjects {
+		return Value{}, &ValidationError{Field: path, Message: fmt.Sprintf("holds %d members: a nested field holds at most %d", len(list), MaxObjects)}
+	}
+	var objects []Object
+	if !a.typesOnly && list != nil {
+		objects = make([]Object, len(list))
+	}
+	for i, member := range list {
+		obj, ok := member.(map[string]any)
+		if !ok {
+			continue
+		}
+		var fields map[string]Value
+		if !a.typesOnly {
+			fields = make(map[string]Value, len(obj))
+		}
+		var claimed map[string]bool
+		if hasNULName(obj) {
+			claimed = map[string]bool{}
+		}
+		for _, raw := range slices.Sorted(maps.Keys(obj)) {
+			v := obj[raw]
+			sub := analysis.Clean(raw)
+			full := path + "." + sub
+			if v == nil || sub == "" || utf8.RuneCountInString(full) > MaxFieldChars {
+				continue
+			}
+			if claimed != nil {
+				if claimed[full] {
+					continue
+				}
+				claimed[full] = true
+			}
+			t, index, typed := a.typeOf(full, v)
+			switch {
+			case !index || a.typesOnly:
+			case !typed:
+				fields[full] = Value{Present: true}
+			default:
+				fields[full] = analyzeValue(t, v, a.grams)
+			}
+		}
+		if !a.typesOnly {
+			objects[i] = Object{Fields: fields}
+		}
+	}
+	return Value{Present: true, Objects: objects}, nil
+}
+
+// nestedMembers is a nested field's members: an array's, or one object alone; nil
+// for any other value, which holds no member.
+func nestedMembers(value any) []any {
+	switch v := value.(type) {
+	case []any:
+		return v
+	case map[string]any:
+		return []any{v}
+	default:
+		return nil
+	}
 }
 
 func hasNULName(object map[string]any) bool {

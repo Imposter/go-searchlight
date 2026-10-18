@@ -957,6 +957,7 @@ func identityCorpora(t *testing.T) map[string][]schema.Doc {
 		"singleDoc2": testDocs(t)[:1],
 		"noDocs":     nil,
 		"points":     xyDocs(t, rand.New(rand.NewPCG(1, 2)), 1200, 6),
+		"nested":     nestedDocs(t, rand.New(rand.NewPCG(5, 6)), 400),
 	}
 }
 

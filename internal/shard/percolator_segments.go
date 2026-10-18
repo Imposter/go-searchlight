@@ -309,6 +309,8 @@ func writeQuery(buf *bytes.Buffer, n query.Node) error {
 		}
 		buf.WriteByte('}')
 		return nil
+	case *query.Nested:
+		return writeNested(buf, x)
 	default:
 		return fmt.Errorf("query node %T cannot be stored", n)
 	}
@@ -347,5 +349,30 @@ func writeFile(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	return nil
+}
+
+// writeNested writes a nested node: {"nested": {"path": ..., "query": ...,
+// "inner_hits": ...}}.
+func writeNested(buf *bytes.Buffer, n *query.Nested) error {
+	path, err := json.Marshal(n.Path)
+	if err != nil {
+		return err
+	}
+	buf.WriteString(`{"nested":{"path":`)
+	buf.Write(path)
+	buf.WriteString(`,"query":`)
+	if err := writeQuery(buf, n.Query); err != nil {
+		return err
+	}
+	if n.InnerHits != nil {
+		hits, err := json.Marshal(n.InnerHits)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(`,"inner_hits":`)
+		buf.Write(hits)
+	}
+	buf.WriteString("}}")
 	return nil
 }

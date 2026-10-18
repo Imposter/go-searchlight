@@ -29,6 +29,10 @@ const maxNamedFields = 20
 //     non-empty list of non-blank texts for contains_*, has_* and words_* (each of a
 //     words_* list holding a word); {text, min} with a non-blank text and
 //     0 < min <= 1 for similar; for box on a point field, x and y bounds ([boxProblem]);
+//   - a nested node's path is a nested field, and it is in no other nested node;
+//     its conditions name its path's sub-fields (path.name), which no condition
+//     outside one names; its inner_hits name sub-fields of its path, a key no other
+//     inner_hits takes, and are under no not;
 //
 // and, as [Parse] checks them, the tree's shape and bounds and every text's length and
 // NUL, so a tree built by hand is held to the same rules. Problems are in tree order; a
@@ -45,22 +49,164 @@ func Validate(n Node, m *schema.Mapping) []Problem {
 	if msg := boundsProblem(n); msg != "" {
 		ps.add(RootLoc, msg)
 	}
-	Walk(n, func(loc string, node Node) bool {
-		switch x := node.(type) {
-		case *All:
-			checkGroup(&ps, join(loc, "all"), x.Children)
-		case *Any:
-			checkGroup(&ps, join(loc, "any"), x.Children)
-		case *Not:
-			if isNil(x.Child) {
-				ps.add(join(loc, "not"), msgNode)
-			}
-		case *Leaf:
-			checkLeaf(&ps, loc, x, m)
-		}
-		return true
-	})
+	v := validator{ps: &ps, m: m}
+	v.node(n, RootLoc)
 	return ps
+}
+
+// ValidateInner reports every problem with n as a nested field's inner query, as an
+// aggregation's or a sort's where gives one: [Validate]'s, but every condition names a
+// sub-field of path, the root {"all": []} holds of every object, and no node is nested.
+func ValidateInner(n Node, m *schema.Mapping, path string) []Problem {
+	var ps problems
+	if isNil(n) {
+		ps.add(RootLoc, "a query is required")
+		return ps
+	}
+	if isEveryObject(n) {
+		return nil
+	}
+	if msg := boundsProblem(n); msg != "" {
+		ps.add(RootLoc, msg)
+	}
+	v := validator{ps: &ps, m: m, path: path, inner: true}
+	v.node(n, RootLoc)
+	return ps
+}
+
+// validator walks a tree for Validate and ValidateInner, knowing where it is: inside
+// a nested node's query (path), under a not (negated), in an inner query (inner, which
+// holds no nested node). keys are the inner hits' keys seen.
+type validator struct {
+	ps      *problems
+	m       *schema.Mapping
+	path    string
+	inner   bool
+	negated bool
+	keys    map[string]bool
+}
+
+func (v *validator) node(n Node, loc string) {
+	switch x := n.(type) {
+	case *All:
+		v.group(join(loc, "all"), x.Children)
+	case *Any:
+		v.group(join(loc, "any"), x.Children)
+	case *Not:
+		if isNil(x.Child) {
+			v.ps.add(join(loc, "not"), msgNode)
+			return
+		}
+		negated := v.negated
+		v.negated = true
+		v.node(x.Child, join(loc, "not"))
+		v.negated = negated
+	case *Nested:
+		v.nested(x, join(loc, "nested"))
+	case *Leaf:
+		v.leaf(x, loc)
+	}
+}
+
+func (v *validator) group(loc string, children []Node) {
+	checkGroup(v.ps, loc, children)
+	for i, child := range children {
+		if !isNil(child) {
+			v.node(child, index(loc, i))
+		}
+	}
+}
+
+// nested checks a nested node at loc (its "nested" key): its path is a nested field,
+// it is in no other nested node, its inner hits ask for that field's sub-fields and are
+// under no not (a document a not matches has no object to show), and its query is an
+// inner query of the path.
+func (v *validator) nested(n *Nested, loc string) {
+	if v.path != "" || v.inner {
+		v.ps.add(loc, "a nested node is not inside another, nor inside an inner query: objects nest one level deep")
+		return
+	}
+	if t, ok := v.m.Type(n.Path); !ok || t != schema.Nested {
+		v.ps.addf(join(loc, "path"), "%q is not a nested field of the index (nested fields: %s)", n.Path, nestedNames(v.m))
+		return
+	}
+	if h := n.InnerHits; h != nil {
+		at := join(loc, "inner_hits")
+		key := h.Key(n.Path)
+		switch {
+		case v.negated:
+			v.ps.add(at, "inner_hits cannot be under a not: a document a not matches holds no object to show")
+		case v.keys[key]:
+			v.ps.addf(at, "two inner_hits are named %q: name one otherwise (name)", key)
+		case h.Size < 0 || h.Size > MaxInnerHitsSize:
+			v.ps.addf(join(at, "size"), "an inner_hits size is a whole number from 0 to %d", MaxInnerHitsSize)
+		case len(h.Fields) > MaxInnerHitsFields:
+			v.ps.addf(join(at, "fields"), "inner_hits fields is a list of at most %d sub-field names", MaxInnerHitsFields)
+		}
+		if v.keys == nil {
+			v.keys = map[string]bool{}
+		}
+		v.keys[key] = true
+		for i, f := range h.Fields {
+			if p, ok := v.m.NestedPath(f); !ok || p != n.Path {
+				v.ps.addf(index(join(at, "fields"), i), "%q is not a sub-field of nested field %q (%s)", f, n.Path, subFieldNames(v.m, n.Path))
+			}
+		}
+	}
+	at := join(loc, "query")
+	switch {
+	case isNil(n.Query):
+		v.ps.add(at, msgNode)
+	case isEveryObject(n.Query):
+	default:
+		v.path = n.Path
+		v.node(n.Query, at)
+		v.path = ""
+	}
+}
+
+// leaf checks a condition: outside a nested node it names no sub-field, inside one only
+// its path's sub-fields; then [checkLeaf].
+func (v *validator) leaf(l *Leaf, loc string) {
+	path, sub := v.m.NestedPath(l.Field)
+	switch {
+	case v.path == "" && sub:
+		v.ps.addf(join(loc, "field"), `%q is a sub-field of nested field %q: name it inside {"nested": {"path": %q, "query": ...}}`, l.Field, path, path)
+		return
+	case v.path != "" && (!sub || path != v.path):
+		v.ps.addf(join(loc, "field"), "inside nested %q a condition names its sub-fields (%s), not %q", v.path, subFieldNames(v.m, v.path), l.Field)
+		return
+	}
+	checkLeaf(v.ps, loc, l, v.m)
+}
+
+// nestedNames lists m's nested fields, sorted, up to maxNamedFields; "none" when it
+// has none.
+func nestedNames(m *schema.Mapping) string {
+	var names []string
+	if m != nil {
+		for _, name := range slices.Sorted(maps.Keys(m.Fields)) {
+			if m.Fields[name] == schema.Nested {
+				names = append(names, name)
+			}
+		}
+	}
+	return namedList(names)
+}
+
+// subFieldNames lists nested field path's sub-fields, sorted, up to maxNamedFields.
+func subFieldNames(m *schema.Mapping, path string) string {
+	return namedList(m.SubFields(path))
+}
+
+func namedList(names []string) string {
+	switch {
+	case len(names) == 0:
+		return "none"
+	case len(names) > maxNamedFields:
+		return strings.Join(names[:maxNamedFields], ", ") + fmt.Sprintf(", and %d more", len(names)-maxNamedFields)
+	}
+	return strings.Join(names, ", ")
 }
 
 func checkGroup(ps *problems, loc string, children []Node) {

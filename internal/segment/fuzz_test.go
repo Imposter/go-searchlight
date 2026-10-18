@@ -148,6 +148,18 @@ func exerciseReader(r *Reader) {
 		points := 0
 		xy.Each(func(uint32, [2]float64) { points++ })
 	}
+	for name := range r.nested {
+		nv := r.Nested(name)
+		for _, doc := range docs {
+			_, _ = nv.Range(doc)
+		}
+		for _, obj := range []uint32{0, nv.NumObjects() / 2, nv.NumObjects()} {
+			_ = nv.Parent(obj)
+		}
+		consumeBitmap(nv.Parents(roaring.BitmapOf(0, nv.NumObjects()/2, nv.NumObjects())))
+		consumeBitmap(nv.ObjectsOf(roaring.BitmapOf(0, n/2, n)))
+		exerciseReader(nv.Objects())
+	}
 	_, _ = r.MarksUntyped(), r.FormatMajor()
 	_ = r.DiskUsage()
 
@@ -198,6 +210,7 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		buildFile(tb, markedDocs(tb, 40)),
 		buildFile(tb, genCorpus(40)),
 		buildFile(tb, xyDocs(tb, rand.New(rand.NewPCG(9, 9)), 150, 8)), // a point tree of a few leaves
+		buildFile(tb, nestedDocs(tb, rand.New(rand.NewPCG(9, 9)), 60)),  // a nested field's objects
 	}
 	seeds = append(seeds, buildWithStoredDict(tb, genCorpus(40)))
 	for _, craft := range craftedCases() {

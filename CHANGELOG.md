@@ -47,7 +47,6 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   node's own copies at once for 64 documents or more: 200 documents on 8 shards take
   2.5 ms against 3.3 ms; fewer run in turn while the peers answer), and
   merges their matches; a shard that fails cancels the rest.
-
 - **Saved-query listings page each shard in its primary key's order** and merge them by
   id, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
   query of the index by id before).
@@ -55,7 +54,14 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   Segments of `percolate/3` open as they are, their queries with no version, until
   merges rewrite them; a release before this one refuses a `percolate/4` segment, so a
   copy that has written one cannot be downgraded.
-
+- **Saved nested queries anchor on their inner conditions** instead of being checked
+  against every document: a nested node anchors as its inner query would, on the
+  path's sub-fields, and a document holds the atoms of each of its objects; only an
+  inner query with no positive conjunct stays always-check. On
+  BenchmarkPercolateNested (100k saved searches, 70% variant searches, a tenth of all
+  with no other condition), always-check queries fall from 9,867 to 0 and candidates
+  from 10,492 to 2,292 per document: 6,692 documents a second against 1,564, p50
+  255 µs against 906 µs. Answers are exactly as before.
 - **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes
   of one path giving one `inner_hits` name, in the query and the `post_filter`, share
   one set of inner hits: every member satisfying any of their queries once, `total`

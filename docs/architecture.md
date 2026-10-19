@@ -280,7 +280,7 @@ data_dir/
     fetched body, by the inner query's compiled matcher on each member.
   - The percolator compiles a nested node to a program (`pNested`) holding its
     sub-fields' slots: each object of the document fills them in turn while the inner
-    program runs. A saved nested query anchors as always-check.
+    program runs. A saved nested query anchors on its inner query's atoms (see Anchors).
   - On BenchmarkNested*/Flat* (20,000 products of five variants, one merged segment,
     Ryzen 7 3700X), the correlated query "size L, in stock, under 150" takes 0.67 ms
     nested against 0.21 ms over one document per variant; a `terms` with a `where`
@@ -357,6 +357,17 @@ flowchart LR
   (a number range, a bool, a text the field must not equal, or an entry it must not
   hold) that a document must pass to become a candidate. A `words_*` phrase anchors on
   the pair of its two rarest words.
+- **Nested anchors.** A nested node anchors as its inner query would, on its path's
+  sub-fields by their full names (`_v.size`), and a document holds the atoms of every
+  one of its objects' values of them: the object a match needs holds the anchor, so
+  the document does. Only an inner query with no positive conjunct (a `not`, the
+  match-any `{"all": []}`) leaves the node Always. A sub-field's cost counts the
+  objects holding the term (`Generation.DocFreq`, an upper bound on the documents), or,
+  without statistics, scales its prior by 8: a document holds an atom when any of its
+  objects does, so a top-level anchor of the same group wins unless the variant's is
+  rarer. On BenchmarkPercolateNested (100k saved searches, 70% of them variant
+  searches), always-check queries fall from 9,867 to 0, and throughput rises from
+  1,564 to 6,692 documents a second.
 - **Query segments.** Anchors live in percolator segments (`percolate/4`) that refresh
   and merge like document segments, under their own merge policy (two per tier). Every
   query segment costs every document a probe, so the policy keeps them few. A segment is

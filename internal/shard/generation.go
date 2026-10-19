@@ -423,10 +423,20 @@ func (g *Generation) NumQueries() uint64 { return g.numQueries }
 func (g *Generation) FilterCache() *FilterCache { return g.shard.opts.FilterCache }
 
 // DocFreq implements [TermStats]: how many documents hold term, deleted ones included.
+// A nested field's sub-field (path.name) counts the objects holding it, which bounds
+// the documents holding it from above.
 func (g *Generation) DocFreq(field string, kind segment.TermKind, term string) uint64 {
 	var n uint64
+	path, _, sub := strings.Cut(field, ".")
 	for i := range g.Segments {
-		n += uint64(g.Segments[i].Reader.TermFreq(field, kind, term))
+		r := g.Segments[i].Reader
+		f := uint64(r.TermFreq(field, kind, term))
+		if f == 0 && sub {
+			if nv := r.Nested(path); nv != nil {
+				f = uint64(nv.Objects().TermFreq(field, kind, term))
+			}
+		}
+		n += f
 	}
 	return n
 }

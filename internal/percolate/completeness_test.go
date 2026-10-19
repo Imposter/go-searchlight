@@ -76,7 +76,7 @@ func TestCompletenessProperty(t *testing.T) {
 			// rarely negates, so most queries are anchored and most matches come
 			// through anchors; dense is positive over a tiny vocabulary, so that
 			// conjunctions (pair anchors) match often.
-			for _, mode := range []string{"mixed", "positive", "dense", "filters"} {
+			for _, mode := range []string{"mixed", "positive", "dense", "filters", "nested"} {
 				t.Run(fmt.Sprintf("seed=%d/%s/%s", seed, regime, mode), func(t *testing.T) {
 					var stats shard.TermStats
 					switch regime {
@@ -89,6 +89,7 @@ func TestCompletenessProperty(t *testing.T) {
 					g.positive = mode != "mixed"
 					g.dense = mode == "dense"
 					g.filters = mode == "filters"
+					g.nestedHeavy = mode == "nested"
 					checkCompleteness(t, g, seed, queries, docs, stats)
 				})
 			}
@@ -142,6 +143,18 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	isAlways := make(map[uint32]bool)
 	for i := 0; i < len(seg.always); i += 4 {
 		isAlways[seg.ordAt(u32(seg.always, i))] = true
+	}
+	nestedQueries, nestedAlways := 0, 0
+	for i := range qs {
+		if hasNested(qs[i].Query) {
+			nestedQueries++
+			if isAlways[uint32(i)] {
+				nestedAlways++
+			}
+		}
+	}
+	if g.nestedHeavy && (nestedQueries < numQueries/2 || nestedAlways*3 > nestedQueries) {
+		t.Fatalf("%d queries hold a nested node, %d of them always-check: nested queries should anchor on their inner conditions", nestedQueries, nestedAlways)
 	}
 	pairs, matches, anchored, candidates := 0, 0, 0, 0
 	for di := range numDocs {
@@ -207,8 +220,8 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	if anchored == 0 || anchored*200 < pairs {
 		t.Fatalf("only %d of %d pairs match through anchors: the generator is too sparse to test anything", anchored, pairs)
 	}
-	t.Logf("%d pairs, %d matches (%d through anchors), %.1f candidates per document of %d queries (%d always-check)",
-		pairs, matches, anchored, float64(candidates)/float64(numDocs), len(qs), seg.NumAlways())
+	t.Logf("%d pairs, %d matches (%d through anchors), %.1f candidates per document of %d queries (%d always-check; %d nested, %d of them always-check)",
+		pairs, matches, anchored, float64(candidates)/float64(numDocs), len(qs), seg.NumAlways(), nestedQueries, nestedAlways)
 }
 
 // randStats are arbitrary, deterministic term statistics: anchors chosen under them
@@ -237,6 +250,8 @@ type gen struct {
 	dense    bool // draw words from a tiny vocabulary
 	filters  bool // root conjunctions of a term anchor and conditions posting filters carry
 	nested   bool // drawing a nested node's inner query: conditions on v's sub-fields
+	// nestedHeavy draws nested nodes most of the time, at the root and in groups.
+	nestedHeavy bool
 }
 
 // positiveOps are the ops a positive generator draws: the anchorable ones.
@@ -437,7 +452,7 @@ func (g *gen) points() any {
 
 func (g *gen) node(depth int) any {
 	switch r := g.r.IntN(10); {
-	case r == 9 && depth > 0 && !g.nested && !g.filters:
+	case (r == 9 || (g.nestedHeavy && r >= 4)) && depth > 0 && !g.nested && !g.filters:
 		g.nested = true
 		inner := g.node(depth - 1)
 		g.nested = false
@@ -619,4 +634,14 @@ func (g *gen) title() string {
 		t += "\x00nul"
 	}
 	return t
+}
+
+// hasNested reports whether n holds a nested node.
+func hasNested(n query.Node) bool {
+	found := false
+	query.Walk(n, func(_ string, node query.Node) bool {
+		_, found = node.(*query.Nested)
+		return !found
+	})
+	return found
 }

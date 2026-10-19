@@ -450,6 +450,9 @@ const (
 	// between two terms equally rare in the documents, the kind more selective in
 	// general wins.
 	tiebreak = 1e-3
+	// nestedPrior scales the prior of a sub-field's atom: a document holds it when any of
+	// its objects does, a few times as likely as one value holds it.
+	nestedPrior = 8
 )
 
 // extractor extracts anchors under one set of term statistics, caching term costs: a
@@ -458,7 +461,11 @@ type extractor struct {
 	stats TermStats
 	docs  float64 // live documents; 0: no statistics
 	costs map[string]float64
-	key   []byte
+	// nested is set while extracting a nested node's inner query, whose atoms are its
+	// objects' sub-fields: the statistics count a sub-field's objects (TermStats), and a
+	// prior is scaled by nestedPrior, a document holding an atom of any of its objects.
+	nested bool
+	key    []byte
 }
 
 func newExtractor(stats TermStats) *extractor {
@@ -501,6 +508,9 @@ func newExtractor(stats TermStats) *extractor {
 //     two are assumed independent).
 //   - any: the union of its children; one Always child makes the group Always. An any
 //     with no child (never true) is the empty set.
+//   - nested: its inner query's anchors, on the full names of its path's sub-fields (a
+//     document holds the atoms of each of its objects, so of the object that matches);
+//     Always when the inner query has none (a not, the match-any {"all": []}).
 //   - not: Always, but not(not x) is x. ne, exists:false, empty, and the root
 //     {"all": []} are Always, as is anything this list does not name (an unknown op, a
 //     value the op cannot read, a nil node): when in doubt, Always.
@@ -554,6 +564,13 @@ func (e *extractor) node(n query.Node) aset {
 			return e.node(inner.Child)
 		}
 		return always
+	case *query.Nested:
+		if x == nil || x.Query == nil || e.nested {
+			return always
+		}
+		e.nested = true
+		defer func() { e.nested = false }()
+		return e.node(x.Query)
 	case *query.Leaf:
 		if x == nil {
 			return always
@@ -873,6 +890,9 @@ func (e *extractor) rangeSet(field string, lo, hi float64) aset {
 	case math.IsInf(lo, 0) || math.IsInf(hi, 0):
 		cost = priorHalf
 	}
+	if e.nested {
+		cost = min(1, cost*nestedPrior)
+	}
 	return aset{ok: true, ranges: []Range{{Field: field, Lo: lo, Hi: hi}}, cost: cost}
 }
 
@@ -884,6 +904,9 @@ func (e *extractor) rangeSet(field string, lo, hi float64) aset {
 func (e *extractor) termCost(kind AtomKind, field, term string) float64 {
 	prior := atomPrior(kind, term)
 	segKind, segTerm, measured := segmentTerm(kind, term)
+	if e.nested {
+		prior = min(1, prior*nestedPrior)
+	}
 	if e.docs == 0 || !measured {
 		return prior
 	}

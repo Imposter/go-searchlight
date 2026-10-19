@@ -758,6 +758,10 @@ type fieldInfo struct {
 	recStart, recEnd   uint32
 	grams              []uint64
 	gramMask           uint32
+	// path is the nested field a name of path.name may be a sub-field of ("" for a
+	// name with no dot): a document holding no field of the whole name and objects of
+	// path has its objects' values of it probed for atoms.
+	path string
 }
 
 // Segment is an open query segment: a [shard.QuerySegment] that also answers the
@@ -1107,6 +1111,9 @@ func (s *Segment) parseFields(b []byte, numFields, numNodes, numRecs uint32) err
 			if start < uint64(f.recStart) || start+count > uint64(f.recEnd) {
 				return fmt.Errorf("field %d: node records out of range", i)
 			}
+		}
+		if dot := strings.IndexByte(f.name, '.'); dot > 0 {
+			f.path = f.name[:dot]
 		}
 		s.fields = append(s.fields, f)
 	}

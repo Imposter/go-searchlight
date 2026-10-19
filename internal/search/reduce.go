@@ -30,7 +30,7 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	sorts := prepareSorts(r.Sort, nil, new(problems))
 	var specs []*aggSpec
 	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, "", new(problems)); s != nil {
+		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, new(problems)); s != nil {
 			specs = append(specs, s)
 		}
 	}

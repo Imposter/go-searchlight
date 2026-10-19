@@ -192,7 +192,7 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		ps.add(aggsLoc(r.aggsKey), "a search holds at most %d aggregations, sub-aggregations included and those under a filters aggregation counted once per bucket; this one holds %d", MaxAggs, n)
 	} else {
 		for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-			if s := prepareAgg(name, r.Aggs[name], m, aggsLoc(r.aggsKey)+"."+name, "", &ps); s != nil {
+			if s := prepareAgg(name, r.Aggs[name], m, aggsLoc(r.aggsKey)+"."+name, &ps); s != nil {
 				p.aggs = append(p.aggs, s)
 			}
 		}
@@ -387,11 +387,10 @@ func toFloat(v any) (float64, bool) { return analysis.Number(v) }
 
 var calendarUnits = []string{"minute", "hour", "day", "week", "month", "quarter", "year"}
 
-// prepareAgg checks aggregation a, given at loc under an aggregation of type parent
-// ("" at the top level), against m, and compiles it (its filters aside: see
-// compileFilters).
-func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *problems) *aggSpec {
-	return prepareAggUnder(name, a, m, loc, parent, "", ps)
+// prepareAgg checks top-level aggregation a, given at loc, against m, and compiles it
+// (its filters aside: see compileFilters).
+func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, ps *problems) *aggSpec {
+	return prepareAggUnder(name, a, m, loc, "", "", ps)
 }
 
 // prepareAggUnder is prepareAgg for an aggregation under a terms aggregation on a

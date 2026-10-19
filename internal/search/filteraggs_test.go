@@ -53,7 +53,7 @@ func bruteWrapped(t *testing.T, a Agg, matched, all []*schema.Doc) *AggResult {
 	if !singleBucket(a.Type) {
 		return bruteAgg(t, a, matched)
 	}
-	spec := prepareAgg("x", a, testMapping, "aggs.x", "", new(problems))
+	spec := prepareAgg("x", a, testMapping, "aggs.x", new(problems))
 	if spec == nil {
 		t.Fatalf("agg %+v refused", a)
 	}

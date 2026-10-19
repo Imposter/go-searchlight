@@ -1,11 +1,13 @@
 package api_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -99,7 +101,7 @@ func TestPercolateMatchesEqualSearch(t *testing.T) {
 		for _, m := range it.Matches {
 			matchIDs = append(matchIDs, m.ID)
 		}
-		if !slices.Equal(matchIDs, it.Queries) && !(len(matchIDs) == 0 && len(it.Queries) == 0) {
+		if !slices.Equal(matchIDs, it.Queries) && (len(matchIDs) > 0 || len(it.Queries) > 0) {
 			t.Fatalf("%s: matches %v, queries %v", it.ID, matchIDs, it.Queries)
 		}
 		for id, q := range queries {
@@ -124,8 +126,11 @@ func TestPercolateMatchesEqualSearch(t *testing.T) {
 			if err := json.Unmarshal(hraw, &want); err != nil {
 				t.Fatal(err)
 			}
-			wantVersion := int64(10)
-			fmt.Sscanf(id, "q%d", &wantVersion)
+			n, err := strconv.Atoi(strings.TrimPrefix(id, "q"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantVersion := int64(n)
 			if m.Version != wantVersion+10 || len(m.InnerHits) != len(want.InnerHits) {
 				t.Fatalf("%s %s: version %d, inner hits %v; want %d, %v", it.ID, id, m.Version, m.InnerHits, wantVersion+10, want.InnerHits)
 			}
@@ -154,7 +159,7 @@ func TestPercolateMatchesEqualSearch(t *testing.T) {
 		want := items[30+i]
 		a, _ := json.Marshal(res.Matches)
 		b, _ := json.Marshal(want.Matches)
-		if string(a) != string(b) {
+		if !bytes.Equal(a, b) {
 			t.Fatalf("_percolate of %s: %s, the bulk's %s", want.ID, a, b)
 		}
 	}

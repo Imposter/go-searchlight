@@ -358,7 +358,7 @@ func TestTermsFilterProblems(t *testing.T) {
 		{Agg{Type: AggRange, Field: "price", Ranges: []Range{{}}, Exclude: &TermsFilter{Values: []any{}}}, "aggs.x.range.exclude"},
 	} {
 		var ps problems
-		prepareAgg("x", tc.agg, testMapping, "aggs.x", "", &ps)
+		prepareAgg("x", tc.agg, testMapping, "aggs.x", &ps)
 		if !slices.ContainsFunc(ps, func(p query.Problem) bool { return p.Loc == tc.loc }) {
 			t.Errorf("%+v: %v, want a problem at %s", tc.agg, ps, tc.loc)
 		}
@@ -369,7 +369,7 @@ func TestTermsFilterProblems(t *testing.T) {
 		{Type: AggTerms, Field: "nope", Include: &TermsFilter{Pattern: "x"}, Exclude: &TermsFilter{Values: []any{1.0, true}}},
 	} {
 		var ps problems
-		prepareAgg("x", a, testMapping, "aggs.x", "", &ps)
+		prepareAgg("x", a, testMapping, "aggs.x", &ps)
 		if len(ps) > 0 {
 			t.Errorf("%+v refused: %v", a, ps)
 		}
@@ -395,7 +395,7 @@ func TestTermsFilterCompiledOnce(t *testing.T) {
 	for _, f := range []*TermsFilter{a.Include, &decoded} {
 		var res []*regexp.Regexp
 		for range 3 {
-			s := prepareAgg("b", Agg{Type: AggTerms, Field: "brand", Include: f}, testMapping, "aggs.b", "", new(problems))
+			s := prepareAgg("b", Agg{Type: AggTerms, Field: "brand", Include: f}, testMapping, "aggs.b", new(problems))
 			res = append(res, s.terms.include.re)
 		}
 		if res[0] == nil || res[0] != res[1] || res[1] != res[2] {

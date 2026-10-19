@@ -51,7 +51,7 @@ func aggValues(d *schema.Doc, field string) []any {
 // bruteAgg computes a over docs, as the reduce should answer with exact shard sizes.
 func bruteAgg(t *testing.T, a Agg, docs []*schema.Doc) *AggResult {
 	t.Helper()
-	spec := prepareAgg("x", a, testMapping, "aggs.x", "", new(problems))
+	spec := prepareAgg("x", a, testMapping, "aggs.x", new(problems))
 	if spec == nil {
 		t.Fatalf("agg %+v refused", a)
 	}

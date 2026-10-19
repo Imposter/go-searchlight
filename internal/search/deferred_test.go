@@ -177,7 +177,7 @@ func TestParseMinMaxCollectMode(t *testing.T) {
 		{Agg{Type: AggTerms, Field: "brand", CollectMode: "sideways"}, "aggs.x.terms.collect_mode"},
 	} {
 		var ps problems
-		prepareAgg("x", tc.a, testMapping, "aggs.x", "", &ps)
+		prepareAgg("x", tc.a, testMapping, "aggs.x", &ps)
 		if len(ps) != 1 || ps[0].Loc != tc.loc {
 			t.Errorf("%+v: %v, want one problem at %s", tc.a, ps, tc.loc)
 		}
@@ -233,7 +233,7 @@ func TestCardinalityThreshold(t *testing.T) {
 		{Type: AggCardinality, Field: "brand", Threshold: 2, Precision: 10},
 	} {
 		var ps problems
-		prepareAgg("x", a, testMapping, "aggs.x", "", &ps)
+		prepareAgg("x", a, testMapping, "aggs.x", &ps)
 		if len(ps) != 1 || ps[0].Loc != "aggs.x.cardinality.threshold" {
 			t.Errorf("%+v: %v", a, ps)
 		}

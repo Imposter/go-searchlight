@@ -679,7 +679,8 @@ func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs
 			})
 		}
 		for _, s := range inline {
-			if run(fanCtx, s); errs[s] != nil {
+			run(fanCtx, s)
+			if errs[s] != nil {
 				cancel()
 			}
 		}

@@ -10,21 +10,27 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
-const variantMapping = `{"mapping": {"fields": {"brand": "keyword", "_v": {"type": "nested", "fields": {"size": "keyword", "price": "number", "stock": "bool"}}}}, "settings": {"shards": 3}}`
+const variantMapping = `{"mapping": {"fields": {"brand": "keyword", "_v": {"type": "nested", "fields": {"size": "keyword", "price": "number", "stock": "bool", "seen": "date"}}}}, "settings": {"shards": 3}}`
 
 func randomVariantDoc(rng *rand.Rand) string {
 	n := rng.IntN(5)
 	vs := make([]string, n)
 	for i := range vs {
-		vs[i] = fmt.Sprintf(`{"size": %q, "price": %d, "stock": %v}`, []string{"S", "M", "L"}[rng.IntN(3)], rng.IntN(20), rng.IntN(2) == 0)
+		seen := time.Now().UTC().AddDate(0, 0, -rng.IntN(60)).Format(time.RFC3339)
+		vs[i] = fmt.Sprintf(`{"size": %q, "price": %d, "stock": %v, "seen": %q}`, []string{"S", "M", "L"}[rng.IntN(3)], rng.IntN(20), rng.IntN(2) == 0, seen)
 	}
 	return fmt.Sprintf(`{"brand": %q, "_v": [%s]}`, []string{"acme", "zeta"}[rng.IntN(2)], strings.Join(vs, ","))
 }
 
 func randomInnerCondition(rng *rand.Rand) string {
-	switch rng.IntN(4) {
+	switch rng.IntN(6) {
+	case 4:
+		return fmt.Sprintf(`{"field": "_v.seen", "op": "gte", "value": "now-%dd/d"}`, 5+rng.IntN(40))
+	case 5:
+		return fmt.Sprintf(`{"field": "_v.seen", "op": "lt", "value": %q}`, time.Now().UTC().AddDate(0, 0, -rng.IntN(60)).Format("2006-01-02"))
 	case 0:
 		return fmt.Sprintf(`{"field": "_v.size", "op": "eq", "value": %q}`, []string{"S", "M", "L"}[rng.IntN(3)])
 	case 1:

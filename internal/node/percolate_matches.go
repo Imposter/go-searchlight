@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -29,8 +31,13 @@ func (d MatchDetails) Any() bool { return d.Versions || d.InnerHits }
 // matchDetails returns each document's matches with the details d asks for, in the order
 // of its ids (as Percolate returned them from g): the saved queries' versions, and the
 // inner hits they ask of the document, read from the query segments that hold them. A
-// saved query's inner hits are compiled once for every document.
-func matchDetails(g *shard.Generation, d MatchDetails, docs []schema.Doc, ids []percolate.IDs) ([][]api.PercolateMatch, error) {
+// saved query's inner hits are compiled once for every document, its date math resolved
+// at the percolation's now (ctx's, [query.WithNow]), as the percolator resolves it.
+func matchDetails(ctx context.Context, g *shard.Generation, d MatchDetails, docs []schema.Doc, ids []percolate.IDs) ([][]api.PercolateMatch, error) {
+	now, ok := query.NowFrom(ctx)
+	if !ok {
+		return nil, errNoNow
+	}
 	out := make([][]api.PercolateMatch, len(docs))
 	compiled := map[string]*search.QueryInnerHits{}
 	offsets := 0
@@ -70,7 +77,8 @@ func matchDetails(g *shard.Generation, d MatchDetails, docs []schema.Doc, ids []
 				if err != nil {
 					return nil, err
 				}
-				qh = search.NewQueryInnerHits(sq.Query)
+				resolved, _ := query.Resolve(sq.Query, now)
+				qh = search.NewQueryInnerHits(resolved)
 				compiled[id] = qh
 			}
 			if qh == nil {
@@ -122,3 +130,7 @@ func innerHitOffsets(matches [][]api.PercolateMatch) int {
 
 // errDetailsCount is a target that answered details for another number of documents.
 var errDetailsCount = errors.New("node: a percolation's details are not one per document")
+
+// errNoNow is a percolation's details asked for with no now in its context: every
+// percolation sets one (percolateDocs, the peer API), which date math resolves at.
+var errNoNow = errors.New("node: a percolation's details need its now (query.WithNow)")

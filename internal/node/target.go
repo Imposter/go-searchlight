@@ -41,7 +41,7 @@ func (t *localTarget) Percolate(ctx context.Context, _ json.RawMessage, docs []s
 	if err != nil || !details.Any() {
 		return ids, nil, err
 	}
-	matches, err := matchDetails(t.g, details, docs, ids)
+	matches, err := matchDetails(ctx, t.g, details, docs, ids)
 	if err != nil {
 		return nil, nil, err
 	}

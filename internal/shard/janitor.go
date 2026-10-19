@@ -35,6 +35,11 @@ type janitor struct {
 	s      *Shard
 	remove func(path string) error
 
+	// drainMu serializes drains, so that one returns only once every segment retired
+	// before it began is closed and its files tried, whichever drain took them: the
+	// loop's, woken by the retire, may be closing them while another drain runs.
+	drainMu sync.Mutex
+
 	// removeMu is held across each removal and by forget, so forget returns only
 	// once no removal of the forgotten names is running or can start.
 	removeMu sync.Mutex
@@ -148,8 +153,11 @@ func (j *janitor) loop() {
 // drain closes every retired segment, queues the files of obsolete ones, and tries
 // every pending removal once. After stop nothing stays pending. A segment's own name
 // is unique for the directory's life (and no manifest lists an obsolete one again),
-// so its files are safe to remove whenever this runs.
+// so its files are safe to remove whenever this runs. Drains run one at a time
+// (drainMu).
 func (j *janitor) drain() {
+	j.drainMu.Lock()
+	defer j.drainMu.Unlock()
 	j.mu.Lock()
 	retired := j.retired
 	j.retired = nil

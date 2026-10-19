@@ -95,8 +95,8 @@ func TestWireNested(t *testing.T) {
 			t.Errorf("%s needs percolate level %d, want %d", mapping, got, want)
 		}
 	}
-	if percolateLevel != percolateNested {
-		t.Error("percolate level 3 is not the newest")
+	if percolateLevel < percolateNested {
+		t.Error("this binary speaks no percolate level 3")
 	}
 }
 
@@ -257,8 +257,8 @@ func TestWireNestedSubAggs(t *testing.T) {
 	if wr.Needs != levelNestedSubAggs || len(got.Aggs["sizes"].Aggs) != 3 {
 		t.Fatalf("needs %d, sub-aggregations %v", wr.Needs, got.Aggs["sizes"].Aggs)
 	}
-	if searchLevel != levelNestedSubAggs || levelNeeds(levelNestedSubAggs) == levelNeeds(levelNested) {
-		t.Error("level 7 is not the newest search level, or its errors name level 6's needs")
+	if searchLevel < levelNestedSubAggs || levelNeeds(levelNestedSubAggs) == levelNeeds(levelNested) {
+		t.Error("this binary speaks no search level 7, or its errors name level 6's needs")
 	}
 
 	coord, seq := nestedCluster(t, olderNone, 0)
@@ -291,6 +291,60 @@ func TestWireNestedSubAggs(t *testing.T) {
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
 				t.Fatalf("nested sub-aggregations through an older peer: %v; want a 503", err)
+			}
+		})
+	}
+}
+
+// A percolation asked for its matches' details, and a search with seq_no, run on peers
+// as on the node itself: the details need percolate wire level 4 and seq_no search wire
+// level 8, and a peer below either is not trusted with them (503 with no other copy).
+func TestDetailsAndSeqNoThroughPeers(t *testing.T) {
+	coord, seq := nestedCluster(t, olderNone, 0)
+	res, err := coord.n.Percolate(tctx(t), "nw", &api.PercolateRequest{
+		Docs:    []json.RawMessage{json.RawMessage(`{"_v": [{"size": "M", "price": 1}, {"size": "L", "price": 5}]}`)},
+		IDs:     []string{"p03"},
+		Matches: true, InnerHits: true,
+	}, api.ReadOptions{WaitForSeq: seq})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{`[{"id":"q","inner_hits":{"_v":{"total":1,"offsets":[1]}}}]`, `[{"id":"q","inner_hits":{"_v":{"total":1,"offsets":[0]}}}]`} {
+		got, _ := json.Marshal(res.Results[i].Matches)
+		if string(got) != want {
+			t.Fatalf("result %d's matches %s, want %s", i, got, want)
+		}
+	}
+	if res.Results[1].Seq <= 0 || res.Results[1].Seq > seq {
+		t.Fatalf("p03's _seq %d", res.Results[1].Seq)
+	}
+	s, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 20, SeqNo: true, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: seq})
+	if err != nil || len(s.Hits) != 20 {
+		t.Fatalf("a seq_no search: %v, %v", s, err)
+	}
+	for _, h := range s.Hits {
+		if h.Seq <= 0 || h.Seq > seq {
+			t.Fatalf("hit %s's seq %d", h.ID, h.Seq)
+		}
+	}
+	if wr, _ := encodeRequest(&search.Request{Query: &query.All{}, Size: 1, SeqNo: true}); wr.Needs != levelSeqNo || searchLevel != levelSeqNo || percolateLevel != percolateDetails {
+		t.Fatal("seq_no needs search level 8, the newest, and percolate level 4 is the newest")
+	}
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) {
+			coord, seq := nestedCluster(t, older, percolateNested)
+			if _, err := percolateNestedDoc(t, coord, seq); err != nil {
+				t.Fatalf("a percolation without details through a level-3 peer: %v", err)
+			}
+			_, err := coord.n.Percolate(tctx(t), "nw", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{}`)}, Matches: true}, api.ReadOptions{WaitForSeq: seq})
+			var ae *api.Error
+			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+				t.Fatalf("details through an older peer: %v; want a 503", err)
+			}
+			coord, seq = nestedCluster(t, older, levelNestedSubAggs)
+			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 5, SeqNo: true}, api.ReadOptions{WaitForSeq: seq})
+			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+				t.Fatalf("seq_no through an older peer: %v; want a 503", err)
 			}
 		})
 	}

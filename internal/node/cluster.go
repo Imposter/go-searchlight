@@ -61,10 +61,12 @@ type ShardTarget interface {
 	Fetch(ctx context.Context, hits []search.Hit, fields []string) error
 	// Percolate matches docs, analyzed under mapping (its catalogue JSON), against the
 	// copy's saved queries: the ids each document matches, in order, as
-	// [percolate.Percolator.Percolate] returns them.
-	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error)
-	// Get reads a stored document from the copy.
-	Get(ctx context.Context, id string) (body []byte, found bool, err error)
+	// [percolate.Percolator.Percolate] returns them, and, when details asks for any,
+	// each document's matches with them, in the same order ([MatchDetails]).
+	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc, details MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error)
+	// Get reads a stored document from the copy, with the seq of the change that wrote
+	// the version it holds (0 when the copy kept none).
+	Get(ctx context.Context, id string) (body []byte, seq int64, found bool, err error)
 	// GetQuery reads a saved query from the copy.
 	GetQuery(ctx context.Context, id string) (q *api.SavedQuery, found bool, err error)
 	// Stale reports whether the copy's reads are stale: it trails the changelog by

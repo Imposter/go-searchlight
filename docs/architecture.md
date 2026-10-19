@@ -286,6 +286,11 @@ data_dir/
     nested against 0.21 ms over one document per variant; a `terms` with a `where`
     1.4 ms against 0.24 ms (which counts from the dictionary); a sort by the cheapest
     in-stock variant 1.3 ms against 0.1 ms (which walks the point index).
+- **Document seqs.** A copy keeps each document's seq, the seq of the change that wrote
+  the version it indexes, in a numeric column of its own (`schema.SeqColumn`, a name no
+  mapping or document member can take), added as the change is applied: no query reads
+  it, and a hit's `_seq` (`seq_no`) and a stored document's percolation `_seq` are read
+  from it. Segments written before it have no such column, and their documents no seq.
 - **Format versions.** The segment format is versioned (major 4, minor 1 for a segment
   holding a point field, 2 for one holding a nested field's objects; a binary reads its
   own major and the one before). A copy whose files
@@ -352,12 +357,13 @@ flowchart LR
   (a number range, a bool, a text the field must not equal, or an entry it must not
   hold) that a document must pass to become a candidate. A `words_*` phrase anchors on
   the pair of its two rarest words.
-- **Query segments.** Anchors live in percolator segments (`percolate/3`) that refresh
+- **Query segments.** Anchors live in percolator segments (`percolate/4`) that refresh
   and merge like document segments, under their own merge policy (two per tier). Every
   query segment costs every document a probe, so the policy keeps them few. A segment is
   memory-mapped and validated at open; nothing per query goes on the heap. It holds the
   term dictionary, interval trees, always-check list, one compiled program per
-  verification class (queries with the same canonical form), and every id as its JSON
+  verification class (queries with the same canonical form), each query's client
+  version, and every id as its JSON
   literal. All of these are numbered by rank (id order), so candidates read in order
   are matches in output order.
 - **Percolating a document.** The document is analyzed for matching (no grams). Its
@@ -380,6 +386,17 @@ flowchart LR
     percolator keeps the plan of the last set of query segments and worker count it
     split for, so requests alternating between documents whose worker counts differ
     (one document, then two) rebuild it each time: a few hundred id reads and a sort.
+  - **Details.** Asked for matches' details, the copy that percolated reads them after
+    the matches: each matched id's query segment and ordinal (`LookupQuery`), its
+    version from the segment's version section, and, for inner hits, its query once
+    per request (parsed and compiled, `search.QueryInnerHits`), whose nested nodes'
+    inner hits it reads off the analyzed document's objects as a search reads them off a
+    hit's body. The coordinator merges each document's matches from every shard by id
+    (disjoint: a query lives on one shard).
+  - **Shards at once.** The coordinator percolates every shard's copy at once (local
+    copies on their percolators, peers over the peer API; local ones in turn, in the
+    caller's goroutine, below 64 documents, as their percolators use every core
+    already) and merges their answers; the first shard to fail cancels the rest.
   - **Exactness.** The answer is exactly the brute-force one. Property tests check that
     the candidates always include every true match, and that every program decides as
     the matcher does.

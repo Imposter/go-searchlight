@@ -744,3 +744,43 @@ func innerObject(value any, k int, spec innerSpec) (json.RawMessage, error) {
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
+
+// QueryInnerHits are the inner hits a query asks for (its nested nodes' inner_hits,
+// merged by key as a search merges them), compiled, for reading them off analyzed
+// documents: a percolation's matches report them.
+type QueryInnerHits struct {
+	specs []innerSpec
+}
+
+// NewQueryInnerHits compiles the inner hits n asks for; nil when it asks for none.
+func NewQueryInnerHits(n query.Node) *QueryInnerHits {
+	specs := innerSpecs(&Request{Query: n})
+	if len(specs) == 0 {
+		return nil
+	}
+	return &QueryInnerHits{specs: specs}
+}
+
+// Offsets returns d's inner hits by key, as a search's hit has them but without the
+// objects: how many members of the key's path satisfy the query of a nested node under
+// it (Total), and the offsets of the first size of them in the array, in array order.
+// d is analyzed, its nested fields' objects in d.Fields.
+func (q *QueryInnerHits) Offsets(d *schema.Doc) map[string]*InnerHits {
+	out := make(map[string]*InnerHits, len(q.specs))
+	for i := range q.specs {
+		spec := &q.specs[i]
+		ih := &InnerHits{Offsets: []int{}}
+		objects := d.Fields[spec.path].Objects
+		for k := range objects {
+			if !spec.match(&objects[k]) {
+				continue
+			}
+			ih.Total++
+			if len(ih.Offsets) < spec.size {
+				ih.Offsets = append(ih.Offsets, k)
+			}
+		}
+		out[spec.key] = ih
+	}
+	return out
+}

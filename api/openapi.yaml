@@ -393,6 +393,8 @@ paths:
           in: query
           schema: { type: boolean }
           description: Return each upserted document's matching saved queries.
+        - $ref: "#/components/parameters/PercolateMatches"
+        - $ref: "#/components/parameters/PercolateInnerHits"
         - $ref: "#/components/parameters/WaitForSeq"
       requestBody:
         required: true
@@ -608,6 +610,8 @@ paths:
       summary: The saved queries each document matches.
       description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it), and at most 1000000 matches, every document's together (422 too_many_matches past it; an answer is never truncated).
       parameters:
+        - $ref: "#/components/parameters/PercolateMatches"
+        - $ref: "#/components/parameters/PercolateInnerHits"
         - $ref: "#/components/parameters/WaitForSeq"
       requestBody:
         required: true
@@ -711,6 +715,16 @@ components:
       in: query
       description: Apply only if the target's current seq is this one (409 otherwise).
       schema: { type: integer, minimum: 1 }
+    PercolateMatches:
+      name: percolate_matches
+      in: query
+      description: "Each percolated document's result or item also lists matches, its matched saved queries in queries' order, each {\"id\", \"version\"} (version absent for none). On _bulk, with percolate=true."
+      schema: { type: boolean }
+    PercolateInnerHits:
+      name: percolate_inner_hits
+      in: query
+      description: "percolate_matches, and each match of a saved query whose nested nodes declare inner_hits gives inner_hits by key, {\"total\", \"offsets\"}: the document's members those nodes match, as a search reports them, without the objects. At most 100000 offsets per request (a 422 too_many_matches past them), which count against max_inflight_read_bytes while it runs."
+      schema: { type: boolean }
     Version:
       name: version
       in: query
@@ -962,6 +976,7 @@ components:
               queries:
                 type: array
                 items: { type: string }
+              matches: { type: array, items: { $ref: "#/components/schemas/PercolateMatch" }, description: "With percolate_matches or percolate_inner_hits, the matched saved queries in queries' order." }
               error: { $ref: "#/components/schemas/Problem" }
     Query:
       description: 'A tree of groups and conditions (spec section 4); {"all": []} matches every document.'
@@ -1065,6 +1080,10 @@ components:
           oneOf:
             - type: string
             - type: number
+        seq_no:
+          type: boolean
+          default: false
+          description: Give each hit its _seq, the seq of the change that wrote the version the copy holds (as Elasticsearch's seq_no_primary_term gives _seq_no); absent for a document indexed by a release before 1.5. A search with hits and seq_no reaches only nodes of 1.5 or later (search wire level 8).
         request_cache:
           type: boolean
           default: true
@@ -1093,6 +1112,7 @@ components:
             properties:
               id: { type: string }
               sort: { type: array, items: {} }
+              _seq: { type: integer, description: "With seq_no: the seq of the change that wrote the version the copy holds." }
               body: { type: object }
               inner_hits:
                 type: object
@@ -1145,6 +1165,28 @@ components:
         queries:
           type: array
           items: { type: string }
+        _seq: { type: integer, description: "A stored document's seq, as the copy that read it holds it: the version it was percolated at." }
+        matches:
+          type: array
+          description: With percolate_matches or percolate_inner_hits, the matched saved queries in queries' order.
+          items: { $ref: "#/components/schemas/PercolateMatch" }
+    PercolateMatch:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: { type: string }
+        version: { type: integer, description: "The saved query's client version; absent for none." }
+        inner_hits:
+          type: object
+          description: "With percolate_inner_hits, for a saved query whose nested nodes declare inner_hits, by key (merged as a search merges them): the document's members their queries match, as a search's inner hits but without the objects."
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [total, offsets]
+            properties:
+              total: { type: integer }
+              offsets: { type: array, items: { type: integer } }
     FieldCatalog:
       type: object
       additionalProperties: false

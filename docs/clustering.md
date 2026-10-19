@@ -369,6 +369,11 @@ each search has a wire level, the level a peer must speak to answer it exactly.
   and its endpoint, in the same way: a node of level 0 to 5 would refuse the node, or
   read the sub-field as a field no document holds and answer empty. The coordinator
   marks a search that reads one as it checks the queries against the mapping.
+- A search holding sub-aggregations under a `terms` on a sub-field needs level 7, and
+  its endpoint, in the same way: a node of level 0 to 6 would refuse them. A search
+  with `seq_no` (and a `size` past 0) needs level 8: a node of level 0 to 7 would
+  answer its hits without their seqs. Inner hits merged by name need no level: only the
+  coordinating node checks the names and reads inner hits.
 - Each reply says the level it was answered at, and the coordinator refuses one below
   the search's; a node refuses (503) a search past its own level. A later wire
   addition raises the level, so it is never silently ignored either.
@@ -390,6 +395,11 @@ each search has a wire level, the level a peer must speak to answer it exactly.
   release reads neither the mapping nor saved `box` conditions.
 - A percolation of an index whose mapping has a [nested field](api.md#nested-fields)
   needs percolate level 3, and its endpoint, in the same way.
+- A percolation asked for its matches' details (`percolate_matches`,
+  `percolate_inner_hits`) needs percolate level 4, and its endpoint, in the same way:
+  each copy reads the versions and inner hits of the saved queries it holds, which a
+  node of an earlier release would leave out. A stored document's `_seq` needs none: a
+  copy of an earlier release sends none, and the result has none.
 - A mapping is decoded by every node, so a point or nested field is not admitted while
   any node of an earlier release is live: each node heartbeats the mapping field types
   it reads (`sl_nodes.mapping_types`: 1 from point fields on, 2 from nested fields on),

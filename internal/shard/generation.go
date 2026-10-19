@@ -569,3 +569,18 @@ func reads(qi QueryIndexBuilder, format string) bool {
 	r, ok := qi.(FormatReader)
 	return ok && r.Reads(format)
 }
+
+// DocSeq returns the seq of the change that wrote document ord of Segments[seg], the
+// version the segment holds ([schema.SeqColumn]): 0 for a document indexed by a release
+// that kept none.
+func (g *Generation) DocSeq(seg int, ord uint32) int64 {
+	nc := g.Segments[seg].Reader.Numbers(schema.SeqColumn)
+	if !nc.Exists() {
+		return 0
+	}
+	v, ok := nc.Value(ord)
+	if !ok {
+		return 0
+	}
+	return int64(v)
+}

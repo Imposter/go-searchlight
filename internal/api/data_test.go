@@ -238,8 +238,9 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 	}
 
 	r = e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/p/_percolate?wait_for_seq=%d", seqOf(t, r)), `{"docs": [{"brand": "acme", "price": 50}], "ids": ["x", "missing"]}`)
-	res := r["results"].([]any) //nolint:forcetypeassert,errcheck // the shape
-	if got := fmt.Sprint(res); got != "[map[found:true queries:[acme everything]] map[found:true id:x queries:[acme cheap everything]] map[found:false id:missing queries:[]]]" {
+	res := r["results"].([]any)                               //nolint:forcetypeassert,errcheck // the shape
+	xSeq := int64(items[0].(map[string]any)["seq"].(float64)) //nolint:forcetypeassert,errcheck // the shape
+	if got := fmt.Sprint(res); got != fmt.Sprintf("[map[found:true queries:[acme everything]] map[_seq:%d found:true id:x queries:[acme cheap everything]] map[found:false id:missing queries:[]]]", xSeq) {
 		t.Errorf("percolate = %s", got)
 	}
 	p = e.problem(e.do("POST", "/indexes/p/_percolate", `{"docs": [{"brand": "a"}, "nope"]}`), 400, "invalid_request")

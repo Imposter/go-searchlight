@@ -450,7 +450,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			return nil, docProblem(err, loc)
 		}
 		res := api.PercolateResult{ID: id}
-		body, ok, err := ts[ShardFor(id, len(ts))].Get(ctx, id)
+		body, seq, ok, err := ts[ShardFor(id, len(ts))].Get(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -459,21 +459,32 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			if err != nil {
 				return nil, docProblem(err, loc)
 			}
-			res.Found = true
+			res.Found, res.Seq = true, seq
 			docs = append(docs, doc)
 			storedPositions = append(storedPositions, len(out))
 		}
 		out = append(out, res)
 	}
-	matches, err := n.percolateDocs(ctx, idx, ts, docs)
+	matches, details, err := n.percolateDocs(ctx, idx, ts, docs, MatchDetails{Versions: req.Matches || req.InnerHits, InnerHits: req.InnerHits})
+	if details != nil {
+		for i := range out {
+			out[i].Matches = []api.PercolateMatch{}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	for i := range req.Docs {
 		out[i].Queries = json.RawMessage(matches[i])
+		if details != nil {
+			out[i].Matches = details[i]
+		}
 	}
 	for k, p := range storedPositions {
 		out[p].Queries = json.RawMessage(matches[len(req.Docs)+k])
+		if details != nil {
+			out[p].Matches = details[len(req.Docs)+k]
+		}
 	}
 	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil
 }
@@ -629,7 +640,7 @@ func (n *Single) staleDocument(ctx context.Context, idx *index, id string, waitS
 		return nil, err
 	}
 	defer t.Release()
-	body, ok, err := t.Get(ctx, id)
+	body, _, ok, err := t.Get(ctx, id)
 	if err != nil {
 		return nil, cause
 	}

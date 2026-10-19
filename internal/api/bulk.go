@@ -38,7 +38,9 @@ type bulkItem struct {
 	// Queries are the upserted document's matching saved queries, with
 	// percolate=true.
 	Queries *json.RawMessage `json:"queries,omitempty"`
-	Error   map[string]any   `json:"error,omitempty"`
+	// Matches are their details, with percolate_matches or percolate_inner_hits.
+	Matches *[]PercolateMatch `json:"matches,omitempty"`
+	Error   map[string]any    `json:"error,omitempty"`
 }
 
 // bulkResponse answers a _bulk request.
@@ -90,11 +92,19 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if e != nil {
 		return e
 	}
+	withMatches, innerHits, release, e := s.percolateDetails(p)
+	if e != nil {
+		return e
+	}
+	defer release()
+	if withMatches && !perc {
+		return InvalidAt("params.percolate_matches", "percolate_matches and percolate_inner_hits detail a percolation: give percolate=true")
+	}
 	ops, err := s.parseBulk(r.Body)
 	if err != nil {
 		return err
 	}
-	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{Refresh: refresh, Percolate: perc, WaitForSeq: wait})
+	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitForSeq: wait})
 	if err != nil {
 		return err
 	}
@@ -129,6 +139,13 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 				q = json.RawMessage(emptyArray)
 			}
 			item.Queries = &q
+			if perc && withMatches {
+				ms := it.Matches
+				if ms == nil {
+					ms = []PercolateMatch{}
+				}
+				item.Matches = &ms
+			}
 		}
 		out.Items[i] = item
 	}

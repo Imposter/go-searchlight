@@ -123,6 +123,12 @@ func TooMany(retry time.Duration, format string, args ...any) *Error {
 // tooManyMatches is the 422 of a percolation whose documents match more than
 // percolate.MaxMatches saved queries together, caused by err when a copy refused it.
 func tooManyMatches(err error) *Error {
+	if errors.Is(err, ErrTooManyInnerHits) {
+		return &Error{
+			Status: http.StatusUnprocessableEntity, Code: CodeTooManyMatches, Err: err,
+			Detail: fmt.Sprintf("the matches' inner hits hold more than %d offsets together: percolate fewer documents per request", MaxPercolateInnerHits),
+		}
+	}
 	return &Error{
 		Status: http.StatusUnprocessableEntity, Code: CodeTooManyMatches, Err: err,
 		Detail: fmt.Sprintf("the documents match more than %d saved queries together: percolate fewer documents per request", percolate.MaxMatches),
@@ -232,3 +238,12 @@ func writeProblem(w http.ResponseWriter, e *Error, requestID string) {
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(append(b, '\n'))
 }
+
+// MaxPercolateInnerHits bounds the inner hit offsets one percolation reports, every
+// document's and every match's together.
+const MaxPercolateInnerHits = 100_000
+
+// ErrTooManyInnerHits is a percolation whose matches' inner hits hold more than
+// MaxPercolateInnerHits offsets together: it is refused as one with too many matches is
+// (it wraps percolate.ErrTooManyMatches), a 422 too_many_matches.
+var ErrTooManyInnerHits = fmt.Errorf("%w: their inner hits hold more than %d offsets together", percolate.ErrTooManyMatches, MaxPercolateInnerHits)

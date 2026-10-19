@@ -62,7 +62,7 @@ func TestRefreshDisabledReadsRefreshOnDemand(t *testing.T) {
 		cancel()
 		t.Fatalf("a peer's read with wait_for_seq: %v", err)
 	}
-	_, found, err := target.Get(c, "e")
+	_, _, found, err := target.Get(c, "e")
 	target.Release()
 	cancel()
 	if err != nil || !found {

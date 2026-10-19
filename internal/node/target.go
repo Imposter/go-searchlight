@@ -33,15 +33,31 @@ func (t *localTarget) Fetch(ctx context.Context, hits []search.Hit, fields []str
 	return search.FetchShard(ctx, t.g, hits, fields)
 }
 
-func (t *localTarget) Percolate(ctx context.Context, _ json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error) {
+func (t *localTarget) Percolate(ctx context.Context, _ json.RawMessage, docs []schema.Doc, details MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error) {
 	if t.g.NumQueries() == 0 {
-		return make([]percolate.IDs, len(docs)), nil
+		return make([]percolate.IDs, len(docs)), nil, nil
 	}
-	return t.c.perc.Percolate(ctx, t.g, docs)
+	ids, err := t.c.perc.Percolate(ctx, t.g, docs)
+	if err != nil || !details.Any() {
+		return ids, nil, err
+	}
+	matches, err := matchDetails(t.g, details, docs, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ids, matches, nil
 }
 
-func (t *localTarget) Get(_ context.Context, id string) ([]byte, bool, error) {
-	return t.g.Get(id)
+func (t *localTarget) Get(_ context.Context, id string) ([]byte, int64, bool, error) {
+	seg, ord, ok := t.g.Lookup(id)
+	if !ok {
+		return nil, 0, false, nil
+	}
+	body, err := t.g.Segments[seg].Reader.Stored(ord)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return body, t.g.DocSeq(seg, ord), true, nil
 }
 
 func (t *localTarget) GetQuery(_ context.Context, id string) (*api.SavedQuery, bool, error) {
@@ -111,20 +127,20 @@ func (f *fallbackTarget) Fetch(ctx context.Context, hits []search.Hit, fields []
 	return f.used.Fetch(ctx, hits, fields)
 }
 
-func (f *fallbackTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) (out []percolate.IDs, err error) {
+func (f *fallbackTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc, details MatchDetails) (out []percolate.IDs, matches [][]api.PercolateMatch, err error) {
 	err = f.first(func(t ShardTarget) error {
-		out, err = t.Percolate(ctx, mapping, docs)
+		out, matches, err = t.Percolate(ctx, mapping, docs, details)
 		return err
 	})
-	return out, err
+	return out, matches, err
 }
 
-func (f *fallbackTarget) Get(ctx context.Context, id string) (body []byte, found bool, err error) {
+func (f *fallbackTarget) Get(ctx context.Context, id string) (body []byte, seq int64, found bool, err error) {
 	err = f.first(func(t ShardTarget) error {
-		body, found, err = t.Get(ctx, id)
+		body, seq, found, err = t.Get(ctx, id)
 		return err
 	})
-	return body, found, err
+	return body, seq, found, err
 }
 
 func (f *fallbackTarget) GetQuery(ctx context.Context, id string) (q *api.SavedQuery, found bool, err error) {

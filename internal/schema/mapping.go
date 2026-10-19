@@ -615,3 +615,9 @@ func (e *ValidationError) Error() string {
 	}
 	return fmt.Sprintf("field %q: %s", e.Field, e.Message)
 }
+
+// SeqColumn is the numeric column a shard keeps each document's seq in, the seq of the
+// change that wrote the version it holds: a name no mapping or document can give a
+// field, since analysis reads a NUL in a member's name as U+FFFD. No query reads it; a
+// hit's and a percolated document's _seq are read from it.
+const SeqColumn = "\x00seq"

@@ -27,8 +27,26 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   per-item results; a document percolates against the queries written before it.
 - **A lean saved-query listing**: `GET .../queries?fields=id,version` pages ids and
   versions without reading the queries' trees or meta.
+- **Percolation matches with versions and inner hits** ([docs/api.md](docs/api.md#percolation)):
+  `percolate_matches=true` on `_percolate` and `_bulk?percolate=true` adds `matches`,
+  each matched saved query as `{"id", "version"}` beside the unchanged `queries`, and
+  `percolate_inner_hits=true` adds to each the inner hits its nested nodes declare,
+  `{"total", "offsets"}` by key, as a search reports them for the document (at most
+  100,000 offsets per request, charged to `max_inflight_read_bytes`; past them a 422
+  `too_many_matches`). Percolate wire level 4 keeps them off peers of an earlier
+  release.
+- **Document seqs in answers**: a search's `seq_no: true` gives each hit `_seq`, the seq
+  of the change that wrote the version its copy holds (search wire level 8), and
+  `_percolate` gives each found stored document its `_seq`. Each copy keeps the seqs in a
+  column of its own from this release; documents indexed before have none until written
+  again.
 
 ### Changed
+
+- **Percolation fans out to every shard at once** instead of one after another (this
+  node's own copies at once for 64 documents or more: 200 documents on 8 shards take
+  2.5 ms against 3.3 ms; fewer run in turn while the peers answer), and
+  merges their matches; a shard that fails cancels the rest.
 
 - **Saved-query listings page each shard in its primary key's order** and merge them by
   id, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every

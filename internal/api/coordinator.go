@@ -272,6 +272,11 @@ type WriteOptions struct {
 	Refresh RefreshMode
 	// Percolate returns each upserted document's matching saved queries.
 	Percolate bool
+	// Matches, with Percolate, fills each upserted document's ItemResult.Matches: its
+	// matched saved queries with their versions, and with them, under InnerHits, the
+	// document's nested objects their inner_hits match.
+	Matches   bool
+	InnerHits bool
 	// WaitForSeq, with Percolate, waits for this node's copies to have every change
 	// up to it searchable before percolating, so saved queries written up to it are
 	// seen.
@@ -312,6 +317,9 @@ type ItemResult struct {
 	// Queries are the ids of the saved queries the upserted document matches, with
 	// WriteOptions.Percolate: a JSON array of strings, sorted (nil for none).
 	Queries json.RawMessage
+	// Matches are those saved queries' details, in Queries' order, with
+	// WriteOptions.Matches.
+	Matches []PercolateMatch
 }
 
 // ReadOptions are a read's parameters.
@@ -367,6 +375,10 @@ type PercolateResponse struct {
 type PercolateRequest struct {
 	Docs []json.RawMessage
 	IDs  []string
+	// Matches fills each result's Matches, and InnerHits their inner hits (as
+	// WriteOptions').
+	Matches   bool
+	InnerHits bool
 }
 
 // PercolateResult is one percolated document's matches. Results list Docs first,
@@ -379,6 +391,12 @@ type PercolateResult struct {
 	// Queries are the ids of the saved queries the document matches: a JSON array of
 	// strings, sorted (nil for none), written into the response as it is.
 	Queries json.RawMessage `json:"queries"`
+	// Seq is a stored document's seq, as the copy that read it holds it (0 when it
+	// kept none, or for a given document).
+	Seq int64 `json:"_seq,omitempty"`
+	// Matches are the matched saved queries' details, in Queries' order, when the
+	// request asked for them.
+	Matches []PercolateMatch `json:"matches,omitempty"`
 }
 
 // FieldCatalog describes an index's fields.
@@ -488,4 +506,22 @@ func strictDecode(data []byte, v any) error {
 		return errors.New("trailing data after the JSON value")
 	}
 	return nil
+}
+
+// PercolateMatch is one saved query a document matches, as a percolation asked for
+// Matches reports it: its id, its client version (0 for none), and, with InnerHits,
+// the document's nested objects that the inner_hits its nested nodes declare match,
+// by key.
+type PercolateMatch struct {
+	ID        string                         `json:"id"`
+	Version   int64                          `json:"version,omitempty"`
+	InnerHits map[string]*PercolateInnerHits `json:"inner_hits,omitempty"`
+}
+
+// PercolateInnerHits are a match's inner hits under one key, as a search's are but
+// without the objects: how many members of the path its nested nodes' queries match
+// (Total), and the offsets of the first size of them, in array order.
+type PercolateInnerHits struct {
+	Total   int   `json:"total"`
+	Offsets []int `json:"offsets"`
 }

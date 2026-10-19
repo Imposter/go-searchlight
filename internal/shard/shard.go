@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -786,7 +787,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		c := &changes[i]
 		switch c.Kind {
 		case Upsert:
-			s.buf.putDoc(c.id(), c.Seq, c.Doc)
+			s.buf.putDoc(c.id(), c.Seq, withSeq(c.Doc, c.Seq))
 		case Delete:
 			s.buf.putDoc(c.id(), c.Seq, nil)
 		case QueryUpsert:
@@ -1095,4 +1096,15 @@ func (s *Shard) refreshLoop() {
 			}
 		},
 	}.Run(s.bg)
+}
+
+// withSeq returns d with its seq in [schema.SeqColumn], the fields copied: the caller's
+// document is left as it is.
+func withSeq(d *schema.Doc, seq int64) *schema.Doc {
+	out := *d
+	out.Fields = make(map[string]schema.Value, len(d.Fields)+1)
+	maps.Copy(out.Fields, d.Fields)
+	v := float64(seq)
+	out.Fields[schema.SeqColumn] = schema.Value{Present: true, Number: &v}
+	return &out
 }

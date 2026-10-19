@@ -172,6 +172,9 @@ type Request struct {
 	Timeout time.Duration
 	// Index labels the search's spans, logs and metrics.
 	Index string
+	// SeqNo gives each hit its Seq, as Elasticsearch's seq_no_primary_term gives
+	// _seq_no: the seq of the change that wrote the version a copy holds.
+	SeqNo bool
 	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
@@ -344,7 +347,7 @@ func (ps *problems) add(loc, format string, args ...any) {
 }
 
 // ParseRequest reads a search request body: {query, post_filter, sort, size, from,
-// search_after, track_total, aggs, fields, timeout, request_cache}, Elasticsearch
+// search_after, track_total, aggs, fields, seq_no, timeout, request_cache}, Elasticsearch
 // style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
@@ -357,7 +360,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
-//   - request_cache: false keeps a size-0 search out of the shard request cache.
+//   - request_cache: false keeps a size-0 search out of the shard request cache;
+//   - seq_no: true gives each hit the seq of the change that wrote it.
 //
 // A missing query matches every document, and a missing size is DefaultSize. It
 // returns every problem found, each with its loc ("sort.1",
@@ -439,6 +443,15 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Fields = fields
+		case "seq_no":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				r.SeqNo = true
+			case "false":
+				r.SeqNo = false
+			default:
+				ps.add("seq_no", "seq_no is true or false")
+			}
 		case "request_cache":
 			switch string(bytes.TrimSpace(val)) {
 			case "true":
@@ -456,7 +469,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.Timeout = d
 		default:
-			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout and request_cache")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, seq_no, timeout and request_cache")
 		}
 	}
 	switch {

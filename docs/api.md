@@ -635,6 +635,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
 
   Any cut sets `timed_out: true`. The hits found are fetched past the deadline, and
   the response written after it.
+- **`seq_no`** (`false` by default), as Elasticsearch's `seq_no_primary_term`: each hit
+  carries `_seq`, the seq of the change that wrote the version its copy holds (absent
+  for a document indexed by a release before 1.5, until it is written again or its
+  copy rebuilt). It is the same seq a write answered, and a percolation's `_seq`, so a
+  client can tell which of two answers saw the newer document. A search with hits and
+  `seq_no` reaches only nodes of 1.5 or later (search wire level 8).
 - **`request_cache`** (`true` by default), Elasticsearch's shard request cache. A search
   with `size` 0 (a count, or aggregations only; no `from` or `search_after`) is
   answered, shard by shard, from what an identical search of the same shard contents
@@ -832,13 +838,45 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
   order.
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
-  pass `wait_for_seq` to see a recent write.
+  pass `wait_for_seq` to see a recent write. Each found one's result carries `_seq`,
+  the seq of the change that wrote the version the copy percolated (absent for a
+  document indexed by a release before 1.5), so a client can order its decisions by
+  document version.
+- **Shards at once.** The node sends the documents to every peer's copy at once (its own
+  copies too for 64 documents or more; fewer, it runs them in turn while the peers
+  answer) and merges their matches (a saved query lives on the shard its id hashes to); a shard
+  that fails cancels the others.
+- **Matches with versions: `percolate_matches=true`.** Each result also lists
+  `matches`, its matched saved queries in `queries`' order, each with its client
+  [version](#saved-queries) (absent for none). `queries` stays as it was, so a client
+  that does not ask sees no change.
+- **Inner hits: `percolate_inner_hits=true`** (implies `percolate_matches`). Each match
+  of a saved query whose nested nodes declare `inner_hits` gives them by key, merged by
+  name as a [search](#nested-fields) merges them, as `{"total", "offsets"}`: the
+  document's members those nodes' queries match, the first `size` (the saved query's)
+  by their offsets, exactly what a search of that saved query reports for the document,
+  without the objects. The copy that holds the saved query reads them off the
+  document as it percolated it.
+
+  ```json
+  {"results": [{"found": true, "queries": ["s7"], "matches": [
+    {"id": "s7", "version": 3, "inner_hits": {"picked": {"total": 2, "offsets": [0, 3]}}}]}]}
+  ```
+
+  Both parameters work on `_bulk?percolate=true` too, each upserted document's item
+  carrying `matches` beside `queries` (and `seq`, the version it was percolated at).
+  With them, a percolation reaches only nodes of 1.5 or later (percolate wire level 4).
 - **Limits.**
   - Up to 10,000 documents per request, given and stored together. More is a 413.
   - At most 1,000,000 matches per request, every document's together. Past it, the
     request is refused with a 422 whose code is `too_many_matches`: percolate fewer
     documents per request. An answer is never truncated, since a missing match is
     a wrong answer.
+  - With `percolate_inner_hits`, at most 100,000 inner hit offsets per request, every
+    match's together: past them, the same 422 `too_many_matches` (`_bulk`:
+    `percolated: false`, `percolate_reason: "too_many_matches"`). The request reserves
+    what they may take (16 bytes each, at most half the budget) from
+    `max_inflight_read_bytes` while it runs.
 - **Server time.** `took_ms` and `took_us` are the server's time for the request, from
   its admission to the last byte of its answer encoded, in whole milliseconds and
   microseconds. The `Server-Timing` header carries the same time

@@ -27,7 +27,7 @@ func TestSplitWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 		qp := func(i int) []byte {
-			p, err := EncodeQueryPayload(json.RawMessage(fmt.Sprintf(`{"eq":{"n":%d}}`, i)), json.RawMessage(`{"pad":"`+strings.Repeat("m", 40)+`"}`))
+			p, err := EncodeQueryPayload(json.RawMessage(fmt.Sprintf(`{"eq":{"n":%d}}`, i)), json.RawMessage(`{"pad":"`+strings.Repeat("m", 40)+`"}`), 0)
 			if err != nil {
 				t.Fatal(err)
 			}

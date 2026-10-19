@@ -37,11 +37,11 @@ import (
 //
 //	POST   /_internal/hint                      push hints: wake the named copies' tailers
 //	POST   /_internal/search                    a shard's query (or whole search) on this node's copy
-//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 6 (searchPath)
+//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 8 (searchPath)
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
-//	POST   /_internal/percolate/{level}         the same, for a percolation of wire level 1 to 3 (percolatePath)
+//	POST   /_internal/percolate/{level}         the same, for a percolation of wire level 1 to 4 (percolatePath)
 //	POST   /_internal/get                       a stored document or saved query from a copy
 //	POST   /_internal/wait                      wait until a copy has a seq searchable
 //	POST   /_internal/counts                    a copy's live documents and saved queries
@@ -339,7 +339,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 		case olderNoEndpoint:
 			return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
 		case olderDropsLevel:
-			msg.Now, level = nil, h.olderLevel
+			msg.Now, msg.Details, level = nil, nil, h.olderLevel
 		}
 	}
 	if msg.Now != nil {
@@ -366,7 +366,11 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 		return nil, err
 	}
 	defer t.Release()
-	matches, err := t.Percolate(ctx, msg.Mapping, docs)
+	var details node.MatchDetails
+	if msg.Details != nil {
+		details = *msg.Details
+	}
+	matches, found, err := t.Percolate(ctx, msg.Mapping, docs, details)
 	if err != nil {
 		return nil, err
 	}
@@ -377,7 +381,10 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 			out[i] = json.RawMessage("[]")
 		}
 	}
-	return &percolateReply{Matches: out, Stale: t.Stale(), Level: level}, nil
+	if details.Any() && found == nil {
+		found = make([][]api.PercolateMatch, len(docs))
+	}
+	return &percolateReply{Matches: out, Details: found, Stale: t.Stale(), Level: level}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {
@@ -395,7 +402,7 @@ func (p *peerAPI) get(r *http.Request) (any, error) {
 	if msg.Query {
 		reply.Saved, reply.Found, err = t.GetQuery(ctx, msg.ID)
 	} else {
-		reply.Body, reply.Found, err = t.Get(ctx, msg.ID)
+		reply.Body, reply.Seq, reply.Found, err = t.Get(ctx, msg.ID)
 	}
 	if err != nil {
 		return nil, err

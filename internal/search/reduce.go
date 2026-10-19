@@ -30,7 +30,7 @@ func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	sorts := prepareSorts(r.Sort, nil, new(problems))
 	var specs []*aggSpec
 	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, "", new(problems)); s != nil {
+		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, new(problems)); s != nil {
 			specs = append(specs, s)
 		}
 	}
@@ -263,6 +263,7 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 		returned += b.DocCount
 		out := finishBucket(b, spec)
 		out.DocCountErrorUpperBound = errs[b]
+		boundSubTerms(out, spec)
 		res.Buckets = append(res.Buckets, out)
 	}
 	res.SumOtherDocCount = docs - returned
@@ -367,7 +368,8 @@ func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
 // order, when they fit in what is left; one whose do not is marked Truncated. The
 // aggregations under a filter, filters or global aggregation's buckets are bounded in
 // turn, right after it; its own buckets (one, or at most MaxFilters+1) count but are
-// never cut.
+// never cut. A terms aggregation's terms sub-aggregations (under a terms on a
+// sub-field) are bounded right after its own buckets, bucket by bucket.
 func boundBuckets(specs []*aggSpec, results map[string]*AggResult) {
 	left := MaxBuckets
 	cutBuckets(specs, results, &left)
@@ -398,6 +400,11 @@ func cutBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
 			res.Buckets, res.Truncated = res.Buckets[:*left], true
 		}
 		*left -= len(res.Buckets)
+		if spec.typ == AggTerms {
+			for _, b := range res.Buckets {
+				cutBuckets(spec.subs, b.Aggs, left)
+			}
+		}
 	}
 }
 
@@ -490,4 +497,24 @@ func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 	added := len(out) - len(res.Buckets)
 	res.Buckets = out
 	return added
+}
+
+// boundSubTerms gives the terms sub-aggregations of bucket b (a terms aggregation's,
+// spec's) b's own error bound. A terms sub-aggregation is never cut by a shard, but the
+// shards that cut b out of their lists counted its documents under none of its
+// sub-buckets: those documents, at most b's bound, may be missing from each of them.
+func boundSubTerms(b *Bucket, spec *aggSpec) {
+	if b.DocCountErrorUpperBound == 0 {
+		return
+	}
+	for _, sub := range spec.subs {
+		res := b.Aggs[sub.name]
+		if sub.typ != AggTerms || res == nil {
+			continue
+		}
+		res.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		for _, sb := range res.Buckets {
+			sb.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		}
+	}
 }

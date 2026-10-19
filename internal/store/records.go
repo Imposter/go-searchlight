@@ -1,10 +1,12 @@
 package store
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -18,8 +20,10 @@ type RecordReader interface {
 	// (RecordQuery) id of shard, or ErrNotFound.
 	GetRecord(ctx context.Context, kind RecordKind, shard ShardID, id string) (Record, error)
 	// ListQueries returns up to limit saved queries of index, across its
-	// shards, with ids above after (all when after is ""), by id.
-	ListQueries(ctx context.Context, index, after string, limit int) ([]Record, error)
+	// shards, with ids above after (all when after is ""), by id. With lean, each
+	// record holds its id, shard, seq and version alone, and the queries' trees and
+	// meta are never read.
+	ListQueries(ctx context.Context, index, after string, limit int, lean bool) ([]Record, error)
 }
 
 var _ RecordReader = (*sqlStore)(nil)
@@ -45,14 +49,14 @@ func (s *sqlStore) GetRecord(ctx context.Context, kind RecordKind, shard ShardID
 	case RecordDocument:
 		var plain, z []byte
 		row = s.r.QueryRowContext(ctx, s.d.Records.GetDocument, shard.Index, shard.Shard, id)
-		if err = row.Scan(&plain, &z, &r.Seq); err == nil {
+		if err = row.Scan(&plain, &z, &r.Seq, &r.Version); err == nil {
 			if r.Body, err = readBody(plain, z); err != nil {
 				return r, &CorruptError{Shard: shard, Seq: r.Seq, ID: id, Err: err}
 			}
 		}
 	case RecordQuery:
 		row = s.r.QueryRowContext(ctx, s.d.Records.GetQuery, shard.Index, shard.Shard, id)
-		err = row.Scan(&r.Body, &r.Meta, &r.Seq)
+		err = row.Scan(&r.Body, &r.Meta, &r.Seq, &r.Version)
 	default:
 		return r, invalidf("record kind %d", kind)
 	}
@@ -62,8 +66,18 @@ func (s *sqlStore) GetRecord(ctx context.Context, kind RecordKind, shard ShardID
 	return r, err
 }
 
-func (s *sqlStore) ListQueries(ctx context.Context, index, after string, limit int) (out []Record, err error) {
-	ctx, end := s.start(ctx, "list_queries", attribute.String("index", index))
+// pageShards is the most shards one page statement reads: SQLite takes at most 500
+// selects in one compound select.
+const pageShards = 200
+
+// ListQueries pages the index's queries in two steps, each one statement in one
+// snapshot: the page's ids, seqs and versions, the first limit by id of every shard's
+// primary key range above after (each shard's cut at limit, so the database reads what
+// it returns on every shard and sends limit rows), then, unless lean, the trees and meta
+// of those ids alone. An index of more than pageShards shards takes one statement per
+// pageShards of them for the ids, their pages merged by id.
+func (s *sqlStore) ListQueries(ctx context.Context, index, after string, limit int, lean bool) (out []Record, err error) {
+	ctx, end := s.start(ctx, "list_queries", attribute.String("index", index), attribute.Bool("lean", lean))
 	defer end(&err)
 	if s.closed.Load() {
 		return nil, ErrClosed
@@ -74,17 +88,143 @@ func (s *sqlStore) ListQueries(ctx context.Context, index, after string, limit i
 	if limit <= 0 || limit > MaxListLimit {
 		return nil, invalidf("limit %d is not 1 to %d", limit, MaxListLimit)
 	}
-	rows, err := s.r.QueryContext(ctx, s.d.Records.ListQueries, index, after, limit)
+	tx, err := s.r.BeginTx(ctx, s.d.SnapshotTx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(tx)
+	var mapping, settings []byte
+	var version, mv int64
+	var uid string
+	switch err := tx.QueryRowContext(ctx, s.d.Indexes.Current, index).Scan(&mapping, &settings, &version, &mv, &uid); {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	}
+	shards, err := settingsShards(settings)
+	if err != nil {
+		return nil, err
+	}
+	for first := 0; first < shards; first += pageShards {
+		part := make([]int, 0, min(pageShards, shards-first))
+		args := make([]any, 0, 3*cap(part)+1)
+		for sh := first; sh < min(first+pageShards, shards); sh++ {
+			part = append(part, sh)
+			args = append(args, index, after, limit)
+		}
+		page, err := s.queryPage(ctx, tx, index, part, append(args, limit))
+		if err != nil {
+			return nil, err
+		}
+		out = mergeByID([][]Record{out, page}, limit)
+	}
+	if !lean && len(out) > 0 {
+		if err := s.fillQueries(ctx, tx, index, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, tx.Commit()
+}
+
+func (s *sqlStore) queryPage(ctx context.Context, tx *sql.Tx, index string, shards []int, args []any) ([]Record, error) {
+	rows, err := tx.QueryContext(ctx, s.d.Records.QueryPage(shards), args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	var out []Record
 	for rows.Next() {
 		r := Record{Kind: RecordQuery, Index: index}
-		if err := rows.Scan(&r.Shard, &r.ID, &r.Body, &r.Meta, &r.Seq); err != nil {
+		if err := rows.Scan(&r.Shard, &r.ID, &r.Seq, &r.Version); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// fillQueries reads the trees and meta of page's queries, by shard and id.
+func (s *sqlStore) fillQueries(ctx context.Context, tx *sql.Tx, index string, page []Record) error {
+	byShard := map[int][]int{}
+	var order []int
+	for i := range page {
+		if _, ok := byShard[page[i].Shard]; !ok {
+			order = append(order, page[i].Shard)
+		}
+		byShard[page[i].Shard] = append(byShard[page[i].Shard], i)
+	}
+	counts := make([]int, len(order))
+	args := []any{index}
+	for k, sh := range order {
+		counts[k] = len(byShard[sh])
+		args = append(args, sh)
+		for _, i := range byShard[sh] {
+			args = append(args, page[i].ID)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, s.d.Records.QueriesByID(counts), args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	at := make(map[[2]string]int, len(page))
+	for i := range page {
+		at[[2]string{strconv.Itoa(page[i].Shard), page[i].ID}] = i
+	}
+	for rows.Next() {
+		var shard int
+		var id string
+		var query, meta []byte
+		if err := rows.Scan(&shard, &id, &query, &meta); err != nil {
+			return err
+		}
+		if i, ok := at[[2]string{strconv.Itoa(shard), id}]; ok {
+			page[i].Body, page[i].Meta = query, meta
+		}
+	}
+	return rows.Err()
+}
+
+// mergeByID merges pages, each sorted by id (ids are unique across them: a query lives
+// on one shard), into the first limit records by id.
+func mergeByID(pages [][]Record, limit int) []Record {
+	var nonEmpty [][]Record
+	for _, p := range pages {
+		if len(p) > 0 {
+			nonEmpty = append(nonEmpty, p)
+		}
+	}
+	switch len(nonEmpty) {
+	case 0:
+		return nil
+	case 1:
+		return nonEmpty[0][:min(len(nonEmpty[0]), limit)]
+	}
+	h := pageHeap(nonEmpty)
+	heap.Init(&h)
+	var out []Record
+	for len(h) > 0 && len(out) < limit {
+		out = append(out, h[0][0])
+		if h[0] = h[0][1:]; len(h[0]) == 0 {
+			heap.Pop(&h)
+		} else {
+			heap.Fix(&h, 0)
+		}
+	}
+	return out
+}
+
+// pageHeap orders pages by their first record's id.
+type pageHeap [][]Record
+
+func (h pageHeap) Len() int           { return len(h) }
+func (h pageHeap) Less(i, j int) bool { return h[i][0].ID < h[j][0].ID }
+func (h pageHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *pageHeap) Push(x any)        { *h = append(*h, x.([]Record)) } //nolint:forcetypeassert,errcheck // only pages
+func (h *pageHeap) Pop() any {
+	old := *h
+	p := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return p
 }

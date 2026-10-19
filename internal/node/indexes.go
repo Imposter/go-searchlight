@@ -402,6 +402,9 @@ func (n *Single) PatchSettings(ctx context.Context, name string, patch api.Setti
 		if patch.RefreshInterval != nil {
 			s.RefreshInterval = *patch.RefreshInterval
 		}
+		if patch.GCDeletes != nil {
+			s.GCDeletes = *patch.GCDeletes
+		}
 		if patch.ReplicasPerShard != nil {
 			s.ReplicasPerShard = *patch.ReplicasPerShard
 		}

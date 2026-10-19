@@ -1,5 +1,10 @@
 package dialect
 
+import (
+	"fmt"
+	"strings"
+)
+
 // The statement tables. Every field is one statement in the engine's own
 // spelling (placeholders, upserts, row locks, its clock), documented here by
 // the arguments it takes, in order, and the columns it returns, in order. NOW
@@ -65,24 +70,44 @@ func Blob(b []byte) any {
 }
 
 // DocumentRow is a document's new state: its body in Body (text) or BodyZ (body_z;
-// see ChangeRow). An upsert sets both columns.
+// see ChangeRow), and the client version its write named (0 for none). An upsert
+// sets every column.
 type DocumentRow struct {
-	Index string
-	Shard int
-	ID    string
-	Body  string
-	BodyZ []byte
-	Seq   int64
+	Index   string
+	Shard   int
+	ID      string
+	Body    string
+	BodyZ   []byte
+	Seq     int64
+	Version int64
 }
 
 // QueryRow is a saved query's new state.
 type QueryRow struct {
-	Index string
-	Shard int
-	ID    string
-	Query string
-	Meta  string
-	Seq   int64
+	Index   string
+	Shard   int
+	ID      string
+	Query   string
+	Meta    string
+	Seq     int64
+	Version int64
+}
+
+// Tombstone kinds: what a tombstone keeps the version of.
+const (
+	TombstoneDocument = "d"
+	TombstoneQuery    = "q"
+)
+
+// TombstoneRow is the version a delete keeps of an id (sl_tombstones).
+type TombstoneRow struct {
+	Index   string
+	Shard   int
+	Kind    string
+	ID      string
+	Version int64
+	// At is when the delete committed, by the database clock (Unix ms).
+	At int64
 }
 
 // DeleteGroup is the ids of one shard of one index to delete.
@@ -95,16 +120,20 @@ type DeleteGroup struct {
 // Write is everything a transaction holding the counter lock writes once
 // the store has allocated its seqs: the changelog rows, the net effect on
 // sl_documents and sl_queries (at most one entry per key across the upserts
-// and deletes of a table), the counter's new value, and the notification
-// payloads (only when the dialect has Listen).
+// and deletes of a table), the tombstones versioned deletes keep and those
+// versioned upserts replace (at most one entry per key across both), the
+// counter's new value, and the notification payloads (only when the dialect has
+// Listen).
 type Write struct {
-	Changes         []ChangeRow
-	Documents       []DocumentRow
-	Queries         []QueryRow
-	DocumentDeletes []DeleteGroup
-	QueryDeletes    []DeleteGroup
-	Counter         int64
-	Notify          []string
+	Changes          []ChangeRow
+	Documents        []DocumentRow
+	Queries          []QueryRow
+	DocumentDeletes  []DeleteGroup
+	QueryDeletes     []DeleteGroup
+	Tombstones       []TombstoneRow
+	TombstoneDeletes []TombstoneRow
+	Counter          int64
+	Notify           []string
 }
 
 // Changelog is the write-ahead log and the documents and saved queries it
@@ -130,9 +159,11 @@ type Changelog struct {
 	ReadTip string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
-	// DocumentSeq and QuerySeq: (index, shard, id) -> seq.
-	DocumentSeq string
-	QuerySeq    string
+	// DocumentState and QueryState: (index, shard, id) -> seq, version.
+	DocumentState string
+	QueryState    string
+	// Tombstone: (index, shard, kind, id) -> version of sl_tombstones.
+	Tombstone string
 	// Write returns the statements that store w, in order, inside the
 	// transaction holding the counter lock, splitting a batch so that no
 	// statement passes l. The store prepares a statement text that runs
@@ -150,19 +181,68 @@ type Changelog struct {
 	Horizon string
 	// ScanDocuments: (index, shard) -> id, body, body_z, seq, by id.
 	ScanDocuments string
-	// ScanQueries: (index, shard) -> id, query, meta, seq, by id.
+	// ScanQueries: (index, shard) -> id, query, meta, seq, version, by id.
 	ScanQueries string
 }
 
 // Records reads the system of record directly.
 type Records struct {
-	// GetDocument: (index, shard, id) -> body, body_z, seq.
+	// GetDocument: (index, shard, id) -> body, body_z, seq, version.
 	GetDocument string
-	// GetQuery: (index, shard, id) -> query, meta, seq.
+	// GetQuery: (index, shard, id) -> query, meta, seq, version.
 	GetQuery string
-	// ListQueries: (index, after, limit) -> shard, id, query, meta, seq of the
-	// index's saved queries with id > after, by id.
-	ListQueries string
+	// QueryPage returns the statement that pages saved queries over shards: (index, after
+	// and limit per shard, then limit) -> shard, id, seq, version of the first
+	// limit queries with id > after across them, by id. Each shard's part is a range of
+	// its primary key, (index, shard, id), cut at limit, so the page costs what it
+	// returns on every shard however many queries they hold.
+	QueryPage func(shards []int) string
+	// QueriesByID returns the statement that reads saved queries by shard and id: (index,
+	// then per group its shard and its counts[i] ids) -> shard, id, query, meta of those
+	// that exist.
+	QueriesByID func(counts []int) string
+}
+
+// QueryPageSQL is Records.QueryPage in a dialect whose n-th placeholder (from 1) ph
+// spells: a UNION ALL of the shards' key ranges.
+func QueryPageSQL(shards []int, ph func(int) string) string {
+	var b strings.Builder
+	n := 1
+	b.WriteString("SELECT shard, id, seq, version FROM (")
+	for i, s := range shards {
+		if i > 0 {
+			b.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&b, "SELECT * FROM (SELECT shard, id, seq, version FROM sl_queries WHERE index_name = %s AND shard = %d AND id > %s ORDER BY id LIMIT %s) AS s%d",
+			ph(n), s, ph(n+1), ph(n+2), i)
+		n += 3
+	}
+	fmt.Fprintf(&b, ") AS page ORDER BY id LIMIT %s", ph(n))
+	return b.String()
+}
+
+// QueriesByIDSQL is Records.QueriesByID in a dialect whose n-th placeholder ph spells.
+func QueriesByIDSQL(counts []int, ph func(int) string) string {
+	var b strings.Builder
+	n := 2
+	fmt.Fprintf(&b, "SELECT shard, id, query, meta FROM sl_queries WHERE index_name = %s AND (", ph(1))
+	for i, c := range counts {
+		if i > 0 {
+			b.WriteString(" OR ")
+		}
+		fmt.Fprintf(&b, "(shard = %s AND id IN (", ph(n))
+		n++
+		for k := range c {
+			if k > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(ph(n))
+			n++
+		}
+		b.WriteString("))")
+	}
+	b.WriteString(")")
+	return b.String()
 }
 
 // Registry is the cluster registry: sl_nodes and the shard-copy slots of
@@ -290,13 +370,16 @@ type Indexes struct {
 	Update string
 	// Drop: (name) deletes the index's row.
 	Drop string
-	// DropData: each (name), deletes the index's documents, queries,
+	// DropData: each (name), deletes the index's documents, queries, tombstones,
 	// changes, prune horizons and shard copies.
 	DropData []string
 }
 
 // Maintenance is pruning and the schema migrations.
 type Maintenance struct {
+	// PruneTombstones: (index, age_ms) deletes the index's tombstones older than age_ms by
+	// NOW.
+	PruneTombstones string
 	// MinSeq: (index, shard, below) -> the lowest seq of the shard's changes
 	// below below, or NULL.
 	MinSeq string

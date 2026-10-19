@@ -783,11 +783,11 @@ func (f *faultStore) GetRecord(ctx context.Context, kind store.RecordKind, id st
 	return f.Store.(store.RecordReader).GetRecord(ctx, kind, id, rec) //nolint:forcetypeassert,errcheck // every SQL store reads records
 }
 
-func (f *faultStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {
+func (f *faultStore) ListQueries(ctx context.Context, index, after string, limit int, lean bool) ([]store.Record, error) {
 	if f.isDown() {
 		return nil, errPartitioned
 	}
-	return f.Store.(store.RecordReader).ListQueries(ctx, index, after, limit) //nolint:forcetypeassert,errcheck // every SQL store reads records
+	return f.Store.(store.RecordReader).ListQueries(ctx, index, after, limit, lean) //nolint:forcetypeassert,errcheck // every SQL store reads records
 }
 
 // watchingFaultStore is a faultStore over a store that pushes notifications.

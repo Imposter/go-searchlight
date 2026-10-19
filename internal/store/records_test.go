@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -15,9 +16,11 @@ func TestRecordReader(t *testing.T) {
 		if !ok {
 			t.Fatalf("%T does not implement RecordReader", st)
 		}
-		mustCreateIndex(t, st, "rec")
+		if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "rec", Settings: []byte(`{"shards": 2}`)}); err != nil {
+			t.Fatal(err)
+		}
 		payload := func(q string) []byte {
-			p, err := EncodeQueryPayload([]byte(q), []byte(`{"owner":"x"}`))
+			p, err := EncodeQueryPayload([]byte(q), []byte(`{"owner":"x"}`), 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -53,7 +56,7 @@ func TestRecordReader(t *testing.T) {
 		var ids []string
 		after := ""
 		for {
-			page, err := rr.ListQueries(ctx, "rec", after, 2)
+			page, err := rr.ListQueries(ctx, "rec", after, 2, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -68,8 +71,69 @@ func TestRecordReader(t *testing.T) {
 		if fmt.Sprint(ids) != "[q1@0 q2@1 q3@0]" {
 			t.Errorf("ListQueries pages = %v", ids)
 		}
-		if _, err := rr.ListQueries(ctx, "rec", "", MaxListLimit+1); !errors.Is(err, ErrInvalid) {
+		lean, err := rr.ListQueries(ctx, "rec", "q1", 10, true)
+		if err != nil || len(lean) != 2 || lean[0].ID != "q2" || lean[0].Shard != 1 || lean[0].Body != nil || lean[0].Meta != nil || lean[0].Seq == 0 {
+			t.Errorf("lean ListQueries after q1 = %+v, %v", lean, err)
+		}
+		if _, err := rr.ListQueries(ctx, "rec", "", MaxListLimit+1, false); !errors.Is(err, ErrInvalid) {
 			t.Errorf("limit over the maximum: err = %v, want ErrInvalid", err)
+		}
+	})
+}
+
+// ListQueries pages an index of more shards than one page statement reads, lean and
+// full, as a sort of every query by id does, each page's trees and meta its own.
+func TestListQueriesAcrossShards(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		rr := st.(RecordReader) //nolint:forcetypeassert,errcheck // every store reads records
+		const shards = pageShards + 37
+		if _, err := st.Indexes().Create(ctx, IndexMeta{Name: "many", Settings: []byte(fmt.Sprintf(`{"shards": %d}`, shards))}); err != nil {
+			t.Fatal(err)
+		}
+		var batch []Change
+		want := map[string]string{}
+		for i := range 600 {
+			id := fmt.Sprintf("q%04d", (i*7919)%10000)
+			q := fmt.Sprintf(`{"field":"n","op":"eq","value":%d}`, i)
+			p, err := EncodeQueryPayload([]byte(q), []byte(fmt.Sprintf(`{"i":%d}`, i)), int64(i%5))
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch = append(batch, Change{Index: "many", Shard: i % shards, Kind: KindQueryUpsert, ID: id, Payload: p, Version: int64(i % 5)})
+			want[id] = q
+		}
+		mustApply(t, st, batch...)
+		ids := make([]string, 0, len(want))
+		for id := range want {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		for _, size := range []int{29, 250, MaxListLimit} {
+			for _, lean := range []bool{true, false} {
+				var got []string
+				after := ""
+				for {
+					page, err := rr.ListQueries(ctx, "many", after, size, lean)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, r := range page {
+						got = append(got, r.ID)
+						if lean != (r.Body == nil) || (!lean && string(r.Body) != want[r.ID]) || r.Seq == 0 {
+							t.Fatalf("size %d, lean %v: %s's record %+v", size, lean, r.ID, r)
+						}
+					}
+					if len(page) < size {
+						break
+					}
+					after = page[len(page)-1].ID
+				}
+				if !slices.Equal(got, ids) {
+					t.Fatalf("size %d, lean %v: %d ids, want %d in order", size, lean, len(got), len(ids))
+				}
+			}
 		}
 	})
 }

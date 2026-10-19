@@ -171,7 +171,7 @@ func (s *Server) Routes() []Route {
 func (s *Server) table() []*route {
 	read, write := scopeRead, scopeWrite
 	wait := []string{"wait_for_seq"}
-	writeParams := []string{"if_seq", "op_type", "refresh"}
+	writeParams := []string{"if_seq", "op_type", "refresh", "version"}
 	return []*route{
 		{method: http.MethodGet, path: "/healthz", scope: scopeNone, quiet: true, handler: s.healthz},
 		{method: http.MethodGet, path: "/readyz", scope: scopeNone, quiet: true, handler: s.readyz},
@@ -190,7 +190,7 @@ func (s *Server) table() []*route {
 		{method: http.MethodPut, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, docBody: true, handler: s.putDoc},
 		{method: http.MethodGet, path: "/indexes/{index}/docs/{id}", scope: read, params: wait, handler: s.getDoc},
 		{method: http.MethodDelete, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, handler: s.deleteDoc},
-		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "wait_for_seq"}, handler: s.bulk},
+		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "percolate_matches", "percolate_inner_hits", "wait_for_seq"}, handler: s.bulk},
 
 		{method: http.MethodPost, path: "/indexes/{index}/_search", scope: read, params: wait, queued: true, handler: s.search},
 		{method: http.MethodPost, path: "/indexes/{index}/_count", scope: read, params: wait, queued: true, handler: s.count},
@@ -198,9 +198,9 @@ func (s *Server) table() []*route {
 		{method: http.MethodPut, path: "/indexes/{index}/queries/{id}", scope: write, params: writeParams, docBody: true, handler: s.putQuery},
 		{method: http.MethodGet, path: "/indexes/{index}/queries/{id}", scope: read, params: wait, handler: s.getQuery},
 		{method: http.MethodDelete, path: "/indexes/{index}/queries/{id}", scope: write, params: writeParams, handler: s.deleteQuery},
-		{method: http.MethodGet, path: "/indexes/{index}/queries", scope: read, params: []string{"after", "size", "wait_for_seq"}, handler: s.listQueries},
+		{method: http.MethodGet, path: "/indexes/{index}/queries", scope: read, params: []string{"after", "size", "fields", "wait_for_seq"}, handler: s.listQueries},
 
-		{method: http.MethodPost, path: "/indexes/{index}/_percolate", scope: read, params: wait, queued: true, handler: s.percolate},
+		{method: http.MethodPost, path: "/indexes/{index}/_percolate", scope: read, params: []string{"percolate_matches", "percolate_inner_hits", "wait_for_seq"}, queued: true, handler: s.percolate},
 		{method: http.MethodGet, path: "/indexes/{index}/_fields", scope: read, params: []string{"entries", "wait_for_seq"}, queued: true, handler: s.fields},
 	}
 }

@@ -857,6 +857,25 @@ Notes:
     ([clustering](clustering.md)).
   - Segments without a nested field's objects are still written in the minor before
     (4.1 with points, 4.0 without), byte for byte.
+- **Upgrading to client versions** (schema migration 5, query segment format
+  `percolate/4`; 1.5) is a rolling upgrade. The migration only adds columns and a table,
+  which takes milliseconds whatever the database holds: `version` (a BIGINT, 0 by
+  default) on `sl_documents` and `sl_queries`, and `sl_tombstones`. Nothing is
+  rewritten. As with the migrations before it, an old binary refuses to start once the
+  first node has migrated, so finish the rollout.
+  - Nodes still on the old binary keep writing as before, never touching the new
+    columns: a write they take leaves the target's stored version as it was, and a
+    delete they take keeps no tombstone. Send versioned writes to upgraded nodes, and
+    expect versions in `GET` and percolation matches to be right only once every node
+    runs 1.5.
+  - **Set `gc_deletes` only once every node runs 1.5**: an older node refuses index
+    settings it does not know, so it cannot read an index whose settings name it.
+    Unset, an index keeps tombstones for 24 h; the leader prunes older ones at each
+    changelog prune.
+  - Upgraded nodes open `percolate/3` query segments as they are (their queries have no
+    version until written again) and write `percolate/4` ones. **A copy that has
+    written one cannot be downgraded**: an older binary refuses the newer format, and
+    the copy is rebuilt from a peer or the database.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

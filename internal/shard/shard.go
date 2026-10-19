@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -104,8 +105,10 @@ type Change struct {
 	QueryID string
 	// Query is a QueryUpsert's parsed query ([query.Parse]); the shard keeps it.
 	Query query.Node
-	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes].
-	Meta []byte
+	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes], and QueryVersion
+	// its client version (store.Change.Version; 0 for none).
+	Meta         []byte
+	QueryVersion int64
 	// Mapping and MappingVersion are a Remap's mapping and its version (the store's
 	// mapping version, increasing with every mapping change of the index).
 	Mapping        *schema.Mapping
@@ -784,11 +787,11 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		c := &changes[i]
 		switch c.Kind {
 		case Upsert:
-			s.buf.putDoc(c.id(), c.Seq, c.Doc)
+			s.buf.putDoc(c.id(), c.Seq, withSeq(c.Doc, c.Seq))
 		case Delete:
 			s.buf.putDoc(c.id(), c.Seq, nil)
 		case QueryUpsert:
-			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Query: c.Query, Meta: c.Meta})
+			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Version: c.QueryVersion, Query: c.Query, Meta: c.Meta})
 		case QueryDelete:
 			s.buf.putQuery(c.QueryID, c.Seq, nil)
 		}
@@ -1093,4 +1096,15 @@ func (s *Shard) refreshLoop() {
 			}
 		},
 	}.Run(s.bg)
+}
+
+// withSeq returns d with its seq in [schema.SeqColumn], the fields copied: the caller's
+// document is left as it is.
+func withSeq(d *schema.Doc, seq int64) *schema.Doc {
+	out := *d
+	out.Fields = make(map[string]schema.Value, len(d.Fields)+1)
+	maps.Copy(out.Fields, d.Fields)
+	v := float64(seq)
+	out.Fields[schema.SeqColumn] = schema.Value{Present: true, Number: &v}
+	return &out
 }

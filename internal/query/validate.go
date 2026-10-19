@@ -31,8 +31,9 @@ const maxNamedFields = 20
 //     0 < min <= 1 for similar; for box on a point field, x and y bounds ([boxProblem]);
 //   - a nested node's path is a nested field, and it is in no other nested node;
 //     its conditions name its path's sub-fields (path.name), which no condition
-//     outside one names; its inner_hits name sub-fields of its path, a key no other
-//     inner_hits takes, and are under no not;
+//     outside one names; its inner_hits name sub-fields of its path, a key no
+//     inner_hits of another path takes (those of one path sharing a key merge), and
+//     are under no not;
 //
 // and, as [Parse] checks them, the tree's shape and bounds and every text's length and
 // NUL, so a tree built by hand is held to the same rules. Problems are in tree order; a
@@ -76,14 +77,14 @@ func ValidateInner(n Node, m *schema.Mapping, path string) []Problem {
 
 // validator walks a tree for Validate and ValidateInner, knowing where it is: inside
 // a nested node's query (path), under a not (negated), in an inner query (inner, which
-// holds no nested node). keys are the inner hits' keys seen.
+// holds no nested node). keys are the inner hits' keys seen, each with its path.
 type validator struct {
 	ps      *problems
 	m       *schema.Mapping
 	path    string
 	inner   bool
 	negated bool
-	keys    map[string]bool
+	keys    map[string]string
 }
 
 func (v *validator) node(n Node, loc string) {
@@ -118,9 +119,9 @@ func (v *validator) group(loc string, children []Node) {
 }
 
 // nested checks a nested node at loc (its "nested" key): its path is a nested field,
-// it is in no other nested node, its inner hits ask for that field's sub-fields and are
-// under no not (a document a not matches has no object to show), and its query is an
-// inner query of the path.
+// it is in no other nested node, its inner hits ask for that field's sub-fields, under
+// a key no node of another path takes, and are under no not (a document a not matches
+// has no object to show), and its query is an inner query of the path.
 func (v *validator) nested(n *Nested, loc string) {
 	if v.path != "" || v.inner {
 		v.ps.add(loc, "a nested node is not inside another, nor inside an inner query: objects nest one level deep")
@@ -136,17 +137,19 @@ func (v *validator) nested(n *Nested, loc string) {
 		switch {
 		case v.negated:
 			v.ps.add(at, "inner_hits cannot be under a not: a document a not matches holds no object to show")
-		case v.keys[key]:
-			v.ps.addf(at, "two inner_hits are named %q: name one otherwise (name)", key)
+		case v.keys[key] != "" && v.keys[key] != n.Path:
+			v.ps.addf(at, "inner_hits %q are nested field %q's already: nodes share inner hits by name on one path alone (name these otherwise)", key, v.keys[key])
 		case h.Size < 0 || h.Size > MaxInnerHitsSize:
 			v.ps.addf(join(at, "size"), "an inner_hits size is a whole number from 0 to %d", MaxInnerHitsSize)
 		case len(h.Fields) > MaxInnerHitsFields:
 			v.ps.addf(join(at, "fields"), "inner_hits fields is a list of at most %d sub-field names", MaxInnerHitsFields)
 		}
 		if v.keys == nil {
-			v.keys = map[string]bool{}
+			v.keys = map[string]string{}
 		}
-		v.keys[key] = true
+		if v.keys[key] == "" {
+			v.keys[key] = n.Path
+		}
 		for i, f := range h.Fields {
 			if p, ok := v.m.NestedPath(f); !ok || p != n.Path {
 				v.ps.addf(index(join(at, "fields"), i), "%q is not a sub-field of nested field %q (%s)", f, n.Path, subFieldNames(v.m, n.Path))

@@ -192,7 +192,7 @@ func prepare(r *Request, m *schema.Mapping) (*prepared, error) {
 		ps.add(aggsLoc(r.aggsKey), "a search holds at most %d aggregations, sub-aggregations included and those under a filters aggregation counted once per bucket; this one holds %d", MaxAggs, n)
 	} else {
 		for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-			if s := prepareAgg(name, r.Aggs[name], m, aggsLoc(r.aggsKey)+"."+name, "", &ps); s != nil {
+			if s := prepareAgg(name, r.Aggs[name], m, aggsLoc(r.aggsKey)+"."+name, &ps); s != nil {
 				p.aggs = append(p.aggs, s)
 			}
 		}
@@ -387,10 +387,17 @@ func toFloat(v any) (float64, bool) { return analysis.Number(v) }
 
 var calendarUnits = []string{"minute", "hour", "day", "week", "month", "quarter", "year"}
 
-// prepareAgg checks aggregation a, given at loc under an aggregation of type parent
-// ("" at the top level), against m, and compiles it (its filters aside: see
-// compileFilters).
-func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *problems) *aggSpec {
+// prepareAgg checks top-level aggregation a, given at loc, against m, and compiles it
+// (its filters aside: see compileFilters).
+func prepareAgg(name string, a Agg, m *schema.Mapping, loc string, ps *problems) *aggSpec {
+	return prepareAggUnder(name, a, m, loc, "", "", ps)
+}
+
+// prepareAggUnder is prepareAgg for an aggregation under a terms aggregation on a
+// sub-field of nested field under ("" under any other, or at the top level): a metric
+// or a terms aggregation, on a top-level field (the bucket's documents) or on one of
+// under's sub-fields (the bucket's objects).
+func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under string, ps *problems) *aggSpec {
 	s := &aggSpec{name: name, loc: loc, typ: a.Type, field: a.Field, ftype: fieldType(m, a.Field)}
 	at := loc + "." + a.Type
 	wrapper := singleBucket(a.Type)
@@ -411,11 +418,14 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 		case a.Type != AggTerms && a.Type != AggStats && a.Type != AggMin && a.Type != AggMax && a.Type != AggCardinality:
 			ps.add(at+".field", "%q is a nested field's sub-field: terms, stats, min, max and cardinality aggregate one, %s does not", a.Field, a.Type)
 			return nil
-		case parent != "" && !singleBucket(parent):
-			ps.add(loc, "an aggregation on a sub-field is top-level, or under filter, filters or global: a bucket's metrics aggregate its documents' own fields")
+		case under != "" && path != under:
+			ps.add(at+".field", "under a terms aggregation on a sub-field of %q, an aggregation reads %q's sub-fields (the bucket's objects) or top-level fields (its documents): %q is a sub-field of %q", under, under, a.Field, path)
 			return nil
-		case len(a.Aggs) > 0:
-			ps.add(loc+"."+aggsLoc(a.aggsKey), "an aggregation on a sub-field holds no sub-aggregations")
+		case under == "" && parent != "" && !singleBucket(parent):
+			ps.add(loc, "an aggregation on a sub-field is top-level, under filter, filters or global, or under a terms aggregation on a sub-field of its nested field: a bucket's metrics aggregate its documents' own fields")
+			return nil
+		case len(a.Aggs) > 0 && a.Type != AggTerms:
+			ps.add(loc+"."+aggsLoc(a.aggsKey), "only a terms aggregation on a sub-field holds sub-aggregations")
 			return nil
 		}
 		s.nested, s.where = path, a.Where
@@ -432,8 +442,9 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 	case singleBucket(parent) && wrapper:
 		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min and max", a.Type, parent)
 		return nil
+	case !singleBucket(parent) && a.Type == AggTerms && (under != "" || m == nil):
 	case !singleBucket(parent) && !isMetric:
-		ps.add(loc, "a sub-aggregation is a metric: stats, cardinality, min or max")
+		ps.add(loc, "a sub-aggregation is a metric (stats, cardinality, min or max), or a terms aggregation under a terms aggregation on a sub-field")
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
@@ -586,7 +597,7 @@ func prepareAgg(name string, a Agg, m *schema.Mapping, loc, parent string, ps *p
 					ps.add(at, "%q is a member of the %s bucket the sub-aggregation is written in: name it otherwise", subName, a.Type)
 					continue
 				}
-				if ss := prepareAgg(subName, a.Aggs[subName], m, at, a.Type, ps); ss != nil {
+				if ss := prepareAggUnder(subName, a.Aggs[subName], m, at, a.Type, nestedTermsPath(s), ps); ss != nil {
 					s.subs = append(s.subs, ss)
 				}
 			}
@@ -638,4 +649,13 @@ func reservedNames(typ string) []string {
 		return []string{"doc_count"}
 	}
 	return []string{"key", "key_as_string", "from", "to", "doc_count", "doc_count_error_upper_bound"}
+}
+
+// nestedTermsPath is the nested field s, a terms aggregation on one of its sub-fields,
+// reads the objects of; "" for any other aggregation.
+func nestedTermsPath(s *aggSpec) string {
+	if s.typ == AggTerms {
+		return s.nested
+	}
+	return ""
 }

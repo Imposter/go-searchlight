@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
+	"strings"
 )
 
 // queryBody is PUT /indexes/{index}/queries/{id}'s body.
@@ -51,6 +53,9 @@ const (
 	MaxListSize     = 1000
 )
 
+// listFields are the members a saved-query listing's fields parameter may name.
+var listFields = []string{"id", "seq", "version", "query", "meta"}
+
 func (s *Server) listQueries(w http.ResponseWriter, r *http.Request, p params) error {
 	if _, e := p.waitForSeq(); e != nil {
 		return e
@@ -59,17 +64,50 @@ func (s *Server) listQueries(w http.ResponseWriter, r *http.Request, p params) e
 	if e != nil {
 		return e
 	}
+	var fields []string
+	if raw, ok := p.values["fields"]; ok {
+		for _, f := range strings.Split(raw, ",") {
+			f = strings.TrimSpace(f)
+			if !slices.Contains(listFields, f) {
+				return InvalidAt("params.fields", "fields names members of a saved query: %s", strings.Join(listFields, ", "))
+			}
+			if !slices.Contains(fields, f) {
+				fields = append(fields, f)
+			}
+		}
+	}
+	lean := fields != nil && !slices.Contains(fields, "query") && !slices.Contains(fields, "meta")
 	after := p.values["after"]
-	list, err := s.c.ListQueries(r.Context(), r.PathValue("index"), after, int(size))
+	list, err := s.c.ListQueries(r.Context(), r.PathValue("index"), after, int(size), lean)
 	if err != nil {
 		return err
-	}
-	if list == nil {
-		list = []*SavedQuery{}
 	}
 	var next *string
 	if int64(len(list)) == size {
 		next = &list[len(list)-1].ID
 	}
-	return writeJSON(w, http.StatusOK, map[string]any{"queries": list, "next": next})
+	if fields == nil {
+		if list == nil {
+			list = []*SavedQuery{}
+		}
+		return writeJSON(w, http.StatusOK, map[string]any{"queries": list, "next": next})
+	}
+	out := make([]map[string]any, len(list))
+	for i, q := range list {
+		m := map[string]any{"id": q.ID}
+		for _, f := range fields {
+			switch f {
+			case "seq":
+				m[f] = q.Seq
+			case "version":
+				m[f] = q.Version
+			case "query":
+				m[f] = q.Query
+			case "meta":
+				m[f] = q.Meta
+			}
+		}
+		out[i] = m
+	}
+	return writeJSON(w, http.StatusOK, map[string]any{"queries": out, "next": next})
 }

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if len(batch) == 0 {
+		res.Percolated = opts.Percolate
 		return res, nil
 	}
 	if err := n.admit(idx, batch); err != nil {
@@ -71,6 +73,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if len(batch) == 0 {
+		res.Percolated = opts.Percolate
 		return res, nil
 	}
 	res.Seq = batch[len(batch)-1].change.Seq
@@ -97,7 +100,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	if opts.Percolate {
-		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq); err != nil {
+		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				res.TimedOut = true
@@ -220,7 +223,10 @@ func added(base, grown *schema.Mapping) map[string]schema.FieldType {
 // reaches the changelog, where it would halt the copy. A delete of nothing is a 404
 // and writes no change.
 func (n *Single) prepareOp(idx *index, op *api.WriteOp, m *schema.Mapping, keepDoc bool) (prepared, *schema.Mapping, error) {
-	c := store.Change{Index: idx.name, ID: op.ID, IfSeq: op.IfSeq}
+	c := store.Change{Index: idx.name, ID: op.ID, IfSeq: op.IfSeq, Version: op.Version}
+	if op.Version < 0 || (op.Version > 0 && op.IfSeq != 0) {
+		return prepared{}, m, api.InvalidAt("version", "a version is at least 1, and excludes if_seq and create")
+	}
 	if err := schema.ValidateID(op.ID); err != nil {
 		msg := err.Error()
 		var ve *schema.ValidationError
@@ -315,7 +321,7 @@ func queryPayload(op *api.WriteOp, m *schema.Mapping, now time.Time) ([]byte, er
 	if err := (percolate.Index{}).Check(&shard.StoredQuery{ID: op.ID, Query: node, Meta: meta}); err != nil {
 		return nil, api.InvalidAt("query", "the percolator cannot index the query: %v", err)
 	}
-	payload, err := store.EncodeQueryPayload(op.Query, meta)
+	payload, err := store.EncodeQueryPayload(op.Query, meta, op.Version)
 	if err != nil {
 		return nil, api.InvalidAt("query", "%v", err)
 	}
@@ -369,7 +375,8 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 // commit commits batch through the group committer. An op whose if_seq fails, or
 // that the store refuses on its own, is answered in its item and the rest commit
 // without it. It returns the committed ops, with their seqs. A delete of nothing
-// (IfExists) is skipped in the transaction: it takes no seq and is a 404.
+// (IfExists) is skipped in the transaction: it takes no seq and is a 404. A versioned
+// op whose version is not above the stored one is a noop: no seq, and no error.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
@@ -389,6 +396,10 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 		case err == nil:
 			var applied []prepared
 			for i := range batch {
+				if changes[i].Noop {
+					items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
+					continue
+				}
 				if changes[i].Seq == 0 {
 					items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
 					continue
@@ -401,7 +412,7 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 				return nil, nil
 			}
 			for i := range batch {
-				items[batch[i].pos].Seq = batch[i].change.Seq
+				items[batch[i].pos].Seq, items[batch[i].pos].Version = batch[i].change.Seq, batch[i].change.Version
 				sl := idx.shards[batch[i].change.Shard]
 				raise(&sl.written, batch[i].change.Seq)
 				if k := batch[i].change.Kind; k == store.KindQueryUpsert || k == store.KindQueryDelete {
@@ -588,8 +599,9 @@ func (n *Single) waitApplied(ctx context.Context, c *copyState, seq int64) error
 
 // percolateWritten fills each committed upsert's item with the saved queries its
 // document matches, as written: against every saved query committed through this node
-// before the percolation, and every change up to waitFor when it is set.
-func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor int64) error {
+// before the percolation, and every change up to waitFor when it is set. With details,
+// each item's Matches carry them too.
+func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor int64, details MatchDetails) error {
 	var docs []schema.Doc
 	var pos []int
 	for i := range batch {
@@ -607,49 +619,122 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 		return err
 	}
 	defer ts.release()
-	matches, err := n.percolateDocs(ctx, idx, ts, docs)
+	ids, matches, err := n.percolateDocs(ctx, idx, ts, docs, details)
 	if err != nil {
 		return err
 	}
 	for k, p := range pos {
-		res.Items[p].Queries = json.RawMessage(matches[k])
+		res.Items[p].Queries = json.RawMessage(ids[k])
+		if matches != nil {
+			res.Items[p].Matches = matches[k]
+		}
 	}
 	res.Percolated = true
 	return nil
 }
 
 // percolateDocs percolates docs against the saved queries of every shard of idx (a
-// saved query lives on the shard its id hashes to), merging each document's matches.
+// saved query lives on the shard its id hashes to), merging each document's matches:
+// their ids, and with details their details too (nil without).
+// Peers' copies are asked at once, each in a goroutine of its own, and so are this
+// node's for parallelPercolateDocs documents or more; fewer, this node's copies run
+// one after another in the caller's goroutine while the peers answer (each copy's
+// percolator spreads its documents over the cores already, and goroutines of their own
+// would only crowd them).
 //
-// Every shard resolves date math at one instant, set here once ([query.WithNow]).
-func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc) ([]percolate.IDs, error) {
+// Every shard resolves date math at one instant, set here once ([query.WithNow]). A
+// shard that fails cancels the others.
+func (n *Single) percolateDocs(ctx context.Context, idx *index, ts targets, docs []schema.Doc, details MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error) {
 	ctx = query.WithNow(ctx, n.now(ctx))
 	mapping := idx.meta.Load().meta.Mapping
 	perShard := make([][]percolate.IDs, len(ts))
-	for s, t := range ts {
-		ids, err := t.Percolate(ctx, mapping, docs)
-		if err != nil {
-			return nil, fmt.Errorf("percolate shard %d: %w", s, err)
+	perDetails := make([][][]api.PercolateMatch, len(ts))
+	errs := make([]error, len(ts))
+	run := func(ctx context.Context, s int) {
+		ids, matches, err := ts[s].Percolate(ctx, mapping, docs, details)
+		switch {
+		case err != nil:
+			errs[s] = fmt.Errorf("percolate shard %d: %w", s, err)
+		case len(ids) != len(docs):
+			errs[s] = fmt.Errorf("percolate shard %d: %d answers for %d documents", s, len(ids), len(docs))
+		case details.Any() && matches != nil && len(matches) != len(docs):
+			errs[s] = fmt.Errorf("percolate shard %d: %w", s, errDetailsCount)
 		}
-		if len(ids) != len(docs) {
-			return nil, fmt.Errorf("percolate shard %d: %d answers for %d documents", s, len(ids), len(docs))
-		}
-		perShard[s] = ids
+		perShard[s], perDetails[s] = ids, matches
 	}
 	if len(ts) == 1 {
-		return perShard[0], nil
+		run(ctx, 0)
+	} else {
+		fanCtx, cancel := context.WithCancel(ctx)
+		var wg sync.WaitGroup
+		var inline []int
+		for s := range ts {
+			if _, local := ts[s].(*localTarget); local && len(docs) < parallelPercolateDocs {
+				inline = append(inline, s)
+				continue
+			}
+			wg.Go(func() {
+				run(fanCtx, s)
+				if errs[s] != nil {
+					cancel()
+				}
+			})
+		}
+		for _, s := range inline {
+			run(fanCtx, s)
+			if errs[s] != nil {
+				cancel()
+			}
+		}
+		wg.Wait()
+		cancel()
+	}
+	if err := firstShardError(errs); err != nil {
+		return nil, nil, err
 	}
 	out := make([]percolate.IDs, len(docs))
+	var matches [][]api.PercolateMatch
+	if details.Any() {
+		matches = make([][]api.PercolateMatch, len(docs))
+	}
 	lists := make([]percolate.IDs, len(ts))
+	found := make([][]api.PercolateMatch, len(ts))
 	for i := range docs {
 		for s := range ts {
 			lists[s] = perShard[s][i]
+			found[s] = nil
+			if perDetails[s] != nil {
+				found[s] = perDetails[s][i]
+			}
 		}
 		merged, err := percolate.MergeIDs(lists)
 		if err != nil {
-			return nil, fmt.Errorf("percolate: %w", err)
+			return nil, nil, fmt.Errorf("percolate: %w", err)
 		}
 		out[i] = merged
+		if matches != nil {
+			matches[i] = mergeMatches(found)
+		}
 	}
-	return out, nil
+	if details.InnerHits && innerHitOffsets(matches) > api.MaxPercolateInnerHits {
+		return nil, nil, api.ErrTooManyInnerHits
+	}
+	return out, matches, nil
 }
+
+// firstShardError is the first shard's error that is no cancellation another shard's
+// failure caused, else the first error.
+func firstShardError(errs []error) error {
+	for _, err := range errs {
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// parallelPercolateDocs is the fewest documents a percolation runs this node's copies of
+// their shards at once for: on BenchmarkPercolateShards (8 shards, Ryzen 7 3700X), one
+// document takes 38 µs one copy after another and 78 µs at once, 200 take 3.3 ms one
+// after another and 2.6 ms at once.
+const parallelPercolateDocs = 64

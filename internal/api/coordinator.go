@@ -54,8 +54,8 @@ type Coordinator interface {
 	// to opts.WaitForSeq in it.
 	GetQuery(ctx context.Context, index, id string, opts ReadOptions) (*SavedQuery, error)
 	// ListQueries pages an index's saved queries by id: up to size of them with ids
-	// above after.
-	ListQueries(ctx context.Context, index, after string, size int) ([]*SavedQuery, error)
+	// above after. With lean, each holds its id, seq and version alone.
+	ListQueries(ctx context.Context, index, after string, size int, lean bool) ([]*SavedQuery, error)
 
 	// Search runs a search over every shard of index.
 	Search(ctx context.Context, index string, r *search.Request, opts ReadOptions) (*SearchResult, error)
@@ -90,6 +90,10 @@ const (
 	MaxShards       = 1024
 	MaxReplicas     = 1024
 	DisabledRefresh = time.Duration(-1)
+	// DefaultGCDeletes is an index's gc_deletes when it sets none, and MaxGCDeletes the
+	// longest it takes.
+	DefaultGCDeletes = 24 * time.Hour
+	MaxGCDeletes     = 365 * 24 * time.Hour
 )
 
 // IndexSettings are an index's settings (spec section 3).
@@ -103,12 +107,17 @@ type IndexSettings struct {
 	// node's refresh_interval, DisabledRefresh never (refresh=true and wait_for
 	// still refresh).
 	RefreshInterval time.Duration
+	// GCDeletes is how long a delete keeps its id's version (a tombstone) for later
+	// versioned writes to compare with, as Elasticsearch's index.gc_deletes: 0 means
+	// DefaultGCDeletes.
+	GCDeletes time.Duration
 }
 
 type settingsJSON struct {
 	Shards           *int            `json:"shards,omitempty"`
 	ReplicasPerShard *int            `json:"replicas_per_shard,omitempty"`
 	RefreshInterval  json.RawMessage `json:"refresh_interval,omitempty"`
+	GCDeletes        json.RawMessage `json:"gc_deletes,omitempty"`
 }
 
 // MarshalJSON writes {"shards": n, "replicas_per_shard": n, "refresh_interval": "1s"},
@@ -120,6 +129,9 @@ func (s IndexSettings) MarshalJSON() ([]byte, error) {
 		out.RefreshInterval = json.RawMessage("-1")
 	case s.RefreshInterval > 0:
 		out.RefreshInterval, _ = json.Marshal(s.RefreshInterval.String())
+	}
+	if s.GCDeletes > 0 {
+		out.GCDeletes, _ = json.Marshal(s.GCDeletes.String())
 	}
 	return json.Marshal(out)
 }
@@ -145,6 +157,13 @@ func (s *IndexSettings) UnmarshalJSON(data []byte) error {
 		}
 		out.RefreshInterval = d
 	}
+	if raw.GCDeletes != nil {
+		d, err := ParseGCDeletes(raw.GCDeletes)
+		if err != nil {
+			return err
+		}
+		out.GCDeletes = d
+	}
 	if err := out.Validate(); err != nil {
 		return err
 	}
@@ -162,6 +181,9 @@ func (s *IndexSettings) Validate() error {
 	}
 	if s.RefreshInterval < 0 && s.RefreshInterval != DisabledRefresh {
 		return &FieldError{Loc: "refresh_interval", Message: `refresh_interval is a positive duration ("1s") or -1`}
+	}
+	if s.GCDeletes != 0 && (s.GCDeletes < time.Second || s.GCDeletes > MaxGCDeletes) {
+		return &FieldError{Loc: "gc_deletes", Message: "gc_deletes is a duration (\"24h\") from 1s to 365 days"}
 	}
 	return nil
 }
@@ -188,6 +210,7 @@ func parseRefreshInterval(raw json.RawMessage) (time.Duration, error) {
 type SettingsPatch struct {
 	RefreshInterval  *time.Duration
 	ReplicasPerShard *int
+	GCDeletes        *time.Duration
 }
 
 // FieldError is a request value that is out of bounds, at Loc.
@@ -243,6 +266,11 @@ type WriteOp struct {
 	// Query and Meta are a saved query's DSL tree and opaque meta object.
 	Query json.RawMessage
 	Meta  json.RawMessage
+	// Version is the client's version of the document or saved query (Elasticsearch's
+	// external versioning), 0 for none: the op applies only when it is higher than the
+	// stored one (the target's, or the version a versioned delete of it kept), and is
+	// otherwise a noop (ItemResult.Noop). It excludes IfSeq.
+	Version int64
 	// IfSeq makes the op conditional: a positive IfSeq requires the target's current
 	// seq to equal it, IfAbsent requires it not to exist, 0 applies unconditionally.
 	IfSeq int64
@@ -267,6 +295,11 @@ type WriteOptions struct {
 	Refresh RefreshMode
 	// Percolate returns each upserted document's matching saved queries.
 	Percolate bool
+	// Matches, with Percolate, fills each upserted document's ItemResult.Matches: its
+	// matched saved queries with their versions, and with them, under InnerHits, the
+	// document's nested objects their inner_hits match.
+	Matches   bool
+	InnerHits bool
 	// WaitForSeq, with Percolate, waits for this node's copies to have every change
 	// up to it searchable before percolating, so saved queries written up to it are
 	// seen.
@@ -297,11 +330,19 @@ type WriteResult struct {
 type ItemResult struct {
 	// Seq is the op's seq when it committed.
 	Seq int64
+	// Noop is set when the op's Version was not above the stored one: nothing was
+	// written, and Seq is 0.
+	Noop bool
+	// Version is the op's Version, when it had one.
+	Version int64
 	// Err is why the op was refused (an *Error), nil when it committed.
 	Err error
 	// Queries are the ids of the saved queries the upserted document matches, with
 	// WriteOptions.Percolate: a JSON array of strings, sorted (nil for none).
 	Queries json.RawMessage
+	// Matches are those saved queries' details, in Queries' order, with
+	// WriteOptions.Matches.
+	Matches []PercolateMatch
 }
 
 // ReadOptions are a read's parameters.
@@ -315,8 +356,10 @@ type ReadOptions struct {
 type Document struct {
 	ID string `json:"id"`
 	// Seq is the change that last wrote it; 0 (omitted) on a stale read.
-	Seq  int64           `json:"seq,omitempty"`
-	Body json.RawMessage `json:"body"`
+	Seq int64 `json:"seq,omitempty"`
+	// Version is the client version its last write named (omitted for none).
+	Version int64           `json:"version,omitempty"`
+	Body    json.RawMessage `json:"body"`
 	// Stale is set when the database could not be reached and the document was
 	// read from this node's copy instead: it may trail the latest write.
 	Stale bool `json:"stale,omitempty"`
@@ -324,10 +367,12 @@ type Document struct {
 
 // SavedQuery is a stored saved query.
 type SavedQuery struct {
-	ID    string          `json:"id"`
-	Seq   int64           `json:"seq"`
-	Query json.RawMessage `json:"query"`
-	Meta  json.RawMessage `json:"meta"`
+	ID  string `json:"id"`
+	Seq int64  `json:"seq"`
+	// Version is the client version its last write named (omitted for none).
+	Version int64           `json:"version,omitempty"`
+	Query   json.RawMessage `json:"query,omitempty"`
+	Meta    json.RawMessage `json:"meta,omitempty"`
 	// Stale is set when it was read from this node's copy because the database
 	// could not be reached.
 	Stale bool `json:"stale,omitempty"`
@@ -353,6 +398,10 @@ type PercolateResponse struct {
 type PercolateRequest struct {
 	Docs []json.RawMessage
 	IDs  []string
+	// Matches fills each result's Matches, and InnerHits their inner hits (as
+	// WriteOptions').
+	Matches   bool
+	InnerHits bool
 }
 
 // PercolateResult is one percolated document's matches. Results list Docs first,
@@ -365,6 +414,12 @@ type PercolateResult struct {
 	// Queries are the ids of the saved queries the document matches: a JSON array of
 	// strings, sorted (nil for none), written into the response as it is.
 	Queries json.RawMessage `json:"queries"`
+	// Seq is a stored document's seq, as the copy that read it holds it (0 when it
+	// kept none, or for a given document).
+	Seq int64 `json:"_seq,omitempty"`
+	// Matches are the matched saved queries' details, in Queries' order, when the
+	// request asked for them.
+	Matches []PercolateMatch `json:"matches,omitempty"`
 }
 
 // FieldCatalog describes an index's fields.
@@ -474,4 +529,44 @@ func strictDecode(data []byte, v any) error {
 		return errors.New("trailing data after the JSON value")
 	}
 	return nil
+}
+
+// PercolateMatch is one saved query a document matches, as a percolation asked for
+// Matches reports it: its id, its client version (0 for none), and, with InnerHits,
+// the document's nested objects that the inner_hits its nested nodes declare match,
+// by key.
+type PercolateMatch struct {
+	ID        string                         `json:"id"`
+	Version   int64                          `json:"version,omitempty"`
+	InnerHits map[string]*PercolateInnerHits `json:"inner_hits,omitempty"`
+}
+
+// PercolateInnerHits are a match's inner hits under one key, as a search's are but
+// without the objects: how many members of the path its nested nodes' queries match
+// (Total), and the offsets of the first size of them, in array order.
+type PercolateInnerHits struct {
+	Total   int   `json:"total"`
+	Offsets []int `json:"offsets"`
+}
+
+// ParseGCDeletes reads gc_deletes: a duration ("24h", "60s"), 1s to MaxGCDeletes.
+func ParseGCDeletes(raw json.RawMessage) (time.Duration, error) {
+	bad := &FieldError{Loc: "gc_deletes", Message: `gc_deletes is a duration ("24h") from 1s to 365 days`}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, bad
+	}
+	d, err := time.ParseDuration(text)
+	if err != nil || d < time.Second || d > MaxGCDeletes {
+		return 0, bad
+	}
+	return d, nil
+}
+
+// EffectiveGCDeletes is s's gc_deletes, DefaultGCDeletes when it sets none.
+func (s IndexSettings) EffectiveGCDeletes() time.Duration {
+	if s.GCDeletes == 0 {
+		return DefaultGCDeletes
+	}
+	return s.GCDeletes
 }

@@ -81,7 +81,7 @@ func TestApplyAndRead(t *testing.T) {
 		s0 := ShardID{Index: "products", Shard: 0}
 		s1 := ShardID{Index: "products", Shard: 1}
 
-		qp, err := EncodeQueryPayload(json.RawMessage(`{"eq":{"brand":"acme"}}`), json.RawMessage(`{"search_id":7}`))
+		qp, err := EncodeQueryPayload(json.RawMessage(`{"eq":{"brand":"acme"}}`), json.RawMessage(`{"search_id":7}`), 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -616,7 +616,7 @@ func TestConditionalWrites(t *testing.T) {
 		re.IfSeq = IfAbsent
 		mustApply(t, st, d, re)
 		// Documents and queries are separate namespaces.
-		qp, _ := EncodeQueryPayload(json.RawMessage(`{"exists":"x"}`), nil)
+		qp, _ := EncodeQueryPayload(json.RawMessage(`{"exists":"x"}`), nil, 0)
 		q := Change{Index: "cond", Kind: KindQueryUpsert, ID: "a", Payload: qp, IfSeq: IfAbsent}
 		mustApply(t, st, q)
 		recs, _ := scanAll(t, st, ShardID{Index: "cond"})

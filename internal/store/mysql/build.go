@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
@@ -97,9 +98,10 @@ func escapedSize(args []any) int {
 // Column lists of the batch-written tables, in the order of the args
 // functions below.
 const (
-	changeColumns   = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce"
-	documentColumns = "index_name, shard, id, body, body_z, seq"
-	queryColumns    = "index_name, shard, id, query, meta, seq"
+	changeColumns    = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce"
+	documentColumns  = "index_name, shard, id, body, body_z, seq, version"
+	queryColumns     = "index_name, shard, id, query, meta, seq, version"
+	tombstoneColumns = "index_name, shard, kind, id, version, at"
 )
 
 func changeArgs(rows []dialect.ChangeRow) []any {
@@ -112,19 +114,53 @@ func changeArgs(rows []dialect.ChangeRow) []any {
 }
 
 func documentArgs(rows []dialect.DocumentRow) []any {
-	args := make([]any, 0, len(rows)*6)
+	args := make([]any, 0, len(rows)*7)
 	for i := range rows {
 		r := &rows[i]
-		args = append(args, r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq)
+		args = append(args, r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version)
 	}
 	return args
 }
 
 func queryArgs(rows []dialect.QueryRow) []any {
+	args := make([]any, 0, len(rows)*7)
+	for i := range rows {
+		r := &rows[i]
+		args = append(args, r.Index, r.Shard, r.ID, r.Query, r.Meta, r.Seq, r.Version)
+	}
+	return args
+}
+
+func tombstoneArgs(rows []dialect.TombstoneRow) []any {
 	args := make([]any, 0, len(rows)*6)
 	for i := range rows {
 		r := &rows[i]
-		args = append(args, r.Index, r.Shard, r.ID, r.Query, r.Meta, r.Seq)
+		args = append(args, r.Index, r.Shard, r.Kind, r.ID, r.Version, r.At)
 	}
 	return args
+}
+
+// tombstoneGroup is the ids of one kind of one shard of one index whose tombstones go.
+type tombstoneGroup struct {
+	Index string
+	Shard int
+	Kind  string
+	IDs   []string
+}
+
+// tombstoneGroups groups rows by index, shard and kind, in first-seen order.
+func tombstoneGroups(rows []dialect.TombstoneRow) []tombstoneGroup {
+	var out []tombstoneGroup
+	at := map[[3]string]int{}
+	for _, r := range rows {
+		k := [3]string{r.Index, strconv.Itoa(r.Shard), r.Kind}
+		i, ok := at[k]
+		if !ok {
+			i = len(out)
+			at[k] = i
+			out = append(out, tombstoneGroup{Index: r.Index, Shard: r.Shard, Kind: r.Kind})
+		}
+		out[i].IDs = append(out[i].IDs, r.ID)
+	}
+	return out
 }

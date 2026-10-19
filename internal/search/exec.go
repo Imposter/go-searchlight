@@ -35,6 +35,9 @@ type Hit struct {
 	// Body is the stored document, limited to Request.Fields when set; nil when the
 	// request asked for no bodies (Request.NoBodies), for a later [FetchShard].
 	Body json.RawMessage `json:"body,omitempty"`
+	// Seq is the seq of the change that wrote the version the copy holds, with
+	// Request.SeqNo (0 for a document indexed by a release that kept none).
+	Seq int64 `json:"seq,omitempty"`
 	// Ref locates the hit in the generation that found it, for [FetchShard].
 	Ref *HitRef `json:"ref,omitempty"`
 	// InnerHits are the hit's inner hits, by key ([query.InnerHits.Key]): set by
@@ -726,6 +729,9 @@ func fetchHit(g *shard.Generation, p *prepared, h *segHit) (Hit, error) {
 		return Hit{}, err
 	}
 	hit := Hit{ID: h.id, Ref: &HitRef{Segment: sv.ID, Ord: h.ord}}
+	if p.req.SeqNo {
+		hit.Seq = g.DocSeq(h.seg, h.ord)
+	}
 	if !p.req.NoBodies {
 		body, err := readBody(sv.Reader, h.ord, p.fields)
 		if err != nil {

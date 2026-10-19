@@ -6,6 +6,78 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-aggregations under a `terms` on a sub-field**
+  ([docs/api.md](docs/api.md#nested-fields)): `stats`, `min`, `max`, `cardinality` and
+  one level of `terms`, per bucket over its documents (a top-level field, each document
+  once) or over its objects (a sub-field of the same nested field, narrowed by the
+  sub-aggregation's own `where`). A `terms` there is never cut per shard (its buckets
+  carry the outer bucket's error bound where a shard cut that); its
+  buckets count towards the 65,536 as shards collect them. Search wire level 7 keeps them off
+  peers of an earlier release (503 with no other copy).
+- **Client versions** ([docs/api.md](docs/api.md#documents)), Elasticsearch's external
+  versioning, on documents and saved queries: `version=N` on `PUT` and `DELETE`, and
+  `"version": N` in a `_bulk` action, applies only when N is higher than the stored
+  version, and is otherwise a noop (`"result": "noop"`, no seq), never a 409. Versions
+  only rise: an unversioned write keeps the stored version, and a delete keeps it as a
+  tombstone, so a replay of an older write after it is a noop too. A versioned delete
+  of an absent id is a 404 that records its version above the tombstone, a noop at or
+  below it. Tombstones are kept for the index setting `gc_deletes` (24 h by default, as
+  Elasticsearch's), then pruned by the cluster's leader. `GET`, listings and `_bulk`
+  items return `version`. Schema migration 5 adds `version` to `sl_documents` and
+  `sl_queries` and the table `sl_tombstones`. Until every node runs 1.5, versions and
+  percolation matches may disagree with `GET`.
+- **Saved queries in `_bulk`**: `query_upsert` (followed by `{"query": ..., "meta":
+  ...}`) and `query_delete` actions beside the documents, in one transaction, with
+  per-item results. With `percolate=true` the documents percolate against the saved
+  queries as the whole request leaves them (its own query writes included, wherever
+  they are in it).
+- **A lean saved-query listing**: `GET .../queries?fields=id,version` pages ids and
+  versions without reading the queries' trees or meta.
+- **Percolation matches with versions and inner hits** ([docs/api.md](docs/api.md#percolation)):
+  `percolate_matches=true` on `_percolate` and `_bulk?percolate=true` adds `matches`,
+  each matched saved query as `{"id", "version"}` beside the unchanged `queries`, and
+  `percolate_inner_hits=true` adds to each the inner hits its nested nodes declare,
+  `{"total", "offsets"}` by key, as a search reports them for the document (at most
+  100,000 offsets per request, charged to `max_inflight_read_bytes`; past them a 422
+  `too_many_matches`). Percolate wire level 4 keeps them off peers of an earlier
+  release.
+- **Document seqs in answers**: a search's `seq_no: true` gives each hit `_seq`, the seq
+  of the change that wrote the version its copy holds (search wire level 8), and
+  `_percolate` gives each found stored document its `_seq`. Each copy keeps the seqs in a
+  column of its own from this release; documents indexed before have none until written
+  again.
+
+### Changed
+
+- **Percolation fans out to every shard at once** instead of one after another (this
+  node's own copies at once for 64 documents or more: 200 documents on 8 shards take
+  2.5 ms against 3.3 ms; fewer run in turn while the peers answer), and
+  merges their matches; a shard that fails cancels the rest.
+- **Saved-query listings pick a page's ids from each shard's primary key range** in one
+  statement (each range cut at the page size), then read the trees and meta of those ids
+  alone, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
+  query of the index by id before).
+- **Query segments are format `percolate/4`**, which keeps each saved query's version.
+  Segments of `percolate/3` open as they are, their queries with no version, until
+  merges rewrite them; a release before this one refuses a `percolate/4` segment, so a
+  copy that has written one cannot be downgraded.
+- **Saved nested queries anchor on their inner conditions** instead of being checked
+  against every document: a nested node anchors as its inner query would, on the
+  path's sub-fields, and a document holds the atoms of each of its objects; only an
+  inner query with no positive conjunct stays always-check. On
+  BenchmarkPercolateNested (100k saved searches, 70% variant searches, a tenth of all
+  with no other condition), always-check queries fall from 9,867 to 0 and candidates
+  from 10,492 to 2,292 per document: 6,692 documents a second against 1,564, p50
+  255 µs against 906 µs. Answers are exactly as before.
+- **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes
+  of one path giving one `inner_hits` name, in the query and the `post_filter`, share
+  one set of inner hits: every member satisfying any of their queries once, `total`
+  exact, by the largest of their sizes. Such a request was a 400; a name given to
+  nodes of two paths still is. Peers need no new wire level: only the coordinating
+  node checks names and reads inner hits.
+
 ## [1.4.0] - 2026-10-18
 
 Nested fields: one document per product with its variants, queried, counted and sorted per variant.

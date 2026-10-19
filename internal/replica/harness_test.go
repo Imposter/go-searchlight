@@ -222,7 +222,7 @@ func queryUpsert(t testing.TB, index string, sh int, id, q, meta string) store.C
 	if meta != "" {
 		m = []byte(meta)
 	}
-	p, err := store.EncodeQueryPayload([]byte(q), m)
+	p, err := store.EncodeQueryPayload([]byte(q), m, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

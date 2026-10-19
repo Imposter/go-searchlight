@@ -262,3 +262,19 @@ func (q queue) acquire() bool {
 }
 
 func (q queue) release() { <-q }
+
+// MaxVersion is the greatest client version a write takes.
+const MaxVersion = 1 << 62
+
+// version reads a single write's client version (version=N, at least 1), which
+// excludes if_seq and op_type=create.
+func (p params) version(ifSeq int64) (int64, *Error) {
+	v, e := p.int("version", 0, 1, MaxVersion)
+	if e != nil || v == 0 {
+		return 0, e
+	}
+	if ifSeq != 0 {
+		return 0, InvalidAt("params.version", "version excludes if_seq and op_type=create: a versioned write applies when its version is higher than the stored one")
+	}
+	return v, nil
+}

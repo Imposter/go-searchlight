@@ -563,7 +563,7 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 	return nil
 }
 
-func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error) {
+func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc, details node.MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error) {
 	wdocs := make([]wireDoc, len(docs))
 	for i := range docs {
 		wdocs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
@@ -574,10 +574,14 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 		at = &ms
 	}
 	needs := percolateNeeds(mapping)
+	var asked *node.MatchDetails
+	if details.Any() {
+		asked, needs = &details, max(needs, percolateDetails)
+	}
 	var reply percolateReply
 	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = percolateReply{}
-		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at, Needs: needs}
+		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at, Needs: needs, Details: asked}
 		if err := t.n.readCall(ctx, c, percolatePath(needs), msg, &reply); err != nil {
 			var ae *api.Error
 			if needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
@@ -592,10 +596,10 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(reply.Matches) != len(docs) {
-		return nil, fmt.Errorf("cluster: the peer percolated %d documents of %d", len(reply.Matches), len(docs))
+		return nil, nil, fmt.Errorf("cluster: the peer percolated %d documents of %d", len(reply.Matches), len(docs))
 	}
 	out := make([]percolate.IDs, len(docs))
 	for i, m := range reply.Matches {
@@ -603,7 +607,10 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 			out[i] = percolate.IDs(m)
 		}
 	}
-	return out, nil
+	if asked != nil && len(reply.Details) != len(docs) {
+		return nil, nil, fmt.Errorf("cluster: the peer gave details of %d documents of %d", len(reply.Details), len(docs))
+	}
+	return out, reply.Details, nil
 }
 
 func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getReply, error) {
@@ -619,12 +626,12 @@ func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getRepl
 	return &reply, err
 }
 
-func (t *remoteTarget) Get(ctx context.Context, id string) ([]byte, bool, error) {
+func (t *remoteTarget) Get(ctx context.Context, id string) ([]byte, int64, bool, error) {
 	reply, err := t.get(ctx, id, false)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
-	return reply.Body, reply.Found, nil
+	return reply.Body, reply.Seq, reply.Found, nil
 }
 
 func (t *remoteTarget) GetQuery(ctx context.Context, id string) (*api.SavedQuery, bool, error) {

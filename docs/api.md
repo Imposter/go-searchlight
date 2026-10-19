@@ -226,17 +226,34 @@ their own names (every member when `fields` is empty; at most 100):
 The key is `name`, or the path. They are read from each hit's stored body once the
 page is fetched (a `fields` limit applies after), and a hit matched by another branch
 of an `any` has them too, maybe with a `total` of 0. `inner_hits` under a `not` (a
-document a `not` matches has no object to show), in an aggregation's filter, or twice
-under one key is a 400 at its `loc`. A response holds at most 10,000 inner hit objects:
-a search whose `size` times its `inner_hits` sizes (added up) passes that is a 400 at
-`size`, and the objects it may hold count against `max_inflight_read_bytes` (1 KiB
-each) while it runs.
+document a `not` matches has no object to show), or in an aggregation's filter, is a
+400 at its `loc`.
+
+**Merged by name.** Nested nodes of one path that give one key, in the query and the
+`post_filter` alike, share one set of inner hits under it: the members satisfying any
+of their queries, each once (`total` counts them exactly), the first of them by the
+largest of their `size`s, with the sub-fields any of them names (every member when one
+names none). "A variant in size L under 150, or in size M under 120" is one list:
+
+```json
+{"any": [
+  {"nested": {"path": "_v", "query": {"all": [{"field": "_v.size", "op": "eq", "value": "L"},
+    {"field": "_v.price", "op": "lt", "value": 15000}]}, "inner_hits": {"name": "picked", "size": 10}}},
+  {"nested": {"path": "_v", "query": {"all": [{"field": "_v.size", "op": "eq", "value": "M"},
+    {"field": "_v.price", "op": "lt", "value": 12000}]}, "inner_hits": {"name": "picked", "size": 10}}}]}
+```
+
+A key given to nodes of two paths is a 400 at the second one's `inner_hits`.
+
+A response holds at most 10,000 inner hit objects: a search whose `size` times its
+`inner_hits` sizes (added up, a merged key's once) passes that is a 400 at `size`, and
+the objects it may hold count against `max_inflight_read_bytes` (1 KiB each) while it
+runs.
 
 **Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
 `min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at
-the top level or under `filter`, `filters` and `global`, with no sub-aggregations. They
-collect the objects of the hits; `"where"`, a query of the sub-fields, keeps the objects
-it matches:
+the top level or under `filter`, `filters` and `global`. They collect the objects of
+the hits; `"where"`, a query of the sub-fields, keeps the objects it matches:
 
 ```json
 {"aggs": {
@@ -246,9 +263,50 @@ it matches:
 
 `terms` counts each hit once per value, however many of its objects hold it: a
 product with two L variants is one L. `stats`, `min`, `max` and `cardinality` read
-every chosen object's value. Any other aggregation on a sub-field, one under a bucket
-aggregation, a sub-aggregation of one, and a `where` on a field that is no sub-field
-are each a 400 at their `loc`.
+every chosen object's value.
+
+**Sub-aggregations under a `terms` on a sub-field.** Such a `terms` holds `stats`,
+`min`, `max`, `cardinality` and `terms` sub-aggregations (the `terms` holding none of
+its own), each bucket collecting them over:
+
+- **its documents**, for a sub-aggregation on a top-level field: each hit holding a
+  chosen object with the bucket's value, once;
+- **its objects**, for one on a sub-field of the same nested field: the chosen objects
+  (by the outer `where`) holding the bucket's value, narrowed by the sub-aggregation's
+  own `where` when it has one. A `terms` there counts documents, each once per value
+  among those objects.
+
+```json
+{"aggs": {"sizes": {"terms": {"field": "_v.size", "where": {"field": "_v.in_stock", "op": "eq", "value": true}},
+  "aggs": {
+    "sample": {"min": {"field": "item_no"}},
+    "price": {"stats": {"field": "_v.price"}},
+    "colors": {"terms": {"field": "_v.color", "size": 20}}}}}}
+```
+
+```json
+{"sizes": {"buckets": [{"key": "l", "doc_count": 12,
+  "sample": {"value": 1042},
+  "price": {"count": 15, "min": 8999, "max": 15999, "avg": 12100, "sum": 181500},
+  "colors": {"buckets": [{"key": "red", "doc_count": 7, "doc_count_error_upper_bound": 0}], "sum_other_doc_count": 0, "doc_count_error_upper_bound": 0}}]}}
+```
+
+No shard cuts a `terms` sub-aggregation's list (it takes no `shard_size`); the response
+keeps its `size` buckets, as `min_doc_count`, `include` and `exclude` choose them, and
+counts the rest in `sum_other_doc_count`. Its counts are exact where every shard
+returned the outer bucket; where a shard cut the outer bucket out of its list, that
+shard's documents are missing from it, and the sub-aggregation and each of its buckets
+carry the outer bucket's `doc_count_error_upper_bound`. Its buckets count towards the
+65,536 as each shard collects them, every one it holds (a shard past them refuses the
+search, as for a histogram), and in the response those under the buckets it holds,
+right after their own aggregation's.
+
+Any other aggregation on a sub-field, a sub-aggregation of a `stats`, `min`, `max` or
+`cardinality` on one, one on a sub-field under any other bucket aggregation or of
+another nested field, any other sub-aggregation type under a `terms` on a sub-field,
+and a `where` on a field that is no sub-field are each a 400 at their `loc`. A search
+holding sub-aggregations under a `terms` on a sub-field reaches only nodes of 1.5 or
+later (search wire level 7), a 503 while only older copies serve a shard.
 
 **Sorts** on a sub-field (a number, date, keyword or text) order the hits by the least
 (`"mode": "min"`, ascending's default) or greatest (`"max"`, descending's) value among
@@ -265,9 +323,9 @@ missing value does:
 a `bool` or `keyword_list` sub-field or on the nested field itself, are 400s at
 `sort.N`.
 
-`PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once, or
-`replicas_per_shard`. The allocator then places or releases copies to meet the new
-target.
+`PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once,
+`replicas_per_shard`, after which the allocator places or releases copies to meet the
+new target, or [`gc_deletes`](#documents), how long deletes keep their versions.
 
 ## Documents
 
@@ -287,9 +345,39 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   is a 409 `conflict` carrying `current_seq`, which gives optimistic concurrency.
 - **`op_type=create`.** Applies only if the document does not exist yet (409
   otherwise).
+- **`version=N`**, Elasticsearch's external versioning (`version_type=external`): the
+  client's own version of the document, 1 to 2^62. The write applies only when N is
+  higher than the stored version, and answers `{"id", "seq", "version"}`; otherwise it is
+  a noop, `{"id", "version", "result": "noop"}` (200, no `seq`), and writes nothing. It
+  excludes `if_seq` and `op_type=create` (400 at `params.version`).
+  - The stored version is the greater of the document's and its tombstone's. Versions
+    only rise: a write without `version` keeps the stored version (so a stale replay
+    of a lower one after it is still a noop), and a delete keeps the document's
+    version as a tombstone, so a replay of an older write after it is a noop as well.
+    A versioned write above it applies and replaces the tombstone.
+  - **A versioned delete of a document that does not exist**: when N is higher than
+    its tombstone (or there is none), a 404 `document_not_found` (`result:
+    "not_found"`) that records N as its tombstone; at or below it, a noop (200,
+    `result: "noop"`).
+  - **`gc_deletes`**, an index setting as Elasticsearch's `index.gc_deletes` (24 h by
+    default, 1 s to 365 days, set at creation or by `PATCH .../settings`): how long a
+    tombstone is kept. The cluster's leader prunes older ones at each changelog prune,
+    after which a write of any version applies to the deleted id, as in
+    Elasticsearch. Replay within it.
+  - `GET` returns the document's `version` (absent for 0), as `_bulk` items and
+    percolation matches do.
+  - Replays and reconciles are harmless: send the same versioned writes again, and each
+    one already applied is a noop.
+  - **During a rolling upgrade** from 1.4, until every node runs 1.5, versions may
+    disagree: a 1.4 node writes as before, leaving the stored version untouched, and
+    its copies report no versions or `_seq` (a request with `percolate_matches` or
+    `seq_no` skips them, 503 with no other copy). Send versioned writes to upgraded
+    nodes, and trust `version` in `GET` and percolation matches once the rollout is
+    done.
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
 - **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
-  is a 404 `document_not_found` with `result: "not_found"`, and writes nothing.
+  is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the
+  version of a versioned one).
 - **Stale reads.** While the database cannot be reached, `GET` answers from this node's
   copy with `stale: true` and no `seq`.
 
@@ -323,6 +411,27 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 - **Actions.** Each operation is an action line, `upsert`, `create` or `delete`,
   followed by the document for an upsert or a create. `index` is an alias of `upsert`,
   and `_id` of `id`.
+- **Saved queries.** `query_upsert` is followed by the saved query, as `PUT
+  .../queries/{id}` takes it (`{"query": ..., "meta": {...}}`; a line of another shape
+  refuses the whole request), and `query_delete` takes none. Documents and saved queries
+  mix in one request, in one transaction. With `percolate=true` every document of the
+  request percolates after the whole request commits, so against the saved queries as
+  they stand at its end: those its `query_upsert`s write, wherever they are in the
+  request, included, and those its `query_delete`s remove left out:
+
+  ```
+  {"query_upsert": {"id": "s7", "version": 3}}
+  {"query": {"field": "brand", "op": "eq", "value": "acme"}, "meta": {"search_id": 7}}
+  {"upsert": {"id": "sku-1", "version": 12}}
+  {"brand": "Acme", "price": 30}
+  {"query_delete": {"id": "s8", "version": 5}}
+  ```
+
+- **`version`** in an action's metadata is the [`version=N`](#documents) of its op, on
+  documents and saved queries alike: an item at or below the stored version answers
+  `{"status": 200, "version": N, "result": "noop"}`, with no `seq` and, under
+  `percolate=true`, no `queries`. It excludes `if_seq` and `create` (400 at
+  `line.N.<action>.version`).
 - **Partial failure.** An operation refused on its own (an invalid document, a failed
   `if_seq`) is reported in its item, with `errors` set, and the rest commit.
 - **Whole-request refusal.** A malformed action line, a line over `max_doc_bytes`, or
@@ -546,6 +655,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
 
   Any cut sets `timed_out: true`. The hits found are fetched past the deadline, and
   the response written after it.
+- **`seq_no`** (`false` by default), as Elasticsearch's `seq_no_primary_term`: each hit
+  carries `_seq`, the seq of the change that wrote the version its copy holds (absent
+  for a document indexed by a release before 1.5, until it is written again or its
+  copy rebuilt). It is the same seq a write answered, and a percolation's `_seq`, so a
+  client can tell which of two answers saw the newer document. A search with hits and
+  `seq_no` reaches only nodes of 1.5 or later (search wire level 8).
 - **`request_cache`** (`true` by default), Elasticsearch's shard request cache. A search
   with `size` 0 (a count, or aggregations only; no `from` or `search_after`) is
   answered, shard by shard, from what an identical search of the same shard contents
@@ -704,8 +819,22 @@ curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: B
   `query.field`.
 - **`meta`** is an opaque object of at most 16 KiB, returned as given. scrape-bot keeps
   its search id there.
-- **Writes** take the same `if_seq`, `op_type` and `refresh` parameters as documents.
-- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`.
+- **Writes** take the same `if_seq`, `op_type`, `refresh` and [`version`](#documents)
+  parameters as documents, and so do `_bulk`'s `query_upsert` and `query_delete`
+  ([Bulk](#bulk)). `GET` returns the query's `version` (absent for 0), and every
+  percolation copy indexes it with the query.
+- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`. A page takes two
+  statements in one snapshot: one picks its ids, the first `size` of every shard's
+  primary key range after `after` (each range cut at `size`), then one reads the trees
+  and meta of those ids alone, so a page costs what it returns whatever the index holds.
+  - **`fields`**, a comma-separated list of `id`, `seq`, `version`, `query` and `meta`,
+    keeps those members of each query (`id` always). Without `query` and `meta`, their
+    trees and meta are never read: `?fields=id,version&size=1000` pages a reconcile of
+    100,000 queries in 100 requests of ids and versions (`version` 0 for none):
+
+    ```json
+    {"queries": [{"id": "s7", "version": 3}, {"id": "s8", "version": 0}], "next": "s8"}
+    ```
 
 ## Percolation
 
@@ -730,13 +859,45 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
   order.
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
-  pass `wait_for_seq` to see a recent write.
+  pass `wait_for_seq` to see a recent write. Each found one's result carries `_seq`,
+  the seq of the change that wrote the version the copy percolated (absent for a
+  document indexed by a release before 1.5), so a client can order its decisions by
+  document version.
+- **Shards at once.** The node sends the documents to every peer's copy at once (its own
+  copies too for 64 documents or more; fewer, it runs them in turn while the peers
+  answer) and merges their matches (a saved query lives on the shard its id hashes to); a shard
+  that fails cancels the others.
+- **Matches with versions: `percolate_matches=true`.** Each result also lists
+  `matches`, its matched saved queries in `queries`' order, each with its client
+  [version](#saved-queries) (absent for none). `queries` stays as it was, so a client
+  that does not ask sees no change.
+- **Inner hits: `percolate_inner_hits=true`** (implies `percolate_matches`). Each match
+  of a saved query whose nested nodes declare `inner_hits` gives them by key, merged by
+  name as a [search](#nested-fields) merges them, as `{"total", "offsets"}`: the
+  document's members those nodes' queries match, the first `size` (the saved query's)
+  by their offsets, exactly what a search of that saved query reports for the document,
+  without the objects. The copy that holds the saved query reads them off the
+  document as it percolated it.
+
+  ```json
+  {"results": [{"found": true, "queries": ["s7"], "matches": [
+    {"id": "s7", "version": 3, "inner_hits": {"picked": {"total": 2, "offsets": [0, 3]}}}]}]}
+  ```
+
+  Both parameters work on `_bulk?percolate=true` too, each upserted document's item
+  carrying `matches` beside `queries` (and `seq`, the version it was percolated at).
+  With them, a percolation reaches only nodes of 1.5 or later (percolate wire level 4).
 - **Limits.**
   - Up to 10,000 documents per request, given and stored together. More is a 413.
   - At most 1,000,000 matches per request, every document's together. Past it, the
     request is refused with a 422 whose code is `too_many_matches`: percolate fewer
     documents per request. An answer is never truncated, since a missing match is
     a wrong answer.
+  - With `percolate_inner_hits`, at most 100,000 inner hit offsets per request, every
+    match's together: past them, the same 422 `too_many_matches` (`_bulk`:
+    `percolated: false`, `percolate_reason: "too_many_matches"`). The request reserves
+    what they may take (16 bytes each, at most half the budget) from
+    `max_inflight_read_bytes` while it runs.
 - **Server time.** `took_ms` and `took_us` are the server's time for the request, from
   its admission to the last byte of its answer encoded, in whole milliseconds and
   microseconds. The `Server-Timing` header carries the same time

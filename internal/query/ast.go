@@ -165,7 +165,8 @@ type Nested struct {
 // them with their sub-fields Fields (full names; every member when empty). It is no
 // part of what the query matches.
 type InnerHits struct {
-	// Name keys the hit's inner hits: the path when empty.
+	// Name keys the hit's inner hits: the path when empty. Nodes of one path under one
+	// key share one set of inner hits: the members satisfying any of their queries.
 	Name   string   `json:"name,omitempty"`
 	Size   int      `json:"size"`
 	Fields []string `json:"fields,omitempty"`

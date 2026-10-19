@@ -172,6 +172,9 @@ type Request struct {
 	Timeout time.Duration
 	// Index labels the search's spans, logs and metrics.
 	Index string
+	// SeqNo gives each hit its Seq, as Elasticsearch's seq_no_primary_term gives
+	// _seq_no: the seq of the change that wrote the version a copy holds.
+	SeqNo bool
 	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
@@ -185,6 +188,10 @@ type Request struct {
 	// objects: a nested node in a query, or an aggregation or sort on a sub-field. A
 	// peer answers such a request only from the release that reads them.
 	Nested bool `json:"-"`
+	// NestedSubAggs is set by [ValidateQueries] when a terms aggregation on a
+	// sub-field holds sub-aggregations, which a peer answers only from the release
+	// that collects them.
+	NestedSubAggs bool `json:"-"`
 
 	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
 	// ("" reads as aggs).
@@ -231,10 +238,15 @@ const (
 // ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
 //
 // A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max and
-// cardinality alone, at the top level or under filter, filters and global, with no
-// sub-aggregations: over the objects of the hits that Where chooses. terms counts
-// each document once per value, however many of its objects hold it; the metrics
-// read every chosen object's value.
+// cardinality alone, at the top level or under filter, filters and global: over the
+// objects of the hits that Where chooses. terms counts each document once per value,
+// however many of its objects hold it; the metrics read every chosen object's value.
+// A terms on a sub-field holds metric and terms sub-aggregations (those terms holding
+// none): one on a top-level field reads the bucket's documents, each once; one on a
+// sub-field of the same nested field reads the bucket's objects, the chosen ones
+// holding its value that its own Where chooses. No shard cuts a terms
+// sub-aggregation there (its buckets count towards MaxBuckets as they are collected),
+// and the outer bucket's error bound bounds what it misses.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string
@@ -336,7 +348,7 @@ func (ps *problems) add(loc, format string, args ...any) {
 }
 
 // ParseRequest reads a search request body: {query, post_filter, sort, size, from,
-// search_after, track_total, aggs, fields, timeout, request_cache}, Elasticsearch
+// search_after, track_total, aggs, fields, seq_no, timeout, request_cache}, Elasticsearch
 // style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
@@ -349,7 +361,8 @@ func (ps *problems) add(loc, format string, args ...any) {
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
-//   - request_cache: false keeps a size-0 search out of the shard request cache.
+//   - request_cache: false keeps a size-0 search out of the shard request cache;
+//   - seq_no: true gives each hit the seq of the change that wrote it.
 //
 // A missing query matches every document, and a missing size is DefaultSize. It
 // returns every problem found, each with its loc ("sort.1",
@@ -431,6 +444,15 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Fields = fields
+		case "seq_no":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				r.SeqNo = true
+			case "false":
+				r.SeqNo = false
+			default:
+				ps.add("seq_no", "seq_no is true or false")
+			}
 		case "request_cache":
 			switch string(bytes.TrimSpace(val)) {
 			case "true":
@@ -448,7 +470,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			}
 			r.Timeout = d
 		default:
-			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout and request_cache")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, seq_no, timeout and request_cache")
 		}
 	}
 	switch {
@@ -728,9 +750,10 @@ func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
 // aggregation that holds it), which ask for no inner hits, and as
 // [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
 // field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
-// query and post_filter ask for no inner hits under one key, and at most
-// MaxInnerHitsObjects together (InnerHitsObjects). It sets r.Nested when r reads a
-// nested field's objects.
+// query and post_filter give one key to one path's nodes alone, and ask for at most
+// MaxInnerHitsObjects inner hits together (InnerHitsObjects). It sets r.Nested when r
+// reads a nested field's objects, and r.NestedSubAggs when a terms aggregation on a
+// sub-field holds sub-aggregations.
 func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	ps := query.Validate(r.Query, m)
 	if r.PostFilter != nil {
@@ -750,23 +773,29 @@ func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
 	}
 	ps = append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
 	r.Nested = readsNested(r, m)
+	r.NestedSubAggs = nestedSubAggs(r.Aggs, m)
 	return ps
 }
 
 // sharedInnerHits reports each nested node of post that asks for inner hits under a key
-// one of q's takes already: a hit has one set of inner hits per key.
+// one of q's takes already for another path: nodes of one path share a key, and its
+// inner hits, across the query and post_filter as within either.
 func sharedInnerHits(q, post query.Node) []query.Problem {
-	keys := map[string]bool{}
+	keys := map[string]string{}
 	query.Walk(q, func(_ string, node query.Node) bool {
 		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
-			keys[x.InnerHits.Key(x.Path)] = true
+			if key := x.InnerHits.Key(x.Path); keys[key] == "" {
+				keys[key] = x.Path
+			}
 		}
 		return true
 	})
 	var ps []query.Problem
 	query.Walk(post, func(at string, node query.Node) bool {
-		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil && keys[x.InnerHits.Key(x.Path)] {
-			ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits take the key %q already: name one otherwise (name)", x.InnerHits.Key(x.Path))})
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			if path := keys[x.InnerHits.Key(x.Path)]; path != "" && path != x.Path {
+				ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits %q are nested field %q's: nodes share inner hits by name on one path alone (name these otherwise)", x.InnerHits.Key(x.Path), path)})
+			}
 		}
 		return true
 	})
@@ -1103,4 +1132,16 @@ func aggsLoc(key string) string {
 		return "aggs"
 	}
 	return key
+}
+
+// nestedSubAggs reports whether aggs hold, at any level, a terms aggregation on a
+// sub-field of m's with sub-aggregations.
+func nestedSubAggs(aggs map[string]Agg, m *schema.Mapping) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if _, sub := m.NestedPath(a.Field); (sub && a.Type == AggTerms && len(a.Aggs) > 0) || nestedSubAggs(a.Aggs, m) {
+			return true
+		}
+	}
+	return false
 }

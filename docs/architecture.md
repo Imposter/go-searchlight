@@ -14,7 +14,14 @@ database (Postgres, MySQL or SQLite), and nowhere else:
 - **The changelog** (`sl_changes`) is the write-ahead log. A write is acknowledged once
   its transaction commits.
 - **The documents and saved queries** (`sl_documents`, `sl_queries`) are the system of
-  record.
+  record, each row with the seq of its last write and the client version it named.
+  `sl_tombstones` keeps the version of each id a delete removed, with when, for the
+  index's `gc_deletes`. A versioned change is checked inside its transaction, under the
+  counter lock, against the greater of the row's version and the tombstone's: at or below
+  it, the change is dropped as a noop and takes no seq. An unversioned upsert keeps the
+  row's version (the upsert statement leaves it), so versions only rise. A saved query's
+  version also rides its changelog payload, so copies index it with the query
+  (`percolate/4` keeps it per query).
 - **The registry** (`sl_nodes`, `sl_shard_copies`) is how nodes find each other, and its
   leases decide who holds which shard copy.
 
@@ -263,18 +270,30 @@ data_dir/
     request cache, totals and sorts stay the documents'.
   - An aggregation on a sub-field collects the objects of the hits (those its `where`
     matches); `terms` counts a document once per value with each value's last
-    counted document, and its partial is keyed by value, never by ordinal. A sort on
+    counted document, and its partial is keyed by value, never by ordinal. Each of its
+    buckets holds its sub-aggregations' collectors, made at the bucket's first object:
+    one on a top-level field built on the parent segment and fed each document once
+    (when the bucket first counts it), one on a sub-field built on the object segment
+    and fed each object (those its own `where` matches, a bitmap computed once per
+    segment). A `terms` there is keyed by value too, charged to the segment's bucket
+    budget as it collects, and never cut by a shard, so the
+    shards' lists merge by key exactly. A sort on
     a sub-field reads, per document, the least or greatest value among its chosen
     objects, from a bitset of them. Inner hits are read at the coordinator from each
     fetched body, by the inner query's compiled matcher on each member.
   - The percolator compiles a nested node to a program (`pNested`) holding its
     sub-fields' slots: each object of the document fills them in turn while the inner
-    program runs. A saved nested query anchors as always-check.
+    program runs. A saved nested query anchors on its inner query's atoms (see Anchors).
   - On BenchmarkNested*/Flat* (20,000 products of five variants, one merged segment,
     Ryzen 7 3700X), the correlated query "size L, in stock, under 150" takes 0.67 ms
     nested against 0.21 ms over one document per variant; a `terms` with a `where`
     1.4 ms against 0.24 ms (which counts from the dictionary); a sort by the cheapest
     in-stock variant 1.3 ms against 0.1 ms (which walks the point index).
+- **Document seqs.** A copy keeps each document's seq, the seq of the change that wrote
+  the version it indexes, in a numeric column of its own (`schema.SeqColumn`, a name no
+  mapping or document member can take), added as the change is applied: no query reads
+  it, and a hit's `_seq` (`seq_no`) and a stored document's percolation `_seq` are read
+  from it. Segments written before it have no such column, and their documents no seq.
 - **Format versions.** The segment format is versioned (major 4, minor 1 for a segment
   holding a point field, 2 for one holding a nested field's objects; a binary reads its
   own major and the one before). A copy whose files
@@ -341,12 +360,24 @@ flowchart LR
   (a number range, a bool, a text the field must not equal, or an entry it must not
   hold) that a document must pass to become a candidate. A `words_*` phrase anchors on
   the pair of its two rarest words.
-- **Query segments.** Anchors live in percolator segments (`percolate/3`) that refresh
+- **Nested anchors.** A nested node anchors as its inner query would, on its path's
+  sub-fields by their full names (`_v.size`), and a document holds the atoms of every
+  one of its objects' values of them: the object a match needs holds the anchor, so
+  the document does. Only an inner query with no positive conjunct (a `not`, the
+  match-any `{"all": []}`) leaves the node Always. A sub-field's cost counts the
+  objects holding the term (`Generation.DocFreq`, an upper bound on the documents), or,
+  without statistics, scales its prior by 8: a document holds an atom when any of its
+  objects does, so a top-level anchor of the same group wins unless the variant's is
+  rarer. On BenchmarkPercolateNested (100k saved searches, 70% of them variant
+  searches), always-check queries fall from 9,867 to 0, and throughput rises from
+  1,564 to 6,692 documents a second.
+- **Query segments.** Anchors live in percolator segments (`percolate/4`) that refresh
   and merge like document segments, under their own merge policy (two per tier). Every
   query segment costs every document a probe, so the policy keeps them few. A segment is
   memory-mapped and validated at open; nothing per query goes on the heap. It holds the
   term dictionary, interval trees, always-check list, one compiled program per
-  verification class (queries with the same canonical form), and every id as its JSON
+  verification class (queries with the same canonical form), each query's client
+  version, and every id as its JSON
   literal. All of these are numbered by rank (id order), so candidates read in order
   are matches in output order.
 - **Percolating a document.** The document is analyzed for matching (no grams). Its
@@ -369,6 +400,17 @@ flowchart LR
     percolator keeps the plan of the last set of query segments and worker count it
     split for, so requests alternating between documents whose worker counts differ
     (one document, then two) rebuild it each time: a few hundred id reads and a sort.
+  - **Details.** Asked for matches' details, the copy that percolated reads them after
+    the matches: each matched id's query segment and ordinal (`LookupQuery`), its
+    version from the segment's version section, and, for inner hits, its query once
+    per request (parsed and compiled, `search.QueryInnerHits`), whose nested nodes'
+    inner hits it reads off the analyzed document's objects as a search reads them off a
+    hit's body. The coordinator merges each document's matches from every shard by id
+    (disjoint: a query lives on one shard).
+  - **Shards at once.** The coordinator percolates every shard's copy at once (local
+    copies on their percolators, peers over the peer API; local ones in turn, in the
+    caller's goroutine, below 64 documents, as their percolators use every core
+    already) and merges their answers; the first shard to fail cancels the rest.
   - **Exactness.** The answer is exactly the brute-force one. Property tests check that
     the candidates always include every true match, and that every program decides as
     the matcher does.

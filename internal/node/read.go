@@ -450,7 +450,7 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			return nil, docProblem(err, loc)
 		}
 		res := api.PercolateResult{ID: id}
-		body, ok, err := ts[ShardFor(id, len(ts))].Get(ctx, id)
+		body, seq, ok, err := ts[ShardFor(id, len(ts))].Get(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -459,21 +459,32 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 			if err != nil {
 				return nil, docProblem(err, loc)
 			}
-			res.Found = true
+			res.Found, res.Seq = true, seq
 			docs = append(docs, doc)
 			storedPositions = append(storedPositions, len(out))
 		}
 		out = append(out, res)
 	}
-	matches, err := n.percolateDocs(ctx, idx, ts, docs)
+	matches, details, err := n.percolateDocs(ctx, idx, ts, docs, MatchDetails{Versions: req.Matches || req.InnerHits, InnerHits: req.InnerHits})
+	if details != nil {
+		for i := range out {
+			out[i].Matches = []api.PercolateMatch{}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	for i := range req.Docs {
 		out[i].Queries = json.RawMessage(matches[i])
+		if details != nil {
+			out[i].Matches = details[i]
+		}
 	}
 	for k, p := range storedPositions {
 		out[p].Queries = json.RawMessage(matches[len(req.Docs)+k])
+		if details != nil {
+			out[p].Matches = details[len(req.Docs)+k]
+		}
 	}
 	return &api.PercolateResponse{Results: out, Stale: ts.stale() || n.stale()}, nil
 }
@@ -560,7 +571,7 @@ func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.Read
 	if err != nil {
 		return nil, err
 	}
-	return &api.Document{ID: id, Seq: r.Seq, Body: r.Body}, nil
+	return &api.Document{ID: id, Seq: r.Seq, Version: r.Version, Body: r.Body}, nil
 }
 
 // GetQuery implements [api.Coordinator]: read from the store, so realtime; from a
@@ -588,7 +599,7 @@ func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOpt
 	if err != nil {
 		return nil, err
 	}
-	return &api.SavedQuery{ID: id, Seq: r.Seq, Query: r.Body, Meta: r.Meta}, nil
+	return &api.SavedQuery{ID: id, Seq: r.Seq, Version: r.Version, Query: r.Body, Meta: r.Meta}, nil
 }
 
 // recordTimeout bounds a realtime read of one record: past it (a database that hangs
@@ -629,7 +640,7 @@ func (n *Single) staleDocument(ctx context.Context, idx *index, id string, waitS
 		return nil, err
 	}
 	defer t.Release()
-	body, ok, err := t.Get(ctx, id)
+	body, _, ok, err := t.Get(ctx, id)
 	if err != nil {
 		return nil, cause
 	}
@@ -682,17 +693,17 @@ func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKin
 }
 
 // ListQueries implements [api.Coordinator]: read from the store, so realtime.
-func (n *Single) ListQueries(ctx context.Context, name, after string, size int) ([]*api.SavedQuery, error) {
+func (n *Single) ListQueries(ctx context.Context, name, after string, size int, lean bool) ([]*api.SavedQuery, error) {
 	if _, err := n.lookupForRead(ctx, name, 0); err != nil {
 		return nil, err
 	}
-	recs, err := n.records.ListQueries(ctx, name, after, size)
+	recs, err := n.records.ListQueries(ctx, name, after, size, lean)
 	if err != nil {
 		return nil, storeError(err, name)
 	}
 	out := make([]*api.SavedQuery, len(recs))
 	for i := range recs {
-		out[i] = &api.SavedQuery{ID: recs[i].ID, Seq: recs[i].Seq, Query: recs[i].Body, Meta: recs[i].Meta}
+		out[i] = &api.SavedQuery{ID: recs[i].ID, Seq: recs[i].Seq, Version: recs[i].Version, Query: recs[i].Body, Meta: recs[i].Meta}
 	}
 	return out, nil
 }

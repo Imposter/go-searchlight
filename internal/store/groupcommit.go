@@ -326,7 +326,7 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 				var res gcResult
 				for j := range batch[i].changes {
 					seq := changes[off+j].Seq
-					batch[i].changes[j].Seq = seq
+					batch[i].changes[j].Seq, batch[i].changes[j].Noop = seq, changes[off+j].Noop
 					if seq == 0 {
 						continue
 					}

@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -224,14 +225,14 @@ var rereadOps = []struct {
 		return err
 	}},
 	{"percolate", func(ctx context.Context, rt *remoteTarget) error {
-		ids, err := rt.Percolate(query.WithNow(ctx, time.UnixMilli(1_900_000_000_000)), nil, []schema.Doc{{ID: "d", Body: []byte(`{"title": "a"}`)}})
+		ids, _, err := rt.Percolate(query.WithNow(ctx, time.UnixMilli(1_900_000_000_000)), nil, []schema.Doc{{ID: "d", Body: []byte(`{"title": "a"}`)}}, node.MatchDetails{})
 		if err == nil && (len(ids) != 1 || !strings.Contains(string(ids[0]), `"q"`)) {
 			err = errors.New("the percolation matched no saved query")
 		}
 		return err
 	}},
 	{"get", func(ctx context.Context, rt *remoteTarget) error {
-		_, found, err := rt.Get(ctx, "x")
+		_, _, found, err := rt.Get(ctx, "x")
 		if err == nil && !found {
 			err = errors.New("the document was not found")
 		}
@@ -370,7 +371,7 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 	t.Run("new address", func(t *testing.T) {
 		r.reset(r.c.addr)
 		gone := candidate{node: r.b.n.ID(), addr: "127.0.0.1:1", shard: r.id}
-		if _, found, err := r.target(gone).Get(tctx(t), "x"); err != nil || !found {
+		if _, _, found, err := r.target(gone).Get(tctx(t), "x"); err != nil || !found {
 			t.Fatalf("a get routed to b's old address: %v, %v", found, err)
 		}
 		if n := r.tap.count(r.b.addr); n != 1 {
@@ -488,7 +489,7 @@ func TestRereadKeepsTheRequestBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	start := time.Now()
-	_, _, err := r.target(r.at(r.b)).Get(ctx, "x")
+	_, _, _, err := r.target(r.at(r.b)).Get(ctx, "x")
 	var ae *api.Error
 	if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || ctx.Err() != nil {
 		t.Fatalf("a read whose re-read is held: %v (request %v), want a 503 in time", err, ctx.Err())
@@ -565,7 +566,7 @@ func TestRereadsOfShortRequestsAreNotStarved(t *testing.T) {
 		rt := r.target(r.at(r.b))
 		rt.routed = r.trailing.readBegan
 		ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-		_, found, err := rt.Get(ctx, "x")
+		_, _, found, err := rt.Get(ctx, "x")
 		cancel()
 		if err == nil && found {
 			answered = i

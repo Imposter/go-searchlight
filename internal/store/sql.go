@@ -376,7 +376,10 @@ func (p *prepared) prepareOne(i int, c *Change, compress bool) error {
 	if c.IfSeq < IfExists {
 		return invalidf("if_seq %d", c.IfSeq)
 	}
-	if c.IfSeq != 0 {
+	if c.Version < 0 {
+		return invalidf("version %d", c.Version)
+	}
+	if c.IfSeq != 0 || c.Version > 0 || !c.Kind.isUpsert() {
 		p.conditional = true
 	}
 	switch c.Kind {
@@ -398,6 +401,9 @@ func (p *prepared) prepareOne(i int, c *Change, compress bool) error {
 		}
 		if len(q.Meta) == 0 || string(q.Meta) == "null" {
 			q.Meta = json.RawMessage("{}")
+		}
+		if q.Version != c.Version {
+			return invalidf("the query payload's version %d is not the change's, %d", q.Version, c.Version)
 		}
 		p.query[i] = q
 		p.payload[i] = storedBody{plain: string(c.Payload)}
@@ -480,8 +486,10 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	if err != nil {
 		return 0, 0, err
 	}
+	var tombs map[recKey]tombAction
 	if p.conditional {
-		skip, err := s.checkConditions(ctx, tx, batch, counter+1)
+		var skip []bool
+		skip, tombs, err = s.checkConditions(ctx, tx, batch, counter+1)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -502,6 +510,18 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 	}
 	first, last = counter+1, counter+int64(len(batch))
 	if len(batch) == 0 {
+		if len(tombs) == 0 {
+			return first, last, nil
+		}
+		w := &dialect.Write{Counter: counter}
+		addTombs(w, tombs, nowMs)
+		if err := s.write(ctx, tx, w); err != nil {
+			return 0, 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, 0, fmt.Errorf("commit: %w", err)
+		}
+		committed = true
 		return first, last, nil
 	}
 
@@ -515,6 +535,7 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		}
 	}
 	netState(w, batch, p, first)
+	addTombs(w, tombs, nowMs)
 	if w.Notify, err = s.notifications(batch, first); err != nil {
 		return 0, 0, err
 	}
@@ -632,58 +653,170 @@ func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change)
 	return states, nil
 }
 
-// checkConditions evaluates IfSeq conditions in batch order, as if each
-// change before that passed its condition applied, and fails with a
-// *ConflictError listing every failure. An IfExists change whose target is
-// missing is not a failure: it is reported in skip, and treated as not
-// applied by the changes after it, as a change whose condition failed is.
-func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) (skip []bool, err error) {
-	cur := make(map[recKey]int64)
+// keyState is what checkConditions knows of one target as the batch goes: its seq (0:
+// absent), its version (once versionKnown: an unconditional upsert of a target not read
+// yet leaves the stored version as it was, and the store's is read when a later change
+// needs it), and its tombstone's version (read once, when a version needs it).
+type keyState struct {
+	seq, version int64
+	versionKnown bool
+	tomb         int64
+	tombRead     bool
+}
+
+// tombAction is what a batch does to one target's tombstone: keep version (keep set),
+// or remove it.
+type tombAction struct {
+	keep    bool
+	version int64
+}
+
+// checkConditions evaluates Version and IfSeq conditions in batch order, as if each
+// change before that passed its conditions applied, and fails with a *ConflictError
+// listing every IfSeq failure. A change whose Version is not above the stored one (the
+// greater of the target's and its tombstone's) is a noop (Noop set), and an IfExists
+// change whose target is missing is not a failure: both are reported in skip, and
+// treated as not applied by the changes after them, as a change whose condition failed
+// is. tombs are the batch's net tombstone writes, by target: a delete of a target with
+// a version keeps it (the greater of the change's, the target's and its tombstone's; a
+// versioned delete of nothing, which skip drops, too), and a versioned upsert removes
+// a tombstone the target had. Versions only ever rise: an unversioned write keeps the
+// stored one.
+func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) (skip []bool, tombs map[recKey]tombAction, err error) {
+	cur := make(map[recKey]*keyState)
+	read := func(c *Change, k recKey, st *keyState) error {
+		q := s.d.Changelog.DocumentState
+		if k.query {
+			q = s.d.Changelog.QueryState
+		}
+		var seq, version int64
+		err := tx.QueryRowContext(ctx, q, c.Index, c.Shard, c.ID).Scan(&seq, &version)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			seq, version = 0, 0
+		case err != nil:
+			return fmt.Errorf("check conditions: %w", err)
+		}
+		if st.seq == 0 && !st.versionKnown {
+			st.seq = seq
+		}
+		st.version, st.versionKnown = version, true
+		return nil
+	}
+	state := func(c *Change, k recKey) (*keyState, error) {
+		st, ok := cur[k]
+		if !ok {
+			st = &keyState{}
+			if err := read(c, k, st); err != nil {
+				return nil, err
+			}
+			cur[k] = st
+			return st, nil
+		}
+		if !st.versionKnown {
+			if err := read(c, k, st); err != nil {
+				return nil, err
+			}
+		}
+		return st, nil
+	}
+	tomb := func(c *Change, k recKey, st *keyState) (int64, error) {
+		if !st.tombRead {
+			kind := dialect.TombstoneDocument
+			if k.query {
+				kind = dialect.TombstoneQuery
+			}
+			err := tx.QueryRowContext(ctx, s.d.Changelog.Tombstone, c.Index, c.Shard, kind, c.ID).Scan(&st.tomb)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				st.tomb = 0
+			case err != nil:
+				return 0, fmt.Errorf("check tombstone: %w", err)
+			}
+			st.tombRead = true
+		}
+		return st.tomb, nil
+	}
+	skipAt := func(i int) {
+		if skip == nil {
+			skip = make([]bool, len(batch))
+		}
+		skip[i] = true
+	}
 	var conflict *ConflictError
 	for i := range batch {
 		c := &batch[i]
+		c.Noop = false
 		k := keyOf(c)
-		if c.IfSeq != 0 {
-			seq, ok := cur[k]
+		if c.IfSeq == 0 && c.Version == 0 && c.Kind.isUpsert() {
+			st, ok := cur[k]
 			if !ok {
-				q := s.d.Changelog.DocumentSeq
-				if k.query {
-					q = s.d.Changelog.QuerySeq
-				}
-				err := tx.QueryRowContext(ctx, q, c.Index, c.Shard, c.ID).Scan(&seq)
-				switch {
-				case errors.Is(err, sql.ErrNoRows):
-					seq = 0
-				case err != nil:
-					return nil, fmt.Errorf("check if_seq: %w", err)
-				}
+				st = &keyState{}
+				cur[k] = st
 			}
-			if c.IfSeq == IfExists && seq == 0 {
-				if skip == nil {
-					skip = make([]bool, len(batch))
-				}
-				skip[i] = true
-				continue
-			}
-			if (c.IfSeq == IfAbsent && seq != 0) || (c.IfSeq > 0 && seq != c.IfSeq) {
-				if conflict == nil {
-					conflict = &ConflictError{}
-				}
-				conflict.Positions = append(conflict.Positions, i)
-				conflict.Current = append(conflict.Current, seq)
-				continue
+			st.seq = first + int64(i)
+			continue
+		}
+		st, err := state(c, k)
+		if err != nil {
+			return nil, nil, err
+		}
+		var stone int64
+		if c.Version > 0 || (!c.Kind.isUpsert() && st.version > 0) {
+			if stone, err = tomb(c, k, st); err != nil {
+				return nil, nil, err
 			}
 		}
-		if c.Kind.isUpsert() {
-			cur[k] = first + int64(i)
-		} else {
-			cur[k] = 0
+		if c.Version > 0 && c.Version <= max(st.version, stone) {
+			c.Noop = true
+			skipAt(i)
+			continue
+		}
+		if c.IfSeq == IfExists && st.seq == 0 {
+			skipAt(i)
+			if c.Version > 0 {
+				st.tomb = c.Version
+				tombs = setTomb(tombs, k, tombAction{keep: true, version: c.Version})
+			}
+			continue
+		}
+		if (c.IfSeq == IfAbsent && st.seq != 0) || (c.IfSeq > 0 && st.seq != c.IfSeq) {
+			if conflict == nil {
+				conflict = &ConflictError{}
+			}
+			conflict.Positions = append(conflict.Positions, i)
+			conflict.Current = append(conflict.Current, st.seq)
+			continue
+		}
+		switch {
+		case !c.Kind.isUpsert():
+			if v := max(c.Version, st.version, stone); v > 0 {
+				st.tomb = v
+				tombs = setTomb(tombs, k, tombAction{keep: true, version: v})
+			}
+			st.seq, st.version = 0, 0
+		case c.Version > 0:
+			if stone > 0 {
+				st.tomb = 0
+				tombs = setTomb(tombs, k, tombAction{})
+			}
+			st.seq, st.version = first+int64(i), c.Version
+		default:
+			st.seq = first + int64(i)
 		}
 	}
 	if conflict != nil {
-		return nil, conflict
+		return nil, nil, conflict
 	}
-	return skip, nil
+	return skip, tombs, nil
+}
+
+func setTomb(tombs map[recKey]tombAction, k recKey, a tombAction) map[recKey]tombAction {
+	if tombs == nil {
+		tombs = map[recKey]tombAction{}
+	}
+	tombs[k] = a
+	return tombs
 }
 
 // netState adds the batch's net effect on sl_documents and sl_queries to w:
@@ -708,10 +841,10 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 		seq := first + int64(i)
 		switch c.Kind {
 		case KindUpsert:
-			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i].plain, BodyZ: p.payload[i].z, Seq: seq})
+			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i].plain, BodyZ: p.payload[i].z, Seq: seq, Version: c.Version})
 		case KindQueryUpsert:
 			w.Queries = append(w.Queries, dialect.QueryRow{
-				Index: c.Index, Shard: c.Shard, ID: c.ID, Query: string(p.query[i].Query), Meta: string(p.query[i].Meta), Seq: seq,
+				Index: c.Index, Shard: c.Shard, ID: c.ID, Query: string(p.query[i].Query), Meta: string(p.query[i].Meta), Seq: seq, Version: c.Version,
 			})
 		case KindDelete, KindQueryDelete:
 			groups := &w.DocumentDeletes
@@ -726,6 +859,22 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 				*groups = append(*groups, dialect.DeleteGroup{Index: c.Index, Shard: c.Shard})
 			}
 			(*groups)[at].IDs = append((*groups)[at].IDs, c.ID)
+		}
+	}
+}
+
+// addTombs adds tombs, a batch's net tombstone writes, to w, stamped nowMs.
+func addTombs(w *dialect.Write, tombs map[recKey]tombAction, nowMs int64) {
+	for k, a := range tombs {
+		kind := dialect.TombstoneDocument
+		if k.query {
+			kind = dialect.TombstoneQuery
+		}
+		row := dialect.TombstoneRow{Index: k.index, Shard: k.shard, Kind: kind, ID: k.id, Version: a.version, At: nowMs}
+		if a.keep {
+			w.Tombstones = append(w.Tombstones, row)
+		} else {
+			w.TombstoneDeletes = append(w.TombstoneDeletes, row)
 		}
 	}
 }
@@ -884,7 +1033,7 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 	}
 	if err := scanRows(ctx, tx, s.d.Changelog.ScanQueries, shard, func(rows *sql.Rows) (Record, error) {
 		r := Record{Kind: RecordQuery, Index: shard.Index, Shard: shard.Shard, IndexUID: uid, MappingVersion: mv}
-		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq)
+		return r, rows.Scan(&r.ID, &r.Body, &r.Meta, &r.Seq, &r.Version)
 	}, fn); err != nil {
 		return pt, err
 	}
@@ -1073,4 +1222,23 @@ func (s *watchingStore) Watch(ctx context.Context, ready func(), fn func(Notific
 		}
 		fn(Notification{Shard: ShardID{Index: n.Index, Shard: n.Shard}, Seq: n.Seq})
 	})
+}
+
+func (s *sqlStore) PruneTombstones(ctx context.Context, index string, age time.Duration) (n int64, err error) {
+	ctx, end := s.start(ctx, "prune_tombstones", attribute.String("index", index))
+	defer end(&err)
+	if s.closed.Load() {
+		return 0, ErrClosed
+	}
+	if err := validKey("index name", index, MaxIndexName); err != nil {
+		return 0, err
+	}
+	if age < 0 {
+		return 0, invalidf("tombstone age %v", age)
+	}
+	res, err := s.w.ExecContext(ctx, s.d.Maintenance.PruneTombstones, index, age.Milliseconds())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

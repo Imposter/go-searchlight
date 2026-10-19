@@ -31,9 +31,11 @@ import (
 // StoredQuery is one saved query, as a query segment holds it.
 type StoredQuery struct {
 	ID string
-	// Seq is the change that wrote this version.
-	Seq   int64
-	Query query.Node
+	// Seq is the change that wrote this version, and Version the client version it
+	// named (store.Change.Version; 0 for none).
+	Seq     int64
+	Version int64
+	Query   query.Node
 	// Meta is the query's opaque meta object.
 	Meta []byte
 }
@@ -57,6 +59,9 @@ type QuerySegment interface {
 	Ord(id string) (uint32, bool)
 	// Query returns the query at ord, for merges and for verification.
 	Query(ord uint32) (StoredQuery, error)
+	// Version returns the client version of the query at ord (0 for none), without
+	// decoding the query.
+	Version(ord uint32) int64
 	// Close releases the segment; the shard calls it once no generation holds it.
 	Close() error
 }
@@ -82,6 +87,14 @@ type QueryIndexBuilder interface {
 	Open(dir, name string) (QuerySegment, error)
 }
 
+// FormatReader is a [QueryIndexBuilder] that opens query segments of formats other
+// than the one it builds: the ones before it, whose segments a shard keeps as they are
+// until merges rewrite them.
+type FormatReader interface {
+	// Reads reports whether the builder's Open reads query segments of format.
+	Reads(format string) bool
+}
+
 // DefaultQueryIndex is the built-in [QueryIndexBuilder]: one checksummed file per
 // segment holding each query's id, seq, JSON and meta, read wholly into memory at Open.
 // It has no anchors (every query is a candidate for every document); the percolator
@@ -90,7 +103,7 @@ type DefaultQueryIndex struct{}
 
 const (
 	defaultQueryExt     = ".qry"
-	defaultQueryVersion = 1
+	defaultQueryVersion = 2
 )
 
 var defaultQueryMagic = [8]byte{'S', 'L', 'Q', 'R', 'Y', '\r', '\n', 0x1a}
@@ -98,7 +111,11 @@ var defaultQueryMagic = [8]byte{'S', 'L', 'Q', 'R', 'Y', '\r', '\n', 0x1a}
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Format implements [QueryIndexBuilder].
-func (DefaultQueryIndex) Format() string { return "default/1" }
+func (DefaultQueryIndex) Format() string { return "default/2" }
+
+// Reads implements [FormatReader]: default/1, the format before client versions, whose
+// queries have none.
+func (DefaultQueryIndex) Reads(format string) bool { return format == "default/1" }
 
 // Check implements [QueryIndexBuilder]: the query must survive a round trip through
 // its JSON form unchanged.
@@ -133,6 +150,7 @@ func (DefaultQueryIndex) Build(ctx context.Context, dir, name string, queries []
 		}
 		buf = appendBytes(buf, []byte(q.ID))
 		buf = binary.AppendVarint(buf, q.Seq)
+		buf = binary.AppendVarint(buf, q.Version)
 		buf = appendBytes(buf, raw)
 		buf = appendBytes(buf, q.Meta)
 	}
@@ -159,7 +177,8 @@ func (DefaultQueryIndex) Open(dir, name string) (QuerySegment, error) {
 	if crc32.Checksum(body, castagnoli) != sum {
 		return nil, corrupt("checksum mismatch")
 	}
-	if v := binary.LittleEndian.Uint32(body[8:]); v != defaultQueryVersion {
+	v := binary.LittleEndian.Uint32(body[8:])
+	if v != defaultQueryVersion && v != 1 {
 		return nil, fmt.Errorf("query segment %s: version %d is not %d: %w", path, v, defaultQueryVersion, segment.FormatError(uint64(v), defaultQueryVersion))
 	}
 	r := byteReader{b: body[12:]}
@@ -171,6 +190,10 @@ func (DefaultQueryIndex) Open(dir, name string) (QuerySegment, error) {
 	for i := range n {
 		id := string(r.bytes())
 		seq := r.varint()
+		var version int64
+		if v > 1 {
+			version = r.varint()
+		}
 		raw := r.bytes()
 		meta := r.bytes()
 		if r.err != nil {
@@ -184,7 +207,7 @@ func (DefaultQueryIndex) Open(dir, name string) (QuerySegment, error) {
 			meta = nil
 		}
 		seg.ids[id] = uint32(i)
-		seg.queries = append(seg.queries, StoredQuery{ID: id, Seq: seq, Query: node, Meta: bytes.Clone(meta)})
+		seg.queries = append(seg.queries, StoredQuery{ID: id, Seq: seq, Version: version, Query: node, Meta: bytes.Clone(meta)})
 	}
 	if len(r.b) != 0 {
 		return nil, corrupt("trailing bytes")
@@ -209,6 +232,13 @@ func (s *defaultQuerySegment) Query(ord uint32) (StoredQuery, error) {
 		return StoredQuery{}, fmt.Errorf("query ordinal %d out of range", ord)
 	}
 	return s.queries[ord], nil
+}
+
+func (s *defaultQuerySegment) Version(ord uint32) int64 {
+	if int(ord) >= len(s.queries) {
+		return 0
+	}
+	return s.queries[ord].Version
 }
 
 func (s *defaultQuerySegment) Close() error { return nil }

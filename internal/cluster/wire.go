@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
@@ -71,27 +72,36 @@ const codeStale = "stale_copy"
 // fields (levelBox), which a lower peer would refuse as an unknown op. Level 6 reads
 // nested fields' objects (levelNested): a nested node, an aggregation or sort on a
 // sub-field, which a lower peer would refuse, or answer reading the sub-field as a
-// field of no document. A request says the level it needs (wireRequest.Needs), and
-// goes to that level's endpoint (searchPath), and a reply the level it was answered at
+// field of no document. Level 7 collects sub-aggregations under a terms aggregation
+// on a sub-field (levelNestedSubAggs), which a lower peer would refuse, and level 8 the
+// hits' seqs (levelSeqNo), which a lower peer would leave out. A request says
+// the level it needs (wireRequest.Needs), and goes to that level's endpoint
+// (searchPath), and a reply the level it was answered at
 // (searchReply.Level): a peer refuses a request past its level, and the coordinator a
 // reply below the request's, so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelNested
+const searchLevel = levelSeqNo
 
 // The search wire levels of the additions a peer must not ignore.
 const (
-	levelFilterAggs  = 1
-	levelTermsFilter = 2
-	levelFrom        = 3
-	levelMetrics     = 4
-	levelBox         = 5
-	levelNested      = 6
+	levelFilterAggs    = 1
+	levelTermsFilter   = 2
+	levelFrom          = 3
+	levelMetrics       = 4
+	levelBox           = 5
+	levelNested        = 6
+	levelNestedSubAggs = 7
+	levelSeqNo         = 8
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelSeqNo:
+		return "seq_no, the hits' seqs"
+	case needs >= levelNestedSubAggs:
+		return "sub-aggregations under a terms aggregation on a nested field's sub-field"
 	case needs >= levelNested:
 		return "a nested field's objects: a nested query, or an aggregation or sort on a sub-field"
 	case needs >= levelBox:
@@ -137,6 +147,7 @@ type wireRequest struct {
 	TimeoutNs   int64              `json:"timeout_ns,omitempty"`
 	Index       string             `json:"index"`
 	NoBodies    bool               `json:"no_bodies,omitempty"`
+	SeqNo       bool               `json:"seq_no,omitempty"`
 	// NoRequestCache is search.Request's. It needs no wire level: a peer that ignores
 	// it caches nothing anyway (request caches came after level 4).
 	NoRequestCache bool `json:"no_request_cache,omitempty"`
@@ -144,7 +155,9 @@ type wireRequest struct {
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
 	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
 	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
-	// nested field's objects (search.Request.Nested, or a nested node).
+	// nested field's objects (search.Request.Nested, or a nested node), 7 for
+	// sub-aggregations under a terms aggregation on a sub-field
+	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -165,7 +178,7 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	}
 	w := &wireRequest{
 		Query: q, Sort: r.Sort, Size: r.Size, From: r.From, SearchAfter: r.SearchAfter, TrackTotal: r.TrackTotal,
-		Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies,
+		Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies, SeqNo: r.SeqNo,
 		NoRequestCache: r.NoRequestCache,
 	}
 	if r.PostFilter != nil {
@@ -188,6 +201,10 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		}
 	}
 	switch {
+	case r.SeqNo && r.Size > 0:
+		w.Needs = levelSeqNo
+	case r.NestedSubAggs:
+		w.Needs = levelNestedSubAggs
 	case r.Nested || nestedQueries(r):
 		w.Needs = levelNested
 	case boxQueries(r):
@@ -246,7 +263,7 @@ func (w *wireRequest) decode() (*search.Request, error) {
 	}
 	r := &search.Request{
 		Query: q, Sort: w.Sort, Size: w.Size, From: w.From, SearchAfter: w.SearchAfter, TrackTotal: w.TrackTotal,
-		Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies,
+		Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies, SeqNo: w.SeqNo,
 		NoRequestCache: w.NoRequestCache,
 	}
 	if w.PostFilter != nil {
@@ -346,14 +363,16 @@ type fetchReply struct {
 // fields and their box queries: a percolation under a mapping holding a point field
 // needs it, as a lower peer reads neither the mapping nor the saved boxes. Level 3
 // adds nested fields: a percolation under a mapping holding one needs it, for the
-// same reasons.
-const percolateLevel = 3
+// same reasons. Level 4 reports details of each match (percolateMsg.Details): the
+// saved queries' versions and inner hits, which a lower peer would leave out.
+const percolateLevel = percolateDetails
 
 // Percolate wire levels of the additions a peer must not ignore.
 const (
-	percolateDates  = 1
-	percolatePoints = 2
-	percolateNested = 3
+	percolateDates   = 1
+	percolatePoints  = 2
+	percolateNested  = 3
+	percolateDetails = 4
 )
 
 // percolatePath is the peer path of a percolation needing wire level needs.
@@ -391,6 +410,9 @@ func percolateNeeds(mapping json.RawMessage) int {
 // percolateLevelNeeds names what a percolation of wire level needs carries, for the
 // errors of a peer below it.
 func percolateLevelNeeds(needs int) string {
+	if needs >= percolateDetails {
+		return "the details of each match: the saved queries' versions or inner hits"
+	}
 	if needs >= percolateNested {
 		return "an index with a nested field, whose saved queries may hold nested conditions"
 	}
@@ -410,6 +432,9 @@ type percolateMsg struct {
 	// peer resolves at it, never at its own clock. Nil from a coordinator of an older
 	// release, which sends none: the peer then resolves at its node clock's wall time.
 	Now *int64 `json:"now,omitempty"`
+	// Details, when set, asks for each match's details (node.MatchDetails), which
+	// needs percolate level 4.
+	Details *node.MatchDetails `json:"details,omitempty"`
 	// Needs is the percolate wire level a peer must speak (percolateLevel).
 	Needs int `json:"needs,omitempty"`
 }
@@ -423,8 +448,11 @@ type wireDoc struct {
 // (a 1.0.0 peer sends none).
 type percolateReply struct {
 	Matches []json.RawMessage `json:"matches"`
-	Stale   bool              `json:"stale,omitempty"`
-	Level   int               `json:"level,omitempty"`
+	// Details are each document's matches with the details asked for, in Matches'
+	// order: set when percolateMsg.Details was.
+	Details [][]api.PercolateMatch `json:"details,omitempty"`
+	Stale   bool                   `json:"stale,omitempty"`
+	Level   int                    `json:"level,omitempty"`
 }
 
 // getMsg reads a document or a saved query from a peer's copy.
@@ -437,6 +465,9 @@ type getMsg struct {
 type getReply struct {
 	Found bool            `json:"found"`
 	Body  json.RawMessage `json:"body,omitempty"`
+	// Seq is the stored document's seq as the copy holds it; a peer of a release
+	// before it sends none.
+	Seq   int64           `json:"seq,omitempty"`
 	Saved *api.SavedQuery `json:"saved,omitempty"`
 	Stale bool            `json:"stale,omitempty"`
 }

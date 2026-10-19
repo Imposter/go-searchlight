@@ -189,7 +189,7 @@ func (t *Tailer) apply(ctx context.Context, changes []store.Change) error {
 			if len(meta) == 0 {
 				meta = []byte("{}")
 			}
-			sc.Kind, sc.QueryID, sc.Query, sc.Meta = shard.QueryUpsert, c.ID, n, meta
+			sc.Kind, sc.QueryID, sc.Query, sc.Meta, sc.QueryVersion = shard.QueryUpsert, c.ID, n, meta, p.Version
 		case store.KindQueryDelete:
 			sc.Kind, sc.QueryID = shard.QueryDelete, c.ID
 		default:

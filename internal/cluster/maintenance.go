@@ -21,7 +21,9 @@ import (
 // sweeps abandoned blob uploads, and every node collects its own unused copy
 // directories and recovery staging. Leadership needs no election: every node reads the
 // same registry, and the leader's jobs are idempotent and safe when two nodes briefly
-// both believe they lead. The store only executes Prune; the policy lives here.
+// both believe they lead. The store only executes Prune; the policy lives here. The
+// leader also prunes each index's tombstones older than its gc_deletes, at every
+// changelog prune.
 //
 // # Pruning (spec section 9)
 //
@@ -135,6 +137,13 @@ func (n *Node) pruneAll(ctx context.Context) error {
 	now := n.clock.Now()
 	cutoff := n.clock.Wall().Add(-n.opts.ChangelogRetention)
 	for _, iv := range n.Indexes() {
+		pruned, err := n.st.PruneTombstones(ctx, iv.Name, iv.GCDeletes)
+		if err != nil {
+			return err
+		}
+		if pruned > 0 {
+			n.log.DebugContext(ctx, "pruned tombstones", slog.String("index", iv.Name), slog.Int64("tombstones", pruned))
+		}
 		for s := range iv.Shards {
 			id := store.ShardID{Index: iv.Name, Shard: s}
 			floor, ok := n.pruneFloor(v.copies[id], v, progress, now)

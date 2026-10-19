@@ -701,11 +701,11 @@ func (s flakyStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error
 	return s.Store.Tip(ctx, q)
 }
 
-func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {
+func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit int, lean bool) ([]store.Record, error) {
 	if s.down.Load() {
 		return nil, errUnreachable
 	}
-	return s.rr.ListQueries(ctx, index, after, limit)
+	return s.rr.ListQueries(ctx, index, after, limit, lean)
 }
 
 // I5 (spec section 10): with the database unreachable, reads keep serving from the

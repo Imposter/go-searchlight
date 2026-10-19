@@ -372,7 +372,7 @@ func (n *Single) Indexes() []IndexView {
 	out := make([]IndexView, 0, len(list))
 	for _, idx := range list {
 		st := idx.meta.Load()
-		out = append(out, IndexView{Name: idx.name, UID: st.meta.UID, Shards: len(idx.shards), ReplicasPerShard: st.settings.ReplicasPerShard})
+		out = append(out, IndexView{Name: idx.name, UID: st.meta.UID, Shards: len(idx.shards), ReplicasPerShard: st.settings.ReplicasPerShard, GCDeletes: st.settings.EffectiveGCDeletes()})
 	}
 	return out
 }

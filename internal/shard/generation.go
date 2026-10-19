@@ -423,10 +423,20 @@ func (g *Generation) NumQueries() uint64 { return g.numQueries }
 func (g *Generation) FilterCache() *FilterCache { return g.shard.opts.FilterCache }
 
 // DocFreq implements [TermStats]: how many documents hold term, deleted ones included.
+// A nested field's sub-field (path.name) counts the objects holding it, which bounds
+// the documents holding it from above.
 func (g *Generation) DocFreq(field string, kind segment.TermKind, term string) uint64 {
 	var n uint64
+	path, _, sub := strings.Cut(field, ".")
 	for i := range g.Segments {
-		n += uint64(g.Segments[i].Reader.TermFreq(field, kind, term))
+		r := g.Segments[i].Reader
+		f := uint64(r.TermFreq(field, kind, term))
+		if f == 0 && sub {
+			if nv := r.Nested(path); nv != nil {
+				f = uint64(nv.Objects().TermFreq(field, kind, term))
+			}
+		}
+		n += f
 	}
 	return n
 }
@@ -495,7 +505,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	for _, ms := range man.QuerySegments {
-		if ms.Format != s.opts.QueryIndex.Format() {
+		if ms.Format != s.opts.QueryIndex.Format() && !reads(s.opts.QueryIndex, ms.Format) {
 			return fail(fmt.Errorf("shard: query segment %s is in format %q, the query index builds %q: %w", ms.ID, ms.Format, s.opts.QueryIndex.Format(),
 				queryFormatError(ms.Format, s.opts.QueryIndex.Format())))
 		}
@@ -562,4 +572,25 @@ func queryFormatError(found, builds string) error {
 		}
 	}
 	return segment.ErrOlderFormat
+}
+
+// reads reports whether qi opens query segments of format, an older one it reads.
+func reads(qi QueryIndexBuilder, format string) bool {
+	r, ok := qi.(FormatReader)
+	return ok && r.Reads(format)
+}
+
+// DocSeq returns the seq of the change that wrote document ord of Segments[seg], the
+// version the segment holds ([schema.SeqColumn]): 0 for a document indexed by a release
+// that kept none.
+func (g *Generation) DocSeq(seg int, ord uint32) int64 {
+	nc := g.Segments[seg].Reader.Numbers(schema.SeqColumn)
+	if !nc.Exists() {
+		return 0
+	}
+	v, ok := nc.Value(ord)
+	if !ok {
+		return 0
+	}
+	return int64(v)
 }

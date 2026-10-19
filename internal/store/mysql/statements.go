@@ -36,14 +36,15 @@ var changelog = dialect.Changelog{
 	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
 	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?), (SELECT uid FROM sl_indexes WHERE name = ?) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE c.id = 1"),
 	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
-	DocumentSeq:     "SELECT seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	QuerySeq:        "SELECT seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	DocumentState:   "SELECT seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryState:      "SELECT seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	Tombstone:       "SELECT version FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?",
 	Write:           write,
 	Limits:          limits,
 	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
 	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
 	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
-	ScanQueries:     "SELECT id, query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanQueries:     "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
 // write spells w as multi-row INSERTs as large as l allows, upserts with ON
@@ -52,11 +53,11 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 	out := values("insert changes", "INSERT INTO sl_changes ("+changeColumns+") VALUES ", "",
 		11, l, changeArgs(w.Changes))
 	out = append(out, values("upsert documents", "INSERT INTO sl_documents ("+documentColumns+") VALUES ",
-		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq",
-		6, l, documentArgs(w.Documents))...)
+		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq, version = IF(new.version = 0, sl_documents.version, new.version)",
+		7, l, documentArgs(w.Documents))...)
 	out = append(out, values("upsert queries", "INSERT INTO sl_queries ("+queryColumns+") VALUES ",
-		" AS new ON DUPLICATE KEY UPDATE query = new.query, meta = new.meta, seq = new.seq",
-		6, l, queryArgs(w.Queries))...)
+		" AS new ON DUPLICATE KEY UPDATE query = new.query, meta = new.meta, seq = new.seq, version = IF(new.version = 0, sl_queries.version, new.version)",
+		7, l, queryArgs(w.Queries))...)
 	for _, g := range w.DocumentDeletes {
 		out = append(out, in("delete documents", "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id IN (",
 			[]any{g.Index, g.Shard}, g.IDs, l)...)
@@ -65,13 +66,21 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 		out = append(out, in("delete queries", "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id IN (",
 			[]any{g.Index, g.Shard}, g.IDs, l)...)
 	}
+	out = append(out, values("upsert tombstones", "INSERT INTO sl_tombstones ("+tombstoneColumns+") VALUES ",
+		" AS new ON DUPLICATE KEY UPDATE version = new.version, at = new.at",
+		6, l, tombstoneArgs(w.Tombstones))...)
+	for _, g := range tombstoneGroups(w.TombstoneDeletes) {
+		out = append(out, in("delete tombstones", "DELETE FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id IN (",
+			[]any{g.Index, g.Shard, g.Kind}, g.IDs, l)...)
+	}
 	return append(out, dialect.Stmt{What: "advance counter", SQL: "UPDATE sl_counter SET value = ? WHERE id = 1", Args: []any{w.Counter}})
 }
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	GetQuery:    "SELECT query, meta, seq FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	ListQueries: "SELECT shard, id, query, meta, seq FROM sl_queries WHERE index_name = ? AND id > ? ORDER BY id LIMIT ?",
+	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
+	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
 }
 
 var registry = dialect.Registry{
@@ -158,6 +167,7 @@ var indexes = dialect.Indexes{
 	DropData: []string{
 		"DELETE FROM sl_documents WHERE index_name = ?",
 		"DELETE FROM sl_queries WHERE index_name = ?",
+		"DELETE FROM sl_tombstones WHERE index_name = ?",
 		"DELETE FROM sl_changes WHERE index_name = ?",
 		"DELETE FROM sl_pruned WHERE index_name = ?",
 		"DELETE FROM sl_shard_copies WHERE index_name = ?",
@@ -165,8 +175,9 @@ var indexes = dialect.Indexes{
 }
 
 var maintenance = dialect.Maintenance{
-	MinSeq:        "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
-	DeleteChanges: "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",
+	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
+	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = ? AND at < NOW - ?"),
+	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",
 	RaiseHorizon: dialect.Returning{
 		Write: "INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES (?, ?, ?) AS new ON DUPLICATE KEY UPDATE below_seq = GREATEST(sl_pruned.below_seq, new.below_seq)",
 		Read:  "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
@@ -189,3 +200,6 @@ var maintenance = dialect.Maintenance{
 	LockTimedOut:       lockTimedOut,
 	AlreadyApplied:     alreadyApplied,
 }
+
+// question is the engine's placeholder, whatever its position.
+func question(int) string { return "?" }

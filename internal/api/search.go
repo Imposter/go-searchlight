@@ -29,12 +29,13 @@ type total struct {
 type hit struct {
 	ID        string                       `json:"id"`
 	Sort      []any                        `json:"sort"`
+	Seq       int64                        `json:"_seq,omitempty"`
 	Body      json.RawMessage              `json:"body,omitempty"`
 	InnerHits map[string]*search.InnerHits `json:"inner_hits,omitempty"`
 }
 
 // search serves POST /indexes/{index}/_search: {query, post_filter, sort, size, from,
-// search_after, track_total, aggs, fields, timeout}. Past the search's timeout, or the
+// search_after, track_total, aggs, fields, seq_no, timeout}. Past the search's timeout, or the
 // request's deadline, the response holds what the shards found by then, with timed_out
 // set.
 func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error {
@@ -92,7 +93,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
-		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body, InnerHits: h.InnerHits}
+		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Seq: h.Seq, Body: h.Body, InnerHits: h.InnerHits}
 	}
 	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)

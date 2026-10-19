@@ -163,6 +163,7 @@ func (s *Server) patchMapping(w http.ResponseWriter, r *http.Request, _ params) 
 type settingsPatchBody struct {
 	RefreshInterval  json.RawMessage `json:"refresh_interval"`
 	ReplicasPerShard *int            `json:"replicas_per_shard"`
+	GCDeletes        json.RawMessage `json:"gc_deletes"`
 	Shards           json.RawMessage `json:"shards"`
 }
 
@@ -192,8 +193,15 @@ func (s *Server) patchSettings(w http.ResponseWriter, r *http.Request, _ params)
 		}
 		patch.ReplicasPerShard = req.ReplicasPerShard
 	}
-	if patch.RefreshInterval == nil && patch.ReplicasPerShard == nil {
-		return InvalidAt("body", "give refresh_interval or replicas_per_shard")
+	if req.GCDeletes != nil {
+		d, err := ParseGCDeletes(req.GCDeletes)
+		if err != nil {
+			return err
+		}
+		patch.GCDeletes = &d
+	}
+	if patch.RefreshInterval == nil && patch.ReplicasPerShard == nil && patch.GCDeletes == nil {
+		return InvalidAt("body", "give refresh_interval, replicas_per_shard or gc_deletes")
 	}
 	info, err := s.c.PatchSettings(r.Context(), r.PathValue("index"), patch)
 	if err != nil {

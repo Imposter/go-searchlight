@@ -1587,7 +1587,8 @@ func mergeShard(ctx context.Context, specs []*aggSpec, segs []map[string]*AggPar
 // under a filter, filters or global aggregation's buckets too, and adds the buckets
 // the response can hold of them to *buckets: it returns the aggregation at which they
 // pass MaxBuckets, or nil. A filter or global aggregation counts its one bucket, a
-// filters aggregation each of its buckets.
+// filters aggregation each of its buckets, and a terms aggregation on a sub-field the
+// buckets of its terms sub-aggregations under the buckets the response can hold.
 func cutShardAggs(specs []*aggSpec, aggs map[string]*AggPartial, buckets *int) *aggSpec {
 	for _, spec := range specs {
 		p := aggs[spec.name]
@@ -1599,6 +1600,19 @@ func cutShardAggs(specs []*aggSpec, aggs map[string]*AggPartial, buckets *int) *
 			for _, b := range p.Buckets {
 				if over := cutShardAggs(spec.subs, b.Aggs, buckets); over != nil {
 					return over
+				}
+			}
+			continue
+		}
+		if spec.typ != AggTerms {
+			continue
+		}
+		for _, b := range p.Buckets[:responseBuckets(p, spec)] {
+			for _, sub := range spec.subs {
+				if sp := b.Aggs[sub.name]; sub.typ == AggTerms && sp != nil {
+					if *buckets += responseBuckets(sp, sub); *buckets > MaxBuckets {
+						return sub
+					}
 				}
 			}
 		}

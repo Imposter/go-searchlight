@@ -211,11 +211,18 @@ func (s *segExec) nestedPartial(spec *aggSpec, hits *roaring.Bitmap) *AggPartial
 }
 
 // nestedTerms counts a terms aggregation on a sub-field over objs: each document once
-// per value, however many of its objects hold it, as key buckets.
+// per value, however many of its objects hold it, as key buckets. Each bucket collects
+// spec's sub-aggregations: one on a top-level field over the bucket's documents (each
+// once, on the parent segment), one on a sub-field over the bucket's objects (those of
+// objs holding the value that its own where, if any, chooses).
 func (s *segExec) nestedTerms(spec *aggSpec, objs *roaring.Bitmap) *AggPartial {
 	src := s.source(spec.field, spec.ftype)
 	allow := s.termMask(spec, src)
 	allowed := func(o uint32) bool { return allow == nil || allow.has(o) }
+	subs := s.nestedSubs(spec, objs)
+	if s.err != nil {
+		return nil
+	}
 	p := &AggPartial{Type: AggTerms}
 	cur := parentCursor{nv: s.nv}
 	it := objs.ManyIterator()
@@ -237,33 +244,30 @@ func (s *segExec) nestedTerms(spec *aggSpec, objs *roaring.Bitmap) *AggPartial {
 		if src.ordinal() {
 			size = src.numTerms()
 		}
-		counts := make([]int64, size)
-		last := make([]uint32, size) // each value's last document counted, plus 1
-		count := func(o, doc uint32) {
-			if allowed(o) && last[o] != doc+1 {
-				last[o] = doc + 1
-				counts[o]++
-			}
-		}
+		buckets := make([]nestedBucket, size)
+		var ords []uint32
 		each(func(obj, doc uint32) {
 			switch src.kind {
 			case srcKeyword:
-				if o, ok := src.kc.Ord(obj); ok {
-					count(o, doc)
+				if o, ok := src.kc.Ord(obj); ok && allowed(o) {
+					buckets[o].add(subs, obj, doc)
 				}
 			case srcList:
-				src.buf = src.mc.Ords(obj, src.buf[:0])
-				for _, o := range src.buf {
-					count(o, doc)
+				ords = src.mc.Ords(obj, ords[:0])
+				for _, o := range ords {
+					if allowed(o) {
+						buckets[o].add(subs, obj, doc)
+					}
 				}
 			default:
-				if b, ok := src.boolOf(obj); ok {
-					count(boolOrd(b), doc)
+				if b, ok := src.boolOf(obj); ok && allowed(boolOrd(b)) {
+					buckets[boolOrd(b)].add(subs, obj, doc)
 				}
 			}
 		})
-		for o, n := range counts {
-			if n == 0 {
+		for o := range buckets {
+			b := &buckets[o]
+			if b.n == 0 {
 				continue
 			}
 			var key any
@@ -275,36 +279,211 @@ func (s *segExec) nestedTerms(spec *aggSpec, objs *roaring.Bitmap) *AggPartial {
 			default:
 				key = o == 1
 			}
-			p.Buckets = append(p.Buckets, &BucketPartial{Key: key, DocCount: n})
+			p.Buckets = append(p.Buckets, b.partial(key, subs))
 		}
 	case srcNumber:
-		type tally struct {
-			n    int64
-			last uint32
-		}
-		byValue := map[float64]*tally{}
+		byValue := map[float64]*nestedBucket{}
 		each(func(obj, doc uint32) {
 			v, ok := src.nc.Value(obj)
 			if !ok {
 				return
 			}
 			v = positiveZero(v)
-			t := byValue[v]
-			if t == nil {
+			b := byValue[v]
+			if b == nil {
 				if spec.terms != nil && !spec.terms.number(v) {
 					return
 				}
-				t = &tally{}
-				byValue[v] = t
+				b = &nestedBucket{}
+				byValue[v] = b
 			}
-			if t.last != doc+1 {
-				t.last = doc + 1
-				t.n++
-			}
+			b.add(subs, obj, doc)
 		})
 		for _, v := range slices.Sorted(maps.Keys(byValue)) {
-			p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: byValue[v].n})
+			p.Buckets = append(p.Buckets, byValue[v].partial(v, subs))
 		}
+	}
+	return p
+}
+
+// nestedSubSpecs are the sub-aggregations of a terms aggregation on a sub-field, in one
+// segment: spec's, the objects each one on a sub-field chooses (nil: every object, or
+// one on a top-level field), and the executions their collectors read.
+type nestedSubSpecs struct {
+	spec   *aggSpec
+	chosen []*roaring.Bitmap
+	inner  *segExec
+}
+
+// nestedSubs prepares spec's sub-aggregations over objs, the objects spec collects.
+func (s *segExec) nestedSubs(spec *aggSpec, objs *roaring.Bitmap) *nestedSubSpecs {
+	if len(spec.subs) == 0 {
+		return nil
+	}
+	ns := &nestedSubSpecs{spec: spec, chosen: make([]*roaring.Bitmap, len(spec.subs)), inner: s}
+	for i, sub := range spec.subs {
+		if sub.nested != "" && sub.wherePlan != nil {
+			ns.chosen[i] = s.matches(sub.wherePlan, objs)
+		}
+	}
+	return ns
+}
+
+// collectors are one bucket's sub-aggregation collectors: on the parent segment for a
+// top-level field, on the object segment for a sub-field.
+func (ns *nestedSubSpecs) collectors() []collector {
+	out := make([]collector, len(ns.spec.subs))
+	for i, sub := range ns.spec.subs {
+		ex := ns.inner
+		if sub.nested == "" {
+			ex = ns.inner.parent
+		}
+		if sub.typ == AggTerms {
+			out[i] = ex.newSubTerms(sub)
+			continue
+		}
+		out[i] = ex.newCollector(sub, false)
+	}
+	return out
+}
+
+// nestedBucket is one value's bucket of a terms aggregation on a sub-field in one
+// segment: its documents (n, the last one counted plus 1 in last) and its
+// sub-aggregations' collectors.
+type nestedBucket struct {
+	n    int64
+	last uint32
+	subs []collector
+}
+
+// add counts object obj of document doc: the document once, and the object into the
+// sub-aggregations that read it.
+func (b *nestedBucket) add(ns *nestedSubSpecs, obj, doc uint32) {
+	first := b.last != doc+1
+	if first {
+		b.last = doc + 1
+		b.n++
+	}
+	if ns == nil {
+		return
+	}
+	if b.subs == nil {
+		b.subs = ns.collectors()
+	}
+	for i, sub := range ns.spec.subs {
+		c := b.subs[i]
+		switch {
+		case sub.nested == "":
+			if first {
+				c.collect(doc)
+			}
+		case ns.chosen[i] != nil && !ns.chosen[i].Contains(obj):
+		default:
+			if st, ok := c.(*subTerms); ok {
+				st.add(obj, doc)
+				continue
+			}
+			c.collect(obj)
+		}
+	}
+}
+
+func (b *nestedBucket) partial(key any, ns *nestedSubSpecs) *BucketPartial {
+	out := &BucketPartial{Key: key, DocCount: b.n}
+	if ns != nil {
+		out.Aggs = subPartials(ns.spec, b.subs)
+	}
+	return out
+}
+
+// subTerms is a terms aggregation under a terms aggregation on a sub-field, in one
+// segment: documents per value, each document once per value however many of its
+// objects hold it, as key buckets. It is never cut on a shard, so its counts are exact
+// and its error bound 0; the reduce keeps its size.
+type subTerms struct {
+	s     *segExec
+	spec  *aggSpec
+	src   *fieldSrc
+	allow *termMask
+	ords  map[uint32]*nestedBucket
+	nums  map[float64]*nestedBucket
+	buf   []uint32
+}
+
+func (s *segExec) newSubTerms(spec *aggSpec) *subTerms {
+	src := s.source(spec.field, spec.ftype)
+	return &subTerms{s: s, spec: spec, src: src, allow: s.termMask(spec, src), ords: map[uint32]*nestedBucket{}, nums: map[float64]*nestedBucket{}}
+}
+
+func (c *subTerms) collect(d uint32) { c.add(d, d) }
+
+// add counts d's values (d a document, or an object of document owner) for owner.
+func (c *subTerms) add(d, owner uint32) {
+	count := func(o uint32) {
+		if c.allow != nil && !c.allow.has(o) {
+			return
+		}
+		b := c.ords[o]
+		if b == nil {
+			if !c.charge() {
+				return
+			}
+			b = &nestedBucket{}
+			c.ords[o] = b
+		}
+		b.add(nil, d, owner)
+	}
+	switch c.src.kind {
+	case srcKeyword:
+		if o, ok := c.src.kc.Ord(d); ok {
+			count(o)
+		}
+	case srcList:
+		c.buf = c.src.mc.Ords(d, c.buf[:0])
+		for _, o := range c.buf {
+			count(o)
+		}
+	case srcBool:
+		if b, ok := c.src.boolOf(d); ok {
+			count(boolOrd(b))
+		}
+	case srcNumber:
+		v, ok := c.src.nc.Value(d)
+		if !ok {
+			return
+		}
+		v = positiveZero(v)
+		b := c.nums[v]
+		if b == nil {
+			if c.spec.terms != nil && !c.spec.terms.number(v) {
+				return
+			}
+			if !c.charge() {
+				return
+			}
+			b = &nestedBucket{}
+			c.nums[v] = b
+		}
+		b.add(nil, d, owner)
+	}
+}
+
+func (c *subTerms) partial() *AggPartial {
+	p := &AggPartial{Type: AggTerms}
+	for _, o := range slices.Sorted(maps.Keys(c.ords)) {
+		var key any
+		switch c.src.kind {
+		case srcKeyword:
+			key = c.src.kc.Term(o)
+		case srcList:
+			key = c.src.mc.Term(o)
+		default:
+			key = o == 1
+		}
+		p.Buckets = append(p.Buckets, &BucketPartial{Key: key, DocCount: c.ords[o].n})
+	}
+	for _, v := range slices.Sorted(maps.Keys(c.nums)) {
+		p.Buckets = append(p.Buckets, &BucketPartial{Key: v, DocCount: c.nums[v].n})
 	}
 	return p
 }
@@ -375,42 +554,79 @@ func (n *nestCol) key(c *sortCol, d uint32) part {
 	return best
 }
 
-// InnerHits are one hit's inner hits for one nested node: how many members of its
-// path satisfy the node's query (Total), and the first of them (inner_hits' size) by
-// their offsets in the array and as objects of the sub-fields asked for.
+// InnerHits are one hit's inner hits under one key: how many members of its path
+// satisfy the query of a nested node asking for them under it (Total, each member
+// once), and the first of them (inner_hits' size) by their offsets in the array, in
+// array order, and as objects of the sub-fields asked for.
 type InnerHits struct {
 	Total   int               `json:"total"`
 	Offsets []int             `json:"offsets"`
 	Objects []json.RawMessage `json:"objects"`
 }
 
-// innerSpec is one nested node's inner hits, compiled.
+// innerSpec is the inner hits of one key, compiled: those of every nested node asking
+// for them under it (all of one path), merged.
 type innerSpec struct {
-	key    string
-	path   string
+	key  string
+	path string
+	// size is the largest of the nodes' sizes, and fields the sub-fields any of them
+	// names (nil, every one, when one names none).
 	size   int
 	fields []string
-	match  *query.Compiled
+	// matches are the nodes' queries: a member is an inner hit when it satisfies one.
+	matches []*query.Compiled
 }
 
-// innerSpecs are the inner hits r's query and post_filter ask for.
+// innerSpecs are the inner hits r's query and post_filter ask for, one per key in the
+// order the keys first appear: the nodes sharing a key (one path's, [ValidateQueries])
+// merged.
 func innerSpecs(r *Request) []innerSpec {
 	var out []innerSpec
+	at := map[string]int{}
 	for _, n := range []query.Node{r.Query, r.PostFilter} {
 		if n == nil {
 			continue
 		}
 		query.Walk(n, func(_ string, node query.Node) bool {
-			if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
-				out = append(out, innerSpec{
-					key: x.InnerHits.Key(x.Path), path: x.Path, size: x.InnerHits.Size,
-					fields: x.InnerHits.Fields, match: query.Compile(x.Query),
-				})
+			x, ok := node.(*query.Nested)
+			if !ok || x.InnerHits == nil {
+				return true
+			}
+			h, key := x.InnerHits, x.InnerHits.Key(x.Path)
+			i, seen := at[key]
+			if !seen {
+				at[key] = len(out)
+				out = append(out, innerSpec{key: key, path: x.Path, size: h.Size, fields: slices.Clone(h.Fields), matches: []*query.Compiled{query.Compile(x.Query)}})
+				return true
+			}
+			spec := &out[i]
+			spec.size = max(spec.size, h.Size)
+			spec.matches = append(spec.matches, query.Compile(x.Query))
+			switch {
+			case len(spec.fields) == 0:
+			case len(h.Fields) == 0:
+				spec.fields = nil
+			default:
+				for _, f := range h.Fields {
+					if !slices.Contains(spec.fields, f) {
+						spec.fields = append(spec.fields, f)
+					}
+				}
 			}
 			return true
 		})
 	}
 	return out
+}
+
+// match reports whether obj satisfies one of spec's queries.
+func (spec *innerSpec) match(obj *schema.Object) bool {
+	for _, m := range spec.matches {
+		if m.MatchObject(obj) {
+			return true
+		}
+	}
+	return false
 }
 
 // MaxInnerHitsObjects bounds the inner hits one response holds: a search's size times
@@ -447,11 +663,11 @@ func InnerHitsFields(r *Request) []string {
 	return out
 }
 
-// FillInnerHits sets each hit's inner hits, for every nested node of r's query and
-// post_filter that asks for them, from its body, read under mapping m as the hit was
-// indexed: each member that satisfies the node's query, in array order. Each body is
-// then limited to fields (the request's own, before [InnerHitsFields] widened them),
-// when set. It stops at ctx's end, with its error.
+// FillInnerHits sets each hit's inner hits, for every key r's query and post_filter
+// ask for them under, from its body, read under mapping m as the hit was indexed: each
+// member that satisfies the query of a nested node under the key, in array order. Each
+// body is then limited to fields (the request's own, before [InnerHitsFields] widened
+// them), when set. It stops at ctx's end, with its error.
 func FillInnerHits(ctx context.Context, hits []Hit, r *Request, m *schema.Mapping, fields []string) error {
 	specs := innerSpecs(r)
 	if len(specs) == 0 {
@@ -479,7 +695,7 @@ func FillInnerHits(ctx context.Context, hits []Hit, r *Request, m *schema.Mappin
 			}
 			ih := &InnerHits{Offsets: []int{}, Objects: []json.RawMessage{}}
 			for k := range objects[spec.path] {
-				if !spec.match.MatchObject(&objects[spec.path][k]) {
+				if !spec.match(&objects[spec.path][k]) {
 					continue
 				}
 				ih.Total++
@@ -534,4 +750,57 @@ func innerObject(value any, k int, spec innerSpec) (json.RawMessage, error) {
 		return nil, err
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+}
+
+// QueryInnerHits are the inner hits a query asks for (its nested nodes' inner_hits,
+// merged by key as a search merges them), compiled, for reading them off analyzed
+// documents: a percolation's matches report them.
+type QueryInnerHits struct {
+	specs []innerSpec
+}
+
+// NewQueryInnerHits compiles the inner hits n asks for; nil when it asks for none.
+func NewQueryInnerHits(n query.Node) *QueryInnerHits {
+	specs := innerSpecs(&Request{Query: n})
+	if len(specs) == 0 {
+		return nil
+	}
+	return &QueryInnerHits{specs: specs}
+}
+
+// Offsets returns d's inner hits by key, as a search's hit has them but without the
+// objects: how many members of the key's path satisfy the query of a nested node under
+// it (Total), and the offsets of the first size of them in the array, in array order.
+// d is analyzed, its nested fields' objects in d.Fields.
+func (q *QueryInnerHits) Offsets(d *schema.Doc) map[string]*InnerHits {
+	out := make(map[string]*InnerHits, len(q.specs))
+	for i := range q.specs {
+		spec := &q.specs[i]
+		ih := &InnerHits{Offsets: []int{}}
+		objects := d.Fields[spec.path].Objects
+		for k := range objects {
+			if !spec.match(&objects[k]) {
+				continue
+			}
+			ih.Total++
+			if len(ih.Offsets) < spec.size {
+				ih.Offsets = append(ih.Offsets, k)
+			}
+		}
+		out[spec.key] = ih
+	}
+	return out
+}
+
+// charge counts one more bucket against the segment's MaxBuckets, which a terms
+// sub-aggregation (never cut by the shard) is held to as it collects: past it, the
+// search is refused as too many buckets.
+func (c *subTerms) charge() bool {
+	if c.s.buckets.Add(1) <= MaxBuckets {
+		return true
+	}
+	if c.s.err == nil {
+		c.s.fail(tooManyBuckets(c.spec))
+	}
+	return false
 }

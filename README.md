@@ -62,34 +62,34 @@ container image and deployment samples. [CHANGELOG.md](CHANGELOG.md) has its not
   checked by `SHA256SUMS`:
 
   ```sh
-  base=https://github.com/Imposter/go-searchlight/releases/download/v1.4.0
-  curl -fsSLO "$base/searchlight-1.4.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
+  base=https://github.com/Imposter/go-searchlight/releases/download/v1.5.0
+  curl -fsSLO "$base/searchlight-1.5.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
   sha256sum --ignore-missing -c SHA256SUMS
-  tar -xzf searchlight-1.4.0-linux-amd64.tar.gz
-  ./searchlight-1.4.0-linux-amd64/searchlight version
+  tar -xzf searchlight-1.5.0-linux-amd64.tar.gz
+  ./searchlight-1.5.0-linux-amd64/searchlight version
   ```
 
   The macOS binaries are not signed: one downloaded with a browser needs
   `xattr -d com.apple.quarantine searchlight` (or **Open Anyway** in System Settings ›
   Privacy & Security) before it
   runs ([docs/operations.md](docs/operations.md#the-binary)).
-  `go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.4.0` builds it too.
+  `go install github.com/Imposter/go-searchlight/cmd/searchlight@v1.5.0` builds it too.
 
-- **The image**, for linux/amd64 and linux/arm64, tagged `1.4.0`, `1.4`, `1` and
+- **The image**, for linux/amd64 and linux/arm64, tagged `1.5.0`, `1.5`, `1` and
   `latest`:
 
   ```sh
-  docker pull ghcr.io/imposter/searchlight:1.4.0
+  docker pull ghcr.io/imposter/searchlight:1.5.0
   ```
 
-- **Docker Compose samples** in `searchlight-deploy-1.4.0.tar.gz`, which needs no
+- **Docker Compose samples** in `searchlight-deploy-1.5.0.tar.gz`, which needs no
   checkout: a three-node cluster on Postgres 17 behind nginx (`compose.postgres.yml`), a
   single node on SQLite (`compose.sqlite.yml`), their `.env.example`, and the Kubernetes
   manifests (`k8s/`):
 
   ```sh
-  curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.4.0/searchlight-deploy-1.4.0.tar.gz | tar -xz
-  cd searchlight-deploy-1.4.0
+  curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v1.5.0/searchlight-deploy-1.5.0.tar.gz | tar -xz
+  cd searchlight-deploy-1.5.0
   docker compose -f compose.postgres.yml up -d                              # nginx on 127.0.0.1:8080
   docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens  # the API tokens
   ```

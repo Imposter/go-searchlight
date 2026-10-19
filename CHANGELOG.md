@@ -6,6 +6,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-19
+
+Versioned writes and saved queries in `_bulk`, percolation that reports versions, sequence numbers and matched nested objects, nested saved queries anchored on their inner conditions, and sub-aggregations and merged inner hits for nested fields.
+
 ### Added
 
 - **Sub-aggregations under a `terms` on a sub-field**
@@ -482,6 +486,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.5.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.5.0
 [1.4.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.3.0
 [1.2.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.2.0

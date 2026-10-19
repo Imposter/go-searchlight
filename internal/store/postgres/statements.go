@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
@@ -63,11 +64,11 @@ const writeSQL = `WITH changes AS (
 ), documents AS (
 	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version)
 	SELECT * FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[], $32::bigint[])
-	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq, version = EXCLUDED.version
+	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq, version = CASE WHEN EXCLUDED.version = 0 THEN sl_documents.version ELSE EXCLUDED.version END
 ), queries AS (
 	INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version)
 	SELECT * FROM unnest($17::text[], $18::int[], $19::text[], $20::text[], $21::text[], $22::bigint[], $33::bigint[])
-	ON CONFLICT (index_name, shard, id) DO UPDATE SET query = EXCLUDED.query, meta = EXCLUDED.meta, seq = EXCLUDED.seq, version = EXCLUDED.version
+	ON CONFLICT (index_name, shard, id) DO UPDATE SET query = EXCLUDED.query, meta = EXCLUDED.meta, seq = EXCLUDED.seq, version = CASE WHEN EXCLUDED.version = 0 THEN sl_queries.version ELSE EXCLUDED.version END
 ), document_deletes AS (
 	DELETE FROM sl_documents d USING unnest($23::text[], $24::int[], $25::text[]) AS k (index_name, shard, id)
 	WHERE d.index_name = k.index_name AND d.shard = k.shard AND d.id = k.id
@@ -75,9 +76,9 @@ const writeSQL = `WITH changes AS (
 	DELETE FROM sl_queries q USING unnest($26::text[], $27::int[], $28::text[]) AS k (index_name, shard, id)
 	WHERE q.index_name = k.index_name AND q.shard = k.shard AND q.id = k.id
 ), tombstones AS (
-	INSERT INTO sl_tombstones (index_name, shard, kind, id, version)
-	SELECT * FROM unnest($34::text[], $35::int[], $36::text[], $37::text[], $38::bigint[])
-	ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = EXCLUDED.version
+	INSERT INTO sl_tombstones (index_name, shard, kind, id, version, at)
+	SELECT * FROM unnest($34::text[], $35::int[], $36::text[], $37::text[], $38::bigint[], $43::bigint[])
+	ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = EXCLUDED.version, at = EXCLUDED.at
 ), tombstone_deletes AS (
 	DELETE FROM sl_tombstones t USING unnest($39::text[], $40::int[], $41::text[], $42::text[]) AS k (index_name, shard, kind, id)
 	WHERE t.index_name = k.index_name AND t.shard = k.shard AND t.kind = k.kind AND t.id = k.id
@@ -89,7 +90,7 @@ SELECT pg_notify('` + notifyChannel + `', payload) FROM unnest($30::text[]) AS p
 // limits is the engine's: one write statement carries at most 64 MB of
 // payload, well below the 1 GB a single array value (and a protocol message)
 // may hold. A batch beyond it is written in several statements of the same
-// text. Bind parameters never limit it: writeSQL always takes 42.
+// text. Bind parameters never limit it: writeSQL always takes 43.
 var limits = dialect.Limits{Bytes: 64 << 20}
 
 // write spells w in parts of about l.Bytes payload bytes: one, unless the
@@ -226,7 +227,7 @@ func (a *writeArgs) queries(rows []dialect.QueryRow) {
 	}
 }
 
-// args returns writeSQL's 42 arguments. Every array is non-nil: pgx sends a
+// args returns writeSQL's 43 arguments. Every array is non-nil: pgx sends a
 // nil slice as NULL, and unnest(NULL) is no rows too, but an empty array says
 // what is meant.
 func (a *writeArgs) args(counter int64, notify []string) []any {
@@ -242,6 +243,7 @@ func (a *writeArgs) args(counter int64, notify []string) []any {
 		ints64(a.dVersion), ints64(a.qVersion),
 		strs(a.t.index), ints(a.t.shard), strs(a.t.kind), strs(a.t.id), ints64(a.t.version),
 		strs(a.tDel.index), ints(a.tDel.shard), strs(a.tDel.kind), strs(a.tDel.id),
+		ints64(a.t.at),
 	}
 }
 
@@ -274,10 +276,10 @@ func ints64(s []int64) []int64 {
 }
 
 var records = dialect.Records{
-	GetDocument:       "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
-	GetQuery:          "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
-	ListQueries:       "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id > $3 ORDER BY id LIMIT $4",
-	ListQueryVersions: "SELECT id, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id > $3 ORDER BY id LIMIT $4",
+	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
+	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, dollar) },
+	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, dollar) },
 }
 
 var registry = dialect.Registry{
@@ -357,8 +359,9 @@ VALUES ($1, $2, $3, 1, NOW, 1, $4) RETURNING ` + indexColumns)},
 }
 
 var maintenance = dialect.Maintenance{
-	MinSeq:        "SELECT MIN(seq) FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq < $3",
-	DeleteChanges: "DELETE FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq >= $3 AND seq < $4",
+	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq < $3",
+	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = $1 AND at < NOW - $2"),
+	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq >= $3 AND seq < $4",
 	RaiseHorizon: dialect.Returning{Read: `INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES ($1, $2, $3)
 ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = GREATEST(sl_pruned.below_seq, EXCLUDED.below_seq) RETURNING below_seq`},
 	VersionTable: `CREATE TABLE IF NOT EXISTS sl_schema_migrations (
@@ -380,7 +383,7 @@ ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = GREATEST(sl_pruned.bel
 type tombstoneColumns struct {
 	index, kind, id []string
 	shard           []int
-	version         []int64
+	version, at     []int64
 }
 
 func tombstoneRows(rows []dialect.TombstoneRow) tombstoneColumns {
@@ -391,6 +394,10 @@ func tombstoneRows(rows []dialect.TombstoneRow) tombstoneColumns {
 		t.kind = append(t.kind, r.Kind)
 		t.id = append(t.id, r.ID)
 		t.version = append(t.version, r.Version)
+		t.at = append(t.at, r.At)
 	}
 	return t
 }
+
+// dollar is the engine's n-th placeholder.
+func dollar(n int) string { return "$" + strconv.Itoa(n) }

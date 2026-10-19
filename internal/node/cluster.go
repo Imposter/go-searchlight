@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
@@ -112,4 +113,6 @@ type IndexView struct {
 	Shards int
 	// ReplicasPerShard is the copy target per shard; 0 means every node.
 	ReplicasPerShard int
+	// GCDeletes is how long its deletes keep their versions (api.IndexSettings).
+	GCDeletes time.Duration
 }

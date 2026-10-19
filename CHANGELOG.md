@@ -12,19 +12,27 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   ([docs/api.md](docs/api.md#nested-fields)): `stats`, `min`, `max`, `cardinality` and
   one level of `terms`, per bucket over its documents (a top-level field, each document
   once) or over its objects (a sub-field of the same nested field, narrowed by the
-  sub-aggregation's own `where`). A `terms` there is exact, never cut per shard; its
-  buckets count towards the response's 65,536. Search wire level 7 keeps them off
+  sub-aggregation's own `where`). A `terms` there is never cut per shard (its buckets
+  carry the outer bucket's error bound where a shard cut that); its
+  buckets count towards the 65,536 as shards collect them. Search wire level 7 keeps them off
   peers of an earlier release (503 with no other copy).
 - **Client versions** ([docs/api.md](docs/api.md#documents)), Elasticsearch's external
   versioning, on documents and saved queries: `version=N` on `PUT` and `DELETE`, and
   `"version": N` in a `_bulk` action, applies only when N is higher than the stored
-  version, and is otherwise a noop (`"result": "noop"`, no seq), never a 409. A versioned
-  delete keeps its version as a tombstone, so a replay of an older write after it is a
-  noop too. `GET`, listings and `_bulk` items return `version`. Schema migration 5 adds
-  `version` to `sl_documents` and `sl_queries` and the table `sl_tombstones`.
+  version, and is otherwise a noop (`"result": "noop"`, no seq), never a 409. Versions
+  only rise: an unversioned write keeps the stored version, and a delete keeps it as a
+  tombstone, so a replay of an older write after it is a noop too. A versioned delete
+  of an absent id is a 404 that records its version above the tombstone, a noop at or
+  below it. Tombstones are kept for the index setting `gc_deletes` (24 h by default, as
+  Elasticsearch's), then pruned by the cluster's leader. `GET`, listings and `_bulk`
+  items return `version`. Schema migration 5 adds `version` to `sl_documents` and
+  `sl_queries` and the table `sl_tombstones`. Until every node runs 1.5, versions and
+  percolation matches may disagree with `GET`.
 - **Saved queries in `_bulk`**: `query_upsert` (followed by `{"query": ..., "meta":
   ...}`) and `query_delete` actions beside the documents, in one transaction, with
-  per-item results; a document percolates against the queries written before it.
+  per-item results. With `percolate=true` the documents percolate against the saved
+  queries as the whole request leaves them (its own query writes included, wherever
+  they are in it).
 - **A lean saved-query listing**: `GET .../queries?fields=id,version` pages ids and
   versions without reading the queries' trees or meta.
 - **Percolation matches with versions and inner hits** ([docs/api.md](docs/api.md#percolation)):
@@ -47,8 +55,9 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   node's own copies at once for 64 documents or more: 200 documents on 8 shards take
   2.5 ms against 3.3 ms; fewer run in turn while the peers answer), and
   merges their matches; a shard that fails cancels the rest.
-- **Saved-query listings page each shard in its primary key's order** and merge them by
-  id, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
+- **Saved-query listings pick a page's ids from each shard's primary key range** in one
+  statement (each range cut at the page size), then read the trees and meta of those ids
+  alone, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
   query of the index by id before).
 - **Query segments are format `percolate/4`**, which keeps each saved query's version.
   Segments of `percolate/3` open as they are, their queries with no version, until

@@ -15,11 +15,13 @@ database (Postgres, MySQL or SQLite), and nowhere else:
   its transaction commits.
 - **The documents and saved queries** (`sl_documents`, `sl_queries`) are the system of
   record, each row with the seq of its last write and the client version it named.
-  `sl_tombstones` keeps the version of each id a versioned delete removed. A versioned
-  change is checked inside its transaction, under the counter lock, against the row's
-  version or, while the row is absent, the tombstone's: at or below it, the change is
-  dropped as a noop and takes no seq. A saved query's version also rides its changelog
-  payload, so copies index it with the query (`percolate/4` keeps it per query).
+  `sl_tombstones` keeps the version of each id a delete removed, with when, for the
+  index's `gc_deletes`. A versioned change is checked inside its transaction, under the
+  counter lock, against the greater of the row's version and the tombstone's: at or below
+  it, the change is dropped as a noop and takes no seq. An unversioned upsert keeps the
+  row's version (the upsert statement leaves it), so versions only rise. A saved query's
+  version also rides its changelog payload, so copies index it with the query
+  (`percolate/4` keeps it per query).
 - **The registry** (`sl_nodes`, `sl_shard_copies`) is how nodes find each other, and its
   leases decide who holds which shard copy.
 
@@ -273,7 +275,8 @@ data_dir/
     one on a top-level field built on the parent segment and fed each document once
     (when the bucket first counts it), one on a sub-field built on the object segment
     and fed each object (those its own `where` matches, a bitmap computed once per
-    segment). A `terms` there is keyed by value too and never cut by a shard, so the
+    segment). A `terms` there is keyed by value too, charged to the segment's bucket
+    budget as it collects, and never cut by a shard, so the
     shards' lists merge by key exactly. A sort on
     a sub-field reads, per document, the least or greatest value among its chosen
     objects, from a bitset of them. Inner hits are read at the coordinator from each

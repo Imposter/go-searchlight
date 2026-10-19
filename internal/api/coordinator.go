@@ -90,6 +90,10 @@ const (
 	MaxShards       = 1024
 	MaxReplicas     = 1024
 	DisabledRefresh = time.Duration(-1)
+	// DefaultGCDeletes is an index's gc_deletes when it sets none, and MaxGCDeletes the
+	// longest it takes.
+	DefaultGCDeletes = 24 * time.Hour
+	MaxGCDeletes     = 365 * 24 * time.Hour
 )
 
 // IndexSettings are an index's settings (spec section 3).
@@ -103,12 +107,17 @@ type IndexSettings struct {
 	// node's refresh_interval, DisabledRefresh never (refresh=true and wait_for
 	// still refresh).
 	RefreshInterval time.Duration
+	// GCDeletes is how long a delete keeps its id's version (a tombstone) for later
+	// versioned writes to compare with, as Elasticsearch's index.gc_deletes: 0 means
+	// DefaultGCDeletes.
+	GCDeletes time.Duration
 }
 
 type settingsJSON struct {
 	Shards           *int            `json:"shards,omitempty"`
 	ReplicasPerShard *int            `json:"replicas_per_shard,omitempty"`
 	RefreshInterval  json.RawMessage `json:"refresh_interval,omitempty"`
+	GCDeletes        json.RawMessage `json:"gc_deletes,omitempty"`
 }
 
 // MarshalJSON writes {"shards": n, "replicas_per_shard": n, "refresh_interval": "1s"},
@@ -120,6 +129,9 @@ func (s IndexSettings) MarshalJSON() ([]byte, error) {
 		out.RefreshInterval = json.RawMessage("-1")
 	case s.RefreshInterval > 0:
 		out.RefreshInterval, _ = json.Marshal(s.RefreshInterval.String())
+	}
+	if s.GCDeletes > 0 {
+		out.GCDeletes, _ = json.Marshal(s.GCDeletes.String())
 	}
 	return json.Marshal(out)
 }
@@ -145,6 +157,13 @@ func (s *IndexSettings) UnmarshalJSON(data []byte) error {
 		}
 		out.RefreshInterval = d
 	}
+	if raw.GCDeletes != nil {
+		d, err := ParseGCDeletes(raw.GCDeletes)
+		if err != nil {
+			return err
+		}
+		out.GCDeletes = d
+	}
 	if err := out.Validate(); err != nil {
 		return err
 	}
@@ -162,6 +181,9 @@ func (s *IndexSettings) Validate() error {
 	}
 	if s.RefreshInterval < 0 && s.RefreshInterval != DisabledRefresh {
 		return &FieldError{Loc: "refresh_interval", Message: `refresh_interval is a positive duration ("1s") or -1`}
+	}
+	if s.GCDeletes != 0 && (s.GCDeletes < time.Second || s.GCDeletes > MaxGCDeletes) {
+		return &FieldError{Loc: "gc_deletes", Message: "gc_deletes is a duration (\"24h\") from 1s to 365 days"}
 	}
 	return nil
 }
@@ -188,6 +210,7 @@ func parseRefreshInterval(raw json.RawMessage) (time.Duration, error) {
 type SettingsPatch struct {
 	RefreshInterval  *time.Duration
 	ReplicasPerShard *int
+	GCDeletes        *time.Duration
 }
 
 // FieldError is a request value that is out of bounds, at Loc.
@@ -524,4 +547,26 @@ type PercolateMatch struct {
 type PercolateInnerHits struct {
 	Total   int   `json:"total"`
 	Offsets []int `json:"offsets"`
+}
+
+// ParseGCDeletes reads gc_deletes: a duration ("24h", "60s"), 1s to MaxGCDeletes.
+func ParseGCDeletes(raw json.RawMessage) (time.Duration, error) {
+	bad := &FieldError{Loc: "gc_deletes", Message: `gc_deletes is a duration ("24h") from 1s to 365 days`}
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return 0, bad
+	}
+	d, err := time.ParseDuration(text)
+	if err != nil || d < time.Second || d > MaxGCDeletes {
+		return 0, bad
+	}
+	return d, nil
+}
+
+// EffectiveGCDeletes is s's gc_deletes, DefaultGCDeletes when it sets none.
+func (s IndexSettings) EffectiveGCDeletes() time.Duration {
+	if s.GCDeletes == 0 {
+		return DefaultGCDeletes
+	}
+	return s.GCDeletes
 }

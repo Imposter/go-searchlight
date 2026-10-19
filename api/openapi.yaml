@@ -282,6 +282,7 @@ paths:
               properties:
                 refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
                 replicas_per_shard: { type: integer, minimum: 0, maximum: 1024 }
+                gc_deletes: { $ref: "#/components/schemas/GCDeletes" }
       responses:
         "200":
           description: The index.
@@ -908,6 +909,10 @@ components:
         shards: { type: integer, minimum: 1, maximum: 1024, default: 1, description: Fixed at creation. }
         replicas_per_shard: { type: integer, minimum: 0, maximum: 1024, default: 0, description: 0 means every node holds every shard. }
         refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
+        gc_deletes: { $ref: "#/components/schemas/GCDeletes" }
+    GCDeletes:
+      type: string
+      description: 'How long a delete keeps its id''s version (a tombstone) for versioned writes to compare with, as Elasticsearch''s index.gc_deletes: a duration ("24h", "60s"), 1s to 365 days; 24h when unset. Older tombstones are pruned, and a write of any version then applies.'
     IndexInfo:
       type: object
       additionalProperties: false
@@ -1065,7 +1070,7 @@ components:
         aggs:
           type: object
           maxProperties: 100
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, min, max ({"value": x}, null with no value), cardinality (precision, or threshold: exact up to it, the threshold past it), with metric sub-aggregations one level deep (a nested field''s sub-field, path.name, is aggregated by terms, stats, min, max and cardinality alone, at the top level or under filter, filters and global: over the objects of the hits, those its "where" query of the sub-fields matches when given; terms counts each hit once per value however many of its objects hold it, and holds stats, min, max, cardinality and terms sub-aggregations (the terms holding none, and exact: never cut per shard), over the bucket''s documents for a top-level field, over the bucket''s objects for a sub-field of the same nested field) (terms takes collect_mode, depth_first or breadth_first, the same results either way; and include and exclude: an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are; exclude wins, and both apply before size and shard_size; partitions are refused); and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, min, max ({"value": x}, null with no value), cardinality (precision, or threshold: exact up to it, the threshold past it), with metric sub-aggregations one level deep (a nested field''s sub-field, path.name, is aggregated by terms, stats, min, max and cardinality alone, at the top level or under filter, filters and global: over the objects of the hits, those its "where" query of the sub-fields matches when given; terms counts each hit once per value however many of its objects hold it, and holds stats, min, max, cardinality and terms sub-aggregations (the terms holding none, never cut per shard, its buckets bounded by the outer bucket''s error), over the bucket''s documents for a top-level field, over the bucket''s objects for a sub-field of the same nested field) (terms takes collect_mode, depth_first or breadth_first, the same results either way; and include and exclude: an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are; exclude wins, and both apply before size and shard_size; partitions are refused); and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
         aggregations:
           type: object
           maxProperties: 100

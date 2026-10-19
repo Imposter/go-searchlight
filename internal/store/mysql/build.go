@@ -101,7 +101,7 @@ const (
 	changeColumns    = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce"
 	documentColumns  = "index_name, shard, id, body, body_z, seq, version"
 	queryColumns     = "index_name, shard, id, query, meta, seq, version"
-	tombstoneColumns = "index_name, shard, kind, id, version"
+	tombstoneColumns = "index_name, shard, kind, id, version, at"
 )
 
 func changeArgs(rows []dialect.ChangeRow) []any {
@@ -132,10 +132,10 @@ func queryArgs(rows []dialect.QueryRow) []any {
 }
 
 func tombstoneArgs(rows []dialect.TombstoneRow) []any {
-	args := make([]any, 0, len(rows)*5)
+	args := make([]any, 0, len(rows)*6)
 	for i := range rows {
 		r := &rows[i]
-		args = append(args, r.Index, r.Shard, r.Kind, r.ID, r.Version)
+		args = append(args, r.Index, r.Shard, r.Kind, r.ID, r.Version, r.At)
 	}
 	return args
 }

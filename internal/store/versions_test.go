@@ -3,13 +3,17 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // Client versions (Elasticsearch's external versioning): a versioned change applies
-// only above the stored version, the target's or, while it is absent, its tombstone's;
+// only above the stored version, the greater of the target's and its tombstone's;
 // otherwise it is a noop that takes no seq, as the changes after it in the batch see.
-// A versioned delete keeps its version as a tombstone, of an absent target too, which a
-// versioned upsert replaces; unversioned writes store version 0 and leave tombstones
+// Versions only rise: an unversioned write keeps the stored version, and a delete keeps
+// it as a tombstone (a versioned delete of an absent target too, skipped as a 404 above
+// the tombstone and a noop at or below it), which a versioned upsert replaces.
+// PruneTombstones drops those older than its age, after which a lower version applies;
+// dropping the index drops its tombstones.
 // be; dropping the index drops its tombstones.
 func TestVersions(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
@@ -67,18 +71,18 @@ func TestVersions(t *testing.T) {
 		version(RecordDocument, "b", 0)
 		apply("a", doc("b", 1))
 		version(RecordDocument, "b", 1)
-		apply("a", doc("b", 0))
-		version(RecordDocument, "b", 0)
+		apply("an", doc("b", 0), doc("b", 1))
+		version(RecordDocument, "b", 1)
 
 		apply("anna", gone("a", 5), doc("a", 4), doc("a", 5), doc("a", 6))
 		version(RecordDocument, "a", 6)
-		apply("aa", del("ver", 0, "a"), doc("a", 1))
-		version(RecordDocument, "a", 1)
+		apply("aana", del("ver", 0, "a"), doc("a", 0), doc("a", 6), doc("a", 7))
+		version(RecordDocument, "a", 7)
 
 		apply("snna", gone("c", 9), doc("c", 8), gone("c", 9), doc("c", 10))
 		version(RecordDocument, "c", 10)
 		apply("s", gone("d", 4))
-		apply("na", doc("d", 3), doc("d", 7))
+		apply("nnsa", doc("d", 3), gone("d", 4), gone("d", 5), doc("d", 6))
 
 		apply("anan", qry("q", 2), qry("q", 2), qry("q", 3), qry("q", 1))
 		version(RecordQuery, "q", 3)
@@ -97,6 +101,17 @@ func TestVersions(t *testing.T) {
 		}
 		qdel := Change{Index: "ver", Kind: KindQueryDelete, ID: "q", Version: 4, IfSeq: IfExists}
 		apply("an", qdel, qry("q", 4))
+
+		apply("s", gone("e", 9))
+		apply("n", doc("e", 8))
+		if n, err := st.PruneTombstones(ctx, "ver", 24*time.Hour); err != nil || n != 0 {
+			t.Fatalf("pruning young tombstones: %d, %v", n, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if n, err := st.PruneTombstones(ctx, "ver", 10*time.Millisecond); err != nil || n != 2 {
+			t.Fatalf("pruning old tombstones: %d, %v; want 2 (q's and e's)", n, err)
+		}
+		apply("aa", doc("e", 8), qry("q", 1))
 
 		if err := st.Indexes().Drop(ctx, "ver"); err != nil {
 			t.Fatal(err)

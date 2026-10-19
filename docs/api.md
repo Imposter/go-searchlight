@@ -291,11 +291,15 @@ its own), each bucket collecting them over:
   "colors": {"buckets": [{"key": "red", "doc_count": 7, "doc_count_error_upper_bound": 0}], "sum_other_doc_count": 0, "doc_count_error_upper_bound": 0}}]}}
 ```
 
-A `terms` sub-aggregation is exact: no shard cuts its list (no `shard_size`, an error
-bound of 0); the response keeps its `size` buckets, as `min_doc_count`, `include` and
-`exclude` choose them, and counts the rest in `sum_other_doc_count`. Its buckets count
-towards the 65,536 of a response, those under the buckets the response holds, right
-after their own aggregation's.
+No shard cuts a `terms` sub-aggregation's list (it takes no `shard_size`); the response
+keeps its `size` buckets, as `min_doc_count`, `include` and `exclude` choose them, and
+counts the rest in `sum_other_doc_count`. Its counts are exact where every shard
+returned the outer bucket; where a shard cut the outer bucket out of its list, that
+shard's documents are missing from it, and the sub-aggregation and each of its buckets
+carry the outer bucket's `doc_count_error_upper_bound`. Its buckets count towards the
+65,536 as each shard collects them, every one it holds (a shard past them refuses the
+search, as for a histogram), and in the response those under the buckets it holds,
+right after their own aggregation's.
 
 Any other aggregation on a sub-field, a sub-aggregation of a `stats`, `min`, `max` or
 `cardinality` on one, one on a sub-field under any other bucket aggregation or of
@@ -319,9 +323,9 @@ missing value does:
 a `bool` or `keyword_list` sub-field or on the nested field itself, are 400s at
 `sort.N`.
 
-`PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once, or
-`replicas_per_shard`. The allocator then places or releases copies to meet the new
-target.
+`PATCH /indexes/{index}/settings` changes `refresh_interval`, which applies at once,
+`replicas_per_shard`, after which the allocator places or releases copies to meet the
+new target, or [`gc_deletes`](#documents), how long deletes keep their versions.
 
 ## Documents
 
@@ -346,16 +350,30 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   higher than the stored version, and answers `{"id", "seq", "version"}`; otherwise it is
   a noop, `{"id", "version", "result": "noop"}` (200, no `seq`), and writes nothing. It
   excludes `if_seq` and `op_type=create` (400 at `params.version`).
-  - The stored version is the document's (0 when its last write named none) or, while
-    it does not exist, the version its last versioned delete kept. A versioned delete
-    keeps its version as a tombstone, of a document that does not exist too (which is
-    still a 404), so a replay of an older write after it is a noop as well; a versioned
-    write above it replaces it. A write without `version` stores version 0 and leaves a
-    tombstone as it is.
+  - The stored version is the greater of the document's and its tombstone's. Versions
+    only rise: a write without `version` keeps the stored version (so a stale replay
+    of a lower one after it is still a noop), and a delete keeps the document's
+    version as a tombstone, so a replay of an older write after it is a noop as well.
+    A versioned write above it applies and replaces the tombstone.
+  - **A versioned delete of a document that does not exist**: when N is higher than
+    its tombstone (or there is none), a 404 `document_not_found` (`result:
+    "not_found"`) that records N as its tombstone; at or below it, a noop (200,
+    `result: "noop"`).
+  - **`gc_deletes`**, an index setting as Elasticsearch's `index.gc_deletes` (24 h by
+    default, 1 s to 365 days, set at creation or by `PATCH .../settings`): how long a
+    tombstone is kept. The cluster's leader prunes older ones at each changelog prune,
+    after which a write of any version applies to the deleted id, as in
+    Elasticsearch. Replay within it.
   - `GET` returns the document's `version` (absent for 0), as `_bulk` items and
     percolation matches do.
   - Replays and reconciles are harmless: send the same versioned writes again, and each
     one already applied is a noop.
+  - **During a rolling upgrade** from 1.4, until every node runs 1.5, versions may
+    disagree: a 1.4 node writes as before, leaving the stored version untouched, and
+    its copies report no versions or `_seq` (a request with `percolate_matches` or
+    `seq_no` skips them, 503 with no other copy). Send versioned writes to upgraded
+    nodes, and trust `version` in `GET` and percolation matches once the rollout is
+    done.
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
 - **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
   is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the
@@ -396,8 +414,10 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 - **Saved queries.** `query_upsert` is followed by the saved query, as `PUT
   .../queries/{id}` takes it (`{"query": ..., "meta": {...}}`; a line of another shape
   refuses the whole request), and `query_delete` takes none. Documents and saved queries
-  mix in one request, in one transaction; a document percolates against the saved
-  queries written before it, those of the same request included:
+  mix in one request, in one transaction. With `percolate=true` every document of the
+  request percolates after the whole request commits, so against the saved queries as
+  they stand at its end: those its `query_upsert`s write, wherever they are in the
+  request, included, and those its `query_delete`s remove left out:
 
   ```
   {"query_upsert": {"id": "s7", "version": 3}}
@@ -803,9 +823,10 @@ curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: B
   parameters as documents, and so do `_bulk`'s `query_upsert` and `query_delete`
   ([Bulk](#bulk)). `GET` returns the query's `version` (absent for 0), and every
   percolation copy indexes it with the query.
-- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`. Each page reads
-  every shard's next queries in its primary key's order and merges them by id, so a page
-  costs what it returns whatever the index holds.
+- **Listing.** `GET .../queries` pages by id. Pass `next` as `after`. A page takes two
+  statements in one snapshot: one picks its ids, the first `size` of every shard's
+  primary key range after `after` (each range cut at `size`), then one reads the trees
+  and meta of those ids alone, so a page costs what it returns whatever the index holds.
   - **`fields`**, a comma-separated list of `id`, `seq`, `version`, `query` and `meta`,
     keeps those members of each query (`id` always). Without `query` and `meta`, their
     trees and meta are never read: `?fields=id,version&size=1000` pages a reconcile of

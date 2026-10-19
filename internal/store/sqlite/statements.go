@@ -70,7 +70,7 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 	}
 	for i := range w.Tombstones {
 		r := &w.Tombstones[i]
-		out = append(out, dialect.Stmt{What: "upsert tombstones", SQL: upsertTombstone, Args: []any{r.Index, r.Shard, r.Kind, r.ID, r.Version}})
+		out = append(out, dialect.Stmt{What: "upsert tombstones", SQL: upsertTombstone, Args: []any{r.Index, r.Shard, r.Kind, r.ID, r.Version, r.At}})
 	}
 	for i := range w.TombstoneDeletes {
 		r := &w.TombstoneDeletes[i]
@@ -81,19 +81,19 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 
 const (
 	insertChange    = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	upsertDocument  = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq, version = excluded.version"
-	upsertQuery     = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq, version = excluded.version"
-	upsertTombstone = "INSERT INTO sl_tombstones (index_name, shard, kind, id, version) VALUES (?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = excluded.version"
+	upsertDocument  = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq, version = CASE WHEN excluded.version = 0 THEN sl_documents.version ELSE excluded.version END"
+	upsertQuery     = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq, version = CASE WHEN excluded.version = 0 THEN sl_queries.version ELSE excluded.version END"
+	upsertTombstone = "INSERT INTO sl_tombstones (index_name, shard, kind, id, version, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = excluded.version, at = excluded.at"
 	deleteTombstone = "DELETE FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?"
 	deleteDocument  = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
 	deleteQuery     = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
 )
 
 var records = dialect.Records{
-	GetDocument:       "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	GetQuery:          "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	ListQueries:       "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id > ? ORDER BY id LIMIT ?",
-	ListQueryVersions: "SELECT id, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id > ? ORDER BY id LIMIT ?",
+	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
+	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
 }
 
 var registry = dialect.Registry{
@@ -173,8 +173,9 @@ VALUES (?, ?, ?, 1, NOW, 1, ?) RETURNING ` + indexColumns)},
 }
 
 var maintenance = dialect.Maintenance{
-	MinSeq:        "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
-	DeleteChanges: "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",
+	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
+	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = ? AND at < NOW - ?"),
+	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",
 	// In DO UPDATE, a bare column is the existing row's value.
 	RaiseHorizon: dialect.Returning{Read: `INSERT INTO sl_pruned (index_name, shard, below_seq) VALUES (?, ?, ?)
 ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = MAX(below_seq, excluded.below_seq) RETURNING below_seq`},
@@ -187,3 +188,6 @@ ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = MAX(below_seq, exclude
 	RecordMigration:   withNow("INSERT INTO sl_schema_migrations (version, name, applied_at) VALUES (?, ?, NOW)"),
 	MigrateInTx:       true, // BEGIN IMMEDIATE excludes every other writer
 }
+
+// question is the engine's placeholder, whatever its position.
+func question(int) string { return "?" }

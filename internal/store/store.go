@@ -97,6 +97,10 @@ type Store interface {
 	// calls that would need them return ErrPruned. The caller keeps belowSeq
 	// behind every live copy's applied seq (spec §9).
 	Prune(ctx context.Context, shard ShardID, belowSeq int64) error
+	// PruneTombstones deletes the tombstones of index (the versions its deletes keep)
+	// older than age by the database clock, returning how many it deleted: versions
+	// arriving after then compare with nothing deleted, as Elasticsearch's gc_deletes.
+	PruneTombstones(ctx context.Context, index string, age time.Duration) (int64, error)
 
 	// CompressBodies sets whether Apply stores document bodies compressed from now
 	// on: only once FeatureZstdBodies is on, since nodes from before codecs read

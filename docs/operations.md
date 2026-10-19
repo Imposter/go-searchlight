@@ -864,8 +864,14 @@ Notes:
   rewritten. As with the migrations before it, an old binary refuses to start once the
   first node has migrated, so finish the rollout.
   - Nodes still on the old binary keep writing as before, never touching the new
-    columns: a write they take leaves the target's stored version as it was. Send
-    versioned writes to upgraded nodes.
+    columns: a write they take leaves the target's stored version as it was, and a
+    delete they take keeps no tombstone. Send versioned writes to upgraded nodes, and
+    expect versions in `GET` and percolation matches to be right only once every node
+    runs 1.5.
+  - **Set `gc_deletes` only once every node runs 1.5**: an older node refuses index
+    settings it does not know, so it cannot read an index whose settings name it.
+    Unset, an index keeps tombstones for 24 h; the leader prunes older ones at each
+    changelog prune.
   - Upgraded nodes open `percolate/3` query segments as they are (their queries have no
     version until written again) and write `percolate/4` ones. **A copy that has
     written one cannot be downgraded**: an older binary refuses the newer format, and

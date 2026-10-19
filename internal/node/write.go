@@ -62,6 +62,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if len(batch) == 0 {
+		res.Percolated = opts.Percolate
 		return res, nil
 	}
 	if err := n.admit(idx, batch); err != nil {
@@ -72,6 +73,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if len(batch) == 0 {
+		res.Percolated = opts.Percolate
 		return res, nil
 	}
 	res.Seq = batch[len(batch)-1].change.Seq

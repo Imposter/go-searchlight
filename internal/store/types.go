@@ -110,12 +110,13 @@ type Change struct {
 	IndexUID string
 	// Version is the client's version of the document or saved query (Elasticsearch's
 	// external versioning), 0 for none. A change with one applies only when it is higher
-	// than the stored version: the target's, or, while it is absent, the version its
-	// last versioned delete kept (a tombstone). Otherwise it is a noop, skipped inside
-	// the transaction (no seq, Noop set), as the changes after it see it. A versioned
-	// upsert stores it and replaces the tombstone; a versioned delete keeps it as one,
-	// even of a target that is absent (an IfExists delete of nothing then writes only
-	// the tombstone). A change without one stores version 0 and leaves tombstones be.
+	// than the stored version: the greater of the target's and the version a delete of
+	// it kept (a tombstone, which PruneTombstones removes once it is older than the
+	// index's gc_deletes). Otherwise it is a noop, skipped inside the transaction (no
+	// seq, Noop set), as the changes after it see it. Versions only rise: a versioned
+	// upsert stores its own and removes the tombstone; a change without one keeps the
+	// stored version, and a delete keeps it as a tombstone, of an absent target too for a
+	// versioned delete (an IfExists delete of nothing then writes only the tombstone).
 	Version int64
 	// Noop is set by Apply on a change its Version made a noop.
 	Noop bool

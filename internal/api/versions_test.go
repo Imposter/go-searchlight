@@ -50,7 +50,7 @@ func TestVersionedWrites(t *testing.T) {
 
 // _bulk takes query_upsert and query_delete beside documents, each with its version:
 // a replay of the same bulk is a noop item by item, documents percolate against the
-// queries written before them, and the lean listing pages ids and versions.
+// queries as the request leaves them, and the lean listing pages ids and versions.
 func TestBulkQueryActions(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.createIndex("bq", `{"mapping": {"fields": {"brand": "keyword"}}, "settings": {"shards": 3}}`)
@@ -79,6 +79,9 @@ func TestBulkQueryActions(t *testing.T) {
 		t.Fatalf("d1 percolated against the queries before it: %v", got[2])
 	}
 	r = e.must(http.StatusOK, "POST", "/indexes/bq/_bulk?percolate=true", bulk)
+	if r["percolated"] != true || r["seq"] != 0.0 {
+		t.Fatalf("an all-noop bulk: percolated %v, seq %v; want true and 0", r["percolated"], r["seq"])
+	}
 	got = items(r)
 	for i := range 3 {
 		if got[i]["result"] != "noop" || got[i]["seq"] != nil || got[i]["queries"] != nil {
@@ -109,6 +112,49 @@ func TestBulkQueryActions(t *testing.T) {
 		p := e.problem(e.do("POST", "/indexes/bq/_bulk", tc.body), 400, "invalid_request")
 		if !hasLoc(p, tc.loc) {
 			t.Errorf("bulk %q: locs %v, want %s", tc.body, locs(p), tc.loc)
+		}
+	}
+}
+
+// Versions only rise: an unversioned write keeps the stored version. A versioned delete
+// of an id that does not exist is a 404 that records its version above the tombstone,
+// and a noop at or below it. gc_deletes is an index setting, set at creation and by a
+// settings patch.
+func TestVersionsRiseAndGCDeletes(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	info := e.createIndex("g", `{"mapping": {"fields": {"brand": "keyword"}}, "settings": {"gc_deletes": "2h"}}`)
+	if s := info["settings"].(map[string]any); s["gc_deletes"] != "2h0m0s" { //nolint:forcetypeassert,errcheck // the shape
+		t.Fatalf("settings %v", s)
+	}
+	e.must(http.StatusOK, "PUT", "/indexes/g/docs/a?version=3", `{"brand": "x"}`)
+	e.must(http.StatusOK, "PUT", "/indexes/g/docs/a", `{"brand": "y"}`)
+	if d := e.must(http.StatusOK, "GET", "/indexes/g/docs/a", ""); d["version"] != 3.0 {
+		t.Fatalf("an unversioned write reset the version: %v", d)
+	}
+	if r := e.must(http.StatusOK, "PUT", "/indexes/g/docs/a?version=2", `{}`); r["result"] != "noop" {
+		t.Fatalf("a stale replay after an unversioned write: %v", r)
+	}
+	p := e.problem(e.do("DELETE", "/indexes/g/docs/none?version=9", ""), 404, "document_not_found")
+	if p["result"] != "not_found" {
+		t.Fatalf("a versioned delete of nothing: %v", p)
+	}
+	for _, v := range []string{"9", "8"} {
+		if r := e.must(http.StatusOK, "DELETE", "/indexes/g/docs/none?version="+v, ""); r["result"] != "noop" {
+			t.Fatalf("a delete of nothing at version %s, under the tombstone 9: %v", v, r)
+		}
+	}
+	e.problem(e.do("DELETE", "/indexes/g/docs/none?version=10", ""), 404, "document_not_found")
+	if r := e.must(http.StatusOK, "PUT", "/indexes/g/docs/none?version=10", `{}`); r["result"] != "noop" {
+		t.Fatalf("a write at the tombstone's version: %v", r)
+	}
+	info = e.must(http.StatusOK, "PATCH", "/indexes/g/settings", `{"gc_deletes": "30m"}`)
+	if s := info["settings"].(map[string]any); s["gc_deletes"] != "30m0s" { //nolint:forcetypeassert,errcheck // the shape
+		t.Fatalf("patched settings %v", s)
+	}
+	for _, bad := range []string{`{"gc_deletes": "0s"}`, `{"gc_deletes": "9000h"}`, `{"gc_deletes": 5}`} {
+		p := e.problem(e.do("PATCH", "/indexes/g/settings", bad), 400, "invalid_request")
+		if !hasLoc(p, "gc_deletes") {
+			t.Errorf("%s: %v", bad, p)
 		}
 	}
 }

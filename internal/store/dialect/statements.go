@@ -1,5 +1,10 @@
 package dialect
 
+import (
+	"fmt"
+	"strings"
+)
+
 // The statement tables. Every field is one statement in the engine's own
 // spelling (placeholders, upserts, row locks, its clock), documented here by
 // the arguments it takes, in order, and the columns it returns, in order. NOW
@@ -94,13 +99,15 @@ const (
 	TombstoneQuery    = "q"
 )
 
-// TombstoneRow is the version a versioned delete keeps of an id (sl_tombstones).
+// TombstoneRow is the version a delete keeps of an id (sl_tombstones).
 type TombstoneRow struct {
 	Index   string
 	Shard   int
 	Kind    string
 	ID      string
 	Version int64
+	// At is when the delete committed, by the database clock (Unix ms).
+	At int64
 }
 
 // DeleteGroup is the ids of one shard of one index to delete.
@@ -184,12 +191,58 @@ type Records struct {
 	GetDocument string
 	// GetQuery: (index, shard, id) -> query, meta, seq, version.
 	GetQuery string
-	// ListQueries: (index, shard, after, limit) -> id, query, meta, seq, version of
-	// the shard's saved queries with id > after, by id: the primary key's order.
-	ListQueries string
-	// ListQueryVersions: (index, shard, after, limit) -> id, seq, version of the
-	// same queries, reading neither their trees nor their meta.
-	ListQueryVersions string
+	// QueryPage returns the statement that pages saved queries over shards: (index, after
+	// and limit per shard, then limit) -> shard, id, seq, version of the first
+	// limit queries with id > after across them, by id. Each shard's part is a range of
+	// its primary key, (index, shard, id), cut at limit, so the page costs what it
+	// returns on every shard however many queries they hold.
+	QueryPage func(shards []int) string
+	// QueriesByID returns the statement that reads saved queries by shard and id: (index,
+	// then per group its shard and its counts[i] ids) -> shard, id, query, meta of those
+	// that exist.
+	QueriesByID func(counts []int) string
+}
+
+// QueryPageSQL is Records.QueryPage in a dialect whose n-th placeholder (from 1) ph
+// spells: a UNION ALL of the shards' key ranges.
+func QueryPageSQL(shards []int, ph func(int) string) string {
+	var b strings.Builder
+	n := 1
+	b.WriteString("SELECT shard, id, seq, version FROM (")
+	for i, s := range shards {
+		if i > 0 {
+			b.WriteString(" UNION ALL ")
+		}
+		fmt.Fprintf(&b, "SELECT * FROM (SELECT shard, id, seq, version FROM sl_queries WHERE index_name = %s AND shard = %d AND id > %s ORDER BY id LIMIT %s) AS s%d",
+			ph(n), s, ph(n+1), ph(n+2), i)
+		n += 3
+	}
+	fmt.Fprintf(&b, ") AS page ORDER BY id LIMIT %s", ph(n))
+	return b.String()
+}
+
+// QueriesByIDSQL is Records.QueriesByID in a dialect whose n-th placeholder ph spells.
+func QueriesByIDSQL(counts []int, ph func(int) string) string {
+	var b strings.Builder
+	n := 2
+	fmt.Fprintf(&b, "SELECT shard, id, query, meta FROM sl_queries WHERE index_name = %s AND (", ph(1))
+	for i, c := range counts {
+		if i > 0 {
+			b.WriteString(" OR ")
+		}
+		fmt.Fprintf(&b, "(shard = %s AND id IN (", ph(n))
+		n++
+		for k := range c {
+			if k > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(ph(n))
+			n++
+		}
+		b.WriteString("))")
+	}
+	b.WriteString(")")
+	return b.String()
 }
 
 // Registry is the cluster registry: sl_nodes and the shard-copy slots of
@@ -324,6 +377,9 @@ type Indexes struct {
 
 // Maintenance is pruning and the schema migrations.
 type Maintenance struct {
+	// PruneTombstones: (index, age_ms) deletes the index's tombstones older than age_ms by
+	// NOW.
+	PruneTombstones string
 	// MinSeq: (index, shard, below) -> the lowest seq of the shard's changes
 	// below below, or NULL.
 	MinSeq string

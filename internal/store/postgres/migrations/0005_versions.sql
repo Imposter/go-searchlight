@@ -16,5 +16,8 @@ CREATE TABLE IF NOT EXISTS sl_tombstones (
 	kind TEXT NOT NULL,
 	id TEXT COLLATE "C" NOT NULL,
 	version BIGINT NOT NULL,
+	-- at is when the delete committed, by the database clock (Unix ms): a tombstone
+	-- older than its index's gc_deletes is pruned.
+	at BIGINT NOT NULL,
 	PRIMARY KEY (index_name, shard, kind, id)
 );

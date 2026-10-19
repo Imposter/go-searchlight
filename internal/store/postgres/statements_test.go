@@ -12,7 +12,7 @@ import (
 )
 
 // writeSQL takes 42 arguments, each used once (the nonces are $31, the versions and
-// tombstones, added last, $32 to $42).
+// tombstones, added last, $32 to $43).
 func TestWriteSQLPlaceholders(t *testing.T) {
 	var got []int
 	for _, p := range regexp.MustCompile(`\$(\d+)`).FindAllStringSubmatch(writeSQL, -1) {
@@ -23,7 +23,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 		got = append(got, n)
 	}
 	slices.Sort(got)
-	want := make([]int, 42)
+	want := make([]int, 43)
 	for i := range want {
 		want[i] = i + 1
 	}
@@ -32,7 +32,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 	}
 	w := &dialect.Write{Counter: 7}
 	st := write(w, limits)
-	if len(st) != 1 || len(st[0].Args) != 42 {
+	if len(st) != 1 || len(st[0].Args) != 43 {
 		t.Fatalf("an empty write: %d statements, %d args", len(st), len(st[0].Args))
 	}
 	for i, a := range st[0].Args {

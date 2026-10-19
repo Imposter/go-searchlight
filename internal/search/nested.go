@@ -401,6 +401,7 @@ func (b *nestedBucket) partial(key any, ns *nestedSubSpecs) *BucketPartial {
 // objects hold it, as key buckets. It is never cut on a shard, so its counts are exact
 // and its error bound 0; the reduce keeps its size.
 type subTerms struct {
+	s     *segExec
 	spec  *aggSpec
 	src   *fieldSrc
 	allow *termMask
@@ -411,7 +412,7 @@ type subTerms struct {
 
 func (s *segExec) newSubTerms(spec *aggSpec) *subTerms {
 	src := s.source(spec.field, spec.ftype)
-	return &subTerms{spec: spec, src: src, allow: s.termMask(spec, src), ords: map[uint32]*nestedBucket{}, nums: map[float64]*nestedBucket{}}
+	return &subTerms{s: s, spec: spec, src: src, allow: s.termMask(spec, src), ords: map[uint32]*nestedBucket{}, nums: map[float64]*nestedBucket{}}
 }
 
 func (c *subTerms) collect(d uint32) { c.add(d, d) }
@@ -424,6 +425,9 @@ func (c *subTerms) add(d, owner uint32) {
 		}
 		b := c.ords[o]
 		if b == nil {
+			if !c.charge() {
+				return
+			}
 			b = &nestedBucket{}
 			c.ords[o] = b
 		}
@@ -452,6 +456,9 @@ func (c *subTerms) add(d, owner uint32) {
 		b := c.nums[v]
 		if b == nil {
 			if c.spec.terms != nil && !c.spec.terms.number(v) {
+				return
+			}
+			if !c.charge() {
 				return
 			}
 			b = &nestedBucket{}
@@ -783,4 +790,17 @@ func (q *QueryInnerHits) Offsets(d *schema.Doc) map[string]*InnerHits {
 		out[spec.key] = ih
 	}
 	return out
+}
+
+// charge counts one more bucket against the segment's MaxBuckets, which a terms
+// sub-aggregation (never cut by the shard) is held to as it collects: past it, the
+// search is refused as too many buckets.
+func (c *subTerms) charge() bool {
+	if c.s.buckets.Add(1) <= MaxBuckets {
+		return true
+	}
+	if c.s.err == nil {
+		c.s.fail(tooManyBuckets(c.spec))
+	}
+	return false
 }

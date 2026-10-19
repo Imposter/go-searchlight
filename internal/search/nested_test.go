@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math/rand/v2"
@@ -615,9 +616,7 @@ func TestNestedRefusals(t *testing.T) {
 }
 
 func asRequestError(err error, re **RequestError) bool {
-	e, ok := err.(*RequestError) //nolint:errorlint // ExecuteShard returns it unwrapped
-	*re = e
-	return ok
+	return errors.As(err, re)
 }
 
 // The query and the post_filter give one key to one path's nodes alone: those of one

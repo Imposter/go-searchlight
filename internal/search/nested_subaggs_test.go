@@ -288,3 +288,56 @@ func TestNestedSubAggsRefusals(t *testing.T) {
 		t.Fatal("a terms on a top-level field marked as nested sub-aggregations")
 	}
 }
+
+// A terms sub-aggregation under a terms on a sub-field is held to the 65,536 buckets
+// as it collects, whatever the outer size: a shard past them refuses the search. And
+// when a shard cut an outer bucket out of its list, the bucket's sub-buckets missed its
+// documents: each carries the outer bucket's error bound.
+func TestNestedSubTermsBudgetAndBound(t *testing.T) {
+	many := newCluster(t, 1)
+	var members []string
+	for i := range 300 {
+		members = append(members, fmt.Sprintf(`{"size":"s%d"}`, i))
+	}
+	for i := range 300 {
+		many.upsert(fmt.Sprintf("d%03d", i), fmt.Sprintf(`{"brand":"b%d","_v":[%s]}`, i, strings.Join(members, ",")))
+	}
+	many.refreshAll()
+	_, err := many.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{
+		"t": {Type: AggTerms, Field: "_v.size", Size: 1, Aggs: map[string]Agg{"b": {Type: AggTerms, Field: "brand", Size: 1}}},
+	}})
+	var re *RequestError
+	if !asRequestError(err, &re) || re.Problems[0].Loc != "aggs.t.aggs.b.terms" {
+		t.Fatalf("90,000 sub-buckets collected for one returned: %v, want a refusal at aggs.t.aggs.b.terms", err)
+	}
+
+	c := newCluster(t, 2)
+	next := 0
+	on := func(s int, n int, body string) {
+		for k := 0; k < n; next++ {
+			id := fmt.Sprintf("d%d", next)
+			if c.route(id) == s {
+				c.upsert(id, body)
+				k++
+			}
+		}
+	}
+	on(0, 5, `{"brand":"x","_v":[{"size":"L"}]}`)
+	on(0, 1, `{"brand":"y","_v":[{"size":"M"}]}`)
+	on(1, 4, `{"brand":"z","_v":[{"size":"M"}]}`)
+	on(1, 3, `{"brand":"x","_v":[{"size":"L"}]}`)
+	on(1, 2, `{"brand":"w","_v":[{"size":"S"}]}`)
+	c.refreshAll()
+	got, err := c.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{
+		"t": {Type: AggTerms, Field: "_v.size", Size: 1, ShardSize: 1, Aggs: map[string]Agg{"b": {Type: AggTerms, Field: "brand", Size: 5}}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := got.Aggs["t"].Buckets[0]
+	sub := b.Aggs["b"]
+	if b.Key != "l" || b.DocCount != 5 || b.DocCountErrorUpperBound != 4 || sub.DocCountErrorUpperBound != 4 || len(sub.Buckets) != 1 || sub.Buckets[0].DocCountErrorUpperBound != 4 {
+		raw, _ := json.Marshal(got.Aggs["t"])
+		t.Fatalf("an outer bucket shard 1 cut: %s; want L of 5 with bound 4, its brands bounded by 4 too", raw)
+	}
+}

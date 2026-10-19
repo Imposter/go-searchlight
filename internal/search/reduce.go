@@ -263,6 +263,7 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 		returned += b.DocCount
 		out := finishBucket(b, spec)
 		out.DocCountErrorUpperBound = errs[b]
+		boundSubTerms(out, spec)
 		res.Buckets = append(res.Buckets, out)
 	}
 	res.SumOtherDocCount = docs - returned
@@ -496,4 +497,24 @@ func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
 	added := len(out) - len(res.Buckets)
 	res.Buckets = out
 	return added
+}
+
+// boundSubTerms gives the terms sub-aggregations of bucket b (a terms aggregation's,
+// spec's) b's own error bound. A terms sub-aggregation is never cut by a shard, but the
+// shards that cut b out of their lists counted its documents under none of its
+// sub-buckets: those documents, at most b's bound, may be missing from each of them.
+func boundSubTerms(b *Bucket, spec *aggSpec) {
+	if b.DocCountErrorUpperBound == 0 {
+		return
+	}
+	for _, sub := range spec.subs {
+		res := b.Aggs[sub.name]
+		if sub.typ != AggTerms || res == nil {
+			continue
+		}
+		res.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		for _, sb := range res.Buckets {
+			sb.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		}
+	}
 }

@@ -244,8 +244,9 @@ const (
 // A terms on a sub-field holds metric and terms sub-aggregations (those terms holding
 // none): one on a top-level field reads the bucket's documents, each once; one on a
 // sub-field of the same nested field reads the bucket's objects, the chosen ones
-// holding its value that its own Where chooses. A terms sub-aggregation there is
-// exact: no shard cuts it.
+// holding its value that its own Where chooses. No shard cuts a terms
+// sub-aggregation there (its buckets count towards MaxBuckets as they are collected),
+// and the outer bucket's error bound bounds what it misses.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string

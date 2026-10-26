@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -186,6 +187,9 @@ func (j *janitor) drain() {
 	stopped := j.stopped
 	j.mu.Unlock()
 	for _, p := range paths {
+		if !stopped {
+			prio.Step()
+		}
 		j.removeOne(p, stopped)
 	}
 }

@@ -25,6 +25,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/prio"
 )
 
 // EnvPrefix prefixes every setting's environment variable.
@@ -125,6 +127,13 @@ type Config struct {
 	MergeThreads int
 	// SearchThreads sizes the search worker pool.
 	SearchThreads int
+	// BackgroundShare is the least share of the time background work (merges,
+	// refresh builds, write and apply analysis, file removal) keeps while searches
+	// run: it steps aside for searches at its checkpoints, for the rest of each
+	// prio.Period (see package prio). 1 never steps aside. By default 0.25 on a node of
+	// fewer than 4 cores (GOMAXPROCS), where searches would otherwise queue behind
+	// merges, and 1 with more.
+	BackgroundShare float64
 	// GCHeapFloor is the heap size below which the garbage collector does not start
 	// a cycle (at most a quarter of GOMEMLIMIT); 0 turns the floor off, and a GOGC
 	// environment variable overrides it.
@@ -250,6 +259,7 @@ func Default() Config {
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
+		BackgroundShare:       prio.Default(),
 		GCHeapFloor:           64 << 20,
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       time.Minute,
@@ -485,6 +495,19 @@ var settings = []setting{
 		name: "search_threads", usage: "search worker pool size (default: GOMAXPROCS)",
 		parse:  func(c *Config, v string) error { return positiveInt(&c.SearchThreads, v) },
 		format: func(c *Config) string { return strconv.Itoa(c.SearchThreads) },
+	},
+	{
+		name:  "background_share",
+		usage: "least share of the time merges, refresh builds and write analysis keep while searches run, 0.05 to 1 (1: searches get no priority; default: 0.25 under 4 cores, else 1)",
+		parse: func(c *Config, v string) error {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil || !(f >= prio.MinShare && f <= 1) {
+				return fmt.Errorf("want a share from %g to 1, got %q", prio.MinShare, v)
+			}
+			c.BackgroundShare = f
+			return nil
+		},
+		format: func(c *Config) string { return strconv.FormatFloat(c.BackgroundShare, 'g', -1, 64) },
 	},
 	{
 		name: "log_level", usage: "minimum log level: debug, info, warn or error",

@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -366,7 +367,7 @@ func (t *Tailer) convert(ctx context.Context, items []item, views []*schema.Mapp
 	}
 	out = out[:limit]
 	analyzed := t.handedOff(ctx, items, views, docs)
-	analyzeAll(items, views, dynamic, docs, analyzed)
+	analyzeAll(ctx, items, views, dynamic, docs, analyzed)
 	unmapped := 0
 	for k, i := range docs {
 		a := &analyzed[k]
@@ -436,12 +437,13 @@ func fitsView(d *schema.Doc, view *schema.Mapping) bool {
 }
 
 // analyzeAll analyzes the documents items[docs[k]] into out[k], in parallel, but for
-// those handed off already.
-func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int, out []analysis) {
+// those handed off already. It steps aside for searches before each one (prio.Yield).
+func analyzeAll(ctx context.Context, items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int, out []analysis) {
 	run := func(k int) {
 		if out[k].given {
 			return
 		}
+		_ = prio.Yield(ctx) // a cancelled ctx stops the tailer at its own next check
 		i := docs[k]
 		out[k].doc, out[k].unmapped, out[k].err = analyzeDoc(views[i], dynamic[i], items[i].id, items[i].body)
 	}

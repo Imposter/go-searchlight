@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/prio"
 )
 
 // envOf returns a getenv over a fixed map.
@@ -52,6 +54,7 @@ func TestLoadDefaults(t *testing.T) {
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
+		BackgroundShare:       prio.Default(),
 		GCHeapFloor:           64 << 20,
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       time.Minute,
@@ -107,6 +110,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		"SEARCHLIGHT_MERGE_BUDGET":             "128MB",
 		"SEARCHLIGHT_MERGE_THREADS":            "3",
 		"SEARCHLIGHT_SEARCH_THREADS":           "7",
+		"SEARCHLIGHT_BACKGROUND_SHARE":         "0.5",
 		"SEARCHLIGHT_GC_HEAP_FLOOR":            "0",
 		"SEARCHLIGHT_LOG_LEVEL":                "DEBUG",
 		"SEARCHLIGHT_PPROF":                    "true",
@@ -150,6 +154,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		MergeBudget:           128e6,
 		MergeThreads:          3,
 		SearchThreads:         7,
+		BackgroundShare:       0.5,
 		GCHeapFloor:           0,
 		LogLevel:              slog.LevelDebug,
 		Pprof:                 true,
@@ -255,6 +260,7 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"gc_heap_floor", map[string]string{"SEARCHLIGHT_GC_HEAP_FLOOR": "-1MiB"}, nil},
 		{"merge_threads", map[string]string{"SEARCHLIGHT_MERGE_THREADS": "0"}, nil},
 		{"search_threads", map[string]string{"SEARCHLIGHT_SEARCH_THREADS": "many"}, nil},
+		{"background_share", map[string]string{"SEARCHLIGHT_BACKGROUND_SHARE": "0.01"}, nil},
 		{"log_level", map[string]string{"SEARCHLIGHT_LOG_LEVEL": "loud"}, nil},
 		{"pprof", map[string]string{"SEARCHLIGHT_PPROF": "maybe"}, nil},
 		{"shutdown_timeout", map[string]string{"SEARCHLIGHT_SHUTDOWN_TIMEOUT": "0"}, nil},
@@ -291,6 +297,7 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"request_cache_redis_timeout", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_TIMEOUT": "fast"}, nil},
 		{"request_cache_redis_max_entry_bytes", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_MAX_ENTRY_BYTES": "0"}, nil},
 		{"search_threads", nil, []string{"--search_threads=-2"}},
+		{"background_share", nil, []string{"--background_share=1.5"}},
 		{"data_dir", nil, []string{"--data_dir="}},
 		{"bogus", nil, []string{"--bogus=1"}},
 	}

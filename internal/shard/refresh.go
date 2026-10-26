@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -159,7 +160,11 @@ func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef
 	defer span.End()
 	name := newSegmentName()
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
-	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true, MarksUntyped: true})
+	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{
+		Name: name, Threads: threads, NoSync: true, MarksUntyped: true,
+		// A refresh steps aside for searches as it writes; it never fails for it.
+		Throttle: func(int) error { _ = prio.Yield(ctx); return nil },
+	})
 	if err != nil {
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, fmt.Errorf("shard: building a segment: %w", err)

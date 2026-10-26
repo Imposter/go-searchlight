@@ -19,6 +19,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -341,6 +342,9 @@ func (n *Single) analyzeOps(ctx context.Context, idx *index, ops []api.WriteOp, 
 	batch := make([]prepared, 0, len(ops))
 	for i := range ops {
 		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if err := prio.Yield(ctx); err != nil {
 			return nil, nil, err
 		}
 		items[i] = api.ItemResult{}

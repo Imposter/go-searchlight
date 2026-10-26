@@ -62,6 +62,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -508,6 +509,9 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	}
 	if o.Config.SearchThreads > 0 {
 		search.SetThreads(o.Config.SearchThreads)
+	}
+	if o.Config.BackgroundShare > 0 {
+		prio.Set(prio.New(o.Config.BackgroundShare, o.Clock))
 	}
 	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit) //nolint:contextcheck // the committer outlives this call; each Apply carries its caller's context
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))

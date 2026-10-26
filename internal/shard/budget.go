@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/prio"
 )
 
 // MergeBudget bounds the CPU and I/O background merges use (spec section 12's
@@ -68,9 +69,13 @@ func (b *MergeBudget) release(n int) {
 	}
 }
 
-// throttle waits until n more bytes fit the rate, or ctx ends.
+// throttle steps aside for searches (prio.Yield), then waits until n more bytes fit the
+// rate, or ctx ends.
 func (b *MergeBudget) throttle(ctx context.Context, n int) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := prio.Yield(ctx); err != nil {
 		return err
 	}
 	if b.rate == 0 {

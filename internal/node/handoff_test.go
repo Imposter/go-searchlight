@@ -7,42 +7,60 @@ import (
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
 
-// A handoff gives each document once, by its seq, and refuses one at or below the last
-// seq taken; full, it drops the documents below that seq (no copy takes them any more)
-// before it refuses a new one.
-func TestHandoffTakesOnceAndStaysBounded(t *testing.T) {
-	var h handoff
-	big := &schema.Doc{ID: "a", Body: bytes.Repeat([]byte("x"), maxHandoffBytes/handoffAmplification/4)}
-	h.put(1, big, nil)
-	h.put(2, big, nil)
-	if d, _ := h.take(1); d != big {
-		t.Fatal("seq 1 is not given")
+// A handoff gives each document once, by its seq; taking a seq forgets every document
+// below it, a document at or below the last seq taken is refused, and the handoffs of
+// a node hold at most maxHandoffBytes together, giving the bytes back as they go.
+func TestHandoffTakesInOrderWithinItsBudget(t *testing.T) {
+	var budget handoffBudget
+	a, b := handoff{budget: &budget}, handoff{budget: &budget}
+	doc := &schema.Doc{ID: "d", Body: []byte(`{"k":"v"}`)}
+	for _, seq := range []int64{3, 1, 2, 5} {
+		a.put(seq, doc, nil)
 	}
-	if d, _ := h.take(1); d != nil {
-		t.Fatal("seq 1 is given twice")
+	if d, _ := a.take(2); d != doc || a.held() != 2 {
+		t.Fatalf("take(2) = %v, %d held; want the document and 3 and 5 held", d, a.held())
 	}
-	h.put(3, big, nil)
-	h.put(4, big, nil)
-	h.put(5, big, nil)
-	if d, _ := h.take(5); d != big {
-		t.Fatal("seq 5 is not given")
+	if d, _ := a.take(4); d != nil || a.held() != 1 {
+		t.Fatalf("take(4) = %v, %d held; want none and 5 held", d, a.held())
 	}
-	h.put(6, big, nil)
-	h.put(7, big, nil)
-	if d, _ := h.take(6); d != big {
-		t.Fatal("seq 6 is not given")
+	a.put(4, doc, nil)
+	if a.held() != 1 {
+		t.Fatal("a document below the last seq taken was kept")
 	}
-	if d, _ := h.take(7); d != big {
-		t.Fatal("the handoff did not make room below the last seq taken")
+	if d, _ := a.take(5); d != doc || a.held() != 0 || budget.used.Load() != 0 {
+		t.Fatalf("take(5) = %v; %d held, %d bytes", d, a.held(), budget.used.Load())
 	}
-	h.put(7, big, nil)
-	if len(h.docs) != 0 || h.bytes != 0 {
-		t.Fatalf("left %d documents, %d bytes", len(h.docs), h.bytes)
+
+	big := &schema.Doc{ID: "big", Body: bytes.Repeat([]byte("x"), maxHandoffBytes/3)}
+	a.put(10, big, nil)
+	b.put(10, big, nil)
+	a.put(11, big, nil)
+	if a.held()+b.held() != 2 || budget.used.Load() > maxHandoffBytes {
+		t.Fatalf("held %d and %d, %d bytes: the node's budget does not bound them", a.held(), b.held(), budget.used.Load())
 	}
-	for seq := int64(10); seq < 20; seq++ {
-		h.put(seq, big, nil)
+	b.take(11)
+	a.put(11, big, nil)
+	if a.held() != 2 {
+		t.Fatal("bytes given back were not reused")
 	}
-	if h.bytes > maxHandoffBytes {
-		t.Fatalf("holds %d bytes, over %d", h.bytes, maxHandoffBytes)
+	a.clear()
+	if a.held() != 0 || budget.used.Load() != 0 {
+		t.Fatalf("after clear: %d held, %d bytes", a.held(), budget.used.Load())
+	}
+}
+
+// docHeap counts a document's fields and nested objects, not only its body.
+func TestDocHeapCountsFieldsAndObjects(t *testing.T) {
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{"t": schema.Text, "_v": schema.Nested, "_v.s": schema.Keyword}}
+	flat, _, err := schema.Analyze(m, "a", []byte(`{"t": "oak chair"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, _, err := schema.Analyze(m, "a", []byte(`{"t": "oak chair", "_v": [{"s": "l"}, {"s": "m"}, {"s": "s"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hf, hn := docHeap(&flat), docHeap(&nested); hf <= int64(len(flat.Body)) || hn < hf+3*(objectHeap+valueHeap) {
+		t.Fatalf("docHeap %d flat, %d with three objects", hf, hn)
 	}
 }

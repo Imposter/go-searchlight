@@ -122,6 +122,9 @@ type Options struct {
 // Options.Cluster set it hosts the copies the cluster gives it and reads the rest from
 // peers.
 type Single struct {
+	// handoffs bounds the documents every shard's handoff holds together.
+	handoffs handoffBudget
+
 	st         store.Store
 	records    store.RecordReader
 	cfg        config.Config
@@ -615,6 +618,7 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	for s := range state.settings.Shards {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
+		sl.analyzed.budget = &n.handoffs
 		sl.querySeq.Store(n.head.Load())
 		idx.shards = append(idx.shards, sl)
 	}
@@ -788,6 +792,7 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 		sl.host.Lock()
 		c := sl.local.Swap(nil)
 		sl.host.Unlock()
+		sl.analyzed.clear()
 		if c == nil {
 			continue
 		}

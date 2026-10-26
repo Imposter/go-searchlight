@@ -194,6 +194,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 	sl.unhostedAtNano.Store(n.clock.Now().UnixNano())
 	c.cancel()
 	<-c.done
+	sl.analyzed.clear()
 	var err error
 	if sh := c.shard(); sh != nil {
 		if mode == unhostClose {

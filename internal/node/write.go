@@ -66,6 +66,9 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if len(batch) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := n.admit(idx, batch); err != nil {
 			return nil, err
 		}
@@ -253,7 +256,10 @@ func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp
 	base := idx.meta.Load().mapping
 	reloaded := false
 	for range maxCatalogTries {
-		batch, working := n.analyzeOps(idx, ops, items, base, keepDocs)
+		batch, working, err := n.analyzeOps(ctx, idx, ops, items, base, keepDocs)
+		if err != nil {
+			return nil, err
+		}
 		if n.cl != nil && !reloaded && refused(items) {
 			reloaded = true
 			if changed, _ := n.reloadIfNewer(ctx, idx); changed {
@@ -264,7 +270,7 @@ func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp
 		if working == base {
 			return batch, nil
 		}
-		err := n.ensureFields(ctx, idx, added(base, working))
+		err = n.ensureFields(ctx, idx, added(base, working))
 		switch {
 		case err == nil:
 			return batch, nil
@@ -293,16 +299,20 @@ func refused(items []api.ItemResult) bool {
 }
 
 // analyzeOps prepares every op under base, returning the batch and base grown by the
-// documents' new dynamic fields. An upsert's body becomes its analyzed copy: the raw
+// documents' new dynamic fields. It stops with ctx's error once ctx ends (the client
+// went away): nothing is committed for a request it stops. An upsert's body becomes its analyzed copy: the raw
 // one is freed, and analyzing again (the mapping moved) reads the same document. Every
 // change carries the index incarnation the write means, so a write that races a drop
 // and recreate of the index is refused rather than landing in the new one.
-func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResult, base *schema.Mapping, keepDocs bool) ([]prepared, *schema.Mapping) {
+func (n *Single) analyzeOps(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, base *schema.Mapping, keepDocs bool) ([]prepared, *schema.Mapping, error) {
 	working := base
 	limit := n.maxIndexFields()
 	uid := idx.meta.Load().meta.UID
 	batch := make([]prepared, 0, len(ops))
 	for i := range ops {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		items[i] = api.ItemResult{}
 		p, m, err := n.prepareOp(idx, &ops[i], working, keepDocs)
 		if err != nil {
@@ -324,7 +334,7 @@ func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResul
 		working = m
 		batch = append(batch, p)
 	}
-	return batch, working
+	return batch, working, nil
 }
 
 // added lists the fields grown has that base lacks.

@@ -169,10 +169,12 @@ seq, which is at most `flush_interval` of changes.
 - **Work for a client that went away.** A write checks its context before each op it
   analyzes and before it commits, so a client that disconnects (its timeout) stops the
   attempt's work. The group committer drops a caller gone before its batch flushes and
-  cancels a transaction once every caller in it has gone. A request commits in one
-  transaction, so it is committed whole or not at all, and the client's retry is
-  idempotent: an attempt that committed makes the retry's upserts noops at their
-  stored seqs.
+  cancels a transaction once every caller in it has gone; a cancel that reaches a
+  transaction already in its commit does not stop it, so a request can commit after
+  its caller has been answered with the cancellation (a 499 nobody reads). A request
+  commits in one transaction, so it is committed whole or not at all, and the client's
+  retry is idempotent: an attempt that committed makes the retry's upserts noops at
+  their stored seqs.
 
 **Why the changelog keeps the body.** Each upsert writes its body twice, in its
 `sl_changes` row and in its `sl_documents` row, in the one statement of the commit

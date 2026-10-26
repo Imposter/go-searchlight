@@ -40,10 +40,12 @@ func (s *slowStore) Apply(ctx context.Context, batch []store.Change) (int64, int
 
 // The property: a _bulk whose client goes away at a random point (while the request is
 // read, analyzed, waiting for its group commit, committing, or percolating) leaves
-// either every one of its writes committed or none, and the client's retry of the same
-// bulk leaves every document written, with each item a noop exactly when the abandoned
-// attempt committed. So a client that times out and sends the bulk again gets the
-// state it asked for, whatever the server had done.
+// either every one of its writes committed or none, once its transaction has settled
+// (it may commit after the client has gone, when the cancel reaches it during its
+// commit), and the client's retry of the same bulk leaves every document written, with
+// each item a noop exactly when the abandoned attempt committed. So a client that times
+// out and sends the bulk again gets the state it asked for, whatever the server had
+// done.
 func TestAbandonedBulkIsAllOrNothing(t *testing.T) {
 	slow := &slowStore{}
 	e := newEnv(t, envOpts{node: func(o *node.Options) {
@@ -56,6 +58,7 @@ func TestAbandonedBulkIsAllOrNothing(t *testing.T) {
 	}})
 	e.createIndex("c", `{"mapping": {"fields": {"title": "text", "round": "number", "i": "number"}}, "settings": {"shards": 2}}`)
 	e.must(http.StatusOK, "PUT", "/indexes/c/queries/q", `{"query": {"field": "title", "op": "words_any", "value": ["chair"]}}`)
+	e.createIndex("barrier", `{"mapping": {"fields": {"n": "number"}}}`)
 	slow.delay.Store(int64(20 * time.Millisecond))
 	r := rand.New(rand.NewPCG(3, 5))
 	const docs = 120
@@ -84,6 +87,13 @@ func TestAbandonedBulkIsAllOrNothing(t *testing.T) {
 			_ = res.Body.Close()
 		}
 		cancel()
+		// Settle the abandoned bulk before reading the store. Its handler returns as soon
+		// as the client is gone, and by then its changes are either not handed to the
+		// group committer at all or handed over: the handler's Apply returns at once on
+		// the cancel, while the committer may still be committing the transaction that
+		// holds them (cancelled only if it has not reached its commit). The committer
+		// flushes one batch at a time, so a write sent through it afterwards answers
+		// only once that batch is settled, committed or dropped: the barrier.
 		deadline := time.Now().Add(10 * time.Second * time.Duration(testtier.RaceSlowdown))
 		for api.InflightWriteBytes(e.srv) != 0 {
 			if time.Now().After(deadline) {
@@ -91,6 +101,7 @@ func TestAbandonedBulkIsAllOrNothing(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
+		e.must(http.StatusOK, "PUT", "/indexes/barrier/docs/b", fmt.Sprintf(`{"n": %d}`, round))
 
 		rounds := map[float64]int{}
 		for s := range 2 {

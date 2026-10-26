@@ -207,6 +207,16 @@ func (p params) bool(name string) (bool, *Error) {
 }
 
 // waitForSeq reads wait_for_seq, a seq a write returned.
+// keepIdentical reads detect_noop (true by default): false writes an upsert of the
+// stored document's bytes rather than answering it as a noop.
+func (p params) keepIdentical() (bool, *Error) {
+	if _, given := p.values["detect_noop"]; !given {
+		return false, nil
+	}
+	detect, e := p.bool("detect_noop")
+	return !detect, e
+}
+
 func (p params) waitForSeq() (int64, *Error) {
 	return p.int("wait_for_seq", 0, 0, 1<<62)
 }

@@ -79,6 +79,8 @@ var (
 type storedBody struct {
 	plain string
 	z     []byte
+	// hash is a document body's BodyHash (0 for a saved query's payload).
+	hash int64
 }
 
 // size is the stored body's bytes.

@@ -187,10 +187,10 @@ func (s *Server) table() []*route {
 		{method: http.MethodPatch, path: "/indexes/{index}/mapping", scope: write, handler: s.patchMapping},
 		{method: http.MethodPatch, path: "/indexes/{index}/settings", scope: write, handler: s.patchSettings},
 
-		{method: http.MethodPut, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, docBody: true, handler: s.putDoc},
+		{method: http.MethodPut, path: "/indexes/{index}/docs/{id}", scope: write, params: append(slices.Clone(writeParams), "detect_noop"), docBody: true, handler: s.putDoc},
 		{method: http.MethodGet, path: "/indexes/{index}/docs/{id}", scope: read, params: wait, handler: s.getDoc},
 		{method: http.MethodDelete, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, handler: s.deleteDoc},
-		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "percolate_matches", "percolate_inner_hits", "wait_for_seq"}, handler: s.bulk},
+		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "percolate_matches", "percolate_inner_hits", "wait_for_seq", "detect_noop"}, handler: s.bulk},
 
 		{method: http.MethodPost, path: "/indexes/{index}/_search", scope: read, params: wait, queued: true, handler: s.search},
 		{method: http.MethodPost, path: "/indexes/{index}/_count", scope: read, params: wait, queued: true, handler: s.count},

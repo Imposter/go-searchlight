@@ -304,12 +304,17 @@ type WriteOptions struct {
 	// up to it searchable before percolating, so saved queries written up to it are
 	// seen.
 	WaitForSeq int64
+	// KeepIdentical (detect_noop=false) writes an unconditional upsert whose body is
+	// byte-identical to the stored document's, as releases before 1.6 did, rather than
+	// answering it as a noop (ItemResult.Unchanged).
+	KeepIdentical bool
 }
 
 // WriteResult is the outcome of a Write.
 type WriteResult struct {
-	// Seq is the newest seq the write committed, 0 when it committed nothing. Pass
-	// it as wait_for_seq to read the write back.
+	// Seq is the newest seq the write committed or found an unchanged document at
+	// (ItemResult.Unchanged), 0 when there is none. Pass it as wait_for_seq to read the
+	// write back.
 	Seq int64
 	// Items are the ops' outcomes, in order.
 	Items []ItemResult
@@ -328,11 +333,17 @@ type WriteResult struct {
 
 // ItemResult is one op's outcome.
 type ItemResult struct {
-	// Seq is the op's seq when it committed.
+	// Seq is the op's seq when it committed, or the stored document's when it was
+	// Unchanged.
 	Seq int64
-	// Noop is set when the op's Version was not above the stored one: nothing was
-	// written, and Seq is 0.
+	// Noop is set when nothing was written for the op: its Version was not above the
+	// stored one (Seq is 0), or it was Unchanged.
 	Noop bool
+	// Unchanged is set, with Noop, on an unconditional upsert whose body was
+	// byte-identical to the stored document's: nothing was analyzed, committed or
+	// indexed, Seq is the seq the stored document was written at, and a percolation
+	// reports the document's matches as for a write.
+	Unchanged bool
 	// Version is the op's Version, when it had one.
 	Version int64
 	// Err is why the op was refused (an *Error), nil when it committed.

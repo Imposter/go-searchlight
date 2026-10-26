@@ -790,6 +790,13 @@ func (f *faultStore) ListQueries(ctx context.Context, index, after string, limit
 	return f.Store.(store.RecordReader).ListQueries(ctx, index, after, limit, lean) //nolint:forcetypeassert,errcheck // every SQL store reads records
 }
 
+func (f *faultStore) DocumentHashes(ctx context.Context, index string, keys []store.DocKey) ([]store.DocHash, error) {
+	if f.isDown() {
+		return nil, errPartitioned
+	}
+	return f.Store.(store.RecordReader).DocumentHashes(ctx, index, keys) //nolint:forcetypeassert,errcheck // every SQL store reads records
+}
+
 // watchingFaultStore is a faultStore over a store that pushes notifications.
 type watchingFaultStore struct{ *faultStore }
 

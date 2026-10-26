@@ -7,12 +7,13 @@ import (
 // writeResponse answers a single document or saved-query write.
 type writeResponse struct {
 	ID string `json:"id"`
-	// Seq is the write's seq, omitted for a noop.
+	// Seq is the write's seq, omitted for a versioned noop; an unchanged document's
+	// (an upsert of its stored bytes) is its stored seq.
 	Seq int64 `json:"seq,omitempty"`
 	// Version is the write's client version, when it named one.
 	Version int64 `json:"version,omitempty"`
 	// Result is "noop" for a versioned write whose version was not above the stored
-	// one: nothing was written.
+	// one, or an upsert of the stored document's bytes: nothing was written.
 	Result string `json:"result,omitempty"`
 	// TimedOut is set when refresh=wait_for or refresh=true ran out of time: the
 	// write is committed but may not be searchable yet.
@@ -40,7 +41,11 @@ func (s *Server) singleWrite(w http.ResponseWriter, r *http.Request, p params, o
 			return InvalidAt("params.op_type", "op_type=create is for writes, not deletes")
 		}
 	}
-	res, err := s.c.Write(r.Context(), r.PathValue("index"), []WriteOp{op}, WriteOptions{Refresh: refresh})
+	keep, e := p.keepIdentical()
+	if e != nil {
+		return e
+	}
+	res, err := s.c.Write(r.Context(), r.PathValue("index"), []WriteOp{op}, WriteOptions{Refresh: refresh, KeepIdentical: keep})
 	if err != nil {
 		return err
 	}

@@ -57,40 +57,44 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	res = &api.WriteResult{Items: make([]api.ItemResult, len(ops))}
-	batch, err := n.prepareWrite(ctx, idx, ops, res.Items, opts.Percolate)
+	var unchanged []prepared
+	if !opts.KeepIdentical {
+		unchanged = n.unchangedOps(ctx, idx, ops, res.Items, opts.Percolate)
+	}
+	batch, err := n.prepareRest(ctx, idx, ops, res.Items, unchanged, opts.Percolate)
 	if err != nil {
 		return nil, err
 	}
-	if len(batch) == 0 {
+	if len(batch) > 0 {
+		if err := n.admit(idx, batch); err != nil {
+			return nil, err
+		}
+		if batch, err = n.commit(ctx, idx, batch, res.Items); err != nil {
+			return nil, err
+		}
+	}
+	if len(batch) == 0 && len(unchanged) == 0 {
 		res.Percolated = opts.Percolate
 		return res, nil
 	}
-	if err := n.admit(idx, batch); err != nil {
-		return nil, err
-	}
-	batch, err = n.commit(ctx, idx, batch, res.Items)
-	if err != nil {
-		return nil, err
-	}
-	if len(batch) == 0 {
-		res.Percolated = opts.Percolate
-		return res, nil
-	}
-	res.Seq = batch[len(batch)-1].change.Seq
-	span.SetAttributes(attribute.Int64("seq", res.Seq))
-
 	touched := map[int]bool{}
 	written := map[int]int64{}
 	for i := range batch {
 		touched[batch[i].change.Shard] = true
 		written[batch[i].change.Shard] = max(written[batch[i].change.Shard], batch[i].change.Seq)
+		res.Seq = max(res.Seq, batch[i].change.Seq)
 	}
-	for s := range touched {
+	for i := range unchanged {
+		touched[unchanged[i].change.Shard] = true
+		res.Seq = max(res.Seq, unchanged[i].change.Seq)
+	}
+	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
+	for s := range written {
 		if c := idx.shards[s].local.Load(); c != nil {
 			c.tailer.Wake()
 		}
 	}
-	if n.cl != nil {
+	if n.cl != nil && len(written) > 0 {
 		n.cl.Committed(idx.name, written)
 	}
 	if opts.Refresh != api.RefreshNone {
@@ -100,6 +104,9 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	if opts.Percolate {
+		if len(unchanged) > 0 {
+			batch = mergeByPos(batch, unchanged)
+		}
 		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -109,6 +116,124 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	return res, nil
+}
+
+// unchangedOps finds the upserts of ops whose body is byte-identical to the stored
+// document's (store.BodyHash, as its row keeps it) and answers each in its item as a
+// noop at the stored document's seq: nothing is analyzed, committed, indexed or logged
+// for it. It returns them, in ops' order, each with its shard and stored seq, and with
+// percolate its document analyzed for matching: a noop percolates as a write of the
+// same body would (re-percolating is exact, where results kept from the last write
+// would miss saved queries changed since, and at a handful of saved queries cheaper
+// than storing them).
+//
+// Only an unconditional upsert (no version, if_seq or create) of an id no other op of
+// the request names is a candidate: an op that conditions on the stored document, or
+// that another op of the request reorders with, goes the usual way. The hashes are read
+// at one instant, outside the commit's transaction: the document held those bytes then,
+// which is where the noop takes effect, within the request. A read that fails leaves
+// every op to commit (a write would fail the same way, and say so).
+func (n *Single) unchangedOps(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, withDocs bool) []prepared {
+	if n.records == nil || len(ops) == 0 {
+		return nil
+	}
+	seen := make(map[string]int, len(ops))
+	for i := range ops {
+		seen[ops[i].ID]++
+	}
+	var keys []store.DocKey
+	var at []int
+	for i := range ops {
+		op := &ops[i]
+		if op.Kind != api.OpUpsert || op.IfSeq != 0 || op.Version != 0 || seen[op.ID] != 1 || schema.ValidateID(op.ID) != nil {
+			continue
+		}
+		if limit := n.cfg.MaxDocBytes; limit > 0 && int64(len(op.Body)) > limit {
+			continue
+		}
+		keys = append(keys, store.DocKey{Shard: ShardFor(op.ID, len(idx.shards)), ID: op.ID})
+		at = append(at, i)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	hashes, err := n.records.DocumentHashes(ctx, idx.name, keys)
+	if err != nil {
+		if ctx.Err() == nil {
+			n.log.DebugContext(ctx, "reading body hashes failed; the upserts commit", slog.String(telemetry.KeyIndex, idx.name), slog.Any("error", err))
+		}
+		return nil
+	}
+	var out []prepared
+	var mapping *schema.Mapping
+	for k, h := range hashes {
+		i := at[k]
+		if !h.Known || h.Hash != store.BodyHash(ops[i].Body) {
+			continue
+		}
+		p := prepared{pos: i, change: store.Change{Index: idx.name, Shard: keys[k].Shard, ID: ops[i].ID, Kind: store.KindUpsert, Seq: h.Seq}}
+		if withDocs {
+			if mapping == nil {
+				mapping = idx.meta.Load().mapping
+			}
+			doc, _, err := schema.AnalyzeForMatch(mapping, ops[i].ID, ops[i].Body)
+			if err != nil {
+				continue
+			}
+			p.doc = &doc
+		}
+		items[i] = api.ItemResult{Seq: h.Seq, Noop: true, Unchanged: true}
+		out = append(out, p)
+	}
+	return out
+}
+
+// prepareRest is prepareWrite over the ops that unchanged (in ops' order) leaves.
+func (n *Single) prepareRest(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, unchanged []prepared, keepDocs bool) ([]prepared, error) {
+	if len(unchanged) == 0 {
+		return n.prepareWrite(ctx, idx, ops, items, keepDocs)
+	}
+	rest := make([]api.WriteOp, 0, len(ops)-len(unchanged))
+	pos := make([]int, 0, cap(rest))
+	for i, k := 0, 0; i < len(ops); i++ {
+		if k < len(unchanged) && unchanged[k].pos == i {
+			k++
+			continue
+		}
+		rest = append(rest, ops[i])
+		pos = append(pos, i)
+	}
+	if len(rest) == 0 {
+		return nil, nil
+	}
+	restItems := make([]api.ItemResult, len(rest))
+	batch, err := n.prepareWrite(ctx, idx, rest, restItems, keepDocs)
+	if err != nil {
+		return nil, err
+	}
+	for k := range rest {
+		items[pos[k]] = restItems[k]
+	}
+	for i := range batch {
+		batch[i].pos = pos[batch[i].pos]
+	}
+	return batch, nil
+}
+
+// mergeByPos merges two lists of prepared ops, each in request order, into one.
+func mergeByPos(a, b []prepared) []prepared {
+	out := make([]prepared, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		if j == len(b) || (i < len(a) && a[i].pos < b[j].pos) {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	return out
 }
 
 // prepareWrite validates and analyzes ops, storing an op refused on its own in its

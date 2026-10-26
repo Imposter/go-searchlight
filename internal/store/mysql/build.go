@@ -99,7 +99,7 @@ func escapedSize(args []any) int {
 // functions below.
 const (
 	changeColumns    = "seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce"
-	documentColumns  = "index_name, shard, id, body, body_z, seq, version"
+	documentColumns  = "index_name, shard, id, body, body_z, seq, version, body_hash, hash_seq"
 	queryColumns     = "index_name, shard, id, query, meta, seq, version"
 	tombstoneColumns = "index_name, shard, kind, id, version, at"
 )
@@ -114,10 +114,10 @@ func changeArgs(rows []dialect.ChangeRow) []any {
 }
 
 func documentArgs(rows []dialect.DocumentRow) []any {
-	args := make([]any, 0, len(rows)*7)
+	args := make([]any, 0, len(rows)*9)
 	for i := range rows {
 		r := &rows[i]
-		args = append(args, r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version)
+		args = append(args, r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version, r.BodyHash, r.Seq)
 	}
 	return args
 }

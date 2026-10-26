@@ -62,9 +62,9 @@ const writeSQL = `WITH changes AS (
 	INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce)
 	SELECT * FROM unnest($1::bigint[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::bytea[], $8::bigint[], $9::text[], $10::bigint[], $31::bigint[])
 ), documents AS (
-	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version)
-	SELECT * FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[], $32::bigint[])
-	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq, version = CASE WHEN EXCLUDED.version = 0 THEN sl_documents.version ELSE EXCLUDED.version END
+	INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version, body_hash, hash_seq)
+	SELECT r.*, r.seq FROM unnest($11::text[], $12::int[], $13::text[], $14::text[], $15::bytea[], $16::bigint[], $32::bigint[], $44::bigint[]) AS r (index_name, shard, id, body, body_z, seq, version, body_hash)
+	ON CONFLICT (index_name, shard, id) DO UPDATE SET body = EXCLUDED.body, body_z = EXCLUDED.body_z, seq = EXCLUDED.seq, version = CASE WHEN EXCLUDED.version = 0 THEN sl_documents.version ELSE EXCLUDED.version END, body_hash = EXCLUDED.body_hash, hash_seq = EXCLUDED.hash_seq
 ), queries AS (
 	INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version)
 	SELECT * FROM unnest($17::text[], $18::int[], $19::text[], $20::text[], $21::text[], $22::bigint[], $33::bigint[])
@@ -90,7 +90,7 @@ SELECT pg_notify('` + notifyChannel + `', payload) FROM unnest($30::text[]) AS p
 // limits is the engine's: one write statement carries at most 64 MB of
 // payload, well below the 1 GB a single array value (and a protocol message)
 // may hold. A batch beyond it is written in several statements of the same
-// text. Bind parameters never limit it: writeSQL always takes 43.
+// text. Bind parameters never limit it: writeSQL always takes 44.
 var limits = dialect.Limits{Bytes: 64 << 20}
 
 // write spells w in parts of about l.Bytes payload bytes: one, unless the
@@ -182,7 +182,7 @@ type writeArgs struct {
 	d                      keyColumns
 	dBody                  []string
 	dBodyZ                 [][]byte
-	dSeq, dVersion         []int64
+	dSeq, dVersion, dHash  []int64
 	q                      keyColumns
 	qQuery, qMeta          []string
 	qSeq, qVersion         []int64
@@ -213,6 +213,7 @@ func (a *writeArgs) documents(rows []dialect.DocumentRow) {
 		a.dBodyZ = append(a.dBodyZ, r.BodyZ)
 		a.dSeq = append(a.dSeq, r.Seq)
 		a.dVersion = append(a.dVersion, r.Version)
+		a.dHash = append(a.dHash, r.BodyHash)
 	}
 }
 
@@ -227,7 +228,7 @@ func (a *writeArgs) queries(rows []dialect.QueryRow) {
 	}
 }
 
-// args returns writeSQL's 43 arguments. Every array is non-nil: pgx sends a
+// args returns writeSQL's 44 arguments. Every array is non-nil: pgx sends a
 // nil slice as NULL, and unnest(NULL) is no rows too, but an empty array says
 // what is meant.
 func (a *writeArgs) args(counter int64, notify []string) []any {
@@ -244,6 +245,7 @@ func (a *writeArgs) args(counter int64, notify []string) []any {
 		strs(a.t.index), ints(a.t.shard), strs(a.t.kind), strs(a.t.id), ints64(a.t.version),
 		strs(a.tDel.index), ints(a.tDel.shard), strs(a.tDel.kind), strs(a.tDel.id),
 		ints64(a.t.at),
+		ints64(a.dHash),
 	}
 }
 
@@ -276,10 +278,11 @@ func ints64(s []int64) []int64 {
 }
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
-	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
-	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, dollar) },
-	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, dollar) },
+	GetDocument:    "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = $1 AND shard = $2 AND id = $3",
+	GetQuery:       "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = $1 AND shard = $2 AND id = $3",
+	QueryPage:      func(shards []int) string { return dialect.QueryPageSQL(shards, dollar) },
+	QueriesByID:    func(counts []int) string { return dialect.QueriesByIDSQL(counts, dollar) },
+	DocumentHashes: func(counts []int) string { return dialect.DocumentHashesSQL(counts, dollar) },
 }
 
 var registry = dialect.Registry{

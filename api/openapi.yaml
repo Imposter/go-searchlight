@@ -309,6 +309,7 @@ paths:
         - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
+        - $ref: "#/components/parameters/DetectNoop"
       requestBody:
         required: true
         content:
@@ -387,7 +388,10 @@ paths:
         document's item lists the saved queries it matches, as written: against
         every saved query committed through this node before the percolation, and
         every change up to `wait_for_seq` when it is given (a seq past the newest
-        committed one is a 400, before anything is written).
+        committed one is a 400, before anything is written). An unconditional upsert
+        whose body is byte-identical to the stored document's is a noop at the stored
+        document's seq (see `detect_noop`), and still lists its matching saved
+        queries.
       parameters:
         - $ref: "#/components/parameters/Refresh"
         - name: percolate
@@ -397,6 +401,7 @@ paths:
         - $ref: "#/components/parameters/PercolateMatches"
         - $ref: "#/components/parameters/PercolateInnerHits"
         - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/DetectNoop"
       requestBody:
         required: true
         content:
@@ -736,6 +741,11 @@ components:
       in: query
       description: create applies only if the target does not exist (409 otherwise).
       schema: { type: string, enum: [create, upsert, index] }
+    DetectNoop:
+      name: detect_noop
+      in: query
+      description: "true (the default) answers an unconditional upsert (no if_seq, op_type=create or version) whose body is byte-identical to the stored document's as a noop at the stored document's seq, without analyzing, committing or indexing it; false writes it, as releases before 1.6 did. On _bulk, an id named by more than one operation of the request always writes."
+      schema: { type: boolean }
     Refresh:
       name: refresh
       in: query
@@ -945,9 +955,9 @@ components:
       required: [id]
       properties:
         id: { type: string }
-        seq: { type: integer, description: "The seq the write committed; pass it as wait_for_seq. Absent for a noop." }
+        seq: { type: integer, description: "The seq the write committed; pass it as wait_for_seq. Absent for a versioned noop; for an unchanged upsert's noop, the seq the stored document was written at." }
         version: { type: integer, description: "The write's client version, when it named one." }
-        result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, and nothing was written." }
+        result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, or an unconditional upsert's body was byte-identical to the stored document's (unless detect_noop=false); nothing was written." }
         timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
     BulkResponse:
       type: object
@@ -955,7 +965,7 @@ components:
       required: [took_ms, seq, errors, timed_out, items]
       properties:
         took_ms: { type: integer }
-        seq: { type: integer, description: The newest seq the request committed (0 when none). }
+        seq: { type: integer, description: "The newest seq the request committed, or an unchanged upsert's noop found its document at (0 when none): pass it as wait_for_seq." }
         errors: { type: boolean }
         timed_out: { type: boolean }
         percolated:
@@ -977,7 +987,7 @@ components:
               status: { type: integer }
               seq: { type: integer }
               version: { type: integer, description: "The op's client version, when it named one." }
-              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one; nothing was written (and nothing percolated)." }
+              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written; seq is the stored document's, and with percolate=true queries and matches are reported as for a write)." }
               queries:
                 type: array
                 items: { type: string }

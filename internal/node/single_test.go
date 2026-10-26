@@ -708,6 +708,13 @@ func (s flakyStore) ListQueries(ctx context.Context, index, after string, limit 
 	return s.rr.ListQueries(ctx, index, after, limit, lean)
 }
 
+func (s flakyStore) DocumentHashes(ctx context.Context, index string, keys []store.DocKey) ([]store.DocHash, error) {
+	if s.down.Load() {
+		return nil, errUnreachable
+	}
+	return s.rr.DocumentHashes(ctx, index, keys)
+}
+
 // I5 (spec section 10): with the database unreachable, reads keep serving from the
 // copies marked stale, GET falls back to the copy, and readiness turns false after
 // max_lag; it all recovers with the database.

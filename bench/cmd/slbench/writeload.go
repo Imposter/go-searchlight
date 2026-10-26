@@ -120,12 +120,19 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			}
 		}()
 	}
+	var shards *shardSampler
+	if admin != "" {
+		shards = startShardSampler(ctx, admin)
+	}
 	res, err := c.run(ctx, wlRun{
 		n: n, bulk: *bulk, duration: *duration, writers: *writers, changed: *changed, readers: *readers,
 		readPause: *readPause, readParams: *readParams, staleness: *staleness, clientTimeout: *clientTimeout, percolate: *percolate, seed: *seed,
 	})
 	if err != nil {
 		return err
+	}
+	if shards != nil {
+		shards.stop(res)
 	}
 	res.print(stdout)
 	if *out != "" {
@@ -336,6 +343,15 @@ type wlResult struct {
 	ReadMaxMS    float64 `json:"read_max_ms"`
 	ReadErrors   int64   `json:"read_errors"`
 	ReadTimeouts int64   `json:"read_timeouts"`
+	// Segments and MergeBacklog are the node's (every shard's together), sampled every
+	// 2 s during the load: the largest and the last.
+	SegmentsMax     float64 `json:"segments_max"`
+	SegmentsLast    float64 `json:"segments_last"`
+	MergeBacklogMax float64 `json:"merge_backlog_max"`
+	MergeBacklogEnd float64 `json:"merge_backlog_last"`
+	Samples         int     `json:"shard_samples"`
+	// Series is every sample, [seconds into the load, segments, merge backlog].
+	Series [][3]float64 `json:"shard_series,omitempty"`
 }
 
 func (r *wlResult) print(w io.Writer) {
@@ -343,6 +359,95 @@ func (r *wlResult) print(w io.Writer) {
 		r.Docs, r.Seconds, r.DocsPerSec, r.Bulks, r.BulkP50MS, r.BulkP95MS, r.BulkMaxMS, r.Retries, r.Noops)
 	fmt.Fprintf(w, "reads:  %d, p50 %.1f ms, p95 %.1f ms, p99 %.1f ms, max %.0f ms; %d errors, %d over 10 s\n",
 		r.Reads, r.ReadP50MS, r.ReadP95MS, r.ReadP99MS, r.ReadMaxMS, r.ReadErrors, r.ReadTimeouts)
+	if r.Samples > 0 {
+		fmt.Fprintf(w, "shards: segments max %.0f, last %.0f; merge backlog max %.0f, last %.0f (%d samples)\n",
+			r.SegmentsMax, r.SegmentsLast, r.MergeBacklogMax, r.MergeBacklogEnd, r.Samples)
+	}
+}
+
+// shardSampler reads the node's segment count and merge backlog from its metrics every
+// 2 s.
+type shardSampler struct {
+	cancel                             context.CancelFunc
+	done                               chan struct{}
+	mu                                 sync.Mutex
+	segMax, segLast, backMax, backLast float64
+	n                                  int
+	series                             [][3]float64
+}
+
+func startShardSampler(ctx context.Context, admin string) *shardSampler {
+	ctx, cancel := context.WithCancel(ctx)
+	s := &shardSampler{cancel: cancel, done: make(chan struct{})}
+	began := time.Now()
+	go func() {
+		defer close(s.done)
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			seg, back, ok := scrapeShards(ctx, admin)
+			if !ok {
+				continue
+			}
+			s.mu.Lock()
+			s.segMax, s.segLast = max(s.segMax, seg), seg
+			s.backMax, s.backLast = max(s.backMax, back), back
+			s.n++
+			s.series = append(s.series, [3]float64{time.Since(began).Seconds(), seg, back})
+			s.mu.Unlock()
+		}
+	}()
+	return s
+}
+
+func (s *shardSampler) stop(r *wlResult) {
+	s.cancel()
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r.SegmentsMax, r.SegmentsLast, r.MergeBacklogMax, r.MergeBacklogEnd, r.Samples = s.segMax, s.segLast, s.backMax, s.backLast, s.n
+	r.Series = s.series
+}
+
+// scrapeShards sums searchlight_shard_segments and searchlight_shard_merge_backlog over
+// every shard in the node's Prometheus metrics.
+func scrapeShards(ctx context.Context, admin string) (segments, backlog float64, ok bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, admin+"/metrics", http.NoBody)
+	if err != nil {
+		return 0, 0, false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		var dst *float64
+		switch {
+		case strings.HasPrefix(line, "searchlight_shard_segments{"), strings.HasPrefix(line, "searchlight_shard_segments "):
+			dst = &segments
+		case strings.HasPrefix(line, "searchlight_shard_merge_backlog{"), strings.HasPrefix(line, "searchlight_shard_merge_backlog "):
+			dst = &backlog
+		default:
+			continue
+		}
+		fields := strings.Fields(line)
+		var v float64
+		if _, err := fmt.Sscan(fields[len(fields)-1], &v); err == nil {
+			*dst += v
+			ok = true
+		}
+	}
+	return segments, backlog, ok
 }
 
 // readTimeout is a reader's client timeout, as a dashboard's would be.

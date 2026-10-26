@@ -10,6 +10,13 @@ Write efficiency and read latency on small CPU budgets: unchanged documents are 
 abandoned bulks stop, each document is analyzed once on its node, searches go before
 background work, and counts and facets can accept a bounded staleness.
 
+On `slbench writeload` (one core, Postgres, 150k listings with nested variants, 500-document
+bulks percolated with matches and inner hits, two readers of counts and facets), with half
+of each bulk's documents unchanged, writes went from 2,517 to 3,991 documents a second (bulk
+p50 180 to 63 ms, p95 353 to 259 ms) and reads' p95 from 267 to 152 ms; with every document
+changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 ms with
+`max_staleness: 5s`.
+
 ### Added
 
 - **Unchanged documents are noops** ([docs/api.md](docs/api.md#documents)): an upsert

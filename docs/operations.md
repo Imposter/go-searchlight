@@ -376,7 +376,7 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
-| `background_share` | `0.25` under 4 cores (GOMAXPROCS), else `1` | the least share of the time background work keeps while searches run, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints (see [CPU](#cpu)). `1` gives searches no priority |
+| `background_share` | `0.25` at GOMAXPROCS 1, else `1` | the share of each 100 ms background work runs while searches occupy every processor, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints for the rest (see [CPU](#cpu)). `1` gives searches no priority |
 | `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
 | `max_body_bytes` | `16MiB` | largest request body (at most 32 MiB less 1 KiB) |
@@ -655,22 +655,37 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
   follow it.
 - **Merges** are further capped by `merge_budget` bytes per second, so a merge storm
   cannot starve searches of disk.
-- **Small CPU budgets** (a container with `cpus: 1`, GOMAXPROCS 1 to 3). Go shares the
-  processor between goroutines alike, so a count that needs 5 ms of CPU would queue
-  behind seconds of merging. With `background_share` below 1 (0.25 by default under 4
-  cores) a search marks its shard work as foreground, and background work (merges every
-  4,096 documents and before each chunk they write, refresh builds before each chunk,
-  the analysis of writes and of the changes a copy applies before each document, file
-  removal before each file) steps aside at its checkpoints: while searches run, time
-  goes in 100 ms cycles, background work pausing for the first `1 - background_share`
-  of each, or until the searches finish, and running the rest. Background work keeps
-  that share whatever the reads, so writes slow down under a heavy read load but are
-  never held off; their buffers fill and clients get 429s before anything is lost. With
-  4 cores or more searches find a core of their own, and the default is `1`.
+- **One core** (a container with `cpus: 1`, GOMAXPROCS 1). Go shares the processor
+  between goroutines alike, so a count that needs 5 ms of CPU would queue behind
+  seconds of merging. With `background_share` below 1 (0.25 by default at GOMAXPROCS 1)
+  a search marks its shard work as foreground, and background work (merges every 4,096
+  documents and before each chunk they write, refresh builds before each chunk, the
+  analysis of writes and of the changes a copy applies before each document, file
+  removal before each file) steps aside at its checkpoints while searches occupy every
+  processor: time goes in 100 ms cycles, background work pausing for the first
+  `1 - background_share` of each, or until a processor is free of searches, then
+  running the rest beside the searches. So under reads that never stop it gets about
+  half of `background_share` on one core (about an eighth of the CPU by default), and
+  all of it between reads. Writes slow down under a heavy read load but are never held
+  off for good: their buffers fill and clients get 429s before anything is lost. On
+  `slbench writeload` at one core (50k listings, three readers of counts and facets
+  every 20 ms), merges kept up: segments stayed between 4 and 14, and each burst of
+  merge backlog cleared within seconds. With 2 cores or more the default is `1`; set
+  `background_share` there and background work pauses only while as many searches run
+  as there are processors.
+- **What waits while background work steps aside.** A refresh pauses holding its
+  shard's refresh lock, and the janitor's loop pauses holding its drain lock, so under
+  a steady read load these take longer too: writes with `refresh=true` or
+  `refresh=wait_for`, closing a shard copy (it waits for the janitor's drain), and
+  freeing disk from merged-away segments and old sidecars. A merge pauses holding its
+  `merge_threads` tokens, so other shards' merges wait behind it.
 - **One analysis per write.** A write analyzes its documents once on the node that
   takes it, and hands them to that node's own copies of their shards, which apply them
   without analyzing the bodies again (`searchlight_replica_handed_off_total` counts
-  them). Copies on other nodes analyze the bodies from the changelog, as before.
+  them). The documents waiting for their copy take at most 64 MiB of heap per node (by
+  their fields and objects, not only their bodies); past it the copies analyze the
+  bodies themselves. Copies on other nodes analyze the bodies from the changelog, as
+  before, and a write analyzes in full only the documents it percolates or hands off.
 - **Unchanged documents cost one read.** An upsert of a document's stored bytes is a
   noop found by id from the body hash its row keeps, before anything is analyzed: a
   scraper that sends unchanged documents again, or a client's retry of a bulk that

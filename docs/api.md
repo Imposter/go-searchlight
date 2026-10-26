@@ -386,7 +386,14 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   document indexed again). A document written by a release before 1.6 has no hash
   until it is next written, and during a rolling upgrade a 1.5 node's write leaves the
   hash behind, which is then not trusted: such a document is written, never answered
-  as a noop from a stale hash. A noop writes nothing, so it is neither checked against
+  as a noop from a stale hash. **When it takes effect:** the hashes are read once, by
+  id, before the request analyzes or commits anything, outside its transaction, so a
+  noop takes effect at that read, not at the request's commit. A write of the same id
+  that another request commits after that read and before this request answers is
+  not undone: the document then holds the other request's body, as if this request's
+  upsert had committed first. Within one request the noops and the writes are not one
+  atomic step (the writes still commit together); send `detect_noop=false` for a bulk
+  whose upserts must all commit in its transaction. A noop writes nothing, so it is neither checked against
   the mapping again (a document stored before the index turned `dynamic: "strict"` is
   a noop where a write of it would be a 400) nor held back by write backpressure (a
   request of noops alone answers while its shards refuse writes with 429 or 503).
@@ -480,6 +487,15 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   - Past 1,000,000 matches, every document's together, `percolated` is false and
     `percolate_reason` is `too_many_matches`, with no item's `queries`. Percolate
     those documents in smaller requests.
+  - `percolated_seq`, with `percolated` true, is a seq every saved query committed at
+    or below which the documents were percolated against: the least, over the shards,
+    of the seq the copy percolating it held every change up to. A saved query written
+    after it may or may not have been seen. It is not `seq`: an unchanged document's
+    noop puts its stored seq, which can be far older, in `seq`, and a written
+    document's seq can be newer than the copies' last refresh. On a cluster, a shard
+    percolated by a copy on another node counts up to the seq the percolation asked of
+    it (`wait_for_seq`, or the newest saved query this node wrote to the shard), so pass
+    `wait_for_seq` there to raise it.
 - **`refresh`.** As on single-document writes.
 
 ## Search and count

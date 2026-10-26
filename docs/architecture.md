@@ -161,7 +161,11 @@ seq, which is at most `flush_interval` of changes.
   is that change's document (same id, same body bytes) and every field it holds,
   nested sub-fields included, is one the copy maps. Mappings only add fields and never
   retype one, so that document is then exactly the copy's own analysis; anything else
-  (another node's copies, a rebuild, a handoff past its 32 MiB) analyzes the body.
+  (another node's copies, a rebuild, a handoff past the node's 64 MiB) analyzes the
+  body. The handoff carries the writer's mapping, and the copy compares the type of
+  every field the document holds under both, so a value the writer left untyped on a
+  field mapped since, or a dotted member a later nested field claims, is analyzed
+  anew. A write analyzes in full only the documents it percolates or hands off.
 - **Work for a client that went away.** A write checks its context before each op it
   analyzes and before it commits, so a client that disconnects (its timeout) stops the
   attempt's work. The group committer drops a caller gone before its batch flushes and
@@ -398,12 +402,14 @@ priority without starving the rest: a shard search or fetch marks its work foreg
 (`prio.Foreground`), and background work calls `prio.Yield` at its checkpoints: a merge
 every 4,096 documents and before each chunk it writes (its I/O throttle), a refresh
 build before each chunk, the tailer's and a bulk's analysis before each document, the
-janitor before each file. While searches run, time is cut into 100 ms cycles;
-background work pauses for the first `1 - background_share` of a cycle, or until the
-searches finish, and runs the rest, so it keeps `background_share` of the time
-whatever the reads. The gate only delays goroutines at checkpoints, so what runs
-between two still runs whole. `background_share` is 0.25 below 4 cores and 1 (off)
-from 4.
+janitor's loop before each file. While searches occupy every processor (as many in
+progress as GOMAXPROCS), time is cut into 100 ms cycles; background work pauses for
+the first `1 - background_share` of a cycle, or until a processor is free of searches,
+and runs the rest beside the searches, so under reads that never stop it gets about
+half of `background_share` on one core. The gate only delays goroutines at
+checkpoints, so what runs between two still runs whole, and a pause holds whatever its
+goroutine holds: a refresh its shard's refresh lock, the janitor its drain lock, a
+merge its merge tokens. `background_share` is 0.25 at GOMAXPROCS 1 and 1 (off) from 2.
 
 ### Percolator
 

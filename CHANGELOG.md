@@ -19,20 +19,19 @@ changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 
 
 ### Added
 
-- **Unchanged documents are noops** ([docs/api.md](docs/api.md#documents)): an upsert
-  without `if_seq`, `create` or `version` whose body is byte for byte the stored
-  document's answers `"result": "noop"` with the stored document's `seq`, and is not
-  analyzed, committed, indexed or logged. In `_bulk` it applies item by item, to ids
-  only one operation of the request names, and under `percolate=true` the item still
-  lists its `queries` and `matches` (it is percolated as a write of the same body,
-  against the saved queries as they are now). The response's `seq` covers it, so
-  `wait_for_seq` reads it back. One batched read by id decides it, outside the commit's
-  transaction. `detect_noop=false` (`PUT .../docs/{id}` and `_bulk`) writes as before.
-  Schema migration 6 adds `body_hash` and `hash_seq` to `sl_documents` (nullable;
-  nothing is rewritten), a rolling upgrade: a document written by an older release has
-  no hash until it is written again, and 1.5 nodes keep working (their writes leave the
-  hash behind, which is then not trusted), but as with every migration a 1.5 binary
-  refuses to start once the first node has migrated, so finish the rollout
+- **`percolated_seq`** in a `_bulk?percolate=true` response
+  ([docs/api.md](docs/api.md#bulk)): every saved query committed at or below it was
+  percolated against (the least, over the shards, of the seq the copy percolating it
+  held every change up to). Use it, not `seq`, to tell which saved queries an answer
+  covers: `seq` now covers unchanged documents' stored seqs (below), which can be far
+  older than the percolation.
+- **`detect_noop`** (`PUT .../docs/{id}` and `_bulk`, `true` by default): see
+  unchanged documents under Changed. Schema migration 6 adds `body_hash` and
+  `hash_seq` to `sl_documents` for it (nullable; nothing is rewritten), a rolling
+  upgrade: a document written by an older release has no hash until it is written
+  again, and 1.5 nodes keep working (their writes leave the hash behind, which is then
+  not trusted), but as with every migration a 1.5 binary refuses to start once the
+  first node has migrated, so finish the rollout
   ([upgrade notes](docs/operations.md#upgrades-and-rolling-restarts)).
 - **`max_staleness` for counts and size-0 searches**
   ([docs/api.md](docs/api.md#search-and-count)): a duration (at most 1h) in the body of
@@ -43,20 +42,33 @@ changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 
   `wait_for_seq` and `request_cache: false` ignore it. It needs no wire level: a peer
   before 1.6 ignores it and answers with a current result.
 - **`background_share`** ([docs/operations.md](docs/operations.md#cpu)): on a node of
-  fewer than 4 cores, searches go before background work. A shard search marks its
-  work, and merges, refresh builds, write and apply analysis and file removal step
-  aside at their checkpoints for the first `1 - background_share` (0.75 by default) of
-  each 100 ms while searches run, keeping the rest. `1`, the default from 4 cores,
-  gives searches no priority.
+  one core (GOMAXPROCS 1), searches go before background work. A shard search marks
+  its work, and while searches occupy every processor, merges, refresh builds, write
+  and apply analysis and file removal step aside at their checkpoints for the first
+  `1 - background_share` (0.75 by default) of each 100 ms, and run the rest beside the
+  searches (so under reads that never stop, about half of `background_share` on one
+  core). `1`, the default from 2 cores, gives searches no priority.
 - **`slbench writeload`**: a sustained `_bulk` load (scrape-bot shaped listings with
   nested variants, percolated with matches and inner hits) and the counts and facet
-  searches beside it, on a node of its own GOMAXPROCS, with the write throughput and
-  the bulk and read latencies.
+  searches beside it, on a node of its own GOMAXPROCS, with the write throughput, the
+  bulk and read latencies, and the segments and merge backlog over the load.
 - `searchlight_replica_handed_off_total`, and `result="stale_hit"` on
   `searchlight_search_request_cache_lookups_total`.
 
 ### Changed
 
+- **Unchanged documents are noops by default** ([docs/api.md](docs/api.md#documents)):
+  an upsert without `if_seq`, `create` or `version` whose body is byte for byte the
+  stored document's answers `"result": "noop"` with the stored document's `seq`, and is
+  not analyzed, committed, indexed or logged. In `_bulk` it applies item by item, to
+  ids only one operation of the request names, and under `percolate=true` the item
+  still lists its `queries` and `matches` (it is percolated as a write of the same
+  body, against the saved queries as they are now). One batched read by id decides it,
+  before the request commits. **Compatibility:** such an upsert no longer gets a new
+  seq (nor re-indexes the document): its item's `seq` is the stored one, and the
+  response's `seq` covers it, so `wait_for_seq` still reads it back, but a client that
+  took `seq` as the seq the percolation saw should read `percolated_seq`.
+  `detect_noop=false` restores the old behaviour.
 - **A bulk whose client went away stops** before the next document it would analyze
   and before it commits; once committed, its percolation and refresh wait end too. It
   commits in one transaction, so whole or not at all, and the client's retry of the
@@ -65,8 +77,10 @@ changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 
 - **Each document is analyzed once per write on its node**: the node that takes a write
   hands its analyzed documents to its own copies of their shards, which apply them
   without analyzing the bodies again when the documents are their changes' and every
-  field they hold is mapped (dynamic true or strict). Other nodes' copies analyze the
-  bodies as before.
+  field they hold has the same type under the writer's mapping and theirs (dynamic
+  true or strict), at most 64 MiB of them per node at once. Other nodes' copies analyze
+  the bodies as before, and a write analyzes in full only the documents it percolates
+  or hands off.
 - **The request cache's memory is cut into 8 parts** under their own locks, each
   bounded by an eighth of `request_cache_size`; one result takes at most a sixteenth of
   it (an eighth before).

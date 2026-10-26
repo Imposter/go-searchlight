@@ -6,6 +6,8 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-26
+
 Write efficiency and read latency on small CPU budgets: unchanged documents are noops,
 abandoned bulks stop, each document is analyzed once on its node, searches go before
 background work, and counts and facets can accept a bounded staleness.
@@ -565,6 +567,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.6.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.6.0
 [1.5.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.5.0
 [1.4.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.4.0
 [1.3.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.3.0

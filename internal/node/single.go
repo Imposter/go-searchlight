@@ -208,6 +208,8 @@ type shardSlot struct {
 	host           sync.Mutex
 	local          atomic.Pointer[copyState]
 	unhostedAtNano atomic.Int64
+	// analyzed hands the documents writes on this node analyzed to its copy's tailer.
+	analyzed handoff
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.
@@ -688,7 +690,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
 	n.noteHead(sh.AppliedSeq())
-	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead}
+	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead, Analyzed: sl.analyzed.take}
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp

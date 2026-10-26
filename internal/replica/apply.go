@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -330,7 +331,7 @@ type failure struct {
 // convert analyzes items into shard changes, in order, each document under views[i]
 // (its mapping as analysisView makes it; dynamic[i] is the real mode). It returns the
 // changes before the first item that cannot be converted, and that failure.
-func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode) ([]shard.Change, *failure) {
+func (t *Tailer) convert(ctx context.Context, items []item, views []*schema.Mapping, dynamic []schema.DynamicMode) ([]shard.Change, *failure) {
 	out := make([]shard.Change, len(items))
 	docs := make([]int, 0, len(items))
 	limit := len(items)
@@ -364,7 +365,8 @@ func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema
 		out[i] = c
 	}
 	out = out[:limit]
-	analyzed := analyzeAll(items, views, dynamic, docs)
+	analyzed := t.handedOff(ctx, items, views, docs)
+	analyzeAll(items, views, dynamic, docs, analyzed)
 	unmapped := 0
 	for k, i := range docs {
 		a := &analyzed[k]
@@ -378,7 +380,7 @@ func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema
 	}
 	if unmapped > 0 {
 		if suppressed, ok := t.warn.allow(); ok {
-			t.log.Warn("documents hold fields their mapping does not map: the writer must add a dynamic field to the mapping before it commits a document with it",
+			t.log.WarnContext(ctx, "documents hold fields their mapping does not map: the writer must add a dynamic field to the mapping before it commits a document with it",
 				slog.Int("documents", unmapped), slog.Int("suppressed", suppressed))
 		}
 	}
@@ -389,12 +391,57 @@ type analysis struct {
 	doc      schema.Doc
 	unmapped bool
 	err      error
+	given    bool // handed off by the writer (Options.Analyzed), not analyzed here
 }
 
-// analyzeAll analyzes the documents items[docs[k]], in parallel.
-func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int) []analysis {
+// handedOff returns the analyses of the documents items[docs[k]] that Options.Analyzed
+// holds and that fit the copy (see it), the others left zero for analyzeAll.
+func (t *Tailer) handedOff(ctx context.Context, items []item, views []*schema.Mapping, docs []int) []analysis {
 	out := make([]analysis, len(docs))
+	if t.opts.Analyzed == nil {
+		return out
+	}
+	used := 0
+	for k, i := range docs {
+		d := t.opts.Analyzed(items[i].seq)
+		if d != nil && d.ID == items[i].id && bytes.Equal(d.Body, items[i].body) && fitsView(d, views[i]) {
+			out[k].doc, out[k].given = *d, true
+			used++
+		}
+	}
+	t.inst.handedOff.Add(ctx, int64(used), t.inst.attrs)
+	return out
+}
+
+// fitsView reports whether every field d holds, and every sub-field of its nested
+// objects, is one view maps: d's analysis is then the one analyzeDoc makes under view.
+func fitsView(d *schema.Doc, view *schema.Mapping) bool {
+	for name := range d.Fields {
+		if name == schema.IDField {
+			continue
+		}
+		if _, ok := view.Fields[name]; !ok {
+			return false
+		}
+		objects := d.Fields[name].Objects
+		for o := range objects {
+			for sub := range objects[o].Fields {
+				if _, ok := view.Fields[sub]; !ok {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// analyzeAll analyzes the documents items[docs[k]] into out[k], in parallel, but for
+// those handed off already.
+func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int, out []analysis) {
 	run := func(k int) {
+		if out[k].given {
+			return
+		}
 		i := docs[k]
 		out[k].doc, out[k].unmapped, out[k].err = analyzeDoc(views[i], dynamic[i], items[i].id, items[i].body)
 	}
@@ -403,7 +450,7 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 		for k := range docs {
 			run(k)
 		}
-		return out
+		return
 	}
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -421,7 +468,6 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 		}()
 	}
 	wg.Wait()
-	return out
 }
 
 func (t *Tailer) haltAt(it *item, reason string, err error) *HaltError {
@@ -477,7 +523,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 			return nil
 		}
 		run := items[runStart:end]
-		converted, fail := t.convert(run, views[runStart:end], dynamic[runStart:end])
+		converted, fail := t.convert(ctx, run, views[runStart:end], dynamic[runStart:end])
 		n, err := t.applyBatch(ctx, sh, converted, load)
 		if !load && n > 0 {
 			t.applied.Store(converted[n-1].Seq)

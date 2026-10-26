@@ -30,7 +30,11 @@ import (
 type prepared struct {
 	pos    int // the op's position in the request
 	change store.Change
-	doc    *schema.Doc // an upsert's analyzed document, for percolation
+	doc    *schema.Doc // an upsert's analyzed document, for percolation and the handoff
+	// whole is set when doc was analyzed under a mapping that types every field
+	// (dynamic true or strict), so it holds every field a copy indexes: only such a
+	// document is handed off to this node's copy.
+	whole bool
 }
 
 // Write implements [api.Coordinator]: see the package documentation. With percolation,
@@ -61,7 +65,8 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	if !opts.KeepIdentical {
 		unchanged = n.unchangedOps(ctx, idx, ops, res.Items, opts.Percolate)
 	}
-	batch, err := n.prepareRest(ctx, idx, ops, res.Items, unchanged, opts.Percolate)
+	handOff := handsOff(idx)
+	batch, err := n.prepareRest(ctx, idx, ops, res.Items, unchanged, opts.Percolate || handOff)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +97,14 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		res.Seq = max(res.Seq, unchanged[i].change.Seq)
 	}
 	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
+	if handOff {
+		for i := range batch {
+			sl := idx.shards[batch[i].change.Shard]
+			if batch[i].doc != nil && batch[i].whole && sl.local.Load() != nil {
+				sl.analyzed.put(batch[i].change.Seq, batch[i].doc)
+			}
+		}
+	}
 	for s := range written {
 		if c := idx.shards[s].local.Load(); c != nil {
 			c.tailer.Wake()
@@ -119,6 +132,23 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	return res, nil
+}
+
+// handsOff reports whether a write to idx analyzes its documents in full to hand them
+// to this node's copies (handoff): when the node hosts a copy of one of its shards,
+// and the index's mapping types new fields (not dynamic: false, under which a copy
+// marks a document's unmapped fields as the writer's analysis does not; prepared.whole
+// holds each document to that).
+func handsOff(idx *index) bool {
+	if m := idx.meta.Load().mapping; m == nil || m.Dynamic == schema.DynamicFalse {
+		return false
+	}
+	for _, sl := range idx.shards {
+		if sl.local.Load() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // unchangedOps finds the upserts of ops whose body is byte-identical to the stored
@@ -315,6 +345,7 @@ func (n *Single) analyzeOps(ctx context.Context, idx *index, ops []api.WriteOp, 
 		}
 		items[i] = api.ItemResult{}
 		p, m, err := n.prepareOp(idx, &ops[i], working, keepDocs)
+		p.whole = working.Dynamic != schema.DynamicFalse
 		if err != nil {
 			items[i].Err = err
 			continue

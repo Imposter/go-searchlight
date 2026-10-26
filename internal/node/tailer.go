@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 
 	"github.com/Imposter/go-searchlight/internal/replica"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -62,6 +63,9 @@ type TailerEnv struct {
 	// Rewound is called when the copy finds the changelog rewound under it (a
 	// failover that lost commits), with the changelog's head as the tailer read it.
 	Rewound func(head int64)
+	// Analyzed returns the document a write on this node analyzed for the upsert it
+	// committed at seq, nil when there is none (replica.Options.Analyzed).
+	Analyzed func(seq int64) *schema.Doc
 }
 
 // NewTailerFunc makes the tailer of one shard copy: the node's one seam for its

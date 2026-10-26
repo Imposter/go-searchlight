@@ -325,6 +325,13 @@ type WriteResult struct {
 	// document's Queries were filled. When it is not (a deadline passed waiting for
 	// WaitForSeq, a copy closed), the writes are committed all the same.
 	Percolated bool
+	// PercolatedSeq, when Percolated and documents were percolated, is a seq every saved
+	// query committed at or below which they were percolated against: the least, over
+	// the shards, of the seq the copy percolating it held every change up to. A saved
+	// query written after it may or may not have been seen. It is not Seq: a noop's
+	// Seq can be far older than the percolation, and a write's newer than a copy's
+	// refresh.
+	PercolatedSeq int64
 	// PercolateErr is why the percolation asked for did not finish, nil when it did:
 	// a passed deadline, a closed copy, too many matches. It is reported in the
 	// response, never as the write's error.

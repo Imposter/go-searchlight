@@ -80,11 +80,14 @@ func TestUnchangedUpsertPercolates(t *testing.T) {
 	path := "/indexes/np/_bulk?percolate=true&percolate_matches=true&percolate_inner_hits=true"
 	r := e.must(http.StatusOK, "POST", path, ndjson(`{"upsert": {"id": "d"}}`, doc))
 	written := bulkItems(t, r)[0]
-	e.must(http.StatusOK, "PUT", "/indexes/np/queries/large", `{"query": {"nested": {"path": "_v", "query": {"field": "_v.size", "op": "eq", "value": "l"}, "inner_hits": {}}}}`)
+	large := seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/np/queries/large", `{"query": {"nested": {"path": "_v", "query": {"field": "_v.size", "op": "eq", "value": "l"}, "inner_hits": {}}}}`))
 	r = e.must(http.StatusOK, "POST", path+"&refresh=wait_for", ndjson(`{"upsert": {"id": "d"}}`, doc))
 	it := bulkItems(t, r)[0]
 	if it["result"] != "noop" || it["seq"] != written["seq"] || r["percolated"] != true {
 		t.Fatalf("an unchanged percolated upsert = %v", r)
+	}
+	if ps, _ := r["percolated_seq"].(float64); int64(ps) < large || r["seq"] != written["seq"] {
+		t.Fatalf("percolated_seq %v, seq %v: want percolated_seq at least the saved query's %d, seq the noop's", r["percolated_seq"], r["seq"], large)
 	}
 	if got, _ := json.Marshal(it["queries"]); string(got) != `["acme","large"]` {
 		t.Fatalf("queries = %s, want acme and large", got)
@@ -93,8 +96,8 @@ func TestUnchangedUpsertPercolates(t *testing.T) {
 	if len(ms) != 2 {
 		t.Fatalf("matches = %v", it["matches"])
 	}
-	large, _ := ms[1].(map[string]any)
-	if hits, _ := json.Marshal(large["inner_hits"]); !strings.Contains(string(hits), `"offsets":[1]`) {
+	second, _ := ms[1].(map[string]any)
+	if hits, _ := json.Marshal(second["inner_hits"]); !strings.Contains(string(hits), `"offsets":[1]`) {
 		t.Fatalf("inner hits = %s, want offset 1", hits)
 	}
 }

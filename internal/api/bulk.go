@@ -57,8 +57,11 @@ type bulkResponse struct {
 	Percolated *bool `json:"percolated,omitempty"`
 	// PercolateReason is CodeTooManyMatches when Percolated is false because the
 	// documents match more than percolate.MaxMatches saved queries together.
-	PercolateReason string     `json:"percolate_reason,omitempty"`
-	Items           []bulkItem `json:"items"`
+	PercolateReason string `json:"percolate_reason,omitempty"`
+	// PercolatedSeq, with Percolated true, is a seq every saved query committed at or
+	// below which the documents were percolated against (WriteResult.PercolatedSeq).
+	PercolatedSeq int64      `json:"percolated_seq,omitempty"`
+	Items         []bulkItem `json:"items"`
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
@@ -130,6 +133,9 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	}
 	if perc {
 		out.Percolated = &res.Percolated
+		if res.Percolated {
+			out.PercolatedSeq = res.PercolatedSeq
+		}
 	}
 	id := info(r.Context()).id
 	for i := range ops {

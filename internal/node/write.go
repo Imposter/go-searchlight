@@ -795,6 +795,7 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 	if err != nil {
 		return err
 	}
+	res.PercolatedSeq = ts.seq()
 	for k, p := range pos {
 		res.Items[p].Queries = json.RawMessage(ids[k])
 		if matches != nil {

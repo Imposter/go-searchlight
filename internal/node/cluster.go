@@ -73,6 +73,9 @@ type ShardTarget interface {
 	// Stale reports whether the copy's reads are stale: it trails the changelog by
 	// more than max_lag, or its node cannot reach the database.
 	Stale() bool
+	// Seq is a seq every change up to which is in what the target answers from: this
+	// node's copy's generation's, or, for a copy elsewhere, the seq the read asked of it.
+	Seq() int64
 	// Release lets the copy drop the generation the read held.
 	Release()
 }

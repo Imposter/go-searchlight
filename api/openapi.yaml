@@ -976,6 +976,9 @@ components:
           type: string
           enum: [too_many_matches]
           description: Why percolated is false when the documents match more than 1000000 saved queries together; the writes stay committed.
+        percolated_seq:
+          type: integer
+          description: "With percolated true (and an upsert to percolate): a seq every saved query committed at or below which the documents were percolated against, the least over the shards of the seq the copy percolating it held every change up to. A saved query written after it may or may not have been seen. Use it, not seq, to tell which saved queries an answer covers: seq is the newest the request committed or an unchanged upsert's noop found its document at, which can be far older than the percolation."
         items:
           type: array
           items:

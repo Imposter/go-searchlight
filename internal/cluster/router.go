@@ -644,6 +644,9 @@ func (t *remoteTarget) GetQuery(ctx context.Context, id string) (*api.SavedQuery
 
 func (t *remoteTarget) Stale() bool { return t.stale }
 
+// Seq is the seq the read asked of the copy, which it answers with every change up to.
+func (t *remoteTarget) Seq() int64 { return t.waitSeq }
+
 // Release unpins the generation the fetch phase held, in the background: the pin
 // expires on its own if the call is lost.
 func (t *remoteTarget) Release() {

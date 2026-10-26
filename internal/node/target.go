@@ -78,6 +78,8 @@ func (t *localTarget) GetQuery(_ context.Context, id string) (*api.SavedQuery, b
 
 func (t *localTarget) Stale() bool { return t.stale }
 
+func (t *localTarget) Seq() int64 { return t.g.Seq() }
+
 func (t *localTarget) Release() { t.g.Release() }
 
 // fallbackTarget reads a copy elsewhere, and falls back to this node's own copy (stale,
@@ -158,6 +160,13 @@ func (f *fallbackTarget) Stale() bool {
 	return f.used.Stale()
 }
 
+func (f *fallbackTarget) Seq() int64 {
+	if f.used == nil {
+		return f.primary.Seq()
+	}
+	return f.used.Seq()
+}
+
 func (f *fallbackTarget) Release() {
 	if f.used != nil {
 		f.used.Release()
@@ -175,6 +184,18 @@ func isUnavailable(err error) bool {
 
 // targets are the read targets of one read, one per shard.
 type targets []ShardTarget
+
+// seq is the least of the targets' Seq: every change up to it is in what each answers
+// from (0 for none).
+func (ts targets) seq() int64 {
+	var out int64
+	for i, t := range ts {
+		if s := t.Seq(); i == 0 || s < out {
+			out = s
+		}
+	}
+	return out
+}
 
 func (ts targets) release() {
 	for _, t := range ts {

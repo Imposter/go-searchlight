@@ -468,6 +468,7 @@ paths:
               additionalProperties: false
               properties:
                 query: { $ref: "#/components/schemas/Query" }
+                max_staleness: { $ref: "#/components/schemas/MaxStaleness" }
       responses:
         "200":
           description: The count.
@@ -1103,6 +1104,21 @@ components:
           type: boolean
           default: true
           description: Whether a search with size 0 (a count, or aggregations only; no from or search_after) may be answered from, and stored in, each shard's request cache, as Elasticsearch's request_cache. A search with hits, or with date math reading now unrounded (now-7d; now-7d/d is cached), is never cached; a timed-out result is never stored.
+        max_staleness: { $ref: "#/components/schemas/MaxStaleness" }
+    MaxStaleness:
+      description: |
+        For a search with size 0 (a count, or aggregations only) whose request_cache is on: how
+        old a shard's cached result may be, as a duration ("5s", "1m") or milliseconds, at most
+        1h. Each shard may answer with its copy's newest result for the same search under the
+        same mapping computed within it, although the copy has refreshed writes since, rather
+        than search what it holds now: under continuous writes, counts and facets then compute
+        about once per max_staleness instead of at every refresh. The result may miss the
+        writes of the last max_staleness (beyond the refresh interval). 0, the default, asks
+        for a current result; wait_for_seq ignores it (read-your-writes). Peers before 1.6
+        ignore it and answer with a current result.
+      oneOf:
+        - type: string
+        - type: number
     SearchResponse:
       type: object
       additionalProperties: false

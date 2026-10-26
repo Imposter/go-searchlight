@@ -815,9 +815,13 @@ func TestRequestCacheTimeoutsCoverWaitsAndTheStore(t *testing.T) {
 	// The leader waits on the store, with no timeout; a waiter with one gives up.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		c.mu.Lock()
-		n := len(c.flights)
-		c.mu.Unlock()
+		n := 0
+		for i := range c.shards {
+			part := &c.shards[i]
+			part.mu.Lock()
+			n += len(part.flights)
+			part.mu.Unlock()
+		}
 		if n == 1 {
 			break
 		}
@@ -1010,5 +1014,103 @@ func TestCachedResultDecodeRefusesImpossibleBuckets(t *testing.T) {
 	empty := `{"total":0,"total_relation":"eq","aggs":{"p":{"type":"stats","stats":{"count":0,"sum":0,"min":9,"max":1}}}}`
 	if _, err := decodeCachedResult(encodeJSONValue(t, empty), 4096, req); err != nil {
 		t.Fatalf("empty stats, whose min and max mean nothing: %v", err)
+	}
+}
+
+// A search with max_staleness is answered with the copy's newest result for it computed
+// within that long, the writes refreshed since unseen; past it, or without it, the
+// copy's current contents are searched. A mapping change, a request_cache: false and
+// another search are never answered so, and the stale result itself stays cached.
+func TestRequestCacheMaxStaleness(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(40)
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20})
+	stale := parseReq(t, `{"size":0,"max_staleness":"1h","aggs":{"brands":{"terms":{"field":"brand"}}}}`)
+	fresh := parseReq(t, `{"size":0,"aggs":{"brands":{"terms":{"field":"brand"}}}}`)
+	if stale.MaxStaleness != time.Hour {
+		t.Fatalf("max_staleness parsed as %v", stale.MaxStaleness)
+	}
+	before := s.search(c, stale)
+	s.put("new", `{"brand":"zeta","price":1}`)
+	s.refresh()
+	if got := s.search(c, stale); !sameResult(t, got, before) {
+		t.Fatal("a search within its max_staleness was not answered with the cached result")
+	}
+	if st := c.Stats(); st.StaleHits != 1 || st.Hits != 1 || st.Misses != 1 {
+		t.Fatalf("stats %v, want one stale hit and one miss", st)
+	}
+	if got := s.search(c, fresh); got.Total != before.Total+1 {
+		t.Fatalf("a current search counted %d, want %d", got.Total, before.Total+1)
+	}
+	if got := s.search(c, stale); got.Total != before.Total+1 {
+		t.Fatalf("after a current result was cached, a stale search counted %d, want it", got.Total)
+	}
+
+	s.put("newer", `{"brand":"zeta","price":2}`)
+	s.refresh()
+	soon := parseReq(t, `{"size":0,"max_staleness":"1ms","aggs":{"brands":{"terms":{"field":"brand"}}}}`)
+	time.Sleep(5 * time.Millisecond)
+	if got := s.search(c, soon); got.Total != before.Total+2 {
+		t.Fatalf("past its max_staleness a search counted %d, want %d", got.Total, before.Total+2)
+	}
+	other := parseReq(t, `{"size":0,"max_staleness":"1h","aggs":{"tags":{"terms":{"field":"tags"}}}}`)
+	s.put("newest", `{"brand":"zeta","tags":["t1"]}`)
+	s.refresh()
+	if got := s.search(c, other); got.Total != before.Total+3 {
+		t.Fatalf("another search counted %d, want %d", got.Total, before.Total+3)
+	}
+	off := parseReq(t, `{"size":0,"max_staleness":"1h","request_cache":false,"aggs":{"brands":{"terms":{"field":"brand"}}}}`)
+	if got := s.search(c, off); got.Total != before.Total+3 {
+		t.Fatalf("request_cache false counted %d, want %d", got.Total, before.Total+3)
+	}
+
+	s.apply(shard.Change{Kind: shard.Remap, Mapping: testMapping, MappingVersion: 2})
+	s.put("remapped", `{"brand":"zeta"}`)
+	s.refresh()
+	if got := s.search(c, stale); got.Total != before.Total+4 {
+		t.Fatalf("after a mapping change a stale search counted %d, want %d", got.Total, before.Total+4)
+	}
+	for _, bad := range []string{`"2h"`, `"soon"`, `-1`} {
+		if _, ps := ParseRequest([]byte(`{"size":0,"max_staleness":` + bad + `}`)); len(ps) == 0 {
+			t.Fatalf("max_staleness %s parsed", bad)
+		}
+	}
+}
+
+// The memory cache's parts each hold their share of its bound: many searches of many
+// copies spread over them, the whole stays within the bound, and every search hits on
+// its second run.
+func TestRequestCachePartsShareTheBound(t *testing.T) {
+	copies := make([]*rcShard, 3)
+	for i := range copies {
+		copies[i] = newRCShard(t)
+		copies[i].fill(20)
+	}
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 4 << 20})
+	var reqs []*Request
+	for i := range 12 {
+		reqs = append(reqs, parseReq(t, fmt.Sprintf(`{"size":0,"query":{"field":"price","op":"gte","value":%d},"aggs":{"b":{"terms":{"field":"brand"}}}}`, i)))
+	}
+	for _, cp := range copies {
+		for _, r := range reqs {
+			cp.search(c, r)
+		}
+	}
+	used := 0
+	for i := range c.shards {
+		if c.shards[i].lru.Len() > 0 {
+			used++
+		}
+	}
+	if st := c.Stats(); st.Entries != len(copies)*len(reqs) || st.Bytes > 4<<20 || used < 2 {
+		t.Fatalf("stats %v over %d parts", st, used)
+	}
+	for _, cp := range copies {
+		for _, r := range reqs {
+			cp.search(c, r)
+		}
+	}
+	if st := c.Stats(); st.Hits != int64(len(copies)*len(reqs)) {
+		t.Fatalf("stats %v: the second run did not hit throughout", st)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"maps"
 	"runtime/debug"
@@ -42,9 +43,11 @@ import (
 // Two layers:
 //
 //   - The memory cache (L1), in process, keyed by the copy's own identity (the open
-//     copy, its generation and its mapping version): an LRU bounded by an estimate of
-//     the results' bytes. A copy's entries of an older generation are dropped as soon
-//     as an entry of a newer one is stored.
+//     copy, its generation and its mapping version): rcParts LRUs, each under its own
+//     lock and bounded by its part of an estimate of the results' bytes, an entry's
+//     shard chosen by its copy and request (so every generation's entry of one search
+//     of one copy lives in one shard). A copy's entries of an older generation in a
+//     shard are dropped as soon as an entry of a newer one is stored there.
 //   - An optional shared store (L2, [reqcache.Store]: Redis), keyed by the
 //     copy-independent identity (the index incarnation, shard, mapping version and the
 //     mark of the shard's newest change the copy holds, as
@@ -68,6 +71,15 @@ import (
 // cached (it timed out or failed) or their time runs out first. The time a search
 // spends waiting or reading the store counts against its timeout, and a store read
 // takes at most a tenth of what is left of it.
+//
+// Bounded staleness: a search that gives Request.MaxStaleness may be answered from the
+// copy's newest entry for the same search under the same mapping version although the
+// copy has refreshed since (an older generation's), when that entry's result was
+// computed no longer than MaxStaleness ago. Under continuous writes every refresh makes
+// a new generation, so without it a count or facet search rarely hits; with it, each
+// one computes at most about once per MaxStaleness. The result then misses the writes
+// of the last MaxStaleness at most (on top of the refresh interval every search
+// misses). It is the memory cache's alone: the shared store is keyed by content.
 //
 // Never cached: a search with hits (size above 0, or a from or search_after), a
 // request_cache: false one, one whose date math reads now unrounded (it resolves
@@ -131,15 +143,12 @@ type RequestCache struct {
 	version  string
 	log      *slog.Logger
 
-	mu      sync.Mutex
-	lru     list.List // of *rcEntry, most recent first
-	items   map[string]*list.Element
-	copies  map[uint64]*rcCopy
-	bytes   int64
-	flights map[string]*rcFlight
+	shards [rcParts]rcPart
+
+	closeMu sync.Mutex
 	closed  bool // no more store writes start
 
-	hits, misses, evictions                         atomic.Int64
+	hits, staleHits, misses, evictions              atomic.Int64
 	storeHits, storeMisses, storeErrors, storeSkips atomic.Int64
 	dropped                                         atomic.Int64
 
@@ -151,12 +160,39 @@ type RequestCache struct {
 	reg metric.Registration
 }
 
+// rcParts is how many parts (shards) the memory cache is cut into, each under its own lock:
+// concurrent searches of other copies or requests rarely wait for each other.
+const rcParts = 8
+
+// rcPart is one part of the memory cache, bounded by its share of the bytes.
+type rcPart struct {
+	mu      sync.Mutex
+	lru     list.List // of *rcEntry, most recent first
+	items   map[string]*list.Element
+	copies  map[uint64]*rcCopy
+	latest  map[rcLatest]*list.Element // each search's newest entry, for MaxStaleness
+	bytes   int64
+	flights map[string]*rcFlight
+}
+
+// rcLatest names one search of one copy whatever the generation: the copy and the
+// request's key.
+type rcLatest struct {
+	copy uint64
+	rk   string
+}
+
 // rcEntry is one memory cache entry.
 type rcEntry struct {
 	key   string
 	copy  uint64
 	res   *ShardResult
 	bytes int64
+	// latest is the search the entry answers, mapping its view's mapping version, and
+	// at when its computation began (a bound on how old its result is).
+	latest  rcLatest
+	mapping int64
+	at      time.Time
 	// shared is the shared-store key the result was last read or written under
 	// ("" for none): a hit under another one (the copy's contents became nameable
 	// after it was stored) writes it there too.
@@ -190,8 +226,9 @@ type rcFlight struct {
 // RequestCacheStats are a request cache's counters, and its memory cache's size.
 type RequestCacheStats struct {
 	// Hits and Misses count memory cache lookups (a search served by another's
-	// computation in flight is a hit).
-	Hits, Misses int64
+	// computation in flight is a hit); StaleHits the hits of an older generation's
+	// result within the search's MaxStaleness, which Hits counts too.
+	Hits, StaleHits, Misses int64
 	// Evictions counts memory entries dropped for room.
 	Evictions int64
 	// Bytes and Entries are the memory cache's size.
@@ -221,11 +258,12 @@ func NewRequestCache(o RequestCacheOptions) *RequestCache {
 		content:    o.ContentMark,
 		version:    o.Version,
 		log:        o.Logger,
-		items:      map[string]*list.Element{},
-		copies:     map[uint64]*rcCopy{},
-		flights:    map[string]*rcFlight{},
 		writeSlots: make(chan struct{}, requestCacheWrites),
 		warns:      &warnLimiter{interval: 10 * time.Second, last: map[string]time.Time{}, dropped: map[string]int{}},
+	}
+	for i := range c.shards {
+		sh := &c.shards[i]
+		sh.items, sh.copies, sh.latest, sh.flights = map[string]*list.Element{}, map[uint64]*rcCopy{}, map[rcLatest]*list.Element{}, map[string]*rcFlight{}
 	}
 	if o.Meter != nil {
 		c.in, c.reg = newRCInstruments(o.Meter, c)
@@ -239,10 +277,10 @@ func (c *RequestCache) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.mu.Lock()
+	c.closeMu.Lock()
 	already := c.closed
 	c.closed = true
-	c.mu.Unlock()
+	c.closeMu.Unlock()
 	if already {
 		return nil
 	}
@@ -261,23 +299,42 @@ func (c *RequestCache) Stats() RequestCacheStats {
 	if c == nil {
 		return RequestCacheStats{}
 	}
-	c.mu.Lock()
-	bytes, entries := c.bytes, c.lru.Len()
-	c.mu.Unlock()
+	bytes, entries := c.size()
 	return RequestCacheStats{
-		Hits: c.hits.Load(), Misses: c.misses.Load(), Evictions: c.evictions.Load(),
+		Hits: c.hits.Load(), StaleHits: c.staleHits.Load(), Misses: c.misses.Load(), Evictions: c.evictions.Load(),
 		Bytes: bytes, Entries: entries,
 		StoreHits: c.storeHits.Load(), StoreMisses: c.storeMisses.Load(), StoreErrors: c.storeErrors.Load(),
 		StoreSkips: c.storeSkips.Load(), DroppedWrites: c.dropped.Load(),
 	}
 }
 
+// size is the memory cache's bytes and entries, every shard's together.
+func (c *RequestCache) size() (bytes int64, entries int) {
+	for i := range c.shards {
+		sh := &c.shards[i]
+		sh.mu.Lock()
+		bytes += sh.bytes
+		entries += sh.lru.Len()
+		sh.mu.Unlock()
+	}
+	return bytes, entries
+}
+
+// shardFor is the memory cache shard of search rk of copy cp.
+func (c *RequestCache) shardFor(cp uint64, rk []byte) *rcPart {
+	h := fnv.New32a()
+	_, _ = h.Write(binary.AppendUvarint(nil, cp))
+	_, _ = h.Write(rk)
+	return &c.shards[h.Sum32()%rcParts]
+}
+
 // Search is [ExecuteShard] through the cache: a cacheable search (size 0, its
 // request cache not turned off) of g is answered from the cache when an identical
-// one of the same contents was, and its complete result is cached otherwise. The
-// caller holds g as ExecuteShard's does. The time spent waiting for another search's
-// result or reading the store counts against r.Timeout. The result's aggregations
-// may be shared with other searches: read them, never change them.
+// one of the same contents was, or, with r.MaxStaleness, of the same copy and mapping
+// at most that long ago; its complete result is cached otherwise. The caller holds g
+// as ExecuteShard's does. The time spent waiting for another search's result or
+// reading the store counts against r.Timeout. The result's aggregations may be shared
+// with other searches: read them, never change them.
 func (c *RequestCache) Search(ctx context.Context, g *shard.Generation, r *Request) (*ShardResult, error) {
 	if c == nil || g == nil || r == nil {
 		return ExecuteShard(ctx, g, r)
@@ -296,26 +353,41 @@ func (c *RequestCache) Search(ctx context.Context, g *shard.Generation, r *Reque
 	id := g.CacheIdentity()
 	key := memoryKey(id, rk)
 	shared := c.sharedKey(id, rk)
-	c.mu.Lock()
+	c.closeMu.Lock()
 	if c.closed {
 		shared = ""
 	}
-	if el, ok := c.items[key]; ok {
-		c.lru.MoveToFront(el)
+	c.closeMu.Unlock()
+	sh := c.shardFor(id.Copy, rk)
+	sh.mu.Lock()
+	if el, ok := sh.items[key]; ok {
+		sh.lru.MoveToFront(el)
 		e := el.Value.(*rcEntry) //nolint:forcetypeassert,errcheck // only entries
 		res, reshare := e.res, shared != "" && shared != e.shared
 		if reshare {
 			e.shared = shared
 		}
-		c.mu.Unlock()
+		sh.mu.Unlock()
 		c.countMemory(ctx, true)
 		if reshare {
 			c.storeSet(ctx, shared, res, r.Index)
 		}
 		return shareResult(res), nil
 	}
-	if f, ok := c.flights[key]; ok {
-		c.mu.Unlock()
+	if r.MaxStaleness > 0 {
+		if el, ok := sh.latest[rcLatest{copy: id.Copy, rk: string(rk)}]; ok {
+			e := el.Value.(*rcEntry) //nolint:forcetypeassert,errcheck // only entries
+			if e.mapping == id.MappingVersion && time.Since(e.at) <= r.MaxStaleness {
+				sh.lru.MoveToFront(el)
+				res := e.res
+				sh.mu.Unlock()
+				c.countStale(ctx)
+				return shareResult(res), nil
+			}
+		}
+	}
+	if f, ok := sh.flights[key]; ok {
+		sh.mu.Unlock()
 		select {
 		case <-f.done:
 			if f.res != nil {
@@ -328,19 +400,21 @@ func (c *RequestCache) Search(ctx context.Context, g *shard.Generation, r *Reque
 		return executeWithin(ctx, g, r, start)
 	}
 	f := &rcFlight{done: make(chan struct{})}
-	c.flights[key] = f
-	c.mu.Unlock()
+	sh.flights[key] = f
+	sh.mu.Unlock()
 	defer func() {
-		c.mu.Lock()
-		delete(c.flights, key)
-		c.mu.Unlock()
+		sh.mu.Lock()
+		delete(sh.flights, key)
+		sh.mu.Unlock()
 		close(f.done)
 	}()
 	c.countMemory(ctx, false)
 
+	entry := &rcEntry{key: key, copy: id.Copy, latest: rcLatest{copy: id.Copy, rk: string(rk)}, mapping: id.MappingVersion, at: start}
 	if shared != "" {
 		if res := c.storeGet(budget, shared, r); res != nil {
-			c.put(ctx, key, id, res, shared)
+			entry.res, entry.shared = res, shared
+			c.put(ctx, sh, id, entry)
 			f.res = res
 			return shareResult(res), nil
 		}
@@ -349,7 +423,8 @@ func (c *RequestCache) Search(ctx context.Context, g *shard.Generation, r *Reque
 	if err != nil || res == nil || res.TimedOut {
 		return res, err
 	}
-	c.put(ctx, key, id, res, shared)
+	entry.res, entry.shared = res, shared
+	c.put(ctx, sh, id, entry)
 	f.res = res
 	if shared != "" {
 		c.storeSet(ctx, shared, res, r.Index)
@@ -376,45 +451,47 @@ func shareResult(res *ShardResult) *ShardResult {
 	return &cp
 }
 
-// put stores res as key's entry, unless the memory cache is off, res is past an
-// eighth of it, or id's view is older than one the cache already holds of its copy.
-// An entry of a newer view drops the copy's older ones.
-func (c *RequestCache) put(ctx context.Context, key string, id shard.CacheIdentity, res *ShardResult, shared string) {
+// put stores e in sh, unless the memory cache is off, e is past half of sh's share of
+// it, or id's view is older than one sh already holds of its copy. An entry of a newer
+// view drops the copy's older ones in sh.
+func (c *RequestCache) put(ctx context.Context, sh *rcPart, id shard.CacheIdentity, e *rcEntry) {
 	if c.maxBytes <= 0 {
 		return
 	}
-	size := int64(len(key)) + resultBytes(res) + 128
-	if size > c.maxBytes/8 {
+	budget := c.maxBytes / rcParts
+	e.bytes = int64(len(e.key)) + resultBytes(e.res) + 128
+	if e.bytes > budget/2 {
 		return
 	}
 	view := rcView{gen: id.Gen, mapping: id.MappingVersion}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	cp := c.copies[id.Copy]
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	cp := sh.copies[id.Copy]
 	if cp != nil && view.before(cp.view) {
 		return
 	}
 	if cp != nil && cp.view != view {
 		for el := range cp.els {
-			c.unlink(el)
+			sh.unlink(el)
 		}
 		cp = nil
 	}
-	if el, ok := c.items[key]; ok {
-		c.unlink(el)
+	if el, ok := sh.items[e.key]; ok {
+		sh.unlink(el)
 	}
-	if cp == nil || c.copies[id.Copy] == nil {
+	if cp == nil || sh.copies[id.Copy] == nil {
 		if cp == nil {
 			cp = &rcCopy{view: view, els: map[*list.Element]struct{}{}}
 		}
-		c.copies[id.Copy] = cp
+		sh.copies[id.Copy] = cp
 	}
-	el := c.lru.PushFront(&rcEntry{key: key, copy: id.Copy, res: res, bytes: size, shared: shared})
-	c.items[key] = el
+	el := sh.lru.PushFront(e)
+	sh.items[e.key] = el
+	sh.latest[e.latest] = el
 	cp.els[el] = struct{}{}
-	c.bytes += size
-	for c.bytes > c.maxBytes && c.lru.Len() > 1 {
-		c.unlink(c.lru.Back())
+	sh.bytes += e.bytes
+	for sh.bytes > budget && sh.lru.Len() > 1 {
+		sh.unlink(sh.lru.Back())
 		c.evictions.Add(1)
 		if c.in != nil {
 			c.in.evictions.Add(ctx, 1)
@@ -422,17 +499,29 @@ func (c *RequestCache) put(ctx context.Context, key string, id shard.CacheIdenti
 	}
 }
 
-// unlink drops el; the caller holds c.mu.
-func (c *RequestCache) unlink(el *list.Element) {
+// unlink drops el; the caller holds sh.mu.
+func (sh *rcPart) unlink(el *list.Element) {
 	e := el.Value.(*rcEntry) //nolint:forcetypeassert,errcheck // only entries
-	c.lru.Remove(el)
-	delete(c.items, e.key)
-	c.bytes -= e.bytes
-	if cp := c.copies[e.copy]; cp != nil {
+	sh.lru.Remove(el)
+	delete(sh.items, e.key)
+	if sh.latest[e.latest] == el {
+		delete(sh.latest, e.latest)
+	}
+	sh.bytes -= e.bytes
+	if cp := sh.copies[e.copy]; cp != nil {
 		delete(cp.els, el)
 		if len(cp.els) == 0 {
-			delete(c.copies, e.copy)
+			delete(sh.copies, e.copy)
 		}
+	}
+}
+
+// countStale counts a hit of an older generation's result within MaxStaleness.
+func (c *RequestCache) countStale(ctx context.Context) {
+	c.hits.Add(1)
+	c.staleHits.Add(1)
+	if c.in != nil {
+		c.in.lookupResult(ctx, "memory", "stale_hit")
 	}
 }
 
@@ -538,21 +627,21 @@ func (c *RequestCache) skipStore(ctx context.Context) {
 // requestCacheWrites writes are in flight already.
 func (c *RequestCache) storeSet(ctx context.Context, key string, res *ShardResult, index string) {
 	ctx = context.WithoutCancel(ctx)
-	c.mu.Lock()
+	c.closeMu.Lock()
 	if c.closed {
-		c.mu.Unlock()
+		c.closeMu.Unlock()
 		c.drop(ctx, "closed")
 		return
 	}
 	select {
 	case c.writeSlots <- struct{}{}:
 	default:
-		c.mu.Unlock()
+		c.closeMu.Unlock()
 		c.drop(ctx, "busy")
 		return
 	}
 	c.writes.Add(1)
-	c.mu.Unlock()
+	c.closeMu.Unlock()
 	go func() {
 		defer func() {
 			<-c.writeSlots
@@ -985,9 +1074,7 @@ func newRCInstruments(m metric.Meter, c *RequestCache) (*rcInstruments, metric.R
 	breaker, _ := c.store.(interface{ Open() bool })
 	openAttrs := metric.WithAttributeSet(attribute.NewSet(attribute.String("store", storeName)))
 	reg, err := m.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		c.mu.Lock()
-		bytes, n := c.bytes, c.lru.Len()
-		c.mu.Unlock()
+		bytes, n := c.size()
 		o.ObserveFloat64(size, float64(bytes))
 		o.ObserveFloat64(entries, float64(n))
 		if breaker != nil {
@@ -1028,7 +1115,7 @@ func (in *rcInstruments) failed(ctx context.Context, store, op string) {
 
 // String renders the stats for logs and test failures.
 func (s RequestCacheStats) String() string {
-	return "hits=" + strconv.FormatInt(s.Hits, 10) + " misses=" + strconv.FormatInt(s.Misses, 10) +
+	return "hits=" + strconv.FormatInt(s.Hits, 10) + " stale_hits=" + strconv.FormatInt(s.StaleHits, 10) + " misses=" + strconv.FormatInt(s.Misses, 10) +
 		" evictions=" + strconv.FormatInt(s.Evictions, 10) + " bytes=" + strconv.FormatInt(s.Bytes, 10) +
 		" entries=" + strconv.Itoa(s.Entries) + " store_hits=" + strconv.FormatInt(s.StoreHits, 10) +
 		" store_misses=" + strconv.FormatInt(s.StoreMisses, 10) + " store_errors=" + strconv.FormatInt(s.StoreErrors, 10) +

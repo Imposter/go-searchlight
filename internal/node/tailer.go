@@ -64,8 +64,9 @@ type TailerEnv struct {
 	// failover that lost commits), with the changelog's head as the tailer read it.
 	Rewound func(head int64)
 	// Analyzed returns the document a write on this node analyzed for the upsert it
-	// committed at seq, nil when there is none (replica.Options.Analyzed).
-	Analyzed func(seq int64) *schema.Doc
+	// committed at seq, with the mapping it analyzed it under; nil when there is none
+	// (replica.Options.Analyzed).
+	Analyzed func(seq int64) (*schema.Doc, *schema.Mapping)
 }
 
 // NewTailerFunc makes the tailer of one shard copy: the node's one seam for its

@@ -87,14 +87,15 @@ func hoDoc(r *rand.Rand, names []string, mapped int, subs []string) string {
 // The property: a document a writer analyzed under its mapping (schema.Analyze, the
 // mapping then grown by its new fields, as a write commits it), when the writer's
 // mapping types every field (dynamic true or strict) and fitsView accepts it under a
-// copy's mapping at or after the write's, is exactly the document the copy's own
-// analysis of the committed body makes (analyzeDoc), with nothing unmapped. So a copy
+// copy's mapping at or after the write's (grown since by other writes, over fields the
+// document holds untyped or dotted members of it too), is exactly the document the
+// copy's own analysis of the committed body makes (analyzeDoc), with nothing unmapped. So a copy
 // applying the handed-off document indexes what it would have indexed itself. The
 // checks run over random mappings, documents with every kind of value under every
 // type, nested objects, fields added after the write, and NUL-named members.
 func TestHandedOffAnalysisIsTheCopys(t *testing.T) {
 	r := rand.New(rand.NewPCG(1, 2))
-	names := []string{"title", "brand", "price", "tags", "when", "flag", "x\x00y", "new1", "new2"}
+	names := []string{"title", "brand", "price", "tags", "when", "flag", "x\x00y", "new1", "new2", "dot.x"}
 	subs := []string{"size", "price", "color", "fresh"}
 	trials, accepted := testtier.Pick(3000, 30000), 0
 	for trial := range trials {
@@ -124,12 +125,28 @@ func TestHandedOffAnalysisIsTheCopys(t *testing.T) {
 				continue
 			}
 		}
+		// Mappings that grew after the write: an unrelated field, a field the document
+		// holds unmapped (a value no type was inferred from, such as {}), possibly as a
+		// nested field, and a nested field over one of its dotted members.
 		later := written.Clone()
 		if r.IntN(3) == 0 {
 			later.Fields["added_later"] = hoTypes[r.IntN(len(hoTypes))]
 		}
+		for _, n := range []string{"new1", "new2"} {
+			if _, ok := later.Fields[n]; !ok && r.IntN(3) == 0 {
+				if r.IntN(2) == 0 {
+					later.Fields[n] = schema.Nested
+				} else {
+					later.Fields[n] = hoTypes[r.IntN(len(hoTypes))]
+				}
+			}
+		}
+		if _, ok := later.Fields["dot.x"]; !ok && r.IntN(3) == 0 {
+			later.Fields["dot"] = schema.Nested
+			later.Fields["dot.x"] = schema.Keyword
+		}
 		view := analysisView(later)
-		if !fitsView(&doc, view) {
+		if !fitsView(&doc, written, view) {
 			continue
 		}
 		accepted++
@@ -185,7 +202,7 @@ func TestHandedOffDocumentsAreApplied(t *testing.T) {
 		reader := sdkmetric.NewManualReader()
 		opts := testOptions()
 		opts.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
-		opts.Analyzed = func(seq int64) *schema.Doc { return handed[seq] }
+		opts.Analyzed = func(seq int64) (*schema.Doc, *schema.Mapping) { return handed[seq], m }
 		sh := openShard(t, t.TempDir(), testShardOptions(id))
 		t.Cleanup(func() { _ = sh.Close(context.Background()) })
 		tl := NewTailer(st, sh, id, opts)

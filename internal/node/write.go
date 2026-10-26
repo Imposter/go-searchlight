@@ -32,9 +32,11 @@ type prepared struct {
 	pos    int // the op's position in the request
 	change store.Change
 	doc    *schema.Doc // an upsert's analyzed document, for percolation and the handoff
-	// whole is set when doc was analyzed under a mapping that types every field
-	// (dynamic true or strict), so it holds every field a copy indexes: only such a
-	// document is handed off to this node's copy.
+	// under is the mapping doc was analyzed under, grown by the fields it typed; whole
+	// is set when that mapping types every field (dynamic true or strict), so doc holds
+	// every field a copy indexes: only such a document is handed off to this node's
+	// copy, which checks its fields' types under both mappings.
+	under *schema.Mapping
 	whole bool
 }
 
@@ -102,7 +104,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		for i := range batch {
 			sl := idx.shards[batch[i].change.Shard]
 			if batch[i].doc != nil && batch[i].whole && sl.local.Load() != nil {
-				sl.analyzed.put(batch[i].change.Seq, batch[i].doc)
+				sl.analyzed.put(batch[i].change.Seq, batch[i].doc, batch[i].under)
 			}
 		}
 	}
@@ -349,7 +351,7 @@ func (n *Single) analyzeOps(ctx context.Context, idx *index, ops []api.WriteOp, 
 		}
 		items[i] = api.ItemResult{}
 		p, m, err := n.prepareOp(idx, &ops[i], working, keepDocs)
-		p.whole = working.Dynamic != schema.DynamicFalse
+		p.under, p.whole = m, working.Dynamic != schema.DynamicFalse
 		if err != nil {
 			items[i].Err = err
 			continue

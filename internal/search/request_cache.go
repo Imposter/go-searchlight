@@ -452,8 +452,10 @@ func shareResult(res *ShardResult) *ShardResult {
 }
 
 // put stores e in sh, unless the memory cache is off, e is past half of sh's share of
-// it, or id's view is older than one sh already holds of its copy. An entry of a newer
-// view drops the copy's older ones in sh.
+// it, or id's view is older than one sh already holds of its copy. It replaces its own
+// search's older result. An entry of a newer view drops the copy's older ones in sh,
+// but for those that are still their search's newest under the same mapping: they stay,
+// for MaxStaleness, until their search stores a newer result or the LRU drops them.
 func (c *RequestCache) put(ctx context.Context, sh *rcPart, id shard.CacheIdentity, e *rcEntry) {
 	if c.maxBytes <= 0 {
 		return
@@ -472,9 +474,17 @@ func (c *RequestCache) put(ctx context.Context, sh *rcPart, id shard.CacheIdenti
 	}
 	if cp != nil && cp.view != view {
 		for el := range cp.els {
+			old := el.Value.(*rcEntry) //nolint:forcetypeassert,errcheck // only entries
+			if old.mapping == view.mapping && sh.latest[old.latest] == el {
+				delete(cp.els, el)
+				continue
+			}
 			sh.unlink(el)
 		}
 		cp = nil
+	}
+	if el, ok := sh.latest[e.latest]; ok {
+		sh.unlink(el)
 	}
 	if el, ok := sh.items[e.key]; ok {
 		sh.unlink(el)
@@ -509,9 +519,11 @@ func (sh *rcPart) unlink(el *list.Element) {
 	}
 	sh.bytes -= e.bytes
 	if cp := sh.copies[e.copy]; cp != nil {
-		delete(cp.els, el)
-		if len(cp.els) == 0 {
-			delete(sh.copies, e.copy)
+		if _, member := cp.els[el]; member {
+			delete(cp.els, el)
+			if len(cp.els) == 0 {
+				delete(sh.copies, e.copy)
+			}
 		}
 	}
 }

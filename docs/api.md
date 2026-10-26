@@ -386,7 +386,10 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   document indexed again). A document written by a release before 1.6 has no hash
   until it is next written, and during a rolling upgrade a 1.5 node's write leaves the
   hash behind, which is then not trusted: such a document is written, never answered
-  as a noop from a stale hash.
+  as a noop from a stale hash. A noop writes nothing, so it is neither checked against
+  the mapping again (a document stored before the index turned `dynamic: "strict"` is
+  a noop where a write of it would be a 400) nor held back by write backpressure (a
+  request of noops alone answers while its shards refuse writes with 429 or 503).
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
 - **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
   is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the

@@ -1114,3 +1114,43 @@ func TestRequestCachePartsShareTheBound(t *testing.T) {
 		t.Fatalf("stats %v: the second run did not hit throughout", st)
 	}
 }
+
+// A search's stale-eligible result survives other searches of the same copy storing
+// newer generations' results in its part of the cache: each search computes about once
+// per max_staleness however many share a part.
+func TestRequestCacheStaleResultsShareAPart(t *testing.T) {
+	s := newRCShard(t)
+	s.fill(30)
+	c := NewRequestCache(RequestCacheOptions{MaxBytes: 8 << 20})
+	copyID := func() uint64 {
+		g := s.s.Acquire()
+		defer g.Release()
+		return g.CacheIdentity().Copy
+	}()
+	var a, b *Request
+	parts := map[*rcPart]*Request{}
+	for i := 0; a == nil; i++ {
+		r := parseReq(t, fmt.Sprintf(`{"size":0,"max_staleness":"1h","query":{"field":"price","op":"gte","value":%d}}`, i))
+		rk, _ := requestCacheKey(r)
+		part := c.shardFor(copyID, rk)
+		if prev, ok := parts[part]; ok {
+			a, b = prev, r
+		}
+		parts[part] = r
+	}
+	s.search(c, a)
+	s.search(c, b)
+	s.put("new", `{"brand":"zeta","price":99}`)
+	s.refresh()
+	fresh := *a
+	fresh.MaxStaleness = 0
+	s.search(c, &fresh)
+	before := c.Stats().StaleHits
+	s.search(c, b)
+	if got := c.Stats().StaleHits; got != before+1 {
+		t.Fatalf("stale hits %d, want %d: another search's newer result dropped this one's", got, before+1)
+	}
+	if st := c.Stats(); st.Entries != 2 {
+		t.Fatalf("stats %v: want one entry per search", st)
+	}
+}

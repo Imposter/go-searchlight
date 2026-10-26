@@ -25,24 +25,34 @@ const (
 // the handoff is full.
 type handoff struct {
 	mu    sync.Mutex
-	docs  map[int64]*schema.Doc
+	docs  map[int64]handedDoc
 	bytes int64
 	// taken is the highest seq a tailer asked for.
 	taken int64
 }
 
+// handedDoc is an analyzed document and the mapping it was analyzed under.
+type handedDoc struct {
+	doc   *schema.Doc
+	under *schema.Mapping
+}
+
 func docBytes(d *schema.Doc) int64 { return int64(len(d.Body)) * handoffAmplification }
 
-// put offers the document committed at seq; it is dropped when the handoff is full.
-func (h *handoff) put(seq int64, d *schema.Doc) {
+// put offers the document committed at seq, analyzed under mapping under; it is dropped
+// when the copy has asked for seq already, or the handoff is full.
+func (h *handoff) put(seq int64, d *schema.Doc, under *schema.Mapping) {
 	size := docBytes(d)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if seq <= h.taken {
+		return
+	}
 	if h.bytes+size > maxHandoffBytes {
 		for s, old := range h.docs {
 			if s <= h.taken {
 				delete(h.docs, s)
-				h.bytes -= docBytes(old)
+				h.bytes -= docBytes(old.doc)
 			}
 		}
 		if h.bytes+size > maxHandoffBytes {
@@ -50,25 +60,26 @@ func (h *handoff) put(seq int64, d *schema.Doc) {
 		}
 	}
 	if h.docs == nil {
-		h.docs = map[int64]*schema.Doc{}
+		h.docs = map[int64]handedDoc{}
 	}
 	if old, ok := h.docs[seq]; ok {
-		h.bytes -= docBytes(old)
+		h.bytes -= docBytes(old.doc)
 	}
-	h.docs[seq] = d
+	h.docs[seq] = handedDoc{doc: d, under: under}
 	h.bytes += size
 }
 
-// take returns and forgets the document committed at seq, nil when it has none.
-func (h *handoff) take(seq int64) *schema.Doc {
+// take returns and forgets the document committed at seq and the mapping it was
+// analyzed under, nil when it has none.
+func (h *handoff) take(seq int64) (*schema.Doc, *schema.Mapping) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.taken = max(h.taken, seq)
 	d, ok := h.docs[seq]
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	delete(h.docs, seq)
-	h.bytes -= docBytes(d)
-	return d
+	h.bytes -= docBytes(d.doc)
+	return d.doc, d.under
 }

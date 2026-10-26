@@ -404,8 +404,8 @@ func (t *Tailer) handedOff(ctx context.Context, items []item, views []*schema.Ma
 	}
 	used := 0
 	for k, i := range docs {
-		d := t.opts.Analyzed(items[i].seq)
-		if d != nil && d.ID == items[i].id && bytes.Equal(d.Body, items[i].body) && fitsView(d, views[i]) {
+		d, under := t.opts.Analyzed(items[i].seq)
+		if d != nil && under != nil && d.ID == items[i].id && bytes.Equal(d.Body, items[i].body) && fitsView(d, under, views[i]) {
 			out[k].doc, out[k].given = *d, true
 			used++
 		}
@@ -414,20 +414,31 @@ func (t *Tailer) handedOff(ctx context.Context, items []item, views []*schema.Ma
 	return out
 }
 
-// fitsView reports whether every field d holds, and every sub-field of its nested
-// objects, is one view maps: d's analysis is then the one analyzeDoc makes under view.
-func fitsView(d *schema.Doc, view *schema.Mapping) bool {
+// fitsView reports whether d, analyzed under mapping under, is the document analyzeDoc
+// makes of its body under view: every field d holds, and every sub-field of its nested
+// objects, has the same type in both (a value under typed nothing, such as {}, would
+// be analyzed by view's type of it), and no top-level field of d is a sub-field's name
+// in view (a member view passes over). Members d does not hold are null, or passed over
+// by under, and so by view too: mappings only add fields and never retype one.
+func fitsView(d *schema.Doc, under, view *schema.Mapping) bool {
+	same := func(name string) bool {
+		t, ok := under.Fields[name]
+		return ok && view.Fields[name] == t
+	}
 	for name := range d.Fields {
 		if name == schema.IDField {
 			continue
 		}
-		if _, ok := view.Fields[name]; !ok {
+		if !same(name) {
+			return false
+		}
+		if _, sub := view.NestedPath(name); sub {
 			return false
 		}
 		objects := d.Fields[name].Objects
 		for o := range objects {
 			for sub := range objects[o].Fields {
-				if _, ok := view.Fields[sub]; !ok {
+				if !same(sub) {
 					return false
 				}
 			}

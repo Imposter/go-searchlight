@@ -11,11 +11,14 @@
 //   - Background work calls [Gate.Yield] at its checkpoints: a merge every few thousand
 //     documents and before each chunk it writes, a tailer's analysis before each
 //     document, a bulk's analysis before each operation, the janitor before each file.
-//     Yield returns at once while no search runs.
-//   - While searches run, time is cut into cycles of [Period]: background work pauses
-//     for the first (1 - share) of a cycle, or until the searches have all finished,
-//     whichever comes first, and runs the rest. So background work keeps at least share
-//     of the time whatever the reads, and a write load cannot be held off for good: its
+//     Yield returns at once unless searches occupy every processor (as many in progress
+//     as GOMAXPROCS): with a processor to spare, a search needs no priority.
+//   - While they do, time is cut into cycles of [Period]: background work pauses for the
+//     first (1 - share) of a cycle, or until a processor is free of searches again,
+//     whichever comes first, and runs the rest, then sharing the processors with the
+//     searches as Go shares them. So under searches that never stop, background work
+//     gets about share of a cycle's run part only: about half of share on one core,
+//     where it runs beside a search. A write load cannot be held off for good: its
 //     buffers would fill and its clients be refused (429).
 //
 // The gate decides nothing alone: it only delays background goroutines at their
@@ -35,21 +38,19 @@ import (
 // Period is the length of one cycle of pause and run while searches are in progress.
 const Period = 100 * time.Millisecond
 
-// DefaultShare is the background share on a node of fewer than SmallCPUs cores. Off
-// (1) with more: there, searches find a core of their own.
+// DefaultShare is the background share on a node of one core (GOMAXPROCS 1). Off (1)
+// with more: there, a search finds a core of its own as often as not, and pausing
+// background work for it would mostly hold writes back.
 const DefaultShare = 0.25
-
-// SmallCPUs is the core count from which background work no longer yields by default.
-const SmallCPUs = 4
 
 // MinShare is the least share a gate takes: background work is never held off longer
 // than nineteen parts in twenty.
 const MinShare = 0.05
 
-// Default returns the share a node uses when none is configured: DefaultShare with
-// fewer than SmallCPUs cores (GOMAXPROCS), 1 (no yielding) otherwise.
+// Default returns the share a node uses when none is configured: DefaultShare on one
+// core (GOMAXPROCS 1), 1 (no yielding) on more.
 func Default() float64 {
-	if runtime.GOMAXPROCS(0) < SmallCPUs {
+	if runtime.GOMAXPROCS(0) == 1 {
 		return DefaultShare
 	}
 	return 1
@@ -60,11 +61,13 @@ func Default() float64 {
 type Gate struct {
 	share float64
 	clock clock.Clock
+	// busy is how many searches occupy every processor (GOMAXPROCS when made).
+	busy int64
 
 	active atomic.Int64 // searches in progress
 
 	mu         sync.Mutex
-	idle       chan struct{} // closed when active falls to 0; nil while it is 0
+	idle       chan struct{} // closed when active falls below busy; nil while it is
 	pauseUntil time.Time     // the current cycle's pause ends
 	runUntil   time.Time     // the current cycle ends
 }
@@ -75,7 +78,7 @@ func New(share float64, clk clock.Clock) *Gate {
 	if clk == nil {
 		clk = clock.Real{}
 	}
-	return &Gate{share: min(max(share, MinShare), 1), clock: clk}
+	return &Gate{share: min(max(share, MinShare), 1), clock: clk, busy: int64(max(1, runtime.GOMAXPROCS(0)))}
 }
 
 // Share is the background share of g's cycles (1 for a nil gate).
@@ -93,7 +96,7 @@ func (g *Gate) Foreground() (done func()) {
 		return func() {}
 	}
 	g.mu.Lock()
-	if g.active.Add(1) == 1 {
+	if g.active.Add(1) == g.busy {
 		g.idle = make(chan struct{})
 	}
 	g.mu.Unlock()
@@ -101,7 +104,7 @@ func (g *Gate) Foreground() (done func()) {
 	return func() {
 		once.Do(func() {
 			g.mu.Lock()
-			if g.active.Add(-1) == 0 {
+			if g.active.Add(-1) == g.busy-1 {
 				close(g.idle)
 				g.idle = nil
 			}
@@ -118,9 +121,9 @@ func (g *Gate) Active() int64 {
 	return g.active.Load()
 }
 
-// Yield is a background checkpoint: while searches run and the current cycle is in its
-// pause, it waits until the pause ends, the searches all finish, or ctx ends (whose
-// error it returns). It returns at once otherwise.
+// Yield is a background checkpoint: while searches occupy every processor and the
+// current cycle is in its pause, it waits until the pause ends, a processor is free of
+// searches, or ctx ends (whose error it returns). It returns at once otherwise.
 func (g *Gate) Yield(ctx context.Context) error {
 	if g.yield(ctx.Done()) {
 		return ctx.Err()
@@ -134,7 +137,7 @@ func (g *Gate) Step() { g.yield(nil) }
 
 // yield waits as Yield does, ending early when done closes, and reports whether it did.
 func (g *Gate) yield(done <-chan struct{}) bool {
-	if g == nil || g.share >= 1 || g.active.Load() == 0 {
+	if g == nil || g.share >= 1 || g.active.Load() < g.busy {
 		return false
 	}
 	g.mu.Lock()

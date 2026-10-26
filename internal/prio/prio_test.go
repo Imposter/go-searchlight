@@ -63,6 +63,7 @@ func TestYieldPausesForSearches(t *testing.T) {
 	ctx := context.Background()
 	fake := clock.NewFake(time.Unix(0, 0))
 	g := New(0.25, fake)
+	g.busy = 1 // one processor: one search occupies it
 	pause := time.Duration(0.75 * float64(Period))
 
 	search := g.Foreground()
@@ -118,4 +119,25 @@ func TestForegroundDoneOnce(t *testing.T) {
 	if New(0, nil).Share() != MinShare || New(3, nil).Share() != 1 {
 		t.Fatal("shares are not clamped")
 	}
+}
+
+// On two processors one search leaves a processor to spare, so background work does not
+// wait for it; two do, and it pauses until one of them finishes.
+func TestYieldWaitsOnlyWhileSearchesFillEveryProcessor(t *testing.T) {
+	ctx := context.Background()
+	fake := clock.NewFake(time.Unix(0, 0))
+	g := New(0.25, fake)
+	g.busy = 2
+	first := g.Foreground()
+	if err := returned(t, yielded(ctx, g)); err != nil {
+		t.Fatal(err)
+	}
+	second := g.Foreground()
+	waiting := yielded(ctx, g)
+	notReturned(t, waiting)
+	first()
+	if err := returned(t, waiting); err != nil {
+		t.Fatal(err)
+	}
+	second()
 }

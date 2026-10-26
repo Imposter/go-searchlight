@@ -65,6 +65,10 @@ type BuildOptions struct {
 	// ([schema.Value.Untyped]), so a reader can trust [Reader.Untyped] to list exactly
 	// them ([Reader.MarksUntyped]).
 	MarksUntyped bool
+	// Throttle, when set, is called as [MergeOptions.Throttle] is while the segment is
+	// written: with each chunk's size before it is written, never from two goroutines
+	// at once. An error from it stops Build, which removes its temp files.
+	Throttle func(n int) error
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -159,7 +163,16 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, img, opts.Threads, nil, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
+	var throttle func(int) error
+	if opts.Throttle != nil {
+		var mu sync.Mutex
+		throttle = func(n int) error {
+			mu.Lock()
+			defer mu.Unlock()
+			return opts.Throttle(n)
+		}
+	}
+	meta, err := writeSegmentParts(path, img, opts.Threads, throttle, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}

@@ -23,7 +23,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 		got = append(got, n)
 	}
 	slices.Sort(got)
-	want := make([]int, 43)
+	want := make([]int, 44)
 	for i := range want {
 		want[i] = i + 1
 	}
@@ -32,7 +32,7 @@ func TestWriteSQLPlaceholders(t *testing.T) {
 	}
 	w := &dialect.Write{Counter: 7}
 	st := write(w, limits)
-	if len(st) != 1 || len(st[0].Args) != 43 {
+	if len(st) != 1 || len(st[0].Args) != 44 {
 		t.Fatalf("an empty write: %d statements, %d args", len(st), len(st[0].Args))
 	}
 	for i, a := range st[0].Args {

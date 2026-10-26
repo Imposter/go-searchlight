@@ -32,7 +32,8 @@ type bulkItem struct {
 	Status int    `json:"status"`
 	Seq    int64  `json:"seq,omitempty"`
 	// Version is the op's client version, when it named one; Result is "noop" when it
-	// was not above the stored one.
+	// was not above the stored one, or when an upsert's body was byte-identical to the
+	// stored document's (Seq is then the stored document's).
 	Version int64  `json:"version,omitempty"`
 	Result  string `json:"result,omitempty"`
 	// Queries are the upserted document's matching saved queries, with
@@ -56,8 +57,11 @@ type bulkResponse struct {
 	Percolated *bool `json:"percolated,omitempty"`
 	// PercolateReason is CodeTooManyMatches when Percolated is false because the
 	// documents match more than percolate.MaxMatches saved queries together.
-	PercolateReason string     `json:"percolate_reason,omitempty"`
-	Items           []bulkItem `json:"items"`
+	PercolateReason string `json:"percolate_reason,omitempty"`
+	// PercolatedSeq, with Percolated true, is a seq every saved query committed at or
+	// below which the documents were percolated against (WriteResult.PercolatedSeq).
+	PercolatedSeq int64      `json:"percolated_seq,omitempty"`
+	Items         []bulkItem `json:"items"`
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
@@ -72,7 +76,9 @@ type bulkResponse struct {
 //
 // A version (Elasticsearch's external versioning) makes an op apply only when it is
 // higher than the stored one; otherwise its item's result is noop, and nothing is
-// written for it.
+// written for it. An unconditional upsert whose body is byte-identical to the stored
+// document's is a noop too, at the stored document's seq, unless detect_noop=false;
+// with percolate=true it still reports the document's matching saved queries.
 //
 // Every op commits in one transaction. An op refused on its own (an invalid document,
 // a failed if_seq) is reported in its item, with errors set, and the rest commit; a
@@ -92,6 +98,10 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if e != nil {
 		return e
 	}
+	keep, e := p.keepIdentical()
+	if e != nil {
+		return e
+	}
 	withMatches, innerHits, release, e := s.percolateDetails(p)
 	if e != nil {
 		return e
@@ -104,7 +114,9 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitForSeq: wait})
+	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{
+		Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitForSeq: wait, KeepIdentical: keep,
+	})
 	if err != nil {
 		return err
 	}
@@ -121,6 +133,9 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	}
 	if perc {
 		out.Percolated = &res.Percolated
+		if res.Percolated {
+			out.PercolatedSeq = res.PercolatedSeq
+		}
 	}
 	id := info(r.Context()).id
 	for i := range ops {
@@ -133,7 +148,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 			pe := ProblemFor(it.Err)
 			item.Status, item.Seq, item.Error = pe.Status, 0, problemBody(pe, id)
 			out.Errors = true
-		} else if perc && res.Percolated && ops[i].Kind == OpUpsert && !it.Noop {
+		} else if perc && res.Percolated && ops[i].Kind == OpUpsert && (!it.Noop || it.Unchanged) {
 			q := it.Queries
 			if len(q) == 0 {
 				q = json.RawMessage(emptyArray)

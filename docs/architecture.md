@@ -61,6 +61,7 @@ flowchart LR
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
 | `internal/telemetry` | slog JSON logs with trace ids, OpenTelemetry traces and metrics, Prometheus, pprof |
 | `internal/heapfloor` | Keeps the garbage collector from running while the heap is under `gc_heap_floor`: segments are mapped, so the live heap is small |
+| `internal/prio` | The node's priority of searches over background work on a small CPU budget: searches mark their shard work, and merges, refresh builds, analysis and file removal step aside at their checkpoints |
 | `internal/clock` | The engine's source of time: every timer, ticker, sleep and elapsed-time reading goes through an injected `clock.Clock`, `clock.Real` in production and `clock.Fake` in tests |
 
 Packages depend one way: `cmd → api, cluster → node → replica → shard → segment`, with
@@ -137,6 +138,56 @@ There is no per-node translog: the SQL changelog is the write-ahead log, so noth
 copy publishes needs to be durable on the copy first. After a crash, a copy reopens the
 segments of its last flushed manifest and replays the changelog from that manifest's
 seq, which is at most `flush_interval` of changes.
+
+### What a write does not do twice
+
+- **Unchanged documents.** Before step 1, the unconditional upserts of a write (no
+  version, `if_seq` or create) whose ids no other op of the request names are looked up
+  by id in one statement, outside any transaction: each document row keeps the hash of
+  its stored body (`body_hash`, the first 8 bytes of its SHA-256) with the seq that
+  stored it (`hash_seq`). An upsert whose body hashes as the stored one is answered as a
+  noop at the stored seq, and is neither analyzed, committed nor indexed. The read is a
+  committed state the request saw, so that is where the noop takes effect; it writes
+  nothing, so it needs no lock. Only an id named once is a candidate, because two ops of
+  one id must apply in order. A node from before body hashes moves `seq` on without
+  touching them, so a hash is trusted only while `hash_seq` is `seq`. With
+  percolation, a noop is percolated as the write of its body would be: the saved
+  queries may have changed since it was stored, so keeping each document's last results
+  would be wrong as well as larger.
+- **One analysis per write.** The coordinating node analyzes each upserted document
+  once (step 1) and, when it hosts a copy of the document's shard and the mapping types
+  every field (dynamic true or strict), hands the analyzed document to that copy by
+  seq. Its tailer applies it in place of analyzing the committed body (step 4) when it
+  is that change's document (same id, same body bytes) and every field it holds,
+  nested sub-fields included, is one the copy maps. Mappings only add fields and never
+  retype one, so that document is then exactly the copy's own analysis; anything else
+  (another node's copies, a rebuild, a handoff past the node's 64 MiB) analyzes the
+  body. The handoff carries the writer's mapping, and the copy compares the type of
+  every field the document holds under both, so a value the writer left untyped on a
+  field mapped since, or a dotted member a later nested field claims, is analyzed
+  anew. A write analyzes in full only the documents it percolates or hands off.
+- **Work for a client that went away.** A write checks its context before each op it
+  analyzes and before it commits, so a client that disconnects (its timeout) stops the
+  attempt's work. The group committer drops a caller gone before its batch flushes and
+  cancels a transaction once every caller in it has gone. A request commits in one
+  transaction, so it is committed whole or not at all, and the client's retry is
+  idempotent: an attempt that committed makes the retry's upserts noops at their
+  stored seqs.
+
+**Why the changelog keeps the body.** Each upsert writes its body twice, in its
+`sl_changes` row and in its `sl_documents` row, in the one statement of the commit
+(encoded once). The changelog cannot keep a reference to the document row instead:
+that row holds only the newest version of the document, so a tailer applying change
+`s` of a document rewritten at `s' > s` (or deleted) would find another body or none.
+It would then either skip `s`, leaving a copy that reports `s` applied without the
+write a client waits for with `wait_for_seq=s`, or apply `s'`'s body early, leaving a
+copy whose state at `s` never existed and whose per-document seqs (`_seq`) and halts
+point at the wrong change; recovery replays the changelog from a snapshot's seq and
+would hit the same. Keeping a hash in the changelog in place of the body has the same
+problem. The cost of the second copy is the database's (its WAL and storage, the time
+the counter lock is held), not Searchlight's CPU: on a one-core node writing to
+Postgres (slbench writeload, 150k listings), the whole commit is about 4% of the
+node's CPU, against 20% for analysis (before it was done once) and 28% for merges.
 
 ### Shards and segments
 
@@ -311,11 +362,16 @@ data_dir/
    - The rest become residual checks over doc values: `contains` behind a trigram
      prefilter, `similar` behind trigram candidates, and ranges served by points.
    - A search with `size` 0 first asks the shard request cache
-     ([`request_cache.go`](../internal/search/request_cache.go)): an LRU in memory
+     ([`request_cache.go`](../internal/search/request_cache.go)): LRUs in memory (8
+     parts under their own locks, an entry's part chosen by its copy and request)
      keyed by the copy's generation, then, when one is configured, a Redis shared by
      every copy and node, keyed by the shard's newest change the copy holds (as its
      changelog poll checked it). A complete result is stored in both, a timed-out one
-     in neither.
+     in neither. A search that gives `max_staleness` may be answered from the copy's
+     newest memory entry for it under the same mapping although the copy has
+     refreshed since, when that entry was computed within `max_staleness`: under
+     continuous writes counts and facets then compute about once per
+     `max_staleness`, not at every refresh.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
    - A box leaf is collected from its field's k-d tree, exactly: no residual check.
@@ -337,6 +393,23 @@ data_dir/
    preferring another copy, up to three times within the request's deadline and what
    is left of its `timeout`, and the shards' results are reduced again; only the
    shards run again are fetched again.
+
+### Searches before background work
+
+On one core, Go shares the processor between a search and a merge alike, so a count
+needing milliseconds waited behind seconds of merging. Package `prio` gives searches
+priority without starving the rest: a shard search or fetch marks its work foreground
+(`prio.Foreground`), and background work calls `prio.Yield` at its checkpoints: a merge
+every 4,096 documents and before each chunk it writes (its I/O throttle), a refresh
+build before each chunk, the tailer's and a bulk's analysis before each document, the
+janitor's loop before each file. While searches occupy every processor (as many in
+progress as GOMAXPROCS), time is cut into 100 ms cycles; background work pauses for
+the first `1 - background_share` of a cycle, or until a processor is free of searches,
+and runs the rest beside the searches, so under reads that never stop it gets about
+half of `background_share` on one core. The gate only delays goroutines at
+checkpoints, so what runs between two still runs whole, and a pause holds whatever its
+goroutine holds: a refresh its shard's refresh lock, the janitor its drain lock, a
+merge its merge tokens. `background_share` is 0.25 at GOMAXPROCS 1 and 1 (off) from 2.
 
 ### Percolator
 

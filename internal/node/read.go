@@ -163,6 +163,9 @@ func (n *Single) Search(ctx context.Context, name string, r *search.Request, opt
 		return nil, api.Invalid("the query is invalid", problems...)
 	}
 	r.Index = name
+	if opts.WaitForSeq > 0 {
+		r.MaxStaleness = 0 // read-your-writes: a cached result from before the write would not show it
+	}
 	fields, inner := r.Fields, search.HasInnerHits(r)
 	if inner {
 		wide := *r

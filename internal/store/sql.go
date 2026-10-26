@@ -391,6 +391,7 @@ func (p *prepared) prepareOne(i int, c *Change, compress bool) error {
 			return err
 		}
 		p.payload[i] = encodeBody(c.Payload, compress)
+		p.payload[i].hash = BodyHash(c.Payload)
 	case KindQueryUpsert:
 		if err := validJSON("payload", c.Payload); err != nil {
 			return err
@@ -841,7 +842,9 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 		seq := first + int64(i)
 		switch c.Kind {
 		case KindUpsert:
-			w.Documents = append(w.Documents, dialect.DocumentRow{Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i].plain, BodyZ: p.payload[i].z, Seq: seq, Version: c.Version})
+			w.Documents = append(w.Documents, dialect.DocumentRow{
+				Index: c.Index, Shard: c.Shard, ID: c.ID, Body: p.payload[i].plain, BodyZ: p.payload[i].z, Seq: seq, Version: c.Version, BodyHash: p.payload[i].hash,
+			})
 		case KindQueryUpsert:
 			w.Queries = append(w.Queries, dialect.QueryRow{
 				Index: c.Index, Shard: c.Shard, ID: c.ID, Query: string(p.query[i].Query), Meta: string(p.query[i].Meta), Seq: seq, Version: c.Version,

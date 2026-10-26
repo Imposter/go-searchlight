@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -438,6 +439,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	if g == nil || r == nil {
 		return nil, errNoGeneration
 	}
+	defer prio.Foreground()()
 	start := time.Now()
 	tr := otel.Tracer(telemetry.ScopeName)
 	ctx, span := tr.Start(ctx, "search.shard", trace.WithAttributes(
@@ -772,6 +774,7 @@ var ErrStaleHit = errors.New("search: the hit's segment is not in this generatio
 // passed deadline does not, so a search that timed out still gets the bodies of the
 // hits it found.
 func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []string) error {
+	defer prio.Foreground()()
 	_, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.fetch", trace.WithAttributes(attribute.Int("hits", len(hits))))
 	defer span.End()
 	segs := make(map[string]*segment.Reader, len(g.Segments))

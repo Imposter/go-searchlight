@@ -3,7 +3,9 @@ package store
 import (
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -24,6 +26,106 @@ type RecordReader interface {
 	// record holds its id, shard, seq and version alone, and the queries' trees and
 	// meta are never read.
 	ListQueries(ctx context.Context, index, after string, limit int, lean bool) ([]Record, error)
+	// DocumentHashes reads the stored documents of index named by keys: for each key,
+	// in order, the document's seq and its body's BodyHash, with Known false when the
+	// document does not exist or its row holds no hash of its current version (a row a
+	// release before body hashes wrote). It reads at one instant, outside any
+	// transaction: what it returns was the committed state when it ran.
+	DocumentHashes(ctx context.Context, index string, keys []DocKey) ([]DocHash, error)
+}
+
+// DocKey names one document of an index: its shard and id.
+type DocKey struct {
+	Shard int
+	ID    string
+}
+
+// DocHash is a stored document's seq and body hash ([RecordReader.DocumentHashes]).
+type DocHash struct {
+	Seq   int64
+	Hash  int64
+	Known bool
+}
+
+// BodyHash is the hash a document body is stored with: the first 8 bytes of its
+// SHA-256, as an int64. Equal bodies hash alike, and two bodies that differ hash alike
+// with odds of 2^-64 by chance, and only with a second preimage of SHA-256's prefix by
+// design.
+func BodyHash(body []byte) int64 {
+	sum := sha256.Sum256(body)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // the hash's bits, not a quantity
+}
+
+// hashesPerStatement bounds one DocumentHashes statement's ids, within every engine's
+// bind parameter limit (SQLite's 32,766 is the least).
+const hashesPerStatement = 1000
+
+func (s *sqlStore) DocumentHashes(ctx context.Context, index string, keys []DocKey) (out []DocHash, err error) {
+	ctx, end := s.start(ctx, "document_hashes", attribute.String("index", index), attribute.Int("documents", len(keys)))
+	defer end(&err)
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
+	if err := validKey("index name", index, MaxIndexName); err != nil {
+		return nil, err
+	}
+	out = make([]DocHash, len(keys))
+	at := make(map[DocKey][]int, len(keys))
+	for i, k := range keys {
+		if err := validShard(ShardID{Index: index, Shard: k.Shard}); err != nil {
+			return nil, err
+		}
+		if err := validKey("id", k.ID, MaxID); err != nil {
+			return nil, err
+		}
+		at[k] = append(at[k], i)
+	}
+	for start := 0; start < len(keys); start += hashesPerStatement {
+		part := keys[start:min(start+hashesPerStatement, len(keys))]
+		byShard := map[int][]string{}
+		var order []int
+		for _, k := range part {
+			if _, ok := byShard[k.Shard]; !ok {
+				order = append(order, k.Shard)
+			}
+			byShard[k.Shard] = append(byShard[k.Shard], k.ID)
+		}
+		counts := make([]int, len(order))
+		args := make([]any, 0, 1+len(order)+len(part))
+		args = append(args, index)
+		for i, sh := range order {
+			counts[i] = len(byShard[sh])
+			args = append(args, sh)
+			for _, id := range byShard[sh] {
+				args = append(args, id)
+			}
+		}
+		if err := s.readHashes(ctx, s.d.Records.DocumentHashes(counts), args, at, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// readHashes runs one DocumentHashes statement, filling out at each row's key.
+func (s *sqlStore) readHashes(ctx context.Context, q string, args []any, at map[DocKey][]int, out []DocHash) error {
+	rows, err := s.r.QueryContext(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k DocKey
+		var seq int64
+		var hash, hashSeq sql.NullInt64
+		if err := rows.Scan(&k.Shard, &k.ID, &seq, &hash, &hashSeq); err != nil {
+			return err
+		}
+		for _, i := range at[k] {
+			out[i] = DocHash{Seq: seq, Hash: hash.Int64, Known: hash.Valid && hashSeq.Valid && hashSeq.Int64 == seq}
+		}
+	}
+	return rows.Err()
 }
 
 var _ RecordReader = (*sqlStore)(nil)

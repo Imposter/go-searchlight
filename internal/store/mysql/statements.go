@@ -53,8 +53,8 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 	out := values("insert changes", "INSERT INTO sl_changes ("+changeColumns+") VALUES ", "",
 		11, l, changeArgs(w.Changes))
 	out = append(out, values("upsert documents", "INSERT INTO sl_documents ("+documentColumns+") VALUES ",
-		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq, version = IF(new.version = 0, sl_documents.version, new.version)",
-		7, l, documentArgs(w.Documents))...)
+		" AS new ON DUPLICATE KEY UPDATE body = new.body, body_z = new.body_z, seq = new.seq, version = IF(new.version = 0, sl_documents.version, new.version), body_hash = new.body_hash, hash_seq = new.hash_seq",
+		9, l, documentArgs(w.Documents))...)
 	out = append(out, values("upsert queries", "INSERT INTO sl_queries ("+queryColumns+") VALUES ",
 		" AS new ON DUPLICATE KEY UPDATE query = new.query, meta = new.meta, seq = new.seq, version = IF(new.version = 0, sl_queries.version, new.version)",
 		7, l, queryArgs(w.Queries))...)
@@ -77,10 +77,11 @@ func write(w *dialect.Write, l dialect.Limits) []dialect.Stmt {
 }
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
-	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
+	GetDocument:    "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:       "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryPage:      func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
+	QueriesByID:    func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
+	DocumentHashes: func(counts []int) string { return dialect.DocumentHashesSQL(counts, question) },
 }
 
 var registry = dialect.Registry{

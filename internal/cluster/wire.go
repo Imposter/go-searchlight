@@ -151,6 +151,9 @@ type wireRequest struct {
 	// NoRequestCache is search.Request's. It needs no wire level: a peer that ignores
 	// it caches nothing anyway (request caches came after level 4).
 	NoRequestCache bool `json:"no_request_cache,omitempty"`
+	// MaxStalenessNs is search.Request.MaxStaleness. It needs no wire level either: a
+	// peer that ignores it answers with a current result.
+	MaxStalenessNs int64 `json:"max_staleness_ns,omitempty"`
 	// Needs is the search wire level a peer must speak to answer the request exactly
 	// (searchLevel): 1 for a post_filter or a filter, filters or global aggregation, 2
 	// for a terms aggregation's include or exclude, 3 for a from past 0, 4 for a min
@@ -179,7 +182,7 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	w := &wireRequest{
 		Query: q, Sort: r.Sort, Size: r.Size, From: r.From, SearchAfter: r.SearchAfter, TrackTotal: r.TrackTotal,
 		Fields: r.Fields, TimeoutNs: int64(r.Timeout), Index: r.Index, NoBodies: r.NoBodies, SeqNo: r.SeqNo,
-		NoRequestCache: r.NoRequestCache,
+		NoRequestCache: r.NoRequestCache, MaxStalenessNs: int64(r.MaxStaleness),
 	}
 	if r.PostFilter != nil {
 		if w.PostFilter, err = percolate.EncodeQuery(r.PostFilter); err != nil {
@@ -264,7 +267,7 @@ func (w *wireRequest) decode() (*search.Request, error) {
 	r := &search.Request{
 		Query: q, Sort: w.Sort, Size: w.Size, From: w.From, SearchAfter: w.SearchAfter, TrackTotal: w.TrackTotal,
 		Fields: w.Fields, Timeout: time.Duration(w.TimeoutNs), Index: w.Index, NoBodies: w.NoBodies, SeqNo: w.SeqNo,
-		NoRequestCache: w.NoRequestCache,
+		NoRequestCache: w.NoRequestCache, MaxStaleness: min(time.Duration(max(w.MaxStalenessNs, 0)), search.MaxStalenessLimit),
 	}
 	if w.PostFilter != nil {
 		if r.PostFilter, problems = query.Parse(w.PostFilter); len(problems) > 0 {

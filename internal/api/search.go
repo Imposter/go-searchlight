@@ -101,7 +101,8 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 
 // countBody is POST _count's body.
 type countBody struct {
-	Query json.RawMessage `json:"query"`
+	Query        json.RawMessage `json:"query"`
+	MaxStaleness json.RawMessage `json:"max_staleness"`
 }
 
 // count serves POST /indexes/{index}/_count: {query}, an exact count.
@@ -125,6 +126,13 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 			return Invalid("the query is invalid", problems...)
 		}
 		sr.Query = n
+	}
+	if len(req.MaxStaleness) > 0 {
+		d, ok := search.ParseMaxStaleness(req.MaxStaleness)
+		if !ok {
+			return InvalidAt("body.max_staleness", `max_staleness is a duration ("5s", "1m") or milliseconds, at most 1h`)
+		}
+		sr.MaxStaleness = d
 	}
 	resp, err := s.c.Search(r.Context(), r.PathValue("index"), sr, ReadOptions{WaitForSeq: wait})
 	if err != nil {

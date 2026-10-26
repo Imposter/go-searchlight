@@ -70,16 +70,19 @@ func Blob(b []byte) any {
 }
 
 // DocumentRow is a document's new state: its body in Body (text) or BodyZ (body_z;
-// see ChangeRow), and the client version its write named (0 for none). An upsert
-// sets every column.
+// see ChangeRow), the client version its write named (0 for none), and BodyHash, the
+// body's hash (store.BodyHash), kept in body_hash with Seq in hash_seq: a release that
+// writes no hash moves seq on and leaves hash_seq behind, so a hash is trusted only
+// while hash_seq is seq. An upsert sets every column.
 type DocumentRow struct {
-	Index   string
-	Shard   int
-	ID      string
-	Body    string
-	BodyZ   []byte
-	Seq     int64
-	Version int64
+	Index    string
+	Shard    int
+	ID       string
+	Body     string
+	BodyZ    []byte
+	Seq      int64
+	Version  int64
+	BodyHash int64
 }
 
 // QueryRow is a saved query's new state.
@@ -201,6 +204,11 @@ type Records struct {
 	// then per group its shard and its counts[i] ids) -> shard, id, query, meta of those
 	// that exist.
 	QueriesByID func(counts []int) string
+	// DocumentHashes returns the statement that reads documents' seqs and body hashes by
+	// shard and id: (index, then per group its shard and its counts[i] ids) -> shard,
+	// id, seq, body_hash, hash_seq (NULL for a row a release before them wrote) of
+	// those that exist.
+	DocumentHashes func(counts []int) string
 }
 
 // QueryPageSQL is Records.QueryPage in a dialect whose n-th placeholder (from 1) ph
@@ -223,9 +231,21 @@ func QueryPageSQL(shards []int, ph func(int) string) string {
 
 // QueriesByIDSQL is Records.QueriesByID in a dialect whose n-th placeholder ph spells.
 func QueriesByIDSQL(counts []int, ph func(int) string) string {
+	return byIDSQL("SELECT shard, id, query, meta FROM sl_queries", counts, ph)
+}
+
+// DocumentHashesSQL is Records.DocumentHashes in a dialect whose n-th placeholder ph
+// spells.
+func DocumentHashesSQL(counts []int, ph func(int) string) string {
+	return byIDSQL("SELECT shard, id, seq, body_hash, hash_seq FROM sl_documents", counts, ph)
+}
+
+// byIDSQL is selectFrom restricted to an index's rows of given shards and ids: (index,
+// then per group its shard and its counts[i] ids).
+func byIDSQL(selectFrom string, counts []int, ph func(int) string) string {
 	var b strings.Builder
 	n := 2
-	fmt.Fprintf(&b, "SELECT shard, id, query, meta FROM sl_queries WHERE index_name = %s AND (", ph(1))
+	fmt.Fprintf(&b, "%s WHERE index_name = %s AND (", selectFrom, ph(1))
 	for i, c := range counts {
 		if i > 0 {
 			b.WriteString(" OR ")

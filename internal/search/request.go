@@ -184,6 +184,11 @@ type Request struct {
 	// SearchAfter) are cached in any case; [ResolveQueries] sets it for date math
 	// that reads now unrounded.
 	NoRequestCache bool
+	// MaxStaleness lets a cacheable search (size 0) be answered from the shard request
+	// cache with a result its copy computed up to this long ago, the copy's writes since
+	// unseen ([RequestCache]), rather than only with one of what the copy holds now. 0
+	// asks for a current result; at most MaxStalenessLimit.
+	MaxStaleness time.Duration
 	// Nested is set by [ValidateQueries] when the request reads a nested field's
 	// objects: a nested node in a query, or an aggregation or sort on a sub-field. A
 	// peer answers such a request only from the release that reads them.
@@ -469,8 +474,15 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Timeout = d
+		case "max_staleness":
+			d, ok := ParseMaxStaleness(val)
+			if !ok {
+				ps.add("max_staleness", `max_staleness is a duration ("5s", "1m") or milliseconds, at most 1h`)
+				continue
+			}
+			r.MaxStaleness = d
 		default:
-			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, seq_no, timeout and request_cache")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, seq_no, timeout, request_cache and max_staleness")
 		}
 	}
 	switch {
@@ -588,6 +600,16 @@ func parseTimeout(raw json.RawMessage) (time.Duration, bool) {
 	}
 	d, ok := parseDuration(s)
 	return d, ok && d >= 0
+}
+
+// MaxStalenessLimit is the longest Request.MaxStaleness.
+const MaxStalenessLimit = time.Hour
+
+// ParseMaxStaleness reads a max_staleness: a duration ("5s") or milliseconds, from 0 to
+// MaxStalenessLimit.
+func ParseMaxStaleness(raw json.RawMessage) (time.Duration, bool) {
+	d, ok := parseTimeout(raw)
+	return d, ok && d <= MaxStalenessLimit
 }
 
 // maxTimeoutMillis bounds a timeout in milliseconds: a year, far inside a Duration.

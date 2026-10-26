@@ -62,6 +62,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -121,6 +122,9 @@ type Options struct {
 // Options.Cluster set it hosts the copies the cluster gives it and reads the rest from
 // peers.
 type Single struct {
+	// handoffs bounds the documents every shard's handoff holds together.
+	handoffs handoffBudget
+
 	st         store.Store
 	records    store.RecordReader
 	cfg        config.Config
@@ -208,6 +212,8 @@ type shardSlot struct {
 	host           sync.Mutex
 	local          atomic.Pointer[copyState]
 	unhostedAtNano atomic.Int64
+	// analyzed hands the documents writes on this node analyzed to its copy's tailer.
+	analyzed handoff
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.
@@ -507,6 +513,9 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Config.SearchThreads > 0 {
 		search.SetThreads(o.Config.SearchThreads)
 	}
+	if o.Config.BackgroundShare > 0 {
+		prio.Set(prio.New(o.Config.BackgroundShare, o.Clock))
+	}
 	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit) //nolint:contextcheck // the committer outlives this call; each Apply carries its caller's context
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	n.bgCancel = cancel
@@ -609,6 +618,7 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	for s := range state.settings.Shards {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
+		sl.analyzed.budget = &n.handoffs
 		sl.querySeq.Store(n.head.Load())
 		idx.shards = append(idx.shards, sl)
 	}
@@ -688,7 +698,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
 	n.noteHead(sh.AppliedSeq())
-	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead}
+	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead, Analyzed: sl.analyzed.take}
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -782,6 +792,7 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 		sl.host.Lock()
 		c := sl.local.Swap(nil)
 		sl.host.Unlock()
+		sl.analyzed.clear()
 		if c == nil {
 			continue
 		}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
@@ -30,7 +31,13 @@ import (
 type prepared struct {
 	pos    int // the op's position in the request
 	change store.Change
-	doc    *schema.Doc // an upsert's analyzed document, for percolation
+	doc    *schema.Doc // an upsert's analyzed document, for percolation and the handoff
+	// under is the mapping doc was analyzed under, grown by the fields it typed; whole
+	// is set when that mapping types every field (dynamic true or strict), so doc holds
+	// every field a copy indexes: only such a document is handed off to this node's
+	// copy, which checks its fields' types under both mappings.
+	under *schema.Mapping
+	whole bool
 }
 
 // Write implements [api.Coordinator]: see the package documentation. With percolation,
@@ -57,40 +64,56 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	res = &api.WriteResult{Items: make([]api.ItemResult, len(ops))}
-	batch, err := n.prepareWrite(ctx, idx, ops, res.Items, opts.Percolate)
+	var unchanged []prepared
+	if !opts.KeepIdentical {
+		unchanged = n.unchangedOps(ctx, idx, ops, res.Items, opts.Percolate)
+	}
+	handOff := handsOff(idx)
+	batch, err := n.prepareRest(ctx, idx, ops, res.Items, unchanged, docKeep{percolate: opts.Percolate, handOff: handOff})
 	if err != nil {
 		return nil, err
 	}
-	if len(batch) == 0 {
+	if len(batch) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := n.admit(idx, batch); err != nil {
+			return nil, err
+		}
+		if batch, err = n.commit(ctx, idx, batch, res.Items); err != nil {
+			return nil, err
+		}
+	}
+	if len(batch) == 0 && len(unchanged) == 0 {
 		res.Percolated = opts.Percolate
 		return res, nil
 	}
-	if err := n.admit(idx, batch); err != nil {
-		return nil, err
-	}
-	batch, err = n.commit(ctx, idx, batch, res.Items)
-	if err != nil {
-		return nil, err
-	}
-	if len(batch) == 0 {
-		res.Percolated = opts.Percolate
-		return res, nil
-	}
-	res.Seq = batch[len(batch)-1].change.Seq
-	span.SetAttributes(attribute.Int64("seq", res.Seq))
-
 	touched := map[int]bool{}
 	written := map[int]int64{}
 	for i := range batch {
 		touched[batch[i].change.Shard] = true
 		written[batch[i].change.Shard] = max(written[batch[i].change.Shard], batch[i].change.Seq)
+		res.Seq = max(res.Seq, batch[i].change.Seq)
 	}
-	for s := range touched {
+	for i := range unchanged {
+		touched[unchanged[i].change.Shard] = true
+		res.Seq = max(res.Seq, unchanged[i].change.Seq)
+	}
+	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
+	if handOff {
+		for i := range batch {
+			sl := idx.shards[batch[i].change.Shard]
+			if batch[i].doc != nil && batch[i].whole && sl.local.Load() != nil {
+				sl.analyzed.put(batch[i].change.Seq, batch[i].doc, batch[i].under)
+			}
+		}
+	}
+	for s := range written {
 		if c := idx.shards[s].local.Load(); c != nil {
 			c.tailer.Wake()
 		}
 	}
-	if n.cl != nil {
+	if n.cl != nil && len(written) > 0 {
 		n.cl.Committed(idx.name, written)
 	}
 	if opts.Refresh != api.RefreshNone {
@@ -100,6 +123,9 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		}
 	}
 	if opts.Percolate {
+		if len(unchanged) > 0 {
+			batch = mergeByPos(batch, unchanged)
+		}
 		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -111,11 +137,156 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	return res, nil
 }
 
+// docKeep says which upserts a write analyzes in full and keeps the analysis of: every
+// one to percolate, and, to hand off, those of a shard this node hosts a copy of. The
+// others are only checked and typed (schema.Check), which allocates a fraction as much.
+type docKeep struct{ percolate, handOff bool }
+
+func (k docKeep) doc(idx *index, id string) bool {
+	return k.percolate || (k.handOff && idx.shards[ShardFor(id, len(idx.shards))].local.Load() != nil)
+}
+
+// handsOff reports whether a write to idx analyzes its documents in full to hand them
+// to this node's copies (handoff): when the node hosts a copy of one of its shards,
+// and the index's mapping types new fields (not dynamic: false, under which a copy
+// marks a document's unmapped fields as the writer's analysis does not; prepared.whole
+// holds each document to that).
+func handsOff(idx *index) bool {
+	if m := idx.meta.Load().mapping; m == nil || m.Dynamic == schema.DynamicFalse {
+		return false
+	}
+	for _, sl := range idx.shards {
+		if sl.local.Load() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// unchangedOps finds the upserts of ops whose body is byte-identical to the stored
+// document's (store.BodyHash, as its row keeps it) and answers each in its item as a
+// noop at the stored document's seq: nothing is analyzed, committed, indexed or logged
+// for it. It returns them, in ops' order, each with its shard and stored seq, and with
+// percolate its document analyzed for matching: a noop percolates as a write of the
+// same body would (re-percolating is exact, where results kept from the last write
+// would miss saved queries changed since, and at a handful of saved queries cheaper
+// than storing them).
+//
+// Only an unconditional upsert (no version, if_seq or create) of an id no other op of
+// the request names is a candidate: an op that conditions on the stored document, or
+// that another op of the request reorders with, goes the usual way. The hashes are read
+// at one instant, outside the commit's transaction: the document held those bytes then,
+// which is where the noop takes effect, within the request. A read that fails leaves
+// every op to commit (a write would fail the same way, and say so).
+func (n *Single) unchangedOps(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, withDocs bool) []prepared {
+	if n.records == nil || len(ops) == 0 {
+		return nil
+	}
+	seen := make(map[string]int, len(ops))
+	for i := range ops {
+		seen[ops[i].ID]++
+	}
+	var keys []store.DocKey
+	var at []int
+	for i := range ops {
+		op := &ops[i]
+		if op.Kind != api.OpUpsert || op.IfSeq != 0 || op.Version != 0 || seen[op.ID] != 1 || schema.ValidateID(op.ID) != nil {
+			continue
+		}
+		if limit := n.cfg.MaxDocBytes; limit > 0 && int64(len(op.Body)) > limit {
+			continue
+		}
+		keys = append(keys, store.DocKey{Shard: ShardFor(op.ID, len(idx.shards)), ID: op.ID})
+		at = append(at, i)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	hashes, err := n.records.DocumentHashes(ctx, idx.name, keys)
+	if err != nil {
+		if ctx.Err() == nil {
+			n.log.DebugContext(ctx, "reading body hashes failed; the upserts commit", slog.String(telemetry.KeyIndex, idx.name), slog.Any("error", err))
+		}
+		return nil
+	}
+	var out []prepared
+	var mapping *schema.Mapping
+	for k, h := range hashes {
+		i := at[k]
+		if !h.Known || h.Hash != store.BodyHash(ops[i].Body) {
+			continue
+		}
+		p := prepared{pos: i, change: store.Change{Index: idx.name, Shard: keys[k].Shard, ID: ops[i].ID, Kind: store.KindUpsert, Seq: h.Seq}}
+		if withDocs {
+			if mapping == nil {
+				mapping = idx.meta.Load().mapping
+			}
+			doc, _, err := schema.AnalyzeForMatch(mapping, ops[i].ID, ops[i].Body)
+			if err != nil {
+				continue
+			}
+			p.doc = &doc
+		}
+		items[i] = api.ItemResult{Seq: h.Seq, Noop: true, Unchanged: true}
+		out = append(out, p)
+	}
+	return out
+}
+
+// prepareRest is prepareWrite over the ops that unchanged (in ops' order) leaves.
+func (n *Single) prepareRest(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, unchanged []prepared, keep docKeep) ([]prepared, error) {
+	if len(unchanged) == 0 {
+		return n.prepareWrite(ctx, idx, ops, items, keep)
+	}
+	rest := make([]api.WriteOp, 0, len(ops)-len(unchanged))
+	pos := make([]int, 0, cap(rest))
+	for i, k := 0, 0; i < len(ops); i++ {
+		if k < len(unchanged) && unchanged[k].pos == i {
+			k++
+			continue
+		}
+		rest = append(rest, ops[i])
+		pos = append(pos, i)
+	}
+	if len(rest) == 0 {
+		return nil, nil
+	}
+	restItems := make([]api.ItemResult, len(rest))
+	batch, err := n.prepareWrite(ctx, idx, rest, restItems, keep)
+	if err != nil {
+		return nil, err
+	}
+	for k := range rest {
+		items[pos[k]] = restItems[k]
+	}
+	for i := range batch {
+		batch[i].pos = pos[batch[i].pos]
+	}
+	return batch, nil
+}
+
+// mergeByPos merges two lists of prepared ops, each in request order, into one.
+func mergeByPos(a, b []prepared) []prepared {
+	out := make([]prepared, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) || j < len(b) {
+		if j == len(b) || (i < len(a) && a[i].pos < b[j].pos) {
+			out = append(out, a[i])
+			i++
+		} else {
+			out = append(out, b[j])
+			j++
+		}
+	}
+	return out
+}
+
 // prepareWrite validates and analyzes ops, storing an op refused on its own in its
 // item, and grows the stored mapping with the documents' new dynamic fields before
-// anything commits. It returns the ops to commit. keepDocs keeps each upsert's
-// analyzed document (for percolation); otherwise it is dropped as soon as it is
-// checked, and so is every op's body once its change holds the analyzed copy.
+// anything commits. It returns the ops to commit. keep says which upserts keep their
+// analyzed document (to percolate, or to hand off to this node's copy); the others'
+// are dropped as soon as they are checked, and so is every op's body once its change
+// holds the analyzed copy.
 //
 // Mappings are additive, so concurrent writers never fail each other: fields the
 // mapping already holds cost nothing, and the new fields of concurrent writes are
@@ -124,11 +295,14 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 // field limit. On a cluster node, a write some op of which was refused re-reads the
 // catalogue once and is analyzed again: another node may have mapped a field this one
 // does not know yet, which a strict index refuses.
-func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, keepDocs bool) ([]prepared, error) {
+func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, keep docKeep) ([]prepared, error) {
 	base := idx.meta.Load().mapping
 	reloaded := false
 	for range maxCatalogTries {
-		batch, working := n.analyzeOps(idx, ops, items, base, keepDocs)
+		batch, working, err := n.analyzeOps(ctx, idx, ops, items, base, keep)
+		if err != nil {
+			return nil, err
+		}
 		if n.cl != nil && !reloaded && refused(items) {
 			reloaded = true
 			if changed, _ := n.reloadIfNewer(ctx, idx); changed {
@@ -139,7 +313,7 @@ func (n *Single) prepareWrite(ctx context.Context, idx *index, ops []api.WriteOp
 		if working == base {
 			return batch, nil
 		}
-		err := n.ensureFields(ctx, idx, added(base, working))
+		err = n.ensureFields(ctx, idx, added(base, working))
 		switch {
 		case err == nil:
 			return batch, nil
@@ -168,18 +342,27 @@ func refused(items []api.ItemResult) bool {
 }
 
 // analyzeOps prepares every op under base, returning the batch and base grown by the
-// documents' new dynamic fields. An upsert's body becomes its analyzed copy: the raw
+// documents' new dynamic fields. It stops with ctx's error once ctx ends (the client
+// went away): nothing is committed for a request it stops. An upsert's body becomes its analyzed copy: the raw
 // one is freed, and analyzing again (the mapping moved) reads the same document. Every
 // change carries the index incarnation the write means, so a write that races a drop
 // and recreate of the index is refused rather than landing in the new one.
-func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResult, base *schema.Mapping, keepDocs bool) ([]prepared, *schema.Mapping) {
+func (n *Single) analyzeOps(ctx context.Context, idx *index, ops []api.WriteOp, items []api.ItemResult, base *schema.Mapping, keep docKeep) ([]prepared, *schema.Mapping, error) {
 	working := base
 	limit := n.maxIndexFields()
 	uid := idx.meta.Load().meta.UID
 	batch := make([]prepared, 0, len(ops))
 	for i := range ops {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if err := prio.Yield(ctx); err != nil {
+			return nil, nil, err
+		}
 		items[i] = api.ItemResult{}
-		p, m, err := n.prepareOp(idx, &ops[i], working, keepDocs)
+		keepDoc := keep.doc(idx, ops[i].ID)
+		p, m, err := n.prepareOp(idx, &ops[i], working, keepDoc)
+		p.under, p.whole = m, working.Dynamic != schema.DynamicFalse
 		if err != nil {
 			items[i].Err = err
 			continue
@@ -188,7 +371,7 @@ func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResul
 			items[i].Err = api.InvalidAt("body."+field, "the index would hold %d fields, over max_index_fields (%d)", len(m.Fields), limit)
 			continue
 		}
-		if !keepDocs {
+		if !keepDoc {
 			p.doc = nil
 		}
 		if p.change.Kind == store.KindUpsert {
@@ -199,7 +382,7 @@ func (n *Single) analyzeOps(idx *index, ops []api.WriteOp, items []api.ItemResul
 		working = m
 		batch = append(batch, p)
 	}
-	return batch, working
+	return batch, working, nil
 }
 
 // added lists the fields grown has that base lacks.
@@ -623,6 +806,7 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 	if err != nil {
 		return err
 	}
+	res.PercolatedSeq = ts.seq()
 	for k, p := range pos {
 		res.Items[p].Queries = json.RawMessage(ids[k])
 		if matches != nil {

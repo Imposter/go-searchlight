@@ -376,6 +376,7 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
+| `background_share` | `0.25` at GOMAXPROCS 1, else `1` | the share of each 100 ms background work runs while searches occupy every processor, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints for the rest (see [CPU](#cpu)). `1` gives searches no priority |
 | `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
 | `max_body_bytes` | `16MiB` | largest request body (at most 32 MiB less 1 KiB) |
@@ -414,10 +415,20 @@ the same shard contents from them, as Elasticsearch's shard request cache does
   invalidated by hand. A hit has the counts and buckets the search would compute; a
   float sum may differ in its last bits (it was summed in another copy's segment
   order), and the result's segment and scan counts are the computing copy's.
-- **Memory.** `request_cache_size` (128 MiB) bounds the entries' estimated heap,
-  least recently used out first; one entry takes at most an eighth of it. Concurrent
-  identical searches of a copy compute once; a search waiting for another's result
-  waits within its own `timeout`.
+- **Memory.** `request_cache_size` (128 MiB) bounds the entries' estimated heap. It is
+  cut into 8 parts, each under its own lock and bounded by an eighth of it, least
+  recently used out first; an entry's part is chosen by its shard copy and request, and
+  one entry takes at most a sixteenth of the whole. Concurrent identical searches of a
+  copy compute once; a search waiting for another's result waits within its own
+  `timeout`.
+- **Under continuous writes**, each refresh (every `refresh_interval`) changes what a
+  copy holds, so counts and facet searches miss almost every time. A search that gives
+  [`max_staleness`](api.md#search-and-count) (say `"5s"`) accepts the copy's newest
+  result for it computed within that long, under the same mapping: it then computes
+  about once per `max_staleness` per copy, however often dashboards ask, at the cost of
+  missing the last `max_staleness` of writes. The memory cache serves it; Redis does
+  not (its keys name contents, which a stale answer by definition does not match).
+  Stale answers count as `result="stale_hit"` lookups.
 - **Redis.** With `request_cache_redis_url` set, the memory cache sits in front of a
   Redis that every node, and every copy of a shard, shares, and that outlives
   restarts. Its keys name the index incarnation, the shard, the mapping version and
@@ -644,6 +655,42 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
   follow it.
 - **Merges** are further capped by `merge_budget` bytes per second, so a merge storm
   cannot starve searches of disk.
+- **One core** (a container with `cpus: 1`, GOMAXPROCS 1). Go shares the processor
+  between goroutines alike, so a count that needs 5 ms of CPU would queue behind
+  seconds of merging. With `background_share` below 1 (0.25 by default at GOMAXPROCS 1)
+  a search marks its shard work as foreground, and background work (merges every 4,096
+  documents and before each chunk they write, refresh builds before each chunk, the
+  analysis of writes and of the changes a copy applies before each document, file
+  removal before each file) steps aside at its checkpoints while searches occupy every
+  processor: time goes in 100 ms cycles, background work pausing for the first
+  `1 - background_share` of each, or until a processor is free of searches, then
+  running the rest beside the searches. So under reads that never stop it gets about
+  half of `background_share` on one core (about an eighth of the CPU by default), and
+  all of it between reads. Writes slow down under a heavy read load but are never held
+  off for good: their buffers fill and clients get 429s before anything is lost. On
+  `slbench writeload` at one core (50k listings, three readers of counts and facets
+  every 20 ms), merges kept up: segments stayed between 4 and 14, and each burst of
+  merge backlog cleared within seconds. With 2 cores or more the default is `1`; set
+  `background_share` there and background work pauses only while as many searches run
+  as there are processors.
+- **What waits while background work steps aside.** A refresh pauses holding its
+  shard's refresh lock, and the janitor's loop pauses holding its drain lock, so under
+  a steady read load these take longer too: writes with `refresh=true` or
+  `refresh=wait_for`, closing a shard copy (it waits for the janitor's drain), and
+  freeing disk from merged-away segments and old sidecars. A merge pauses holding its
+  `merge_threads` tokens, so other shards' merges wait behind it.
+- **One analysis per write.** A write analyzes its documents once on the node that
+  takes it, and hands them to that node's own copies of their shards, which apply them
+  without analyzing the bodies again (`searchlight_replica_handed_off_total` counts
+  them). The documents waiting for their copy take at most 64 MiB of heap per node (by
+  their fields and objects, not only their bodies); past it the copies analyze the
+  bodies themselves. Copies on other nodes analyze the bodies from the changelog, as
+  before, and a write analyzes in full only the documents it percolates or hands off.
+- **Unchanged documents cost one read.** An upsert of a document's stored bytes is a
+  noop found by id from the body hash its row keeps, before anything is analyzed: a
+  scraper that sends unchanged documents again, or a client's retry of a bulk that
+  committed after it timed out, costs one batched read, not a write, an analysis and a
+  refresh.
 
 ### Disk
 
@@ -684,6 +731,13 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 - **Write rate.** Group commit coalesces each node's concurrent writes into one
   transaction every few milliseconds, so the database sees few, larger transactions.
   Use `_bulk` for throughput.
+- **Each upsert's body is written twice**: in its changelog row (`sl_changes`, the
+  write-ahead log copies tail) and in its document row (`sl_documents`, the record
+  GET, rebuilds and noop checks read), with a hash of it (`body_hash`, 8 bytes). Both
+  go in the one statement of the commit, encoded once. The changelog cannot hold a
+  reference to the document row instead: the row keeps only a document's newest
+  version, and a copy applying the changelog must apply each change's own body at its
+  own seq (see [the architecture](architecture.md#the-write-path-the-sql-changelog-is-the-wal)).
 
 ## Backups and disaster recovery
 
@@ -876,6 +930,20 @@ Notes:
     version until written again) and write `percolate/4` ones. **A copy that has
     written one cannot be downgraded**: an older binary refuses the newer format, and
     the copy is rebuilt from a peer or the database.
+- **Upgrading to body hashes** (schema migration 6; 1.6) is a rolling upgrade. The
+  migration only adds two nullable columns to `sl_documents`, `body_hash` and
+  `hash_seq` (BIGINT), which takes milliseconds whatever the table holds; nothing is
+  rewritten. As before, an old binary refuses to start once the first node has
+  migrated, so finish the rollout.
+  - Upgraded nodes store each written document's hash with the seq that wrote it. A
+    document gets one when it is next written: until then an upsert of its bytes is
+    written, as before.
+  - Nodes still on 1.5 write without touching the columns, so a document they write
+    keeps the hash of its previous version beside a newer seq. A hash is trusted only
+    while `hash_seq` is the row's seq, so such a document is never answered as a noop
+    from its stale hash; its next write on an upgraded node stores a fresh one.
+  - `max_staleness` reaches peers without a wire level: a 1.5 peer ignores it and
+    answers with a current result.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and
@@ -918,9 +986,9 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 |---|---|
 | Requests | `searchlight_http_request_duration_seconds` (by route, method, status), `searchlight_http_request_errors_total`, `searchlight_http_requests_inflight` |
 | Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total`, `searchlight_search_ordinals_builds_total` (by kind: full, incremental, unstarted; trigger: search, warm; result: done, cancelled, superseded, shutdown, panic), `searchlight_search_ordinals_build_duration_seconds`, `searchlight_search_ordinals_lookups_total` (hit, shared, miss, queued, stale, absent) |
-| Request cache | `searchlight_search_request_cache_lookups_total` (by `store`, memory or redis, and `result`: hit, miss, or skipped while Redis is skipped), `searchlight_search_request_cache_errors_total` (by store and operation: get, set, encode, decode), `searchlight_search_request_cache_evictions_total`, `searchlight_search_request_cache_stored_bytes_total` (written to Redis), `searchlight_search_request_cache_writes_dropped_total` (by reason: busy, store_failing, closed), `searchlight_search_request_cache_store_open_ratio` (1 while Redis is skipped), `searchlight_search_request_cache_size_bytes`, `searchlight_search_request_cache_entries` |
+| Request cache | `searchlight_search_request_cache_lookups_total` (by `store`, memory or redis, and `result`: hit, miss, `stale_hit` (memory, within a search's `max_staleness`), or skipped while Redis is skipped), `searchlight_search_request_cache_errors_total` (by store and operation: get, set, encode, decode), `searchlight_search_request_cache_evictions_total`, `searchlight_search_request_cache_stored_bytes_total` (written to Redis), `searchlight_search_request_cache_writes_dropped_total` (by reason: busy, store_failing, closed), `searchlight_search_request_cache_store_open_ratio` (1 while Redis is skipped), `searchlight_search_request_cache_size_bytes`, `searchlight_search_request_cache_entries` |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
-| Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
+| Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total`, `searchlight_replica_handed_off_total` (documents a copy applied as its node's write analyzed them) |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
 | Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total`, `searchlight_changelog_rewinds_total` |

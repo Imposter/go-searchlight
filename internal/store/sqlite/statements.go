@@ -52,7 +52,7 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 	}
 	for i := range w.Documents {
 		r := &w.Documents[i]
-		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version}})
+		out = append(out, dialect.Stmt{What: "upsert documents", SQL: upsertDocument, Args: []any{r.Index, r.Shard, r.ID, r.Body, dialect.Blob(r.BodyZ), r.Seq, r.Version, r.BodyHash, r.Seq}})
 	}
 	for i := range w.Queries {
 		r := &w.Queries[i]
@@ -81,7 +81,7 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 
 const (
 	insertChange    = "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	upsertDocument  = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq, version = CASE WHEN excluded.version = 0 THEN sl_documents.version ELSE excluded.version END"
+	upsertDocument  = "INSERT INTO sl_documents (index_name, shard, id, body, body_z, seq, version, body_hash, hash_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET body = excluded.body, body_z = excluded.body_z, seq = excluded.seq, version = CASE WHEN excluded.version = 0 THEN sl_documents.version ELSE excluded.version END, body_hash = excluded.body_hash, hash_seq = excluded.hash_seq"
 	upsertQuery     = "INSERT INTO sl_queries (index_name, shard, id, query, meta, seq, version) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, id) DO UPDATE SET query = excluded.query, meta = excluded.meta, seq = excluded.seq, version = CASE WHEN excluded.version = 0 THEN sl_queries.version ELSE excluded.version END"
 	upsertTombstone = "INSERT INTO sl_tombstones (index_name, shard, kind, id, version, at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (index_name, shard, kind, id) DO UPDATE SET version = excluded.version, at = excluded.at"
 	deleteTombstone = "DELETE FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?"
@@ -90,10 +90,11 @@ const (
 )
 
 var records = dialect.Records{
-	GetDocument: "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	GetQuery:    "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	QueryPage:   func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
-	QueriesByID: func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
+	GetDocument:    "SELECT body, body_z, seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	GetQuery:       "SELECT query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryPage:      func(shards []int) string { return dialect.QueryPageSQL(shards, question) },
+	QueriesByID:    func(counts []int) string { return dialect.QueriesByIDSQL(counts, question) },
+	DocumentHashes: func(counts []int) string { return dialect.DocumentHashesSQL(counts, question) },
 }
 
 var registry = dialect.Registry{

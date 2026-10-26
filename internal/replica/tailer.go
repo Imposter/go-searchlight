@@ -70,6 +70,7 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -143,6 +144,16 @@ type Options struct {
 	Hub *Hub
 	// Fetcher, when set, is tried before ScanShard when the copy must be rebuilt.
 	Fetcher Fetcher
+	// Analyzed, when set, returns the document a writer on this node analyzed
+	// ([schema.Analyze]) for the upsert committed at seq, with the mapping it analyzed it
+	// under; nil when it kept none. The tailer applies it in place of analyzing the
+	// change's body when it is that change's document (the same id and body bytes) and
+	// every field it holds, the sub-fields of its nested objects included, has the same
+	// type under the writer's mapping and the copy's, none of them a sub-field's name in
+	// the copy's: then its analysis is the one the copy would make (mappings only add
+	// fields, and a field's type never changes). Otherwise the tailer analyzes the body,
+	// as without it.
+	Analyzed func(seq int64) (*schema.Doc, *schema.Mapping)
 	// OpenShard reopens the copy's directory: after a wipe, and after the shard
 	// failed. Nil opens it with shard.Open and the first shard's options.
 	OpenShard func(ctx context.Context, dir string) (*shard.Shard, error)

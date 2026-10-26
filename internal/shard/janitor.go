@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -183,9 +184,12 @@ func (j *janitor) drain() {
 	for p := range j.pending {
 		paths = append(paths, p)
 	}
-	stopped := j.stopped
+	stopped, background := j.stopped, j.running
 	j.mu.Unlock()
 	for _, p := range paths {
+		if background && !stopped {
+			prio.Step() // the loop's drain steps aside for searches; one on a search's release never waits
+		}
 		j.removeOne(p, stopped)
 	}
 }

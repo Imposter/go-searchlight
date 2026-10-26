@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
@@ -330,7 +332,7 @@ type failure struct {
 // convert analyzes items into shard changes, in order, each document under views[i]
 // (its mapping as analysisView makes it; dynamic[i] is the real mode). It returns the
 // changes before the first item that cannot be converted, and that failure.
-func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode) ([]shard.Change, *failure) {
+func (t *Tailer) convert(ctx context.Context, items []item, views []*schema.Mapping, dynamic []schema.DynamicMode) ([]shard.Change, *failure) {
 	out := make([]shard.Change, len(items))
 	docs := make([]int, 0, len(items))
 	limit := len(items)
@@ -364,7 +366,8 @@ func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema
 		out[i] = c
 	}
 	out = out[:limit]
-	analyzed := analyzeAll(items, views, dynamic, docs)
+	analyzed := t.handedOff(ctx, items, views, docs)
+	analyzeAll(ctx, items, views, dynamic, docs, analyzed)
 	unmapped := 0
 	for k, i := range docs {
 		a := &analyzed[k]
@@ -378,7 +381,7 @@ func (t *Tailer) convert(items []item, views []*schema.Mapping, dynamic []schema
 	}
 	if unmapped > 0 {
 		if suppressed, ok := t.warn.allow(); ok {
-			t.log.Warn("documents hold fields their mapping does not map: the writer must add a dynamic field to the mapping before it commits a document with it",
+			t.log.WarnContext(ctx, "documents hold fields their mapping does not map: the writer must add a dynamic field to the mapping before it commits a document with it",
 				slog.Int("documents", unmapped), slog.Int("suppressed", suppressed))
 		}
 	}
@@ -389,12 +392,69 @@ type analysis struct {
 	doc      schema.Doc
 	unmapped bool
 	err      error
+	given    bool // handed off by the writer (Options.Analyzed), not analyzed here
 }
 
-// analyzeAll analyzes the documents items[docs[k]], in parallel.
-func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int) []analysis {
+// handedOff returns the analyses of the documents items[docs[k]] that Options.Analyzed
+// holds and that fit the copy (see it), the others left zero for analyzeAll.
+func (t *Tailer) handedOff(ctx context.Context, items []item, views []*schema.Mapping, docs []int) []analysis {
 	out := make([]analysis, len(docs))
+	if t.opts.Analyzed == nil {
+		return out
+	}
+	used := 0
+	for k, i := range docs {
+		d, under := t.opts.Analyzed(items[i].seq)
+		if d != nil && under != nil && d.ID == items[i].id && bytes.Equal(d.Body, items[i].body) && fitsView(d, under, views[i]) {
+			out[k].doc, out[k].given = *d, true
+			used++
+		}
+	}
+	t.inst.handedOff.Add(ctx, int64(used), t.inst.attrs)
+	return out
+}
+
+// fitsView reports whether d, analyzed under mapping under, is the document analyzeDoc
+// makes of its body under view: every field d holds, and every sub-field of its nested
+// objects, has the same type in both (a value under typed nothing, such as {}, would
+// be analyzed by view's type of it), and no top-level field of d is a sub-field's name
+// in view (a member view passes over). Members d does not hold are null, or passed over
+// by under, and so by view too: mappings only add fields and never retype one.
+func fitsView(d *schema.Doc, under, view *schema.Mapping) bool {
+	same := func(name string) bool {
+		t, ok := under.Fields[name]
+		return ok && view.Fields[name] == t
+	}
+	for name := range d.Fields {
+		if name == schema.IDField {
+			continue
+		}
+		if !same(name) {
+			return false
+		}
+		if _, sub := view.NestedPath(name); sub {
+			return false
+		}
+		objects := d.Fields[name].Objects
+		for o := range objects {
+			for sub := range objects[o].Fields {
+				if !same(sub) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// analyzeAll analyzes the documents items[docs[k]] into out[k], in parallel, but for
+// those handed off already. It steps aside for searches before each one (prio.Yield).
+func analyzeAll(ctx context.Context, items []item, views []*schema.Mapping, dynamic []schema.DynamicMode, docs []int, out []analysis) {
 	run := func(k int) {
+		if out[k].given {
+			return
+		}
+		_ = prio.Yield(ctx) // a cancelled ctx stops the tailer at its own next check
 		i := docs[k]
 		out[k].doc, out[k].unmapped, out[k].err = analyzeDoc(views[i], dynamic[i], items[i].id, items[i].body)
 	}
@@ -403,7 +463,7 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 		for k := range docs {
 			run(k)
 		}
-		return out
+		return
 	}
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -421,7 +481,6 @@ func analyzeAll(items []item, views []*schema.Mapping, dynamic []schema.DynamicM
 		}()
 	}
 	wg.Wait()
-	return out
 }
 
 func (t *Tailer) haltAt(it *item, reason string, err error) *HaltError {
@@ -477,7 +536,7 @@ func (t *Tailer) applyItems(ctx context.Context, sh *shard.Shard, items []item, 
 			return nil
 		}
 		run := items[runStart:end]
-		converted, fail := t.convert(run, views[runStart:end], dynamic[runStart:end])
+		converted, fail := t.convert(ctx, run, views[runStart:end], dynamic[runStart:end])
 		n, err := t.applyBatch(ctx, sh, converted, load)
 		if !load && n > 0 {
 			t.applied.Store(converted[n-1].Seq)

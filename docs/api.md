@@ -374,6 +374,19 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
     `seq_no` skips them, 503 with no other copy). Send versioned writes to upgraded
     nodes, and trust `version` in `GET` and percolation matches once the rollout is
     done.
+- **Unchanged documents.** An upsert without `if_seq`, `op_type=create` or `version`
+  whose body is byte for byte the stored document's is a noop: `{"id", "seq",
+  "result": "noop"}`, where `seq` is the seq the stored document was written at, and
+  nothing is analyzed, committed, indexed or logged for it. Each document row keeps a
+  hash of its body (the first 8 bytes of its SHA-256) for this, read by id before the
+  write is analyzed. The bytes must match exactly: the same document with its keys
+  reordered or its whitespace changed is written. `seq` still reads it back:
+  `wait_for_seq` with it waits until the document is searchable, as after a write.
+  `detect_noop=false` writes it anyway, as releases before 1.6 did (a new seq, the
+  document indexed again). A document written by a release before 1.6 has no hash
+  until it is next written, and during a rolling upgrade a 1.5 node's write leaves the
+  hash behind, which is then not trusted: such a document is written, never answered
+  as a noop from a stale hash.
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
 - **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
   is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the
@@ -432,13 +445,30 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   `{"status": 200, "version": N, "result": "noop"}`, with no `seq` and, under
   `percolate=true`, no `queries`. It excludes `if_seq` and `create` (400 at
   `line.N.<action>.version`).
+- **Unchanged documents** are [noops](#documents) item by item: an `upsert` (no
+  `if_seq`, `create` or `version`) of the stored document's bytes answers `{"status":
+  200, "seq": <the stored document's>, "result": "noop"}`, and under `percolate=true`
+  still lists its `queries` (and `matches`): it is percolated as a write of the same
+  body would be, against the saved queries as they stand. An id that more than one
+  operation of the request names is always written. `detect_noop=false` writes every
+  upsert.
 - **Partial failure.** An operation refused on its own (an invalid document, a failed
   `if_seq`) is reported in its item, with `errors` set, and the rest commit.
 - **Whole-request refusal.** A malformed action line, a line over `max_doc_bytes`, or
   more than `max_bulk_ops` operations refuse the whole request before anything is
   written.
-- **`seq`.** The newest seq the request committed. Pass it as `wait_for_seq` to read
-  your writes.
+- **`seq`.** The newest seq the request committed, or an unchanged upsert found its
+  document at. Pass it as `wait_for_seq` to read your writes.
+- **A client that gives up.** When the client disconnects before the answer (its
+  timeout, say), the request stops at its next step that has not committed: before the
+  next document it would analyze, before it commits, or, once committed, before its
+  percolation or refresh wait. The request commits in one transaction, so it is
+  committed whole or not at all, never in part. Sending the same bulk again is then
+  safe and cheap: an attempt that committed makes the retry's upserts noops at their
+  stored seqs (still percolated, with their matches), and one that did not is written
+  now. Deletes and versioned or conditional operations retried after a commit answer
+  as they would to any later request (a 404 for a delete already done, a noop for a
+  version already applied, a 409 for an `if_seq` already used).
 - **`percolate=true`.** Each upserted document's item lists the saved queries it matches.
   This is how scrape-bot's diff engine works out its match edges (spec §16).
   - `percolated` says whether the items carry their matches. It is false when the
@@ -674,6 +704,19 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   (`now-7d/d`) hits until the rounding moves on. `false` keeps the search out of the
   cache. A result that timed out is never stored. `_count` is cached as a size-0 search
   is. See [the request cache](operations.md#request-cache) for its memory and Redis.
+- **`max_staleness`** (none by default; a duration such as `"5s"`, or milliseconds, at
+  most `"1h"`), for a search with `size` 0 or a `_count` (in its body too): how old a
+  cached result may be. Under continuous writes every refresh changes what a shard
+  holds, so without it a count or a facet search almost never hits the request cache.
+  With it, each shard may answer with its copy's newest result for the same search
+  under the same mapping computed within `max_staleness`, although the copy has
+  refreshed writes since: each such search then computes about once per
+  `max_staleness` per shard copy, however often it is asked. The answer may miss the
+  writes of the last `max_staleness`, on top of the refresh interval every search
+  misses. A mapping change is never served across; `request_cache: false` and
+  `wait_for_seq` (read-your-writes) ignore it. It is answered from this node's memory
+  cache, not the shared Redis. Peers before 1.6 ignore it and answer with a current
+  result.
 
 **A facet panel in one search.** Each facet counts under every pick but its own, and
 the hits obey every pick: put the picks in `post_filter`, and make each facet a

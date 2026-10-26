@@ -471,12 +471,17 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   document at. Pass it as `wait_for_seq` to read your writes.
 - **A client that gives up.** When the client disconnects before the answer (its
   timeout, say), the request stops at its next step that has not committed: before the
-  next document it would analyze, before it commits, or, once committed, before its
-  percolation or refresh wait. The request commits in one transaction, so it is
-  committed whole or not at all, never in part. Sending the same bulk again is then
-  safe and cheap: an attempt that committed makes the retry's upserts noops at their
-  stored seqs (still percolated, with their matches), and one that did not is written
-  now. Deletes and versioned or conditional operations retried after a commit answer
+  next document it would analyze, before the transaction of its group commit begins, or,
+  once committed, before its percolation or refresh wait. Once that transaction is
+  under way, it may still commit after the client has gone: it is cancelled only while
+  it has not reached its commit, and only when every request sharing it has gone too. The
+  request commits in one transaction, so it is committed whole or not at all, never in
+  part, but the client cannot tell which. Sending the same bulk again is then safe and
+  cheap: an attempt that committed makes the retry's upserts noops at their stored
+  seqs (still percolated, with their matches), and one that did not is written now. A
+  retry sent while the abandoned attempt is still committing may write some documents
+  again (the same bodies, at new seqs) rather than find them unchanged; the stored
+  state is the same either way. Deletes and versioned or conditional operations retried after a commit answer
   as they would to any later request (a 404 for a delete already done, a noop for a
   version already applied, a 409 for an `if_seq` already used).
 - **`percolate=true`.** Each upserted document's item lists the saved queries it matches.

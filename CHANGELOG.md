@@ -72,10 +72,12 @@ changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 
   took `seq` as the seq the percolation saw should read `percolated_seq`.
   `detect_noop=false` restores the old behaviour.
 - **A bulk whose client went away stops** before the next document it would analyze
-  and before it commits; once committed, its percolation and refresh wait end too. It
-  commits in one transaction, so whole or not at all, and the client's retry of the
-  same bulk is cheap and idempotent: if the abandoned attempt committed, the retry's
-  upserts are noops at their stored seqs (still percolated).
+  and before its group commit's transaction begins; once committed, its percolation and
+  refresh wait end too. One whose transaction is under way may still commit after the
+  client has gone (a transaction is cancelled only before its commit, and only once
+  every request in it has gone). It commits in one transaction, so whole or not at all, and the
+  client's retry of the same bulk is cheap and idempotent: if the abandoned attempt
+  committed, the retry's upserts are noops at their stored seqs (still percolated).
 - **Each document is analyzed once per write on its node**: the node that takes a write
   hands its analyzed documents to its own copies of their shards, which apply them
   without analyzing the bodies again when the documents are their changes' and every

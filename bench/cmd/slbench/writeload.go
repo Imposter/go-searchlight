@@ -52,7 +52,8 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	changed := fs.Float64("changed", 0.5, "share of a bulk's documents changed (the rest are sent as stored)")
 	readers := fs.Int("readers", 2, "concurrent readers (counts and facet searches)")
 	readPause := fs.Duration("read-pause", 100*time.Millisecond, "pause between one reader's reads")
-	readParams := fs.String("read-params", "", "query string added to every read, such as max_staleness=5s")
+	readParams := fs.String("read-params", "", "query string added to every read")
+	staleness := fs.String("max-staleness", "", `max_staleness every read gives, such as 5s ("": none)`)
 	clientTimeout := fs.Duration("client-timeout", 10*time.Second, "a bulk abandoned and sent again past this (0: wait)")
 	percolate := fs.Bool("percolate", true, "bulks percolate with matches and inner hits")
 	settings := fs.String("settings", "", "further node settings, comma-separated name=value")
@@ -121,7 +122,7 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	res, err := c.run(ctx, wlRun{
 		n: n, bulk: *bulk, duration: *duration, writers: *writers, changed: *changed, readers: *readers,
-		readPause: *readPause, readParams: *readParams, clientTimeout: *clientTimeout, percolate: *percolate, seed: *seed,
+		readPause: *readPause, readParams: *readParams, staleness: *staleness, clientTimeout: *clientTimeout, percolate: *percolate, seed: *seed,
 	})
 	if err != nil {
 		return err
@@ -312,7 +313,7 @@ type wlRun struct {
 	duration, readPause       time.Duration
 	clientTimeout             time.Duration
 	changed                   float64
-	readParams                string
+	readParams, staleness     string
 	percolate                 bool
 	seed                      uint64
 }
@@ -448,13 +449,17 @@ func (c *wlClient) run(ctx context.Context, o wlRun) (*wlResult, error) {
 				case <-time.After(o.readPause):
 				}
 				rd := reads[i%len(reads)]
+				body := rd.body
+				if o.staleness != "" {
+					body = `{"max_staleness": "` + o.staleness + `", ` + strings.TrimPrefix(body, "{")
+				}
 				p := rd.path
 				if o.readParams != "" {
 					p += "?" + o.readParams
 				}
 				rctx, cancel := context.WithTimeout(ctx, readTimeout)
 				start := time.Now()
-				status, _, err := c.do(rctx, http.MethodPost, p, []byte(rd.body))
+				status, _, err := c.do(rctx, http.MethodPost, p, []byte(body))
 				d := time.Since(start)
 				timedOut := rctx.Err() != nil
 				cancel()

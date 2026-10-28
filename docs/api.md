@@ -66,6 +66,9 @@ segments.
 | Sort keys in a search | 16, each field once, none after `_id` | 400 with `loc` |
 | Aggregations in a search | 100, sub-aggregations included | 400 with `loc` `aggs` |
 | Ranges in a `range` aggregation | 100 | 400 with `loc` |
+| A `terms` `order` | 8 keys, each once, none after `_key` | 400 with `loc` |
+| A `top_metrics` | `size` 10, 10 `metrics` | 400 with `loc` |
+| A `composite` page | `size` 10,000, 10 `sources` | 400 with `loc`: page on with `after` |
 | `percents` of a `percentiles`, `values` of a `percentile_ranks` aggregation | 100; `tdigest.compression` 10 to 1,000 | 400 with `loc` |
 | A `terms` `include` or `exclude` | 1,000 values; a pattern of 1,000 characters, 10,000 compiled instructions | 400 with `loc` |
 | `fields` in a search | 100 | 400 with `loc` `fields` |
@@ -572,12 +575,14 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   - A number counts exactly up to it (10,000 by default). Past it, `relation` is
     `gte`.
 - **Aggregations** (`aggs`, or `aggregations`):
-  - `terms`, with `size`, `shard_size`, `min_doc_count`, `include`, `exclude` and
-    `collect_mode`;
+  - `terms`, with `size`, `shard_size`, `min_doc_count`, `include`, `exclude`,
+    `collect_mode` and [`order`](#terms-order);
   - `range`, with `ranges` of `from`/`to`/`key`;
   - `histogram`, with `interval`, `offset` and `min_doc_count`;
   - `date_histogram`, with `fixed_interval`, `calendar_interval`, `offset` and
     `min_doc_count`;
+  - [`composite`](#composite), with `sources`, `size` and `after`: every combination
+    of its sources' values, a page at a time;
   - `stats`;
   - `min` and `max`, `{"value": x}`, or `{"value": null}` when no document has one.
     On a `date` field the value is Unix milliseconds, as `stats` gives it. `-0` is
@@ -617,10 +622,12 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     filter matches, `{"buckets": {"key": {"doc_count": n, ...}, ...}}`. Keyed only:
     the anonymous list form is refused;
   - `global`, `{}`: one bucket of every document of the index, whatever the `query`
-    and `post_filter`, `{"doc_count": n, ...}`. Top level only.
+    and `post_filter`, `{"doc_count": n, ...}`. Top level only;
+  - [`top_metrics`](#top_metrics), with `metrics`, `sort` and `size`: fields of the
+    documents first by a sort, `{"top": [{"sort": [v], "metrics": {"field": v}}]}`.
 
   A bucket aggregation may carry metric sub-aggregations (`stats`, `cardinality`,
-  `min`, `max`, `percentiles`, `percentile_ranks`) one level deep. `filter`,
+  `min`, `max`, `percentiles`, `percentile_ranks`, `top_metrics`) one level deep. `filter`,
   `filters` and `global` may carry any other aggregation, written inline in their
   bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
   most `filter` → `terms` → `stats`. A sub-aggregation is never named after a member
@@ -712,6 +719,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     given twice (`loc` `aggs.<name>.percentiles.percents`, or `.percents.<i>` for one),
     and a `tdigest.compression` from 10 to 1,000.
   - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.
+  - A `terms` `order` of at most 8 keys; a `top_metrics` `size` of at most 10 and at most
+    10 `metrics`; a `composite` `size` of at most 10,000 and at most 10 `sources`. A
+    `composite` page's buckets count towards the 65,536 below, as any aggregation's do.
   - At most 1,000 values in an `include` or `exclude` array, and 1,000 characters in
     a pattern, which compiles to at most 10,000 instructions: one whose counted
     repetitions multiply past it is refused as too complex (`loc`
@@ -830,6 +840,122 @@ search by an exact `include`, even when they fall outside the top 10:
 
 `_count` takes `{"query": ...}` and answers `{"count", "relation", "timed_out"}`, counting
 exactly. It refuses any other member, `post_filter` included (400 at its name).
+
+### Terms order
+
+`order` orders a `terms` aggregation's buckets, as Elasticsearch's does:
+`{"_count": "desc"}` (the default), `{"_count": "asc"}`, `{"_key": "asc"|"desc"}`, or a
+metric sub-aggregation of the `terms` by name: a `min`, `max` or `cardinality` by its
+value (`"low"`, or `"low.value"`), a `stats` by a member (`"prices.avg"`: `count`,
+`min`, `max`, `avg` or `sum`), a `top_metrics` of `size` 1 by one of its metrics
+(`"latest.price"`). A list orders by its keys in turn, each breaking the ties of the
+ones before: `[{"prices.avg": "desc"}, {"_count": "desc"}]`. `_key` ascending breaks
+whatever ties are left, and nothing orders after `_key` (keys are unique). A bucket
+whose metric has no value (a `min` over no price) sorts after every bucket with one,
+ascending or descending.
+
+```json
+{"size": 0,
+ "aggs": {"brands": {"terms": {"field": "brand", "size": 5, "order": {"price.avg": "desc"}},
+                     "aggs": {"price": {"stats": {"field": "price"}}}}}}
+```
+
+How exact the answer is over several shards follows the first key, as in
+Elasticsearch:
+
+- **`_count` descending**: each shard returns its `shard_size` best terms, and
+  `doc_count_error_upper_bound` bounds what the shards left out, as without `order`.
+- **`_key`**: each shard returns its first `shard_size` keys in that order, so a term
+  a shard left out sorts after the last one it returned, and the top `size` are exact
+  (`doc_count_error_upper_bound` 0). With a `min_doc_count` above 1 a bucket can miss a
+  shard's documents; such a bucket says `-1`.
+- **`_count` ascending, or a sub-aggregation**: no shard can bound what it leaves out.
+  Each shard collects every term's sub-aggregations (depth first; `collect_mode`
+  `breadth_first` is refused), orders its terms exactly and returns `shard_size` of
+  them, 10,000 by default rather than `size × 1.5 + 10`. The answer is exact while no
+  shard holds more distinct values, and then `doc_count_error_upper_bound` is 0. When
+  a shard does cut its list, `doc_count_error_upper_bound` is `-1` (unknown), on the
+  aggregation and on each bucket some shard that cut did not return: a bucket that
+  says 0 is still exact. Raise `shard_size` (up to 65,536) for more distinct values;
+  its cost is that many buckets, with their sub-aggregations, per shard.
+
+On one shard every order is exact. Searches with an `order` reach only nodes of 1.7 or
+later (search wire level 10), as do `top_metrics` and `composite`.
+
+### top_metrics
+
+`top_metrics` reads `metrics`, fields of the documents first by `sort`, as
+Elasticsearch's does: the latest price, the cheapest listing's store. It is a metric:
+top level, under `filter`, `filters` and `global`, or a bucket aggregation's
+sub-aggregation, per bucket.
+
+```json
+{"size": 0,
+ "aggs": {"stores": {"terms": {"field": "store"},
+                     "aggs": {"latest": {"top_metrics": {"metrics": [{"field": "price"}, {"field": "sku"}],
+                                                         "sort": {"changed_at": "desc"},
+                                                         "size": 1}}}}}}
+```
+
+```json
+{"latest": {"top": [{"sort": [1761500000000], "metrics": {"price": 12.5, "sku": "a-1"}}]}}
+```
+
+- `metrics` is `{"field": name}` or a list of them, at most 10: a number or date field
+  (a number; a date as Unix milliseconds), a keyword or text field (its value
+  normalized, as aggregations read it), a bool, or `_id` (the document's exact id). A
+  document without a value has `null` for it. A `keyword_list`, a point field and a
+  nested field's sub-fields are refused.
+- `sort` is one key, as a search's `sort` takes it (`"price"`, `{"price": "desc"}`,
+  `{"price": {"order": "desc"}}`), on a number or date field. A document without a
+  value sorts after every document with one; equal values go to the least `_id` (exact,
+  byte order), so the answer does not depend on how documents spread over shards.
+- `size` is how many documents, best first: 1 by default, at most 10. `top` holds fewer
+  when fewer documents match.
+
+It is exact: each segment keeps its `size` best documents, and each shard and the
+coordinating node keep the `size` best of those.
+
+### Composite
+
+`composite` pages through every combination of its `sources`' values, as
+Elasticsearch's does: per-group statistics over every group, however many groups there
+are, `size` at a time.
+
+```json
+{"size": 0,
+ "aggs": {"groups": {"composite": {"size": 100,
+                                   "sources": [{"store": {"terms": {"field": "store"}}},
+                                               {"day": {"date_histogram": {"field": "changed_at", "calendar_interval": "day"}}}]},
+                     "aggs": {"price": {"stats": {"field": "price"}}}}}}
+```
+
+```json
+{"groups": {"after_key": {"store": "acme", "day": 1761436800000},
+            "buckets": [{"key": {"store": "acme", "day": 1761350400000}, "doc_count": 12, "price": {"...": "..."}},
+                        "..."]}}
+```
+
+- `sources` is a list of `{"name": {type: {...}}}`, at most 10, each name once: `terms`
+  (`field`: a keyword, text, `keyword_list`, number, date or bool field, or `_id`),
+  `histogram` (`field`, `interval`, `offset`) or `date_histogram` (`field`,
+  `calendar_interval` or `fixed_interval`, `offset`), each with `"order": "asc"`
+  (the default) or `"desc"`. A bucket's `key` holds each source's value by name: a
+  histogram's bucket start, a date as Unix milliseconds.
+- The buckets are ordered by their keys, source by source, and a page is the first
+  `size` (10 by default, at most 10,000) of them, or with `after` the first `size` past
+  it. `after_key` is the page's last bucket's key: pass it as `after`, as it is, for
+  the next page, until a page comes back without buckets (and without `after_key`).
+- A document without a value for some source is in no bucket (Elasticsearch's
+  `missing_bucket` is not taken). A `keyword_list` document is in one bucket per
+  combination of its values. Metric sub-aggregations (`stats`, `cardinality`, `min`,
+  `max`, `top_metrics`) are computed per bucket.
+- It is exact, counts and metrics alike: each segment keeps the `size` least keys past
+  `after` it has seen (with every document of each), and each shard and the
+  coordinating node the `size` least of those. A walk over a changing index sees each
+  page as of its own search, as `search_after` does.
+- Top level only. Its page counts towards the response's 65,536 buckets; a page cut to
+  fit them says `"truncated": true`, and its `after_key` is the last bucket kept.
 
 ### Box queries
 

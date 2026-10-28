@@ -100,8 +100,8 @@ func TestWirePercentiles(t *testing.T) {
 			t.Errorf("%s: values %v after the wire, want %v", name, got.Values, ranks.Values)
 		}
 	}
-	if searchLevel != levelPercentiles || levelNeeds(levelPercentiles) == levelNeeds(levelSeqNo) {
-		t.Errorf("level %d is not the newest, or its errors name level %d's needs", levelPercentiles, levelSeqNo)
+	if searchLevel < levelPercentiles || levelNeeds(levelPercentiles) == levelNeeds(levelSeqNo) || levelNeeds(levelPercentiles) == levelNeeds(levelCompositeAggs) {
+		t.Errorf("search level %d is below %d, or its errors name level %d's or %d's needs", searchLevel, levelPercentiles, levelSeqNo, levelCompositeAggs)
 	}
 	aggs := map[string]search.Agg{"p": pct, "t": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{"r": ranks, "s": {Type: search.AggStats, Field: "price"}}}}
 	dropPercentiles(aggs)

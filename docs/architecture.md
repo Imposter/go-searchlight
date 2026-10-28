@@ -389,6 +389,11 @@ data_dir/
    - Percentiles and percentile_ranks collect a merging t-digest (exact while it holds
      at most `compression` distinct values), which the segments' parts, the segments
      and the shards merge in turn.
+   - A terms aggregation ordered by a sub-aggregation collects every term's
+     sub-aggregations depth first, so each shard's cut is made in that order.
+     `top_metrics` keeps each segment's few best documents, and `composite` the page's
+     least keys past `after` (pruned once it holds twice the page): each shard and the
+     coordinator keep the best of those, which is exact.
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for

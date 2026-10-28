@@ -1217,22 +1217,33 @@ func finishTerms(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec
 			kept = append(kept, uint32(gl))
 		}
 	}
-	topK(kept, spec.shardSize, func(a, b uint32) int {
-		if counts[a] != counts[b] {
-			if counts[a] > counts[b] {
-				return -1
-			}
-			return 1
-		}
-		return int(a) - int(b)
-	})
 	out := &AggPartial{Type: AggTerms}
-	if len(kept) > spec.shardSize {
+	switch {
+	case spec.orderSubs():
+		// Every term's sub-aggregations first: the cut orders by them (cutShard below).
+	case spec.order != nil:
+		topK(kept, spec.shardSize, spec.ordCmp(counts))
+	default:
+		topK(kept, spec.shardSize, func(a, b uint32) int {
+			if counts[a] != counts[b] {
+				if counts[a] > counts[b] {
+					return -1
+				}
+				return 1
+			}
+			return int(a) - int(b)
+		})
+	}
+	if len(kept) > spec.shardSize && !spec.orderSubs() {
 		for _, gl := range kept[spec.shardSize:] {
 			out.OtherDocCount += counts[gl]
 		}
 		kept = kept[:spec.shardSize]
-		out.DocCountError = counts[kept[len(kept)-1]]
+		if spec.bound() == boundCount {
+			out.DocCountError = counts[kept[len(kept)-1]]
+		} else {
+			out.Cut = true
+		}
 	}
 	out.Buckets = make([]*BucketPartial, len(kept))
 	for i, gl := range kept {
@@ -1258,6 +1269,9 @@ func finishTerms(ctx context.Context, dst *AggPartial, parts []*ordPartial, spec
 		if err := keptSubs(ctx, out.Buckets, parts, sels, spec); err != nil {
 			return err
 		}
+	}
+	if spec.orderSubs() {
+		cutShard(out, spec)
 	}
 	adopt(dst, out, spec)
 	return nil
@@ -1297,7 +1311,9 @@ func finishTermsByKey(ctx context.Context, dst *AggPartial, parts []*ordPartial,
 		}
 	}
 	out := &AggPartial{Type: AggTerms, Buckets: slices.Clone(buckets)}
-	cutShard(out, spec)
+	if !spec.orderSubs() {
+		cutShard(out, spec) // else once every bucket's sub-aggregations are in, below
+	}
 	if len(spec.subs) > 0 {
 		pos := make(map[*BucketPartial]int32, len(out.Buckets))
 		for i, b := range out.Buckets {
@@ -1322,6 +1338,9 @@ func finishTermsByKey(ctx context.Context, dst *AggPartial, parts []*ordPartial,
 		if err := keptSubs(ctx, out.Buckets, parts, sels, spec); err != nil {
 			return err
 		}
+		if spec.orderSubs() {
+			cutShard(out, spec)
+		}
 	}
 	adopt(dst, out, spec)
 	return nil
@@ -1337,6 +1356,7 @@ func adopt(dst, out *AggPartial, spec *aggSpec) {
 	dst.Buckets = out.Buckets
 	dst.DocCountError += out.DocCountError
 	dst.OtherDocCount += out.OtherDocCount
+	dst.Cut = dst.Cut || out.Cut
 }
 
 // keptSubs fills the kept buckets' sub-aggregation partials from every part, in part

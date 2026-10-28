@@ -326,16 +326,7 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			break
 		}
 		for i, k := range spec.percents {
-			var v float64
-			var ok bool
-			if spec.typ == AggPercentiles {
-				v, ok = p.Digest.Quantile(k / 100)
-			} else {
-				v, ok = p.Digest.Rank(k)
-				v *= 100
-			}
-			if ok {
-				v = positiveZero(v)
+			if v, ok := percentileValue(p.Digest, spec, k); ok {
 				res.Percentiles[i] = &v
 			}
 		}
@@ -385,6 +376,22 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 		}
 	}
 	return res
+}
+
+// percentileValue is digest d's value at key k of percentiles or percentile_ranks spec:
+// the value at percent k, or the percent of the values below value k (half those equal
+// to it counted); false when d holds no value. The response and a terms order by spec
+// both read it.
+func percentileValue(d *TDigest, spec *aggSpec, k float64) (float64, bool) {
+	var v float64
+	var ok bool
+	if spec.typ == AggPercentiles {
+		v, ok = d.Quantile(k / 100)
+	} else {
+		v, ok = d.Rank(k)
+		v *= 100
+	}
+	return positiveZero(v), ok
 }
 
 // histogramBucket finishes one histogram bucket, a date_histogram's with its key as a

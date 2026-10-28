@@ -5,7 +5,9 @@ import (
 	"cmp"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -13,7 +15,12 @@ import (
 // order takes it: Key is OrderCount, OrderKey, or a metric sub-aggregation of the terms
 // aggregation by name: a min, max or cardinality by its value ("low", or "low.value"),
 // a stats by one of its members ("prices.avg": count, min, max, avg or sum), a
-// top_metrics of size 1 by one of its metrics ("latest.price"). A bucket without a
+// top_metrics of size 1 by one of its metrics ("latest.price"), a percentiles by one of
+// its percents ("load.99.9", or "load[99.9]") and a percentile_ranks by one of its
+// values ("ranks.100"). A member is written after the name's first dot, or in brackets
+// after the name ("prices[avg]"), as Elasticsearch's paths take it; a percent or value
+// as Java's Double.parseDouble reads a decimal ("50", "50.0", "5e1", "+50", "50d"),
+// equal to one the sub-aggregation names. A bucket without a
 // metric value (a min over no value) sorts after every bucket with one, ascending or
 // descending. _key ascending breaks the ties the keys leave, and nothing orders after
 // _key: keys are unique.
@@ -32,6 +39,14 @@ import (
 //     them, OrderedShardSize by default, so the answer is exact while no shard holds
 //     more distinct values. When one does, doc_count_error_upper_bound is -1, on the
 //     response and on each bucket some shard that cut its list did not return.
+//
+// A percentiles or percentile_ranks key reads a t-digest: each shard orders its terms
+// by its own digest of each term's values, and the coordinator orders the merged terms
+// again by the merged digest's value, the one the response shows. A shard's value can
+// differ from the merged one, so a shard that cuts its list may leave out a term the
+// merged values rank higher (doc_count_error_upper_bound -1 says it may have); and
+// once a term's digest holds more distinct values than its compression, the value it
+// orders by is an estimate, as the response's is.
 //
 // One shard is always exact.
 type TermsOrder struct {
@@ -78,7 +93,8 @@ const (
 )
 
 // orderKey is one key of a termsOrder: a bucket's count, its key, or a metric of its
-// sub-aggregation sub (member: a stats member; field: a top_metrics metric's index).
+// sub-aggregation sub (member: a stats member; field: a top_metrics metric's index, or
+// a percentiles or percentile_ranks key's in sub.percents).
 type orderKey struct {
 	kind   orderKind
 	desc   bool
@@ -186,12 +202,43 @@ func prepareTermsOrder(s *aggSpec, a Agg, at string, ps *problems) {
 	}
 }
 
+// SplitOrderKey splits a terms order key that reads a sub-aggregation into the
+// sub-aggregation's name and the member it orders by: "name[member]" (bracketed), or
+// "name.member" at the first dot ("name" alone has no member).
+func SplitOrderKey(key string) (name, member string, bracketed bool) {
+	if n, m, ok := strings.Cut(key, "["); ok && strings.HasSuffix(m, "]") {
+		return n, strings.TrimSuffix(m, "]"), true
+	}
+	name, member, _ = strings.Cut(key, ".")
+	return name, member, false
+}
+
+// javaDecimal is the decimal form Java's Double.parseDouble reads, after its trim and
+// before its optional type suffix.
+var javaDecimal = regexp.MustCompile(`^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$`)
+
+// parsePercentKey reads a percentiles or percentile_ranks order member as
+// Elasticsearch does (Double.parseDouble): ASCII spaces and controls trimmed, a decimal
+// with an optional exponent, and an optional f, F, d or D suffix. False for any other
+// form, or one past a float64's range.
+func parsePercentKey(member string) (float64, bool) {
+	s := strings.TrimFunc(member, func(r rune) bool { return r <= ' ' })
+	if n := len(s); n > 0 && strings.ContainsRune("fFdD", rune(s[n-1])) {
+		s = s[:n-1]
+	}
+	if !javaDecimal.MatchString(s) {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	return positiveZero(f), err == nil
+}
+
 // resolveOrderSub resolves order key key, a sub-aggregation's metric, into ok.
 func resolveOrderSub(ok *orderKey, s *aggSpec, key, loc string, ps *problems) bool {
-	name, member, _ := strings.Cut(key, ".")
+	name, member, _ := SplitOrderKey(key)
 	i := slices.IndexFunc(s.subs, func(sub *aggSpec) bool { return sub.name == name })
 	if i < 0 {
-		ps.add(loc, "%q names no sub-aggregation of this terms aggregation: it orders by _count, _key, or a metric sub-aggregation (name, name.avg for a stats, name.field for a top_metrics)", key)
+		ps.add(loc, "%q names no sub-aggregation of this terms aggregation: it orders by _count, _key, or a metric sub-aggregation (name, name.avg for a stats, name.field for a top_metrics, name.50 for a percentiles)", key)
 		return false
 	}
 	sub := s.subs[i]
@@ -223,11 +270,47 @@ func resolveOrderSub(ok *orderKey, s *aggSpec, key, loc string, ps *problems) bo
 			return false
 		}
 		ok.field = f
+	case AggPercentiles, AggPercentileRanks:
+		return resolvePercentKey(ok, sub, member, loc, ps)
 	default:
 		ps.add(loc, "a terms aggregation orders by a metric sub-aggregation, and %q is a %s", name, sub.typ)
 		return false
 	}
 	return true
+}
+
+// resolvePercentKey resolves member, the percent of percentiles sub (or the value of
+// percentile_ranks sub) a terms order key orders by, into ok.field: its index in
+// sub.percents.
+func resolvePercentKey(ok *orderKey, sub *aggSpec, member, loc string, ps *problems) bool {
+	if len(sub.percents) == 0 {
+		return false // refused already
+	}
+	what, example := "percents", strconv.FormatFloat(sub.percents[0], 'g', -1, 64)
+	if sub.typ == AggPercentileRanks {
+		what = "values"
+	}
+	f, parsed := parsePercentKey(member)
+	switch {
+	case !parsed:
+		ps.add(loc, "%q is a %s: order by one of its %s, %s.<number> (%s.%s, or %s[%s])", sub.name, sub.typ, what, sub.name, sub.name, example, sub.name, example)
+		return false
+	case !slices.Contains(sub.percents, f):
+		ps.add(loc, "%q is a %s of %s %s: %s is none of them", sub.name, sub.typ, what, formatPercents(sub.percents), member)
+		return false
+	}
+	ok.field = slices.Index(sub.percents, f)
+	return true
+}
+
+// formatPercents lists a percentiles aggregation's percents (or a percentile_ranks
+// one's values) for a problem: "1, 5, 25".
+func formatPercents(ps []float64) string {
+	out := make([]string, len(ps))
+	for i, p := range ps {
+		out[i] = strconv.FormatFloat(p, 'g', -1, 64)
+	}
+	return strings.Join(out, ", ")
 }
 
 // bound is what a shard's cut of s's list can say of the terms it left out.
@@ -285,6 +368,13 @@ func (k *orderKey) value(b *BucketPartial) any {
 			return nil
 		}
 		return p.Top[0].Metrics[k.field]
+	case AggPercentiles, AggPercentileRanks:
+		if p.Digest == nil {
+			return nil
+		}
+		if v, ok := percentileValue(p.Digest, k.sub, k.sub.percents[k.field]); ok {
+			return v
+		}
 	}
 	return nil
 }

@@ -374,6 +374,12 @@ each search has a wire level, the level a peer must speak to answer it exactly.
   with `seq_no` (and a `size` past 0) needs level 8: a node of level 0 to 7 would
   answer its hits without their seqs. Inner hits merged by name need no level: only the
   coordinating node checks the names and reads inner hits.
+- A search with a `percentiles` or `percentile_ranks` aggregation needs level 9; one
+  with a `top_metrics` or `composite` aggregation, or a `terms` aggregation's `order`,
+  level 10; one whose `terms` order reads a `percentiles` or `percentile_ranks`
+  sub-aggregation, or names a member in brackets (`"prices[avg]"`), level 11. Each goes
+  to its level's endpoint in the same way: an older node would refuse the aggregation
+  or the order key, or answer in count order.
 - Each reply says the level it was answered at, and the coordinator refuses one below
   the search's; a node refuses (503) a search past its own level. A later wire
   addition raises the level, so it is never silently ignored either.

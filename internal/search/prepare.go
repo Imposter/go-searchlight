@@ -455,7 +455,7 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		ps.add(loc, "global is a top-level aggregation only: it counts every document, whatever holds it")
 		return nil
 	case singleBucket(parent) && wrapper:
-		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min, max, percentiles and percentile_ranks", a.Type, parent)
+		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min, max, percentiles, percentile_ranks and top_metrics (composite and global are top-level only)", a.Type, parent)
 		return nil
 	case !singleBucket(parent) && a.Type == AggTerms && (under != "" || m == nil):
 	case !singleBucket(parent) && !isMetric:
@@ -613,7 +613,7 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 	}
 	if len(a.Aggs) > 0 {
 		if isMetric || (parent != "" && !singleBucket(parent)) {
-			ps.add(loc+"."+aggsLoc(a.aggsKey), "only a bucket aggregation holds sub-aggregations: metrics, one level deep, or under filter, filters and global any aggregation but those")
+			ps.add(loc+"."+aggsLoc(a.aggsKey), "only a bucket aggregation (terms, range, histogram, date_histogram, composite) holds sub-aggregations: metrics (stats, cardinality, min, max, percentiles, percentile_ranks, top_metrics) one level deep, or under filter, filters and global any aggregation but filter, filters, global and composite")
 		} else {
 			for _, subName := range slices.Sorted(maps.Keys(a.Aggs)) {
 				at := loc + "." + aggsLoc(a.aggsKey) + "." + subName

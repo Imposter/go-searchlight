@@ -34,7 +34,8 @@ func aggProblems(t *testing.T, aggs string) []query.Problem {
 // TestOrderedAggsValidation: top_metrics, a terms order and composite refuse what they
 // cannot answer, each problem at its loc.
 func TestOrderedAggsValidation(t *testing.T) {
-	subs := `"aggs":{"st":{"stats":{"field":"price"}},"low":{"min":{"field":"price"}},"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":{"created":"desc"},"size":2}}}`
+	subs := `"aggs":{"st":{"stats":{"field":"price"}},"low":{"min":{"field":"price"}},"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":{"created":"desc"},"size":2}},` +
+		`"pct":{"percentiles":{"field":"price","percents":[50,99.9]}},"rk":{"percentile_ranks":{"field":"price","values":[100,-5]}}}`
 	terms := func(settings string) string {
 		return `{"t":{"terms":{"field":"brand",` + settings + `},` + subs + `}}`
 	}
@@ -72,6 +73,18 @@ func TestOrderedAggsValidation(t *testing.T) {
 		terms(`"order":"_count"`):                             "aggs.t.terms.order",
 		terms(`"order":[{"_count":"asc"},{"st.min":"asc"},{"st.max":"asc"},{"st.avg":"asc"},{"st.sum":"asc"},{"st.count":"asc"},{"low":"asc"},{"tm.price":"asc"},{"_key":"desc"}]`): "aggs.t.terms.order",
 		terms(`"collect_mode":"breadth_first","order":{"low":"asc"}`):               "aggs.t.terms.collect_mode",
+		terms(`"order":{"pct":"asc"}`):                                              "aggs.t.terms.order.0",
+		terms(`"order":{"pct.value":"asc"}`):                                        "aggs.t.terms.order.0",
+		terms(`"order":{"pct.75":"asc"}`):                                           "aggs.t.terms.order.0",
+		terms(`"order":{"pct.99":"asc"}`):                                           "aggs.t.terms.order.0",
+		terms(`"order":{"pct.0x32p0":"asc"}`):                                       "aggs.t.terms.order.0",
+		terms(`"order":{"pct.NaN":"asc"}`):                                          "aggs.t.terms.order.0",
+		terms(`"order":{"pct.1e999":"asc"}`):                                        "aggs.t.terms.order.0",
+		terms(`"order":{"pct.5_0":"asc"}`):                                          "aggs.t.terms.order.0",
+		terms(`"order":{"pct[50":"asc"}`):                                           "aggs.t.terms.order.0",
+		terms(`"order":{"rk.50":"asc"}`):                                            "aggs.t.terms.order.0",
+		terms(`"order":{"rk":"asc"}`):                                               "aggs.t.terms.order.0",
+		terms(`"collect_mode":"breadth_first","order":{"pct.50":"asc"}`):            "aggs.t.terms.collect_mode",
 		`{"t":{"histogram":{"field":"price","interval":5,"order":{"_key":"asc"}}}}`: "aggs.t.histogram.order",
 		// composite
 		`{"t":{"terms":{"field":"brand"},"aggs":{"c":{"composite":{"sources":[{"a":{"terms":{"field":"brand"}}}]}}}}}`: "aggs.t.aggs.c",
@@ -106,6 +119,17 @@ func TestOrderedAggsValidation(t *testing.T) {
 	for _, aggs := range []string{
 		top(`"metrics":[{"field":"price"},{"field":"brand"},{"field":"_id"},{"field":"active"},{"field":"title"},{"field":"unmapped"}],"sort":{"created":{"order":"desc"}},"size":10`),
 		terms(`"order":[{"st.avg":"asc"},{"low.value":"asc"},{"_count":"asc"},{"_key":"desc"}]`),
+		terms(`"order":[{"pct.50":"asc"},{"pct.99.9":"desc"},{"rk.100":"asc"},{"rk.-5":"desc"},{"_key":"desc"}]`),
+		terms(`"order":[{"pct[99.9]":"asc"},{"pct.50.0":"desc"},{"rk[100.00]":"asc"},{"st[avg]":"asc"},{"_key":"desc"}]`),
+		terms(`"order":{"pct.5e1":"desc"}`),
+		terms(`"order":{"pct.+50d":"desc"}`),
+		terms(`"order":{"pct.0050.":"desc"}`),
+		terms(`"order":{"pct.999e-1F":"desc"}`),
+		terms(`"order":{"rk.-5.0e0":"desc"}`),
+		terms(`"order":{"rk.1E2":"desc"}`),
+		`{"t":{"terms":{"field":"brand","order":{"p.0":"asc"}},"aggs":{"p":{"percentiles":{"field":"price","percents":[0,100]}}}}}`,
+		`{"t":{"terms":{"field":"brand","order":{"p.-0":"asc"}},"aggs":{"p":{"percentiles":{"field":"price","percents":[0,100]}}}}}`,
+		`{"t":{"terms":{"field":"brand","order":{"p.1":"asc"}},"aggs":{"p":{"percentiles":{"field":"price"}}}}}`,
 		`{"t":{"terms":{"field":"brand","order":{"tm.price":"desc"}},"aggs":{"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":"created"}}}}}`,
 		`{"t":{"terms":{"field":"_v.size","order":{"m":"desc"}},"aggs":{"m":{"min":{"field":"_v.price"}},"tm":{"top_metrics":{"metrics":{"field":"price"},"sort":"created"}}}}}`,
 		`{"c":{"composite":{"size":10000,"sources":[{"a":{"terms":{"field":"brand","order":"desc"}}},{"b":{"terms":{"field":"tags"}}},{"p":{"histogram":{"field":"price","interval":2.5,"offset":1}}},` +

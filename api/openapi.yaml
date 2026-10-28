@@ -1082,13 +1082,13 @@ components:
             - type: integer
               minimum: 1
         aggs:
-          type: object
-          maxProperties: 100
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, min, max ({"value": x}, null with no value), cardinality (precision, or threshold: exact up to it, the threshold past it), percentiles (percents, 0 to 100, at most 100, by default 1, 5, 25, 50, 75, 95 and 99; keyed, true by default: {"values": {"50.0": v}}, else {"values": [{"key": 50, "value": v}]}, null with no value; tdigest.compression, 10 to 1000, 100 by default: a t-digest exact while the values hold at most compression distinct values) and percentile_ranks (values, at most 100: the percent of values below each plus half those equal to it; keyed and tdigest as percentiles), with metric sub-aggregations one level deep (a nested field''s sub-field, path.name, is aggregated by terms, stats, min, max, cardinality, percentiles and percentile_ranks alone, at the top level or under filter, filters and global: over the objects of the hits, those its "where" query of the sub-fields matches when given; terms counts each hit once per value however many of its objects hold it, and holds stats, min, max, cardinality, percentiles, percentile_ranks and terms sub-aggregations (the terms holding none, never cut per shard, its buckets bounded by the outer bucket''s error), over the bucket''s documents for a top-level field, over the bucket''s objects for a sub-field of the same nested field) (terms takes collect_mode, depth_first or breadth_first, the same results either way; and include and exclude: an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are; exclude wins, and both apply before size and shard_size; partitions are refused); and filter (a query), filters ({"filters": {key: query}, "other_bucket_key": key}, keyed only, at most 100 filters) and global ({}, top level only), each holding any other aggregation with its metric sub-aggregations. At most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; no sub-aggregation named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to, doc_count_error_upper_bound); at most 100 ranges per range aggregation; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          description: 'Named aggregations (Aggregation): at most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          allOf:
+            - $ref: "#/components/schemas/Aggregations"
         aggregations:
-          type: object
-          maxProperties: 100
           description: An alias of aggs, with its bounds.
+          allOf:
+            - $ref: "#/components/schemas/Aggregations"
         fields:
           type: array
           maxItems: 100
@@ -1108,6 +1108,473 @@ components:
           default: true
           description: Whether a search with size 0 (a count, or aggregations only; no from or search_after) may be answered from, and stored in, each shard's request cache, as Elasticsearch's request_cache. A search with hits, or with date math reading now unrounded (now-7d; now-7d/d is cached), is never cached; a timed-out result is never stored.
         max_staleness: { $ref: "#/components/schemas/MaxStaleness" }
+    Aggregations:
+      type: object
+      maxProperties: 100
+      description: Aggregations by name (a name is not empty).
+      additionalProperties: { $ref: "#/components/schemas/Aggregation" }
+    Aggregation:
+      type: object
+      additionalProperties: false
+      description: 'One aggregation: exactly one type, and aggs (or aggregations) for its sub-aggregations. A bucket aggregation (terms, range, histogram, date_histogram, composite) holds metric sub-aggregations (stats, cardinality, min, max, percentiles, percentile_ranks, top_metrics) one level deep. filter, filters and global hold any aggregation but composite and global, each with its own metric sub-aggregations, written inline in their bucket. composite and global are top-level only. A nested field''s sub-field (path.name) is aggregated by terms, stats, min, max, cardinality, percentiles and percentile_ranks alone, at the top level or under filter, filters and global, over the objects of the hits that its where (a query of the sub-fields) chooses; such a terms holds metric and terms sub-aggregations (those terms holding none), over the bucket''s documents for a top-level field and over its objects for a sub-field of the same nested field. No sub-aggregation is named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to and doc_count_error_upper_bound).'
+      oneOf:
+        - required: [terms]
+        - required: [range]
+        - required: [histogram]
+        - required: [date_histogram]
+        - required: [composite]
+        - required: [stats]
+        - required: [cardinality]
+        - required: [min]
+        - required: [max]
+        - required: [percentiles]
+        - required: [percentile_ranks]
+        - required: [top_metrics]
+        - required: [filter]
+        - required: [filters]
+        - required: [global]
+      properties:
+        terms: { $ref: "#/components/schemas/TermsAggregation" }
+        range: { $ref: "#/components/schemas/RangeAggregation" }
+        histogram: { $ref: "#/components/schemas/HistogramAggregation" }
+        date_histogram: { $ref: "#/components/schemas/DateHistogramAggregation" }
+        composite: { $ref: "#/components/schemas/CompositeAggregation" }
+        stats: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        min: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        max: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        cardinality: { $ref: "#/components/schemas/CardinalityAggregation" }
+        percentiles: { $ref: "#/components/schemas/PercentilesAggregation" }
+        percentile_ranks: { $ref: "#/components/schemas/PercentileRanksAggregation" }
+        top_metrics: { $ref: "#/components/schemas/TopMetricsAggregation" }
+        filter:
+          description: 'One bucket of the documents both the search''s query and this query match: {"doc_count": n, ...}. Checked against the mapping as query is; asks for no inner_hits.'
+          allOf:
+            - $ref: "#/components/schemas/Query"
+        filters: { $ref: "#/components/schemas/FiltersAggregation" }
+        global:
+          type: object
+          maxProperties: 0
+          description: 'One bucket of every document of the index, whatever the query and post_filter: {"doc_count": n, ...}. Takes no settings; top level only.'
+        aggs: { $ref: "#/components/schemas/Aggregations" }
+        aggregations: { $ref: "#/components/schemas/Aggregations" }
+    TermsAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'A bucket per value, {"doc_count_error_upper_bound": n, "sum_other_doc_count": n, "buckets": [{"key": v, "doc_count": n}, ...]}. Over several shards each returns its shard_size best terms and doc_count_error_upper_bound bounds what they left out (0 on one shard).'
+      properties:
+        field: { type: string, minLength: 1 }
+        size: { type: integer, minimum: 1, maximum: 65536, default: 10 }
+        shard_size:
+          type: integer
+          minimum: 1
+          description: 'How many terms each shard returns: size * 1.5 + 10 by default (10000 when the order bounds no error: _count ascending or a sub-aggregation), at least size, capped at 65536.'
+        min_doc_count: { type: integer, minimum: 1, default: 1 }
+        include: { $ref: "#/components/schemas/TermsFilter" }
+        exclude: { $ref: "#/components/schemas/TermsFilter" }
+        collect_mode:
+          type: string
+          enum: [depth_first, breadth_first]
+          description: 'How the sub-aggregations are collected: depth_first for every value as the hits are read, breadth_first for the values each shard keeps after its shard_size cut. Unset, each segment chooses. The results are the same either way; an order by a sub-aggregation refuses breadth_first.'
+        order: { $ref: "#/components/schemas/TermsOrder" }
+        where:
+          description: On a nested field's sub-field, the objects it counts (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    TermsFilter:
+      description: 'A terms aggregation''s include or exclude (exclude wins, both before size and shard_size): an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are. Partitions are refused.'
+      oneOf:
+        - type: string
+          maxLength: 1000
+        - type: array
+          maxItems: 1000
+          items:
+            type: [string, number, boolean]
+    TermsOrder:
+      description: 'The order of a terms aggregation''s buckets, as Elasticsearch''s: {key: "asc"|"desc"}, or a list of at most 8 of them, each breaking the ties of the ones before. A key is _count (the default, descending), _key, or a metric sub-aggregation of the terms by name: a min, max or cardinality by its value ("low", or "low.value"), a stats by a member ("prices.avg": count, min, max, avg or sum), a top_metrics of size 1 by one of its metrics ("latest.price"), a percentiles by one of its percents ("load.99.9", or "load[99.9]"; the percent as Java''s Double.parseDouble reads it, "50", "50.0" or "5e1", equal to one of its percents) or a percentile_ranks by one of its values ("ranks.100"). _key ascending breaks the ties left, and nothing orders after _key; each key once. A bucket without a metric value sorts after every bucket with one. Over several shards an order by _count ascending or by a sub-aggregation makes each shard order every term exactly and return shard_size of them (10000 by default): exact while no shard holds more distinct values, doc_count_error_upper_bound -1 where a shard''s cut may have left a term out. A percentiles or percentile_ranks key orders each shard by its own digest, and the merged buckets by the merged digest''s value, the one the response shows (an estimate once a term''s values pass the compression).'
+      oneOf:
+        - $ref: "#/components/schemas/TermsOrderKey"
+        - type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: "#/components/schemas/TermsOrderKey" }
+    TermsOrderKey:
+      type: object
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties:
+        type: string
+        enum: [asc, desc]
+    RangeAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, ranges]
+      description: 'A bucket per range of a number or date field, {"buckets": [{"key": "10-100", "from": 10, "to": 100, "doc_count": n}, ...]} in the order given.'
+      properties:
+        field: { type: string, minLength: 1 }
+        ranges:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              from: { type: [number, "null"], description: Inclusive; open when absent or null. }
+              to: { type: [number, "null"], description: Exclusive; open when absent or null. }
+              key: { type: string, description: 'The bucket''s key: "from-to" by default, * for an open end.' }
+    HistogramAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, interval]
+      description: 'Buckets of a number or date field interval wide, by start, {"buckets": [{"key": start, "doc_count": n}, ...]}; empty ones between the first and the last filled in while min_doc_count is 0 (and the response stays within its buckets, else truncated).'
+      properties:
+        field: { type: string, minLength: 1 }
+        interval: { type: number, description: Above 0. }
+        offset: { type: number, default: 0 }
+        min_doc_count: { type: integer, minimum: 0, default: 0 }
+    DateHistogramAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'Buckets of a date (or number) field by a fixed or a calendar interval (UTC), {"buckets": [{"key": ms, "key_as_string": "2026-10-01T00:00:00Z", "doc_count": n}, ...]}: one of fixed_interval (or interval) and calendar_interval.'
+      properties:
+        field: { type: string, minLength: 1 }
+        fixed_interval: { $ref: "#/components/schemas/Interval" }
+        interval: { $ref: "#/components/schemas/Interval" }
+        calendar_interval:
+          type: string
+          enum: [minute, hour, day, week, month, quarter, year]
+          description: A week starts on Monday.
+        offset:
+          description: A duration ("1h", "-6h") or milliseconds.
+          type: [string, number]
+        min_doc_count: { type: integer, minimum: 0, default: 0 }
+    Interval:
+      description: A duration ("90m", "1d") or milliseconds, at least 1 ms.
+      type: [string, number]
+    CompositeAggregation:
+      type: object
+      additionalProperties: false
+      required: [sources]
+      description: 'Every combination of its sources'' values, a page at a time, ordered by the keys source by source: {"after_key": {...}, "buckets": [{"key": {"name": v, ...}, "doc_count": n, ...}]}. after_key is the page''s last bucket''s key, absent on a page without buckets (the walk done). A document without a value for some source is in no bucket (missing_bucket is not taken). Exact. Top level only; holds metric sub-aggregations.'
+      properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: Each source once by name.
+          items: { $ref: "#/components/schemas/CompositeSource" }
+        size: { type: integer, minimum: 1, maximum: 10000, default: 10 }
+        after:
+          type: object
+          description: The previous page's after_key, as it was given; the page starts after that bucket.
+    CompositeSource:
+      type: object
+      minProperties: 1
+      maxProperties: 1
+      description: '{"name": {"terms"|"histogram"|"date_histogram": {...}}}, the bucket key''s member by that name.'
+      additionalProperties:
+        type: object
+        additionalProperties: false
+        minProperties: 1
+        maxProperties: 1
+        properties:
+          terms:
+            type: object
+            additionalProperties: false
+            required: [field]
+            description: A keyword, text, keyword_list, number, date or bool field, or _id.
+            properties:
+              field: { type: string, minLength: 1 }
+              order: { type: string, enum: [asc, desc], default: asc }
+          histogram:
+            type: object
+            additionalProperties: false
+            required: [field, interval]
+            description: A number or date field's bucket start.
+            properties:
+              field: { type: string, minLength: 1 }
+              interval: { type: number, description: Above 0. }
+              offset: { type: number, default: 0 }
+              order: { type: string, enum: [asc, desc], default: asc }
+          date_histogram:
+            type: object
+            additionalProperties: false
+            required: [field]
+            description: A date field's bucket start, in Unix milliseconds; one of fixed_interval (or interval) and calendar_interval.
+            properties:
+              field: { type: string, minLength: 1 }
+              fixed_interval: { $ref: "#/components/schemas/Interval" }
+              interval: { $ref: "#/components/schemas/Interval" }
+              calendar_interval: { type: string, enum: [minute, hour, day, week, month, quarter, year] }
+              offset: { type: [string, number], description: 'A duration ("1h", "-6h") or milliseconds.' }
+              order: { type: string, enum: [asc, desc], default: asc }
+    FieldMetricAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'stats ({"count": n, "min": x, "max": x, "avg": x, "sum": x}), min or max ({"value": x}, null with no value) over a number or date field (a date as Unix milliseconds).'
+      properties:
+        field: { type: string, minLength: 1 }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    CardinalityAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'The number of distinct values (HyperLogLog++), {"value": n}: with threshold, exact up to it, the threshold past it.'
+      properties:
+        field: { type: string, minLength: 1 }
+        precision: { type: integer, minimum: 4, maximum: 18, default: 14 }
+        threshold: { type: integer, minimum: 1, maximum: 65536, description: Not with precision. }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    PercentilesAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'Percentiles of a number or date field from a t-digest, exact while the values hold at most compression distinct values: keyed {"values": {"50.0": v, ...}} (each percent as Java writes a double), else {"values": [{"key": 50, "value": v}, ...]}, in ascending order, null with no value.'
+      properties:
+        field: { type: string, minLength: 1 }
+        percents:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: None twice; by default 1, 5, 25, 50, 75, 95 and 99.
+          items: { type: number, minimum: 0, maximum: 100 }
+        keyed: { type: boolean, default: true }
+        tdigest: { $ref: "#/components/schemas/TDigestSettings" }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    PercentileRanksAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, values]
+      description: 'For each value, the percent of the field''s values below it plus half those equal to it: {"values": {"500.0": 55.2, ...}}, keyed and written as percentiles.'
+      properties:
+        field: { type: string, minLength: 1 }
+        values:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Finite, none twice.
+          items: { type: number }
+        keyed: { type: boolean, default: true }
+        tdigest: { $ref: "#/components/schemas/TDigestSettings" }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    TDigestSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        compression: { type: number, minimum: 10, maximum: 1000, default: 100 }
+    TopMetricsAggregation:
+      type: object
+      additionalProperties: false
+      required: [metrics, sort]
+      description: 'Fields of the documents first by sort, best first: {"top": [{"sort": [v], "metrics": {"field": v, ...}}, ...]}. A document without a sort value sorts after every one with one; equal values go to the least _id. Exact.'
+      properties:
+        metrics:
+          description: '{"field": name}, or a list of at most 10: a number or date field, a keyword or text field (normalized), a bool, or _id; null for a document without a value. A keyword_list, a point field and a nested field''s sub-fields are refused.'
+          oneOf:
+            - $ref: "#/components/schemas/TopMetric"
+            - type: array
+              minItems: 1
+              maxItems: 10
+              items: { $ref: "#/components/schemas/TopMetric" }
+        sort:
+          description: 'One key on a top-level number or date field, as a search''s sort takes it: "price", {"price": "desc"} or {"price": {"order": "desc"}}, or a list of that one.'
+          oneOf:
+            - type: string
+            - type: object
+              minProperties: 1
+              maxProperties: 1
+            - type: array
+              minItems: 1
+              maxItems: 1
+        size: { type: integer, minimum: 1, maximum: 10, default: 1 }
+    TopMetric:
+      type: object
+      additionalProperties: false
+      required: [field]
+      properties:
+        field: { type: string, minLength: 1 }
+    FiltersAggregation:
+      type: object
+      additionalProperties: false
+      required: [filters]
+      description: 'A filter bucket per key, and with other_bucket_key one more of the documents no filter matches: {"buckets": {"key": {"doc_count": n, ...}, ...}}. Keyed only: the anonymous list is refused.'
+      properties:
+        filters:
+          type: object
+          minProperties: 1
+          maxProperties: 100
+          additionalProperties: { $ref: "#/components/schemas/Query" }
+        other_bucket_key: { type: string, minLength: 1 }
+    AggregationResult:
+      description: 'A top-level aggregation''s result, by its type: terms (TermsResult); range, histogram and date_histogram (BucketsResult); composite (CompositeResult); filters (FiltersResult); filter and global (FilterResult); stats (StatsResult); min, max and cardinality (ValueResult); percentiles and percentile_ranks (PercentilesResult); top_metrics (TopMetricsResult).'
+      anyOf:
+        - $ref: "#/components/schemas/TermsResult"
+        - $ref: "#/components/schemas/BucketsResult"
+        - $ref: "#/components/schemas/CompositeResult"
+        - $ref: "#/components/schemas/FiltersResult"
+        - $ref: "#/components/schemas/FilterResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    WrappedAggregationResult:
+      description: The result of an aggregation under a filter, filters or global aggregation, by its type, as at the top level.
+      anyOf:
+        - $ref: "#/components/schemas/TermsResult"
+        - $ref: "#/components/schemas/BucketsResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    SubAggregationResult:
+      description: 'A bucket''s sub-aggregation''s result: a metric, or the terms under a terms aggregation on a nested field''s sub-field (SubTermsResult).'
+      anyOf:
+        - $ref: "#/components/schemas/SubTermsResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    TermsResult:
+      type: object
+      additionalProperties: false
+      required: [doc_count_error_upper_bound, sum_other_doc_count, buckets]
+      properties:
+        doc_count_error_upper_bound: { type: integer, description: "The most documents a term left out may have; -1 when unknown (an order by _count ascending or a sub-aggregation, past a shard's cut)." }
+        sum_other_doc_count: { type: integer, description: The documents of the terms left out. }
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    SubTermsResult:
+      type: object
+      additionalProperties: false
+      required: [doc_count_error_upper_bound, sum_other_doc_count, buckets]
+      description: A terms result whose buckets hold no sub-aggregation.
+      properties:
+        doc_count_error_upper_bound: { type: integer }
+        sum_other_doc_count: { type: integer }
+        buckets: { type: array, items: { $ref: "#/components/schemas/LeafBucket" } }
+        truncated: { type: boolean }
+    BucketsResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    CompositeResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        after_key: { type: object, description: "The page's last bucket's key, the next page's after; absent on a page without buckets." }
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    FiltersResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        buckets:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/FilterResult" }
+    FilterResult:
+      type: object
+      required: [doc_count]
+      description: A filter or global bucket (or a filters bucket), with the aggregations under it inline by name.
+      properties:
+        doc_count: { type: integer }
+      additionalProperties: { $ref: "#/components/schemas/WrappedAggregationResult" }
+    Bucket:
+      type: object
+      required: [key, doc_count]
+      description: A bucket, with its sub-aggregations' results by name.
+      properties:
+        key: { $ref: "#/components/schemas/BucketKey" }
+        key_as_string: { type: string, description: "A date_histogram bucket's start in RFC 3339." }
+        from: { type: number, description: "A range bucket's from; absent when open." }
+        to: { type: number, description: "A range bucket's to; absent when open." }
+        doc_count: { type: integer }
+        doc_count_error_upper_bound: { type: integer, description: "A terms bucket's: how many more documents it may have (-1: unknown); absent when 0." }
+      additionalProperties: { $ref: "#/components/schemas/SubAggregationResult" }
+    LeafBucket:
+      type: object
+      additionalProperties: false
+      required: [key, doc_count]
+      properties:
+        key: { $ref: "#/components/schemas/BucketKey" }
+        doc_count: { type: integer }
+        doc_count_error_upper_bound: { type: integer }
+    BucketKey:
+      description: "A terms bucket's value, a range's key, a histogram bucket's start (Unix milliseconds for a date_histogram), or a composite bucket's key, each source's value by name."
+      type: [string, number, boolean, object]
+    StatsResult:
+      type: object
+      additionalProperties: false
+      required: [count, min, max, avg, sum]
+      properties:
+        count: { type: integer }
+        min: { type: [number, "null"] }
+        max: { type: [number, "null"] }
+        avg: { type: [number, "null"] }
+        sum: { type: number }
+    ValueResult:
+      type: object
+      additionalProperties: false
+      required: [value]
+      properties:
+        value: { type: [number, "null"], description: "A min or max (null with no value), or a cardinality." }
+    PercentilesResult:
+      type: object
+      additionalProperties: false
+      required: [values]
+      properties:
+        values:
+          oneOf:
+            - type: object
+              description: Keyed, by each percent (or value) as Java writes a double ("50.0", "99.9", "1.0E-4").
+              additionalProperties: { type: [number, "null"] }
+            - type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [key, value]
+                properties:
+                  key: { type: number }
+                  value: { type: [number, "null"] }
+    TopMetricsResult:
+      type: object
+      additionalProperties: false
+      required: [top]
+      properties:
+        top:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [sort, metrics]
+            properties:
+              sort: { type: array, items: { $ref: "#/components/schemas/SortValue" } }
+              metrics:
+                type: object
+                description: Each metric's value by field, null for none.
+                additionalProperties: { type: [string, number, boolean, "null"] }
+    SortValue:
+      description: A hit's value for one sort key, null for none.
+      type: [string, number, boolean, "null"]
     MaxStaleness:
       description: |
         For a search with size 0 (a count, or aggregations only) whose request_cache is on: how
@@ -1145,7 +1612,7 @@ components:
             required: [id, sort]
             properties:
               id: { type: string }
-              sort: { type: array, items: {} }
+              sort: { type: array, items: { $ref: "#/components/schemas/SortValue" } }
               _seq: { type: integer, description: "With seq_no: the seq of the change that wrote the version the copy holds." }
               body: { type: object }
               inner_hits:
@@ -1162,11 +1629,11 @@ components:
         next:
           type: [array, "null"]
           description: The search_after of the next page; null on a short page.
-          items: {}
+          items: { $ref: "#/components/schemas/SortValue" }
         aggs:
           type: object
-          description: 'The aggregations by name. A bucket aggregation cut, or a histogram left without its empty buckets, to keep the response within 65536 buckets carries truncated true. A filter or global aggregation is {"doc_count": n, ...} with the aggregations under it inline by name; a filters aggregation is {"buckets": {key: {"doc_count": n, ...}}}.'
-          additionalProperties: true
+          description: 'The aggregations by name (AggregationResult, by type). A bucket aggregation cut, or a histogram left without its empty buckets, to keep the response within 65536 buckets carries truncated true. A filter or global aggregation is {"doc_count": n, ...} with the aggregations under it inline by name; a filters aggregation is {"buckets": {key: {"doc_count": n, ...}}}.'
+          additionalProperties: { $ref: "#/components/schemas/AggregationResult" }
     SavedQuery:
       type: object
       additionalProperties: false

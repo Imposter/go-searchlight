@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"encoding/json"
+	"slices"
 	"testing"
 
 	"github.com/Imposter/go-searchlight/internal/query"
@@ -54,5 +55,57 @@ func TestWireMetrics(t *testing.T) {
 	}
 	if levelNeeds(levelMetrics) == levelNeeds(levelFrom) {
 		t.Errorf("level %d's errors name level %d's needs", levelMetrics, levelFrom)
+	}
+}
+
+// TestWirePercentiles: a percentiles or percentile_ranks aggregation, at any level,
+// needs search wire level 9, the newest, which a peer of an earlier release would refuse
+// as unknown; its settings cross the wire as they were.
+func TestWirePercentiles(t *testing.T) {
+	pct := search.Agg{Type: search.AggPercentiles, Field: "price", Percents: []float64{50, 99.9}, Compression: 200, Unkeyed: true}
+	ranks := search.Agg{Type: search.AggPercentileRanks, Field: "price", Values: []float64{10, 20}}
+	for name, tc := range map[string]struct {
+		aggs  map[string]search.Agg
+		needs int
+	}{
+		"percentiles": {map[string]search.Agg{"m": pct}, levelPercentiles},
+		"ranks under a filter": {map[string]search.Agg{"f": {Type: search.AggFilter, Filter: &query.All{}, Aggs: map[string]search.Agg{
+			"t": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{"m": ranks}},
+		}}}, levelPercentiles},
+		"stats": {map[string]search.Agg{"m": {Type: search.AggStats, Field: "price"}}, 0},
+	} {
+		wr, err := encodeRequest(&search.Request{Query: &query.All{}, Aggs: tc.aggs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(wr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var back wireRequest
+		if err := json.Unmarshal(raw, &back); err != nil {
+			t.Fatal(err)
+		}
+		r, err := back.decode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wr.Needs != tc.needs || back.Needs != tc.needs {
+			t.Errorf("%s: needs %d, %d after the wire; want %d", name, wr.Needs, back.Needs, tc.needs)
+		}
+		if got := r.Aggs["m"]; name == "percentiles" && (!slices.Equal(got.Percents, pct.Percents) || got.Compression != 200 || !got.Unkeyed) {
+			t.Errorf("%s: %+v after the wire, want %+v", name, got, pct)
+		}
+		if got := r.Aggs["f"].Aggs["t"].Aggs["m"]; name == "ranks under a filter" && !slices.Equal(got.Values, ranks.Values) {
+			t.Errorf("%s: values %v after the wire, want %v", name, got.Values, ranks.Values)
+		}
+	}
+	if searchLevel < levelPercentiles || levelNeeds(levelPercentiles) == levelNeeds(levelSeqNo) || levelNeeds(levelPercentiles) == levelNeeds(levelCompositeAggs) {
+		t.Errorf("search level %d is below %d, or its errors name level %d's or %d's needs", searchLevel, levelPercentiles, levelSeqNo, levelCompositeAggs)
+	}
+	aggs := map[string]search.Agg{"p": pct, "t": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{"r": ranks, "s": {Type: search.AggStats, Field: "price"}}}}
+	dropPercentiles(aggs)
+	if _, ok := aggs["p"]; ok || len(aggs["t"].Aggs) != 1 {
+		t.Errorf("dropPercentiles left %v", aggs)
 	}
 }

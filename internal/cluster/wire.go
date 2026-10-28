@@ -74,10 +74,11 @@ const codeStale = "stale_copy"
 // sub-field, which a lower peer would refuse, or answer reading the sub-field as a
 // field of no document. Level 7 collects sub-aggregations under a terms aggregation
 // on a sub-field (levelNestedSubAggs), which a lower peer would refuse, and level 8 the
-// hits' seqs (levelSeqNo), which a lower peer would leave out. Level 10 adds the
-// top_metrics and composite aggregations and a terms aggregation's order
-// (levelCompositeAggs), which a lower peer would refuse as unknown, or ignore,
-// answering in count order. A request says
+// hits' seqs (levelSeqNo), which a lower peer would leave out, and level 9 the
+// percentiles and percentile_ranks aggregations (levelPercentiles), which a lower peer
+// would refuse as unknown. Level 10 adds the top_metrics and composite aggregations
+// and a terms aggregation's order (levelCompositeAggs), which a lower peer would
+// refuse as unknown, or ignore, answering in count order. A request says
 // the level it needs (wireRequest.Needs), and goes to that level's endpoint
 // (searchPath), and a reply the level it was answered at
 // (searchReply.Level): a peer refuses a request past its level, and the coordinator a
@@ -95,6 +96,7 @@ const (
 	levelNested        = 6
 	levelNestedSubAggs = 7
 	levelSeqNo         = 8
+	levelPercentiles   = 9
 	levelCompositeAggs = 10
 )
 
@@ -104,6 +106,8 @@ func levelNeeds(needs int) string {
 	switch {
 	case needs >= levelCompositeAggs:
 		return "a top_metrics or composite aggregation, or a terms aggregation's order"
+	case needs >= levelPercentiles:
+		return "a percentiles or percentile_ranks aggregation"
 	case needs >= levelSeqNo:
 		return "seq_no, the hits' seqs"
 	case needs >= levelNestedSubAggs:
@@ -166,8 +170,9 @@ type wireRequest struct {
 	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
 	// nested field's objects (search.Request.Nested, or a nested node), 7 for
 	// sub-aggregations under a terms aggregation on a sub-field
-	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 10 for a
-	// top_metrics or composite aggregation or a terms aggregation's order.
+	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 9 for a
+	// percentiles or percentile_ranks aggregation, 10 for a top_metrics or composite
+	// aggregation or a terms aggregation's order.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -213,6 +218,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 	switch {
 	case compositeAggs(r.Aggs):
 		w.Needs = levelCompositeAggs
+	case percentileAggs(r.Aggs):
+		w.Needs = levelPercentiles
 	case r.SeqNo && r.Size > 0:
 		w.Needs = levelSeqNo
 	case r.NestedSubAggs:
@@ -640,6 +647,33 @@ func metricAggs(aggs map[string]search.Agg) bool {
 		}
 	}
 	return false
+}
+
+// percentileAggs reports whether aggs hold a percentiles or percentile_ranks
+// aggregation, at any level.
+func percentileAggs(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Type == search.AggPercentiles || a.Type == search.AggPercentileRanks || percentileAggs(a.Aggs) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropPercentiles removes every percentiles and percentile_ranks aggregation from
+// aggs, in place: what a peer of a level below levelPercentiles leaves of a search
+// holding them, had it not refused it (testHooks.olderPeer).
+func dropPercentiles(aggs map[string]search.Agg) {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Type == search.AggPercentiles || a.Type == search.AggPercentileRanks {
+			delete(aggs, name)
+			continue
+		}
+		dropPercentiles(a.Aggs)
+		aggs[name] = a
+	}
 }
 
 // termsFilters reports whether aggs hold a terms aggregation with an include or an

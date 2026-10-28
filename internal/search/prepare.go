@@ -110,6 +110,12 @@ type aggSpec struct {
 	// (nil under a filters aggregation's buckets, or a bucket aggregation's).
 	threshold int
 	reached   *atomic.Bool
+	// percents are a percentiles aggregation's percents, or a percentile_ranks one's
+	// values, ascending; compression is their digest's, and keyed how they are
+	// written.
+	percents    []float64
+	compression float64
+	keyed       bool
 	// terms is a terms aggregation's include and exclude, compiled; include and exclude
 	// are them as given.
 	terms            *termsFilter
@@ -421,8 +427,8 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 	}
 	if path, sub := m.NestedPath(a.Field); sub && !wrapper {
 		switch {
-		case a.Type != AggTerms && a.Type != AggStats && a.Type != AggMin && a.Type != AggMax && a.Type != AggCardinality:
-			ps.add(at+".field", "%q is a nested field's sub-field: terms, stats, min, max and cardinality aggregate one, %s does not", a.Field, a.Type)
+		case a.Type != AggTerms && a.Type != AggStats && a.Type != AggMin && a.Type != AggMax && a.Type != AggCardinality && !percentileType(a.Type):
+			ps.add(at+".field", "%q is a nested field's sub-field: terms, stats, min, max, cardinality, percentiles and percentile_ranks aggregate one, %s does not", a.Field, a.Type)
 			return nil
 		case under != "" && path != under:
 			ps.add(at+".field", "under a terms aggregation on a sub-field of %q, an aggregation reads %q's sub-fields (the bucket's objects) or top-level fields (its documents): %q is a sub-field of %q", under, under, a.Field, path)
@@ -449,11 +455,11 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		ps.add(loc, "global is a top-level aggregation only: it counts every document, whatever holds it")
 		return nil
 	case singleBucket(parent) && wrapper:
-		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min and max", a.Type, parent)
+		ps.add(loc, "%s does not nest under %s: filter, filters and global hold terms, range, histogram, date_histogram, stats, cardinality, min, max, percentiles and percentile_ranks", a.Type, parent)
 		return nil
 	case !singleBucket(parent) && a.Type == AggTerms && (under != "" || m == nil):
 	case !singleBucket(parent) && !isMetric:
-		ps.add(loc, "a sub-aggregation is a metric (stats, cardinality, min, max or top_metrics), or a terms aggregation under a terms aggregation on a sub-field")
+		ps.add(loc, "a sub-aggregation is a metric (stats, cardinality, min, max, percentiles, percentile_ranks or top_metrics), or a terms aggregation under a terms aggregation on a sub-field")
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
@@ -571,6 +577,11 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		default:
 			s.threshold = a.Threshold
 		}
+	case AggPercentiles, AggPercentileRanks:
+		if !numeric {
+			ps.add(at+".field", "%q is a %s: %s takes a number or date field", a.Field, s.ftype, a.Type)
+		}
+		preparePercentiles(s, a, at, ps)
 	case AggFilter:
 		s.keys, s.queries = []any{nil}, []query.Node{a.Filter}
 	case AggFilters:
@@ -623,6 +634,56 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		ps.add(at+".order", "order orders a terms aggregation's buckets: %s takes none", a.Type)
 	}
 	return s
+}
+
+// preparePercentiles checks a percentiles or percentile_ranks aggregation's settings
+// (given at at) into s: its compression, and its percents (or values) sorted, each
+// finite, a percent from 0 to 100, at most MaxPercents of them and none twice.
+func preparePercentiles(s *aggSpec, a Agg, at string, ps *problems) {
+	s.compression, s.keyed = a.Compression, !a.Unkeyed
+	switch {
+	case s.compression == 0:
+		s.compression = DefaultCompression
+	case !(s.compression >= MinCompression && s.compression <= MaxCompression):
+		ps.add(at+".tdigest.compression", "compression is a number from %d to %d", MinCompression, MaxCompression)
+		s.compression = DefaultCompression
+	}
+	key, given := "percents", a.Percents
+	if a.Type == AggPercentileRanks {
+		key, given = "values", a.Values
+		if len(given) == 0 {
+			ps.add(at+".values", "a percentile_ranks aggregation needs values")
+			return
+		}
+	} else if len(given) == 0 {
+		given = DefaultPercents
+	}
+	if len(given) > MaxPercents {
+		ps.add(at+"."+key, "a %s aggregation holds at most %d %s", a.Type, MaxPercents, key)
+		return
+	}
+	for i, f := range given {
+		switch {
+		case math.IsNaN(f) || math.IsInf(f, 0):
+			ps.add(fmt.Sprintf("%s.%s.%d", at, key, i), "%s are finite numbers", key)
+			return
+		case a.Type == AggPercentiles && (f < 0 || f > 100):
+			ps.add(fmt.Sprintf("%s.%s.%d", at, key, i), "a percent is from 0 to 100")
+			return
+		}
+	}
+	sorted := slices.Clone(given)
+	slices.Sort(sorted)
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i] == sorted[i-1] {
+			ps.add(at+"."+key, "%s holds %g twice", key, sorted[i])
+			return
+		}
+	}
+	for i := range sorted {
+		sorted[i] = positiveZero(sorted[i])
+	}
+	s.percents = sorted
 }
 
 // rangeKey names a range bucket as Elasticsearch does: "from-to", * for an open end.

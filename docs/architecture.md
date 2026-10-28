@@ -386,6 +386,9 @@ data_dir/
      segments by global ordinal when the hits hold many of the field's terms, by term
      otherwise.
    - A large segment's per-document aggregation is collected in parallel parts.
+   - Percentiles and percentile_ranks collect a merging t-digest (exact while it holds
+     at most `compression` distinct values), which the segments' parts, the segments
+     and the shards merge in turn.
    - A terms aggregation ordered by a sub-aggregation collects every term's
      sub-aggregations depth first, so each shard's cut is made in that order.
      `top_metrics` keeps each segment's few best documents, and `composite` the page's

@@ -891,6 +891,9 @@ func partialBytes(p *AggPartial) int64 {
 	if p.Value != nil {
 		n += 8
 	}
+	if d := p.Digest; d != nil {
+		n += 80 + 8*int64(cap(d.Means)+cap(d.Counts)+cap(d.buf))
+	}
 	n += 8 * int64(cap(p.Distinct))
 	return n
 }
@@ -1039,12 +1042,16 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 // validShape checks the members p holds are those of a's type: a min or max holds
 // at most its value; a cardinality with a threshold its distinct hashes (sorted,
 // unique, at most the threshold) and no sketch, one without a threshold no hashes; a
+// percentiles or percentile_ranks at most a well-formed digest of its compression; a
 // top_metrics its documents (validTop), a composite its keyed page (validComposite);
-// no other type holds a value, hashes, documents or composite keys, and only a terms
-// aggregation is cut.
+// no other type holds a value, hashes, a digest, documents or composite keys, and only
+// a terms aggregation is cut.
 func validShape(p *AggPartial, a *Agg) error {
 	if p.Cut && a.Type != AggTerms {
 		return errors.New("a cut list that is no terms list")
+	}
+	if p.Digest != nil && !percentileType(a.Type) {
+		return errors.New("a digest")
 	}
 	if a.Type != AggTopMetrics && p.Top != nil {
 		return errors.New("top documents")
@@ -1053,6 +1060,18 @@ func validShape(p *AggPartial, a *Agg) error {
 		return errors.New("composite keys")
 	}
 	switch a.Type {
+	case AggPercentiles, AggPercentileRanks:
+		if p.Buckets != nil || p.Stats != nil || p.Sketch != nil || p.Value != nil || p.Distinct != nil {
+			return errors.New("percentiles shape")
+		}
+		compression := a.Compression
+		if compression == 0 {
+			compression = DefaultCompression
+		}
+		if p.Digest != nil && !p.Digest.wellFormed(compression) {
+			return errors.New("digest")
+		}
+		return nil
 	case AggTopMetrics:
 		return validTop(p, a)
 	case AggComposite:

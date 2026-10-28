@@ -319,6 +319,26 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			v := *p.Value
 			res.Number = &v
 		}
+	case AggPercentiles, AggPercentileRanks:
+		res.Keys, res.Keyed = spec.percents, spec.keyed
+		res.Percentiles = make([]*float64, len(spec.percents))
+		if p.Digest == nil {
+			break
+		}
+		for i, k := range spec.percents {
+			var v float64
+			var ok bool
+			if spec.typ == AggPercentiles {
+				v, ok = p.Digest.Quantile(k / 100)
+			} else {
+				v, ok = p.Digest.Rank(k)
+				v *= 100
+			}
+			if ok {
+				v = positiveZero(v)
+				res.Percentiles[i] = &v
+			}
+		}
 	case AggCardinality:
 		if spec.threshold > 0 {
 			res.Value = int64(min(len(p.Distinct), spec.threshold))

@@ -69,6 +69,7 @@ segments.
 | A `terms` `order` | 8 keys, each once, none after `_key` | 400 with `loc` |
 | A `top_metrics` | `size` 10, 10 `metrics` | 400 with `loc` |
 | A `composite` page | `size` 10,000, 10 `sources` | 400 with `loc`: page on with `after` |
+| `percents` of a `percentiles`, `values` of a `percentile_ranks` aggregation | 100; `tdigest.compression` 10 to 1,000 | 400 with `loc` |
 | A `terms` `include` or `exclude` | 1,000 values; a pattern of 1,000 characters, 10,000 compiled instructions | 400 with `loc` |
 | `fields` in a search | 100 | 400 with `loc` `fields` |
 | Buckets in a search response, every aggregation's together | 65,536 | 400 with `loc` when one shard passes it; `"truncated": true` on the aggregations cut when only the merged shards do |
@@ -254,8 +255,8 @@ the objects it may hold count against `max_inflight_read_bytes` (1 KiB each) whi
 runs.
 
 **Aggregations** on a sub-field: `terms` (with its `size`, `shard_size`,
-`min_doc_count`, `include` and `exclude`), `stats`, `min`, `max` and `cardinality`, at
-the top level or under `filter`, `filters` and `global`. They collect the objects of
+`min_doc_count`, `include` and `exclude`), `stats`, `min`, `max`, `cardinality`,
+`percentiles` and `percentile_ranks`, at the top level or under `filter`, `filters` and `global`. They collect the objects of
 the hits; `"where"`, a query of the sub-fields, keeps the objects it matches:
 
 ```json
@@ -265,11 +266,12 @@ the hits; `"where"`, a query of the sub-fields, keeps the objects it matches:
 ```
 
 `terms` counts each hit once per value, however many of its objects hold it: a
-product with two L variants is one L. `stats`, `min`, `max` and `cardinality` read
-every chosen object's value.
+product with two L variants is one L. `stats`, `min`, `max`, `cardinality`,
+`percentiles` and `percentile_ranks` read every chosen object's value.
 
 **Sub-aggregations under a `terms` on a sub-field.** Such a `terms` holds `stats`,
-`min`, `max`, `cardinality` and `terms` sub-aggregations (the `terms` holding none of
+`min`, `max`, `cardinality`, `percentiles`, `percentile_ranks` and `terms`
+sub-aggregations (the `terms` holding none of
 its own), each bucket collecting them over:
 
 - **its documents**, for a sub-aggregation on a top-level field: each hit holding a
@@ -304,8 +306,7 @@ carry the outer bucket's `doc_count_error_upper_bound`. Its buckets count toward
 search, as for a histogram), and in the response those under the buckets it holds,
 right after their own aggregation's.
 
-Any other aggregation on a sub-field, a sub-aggregation of a `stats`, `min`, `max` or
-`cardinality` on one, one on a sub-field under any other bucket aggregation or of
+Any other aggregation on a sub-field, a sub-aggregation of a metric on one, one on a sub-field under any other bucket aggregation or of
 another nested field, any other sub-aggregation type under a `terms` on a sub-field,
 and a `where` on a field that is no sub-field are each a 400 at their `loc`. A search
 holding sub-aggregations under a `terms` on a sub-field reaches only nodes of 1.5 or
@@ -593,6 +594,27 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     its shard; over a dense hit set the dictionary's document frequencies answer
     without reading the hits. It is not Elasticsearch's `precision_threshold`, and
     takes no `precision`;
+  - `percentiles`, over a number or date field (a date as Unix milliseconds, as
+    `stats` gives it), with `percents` (each from 0 to 100, none twice; 1, 5, 25, 50,
+    75, 95 and 99 by default), `keyed` (`true` by default) and
+    `"tdigest": {"compression": n}` (10 to 1,000; 100 by default), as Elasticsearch's:
+
+    ```json
+    {"aggs": {"price": {"percentiles": {"field": "price", "percents": [50, 95, 99]}}}}
+    ```
+
+    ```json
+    {"price": {"values": {"50.0": 1299, "95.0": 4999, "99.0": 8950.5}}}
+    ```
+
+    Keyed, each percent is written as Elasticsearch (Java) writes a double: `"50.0"`,
+    `"99.9"`, `"1.0E-4"`. With `"keyed": false` the values are a list,
+    `{"values": [{"key": 50, "value": 1299}, ...]}`. Either is in ascending order of
+    percent, and a value is `null` when no document has one;
+  - `percentile_ranks`, the inverse, with `values` (at least one, none twice),
+    `keyed` and `tdigest` as `percentiles`: for each value, the percent of the field's
+    values below it plus half those equal to it (Elasticsearch's and the t-digest's
+    rank), `{"values": {"500.0": 55.2, ...}}`, keyed by value;
   - `filter`, a query: one bucket of the documents both the search's `query` and it
     match, `{"doc_count": n, ...}`;
   - `filters`, `{"filters": {"key": query, ...}, "other_bucket_key": "other"}`: a
@@ -605,7 +627,7 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     documents first by a sort, `{"top": [{"sort": [v], "metrics": {"field": v}}]}`.
 
   A bucket aggregation may carry metric sub-aggregations (`stats`, `cardinality`,
-  `min`, `max`, `top_metrics`) one level deep. `filter`,
+  `min`, `max`, `percentiles`, `percentile_ranks`, `top_metrics`) one level deep. `filter`,
   `filters` and `global` may carry any other aggregation, written inline in their
   bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
   most `filter` → `terms` → `stats`. A sub-aggregation is never named after a member
@@ -617,6 +639,25 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   query's bounds (4 levels, 50 conditions, 100 nodes). A `terms` aggregation over
   several shards reports its error bound, as Elasticsearch does, under a `filter`
   too. On one shard it is exact, and its `doc_count_error_upper_bound` is 0.
+
+  **Percentiles' accuracy.** `percentiles` and `percentile_ranks` collect a t-digest
+  (a merging digest with the arcsine scale function), per segment, merged per shard
+  and again across shards. While the values it collects (a bucket's, for a
+  sub-aggregation) hold at most `compression` distinct values, however often each
+  repeats, the digest holds each value with its count and is **exact**: a percentile
+  p is the linear interpolation between the two values of the ranks p/100 × (n − 1)
+  falls between, as Elasticsearch's exact digest gives it, and the answer is the same
+  whatever the shards and segments. Past that it keeps between `compression`/2 and
+  `compression` + 2 centroids (about 16 bytes each, in memory and on the wire), and is
+  approximate, sharpest at the tails: over 100,000 to 1,000,000 values of uniform,
+  normal, exponential, log-normal and repeating price data, compression 100, every
+  percentile tested was within 0.15% of its rank (0.08% at and beyond the 1st and
+  99th), merged from 64 parts too, and the 0th and 100th, the least and greatest
+  values, are exact. An approximate answer can differ slightly with the shard count,
+  as Elasticsearch's does. A larger `compression` is more exact and costs more; it
+  takes part in the request cache's key, as do `percents`, `values` and `keyed`. A
+  search holding either reaches only nodes of 1.7 or later (search wire level 9), a
+  503 while only older copies serve a shard.
 
   **`collect_mode`** is how a `terms` aggregation collects its sub-aggregations, as
   Elasticsearch's: `depth_first` collects them for every value as the hits are read;
@@ -673,6 +714,10 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
     aggregations counts 1 + 11 × 2 = 23.
   - At most 100 `ranges` per `range` aggregation, and 100 `filters` per `filters`
     aggregation.
+  - At most 100 `percents` per `percentiles` aggregation and 100 `values` per
+    `percentile_ranks` aggregation, each finite (a percent from 0 to 100) and none
+    given twice (`loc` `aggs.<name>.percentiles.percents`, or `.percents.<i>` for one),
+    and a `tdigest.compression` from 10 to 1,000.
   - A `terms` `size` of at most 65,536. `shard_size` is capped at 65,536.
   - A `terms` `order` of at most 8 keys; a `top_metrics` `size` of at most 10 and at most
     10 `metrics`; a `composite` `size` of at most 10,000 and at most 10 `sources`. A

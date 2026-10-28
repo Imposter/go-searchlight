@@ -8,6 +8,19 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ### Added
 
+- **`percentiles` and `percentile_ranks` aggregations**
+  ([docs/api.md](docs/api.md#search-and-count)), Elasticsearch's, over number and date
+  fields: `percents` (1, 5, 25, 50, 75, 95 and 99 by default) or `values`, `keyed`
+  (`{"values": {"50.0": v}}`, or a list of `{"key", "value"}`) and
+  `tdigest.compression` (10 to 1,000, 100 by default). Top-level, as a metric
+  sub-aggregation of every bucket aggregation, under `filter`, `filters` and `global`,
+  and on a nested field's sub-field with `where`, as `stats` is. Each collects a merging
+  t-digest that shards merge: exact while the values hold at most `compression`
+  distinct values, and past that within 0.15% of a rank on the data tested (0.08% at
+  the 1st and 99th percentiles and beyond), the least and greatest values exact. At most
+  100 percents or values each, none twice. A search holding one needs search wire
+  level 9, so it reaches only nodes of this release or later (503 while only older
+  copies serve a shard).
 - **`top_metrics`** ([docs/api.md](docs/api.md#top_metrics)): fields of the documents
   first by a sort, as Elasticsearch's top_metrics: `{"metrics": [{"field": "price"}],
   "sort": {"changed_at": "desc"}, "size": 1}` answers `{"top": [{"sort": [...],

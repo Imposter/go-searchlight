@@ -101,7 +101,21 @@ const (
 	DefaultCompositeSize = 10
 	MaxCompositeSize     = 10_000
 	MaxCompositeSources  = 10
+	// DefaultCompression is a percentiles or percentile_ranks aggregation's t-digest
+	// compression when Compression is 0, as Elasticsearch's: exact up to 100 distinct
+	// values, and about 100 centroids past them.
+	DefaultCompression = 100
+	// MinCompression and MaxCompression bound a t-digest's compression.
+	MinCompression = 10
+	MaxCompression = 1_000
+	// MaxPercents is the most percents a percentiles aggregation, or values a
+	// percentile_ranks aggregation, holds.
+	MaxPercents = 100
 )
+
+// DefaultPercents are a percentiles aggregation's percents when it names none, as
+// Elasticsearch's.
+var DefaultPercents = []float64{1, 5, 25, 50, 75, 95, 99}
 
 // IDField is the pseudo-field of the document id. Sorting on it sorts by the exact id;
 // querying it compares the id normalized, as a keyword.
@@ -117,15 +131,19 @@ const (
 	AggCardinality   = "cardinality"
 	AggMin           = "min"
 	AggMax           = "max"
-	AggFilter        = "filter"
-	AggFilters       = "filters"
-	AggGlobal        = "global"
-	AggTopMetrics    = "top_metrics"
-	AggComposite     = "composite"
+	AggPercentiles   = "percentiles"
+	// AggPercentileRanks is percentiles' inverse: for each of its values, the percent
+	// of values below it, plus half those equal to it.
+	AggPercentileRanks = "percentile_ranks"
+	AggFilter          = "filter"
+	AggFilters         = "filters"
+	AggGlobal          = "global"
+	AggTopMetrics      = "top_metrics"
+	AggComposite       = "composite"
 )
 
 // aggTypeList names the aggregation types, for problems.
-const aggTypeList = "terms, range, histogram, date_histogram, composite, stats, cardinality, min, max, top_metrics, filter, filters or global"
+const aggTypeList = "terms, range, histogram, date_histogram, composite, stats, cardinality, min, max, percentiles, percentile_ranks, top_metrics, filter, filters or global"
 
 // The collect modes of a terms aggregation with sub-aggregations (Agg.CollectMode).
 const (
@@ -137,10 +155,17 @@ const (
 	CollectBreadthFirst = "breadth_first"
 )
 
-// metricType reports whether typ is a metric aggregation: stats, cardinality, min, max
-// or top_metrics, which a bucket aggregation holds as sub-aggregations.
+// metricType reports whether typ is a metric aggregation: stats, cardinality, min, max,
+// percentiles, percentile_ranks or top_metrics, which a bucket aggregation holds as
+// sub-aggregations.
 func metricType(typ string) bool {
-	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax || typ == AggTopMetrics
+	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax || percentileType(typ) || typ == AggTopMetrics
+}
+
+// percentileType reports whether typ is percentiles or percentile_ranks, which read
+// one t-digest.
+func percentileType(typ string) bool {
+	return typ == AggPercentiles || typ == AggPercentileRanks
 }
 
 // singleBucket reports whether typ is a filter, filters or global aggregation: buckets
@@ -255,7 +280,7 @@ const (
 
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
 // date_histogram, composite) may hold metric sub-aggregations (stats, cardinality,
-// min, max, top_metrics) in Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
+// min, max, percentiles, percentile_ranks, top_metrics) in Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
 // holds any other aggregation in Aggs, each with its own metric sub-aggregations: its
 // buckets are sets of documents, which the aggregations under it count as top-level
 // ones count the search's matches.
@@ -265,8 +290,8 @@ const (
 // and aggregations alike (the parity rules), so terms and cardinality over _id count
 // ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
 //
-// A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max and
-// cardinality alone, at the top level or under filter, filters and global: over the
+// A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max,
+// cardinality, percentiles and percentile_ranks alone, at the top level or under filter, filters and global: over the
 // objects of the hits that Where chooses. terms counts each document once per value,
 // however many of its objects hold it; the metrics read every chosen object's value.
 // A terms on a sub-field holds metric and terms sub-aggregations (those terms holding
@@ -344,8 +369,25 @@ type Agg struct {
 	// not Elasticsearch's precision_threshold, and takes no Precision.
 	Threshold int `json:",omitempty"`
 
-	// Where, on an aggregation of a nested field's sub-field (terms, stats, min, max
-	// or cardinality), chooses the objects it collects: an inner query of the field
+	// Percents are a percentiles aggregation's percentiles, each from 0 to 100, at most
+	// MaxPercents and none twice: DefaultPercents when empty. Values are a
+	// percentile_ranks aggregation's values (at least one, at most MaxPercents, none
+	// twice), each answered with the percent of values below it plus half those equal
+	// to it. Either answers in ascending order.
+	Percents []float64 `json:",omitempty"`
+	Values   []float64 `json:",omitempty"`
+	// Compression is their t-digest's compression (MinCompression to MaxCompression):
+	// DefaultCompression when 0. The digest is exact while the values it collects hold
+	// at most Compression distinct values (rounded up), and approximate past them,
+	// sharpest at the extreme percentiles; a larger compression is more exact and
+	// costs more memory and wire (about 16 bytes a centroid).
+	Compression float64 `json:",omitempty"`
+	// Unkeyed writes a percentiles or percentile_ranks result as a list of
+	// {"key", "value"} rather than an object by key (Elasticsearch's keyed: false).
+	Unkeyed bool `json:",omitempty"`
+
+	// Where, on an aggregation of a nested field's sub-field (terms, stats, min, max,
+	// cardinality, percentiles or percentile_ranks), chooses the objects it collects: an inner query of the field
 	// ([query.ValidateInner]); every object of the hits when nil. Its owner encodes it
 	// on the wire.
 	Where query.Node `json:"-"`
@@ -405,9 +447,11 @@ func (ps *problems) add(loc, format string, args ...any) {
 //   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
 //     (terms also takes include and exclude, an array of values or a pattern,
 //     collect_mode, and order: {"_count"|"_key"|"<sub-aggregation>": "asc"|"desc"} or a
-//     list of them), {"name": {"top_metrics": {"metrics": [{"field": f}], "sort":
-//     {f: "desc"}, "size": 1}}}, {"name": {"composite": {"sources": [{"name": {"terms":
-//     {"field": f}}}], "size": 10, "after": {...}}, "aggs": {...}}}, or
+//     list of them; percentiles takes percents, keyed and tdigest.compression, and
+//     percentile_ranks values, keyed and tdigest.compression), {"name": {"top_metrics":
+//     {"metrics": [{"field": f}], "sort": {f: "desc"}, "size": 1}}}, {"name":
+//     {"composite": {"sources": [{"name": {"terms": {"field": f}}}], "size": 10,
+//     "after": {...}}, "aggs": {...}}}, or
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
@@ -703,7 +747,7 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 			switch key {
 			case "aggs", "aggregations":
 				subs, subsKey = val, key
-			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality, AggMin, AggMax:
+			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality, AggMin, AggMax, AggPercentiles, AggPercentileRanks:
 				typed++
 				a.Type = key
 				parseAggBody(&a, val, at+"."+key, ps)
@@ -1032,14 +1076,16 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "order", "where"},
-		AggRange:         {"field", "ranges"},
-		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
-		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
-		AggStats:         {"field", "where"},
-		AggMin:           {"field", "where"},
-		AggMax:           {"field", "where"},
-		AggCardinality:   {"field", "precision", "threshold", "where"},
+		AggTerms:           {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "order", "where"},
+		AggRange:           {"field", "ranges"},
+		AggHistogram:       {"field", "interval", "offset", "min_doc_count"},
+		AggDateHistogram:   {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
+		AggStats:           {"field", "where"},
+		AggMin:             {"field", "where"},
+		AggMax:             {"field", "where"},
+		AggCardinality:     {"field", "precision", "threshold", "where"},
+		AggPercentiles:     {"field", "percents", "keyed", "tdigest", "where"},
+		AggPercentileRanks: {"field", "values", "keyed", "tdigest", "where"},
 	}[a.Type]
 	for _, key := range slices.Sorted(maps.Keys(body)) {
 		val := body[key]
@@ -1073,6 +1119,29 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			}
 		case "order":
 			a.Order = parseTermsOrder(val, at, ps)
+		case "percents", "values":
+			nums, ok := floatsOf(val)
+			switch {
+			case !ok:
+				ps.add(at, "%s is a list of numbers", key)
+			case len(nums) == 0:
+				ps.add(at, "%s holds at least one number", key)
+			case key == "percents":
+				a.Percents = nums
+			default:
+				a.Values = nums
+			}
+		case "keyed":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				a.Unkeyed = false
+			case "false":
+				a.Unkeyed = true
+			default:
+				ps.add(at, "keyed is true or false")
+			}
+		case "tdigest":
+			parseTDigest(a, val, at, ps)
 		case "collect_mode":
 			if json.Unmarshal(val, &a.CollectMode) != nil || (a.CollectMode != CollectDepthFirst && a.CollectMode != CollectBreadthFirst) {
 				ps.add(at, "collect_mode is %q or %q", CollectDepthFirst, CollectBreadthFirst)
@@ -1180,6 +1249,45 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 				a.Ranges = append(a.Ranges, out)
 			}
 		}
+	}
+}
+
+// floatsOf reads a JSON list of finite numbers.
+func floatsOf(raw json.RawMessage) ([]float64, bool) {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, false
+	}
+	out := make([]float64, len(items))
+	for i, item := range items {
+		f, ok := floatOf(item)
+		if !ok {
+			return nil, false
+		}
+		out[i] = f
+	}
+	return out, true
+}
+
+// parseTDigest reads a percentiles or percentile_ranks aggregation's tdigest settings:
+// {"compression": n}.
+func parseTDigest(a *Agg, raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, `tdigest is an object: {"compression": n}`)
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		if key != "compression" {
+			ps.add(loc+"."+key, "unknown key: tdigest takes compression")
+			continue
+		}
+		f, ok := floatOf(body[key])
+		if !ok || f < MinCompression || f > MaxCompression {
+			ps.add(loc+"."+key, "compression is a number from %d to %d", MinCompression, MaxCompression)
+			continue
+		}
+		a.Compression = f
 	}
 }
 

@@ -386,6 +386,11 @@ data_dir/
      segments by global ordinal when the hits hold many of the field's terms, by term
      otherwise.
    - A large segment's per-document aggregation is collected in parallel parts.
+   - A terms aggregation ordered by a sub-aggregation collects every term's
+     sub-aggregations depth first, so each shard's cut is made in that order.
+     `top_metrics` keeps each segment's few best documents, and `composite` the page's
+     least keys past `after` (pruned once it holds twice the page): each shard and the
+     coordinator keep the best of those, which is exact.
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for

@@ -32,7 +32,12 @@ import (
 // response's doc_count_error_upper_bound is their sum, and each bucket's own bound is
 // the sum over the shards that did not return it. A bucket's doc_count is therefore a
 // lower bound, exact when its bound is 0; with one shard, or shard_size at least the
-// number of distinct terms, every count is exact.
+// number of distinct terms, every count is exact. A terms order other than _count
+// descending cuts each shard's list in that order instead, and bounds the error as
+// [TermsOrder] says (termsorder.go).
+//
+// top_metrics (topmetrics.go) and composite (composite.go) keep, per segment, shard and
+// response, the best (or least) of what their parts kept: exact at every level.
 //
 // A filter, filters or global aggregation is a few buckets of documents: per segment,
 // the hits its filter matches (the plan's, as the query's: filter cache and residual
@@ -50,14 +55,19 @@ type AggPartial struct {
 	// cut list can have: the count of its last returned term, or 0 when it cut none.
 	DocCountError int64 `json:"doc_count_error,omitempty"`
 	// OtherDocCount (terms) counts the documents of the terms left out.
-	OtherDocCount int64         `json:"other_doc_count,omitempty"`
-	Stats         *StatsPartial `json:"stats,omitempty"`
-	Sketch        *Sketch       `json:"sketch,omitempty"`
+	OtherDocCount int64 `json:"other_doc_count,omitempty"`
+	// Cut (terms) is set when the shard cut its list under an order other than
+	// _count descending, whose DocCountError says nothing (see missedBound).
+	Cut    bool          `json:"cut,omitempty"`
+	Stats  *StatsPartial `json:"stats,omitempty"`
+	Sketch *Sketch       `json:"sketch,omitempty"`
 	// Value is a min or max aggregation's least or greatest value, nil with none.
 	Value *float64 `json:"value,omitempty"`
 	// Distinct (a cardinality with a threshold) are distinct value hashes, sorted: all
 	// of them while fewer than the threshold, else threshold of them.
 	Distinct []uint64 `json:"distinct,omitempty"`
+	// Top (top_metrics) are the best documents seen, best first: at most its size.
+	Top []*TopPartial `json:"top,omitempty"`
 
 	// ords are a segment's partials by local ordinal (a keyword or list field's terms
 	// or cardinality, one per part of the segment collected apart), which the shard
@@ -68,8 +78,12 @@ type AggPartial struct {
 // BucketPartial is one bucket of a partial: its key (a string, float64 or bool; a
 // range bucket's index as a float64; a filters bucket's key, nil for filter and
 // global), documents, and sub-aggregation partials.
+//
+// A composite bucket's Key is its Keys, one value per source, encoded as one string
+// (compositeKey), by which partials merge.
 type BucketPartial struct {
 	Key      any                    `json:"key"`
+	Keys     []any                  `json:"keys,omitempty"`
 	DocCount int64                  `json:"doc_count"`
 	Aggs     map[string]*AggPartial `json:"aggs,omitempty"`
 }
@@ -281,6 +295,10 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 			c.allow = s.termMask(spec, src)
 		}
 		return c
+	case AggTopMetrics:
+		return s.newTopColl(spec)
+	case AggComposite:
+		return s.newCompColl(spec)
 	case AggRange:
 		return &rangeColl{s: s, spec: spec, src: src, counts: make([]int64, len(spec.ranges)), subs: make([][]collector, len(spec.ranges))}
 	default:
@@ -650,7 +668,7 @@ type termsColl struct {
 // distinct values than shard_size, so most of the buckets collected depth first would
 // be dropped.
 func deferSubs(spec *aggSpec, src *fieldSrc) bool {
-	if len(spec.subs) == 0 || !src.ordinal() {
+	if len(spec.subs) == 0 || !src.ordinal() || spec.orderSubs() {
 		return false
 	}
 	switch spec.collect {
@@ -1433,6 +1451,8 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 		dst.Stats.merge(src.Stats)
 	case AggMin, AggMax:
 		mergeExtreme(&dst.Value, src.Value, spec.typ == AggMax)
+	case AggTopMetrics:
+		dst.Top = mergeTop(dst.Top, src.Top, spec)
 	case AggCardinality:
 		if spec.threshold > 0 {
 			u := unionSorted(dst.Distinct, src.Distinct)
@@ -1447,6 +1467,7 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 	default:
 		dst.DocCountError += src.DocCountError
 		dst.OtherDocCount += src.OtherDocCount
+		dst.Cut = dst.Cut || src.Cut
 		if spec.typ == AggRange {
 			if len(dst.Buckets) == 0 {
 				for _, b := range src.Buckets {
@@ -1478,7 +1499,7 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 }
 
 func cloneBucket(b *BucketPartial, spec *aggSpec) *BucketPartial {
-	nb := &BucketPartial{Key: b.Key, DocCount: b.DocCount}
+	nb := &BucketPartial{Key: b.Key, Keys: b.Keys, DocCount: b.DocCount}
 	if len(spec.subs) > 0 {
 		nb.Aggs = make(map[string]*AggPartial, len(spec.subs))
 		for _, sub := range spec.subs {
@@ -1516,19 +1537,22 @@ func cmpTerms(a, b *BucketPartial) int {
 	return cmpValue(a.Key, b.Key, false)
 }
 
-// cutShard finishes a shard's partial: a terms list sorted and cut to shard_size (with
-// its error bound), a histogram sorted by key.
+// cutShard finishes a shard's partial: a terms list sorted in its order and cut to
+// shard_size (with its error bound), a composite's page sorted and cut to its size, a
+// histogram sorted by key.
 func cutShard(p *AggPartial, spec *aggSpec) {
 	switch spec.typ {
 	case AggTerms:
-		topK(p.Buckets, spec.shardSize, cmpTerms)
+		sortTerms(p.Buckets, spec.shardSize, spec)
 		if len(p.Buckets) > spec.shardSize {
 			for _, b := range p.Buckets[spec.shardSize:] {
 				p.OtherDocCount += b.DocCount
 			}
 			p.Buckets = p.Buckets[:spec.shardSize]
-			p.DocCountError = p.Buckets[len(p.Buckets)-1].DocCount
+			markCut(p, spec)
 		}
+	case AggComposite:
+		p.Buckets = cutComposite(p.Buckets, spec)
 	case AggHistogram, AggDateHistogram:
 		slices.SortFunc(p.Buckets, func(a, b *BucketPartial) int { return cmpValue(a.Key, b.Key, false) })
 	}
@@ -1653,6 +1677,11 @@ type AggResult struct {
 	// are Buckets, keyed by filter.
 	DocCount int64
 	Aggs     map[string]*AggResult
+	// Top are a top_metrics aggregation's documents, best first.
+	Top []TopMetric
+	// AfterKey is a composite aggregation's page's last bucket's key, which the next
+	// page passes as after: nil when the page has no bucket, the walk done.
+	AfterKey *CompositeKey
 	// Truncated is set on a bucket aggregation cut, or a histogram left without its
 	// empty buckets, to keep the response within MaxBuckets buckets.
 	Truncated bool
@@ -1696,6 +1725,8 @@ func (a *AggResult) appendJSON(dst []byte) ([]byte, error) {
 		return append(strconv.AppendInt(append(dst, `{"value":`...), a.Value, 10), '}'), nil
 	case AggMin, AggMax:
 		return append(appendJSONNumber(append(dst, `{"value":`...), a.Number), '}'), nil
+	case AggTopMetrics:
+		return appendTopJSON(dst, a.Top)
 	case AggFilter, AggGlobal:
 		return appendInlineBucket(dst, a.DocCount, a.Aggs)
 	case AggFilters:
@@ -1720,11 +1751,18 @@ func (a *AggResult) appendJSON(dst []byte) ([]byte, error) {
 		}
 		return append(dst, "}}"...), nil
 	}
-	if a.Type == AggTerms {
+	switch {
+	case a.Type == AggTerms:
 		dst = strconv.AppendInt(append(dst, `{"doc_count_error_upper_bound":`...), a.DocCountErrorUpperBound, 10)
 		dst = strconv.AppendInt(append(dst, `,"sum_other_doc_count":`...), a.SumOtherDocCount, 10)
 		dst = append(dst, `,"buckets":[`...)
-	} else {
+	case a.Type == AggComposite && a.AfterKey != nil:
+		var err error
+		if dst, err = a.AfterKey.appendJSON(append(dst, `{"after_key":`...)); err != nil {
+			return nil, err
+		}
+		dst = append(dst, `,"buckets":[`...)
+	default:
 		dst = append(dst, `{"buckets":[`...)
 	}
 	for i, b := range a.Buckets {
@@ -1886,6 +1924,8 @@ func appendJSONValue(dst []byte, v any) ([]byte, error) {
 		return strconv.AppendBool(dst, v), nil
 	case nil:
 		return append(dst, "null"...), nil
+	case *CompositeKey:
+		return v.appendJSON(dst)
 	}
 	raw, err := json.Marshal(v)
 	return append(dst, raw...), err

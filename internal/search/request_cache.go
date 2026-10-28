@@ -864,9 +864,22 @@ func partialBytes(p *AggPartial) int64 {
 		if b == nil {
 			continue
 		}
-		n += 72 + partialsBytes(b.Aggs)
+		n += 72 + partialsBytes(b.Aggs) + 24*int64(len(b.Keys))
 		if s, ok := b.Key.(string); ok {
 			n += int64(len(s))
+		}
+		for _, k := range b.Keys {
+			if s, ok := k.(string); ok {
+				n += int64(len(s))
+			}
+		}
+	}
+	for _, t := range p.Top {
+		n += 64 + int64(len(t.ID)) + 24*int64(len(t.Metrics))
+		for _, m := range t.Metrics {
+			if s, ok := m.(string); ok {
+				n += int64(len(s))
+			}
 		}
 	}
 	if p.Stats != nil {
@@ -1025,10 +1038,28 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 
 // validShape checks the members p holds are those of a's type: a min or max holds
 // at most its value; a cardinality with a threshold its distinct hashes (sorted,
-// unique, at most the threshold) and no sketch, one without a threshold no hashes;
-// no other type holds a value or hashes.
+// unique, at most the threshold) and no sketch, one without a threshold no hashes; a
+// top_metrics its documents (validTop), a composite its keyed page (validComposite);
+// no other type holds a value, hashes, documents or composite keys, and only a terms
+// aggregation is cut.
 func validShape(p *AggPartial, a *Agg) error {
+	if p.Cut && a.Type != AggTerms {
+		return errors.New("a cut list that is no terms list")
+	}
+	if a.Type != AggTopMetrics && p.Top != nil {
+		return errors.New("top documents")
+	}
+	if a.Type != AggComposite && slices.ContainsFunc(p.Buckets, func(b *BucketPartial) bool { return b != nil && b.Keys != nil }) {
+		return errors.New("composite keys")
+	}
 	switch a.Type {
+	case AggTopMetrics:
+		return validTop(p, a)
+	case AggComposite:
+		if p.Value != nil || p.Distinct != nil {
+			return errors.New("value or distinct hashes")
+		}
+		return validComposite(p, a)
 	case AggMin, AggMax:
 		if p.Buckets != nil || p.Stats != nil || p.Sketch != nil || p.Distinct != nil {
 			return errors.New("min or max shape")

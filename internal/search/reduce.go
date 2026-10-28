@@ -203,8 +203,9 @@ func reduceWrapper(parts []*AggPartial, spec *aggSpec) *AggResult {
 }
 
 // reduceTerms merges terms lists, tracking which shards returned each term for its
-// error bound (see aggs.go). One shard's list is exact, so its bound is 0: no term it
-// left out has more documents than one it returned.
+// error bound (see aggs.go, and TermsOrder for orders other than _count descending,
+// whose bounds are 0 or unknown, -1). One shard's list is exact, so its bound is 0: no
+// term it left out sorts before one it returned.
 func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	// acc is one term's bucket over the shards: the first shard's own until a second
 	// returns the term, then a copy the others merge into, so a shard's partial is
@@ -218,9 +219,14 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	var all []*acc
 	res := &AggResult{Type: AggTerms}
 	var docs int64
+	bound := spec.bound()
 	for i, p := range parts {
-		if len(parts) > 1 {
+		switch {
+		case len(parts) == 1:
+		case bound == boundCount:
 			res.DocCountErrorUpperBound += p.DocCountError
+		case bound == boundNone && p.Cut:
+			res.DocCountErrorUpperBound = -1
 		}
 		docs += p.OtherDocCount
 		for _, b := range p.Buckets {
@@ -245,16 +251,22 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	for _, a := range all {
 		var e int64
 		for i, p := range parts {
-			if !a.seen[i] {
-				e += p.DocCountError
+			if a.seen[i] {
+				continue
 			}
+			m := missedBound(a.b, p, spec)
+			if m < 0 {
+				e = -1
+				break
+			}
+			e += m
 		}
 		errs[a.b] = e
 		if a.b.DocCount >= int64(spec.minDoc) {
 			buckets = append(buckets, a.b)
 		}
 	}
-	topK(buckets, spec.size, cmpTerms)
+	sortTerms(buckets, spec.size, spec)
 	if len(buckets) > spec.size {
 		buckets = buckets[:spec.size]
 	}
@@ -263,6 +275,9 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 		returned += b.DocCount
 		out := finishBucket(b, spec)
 		out.DocCountErrorUpperBound = errs[b]
+		if out.DocCountErrorUpperBound < 0 && bound != boundCount {
+			res.DocCountErrorUpperBound = -1
+		}
 		boundSubTerms(out, spec)
 		res.Buckets = append(res.Buckets, out)
 	}
@@ -332,6 +347,10 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			}
 			res.Buckets = append(res.Buckets, out)
 		}
+	case AggTopMetrics:
+		res.Top = finishTop(p, spec)
+	case AggComposite:
+		return finishComposite(p, spec)
 	case AggTerms:
 		return reduceTerms([]*AggPartial{p}, spec)
 	case AggFilter, AggFilters, AggGlobal:
@@ -398,6 +417,9 @@ func cutBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
 				}
 			}
 			res.Buckets, res.Truncated = res.Buckets[:*left], true
+			if spec.typ == AggComposite {
+				res.AfterKey = lastCompositeKey(res.Buckets)
+			}
 		}
 		*left -= len(res.Buckets)
 		if spec.typ == AggTerms {

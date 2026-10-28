@@ -195,6 +195,21 @@ func TestRequestCacheKeyIgnoresTimeoutAndIndexLabel(t *testing.T) {
 		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand"}}}}`,
 		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand","threshold":2}}}}`,
 		`{"size":0,"aggs":{"b":{"cardinality":{"field":"brand","threshold":3}}}}`,
+		`{"size":0,"aggs":{"b":{"terms":{"field":"brand","order":{"_key":"asc"}}}}}`,
+		`{"size":0,"aggs":{"b":{"terms":{"field":"brand","order":{"_key":"desc"}}}}}`,
+		`{"size":0,"aggs":{"b":{"terms":{"field":"brand","order":[{"_count":"asc"},{"_key":"desc"}]}}}}`,
+		`{"size":0,"aggs":{"b":{"top_metrics":{"metrics":{"field":"price"},"sort":"created"}}}}`,
+		`{"size":0,"aggs":{"b":{"top_metrics":{"metrics":{"field":"price"},"sort":{"created":"desc"}}}}}`,
+		`{"size":0,"aggs":{"b":{"top_metrics":{"metrics":{"field":"brand"},"sort":"created"}}}}`,
+		`{"size":0,"aggs":{"b":{"top_metrics":{"metrics":{"field":"price"},"sort":"created","size":2}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"terms":{"field":"brand"}}}]}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"terms":{"field":"brand","order":"desc"}}}]}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"terms":{"field":"brand"}}}],"size":3}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"terms":{"field":"brand"}}}],"after":{"b":"acme"}}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"terms":{"field":"brand"}}}],"after":{"b":"acmf"}}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"c":{"terms":{"field":"brand"}}}]}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"histogram":{"field":"price","interval":5}}}]}}}}`,
+		`{"size":0,"aggs":{"b":{"composite":{"sources":[{"b":{"histogram":{"field":"price","interval":6}}}]}}}}`,
 	} {
 		k, ok := requestCacheKey(parseReq(t, raw))
 		if !ok || bytes.Equal(k, ka) {
@@ -468,6 +483,10 @@ func TestCachedResultEncodingRoundTrips(t *testing.T) {
 		`{"size":0,"aggs":{"lo":{"min":{"field":"price"}},"hi":{"max":{"field":"created"}},"none":{"min":{"field":"desc_n"}},
 			"few":{"cardinality":{"field":"tags","threshold":3}},"all":{"cardinality":{"field":"tags","threshold":1000}},
 			"b":{"terms":{"field":"brand","collect_mode":"breadth_first"},"aggs":{"lo":{"min":{"field":"price"}},"n":{"cardinality":{"field":"tags","threshold":2}}}}}}`,
+		`{"size":0,"aggs":{"top":{"top_metrics":{"metrics":[{"field":"price"},{"field":"brand"},{"field":"_id"}],"sort":{"created":"desc"},"size":3}},
+			"b":{"terms":{"field":"brand","size":3,"shard_size":3,"order":{"st.avg":"desc"}},"aggs":{"st":{"stats":{"field":"price"}},"top":{"top_metrics":{"metrics":{"field":"price"},"sort":"created"}}}},
+			"k":{"terms":{"field":"brand","size":2,"shard_size":2,"order":{"_key":"desc"}}},
+			"c":{"composite":{"size":4,"sources":[{"b":{"terms":{"field":"brand"}}},{"p":{"histogram":{"field":"price","interval":10}}},{"t":{"terms":{"field":"tags","order":"desc"}}}]},"aggs":{"lo":{"min":{"field":"price"}}}}}}`,
 	} {
 		req := parseReq(t, raw)
 		res := s.search(nil, req)
@@ -923,6 +942,42 @@ func TestCachedResultDecodeChecksNewPartials(t *testing.T) {
 	terms := parseReq(t, `{"size":0,"aggs":{"b":{"terms":{"field":"brand"}}}}`)
 	if _, err := decodeCachedResult(encodeJSONValue(t, `{"total":1,"total_relation":"eq","aggs":{"b":{"type":"terms","value":2}}}`), 4096, terms); err == nil {
 		t.Error("a terms partial with a value decoded")
+	}
+}
+
+// TestCachedResultDecodeChecksOrderedPartials: a top_metrics partial holds at most its
+// size of documents, best first, each with its metrics; a composite's buckets are keyed
+// by one value per source, encoded as their Key, at most its size; only a terms list is
+// cut.
+func TestCachedResultDecodeChecksOrderedPartials(t *testing.T) {
+	req := parseReq(t, `{"size":0,"aggs":{"tm":{"top_metrics":{"metrics":[{"field":"price"},{"field":"brand"}],"sort":{"created":"desc"},"size":2}},
+		"c":{"composite":{"size":2,"sources":[{"b":{"terms":{"field":"brand"}}},{"p":{"terms":{"field":"price"}}}]}},"t":{"terms":{"field":"brand","order":{"_key":"asc"}}}}}`)
+	ok := `{"total":3,"total_relation":"eq","aggs":{"tm":{"type":"top_metrics","top":[{"sort":9,"id":"a","metrics":[1,"x"]},{"sort":null,"id":"b","metrics":[null,null]}]},` +
+		`"c":{"type":"composite","buckets":[{"key":"[\"x\",1]","keys":["x",1],"doc_count":1}]},"t":{"type":"terms","cut":true,"buckets":[{"key":"x","doc_count":1}]}}}`
+	if _, err := decodeCachedResult(encodeJSONValue(t, ok), 4096, req); err != nil {
+		t.Fatalf("a valid value: %v", err)
+	}
+	for name, js := range map[string]string{
+		"top past its size":       strings.Replace(ok, `"top":[`, `"top":[{"sort":10,"id":"0","metrics":[1,"x"]},`, 1),
+		"top out of order":        strings.Replace(ok, `"sort":9,"id":"a"`, `"sort":null,"id":"c"`, 1),
+		"top metrics missing":     strings.Replace(ok, `"metrics":[1,"x"]`, `"metrics":[1]`, 1),
+		"top sort a string":       strings.Replace(ok, `"sort":9`, `"sort":"9"`, 1),
+		"top metric an object":    strings.Replace(ok, `"metrics":[1,"x"]`, `"metrics":[1,{}]`, 1),
+		"top with a value":        strings.Replace(ok, `"type":"top_metrics",`, `"type":"top_metrics","value":1,`, 1),
+		"composite key short":     strings.Replace(ok, `"keys":["x",1]`, `"keys":["x"]`, 1),
+		"composite key encoding":  strings.Replace(ok, `"keys":["x",1]`, `"keys":["x",2]`, 1),
+		"composite key type":      strings.Replace(ok, `"keys":["x",1]`, `"keys":["x",{}]`, 1),
+		"composite past its size": strings.Replace(ok, `"doc_count":1}]},"t"`, `"doc_count":1},{"key":"y","keys":["y",1],"doc_count":1},{"key":"z","keys":["z",1],"doc_count":1}]},"t"`, 1),
+		"terms with keys":         strings.Replace(ok, `"buckets":[{"key":"x","doc_count":1}]`, `"buckets":[{"key":"x","keys":["x"],"doc_count":1}]`, 1),
+		"a cut composite":         strings.Replace(ok, `"type":"composite",`, `"type":"composite","cut":true,`, 1),
+		"top under composite":     strings.Replace(ok, `"type":"composite",`, `"type":"composite","top":[{"sort":9,"id":"a","metrics":[1,"x"]}],`, 1),
+	} {
+		if js == ok {
+			t.Fatalf("%s: the replacement changed nothing", name)
+		}
+		if res, err := decodeCachedResult(encodeJSONValue(t, js), 4096, req); err == nil {
+			t.Errorf("%s: decoded %+v", name, res)
+		}
 	}
 }
 

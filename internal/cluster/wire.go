@@ -74,13 +74,16 @@ const codeStale = "stale_copy"
 // sub-field, which a lower peer would refuse, or answer reading the sub-field as a
 // field of no document. Level 7 collects sub-aggregations under a terms aggregation
 // on a sub-field (levelNestedSubAggs), which a lower peer would refuse, and level 8 the
-// hits' seqs (levelSeqNo), which a lower peer would leave out. A request says
+// hits' seqs (levelSeqNo), which a lower peer would leave out. Level 9 adds the
+// top_metrics and composite aggregations and a terms aggregation's order
+// (levelCompositeAggs), which a lower peer would refuse as unknown, or ignore,
+// answering in count order. A request says
 // the level it needs (wireRequest.Needs), and goes to that level's endpoint
 // (searchPath), and a reply the level it was answered at
 // (searchReply.Level): a peer refuses a request past its level, and the coordinator a
 // reply below the request's, so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelSeqNo
+const searchLevel = levelCompositeAggs
 
 // The search wire levels of the additions a peer must not ignore.
 const (
@@ -92,12 +95,15 @@ const (
 	levelNested        = 6
 	levelNestedSubAggs = 7
 	levelSeqNo         = 8
+	levelCompositeAggs = 9
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelCompositeAggs:
+		return "a top_metrics or composite aggregation, or a terms aggregation's order"
 	case needs >= levelSeqNo:
 		return "seq_no, the hits' seqs"
 	case needs >= levelNestedSubAggs:
@@ -160,7 +166,8 @@ type wireRequest struct {
 	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
 	// nested field's objects (search.Request.Nested, or a nested node), 7 for
 	// sub-aggregations under a terms aggregation on a sub-field
-	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits.
+	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 9 for a
+	// top_metrics or composite aggregation or a terms aggregation's order.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -204,6 +211,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		}
 	}
 	switch {
+	case compositeAggs(r.Aggs):
+		w.Needs = levelCompositeAggs
 	case r.SeqNo && r.Size > 0:
 		w.Needs = levelSeqNo
 	case r.NestedSubAggs:
@@ -607,6 +616,18 @@ func queriesHold(r *search.Request, holds func(query.Node) bool) bool {
 	}
 	aggs(r.Aggs)
 	return found
+}
+
+// compositeAggs reports whether aggs hold a top_metrics or composite aggregation, or a
+// terms aggregation with an order, at any level.
+func compositeAggs(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if a.Type == search.AggTopMetrics || a.Type == search.AggComposite || len(a.Order) > 0 || compositeAggs(a.Aggs) {
+			return true
+		}
+	}
+	return false
 }
 
 // metricAggs reports whether aggs hold a min or max aggregation, or a cardinality

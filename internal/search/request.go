@@ -83,6 +83,24 @@ const (
 	MaxPrecision = 18
 	// MaxThreshold is the largest threshold a cardinality aggregation takes.
 	MaxThreshold = 65_536
+	// MaxTermsOrder is the most keys a terms aggregation's order holds.
+	MaxTermsOrder = 8
+	// OrderedShardSize is a terms aggregation's shard_size when ShardSize is 0 and its
+	// order bounds no error (by a sub-aggregation, or _count ascending): each shard
+	// returns that many terms, so the answer is exact while no shard holds more
+	// distinct values (see Agg.Order).
+	OrderedShardSize = 10_000
+	// MaxTopMetricsSize is the largest size a top_metrics aggregation takes
+	// (Elasticsearch's index.top_metrics_max_size), and MaxTopMetrics the most metrics
+	// it reads.
+	MaxTopMetricsSize = 10
+	MaxTopMetrics     = 10
+	// DefaultCompositeSize is a composite aggregation's page of buckets when Size is 0,
+	// MaxCompositeSize its largest page, and MaxCompositeSources the most sources it
+	// keys its buckets by.
+	DefaultCompositeSize = 10
+	MaxCompositeSize     = 10_000
+	MaxCompositeSources  = 10
 )
 
 // IDField is the pseudo-field of the document id. Sorting on it sorts by the exact id;
@@ -102,7 +120,12 @@ const (
 	AggFilter        = "filter"
 	AggFilters       = "filters"
 	AggGlobal        = "global"
+	AggTopMetrics    = "top_metrics"
+	AggComposite     = "composite"
 )
+
+// aggTypeList names the aggregation types, for problems.
+const aggTypeList = "terms, range, histogram, date_histogram, composite, stats, cardinality, min, max, top_metrics, filter, filters or global"
 
 // The collect modes of a terms aggregation with sub-aggregations (Agg.CollectMode).
 const (
@@ -114,10 +137,10 @@ const (
 	CollectBreadthFirst = "breadth_first"
 )
 
-// metricType reports whether typ is a metric aggregation: stats, cardinality, min or max,
-// which a bucket aggregation holds as sub-aggregations.
+// metricType reports whether typ is a metric aggregation: stats, cardinality, min, max
+// or top_metrics, which a bucket aggregation holds as sub-aggregations.
 func metricType(typ string) bool {
-	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax
+	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax || typ == AggTopMetrics
 }
 
 // singleBucket reports whether typ is a filter, filters or global aggregation: buckets
@@ -231,8 +254,8 @@ const (
 )
 
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
-// date_histogram) may hold metric sub-aggregations (stats, cardinality, min, max) in
-// Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
+// date_histogram, composite) may hold metric sub-aggregations (stats, cardinality,
+// min, max, top_metrics) in Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
 // holds any other aggregation in Aggs, each with its own metric sub-aggregations: its
 // buckets are sets of documents, which the aggregations under it count as top-level
 // ones count the search's matches.
@@ -278,6 +301,25 @@ type Agg struct {
 	// that most of them would be collected for buckets the shard then drops; depth
 	// first otherwise. Either answers the same; only the cost differs.
 	CollectMode string `json:",omitempty"`
+	// Order orders a terms aggregation's buckets key by key, as Elasticsearch's order
+	// does: by _count, by _key, or by a metric sub-aggregation's value. Empty is
+	// _count descending; _key ascending breaks whatever ties are left. See
+	// [TermsOrder] for what each order costs and how exact it is across shards.
+	Order []TermsOrder `json:",omitempty"`
+
+	// Metrics are a top_metrics aggregation's fields (at most MaxTopMetrics), read
+	// from its Size documents (1 when 0, at most MaxTopMetricsSize) first by TopSort,
+	// one number or date field; equal sort values go to the least _id.
+	Metrics []string   `json:",omitempty"`
+	TopSort *SortField `json:",omitempty"`
+
+	// Sources are a composite aggregation's keys, in order (at most
+	// MaxCompositeSources): each bucket is one combination of their values, the
+	// buckets ordered by them, Size per page (DefaultCompositeSize when 0, at most
+	// MaxCompositeSize). After, the previous page's after_key by source name, starts
+	// the page after that bucket. See [CompositeSource].
+	Sources []CompositeSource `json:",omitempty"`
+	After   map[string]any    `json:",omitempty"`
 
 	// Ranges are a range aggregation's buckets: From inclusive, To exclusive, either
 	// open when nil.
@@ -361,8 +403,11 @@ func (ps *problems) add(loc, format string, args ...any) {
 //     MaxResultWindow here; the API holds it to max_result_window);
 //   - track_total: true (exact) or a count;
 //   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
-//     (terms also takes include and exclude, an array of values or a pattern, and
-//     collect_mode), or
+//     (terms also takes include and exclude, an array of values or a pattern,
+//     collect_mode, and order: {"_count"|"_key"|"<sub-aggregation>": "asc"|"desc"} or a
+//     list of them), {"name": {"top_metrics": {"metrics": [{"field": f}], "sort":
+//     {f: "desc"}, "size": 1}}}, {"name": {"composite": {"sources": [{"name": {"terms":
+//     {"field": f}}}], "size": 10, "after": {...}}, "aggs": {...}}}, or
 //     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
 //     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
 //   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
@@ -662,6 +707,14 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 				typed++
 				a.Type = key
 				parseAggBody(&a, val, at+"."+key, ps)
+			case AggTopMetrics:
+				typed++
+				a.Type = key
+				parseTopMetrics(&a, val, at+"."+key, ps)
+			case AggComposite:
+				typed++
+				a.Type = key
+				parseComposite(&a, val, at+"."+key, ps)
 			case AggFilter:
 				typed++
 				a.Type = key
@@ -675,7 +728,7 @@ func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *pro
 				a.Type = key
 				parseGlobal(val, at+"."+key, ps)
 			default:
-				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats, cardinality, min, max, filter, filters or global")
+				ps.add(at+"."+key, "unknown aggregation type: use "+aggTypeList)
 			}
 		}
 		if subs != nil {
@@ -979,7 +1032,7 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "where"},
+		AggTerms:         {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "order", "where"},
 		AggRange:         {"field", "ranges"},
 		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
 		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
@@ -1018,6 +1071,8 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			default:
 				a.Precision = n
 			}
+		case "order":
+			a.Order = parseTermsOrder(val, at, ps)
 		case "collect_mode":
 			if json.Unmarshal(val, &a.CollectMode) != nil || (a.CollectMode != CollectDepthFirst && a.CollectMode != CollectBreadthFirst) {
 				ps.add(at, "collect_mode is %q or %q", CollectDepthFirst, CollectBreadthFirst)

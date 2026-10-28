@@ -117,7 +117,13 @@ type aggSpec struct {
 	// collect is a terms aggregation's collect mode as given: "", CollectDepthFirst
 	// or CollectBreadthFirst (see deferSubs).
 	collect string
-	subs    []*aggSpec
+	// order is a terms aggregation's order resolved (termsorder.go): nil for the
+	// default, _count descending.
+	order *termsOrder
+	// top is a top_metrics aggregation's settings, comp a composite's.
+	top  *topSpec
+	comp *compositeSpec
+	subs []*aggSpec
 	// keys are a filter, filters or global aggregation's buckets' keys, in order: nil
 	// alone for filter and global; filters' keys sorted, then its other bucket's.
 	// queries are the filters of the buckets that have one, in keys' order, and
@@ -401,7 +407,7 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 	s := &aggSpec{name: name, loc: loc, typ: a.Type, field: a.Field, ftype: fieldType(m, a.Field)}
 	at := loc + "." + a.Type
 	wrapper := singleBucket(a.Type)
-	if a.Field == "" && !wrapper {
+	if a.Field == "" && !wrapper && a.Type != AggTopMetrics && a.Type != AggComposite {
 		ps.add(at+".field", "an aggregation needs a field")
 		return nil
 	}
@@ -436,6 +442,9 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 	isMetric := metricType(a.Type)
 	switch {
 	case parent == "":
+	case a.Type == AggComposite:
+		ps.add(loc, "composite is a top-level aggregation only: its pages walk the search's matches")
+		return nil
 	case a.Type == AggGlobal:
 		ps.add(loc, "global is a top-level aggregation only: it counts every document, whatever holds it")
 		return nil
@@ -444,7 +453,7 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		return nil
 	case !singleBucket(parent) && a.Type == AggTerms && (under != "" || m == nil):
 	case !singleBucket(parent) && !isMetric:
-		ps.add(loc, "a sub-aggregation is a metric (stats, cardinality, min or max), or a terms aggregation under a terms aggregation on a sub-field")
+		ps.add(loc, "a sub-aggregation is a metric (stats, cardinality, min, max or top_metrics), or a terms aggregation under a terms aggregation on a sub-field")
 		return nil
 	}
 	numeric := s.ftype == 0 || s.ftype == schema.Number || s.ftype == schema.Date
@@ -583,8 +592,12 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 		}
 	case AggGlobal:
 		s.keys = []any{nil}
+	case AggTopMetrics:
+		prepareTopMetrics(s, a, m, at, ps)
+	case AggComposite:
+		prepareComposite(s, a, m, at, ps)
 	default:
-		ps.add(loc, "unknown aggregation type %q: use terms, range, histogram, date_histogram, stats, cardinality, min, max, filter, filters or global", a.Type)
+		ps.add(loc, "unknown aggregation type %q: use %s", a.Type, aggTypeList)
 		return nil
 	}
 	if len(a.Aggs) > 0 {
@@ -602,6 +615,12 @@ func prepareAggUnder(name string, a Agg, m *schema.Mapping, loc, parent, under s
 				}
 			}
 		}
+	}
+	switch {
+	case a.Type == AggTerms:
+		prepareTermsOrder(s, a, at, ps)
+	case len(a.Order) > 0:
+		ps.add(at+".order", "order orders a terms aggregation's buckets: %s takes none", a.Type)
 	}
 	return s
 }

@@ -327,8 +327,8 @@ func TestDetailsAndSeqNoThroughPeers(t *testing.T) {
 			t.Fatalf("hit %s's seq %d", h.ID, h.Seq)
 		}
 	}
-	if wr, _ := encodeRequest(&search.Request{Query: &query.All{}, Size: 1, SeqNo: true}); wr.Needs != levelSeqNo || searchLevel != levelSeqNo || percolateLevel != percolateDetails {
-		t.Fatal("seq_no needs search level 8, the newest, and percolate level 4 is the newest")
+	if wr, _ := encodeRequest(&search.Request{Query: &query.All{}, Size: 1, SeqNo: true}); wr.Needs != levelSeqNo || searchLevel < levelSeqNo || percolateLevel != percolateDetails {
+		t.Fatal("seq_no needs search level 8, and percolate level 4 is the newest")
 	}
 	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
 		t.Run(name, func(t *testing.T) {

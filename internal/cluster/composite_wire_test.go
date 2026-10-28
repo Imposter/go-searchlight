@@ -10,7 +10,7 @@ import (
 )
 
 // TestWireCompositeAggs: a top_metrics or composite aggregation, or a terms
-// aggregation's order, at any level, needs search wire level 9, which a peer of an
+// aggregation's order, at any level, needs search wire level 10, which a peer of an
 // earlier release would refuse as unknown or ignore (answering in count order); each
 // crosses the wire whole.
 func TestWireCompositeAggs(t *testing.T) {

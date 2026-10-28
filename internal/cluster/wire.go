@@ -74,7 +74,7 @@ const codeStale = "stale_copy"
 // sub-field, which a lower peer would refuse, or answer reading the sub-field as a
 // field of no document. Level 7 collects sub-aggregations under a terms aggregation
 // on a sub-field (levelNestedSubAggs), which a lower peer would refuse, and level 8 the
-// hits' seqs (levelSeqNo), which a lower peer would leave out. Level 9 adds the
+// hits' seqs (levelSeqNo), which a lower peer would leave out. Level 10 adds the
 // top_metrics and composite aggregations and a terms aggregation's order
 // (levelCompositeAggs), which a lower peer would refuse as unknown, or ignore,
 // answering in count order. A request says
@@ -95,7 +95,7 @@ const (
 	levelNested        = 6
 	levelNestedSubAggs = 7
 	levelSeqNo         = 8
-	levelCompositeAggs = 9
+	levelCompositeAggs = 10
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
@@ -166,7 +166,7 @@ type wireRequest struct {
 	// or max aggregation or a cardinality's threshold, 5 for a box query, 6 for a
 	// nested field's objects (search.Request.Nested, or a nested node), 7 for
 	// sub-aggregations under a terms aggregation on a sub-field
-	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 9 for a
+	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 10 for a
 	// top_metrics or composite aggregation or a terms aggregation's order.
 	Needs int `json:"needs,omitempty"`
 }

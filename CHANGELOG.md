@@ -27,7 +27,7 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
   `sources`' values (`terms`, `histogram`, `date_histogram`), `size` buckets a page (at
   most 10,000), paged with `after` and the answer's `after_key`, with metric
   sub-aggregations per bucket. Exact, and every bucket is walked exactly once.
-- Search wire level 9: a search with any of the three reaches only nodes of this
+- Search wire level 10: a search with any of the three reaches only nodes of this
   release or later, and is refused with a retryable 503 by an older peer during a
   rolling upgrade.
 

@@ -835,7 +835,7 @@ Elasticsearch:
   its cost is that many buckets, with their sub-aggregations, per shard.
 
 On one shard every order is exact. Searches with an `order` reach only nodes of 1.7 or
-later (search wire level 9), as do `top_metrics` and `composite`.
+later (search wire level 10), as do `top_metrics` and `composite`.
 
 ### top_metrics
 

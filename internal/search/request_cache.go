@@ -878,6 +878,9 @@ func partialBytes(p *AggPartial) int64 {
 	if p.Value != nil {
 		n += 8
 	}
+	if d := p.Digest; d != nil {
+		n += 80 + 8*int64(cap(d.Means)+cap(d.Counts)+cap(d.buf))
+	}
 	n += 8 * int64(cap(p.Distinct))
 	return n
 }
@@ -1026,9 +1029,25 @@ func validPartials(ps map[string]*AggPartial, aggs map[string]Agg, depth int) er
 // validShape checks the members p holds are those of a's type: a min or max holds
 // at most its value; a cardinality with a threshold its distinct hashes (sorted,
 // unique, at most the threshold) and no sketch, one without a threshold no hashes;
-// no other type holds a value or hashes.
+// a percentiles or percentile_ranks at most a well-formed digest of its compression;
+// no other type holds a value, hashes or a digest.
 func validShape(p *AggPartial, a *Agg) error {
+	if p.Digest != nil && !percentileType(a.Type) {
+		return errors.New("a digest")
+	}
 	switch a.Type {
+	case AggPercentiles, AggPercentileRanks:
+		if p.Buckets != nil || p.Stats != nil || p.Sketch != nil || p.Value != nil || p.Distinct != nil {
+			return errors.New("percentiles shape")
+		}
+		compression := a.Compression
+		if compression == 0 {
+			compression = DefaultCompression
+		}
+		if p.Digest != nil && !p.Digest.wellFormed(compression) {
+			return errors.New("digest")
+		}
+		return nil
 	case AggMin, AggMax:
 		if p.Buckets != nil || p.Stats != nil || p.Sketch != nil || p.Distinct != nil {
 			return errors.New("min or max shape")

@@ -386,6 +386,9 @@ data_dir/
      segments by global ordinal when the hits hold many of the field's terms, by term
      otherwise.
    - A large segment's per-document aggregation is collected in parallel parts.
+   - Percentiles and percentile_ranks collect a merging t-digest (exact while it holds
+     at most `compression` distinct values), which the segments' parts, the segments
+     and the shards merge in turn.
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for

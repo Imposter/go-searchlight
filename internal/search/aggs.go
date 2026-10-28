@@ -58,6 +58,9 @@ type AggPartial struct {
 	// Distinct (a cardinality with a threshold) are distinct value hashes, sorted: all
 	// of them while fewer than the threshold, else threshold of them.
 	Distinct []uint64 `json:"distinct,omitempty"`
+	// Digest is a percentiles or percentile_ranks aggregation's t-digest, nil with no
+	// value.
+	Digest *TDigest `json:"digest,omitempty"`
 
 	// ords are a segment's partials by local ordinal (a keyword or list field's terms
 	// or cardinality, one per part of the segment collected apart), which the shard
@@ -273,6 +276,8 @@ func (s *segExec) newCollector(spec *aggSpec, top bool) collector {
 			c.sketch = NewSketch(spec.precision)
 		}
 		return c
+	case AggPercentiles, AggPercentileRanks:
+		return &digestColl{src: src, typ: spec.typ, compression: spec.compression}
 	case AggTerms:
 		c := &termsColl{s: s, spec: spec, src: src, deferred: deferSubs(spec, src)}
 		if s.lazyTerms(spec, src) {
@@ -339,6 +344,31 @@ func (c *statsColl) collect(d uint32) {
 func (c *statsColl) partial() *AggPartial {
 	st := c.st
 	return &AggPartial{Type: AggStats, Stats: &st}
+}
+
+// digestColl collects a percentiles or percentile_ranks aggregation's values into a
+// t-digest, made at its first value.
+type digestColl struct {
+	src         *fieldSrc
+	typ         string
+	compression float64
+	td          *TDigest
+}
+
+func (c *digestColl) collect(d uint32) {
+	if v, ok := c.src.number(d); ok {
+		if c.td == nil {
+			c.td = NewTDigest(c.compression)
+		}
+		c.td.Add(v)
+	}
+}
+
+func (c *digestColl) partial() *AggPartial {
+	if c.td != nil {
+		c.td.seal()
+	}
+	return &AggPartial{Type: c.typ, Digest: c.td}
 }
 
 // extremeColl keeps a min or max aggregation's least or greatest value; -0 is 0.
@@ -1444,6 +1474,14 @@ func mergePartial(dst, src *AggPartial, spec *aggSpec) {
 		}
 		dst.Sketch.Merge(src.Sketch)
 		dst.Sketch.seal()
+	case AggPercentiles, AggPercentileRanks:
+		if src.Digest == nil {
+			return
+		}
+		if dst.Digest == nil {
+			dst.Digest = NewTDigest(spec.compression)
+		}
+		dst.Digest.Merge(src.Digest)
 	default:
 		dst.DocCountError += src.DocCountError
 		dst.OtherDocCount += src.OtherDocCount
@@ -1648,6 +1686,13 @@ type AggResult struct {
 	Value int64
 	// Number is a min or max aggregation's value: nil when no document has one.
 	Number *float64
+	// Keys are a percentiles aggregation's percents, or a percentile_ranks one's
+	// values, ascending, and Percentiles each one's value (the value at the percent,
+	// or the percent of values below the value, half those equal to it counted), nil with no value. Keyed writes them as
+	// an object by key, else as a list of {key, value}.
+	Keys        []float64
+	Percentiles []*float64
+	Keyed       bool
 	// DocCount and Aggs are a filter or global aggregation's one bucket: its documents
 	// and the results of the aggregations under it. A filters aggregation's buckets
 	// are Buckets, keyed by filter.
@@ -1696,6 +1741,8 @@ func (a *AggResult) appendJSON(dst []byte) ([]byte, error) {
 		return append(strconv.AppendInt(append(dst, `{"value":`...), a.Value, 10), '}'), nil
 	case AggMin, AggMax:
 		return append(appendJSONNumber(append(dst, `{"value":`...), a.Number), '}'), nil
+	case AggPercentiles, AggPercentileRanks:
+		return a.appendPercentiles(dst), nil
 	case AggFilter, AggGlobal:
 		return appendInlineBucket(dst, a.DocCount, a.Aggs)
 	case AggFilters:
@@ -1741,6 +1788,59 @@ func (a *AggResult) appendJSON(dst []byte) ([]byte, error) {
 		dst = append(dst, `,"truncated":true`...)
 	}
 	return append(dst, '}'), nil
+}
+
+// appendPercentiles appends a percentiles or percentile_ranks result as Elasticsearch
+// writes it: {"values": {"50.0": v, ...}} keyed, by each key as Java writes a double,
+// or {"values": [{"key": 50, "value": v}, ...]}; null for a value there is none of.
+func (a *AggResult) appendPercentiles(dst []byte) []byte {
+	value := func(i int) *float64 {
+		if i < len(a.Percentiles) {
+			return a.Percentiles[i]
+		}
+		return nil
+	}
+	if a.Keyed {
+		dst = append(dst, `{"values":{`...)
+		for i, k := range a.Keys {
+			if i > 0 {
+				dst = append(dst, ',')
+			}
+			dst = append(appendJavaDouble(append(dst, '"'), k), `":`...)
+			dst = appendJSONNumber(dst, value(i))
+		}
+		return append(dst, "}}"...)
+	}
+	dst = append(dst, `{"values":[`...)
+	for i, k := range a.Keys {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = appendJSONFloat(append(dst, `{"key":`...), k)
+		dst = append(appendJSONNumber(append(dst, `,"value":`...), value(i)), '}')
+	}
+	return append(dst, "]}"...)
+}
+
+// appendJavaDouble appends finite f as Java's Double.toString writes it, which names
+// Elasticsearch's keyed percentiles: "50.0", "99.9", "1.0E-4", "1.5E12".
+func appendJavaDouble(dst []byte, f float64) []byte {
+	f = positiveZero(f)
+	abs := math.Abs(f)
+	if abs == 0 || (abs >= 1e-3 && abs < 1e7) {
+		dst = strconv.AppendFloat(dst, f, 'f', -1, 64)
+		if f == math.Trunc(f) {
+			dst = append(dst, ".0"...)
+		}
+		return dst
+	}
+	e := strconv.FormatFloat(f, 'E', -1, 64)
+	mantissa, exp, _ := strings.Cut(e, "E")
+	if !strings.Contains(mantissa, ".") {
+		mantissa += ".0"
+	}
+	n, _ := strconv.Atoi(exp)
+	return strconv.AppendInt(append(append(dst, mantissa...), 'E'), int64(n), 10)
 }
 
 // appendInlineBucket appends a filter, filters or global bucket as Elasticsearch writes

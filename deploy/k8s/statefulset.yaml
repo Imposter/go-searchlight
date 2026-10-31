@@ -64,7 +64,7 @@ spec:
         - name: searchlight
           # The release's image. For an image built from a checkout (`make docker`),
           # push it to your registry and point this at it.
-          image: ghcr.io/imposter/searchlight:1.7.0
+          image: ghcr.io/imposter/searchlight:1.8.0
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:

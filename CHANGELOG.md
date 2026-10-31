@@ -6,6 +6,8 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-10-31
+
 ### Added
 
 - **A `terms` order by a percentile** ([docs/api.md](docs/api.md#terms-order)), as
@@ -638,6 +640,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[1.8.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.8.0
 [1.7.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.6.0
 [1.5.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.5.0

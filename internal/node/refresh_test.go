@@ -105,8 +105,22 @@ func TestRewindLowersTheNodesHead(t *testing.T) {
 		t.Fatalf("count = %d", got)
 	}
 	rewindSQLite(t, cfg.StoreURL, kept.Seq)
-	fresh := mustWrite(t, n, "r", upsert("n1", `{"x": 5}`))
 	deadline := time.Now().Add(30 * time.Second)
+	// The copy can find the rewind before this write, and refuses it with a retryable
+	// 503 while it recovers.
+	var fresh *api.WriteResult
+	for {
+		var err error
+		fresh, err = n.Write(ctx(t), "r", []api.WriteOp{upsert("n1", `{"x": 5}`)}, api.WriteOptions{})
+		if err == nil {
+			break
+		}
+		var refused *api.Error
+		if !errors.As(err, &refused) || refused.Status != http.StatusServiceUnavailable || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	for {
 		c, cancel := context.WithTimeout(context.Background(), time.Second)
 		res, err := n.Search(c, "r", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: fresh.Seq})

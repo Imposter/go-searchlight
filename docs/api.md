@@ -628,7 +628,8 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
 
   A bucket aggregation may carry metric sub-aggregations (`stats`, `cardinality`,
   `min`, `max`, `percentiles`, `percentile_ranks`, `top_metrics`) one level deep. `filter`,
-  `filters` and `global` may carry any other aggregation, written inline in their
+  `filters` and `global` may carry any aggregation but one another and `composite`
+  (`composite` and `global` are top level only), written inline in their
   bucket as Elasticsearch writes it, each with its own metric sub-aggregations: at
   most `filter` → `terms` → `stats`. A sub-aggregation is never named after a member
   of the bucket it is written in (`doc_count` under `filter`, `filters` and `global`;
@@ -848,11 +849,26 @@ exactly. It refuses any other member, `post_filter` included (400 at its name).
 metric sub-aggregation of the `terms` by name: a `min`, `max` or `cardinality` by its
 value (`"low"`, or `"low.value"`), a `stats` by a member (`"prices.avg"`: `count`,
 `min`, `max`, `avg` or `sum`), a `top_metrics` of `size` 1 by one of its metrics
-(`"latest.price"`). A list orders by its keys in turn, each breaking the ties of the
-ones before: `[{"prices.avg": "desc"}, {"_count": "desc"}]`. `_key` ascending breaks
-whatever ties are left, and nothing orders after `_key` (keys are unique). A bucket
-whose metric has no value (a `min` over no price) sorts after every bucket with one,
-ascending or descending.
+(`"latest.price"`), a `percentiles` by one of its `percents` (`"load.99.9"`) and a
+`percentile_ranks` by one of its `values` (`"ranks.100"`). A list orders by its keys in
+turn, each breaking the ties of the ones before: `[{"prices.avg": "desc"}, {"_count":
+"desc"}]`. `_key` ascending breaks whatever ties are left, and nothing orders after
+`_key` (keys are unique). A bucket whose metric has no value (a `min` over no price)
+sorts after every bucket with one, ascending or descending.
+
+A member follows the sub-aggregation's name after its first dot, or in brackets after
+it, as Elasticsearch's paths take it: `"prices.avg"` is `"prices[avg]"`, and
+`"load.99.9"` is `"load[99.9]"`. A percent (or a `percentile_ranks` value) is read as
+Elasticsearch reads it, as Java's `Double.parseDouble` reads a decimal: `"50"`,
+`"50.0"`, `"5e1"`, `"+50"` and `"50d"` are the same percent. It must be one of the
+sub-aggregation's `percents` (`values`), else the search is a 400 at the order key's
+`loc` naming them; a `percentiles` without `percents` has the default seven.
+
+```json
+{"size": 0,
+ "aggs": {"stores": {"terms": {"field": "store", "order": {"load.99": "asc"}},
+                     "aggs": {"load": {"percentiles": {"field": "latency_ms", "percents": [50, 99]}}}}}}
+```
 
 ```json
 {"size": 0,
@@ -879,8 +895,30 @@ Elasticsearch:
   says 0 is still exact. Raise `shard_size` (up to 65,536) for more distinct values;
   its cost is that many buckets, with their sub-aggregations, per shard.
 
-On one shard every order is exact. Searches with an `order` reach only nodes of 1.7 or
-later (search wire level 10), as do `top_metrics` and `composite`.
+**By a percentile.** A `percentiles` or `percentile_ranks` key follows the same rules,
+over values read from a t-digest (see percentiles' accuracy under
+[Search and count](#search-and-count)). Each shard orders its terms by its own digest of
+each term's values, and cuts its list by them; the coordinating node merges each term's
+digests from every shard and orders the merged terms again by the merged digest's
+value, the very value the bucket shows, so the buckets returned are always in the
+order of the values they show. What is approximate:
+
+- A shard's own value for a term can differ from the merged one (a term's median on one
+  shard is not its median over all of them), so a shard that cuts its list may leave
+  out a term that the merged values rank higher. That is the cut the bounds above
+  already cover: while no shard holds more than `shard_size` terms nothing is cut and
+  the order is that of the merged values, and when one does, the buckets it may have
+  missed say `-1`.
+- A term whose values hold more distinct values than the digest's `compression` (100
+  by default) has an approximate digest, and orders by an approximate value, the one
+  its bucket shows; two terms whose true percentiles are very close can come out in
+  either order. While every term's values hold at most `compression` distinct values,
+  each value is exact and the order is the exact one.
+
+On one shard every order is exact (by percentile, as exact as the digests). Searches
+with an `order` reach only nodes of 1.7 or later (search wire level 10), as do
+`top_metrics` and `composite`; an order by a `percentiles` or `percentile_ranks`, or a
+member in brackets, reaches only nodes of 1.8 or later (search wire level 11).
 
 ### top_metrics
 

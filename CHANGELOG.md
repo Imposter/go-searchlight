@@ -6,6 +6,35 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+### Added
+
+- **A `terms` order by a percentile** ([docs/api.md](docs/api.md#terms-order)), as
+  Elasticsearch's: `"order": {"load.99": "asc"}` orders by a `percentiles`
+  sub-aggregation's value at one of its `percents`, and `{"ranks.100": "desc"}` by a
+  `percentile_ranks` one's at one of its `values`. The percent is read as
+  Elasticsearch reads it (`"50"`, `"50.0"`, `"5e1"`), and one the sub-aggregation does
+  not hold is a 400 naming those it does. Across shards it follows the rules of every
+  order by a sub-aggregation: each shard orders its terms by its own digest, and the
+  coordinating node orders the merged terms by the merged digest's value, the one each
+  bucket shows; the docs describe what is approximate.
+- **An order key's member in brackets**, as Elasticsearch's paths take it:
+  `"prices[avg]"` is `"prices.avg"`, and `"load[99.9]"` is `"load.99.9"`.
+- Search wire level 11: a search ordering by a percentile, or naming a member in
+  brackets, reaches only nodes of this release or later, and is refused with a
+  retryable 503 by an older peer during a rolling upgrade.
+- **api/openapi.yaml describes every aggregation**: an `Aggregation` schema per type
+  (`terms` with its `order`, `include` and `exclude`, `range`, `histogram`,
+  `date_histogram`, `composite` with its sources, `stats`, `min`, `max`, `cardinality`,
+  `percentiles`, `percentile_ranks`, `top_metrics`, `filter`, `filters`, `global`) and
+  the result of each (`AggregationResult`), where it held only prose before, and a
+  hit's `sort` values (`SortValue`, null for a hit without one).
+
+### Fixed
+
+- The problem of an aggregation nested where it cannot be (a `filter` under a
+  `filters`, sub-aggregations under a metric) lists every type the place takes,
+  `top_metrics` included, and says that `composite` and `global` are top level only.
+
 ## [1.7.0] - 2026-10-28
 
 ### Added

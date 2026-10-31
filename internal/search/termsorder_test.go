@@ -19,6 +19,8 @@ var orderSubs = map[string]Agg{
 	"st":   {Type: AggStats, Field: "price"},
 	"n":    {Type: AggCardinality, Field: "tags"},
 	"tm":   {Type: AggTopMetrics, Metrics: []string{"price"}, TopSort: &SortField{Field: "created", Desc: true}},
+	"pct":  {Type: AggPercentiles, Field: "price", Percents: []float64{50, 99.9}},
+	"rk":   {Type: AggPercentileRanks, Field: "price", Values: []float64{5, 30}},
 }
 
 // bruteOrderValue is a group of documents' value for order key key, as a terms
@@ -71,6 +73,20 @@ func bruteOrderValue(key string, groupKey any, docs []*schema.Doc) any {
 			return nil
 		}
 		return top[0].Metrics["price"]
+	case "pct.50", "pct.99.9", "pct[99.9]", "rk.5", "rk[30.0]":
+		if len(prices) == 0 {
+			return nil
+		}
+		slices.Sort(prices)
+		switch key {
+		case "pct.50":
+			return exactQuantile(prices, 0.5)
+		case "pct.99.9", "pct[99.9]":
+			return exactQuantile(prices, 0.999)
+		case "rk.5":
+			return exactRank(prices, 5) * 100
+		}
+		return exactRank(prices, 30) * 100
 	}
 	panic("unknown order key " + key)
 }
@@ -121,6 +137,10 @@ var testOrders = [][]TermsOrder{
 	{{Key: OrderCount, Desc: true}, {Key: "st.sum"}},
 	{{Key: "high.value"}, {Key: OrderKey, Desc: true}},
 	{{Key: "st.count", Desc: true}},
+	{{Key: "pct.50", Desc: true}},
+	{{Key: "pct[99.9]"}, {Key: OrderCount}},
+	{{Key: "rk.5", Desc: true}, {Key: "pct.99.9", Desc: true}},
+	{{Key: "rk[30.0]"}},
 }
 
 // TestTermsOrderEqualsBruteForce: ordered by a sub-aggregation, by _count ascending or
@@ -268,11 +288,14 @@ func TestTermsOrderJSON(t *testing.T) {
 	}
 	c.refreshAll()
 	for body, want := range map[string]string{
-		`{"terms":{"field":"brand"}}`:                                                                                "zeta acme beta",
-		`{"terms":{"field":"brand","order":{"_count":"asc"}}}`:                                                       "beta acme zeta",
-		`{"terms":{"field":"brand","order":{"_key":"desc"}}}`:                                                        "zeta beta acme",
-		`{"terms":{"field":"brand","order":[{"p.max":"desc"}]},"aggs":{"p":{"stats":{"field":"price"}}}}`:            "acme zeta beta",
-		`{"terms":{"field":"brand","order":[{"p":"asc"},{"_count":"desc"}]},"aggs":{"p":{"min":{"field":"price"}}}}`: "zeta beta acme",
+		`{"terms":{"field":"brand"}}`:                                                                                         "zeta acme beta",
+		`{"terms":{"field":"brand","order":{"_count":"asc"}}}`:                                                                "beta acme zeta",
+		`{"terms":{"field":"brand","order":{"_key":"desc"}}}`:                                                                 "zeta beta acme",
+		`{"terms":{"field":"brand","order":[{"p.max":"desc"}]},"aggs":{"p":{"stats":{"field":"price"}}}}`:                     "acme zeta beta",
+		`{"terms":{"field":"brand","order":[{"p":"asc"},{"_count":"desc"}]},"aggs":{"p":{"min":{"field":"price"}}}}`:          "zeta beta acme",
+		`{"terms":{"field":"brand","order":{"p.50":"asc"}},"aggs":{"p":{"percentiles":{"field":"price"}}}}`:                   "zeta beta acme",
+		`{"terms":{"field":"brand","order":{"p[1.0]":"desc"}},"aggs":{"p":{"percentiles":{"field":"price"}}}}`:                "acme beta zeta",
+		`{"terms":{"field":"brand","order":{"r.8":"desc"}},"aggs":{"r":{"percentile_ranks":{"field":"price","values":[8]}}}}`: "beta zeta acme",
 	} {
 		r := parseAggsBody(t, `{"size":0,"aggs":{"t":`+body+`}}`)
 		resp, err := c.search(r)
@@ -315,6 +338,75 @@ func TestTermsOrderNested(t *testing.T) {
 		}
 		if got := termKeys(resp.Aggs["t"].Buckets); got != want {
 			t.Errorf("order %s: %s, want %s", order, got, want)
+		}
+	}
+}
+
+// TestTermsOrderPercentilesApprox: ordered by a percentile over terms whose digests are
+// approximate (more distinct values than their compression, over several shards), a
+// terms aggregation returns every term in the order of the values it shows, the merged
+// digests', each near the term's exact percentile.
+func TestTermsOrderPercentilesApprox(t *testing.T) {
+	seed := testSeed(t)
+	rng := rand.New(rand.NewPCG(seed, seed^0x9c71))
+	const brands = 6
+	c := newCluster(t, 3)
+	values := map[string][]float64{}
+	for i := range 1800 {
+		b := fmt.Sprintf("B%d", rng.IntN(brands))
+		v := rng.NormFloat64()*10 + float64(len(b)+int(b[1]-'0'))*3
+		values[b] = append(values[b], v)
+		c.upsert(fmt.Sprintf("d%05d", i), fmt.Sprintf(`{"brand":%q,"price":%v}`, b, v))
+		if rng.IntN(300) == 0 {
+			c.refresh(rng.IntN(3))
+		}
+	}
+	c.refreshAll()
+	for _, desc := range []bool{false, true} {
+		a := Agg{
+			Type: AggTerms, Field: "brand", Size: brands, Order: []TermsOrder{{Key: "p.90", Desc: desc}},
+			Aggs: map[string]Agg{"p": {Type: AggPercentiles, Field: "price", Percents: []float64{90}, Compression: 50}},
+		}
+		resp, err := c.search(&Request{Query: &query.All{}, Aggs: map[string]Agg{"t": a}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := resp.Aggs["t"]
+		if len(res.Buckets) != len(values) || res.DocCountErrorUpperBound != 0 {
+			t.Fatalf("desc %t: %d buckets (±%d), want %d exactly", desc, len(res.Buckets), res.DocCountErrorUpperBound, len(values))
+		}
+		var prev float64
+		for i, b := range res.Buckets {
+			v := *b.Aggs["p"].Percentiles[0]
+			if i > 0 && cmpValue(prev, v, desc) > 0 {
+				t.Errorf("desc %t: %s (%v) sorts after %v\n%s", desc, b.Key, v, prev, termKeys(res.Buckets))
+			}
+			prev = v
+			sorted := slices.Sorted(slices.Values(values[b.Key.(string)])) //nolint:forcetypeassert,errcheck // keyword terms
+			if e := rankError(sorted, v, 0.9); e > 0.05 {
+				t.Errorf("desc %t: %s's 90th percentile %v is %.3f off in rank", desc, b.Key, v, e)
+			}
+		}
+	}
+}
+
+// TestTermsOrderPercentilesProblems: an order by a percentile names the percents (or
+// values) its sub-aggregation has, and how to write one.
+func TestTermsOrderPercentilesProblems(t *testing.T) {
+	subs := `"aggs":{"p":{"percentiles":{"field":"price","percents":[50,99.9]}},"r":{"percentile_ranks":{"field":"price","values":[100]}}}`
+	for order, want := range map[string]string{
+		`{"p.75":"asc"}`:  `"p" is a percentiles of percents 50, 99.9: 75 is none of them`,
+		`{"p":"asc"}`:     `"p" is a percentiles: order by one of its percents, p.<number> (p.50, or p[50])`,
+		`{"p.x":"asc"}`:   `"p" is a percentiles: order by one of its percents`,
+		`{"r.5":"asc"}`:   `"r" is a percentile_ranks of values 100: 5 is none of them`,
+		`{"r":"asc"}`:     `"r" is a percentile_ranks: order by one of its values, r.<number> (r.100, or r[100])`,
+		`{"q.50":"desc"}`: `name.50 for a percentiles`,
+	} {
+		ps := aggProblems(t, `{"t":{"terms":{"field":"brand","order":`+order+`},`+subs+`}}`)
+		if !slices.ContainsFunc(ps, func(p query.Problem) bool {
+			return p.Loc == "aggs.t.terms.order.0" && strings.Contains(p.Message, want)
+		}) {
+			t.Errorf("order %s: %v, want %q at aggs.t.terms.order.0", order, ps, want)
 		}
 	}
 }

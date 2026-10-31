@@ -78,32 +78,37 @@ const codeStale = "stale_copy"
 // percentiles and percentile_ranks aggregations (levelPercentiles), which a lower peer
 // would refuse as unknown. Level 10 adds the top_metrics and composite aggregations
 // and a terms aggregation's order (levelCompositeAggs), which a lower peer would
-// refuse as unknown, or ignore, answering in count order. A request says
-// the level it needs (wireRequest.Needs), and goes to that level's endpoint
+// refuse as unknown, or ignore, answering in count order. Level 11 adds a terms order
+// by a percentiles or percentile_ranks sub-aggregation, and an order key's member in
+// brackets ("prices[avg]") (levelPercentileOrder), which a lower peer would refuse. A
+// request says the level it needs (wireRequest.Needs), and goes to that level's endpoint
 // (searchPath), and a reply the level it was answered at
 // (searchReply.Level): a peer refuses a request past its level, and the coordinator a
 // reply below the request's, so a search is never answered with a part of it unread.
 // A wire addition a peer must not ignore raises it.
-const searchLevel = levelCompositeAggs
+const searchLevel = levelPercentileOrder
 
 // The search wire levels of the additions a peer must not ignore.
 const (
-	levelFilterAggs    = 1
-	levelTermsFilter   = 2
-	levelFrom          = 3
-	levelMetrics       = 4
-	levelBox           = 5
-	levelNested        = 6
-	levelNestedSubAggs = 7
-	levelSeqNo         = 8
-	levelPercentiles   = 9
-	levelCompositeAggs = 10
+	levelFilterAggs      = 1
+	levelTermsFilter     = 2
+	levelFrom            = 3
+	levelMetrics         = 4
+	levelBox             = 5
+	levelNested          = 6
+	levelNestedSubAggs   = 7
+	levelSeqNo           = 8
+	levelPercentiles     = 9
+	levelCompositeAggs   = 10
+	levelPercentileOrder = 11
 )
 
 // levelNeeds names what a search of wire level needs carries, for the errors of a
 // peer below it.
 func levelNeeds(needs int) string {
 	switch {
+	case needs >= levelPercentileOrder:
+		return "a terms order by a percentiles or percentile_ranks sub-aggregation, or by a member in brackets"
 	case needs >= levelCompositeAggs:
 		return "a top_metrics or composite aggregation, or a terms aggregation's order"
 	case needs >= levelPercentiles:
@@ -172,7 +177,8 @@ type wireRequest struct {
 	// sub-aggregations under a terms aggregation on a sub-field
 	// (search.Request.NestedSubAggs), 8 for seq_no on a search with hits, 9 for a
 	// percentiles or percentile_ranks aggregation, 10 for a top_metrics or composite
-	// aggregation or a terms aggregation's order.
+	// aggregation or a terms aggregation's order, 11 for a terms order by a percentiles
+	// or percentile_ranks sub-aggregation or by a member in brackets.
 	Needs int `json:"needs,omitempty"`
 }
 
@@ -216,6 +222,8 @@ func encodeRequest(r *search.Request) (*wireRequest, error) {
 		}
 	}
 	switch {
+	case percentileOrders(r.Aggs):
+		w.Needs = levelPercentileOrder
 	case compositeAggs(r.Aggs):
 		w.Needs = levelCompositeAggs
 	case percentileAggs(r.Aggs):
@@ -631,6 +639,25 @@ func compositeAggs(aggs map[string]search.Agg) bool {
 	for name := range aggs {
 		a := aggs[name]
 		if a.Type == search.AggTopMetrics || a.Type == search.AggComposite || len(a.Order) > 0 || compositeAggs(a.Aggs) {
+			return true
+		}
+	}
+	return false
+}
+
+// percentileOrders reports whether aggs hold, at any level, a terms aggregation whose
+// order reads a percentiles or percentile_ranks sub-aggregation, or names a member in
+// brackets.
+func percentileOrders(aggs map[string]search.Agg) bool {
+	for name := range aggs {
+		a := aggs[name]
+		for _, k := range a.Order {
+			sub, _, bracketed := search.SplitOrderKey(k.Key)
+			if t := a.Aggs[sub].Type; bracketed || t == search.AggPercentiles || t == search.AggPercentileRanks {
+				return true
+			}
+		}
+		if percentileOrders(a.Aggs) {
 			return true
 		}
 	}

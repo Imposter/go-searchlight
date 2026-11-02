@@ -276,6 +276,7 @@ type options struct {
 	blobChunk int
 	gateKey   string // the database a single-writer dialect's write gate is shared by
 	dbPath    string
+	dialect   func(*dialect.Dialect) // adjusts a copy of the dialect before the store starts
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -288,6 +289,10 @@ func WithMeter(m metric.Meter) Option { return func(o *options) { o.meter = m } 
 
 // WithLogger sets the logger (default: slog.Default()).
 func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l } }
+
+// withDialect adjusts the store's dialect before it starts (tests that swap a
+// statement, which must not race the goroutines the store starts).
+func withDialect(f func(*dialect.Dialect)) Option { return func(o *options) { o.dialect = f } }
 
 // WithClock sets the clock the store's timers and durations run on (default:
 // clock.Real).
@@ -341,6 +346,11 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	d, err := dialectFor(u.Scheme)
 	if err != nil {
 		return nil, err
+	}
+	if o.dialect != nil {
+		adjusted := *d
+		o.dialect(&adjusted)
+		d = &adjusted
 	}
 	if d.Name == "sqlite" {
 		if p, err := sqlite.Path(u); err == nil {

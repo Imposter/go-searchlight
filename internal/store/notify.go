@@ -109,12 +109,27 @@ func (n *notifier) send(ctx context.Context) {
 		if err == nil {
 			return
 		}
+		if ctx.Err() != nil {
+			n.requeue(pending) // close cut it off: the last send, which close waits for, sends it
+			return
+		}
 	}
 	n.s.lost.Add(ctx, int64(len(payloads)), metric.WithAttributes(n.s.attr))
 	if now := n.s.clock.Now(); now.Sub(n.warned) >= notifyWarnEvery {
 		n.warned = now
 		n.s.log.WarnContext(ctx, "commit notifications could not be sent; tailers poll for those changes instead",
 			slog.Int("shards", len(payloads)), slog.Any("error", err))
+	}
+}
+
+// requeue puts announcements a send did not make back with those pending since.
+func (n *notifier) requeue(pending map[ShardID]int64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, seq := range pending {
+		if seq > n.pending[id] {
+			n.pending[id] = seq
+		}
 	}
 }
 

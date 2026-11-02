@@ -14,6 +14,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
+	"github.com/Imposter/go-searchlight/internal/store/dialect"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -371,11 +372,8 @@ func TestLostNotificationsAreCountedAndWarned(t *testing.T) {
 		}
 		logs := &captureHandler{}
 		reader := sdkmetric.NewManualReader()
-		st := h.open(t, WithLogger(slog.New(logs)), WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")))
-		s := engine(st)
-		d := *s.d
-		d.Changelog.Notify = "SELECT no_such_function($1::text[])"
-		s.d = &d
+		st := h.open(t, WithLogger(slog.New(logs)), WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")),
+			withDialect(func(d *dialect.Dialect) { d.Changelog.Notify = "SELECT no_such_function($1::text[])" }))
 		mustCreateIndex(t, st, "lost")
 		mustApply(t, st, upsert("lost", 0, "a", `{}`))
 		mustApply(t, st, upsert("lost", 0, "b", `{}`))
@@ -388,6 +386,49 @@ func TestLostNotificationsAreCountedAndWarned(t *testing.T) {
 		}
 		if !logs.has("commit notifications could not be sent") {
 			t.Fatal("the loss was not warned about")
+		}
+	})
+}
+
+// TestCloseSendsTheNotificationInFlight: a notification statement still running when
+// the store closes is cut off, and the last send, which Close waits for, makes it: it
+// is neither counted as lost nor warned about (it was, on every shutdown).
+func TestCloseSendsTheNotificationInFlight(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect != "postgres" {
+			t.Skip("no notifications on " + h.dialect)
+		}
+		logs := &captureHandler{}
+		reader := sdkmetric.NewManualReader()
+		st := h.open(t, WithLogger(slog.New(logs)), WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")),
+			withDialect(func(d *dialect.Dialect) {
+				d.Changelog.Notify = "SELECT pg_sleep(0.5), p FROM unnest($1::text[]) AS p"
+			}))
+		s := engine(st)
+		mustCreateIndex(t, st, "flight")
+		mustApply(t, st, upsert("flight", 0, "a", `{}`))
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var running int
+			if err := s.r.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(0.5)%' AND state = 'active'").Scan(&running); err != nil {
+				t.Fatal(err)
+			}
+			if running > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the notification never went out")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if n := lostCount(t, reader); n != 0 {
+			t.Fatalf("%d notifications counted as lost at Close", n)
+		}
+		if logs.has("commit notifications could not be sent") {
+			t.Fatal("Close warned of lost notifications")
 		}
 	})
 }
@@ -415,12 +456,11 @@ func lostCount(t *testing.T, reader *sdkmetric.ManualReader) int64 {
 // TestTooManyConnectionsSaysSo: an operation that fails because the database refused a
 // connection past its limit says what to change, and still wraps the cause.
 func TestTooManyConnectionsSaysSo(t *testing.T) {
-	st := sqliteHarness(t).open(t)
-	s := engine(st)
 	refused := errors.New("too many clients already")
-	d := *s.d
-	d.TooManyConnections = func(err error) bool { return errors.Is(err, refused) }
-	s.d = &d
+	st := sqliteHarness(t).open(t, withDialect(func(d *dialect.Dialect) {
+		d.TooManyConnections = func(err error) bool { return errors.Is(err, refused) }
+	}))
+	s := engine(st)
 	_, end := s.start(context.Background(), "apply")
 	err := fmt.Errorf("begin: %w", refused)
 	end(&err)

@@ -68,7 +68,7 @@ func TestMappingHaltPrunedPast(t *testing.T) {
 		id := ShardID{Index: "m", Shard: 0}
 		mustApply(t, st, upsert("m", 0, "a", docBody("a", 1)))
 		setMapping(t, st, "m", `{"fields":5}`)
-		head, _, err := st.HeadSeq(ctx)
+		head, _, err := st.HeadSeq(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}

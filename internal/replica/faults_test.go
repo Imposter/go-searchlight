@@ -219,7 +219,7 @@ func TestCrashPoints(t *testing.T) {
 			if err := c.shard().Close(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			head, _, err := st.HeadSeq(context.Background())
+			head, _, err := st.HeadSeq(context.Background(), id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +252,7 @@ func TestCrashPoints(t *testing.T) {
 			if err := c.shard().Close(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			head, _, err := st.HeadSeq(context.Background())
+			head, _, err := st.HeadSeq(context.Background(), id)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -356,9 +356,10 @@ func TestPruneDuringLoad(t *testing.T) {
 			if n != 10 || !hooked.CompareAndSwap(false, true) {
 				return nil
 			}
-			_, last, err := st.Apply(ctx, []store.Change{del("pl", 0, "da"), upsert("pl", 0, "new", `{}`)})
+			batch := []store.Change{del("pl", 0, "da"), upsert("pl", 0, "new", `{}`)}
+			err := st.Apply(ctx, batch)
 			if err == nil {
-				err = st.Prune(ctx, id, last+1)
+				err = st.Prune(ctx, id, batch[1].Seq+1)
 			}
 			written <- err
 			return err
@@ -410,7 +411,7 @@ func TestPruneDuringLoad(t *testing.T) {
 			t.Fatalf("the copy at seq %d does not hold the store as of that seq: %v", snapshot, v.docs)
 		}
 
-		head, _, err := st.HeadSeq(ctx)
+		head, _, err := st.HeadSeq(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -466,7 +467,7 @@ func TestLagWhileTheDatabaseIsUnreachable(t *testing.T) {
 
 		fs.down("head", false)
 		fs.down("changes", false)
-		head, _, err := st.HeadSeq(context.Background())
+		head, _, err := st.HeadSeq(context.Background(), id)
 		if err != nil {
 			t.Fatal(err)
 		}

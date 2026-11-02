@@ -23,6 +23,8 @@ func optionalStatements(d *dialect.Dialect) map[string]bool {
 		// a pooled session.
 		"Maintenance.MigrateLockTimeout": d.Name != "sqlite",
 		"Maintenance.MigrateLockReset":   d.Name != "sqlite" && !m.MigrateInTx,
+		// Notifications are sent only where the engine can listen.
+		"Changelog.Notify": d.Listen != nil,
 	}
 }
 

@@ -39,31 +39,48 @@ type GroupCommitOptions struct {
 	// they are) reach this size. A single request larger than this is committed
 	// on its own.
 	MaxBytes int
+	// MaxTransactions bounds the transactions the committer runs at once, so its
+	// share of the store's connections. Above 1, every shard has a lane of its own:
+	// a request is split by shard, and each shard's part commits in a transaction
+	// of that shard's alone, beside other shards'. At 1 there is one lane, and a
+	// request commits whole, its shards together. The default is half the store's
+	// write connections where the Applier is a Store (1 on SQLite, whose one writer
+	// gains nothing from the split, and would pay a commit per shard), and 1
+	// otherwise.
+	MaxTransactions int
 	// Tracer and Meter default to the global providers'.
 	Tracer trace.Tracer
 	Meter  metric.Meter
 	// Clock times the batching window; nil means clock.Real.
 	Clock clock.Clock
 
-	// received, when set (tests only), runs in the committer's goroutine as
-	// each request is taken into a batch.
+	// received, when set (tests only), runs as each request (each part of a split
+	// one) joins its lane, before Apply waits for it.
 	received func()
 }
 
-// GroupCommitter coalesces concurrent Apply calls on a node into one
-// transaction, the way Elasticsearch amortizes translog fsyncs (spec §8).
-// Each caller gets its own contiguous seq range within the batch, in arrival
-// order, and a failed transaction fails every caller in it.
+// GroupCommitter coalesces concurrent Apply calls on a node into one transaction per
+// shard, the way Elasticsearch amortizes translog fsyncs (spec §8). Each shard has a
+// lane, which collects the requests for its shard (its parts of requests that span
+// several) for up to MaxDelay and commits them together. Lanes commit at the same
+// time, up to MaxTransactions transactions; a lane waits out its batching window
+// before it takes a transaction, so a lane collecting holds no connection. Each
+// caller's changes on a shard take contiguous seqs of it, in arrival order, and a
+// failed transaction fails every caller in it.
 //
 // One caller's bad request never fails another's. Each request is validated
 // on its own before it joins a batch, so an invalid change is reported to
 // its caller alone (as a *ChangeError positioned in that request). A request
-// naming a missing index gets its own *IndexNotFoundError and the rest is
-// retried without it. When IfSeq conditions fail, only the first conflicting
-// request is rejected and everything after it is re-evaluated in the next
-// attempt, since its conditions may have failed only because of the rejected
-// request; a rejection is final only once every request before it has
-// committed or itself been answered.
+// naming a missing index, or a shard its index does not have, gets its own error
+// and the rest is retried without it. When IfSeq conditions fail, only the first
+// conflicting request is rejected and everything after it is re-evaluated in the
+// next attempt, since its conditions may have failed only because of the rejected
+// request; a rejection is final only once every request before it has committed
+// or itself been answered.
+//
+// A request split over several shards commits shard by shard: when some shards'
+// transactions fail, Apply returns a *PartialError naming them, and the changes of
+// every other shard have committed.
 //
 // A caller whose context ends before its batch is flushed is dropped from it.
 // A caller whose context ends while its batch is committing gets the
@@ -74,17 +91,29 @@ type GroupCommitter struct {
 	maxDelay   time.Duration
 	maxChanges int
 	maxBytes   int
+	byShard    bool
+	slots      chan struct{}
 	tracer     trace.Tracer
 	clock      clock.Clock
 	batchSize  metric.Float64Histogram
 	received   func()
 
-	reqs    chan *gcRequest
+	mu      sync.Mutex
+	lanes   map[ShardID]*gcLane
+	closed  bool
 	closing chan struct{}
-	done    chan struct{}
-	once    sync.Once
+	running sync.WaitGroup
 
 	flushes atomic.Int64
+}
+
+// gcLane is the requests waiting for one shard's transaction (every shard's, with one
+// lane). A goroutine drains it while it holds any.
+type gcLane struct {
+	key    ShardID
+	reqs   []*gcRequest
+	active bool
+	wake   chan struct{} // buffered, 1: a request joined
 }
 
 type gcRequest struct {
@@ -92,12 +121,13 @@ type gcRequest struct {
 	changes []Change
 	prep    *prepared
 	arrived time.Time
-	result  chan gcResult // buffered, 1
+	result  chan error // buffered, 1
 }
 
-type gcResult struct {
-	first, last int64
-	err         error
+// writeConns is implemented by a store, which says how many write connections it
+// has.
+type writeConns interface {
+	writeConns() int
 }
 
 // NewGroupCommitter starts a committer over st. Close it to stop.
@@ -113,6 +143,12 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 	if o.MaxBytes <= 0 {
 		o.MaxBytes = DefaultGroupCommitBytes
 	}
+	if o.MaxTransactions <= 0 {
+		o.MaxTransactions = 1
+		if w, ok := st.(writeConns); ok {
+			o.MaxTransactions = max(w.writeConns()/2, 1)
+		}
+	}
 	if o.Tracer == nil {
 		o.Tracer = otel.Tracer(telemetry.ScopeName)
 	}
@@ -123,132 +159,286 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 		o.Clock = clock.Real{}
 	}
 	in := telemetry.NewInstruments(o.Meter)
-	g := &GroupCommitter{
+	return &GroupCommitter{
 		st:         st,
 		maxDelay:   o.MaxDelay,
 		maxChanges: o.MaxChanges,
 		maxBytes:   o.MaxBytes,
+		byShard:    o.MaxTransactions > 1,
+		slots:      make(chan struct{}, o.MaxTransactions),
 		tracer:     o.Tracer,
 		clock:      o.Clock,
 		batchSize:  in.Histogram(telemetry.MetricGroupCommitBatchSize),
-		reqs:       make(chan *gcRequest),
+		lanes:      map[ShardID]*gcLane{},
 		closing:    make(chan struct{}),
-		done:       make(chan struct{}),
 		received:   o.received,
 	}
-	go g.run()
-	return g
 }
 
-// Apply commits batch as part of a group-commit transaction and returns its
-// seq range, setting each applied change's Seq, like Store.Apply (a request
-// whose every change was a skipped IfExists gets 0, 0). The batch is validated and
-// compressed in the caller's goroutine, so a bad change fails only this caller.
-func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) (first, last int64, err error) {
+// gcPart is the changes of one lane of a request, at their positions in it (at is
+// nil when the part is the whole request).
+type gcPart struct {
+	key     ShardID
+	at      []int
+	changes []Change
+	prep    *prepared
+	req     *gcRequest
+}
+
+// Apply commits batch through the committer and sets each applied change's Seq,
+// like Store.Apply; it returns a *PartialError when the request was split by shard
+// and some shards' changes did not commit. The batch is validated and compressed in
+// the caller's goroutine, so a bad change fails only this caller.
+func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 	if len(batch) == 0 {
-		return 0, 0, nil
+		return nil
 	}
 	if err := ctx.Err(); err != nil {
-		return 0, 0, err
+		return err
 	}
 	var p *prepared
+	var err error
 	if pa, ok := g.st.(preparedApplier); ok {
 		p, err = pa.prepare(batch)
 	} else {
 		p, err = prepare(batch, false)
 	}
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
-	r := &gcRequest{ctx: ctx, changes: batch, prep: p, arrived: g.clock.Now(), result: make(chan gcResult, 1)}
-	select {
-	case g.reqs <- r:
-	case <-g.closing:
-		return 0, 0, ErrClosed
-	case <-ctx.Done():
-		return 0, 0, ctx.Err()
+	for i := range batch {
+		batch[i].Seq, batch[i].Noop = 0, false
 	}
-	select {
-	case res := <-r.result:
-		return res.first, res.last, res.err
-	case <-ctx.Done():
-		return 0, 0, ctx.Err()
+	parts := g.split(batch, p)
+	arrived := g.clock.Now()
+	for _, part := range parts {
+		part.req = &gcRequest{ctx: ctx, changes: part.changes, prep: part.prep, arrived: arrived, result: make(chan error, 1)}
 	}
+	if err := g.submit(parts); err != nil { //nolint:contextcheck // a lane outlives its requests; each transaction carries its callers' contexts
+		return err
+	}
+	errs := make([]error, len(parts))
+	for i, part := range parts {
+		select {
+		case errs[i] = <-part.req.result:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if len(parts) == 1 {
+		return errs[0]
+	}
+	var pe *PartialError
+	for i, part := range parts {
+		if errs[i] == nil {
+			for k, at := range part.at {
+				batch[at].Seq, batch[at].Noop = part.changes[k].Seq, part.changes[k].Noop
+			}
+			continue
+		}
+		if pe == nil {
+			pe = &PartialError{}
+		}
+		pe.Failed = append(pe.Failed, ShardFailure{Shard: part.key, Positions: part.at, Err: atPositions(errs[i], part.at)})
+	}
+	if pe != nil {
+		return pe
+	}
+	return nil
+}
+
+// split cuts a request into its lanes' parts: one, the request itself, unless the
+// committer has a lane per shard and the request names several shards.
+func (g *GroupCommitter) split(batch []Change, p *prepared) []*gcPart {
+	if !g.byShard {
+		return []*gcPart{{changes: batch, prep: p}}
+	}
+	first := batch[0].ShardID()
+	one := true
+	for i := range batch {
+		if batch[i].ShardID() != first {
+			one = false
+			break
+		}
+	}
+	if one {
+		return []*gcPart{{key: first, changes: batch, prep: p}}
+	}
+	byShard := map[ShardID]*gcPart{}
+	var parts []*gcPart
+	for i := range batch {
+		id := batch[i].ShardID()
+		part := byShard[id]
+		if part == nil {
+			part = &gcPart{key: id, prep: &prepared{conditional: p.conditional}}
+			byShard[id] = part
+			parts = append(parts, part)
+		}
+		part.at = append(part.at, i)
+		part.changes = append(part.changes, batch[i])
+		part.prep.payload = append(part.prep.payload, p.payload[i])
+		part.prep.query = append(part.prep.query, p.query[i])
+		part.prep.bytes += p.payload[i].size()
+	}
+	return parts
+}
+
+// atPositions maps the positions an error names in a part to positions in its
+// request.
+func atPositions(err error, at []int) error {
+	var ce *ConflictError
+	var nf *IndexNotFoundError
+	var che *ChangeError
+	switch {
+	case errors.As(err, &ce):
+		out := &ConflictError{Current: ce.Current}
+		for _, pos := range ce.Positions {
+			out.Positions = append(out.Positions, at[pos])
+		}
+		return out
+	case errors.As(err, &nf):
+		out := &IndexNotFoundError{Indexes: nf.Indexes}
+		for _, pos := range nf.Positions {
+			out.Positions = append(out.Positions, at[pos])
+		}
+		return out
+	case errors.As(err, &che):
+		return &ChangeError{Position: at[che.Position], Err: che.Err}
+	}
+	return err
+}
+
+// submit queues every part in its lane, or none once the committer is closed.
+func (g *GroupCommitter) submit(parts []*gcPart) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return ErrClosed
+	}
+	for _, part := range parts {
+		l := g.lanes[part.key]
+		if l == nil {
+			l = &gcLane{key: part.key, wake: make(chan struct{}, 1)}
+			g.lanes[part.key] = l
+		}
+		l.reqs = append(l.reqs, part.req)
+		if g.received != nil {
+			g.received()
+		}
+		if !l.active {
+			l.active = true
+			g.running.Add(1)
+			go g.drain(l)
+			continue
+		}
+		select {
+		case l.wake <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 // Close flushes the requests already accepted, waits for them, and stops.
 // Later Apply calls return ErrClosed.
 func (g *GroupCommitter) Close() error {
-	g.once.Do(func() { close(g.closing) })
-	<-g.done
+	g.mu.Lock()
+	if !g.closed {
+		g.closed = true
+		close(g.closing)
+	}
+	g.mu.Unlock()
+	g.running.Wait()
 	return nil
 }
 
 // Flushes is the number of transactions committed or attempted so far.
 func (g *GroupCommitter) Flushes() int64 { return g.flushes.Load() }
 
-// run collects requests into transactions until the committer closes. It takes whoever
-// is already waiting before looking at the clock, so a backlog is never flushed one
-// request at a time.
-func (g *GroupCommitter) run() {
-	defer close(g.done)
-	var carry *gcRequest
+// drain commits l's requests until it has none: it waits out the first request's
+// batching window (or until the lane holds a full batch, or the committer closes),
+// then takes a transaction slot and every request then waiting, up to a batch. A
+// backlog's window has passed already, so it is never flushed one request at a time.
+func (g *GroupCommitter) drain(l *gcLane) {
+	defer g.running.Done()
 	for {
-		first := carry
-		carry = nil
-		if first == nil {
-			select {
-			case first = <-g.reqs:
-				g.noteReceived()
-			case <-g.closing:
-				return
-			}
+		g.mu.Lock()
+		if len(l.reqs) == 0 {
+			l.active = false
+			delete(g.lanes, l.key)
+			g.mu.Unlock()
+			return
 		}
-		batch := []*gcRequest{first}
-		n, size := len(first.changes), first.prep.bytes
-		deadline := first.arrived.Add(g.maxDelay)
-		var timer clock.Timer
-	collect:
-		for n < g.maxChanges && size < g.maxBytes {
-			var r *gcRequest
-			select {
-			case r = <-g.reqs:
-			default:
-				wait := g.clock.Until(deadline)
-				if wait <= 0 {
-					break collect
-				}
-				if timer == nil {
-					timer = g.clock.NewTimer(wait)
-				}
-				select {
-				case r = <-g.reqs:
-				case <-timer.C():
-					break collect
-				case <-g.closing:
-					break collect
-				}
-			}
-			g.noteReceived()
-			if n+len(r.changes) > g.maxChanges || size+r.prep.bytes > g.maxBytes {
-				carry = r
-				break
-			}
-			batch = append(batch, r)
-			n += len(r.changes)
-			size += r.prep.bytes
-		}
-		if timer != nil {
-			timer.Stop()
-		}
+		deadline := l.reqs[0].arrived.Add(g.maxDelay)
+		g.mu.Unlock()
+		g.window(l, deadline)
+		g.slots <- struct{}{}
+		g.mu.Lock()
+		batch := g.take(l)
+		g.mu.Unlock()
 		g.flush(batch)
+		<-g.slots
 	}
 }
 
-func (g *GroupCommitter) noteReceived() {
-	if g.received != nil {
-		g.received()
+// window waits until deadline, until l holds a full batch, or until the committer
+// closes.
+func (g *GroupCommitter) window(l *gcLane, deadline time.Time) {
+	var timer clock.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for !g.full(l) {
+		wait := g.clock.Until(deadline)
+		if wait <= 0 {
+			return
+		}
+		if timer == nil {
+			timer = g.clock.NewTimer(wait)
+		}
+		select {
+		case <-l.wake:
+		case <-timer.C():
+			return
+		case <-g.closing:
+			return
+		}
 	}
+}
+
+// full reports whether l's requests reach MaxChanges or MaxBytes.
+func (g *GroupCommitter) full(l *gcLane) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	n, size := 0, 0
+	for _, r := range l.reqs {
+		n += len(r.changes)
+		size += r.prep.bytes
+		if n >= g.maxChanges || size >= g.maxBytes {
+			return true
+		}
+	}
+	return false
+}
+
+// take removes l's first requests, as many as one batch holds: it closes before the
+// request that would pass MaxChanges or MaxBytes, and as soon as it reaches either,
+// and holds at least one. g.mu is held.
+func (g *GroupCommitter) take(l *gcLane) []*gcRequest {
+	n, size, k := 0, 0, 0
+	for _, r := range l.reqs {
+		if k > 0 && (n >= g.maxChanges || size >= g.maxBytes || n+len(r.changes) > g.maxChanges || size+r.prep.bytes > g.maxBytes) {
+			break
+		}
+		n += len(r.changes)
+		size += r.prep.bytes
+		k++
+	}
+	batch := l.reqs[:k:k]
+	l.reqs = l.reqs[k:]
+	return batch
 }
 
 // Request states during a flush.
@@ -263,20 +453,20 @@ const (
 // attempt.
 //
 // After a commit, each request's changes get their seqs back (a skipped IfExists
-// change keeps 0), and its range spans the ones applied. A missing index does not
+// change keeps 0). A missing index, or a shard its index does not have, does not
 // depend on the other requests: every request naming one is answered for good, each
-// naming only the indexes its own changes refer to (not the whole batch's). Only the
-// first conflict is certain: that request is held until everything before it is
-// settled, and the rest retried. Answering a request makes the ones held after it
-// active again, since their conflicts may have depended on it; once nothing is left to
-// retry, held requests get their conflicts (everything before them is settled), and on
-// any other error every request left gets that error.
+// naming only the indexes and positions its own changes refer to (not the whole
+// batch's). Only the first conflict is certain: that request is held until everything
+// before it is settled, and the rest retried. Answering a request makes the ones held
+// after it active again, since their conflicts may have depended on it; once nothing
+// is left to retry, held requests get their conflicts (everything before them is
+// settled), and on any other error every request left gets that error.
 func (g *GroupCommitter) flush(batch []*gcRequest) {
 	state := make([]int, len(batch))
 	held := make([]*ConflictError, len(batch))
-	answer := func(i int, res gcResult) {
+	answer := func(i int, err error) {
 		state[i] = gcDone
-		batch[i].result <- res
+		batch[i].result <- err
 		for j := i + 1; j < len(batch); j++ {
 			if state[j] == gcHeld {
 				state[j] = gcActive
@@ -288,9 +478,9 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 		for i := range batch {
 			switch {
 			case state[i] == gcHeld && err == nil:
-				batch[i].result <- gcResult{err: held[i]}
+				batch[i].result <- held[i]
 			case state[i] != gcDone:
-				batch[i].result <- gcResult{err: err}
+				batch[i].result <- err
 			}
 			state[i] = gcDone
 		}
@@ -298,7 +488,7 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 	for {
 		for i, r := range batch {
 			if state[i] != gcDone && r.ctx.Err() != nil {
-				answer(i, gcResult{err: r.ctx.Err()})
+				answer(i, r.ctx.Err())
 			}
 		}
 		var live []int
@@ -319,31 +509,27 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 
 		var ce *ConflictError
 		var nf *IndexNotFoundError
+		var che *ChangeError
 		switch {
 		case err == nil:
 			off := 0
 			for _, i := range live {
-				var res gcResult
 				for j := range batch[i].changes {
-					seq := changes[off+j].Seq
-					batch[i].changes[j].Seq, batch[i].changes[j].Noop = seq, changes[off+j].Noop
-					if seq == 0 {
-						continue
-					}
-					if res.first == 0 {
-						res.first = seq
-					}
-					res.last = seq
+					batch[i].changes[j].Seq, batch[i].changes[j].Noop = changes[off+j].Seq, changes[off+j].Noop
 				}
 				off += len(batch[i].changes)
 				state[i] = gcDone
-				batch[i].result <- res
+				batch[i].result <- nil
 			}
 			finish(nil)
 			return
 		case errors.As(err, &nf):
 			for k, e := range splitPositions(reqs, nf.Positions, nil) {
-				answer(live[k], gcResult{err: &IndexNotFoundError{Indexes: ownIndexes(reqs[k], e.Positions), Positions: e.Positions}})
+				answer(live[k], &IndexNotFoundError{Indexes: ownIndexes(reqs[k], e.Positions), Positions: e.Positions})
+			}
+		case errors.As(err, &che):
+			for k, e := range splitPositions(reqs, []int{che.Position}, nil) {
+				answer(live[k], &ChangeError{Position: e.Positions[0], Err: che.Err})
 			}
 		case errors.As(err, &ce):
 			parts := splitPositions(reqs, ce.Positions, ce.Current)
@@ -365,8 +551,6 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 
 // commit runs one transaction for reqs and returns the combined batch, each applied
 // change's Seq set. The transaction runs until it finishes or every caller has gone.
-// An Applier that does not report each change's Seq applied them all, in order, as
-// first..last.
 func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 	total := 0
 	links := make([]trace.Link, 0, len(reqs))
@@ -406,31 +590,24 @@ func (g *GroupCommitter) commit(reqs []*gcRequest) ([]Change, error) {
 
 	g.flushes.Add(1)
 	g.batchSize.Record(ctx, float64(total))
-	var first, last int64
 	var err error
 	if pa, ok := g.st.(preparedApplier); ok {
-		first, last, err = pa.applyPrepared(ctx, changes, prep)
+		err = pa.applyPrepared(ctx, changes, prep)
 	} else {
-		first, last, err = g.st.Apply(ctx, changes)
+		err = g.st.Apply(ctx, changes)
 	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
-		return changes, err
 	}
-	if last-first+1 == int64(len(changes)) && len(changes) > 0 && changes[0].Seq == 0 {
-		for i := range changes {
-			changes[i].Seq = first + int64(i)
-		}
-	}
-	return changes, nil
+	return changes, err
 }
 
 // preparedApplier is the store's Apply split in two: prepare validates and encodes a
 // batch, and applyPrepared commits it without doing that again.
 type preparedApplier interface {
 	prepare(batch []Change) (*prepared, error)
-	applyPrepared(ctx context.Context, batch []Change, p *prepared) (int64, int64, error)
+	applyPrepared(ctx context.Context, batch []Change, p *prepared) error
 }
 
 // splitPositions maps positions (and their parallel values, if any) in a

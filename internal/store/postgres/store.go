@@ -1,12 +1,12 @@
 // Package postgres is the PostgreSQL dialect of the SQL store, on
 // jackc/pgx/v5 through database/sql.
 //
-// Apply locks the counter row with SELECT ... FOR UPDATE, so sequence numbers
-// are assigned and committed in order, and writes a whole batch with one
-// statement whose rows travel as arrays (see writeSQL). Writes that are read
-// back use RETURNING. Migrations run in one transaction under a
-// transaction-scoped advisory lock. Committed changes are announced with
-// NOTIFY, which Listen turns into tailer wake-ups. The changelog reads that find a
+// Apply locks its shards' sequence rows with SELECT ... FOR UPDATE, so each
+// shard's sequence numbers are assigned and committed in order, and writes a
+// whole batch with one statement whose rows travel as arrays (see writeSQL).
+// Writes that are read back use RETURNING. Migrations run in one transaction
+// under a transaction-scoped advisory lock. Committed changes are announced with
+// NOTIFY after they commit, which Listen turns into tailer wake-ups. The changelog reads that find a
 // shard's newest change run as unnamed statements (pgx.QueryExecModeExec), which
 // PostgreSQL plans for their values at every run (dialect.Dialect.CustomPlan).
 package postgres

@@ -48,15 +48,19 @@ func forEachDialectB(b *testing.B, fn func(b *testing.B, fresh func(testing.TB) 
 	})
 }
 
-// benchStore opens a store on a fresh database with the bench index, storing bodies
-// compressed as a cluster does once every node reads them.
+// benchStore opens a store on a fresh database with the bench index of
+// benchMaxShards shards, storing bodies compressed as a cluster does once every node
+// reads them.
 func benchStore(b *testing.B, fresh func(testing.TB) *harness) Store {
 	b.Helper()
 	st := fresh(b).open(b)
 	st.CompressBodies(true)
-	mustCreateIndex(b, st, "bench")
+	mustCreateShards(b, st, "bench", benchMaxShards)
 	return st
 }
+
+// benchMaxShards is the most shards a benchmark spreads its changes over.
+const benchMaxShards = 64
 
 // benchShards spreads benchmark changes over a few shards, as a bulk request
 // does.
@@ -125,7 +129,7 @@ func BenchmarkApply(b *testing.B) {
 						batch := benchBatchOver(fmt.Sprintf("a%d", i), n, shards, i)
 						i++
 						b.StartTimer()
-						if _, _, err := st.Apply(ctx, batch); err != nil {
+						if err := st.Apply(ctx, batch); err != nil {
 							b.Fatal(err)
 						}
 					}
@@ -153,7 +157,7 @@ func BenchmarkApplyMix(b *testing.B) {
 					for j := range batch {
 						batch[j] = upsert("bench", (k+j)%benchShards, id(k+j), benchBody(k+j))
 					}
-					if _, _, err := st.Apply(ctx, batch); err != nil {
+					if err := st.Apply(ctx, batch); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -171,7 +175,7 @@ func BenchmarkApplyMix(b *testing.B) {
 					}
 					i++
 					b.StartTimer()
-					if _, _, err := st.Apply(ctx, batch); err != nil {
+					if err := st.Apply(ctx, batch); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -185,7 +189,7 @@ func BenchmarkApplyMix(b *testing.B) {
 func benchFill(b *testing.B, st Store, n int) {
 	b.Helper()
 	for i := 0; i < n; i += 1000 {
-		if _, _, err := st.Apply(context.Background(), benchBatch(fmt.Sprintf("f%d", i), min(1000, n-i))); err != nil {
+		if err := st.Apply(context.Background(), benchBatch(fmt.Sprintf("f%d", i), min(1000, n-i))); err != nil {
 			b.Fatal(err)
 		}
 	}

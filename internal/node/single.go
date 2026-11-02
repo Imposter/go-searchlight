@@ -516,7 +516,7 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Config.BackgroundShare > 0 {
 		prio.Set(prio.New(o.Config.BackgroundShare, o.Clock))
 	}
-	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit) //nolint:contextcheck // the committer outlives this call; each Apply carries its caller's context
+	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit)
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	n.bgCancel = cancel
 	for _, run := range o.Background {
@@ -532,7 +532,7 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		return nil, fmt.Errorf("node: list indexes: %w", err)
 	}
 	n.noteDB(nil)
-	if head, _, err := o.Store.HeadSeq(ctx); err == nil {
+	if head, _, err := o.Store.TopSeq(ctx); err == nil { // temporary (write scaling M1): M2 keeps a head per shard
 		n.noteHead(head)
 	} else {
 		_ = n.Close(ctx)

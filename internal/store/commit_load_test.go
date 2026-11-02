@@ -29,7 +29,7 @@ const walStatsDelay = 1200 * time.Millisecond
 // commitLoad is one case of BenchmarkCommitLoad.
 type commitLoad struct {
 	nodes, writers, shards, bulk int
-	// noNotify drops pg_notify from the transaction; asyncCommit sets the session's
+	// noNotify sends no commit notifications; asyncCommit sets the session's
 	// synchronous_commit to off, which takes the WAL flush out of COMMIT. direct calls the
 	// store's Apply with no group committer, so each bulk is its own transaction.
 	noNotify, asyncCommit, direct bool
@@ -94,9 +94,10 @@ func commitLoads() []commitLoad {
 //	go test ./internal/store -run '^$' -bench 'CommitLoad/nodes=1/writers=4/shards=64' -benchtime 150x
 //
 // One iteration is 1,000 changes, whatever the bulk size. The metrics are each phase's mean milliseconds per
-// transaction: begin, lock (the counter's SELECT FOR UPDATE, so its queue when several
-// commit at once), index (reading sl_indexes), write (the statement of every row),
-// commit, and notify where a notification runs apart from the transaction. wal_sync_ms
+// transaction: begin, lock (the shards' sequence rows' SELECT FOR UPDATE, so their queue
+// when several commit to a shard at once), index (reading sl_indexes, now only for a
+// missing row), write (the statement of every row), commit, and notify (the
+// notifications, sent after the commits). wal_sync_ms
 // is the server's mean flush, and wal_syncs/s how many it ran, from pg_stat_wal
 // (track_wal_io_timing must be on); waits, in the log, are backends by wait event from
 // pg_stat_activity, sampled every 50 ms.
@@ -156,7 +157,7 @@ func runCommitLoad(b *testing.B, base string, c commitLoad) {
 	}
 	ctx := context.Background()
 	for i := 0; i < commitLoadPool; i += 4096 {
-		if _, _, err := gcs[0].Apply(ctx, bulkAt(4096)); err != nil {
+		if err := gcs[0].Apply(ctx, bulkAt(4096)); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -179,7 +180,7 @@ func runCommitLoad(b *testing.B, base string, c commitLoad) {
 		for range c.writers {
 			wg.Go(func() {
 				for taken.Add(1) <= bulks {
-					if _, _, err := gc.Apply(ctx, bulkAt(c.bulk)); err != nil {
+					if err := gc.Apply(ctx, bulkAt(c.bulk)); err != nil {
 						failed.CompareAndSwap(nil, &err)
 						return
 					}
@@ -221,7 +222,7 @@ func runCommitLoad(b *testing.B, base string, c commitLoad) {
 }
 
 // tracePhases gives s a write pool of its own whose every statement tr times. noNotify
-// makes s a store of a dialect that cannot listen, so its transactions notify nobody.
+// stops s's notifier, so its commits are announced to nobody.
 func tracePhases(b *testing.B, s Store, storeURL string, tr *phaseTracer, noNotify bool) {
 	b.Helper()
 	u, err := url.Parse(storeURL)
@@ -239,10 +240,9 @@ func tracePhases(b *testing.B, s Store, storeURL string, tr *phaseTracer, noNoti
 	b.Cleanup(func() { _ = db.Close() })
 	e := engine(s)
 	e.w = &gatedDB{DB: db}
-	if noNotify {
-		d := *e.d
-		d.Listen = nil
-		e.d = &d
+	if noNotify && e.notify != nil {
+		e.notify.close()
+		e.notify = nil
 	}
 }
 

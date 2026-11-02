@@ -195,14 +195,19 @@ func (d *db) open(t testing.TB) store.Store {
 
 const testMapping = `{"dynamic":true,"fields":{"title":"text","brand":"keyword","tags":"keyword_list","price":"number"}}`
 
+// createIndex creates an index of testShards shards: the tests write to several,
+// whatever shard their copy follows.
 func createIndex(t testing.TB, st store.Store, name, mapping string) store.IndexMeta {
 	t.Helper()
-	m, err := st.Indexes().Create(context.Background(), store.IndexMeta{Name: name, Mapping: []byte(mapping)})
+	m, err := st.Indexes().Create(context.Background(), store.IndexMeta{Name: name, Mapping: []byte(mapping), Settings: []byte(fmt.Sprintf(`{"shards": %d}`, testShards))})
 	if err != nil {
 		t.Fatalf("create index %s: %v", name, err)
 	}
 	return m
 }
+
+// testShards is the shard count of the tests' indexes.
+const testShards = 4
 
 func docBody(id string, n int) string {
 	return fmt.Sprintf(`{"title":"item %s v%d","brand":"Brand %d","tags":["t%d","t%d"],"price":%d}`, id, n, n%7, n%5, n%3, n%97)
@@ -233,11 +238,16 @@ func queryDelete(index string, sh int, id string) store.Change {
 	return store.Change{Index: index, Shard: sh, Kind: store.KindQueryDelete, ID: id}
 }
 
+// mustApply applies batch and returns the highest seq it took: its last change's,
+// when it writes one shard.
 func mustApply(t testing.TB, st store.Store, batch ...store.Change) int64 {
 	t.Helper()
-	_, last, err := st.Apply(context.Background(), batch)
-	if err != nil {
+	if err := st.Apply(context.Background(), batch); err != nil {
 		t.Fatalf("apply: %v", err)
+	}
+	var last int64
+	for i := range batch {
+		last = max(last, batch[i].Seq)
 	}
 	return last
 }
@@ -324,11 +334,11 @@ func (f *faultStore) down(op string, down bool) {
 	f.always[op] = down
 }
 
-func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if err := f.take("head"); err != nil {
 		return 0, time.Time{}, err
 	}
-	return f.Store.HeadSeq(ctx)
+	return f.Store.HeadSeq(ctx, id)
 }
 
 func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {

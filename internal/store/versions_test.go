@@ -40,7 +40,7 @@ func TestVersions(t *testing.T) {
 		}
 		apply := func(want string, batch ...Change) {
 			t.Helper()
-			if _, _, err := st.Apply(ctx, batch); err != nil {
+			if err := st.Apply(ctx, batch); err != nil {
 				t.Fatal(err)
 			}
 			got := ""

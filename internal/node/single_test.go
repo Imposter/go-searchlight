@@ -687,11 +687,18 @@ func (s flakyStore) GetRecord(ctx context.Context, kind store.RecordKind, id sto
 	return s.rr.GetRecord(ctx, kind, id, key)
 }
 
-func (s flakyStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (s flakyStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if s.headDown != nil && s.headDown.Load() {
 		return 0, time.Time{}, errUnreachable
 	}
-	return s.Store.HeadSeq(ctx)
+	return s.Store.HeadSeq(ctx, id)
+}
+
+func (s flakyStore) TopSeq(ctx context.Context) (int64, time.Time, error) {
+	if s.headDown != nil && s.headDown.Load() {
+		return 0, time.Time{}, errUnreachable
+	}
+	return s.Store.TopSeq(ctx)
 }
 
 func (s flakyStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
@@ -964,12 +971,16 @@ func TestSettingsPatchLogsNoMappingChange(t *testing.T) {
 	if _, err := n.CreateIndex(ctx(t), "s", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
 		t.Fatal(err)
 	}
-	head := func() int64 {
-		h, _, err := st.HeadSeq(ctx(t))
-		if err != nil {
-			t.Fatal(err)
+	head := func() int64 { // the shards' heads summed: the changes logged since creation
+		var sum int64
+		for sh := range 2 {
+			h, _, err := st.HeadSeq(ctx(t), store.ShardID{Index: "s", Shard: sh})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum += h
 		}
-		return h
+		return sum
 	}
 	before := head()
 	d := 250 * time.Millisecond

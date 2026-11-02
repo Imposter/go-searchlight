@@ -127,7 +127,7 @@ func allChanges(t testing.TB, st store.Store, n *Node) []store.Change {
 // the store's documents.
 func converge(t testing.TB, c *cluster, st store.Store, index string, shards int) {
 	t.Helper()
-	head, _, err := st.HeadSeq(context.Background())
+	head, _, err := st.TopSeq(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestNodeLossMidBulk(t *testing.T) {
 		waitCopies(t, a.st, "mb", 2, 2, time.Minute)
 		converge(t, c, a.st, "mb", 2)
 		// Every acknowledged upsert is searchable on the survivors.
-		head, _, _ := a.st.HeadSeq(context.Background())
+		head, _, _ := a.st.TopSeq(context.Background())
 		want := int64(0)
 		for s := range 2 {
 			want += int64(len(truth(t, a.st, store.ShardID{Index: "mb", Shard: s})))

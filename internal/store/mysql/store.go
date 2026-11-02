@@ -1,10 +1,10 @@
 // Package mysql is the MySQL (InnoDB) dialect of the SQL store, on
 // go-sql-driver/mysql.
 //
-// Apply locks the counter row with SELECT ... FOR UPDATE under READ
-// COMMITTED, so sequence numbers are assigned and committed in order, and
-// writes a batch as multi-row INSERTs sized to MySQL's placeholder and packet
-// limits.
+// Apply locks its shards' sequence rows with SELECT ... FOR UPDATE under READ
+// COMMITTED, so each shard's sequence numbers are assigned and committed in
+// order, and writes a batch as multi-row INSERTs sized to MySQL's placeholder
+// and packet limits.
 // MySQL DDL is not transactional, so migrations run on one connection holding
 // a GET_LOCK named after an MD5 hash of the database (a name can run to 64
 // bytes, which a long database name alone could exceed), and each file is

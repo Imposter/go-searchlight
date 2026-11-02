@@ -180,7 +180,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		go func() {
 			defer writers.Done()
 			for !stopped.Load() {
-				_, _, err := gc.Apply(context.Background(), randomBatch())
+				err := gc.Apply(context.Background(), randomBatch())
 				// A batch can meet a dropped index (it is recreated at once).
 				if err != nil && !errors.Is(err, store.ErrNotFound) {
 					t.Errorf("group commit: %v", err)
@@ -210,7 +210,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		for range 3 {
 			write()
 		}
-		head, _, err := writer.HeadSeq(context.Background())
+		head, _, err := writer.HeadSeq(context.Background(), id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,7 +283,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		t.Fatal(err)
 	}
 
-	head, _, err := writer.HeadSeq(context.Background())
+	head, _, err := writer.HeadSeq(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,10 +523,11 @@ func TestApplyErrorHalts(t *testing.T) {
 				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
 				waitCopyState(t, st, id, store.CopyServing)
 
-				_, last, err := st.Apply(ctx, []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)})
-				if err != nil {
+				batch := []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)}
+				if err := st.Apply(ctx, batch); err != nil {
 					t.Fatal(err)
 				}
+				last := batch[2].Seq
 				badSeq := last - 1
 				c.tailer.Wake()
 				c.until("the copy halts", func() bool { return c.current().Halt() != nil })

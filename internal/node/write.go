@@ -88,15 +88,17 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		res.Percolated = opts.Percolate
 		return res, nil
 	}
-	touched := map[int]bool{}
+	touched := map[int]int64{} // each shard's newest seq the write commits or stands at
 	written := map[int]int64{}
 	for i := range batch {
-		touched[batch[i].change.Shard] = true
-		written[batch[i].change.Shard] = max(written[batch[i].change.Shard], batch[i].change.Seq)
+		s := batch[i].change.Shard
+		touched[s] = max(touched[s], batch[i].change.Seq)
+		written[s] = max(written[s], batch[i].change.Seq)
 		res.Seq = max(res.Seq, batch[i].change.Seq)
 	}
 	for i := range unchanged {
-		touched[unchanged[i].change.Shard] = true
+		s := unchanged[i].change.Shard
+		touched[s] = max(touched[s], unchanged[i].change.Seq)
 		res.Seq = max(res.Seq, unchanged[i].change.Seq)
 	}
 	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
@@ -117,7 +119,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		n.cl.Committed(idx.name, written)
 	}
 	if opts.Refresh != api.RefreshNone {
-		if err := n.waitWritten(ctx, idx, touched, res.Seq, opts.Refresh); err != nil {
+		if err := n.waitWritten(ctx, idx, touched, opts.Refresh); err != nil {
 			res.TimedOut = true
 			n.log.WarnContext(ctx, "refresh after a write did not finish", slog.String(telemetry.KeyIndex, name), slog.Int64("seq", res.Seq), slog.Any("error", err))
 		}
@@ -560,67 +562,106 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 // without it. It returns the committed ops, with their seqs. A delete of nothing
 // (IfExists) is skipped in the transaction: it takes no seq and is a 404. A versioned
 // op whose version is not above the stored one is a noop: no seq, and no error.
+//
+// The committer commits each shard's ops apart (store.PartialError): the ops of the
+// shards that committed are answered as committed, a shard refused for a condition or
+// a bad op is retried without it, and any other failure of a shard fails the request,
+// although other shards' ops may have committed. Temporary (write scaling M1): M3
+// answers that last case per op, with the shards that committed.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
+	var applied []prepared
+	defer func() { n.noteApplied(idx, applied, items) }()
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
 		for i := range batch {
 			changes[i] = batch[i].change
 		}
-		_, _, err := n.gc.Apply(ctx, changes)
+		err := n.gc.Apply(ctx, changes)
 		if err == nil || !store.IsTransient(err) {
 			n.noteDB(nil)
 		} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			n.noteDB(err)
 		}
-		var ce *store.ConflictError
-		var che *store.ChangeError
-		var inf *store.IndexNotFoundError
+		failures := []error{err}
+		failed := map[int]bool{}
+		var pe *store.PartialError
 		switch {
-		case err == nil:
-			var applied []prepared
+		case errors.As(err, &pe):
+			failures = failures[:0]
+			for _, f := range pe.Failed {
+				failures = append(failures, f.Err)
+				for _, pos := range f.Positions {
+					failed[pos] = true
+				}
+			}
+		case err != nil:
 			for i := range batch {
-				if changes[i].Noop {
-					items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
-					continue
-				}
-				if changes[i].Seq == 0 {
-					items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
-					continue
-				}
+				failed[i] = true
+			}
+		}
+		for i := range batch {
+			switch {
+			case failed[i]:
+			case changes[i].Noop:
+				items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
+			case changes[i].Seq == 0:
+				items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
+			default:
 				batch[i].change.Seq = changes[i].Seq
 				applied = append(applied, batch[i])
 			}
-			batch = applied
-			if len(batch) == 0 {
-				return nil, nil
-			}
-			for i := range batch {
-				items[batch[i].pos].Seq, items[batch[i].pos].Version = batch[i].change.Seq, batch[i].change.Version
-				sl := idx.shards[batch[i].change.Shard]
-				raise(&sl.written, batch[i].change.Seq)
-				if k := batch[i].change.Kind; k == store.KindQueryUpsert || k == store.KindQueryDelete {
-					raise(&sl.querySeq, batch[i].change.Seq)
-				}
-			}
-			n.noteHead(batch[len(batch)-1].change.Seq)
-			return batch, nil
-		case errors.As(err, &ce):
-			drop := map[int]bool{}
-			for k, pos := range ce.Positions {
-				items[batch[pos].pos].Err = conditionFailed(&batch[pos].change, ce.Current[k])
-				drop[pos] = true
-			}
-			batch = without(batch, drop)
-		case errors.As(err, &che):
-			items[batch[che.Position].pos].Err = api.InvalidAt("body", "%v", che.Err)
-			batch = without(batch, map[int]bool{che.Position: true})
-		case errors.As(err, &inf):
-			return nil, indexNotFound(idx.name)
-		default:
-			return nil, storeError(err, idx.name)
 		}
+		if err == nil {
+			break
+		}
+		drop := map[int]bool{}
+		for _, err := range failures {
+			var ce *store.ConflictError
+			var che *store.ChangeError
+			var inf *store.IndexNotFoundError
+			switch {
+			case errors.As(err, &ce):
+				for k, pos := range ce.Positions {
+					items[batch[pos].pos].Err = conditionFailed(&batch[pos].change, ce.Current[k])
+					drop[pos] = true
+				}
+			case errors.As(err, &che):
+				items[batch[che.Position].pos].Err = api.InvalidAt("body", "%v", che.Err)
+				drop[che.Position] = true
+			case errors.As(err, &inf):
+				return nil, indexNotFound(idx.name)
+			default:
+				return nil, storeError(err, idx.name)
+			}
+		}
+		var retry []prepared
+		for i := range batch {
+			if failed[i] && !drop[i] {
+				retry = append(retry, batch[i])
+			}
+		}
+		batch = retry
 	}
-	return nil, nil
+	return applied, nil
+}
+
+// noteApplied answers the committed ops' items and moves the shards' written and
+// query seqs, and the node's head, on to them.
+func (n *Single) noteApplied(idx *index, applied []prepared, items []api.ItemResult) {
+	var top int64
+	for i := range applied {
+		c := &applied[i].change
+		items[applied[i].pos].Seq, items[applied[i].pos].Version = c.Seq, c.Version
+		sl := idx.shards[c.Shard]
+		raise(&sl.written, c.Seq)
+		if c.Kind == store.KindQueryUpsert || c.Kind == store.KindQueryDelete {
+			raise(&sl.querySeq, c.Seq)
+		}
+		top = max(top, c.Seq)
+	}
+	if top > 0 {
+		n.noteHead(top)
+	}
 }
 
 // conditionFailed answers a change whose condition failed: a delete of nothing is a
@@ -640,16 +681,6 @@ func conditionFailed(c *store.Change, current int64) *api.Error {
 	return e
 }
 
-func without(batch []prepared, drop map[int]bool) []prepared {
-	out := batch[:0:0]
-	for i := range batch {
-		if !drop[i] {
-			out = append(out, batch[i])
-		}
-	}
-	return out
-}
-
 // raise sets v to seq if seq is higher.
 func raise(v *atomic.Int64, seq int64) {
 	for {
@@ -660,21 +691,22 @@ func raise(v *atomic.Int64, seq int64) {
 	}
 }
 
-// waitWritten waits, under ctx's deadline, for the written shards to have seq
-// searchable: by their next refresh (wait_for), or at once (true: once applied, the
-// copies are refreshed). wait_for waits on this node's copy when it hosts a serving
+// waitWritten waits, under ctx's deadline, for each written shard to have its seq in
+// seqs searchable: by their next refresh (wait_for), or at once (true: once applied,
+// the copies are refreshed). wait_for waits on this node's copy when it hosts a serving
 // one, else (a cluster node) on the first other copy that has seq; true waits on this
 // node's copy and every other serving copy of the shard. A copy of this node being
 // rebuilt aside applies nothing until its replacement is swapped in: a cluster node
 // waits on the other copies instead, and on the replacement only when none of them
 // reaches seq.
-func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bool, seq int64, mode api.RefreshMode) error {
-	shards := make([]int, 0, len(touched))
-	for s := range touched {
+func (n *Single) waitWritten(ctx context.Context, idx *index, seqs map[int]int64, mode api.RefreshMode) error {
+	shards := make([]int, 0, len(seqs))
+	for s := range seqs {
 		shards = append(shards, s)
 	}
 	slices.Sort(shards)
 	for _, s := range shards {
+		seq := seqs[s]
 		sl := idx.shards[s]
 		c := sl.local.Load()
 		if c != nil && n.cl != nil && c.peerServing() != nil {

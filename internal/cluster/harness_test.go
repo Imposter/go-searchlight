@@ -730,10 +730,10 @@ func (x *faultIndexes) Drop(ctx context.Context, name string) error {
 	return x.IndexStore.Drop(ctx, name)
 }
 
-func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
+func (f *faultStore) Apply(ctx context.Context, batch []store.Change) error {
 	defer f.timed("Apply")()
 	if f.isDown() {
-		return 0, 0, errPartitioned
+		return errPartitioned
 	}
 	return f.Store.Apply(ctx, batch)
 }
@@ -754,11 +754,18 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return f.Store.ChangesAfter(ctx, id, seq, limit)
 }
 
-func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if f.isDown() {
 		return 0, time.Time{}, errPartitioned
 	}
-	return f.Store.HeadSeq(ctx)
+	return f.Store.HeadSeq(ctx, id)
+}
+
+func (f *faultStore) TopSeq(ctx context.Context) (int64, time.Time, error) {
+	if f.isDown() {
+		return 0, time.Time{}, errPartitioned
+	}
+	return f.Store.TopSeq(ctx)
 }
 
 func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {

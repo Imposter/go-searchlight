@@ -115,7 +115,7 @@ func TestRenewalLatencyUnderBulkLoad(t *testing.T) {
 				for i := range batch {
 					batch[i] = Change{Index: "bulk", Kind: KindUpsert, ID: fmt.Sprintf("w%d-%d-%d", w, b, i), Payload: body}
 				}
-				if _, _, err := st.Apply(ctx, batch); err != nil {
+				if err := st.Apply(ctx, batch); err != nil {
 					t.Error(err)
 					return
 				}

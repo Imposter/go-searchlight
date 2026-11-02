@@ -480,7 +480,7 @@ func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
 		t.Fatal(err)
 	}
-	remapped, _, err := a.st.HeadSeq(tctx(t))
+	remapped, _, err := a.st.TopSeq(tctx(t))
 	if err != nil {
 		t.Fatal(err)
 	}

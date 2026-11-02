@@ -25,14 +25,14 @@ type slowStore struct {
 	delay atomic.Int64 // the longest delay, in nanoseconds
 }
 
-func (s *slowStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
+func (s *slowStore) Apply(ctx context.Context, batch []store.Change) error {
 	if d := s.delay.Load(); d > 0 {
 		t := time.NewTimer(time.Duration(rand.Int64N(d)))
 		select {
 		case <-t.C:
 		case <-ctx.Done():
 			t.Stop()
-			return 0, 0, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	return s.Store.Apply(ctx, batch)

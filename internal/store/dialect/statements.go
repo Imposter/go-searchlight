@@ -120,13 +120,21 @@ type DeleteGroup struct {
 	IDs   []string
 }
 
-// Write is everything a transaction holding the counter lock writes once
-// the store has allocated its seqs: the changelog rows, the net effect on
+// CounterRow is a shard's sequence row (sl_shard_seq) as a write leaves it: the
+// shard's newest seq and its index's mapping version.
+type CounterRow struct {
+	Index          string
+	Shard          int
+	Value          int64
+	MappingVersion int64
+}
+
+// Write is everything a transaction holding its shards' sequence rows writes once
+// the store has allocated their seqs: the changelog rows, the net effect on
 // sl_documents and sl_queries (at most one entry per key across the upserts
 // and deletes of a table), the tombstones versioned deletes keep and those
-// versioned upserts replace (at most one entry per key across both), the
-// counter's new value, and the notification payloads (only when the dialect has
-// Listen).
+// versioned upserts replace (at most one entry per key across both), and the new
+// values of the sequence rows of the shards it wrote changes to (one per shard).
 type Write struct {
 	Changes          []ChangeRow
 	Documents        []DocumentRow
@@ -135,31 +143,55 @@ type Write struct {
 	QueryDeletes     []DeleteGroup
 	Tombstones       []TombstoneRow
 	TombstoneDeletes []TombstoneRow
-	Counter          int64
-	Notify           []string
+	Counters         []CounterRow
 }
 
 // Changelog is the write-ahead log and the documents and saved queries it
 // maintains.
+//
+// Each shard of each index takes its seqs from its own row of sl_shard_seq, whose
+// value is the shard's newest seq, and which holds the index's uid and mapping
+// version. A shard with no row (its index does not exist) stands at the floor,
+// sl_counter row 1: every shard starts there, and a dropped index raises it past its
+// shards' seqs. A transaction locks the rows of the shards it writes in key order
+// (index name, then shard), so transactions on several shards never deadlock.
 type Changelog struct {
-	// LockCounter: () -> value, NOW of sl_counter row 1, locking the row
-	// until the transaction ends ("" FOR UPDATE where the transaction already
-	// holds the database's write lock).
-	LockCounter string
-	// ReadCounterMark: (index, shard) -> value of sl_counter row 1, without a lock,
-	// then index_name, shard, kind, id, at, nonce of the change at that value, then
-	// seq, kind, id, at, nonce of the shard's newest change at or below it; NULL
-	// when there is no such change.
-	ReadCounterMark string
-	// ReadHead: () -> value of sl_counter row 1, NOW.
+	// LockShard: (index, shard) -> value, index_uid, mapping_version, NOW of the
+	// shard's sequence row, locking it until the transaction ends ("" FOR UPDATE where
+	// the transaction already holds the database's write lock). No row when the shard
+	// has none.
+	LockShard string
+	// LockIndexShards: (index) -> shard, value, index_uid, mapping_version, NOW of
+	// every sequence row of the index, by shard, locking them in that order.
+	LockIndexShards string
+	// SeedShard: (index, shard, uid) inserts the shard's sequence row at the floor's
+	// value, with mapping_version 1.
+	SeedShard string
+	// RaiseFloor: (seq) sets the floor to the larger of its value and seq.
+	RaiseFloor string
+	// ReadShardMark: (index, shard, index, shard, index, shard, index, shard) ->
+	// the shard's value (the floor's when it has no row), without a lock, then kind,
+	// id, at, nonce of the shard's change at that value, then seq, kind, id, at, nonce
+	// of the shard's newest change at or below it; NULL when there is no such change.
+	ReadShardMark string
+	// ReadHead: (index, shard) -> the shard's value (the floor's when it has no row),
+	// NOW.
 	ReadHead string
-	// ReadTip: (index, shard, index, seq, index, shard, upto) -> value of sl_counter
-	// row 1, NOW, then index_name, shard, kind, id, at, nonce of the change at that
-	// value and of the change at seq, then seq, kind, id, at, nonce of the shard's
-	// newest change at or below upto (each NULL when there is no such change), then
-	// the shard's below_seq in sl_pruned and the index's uid (NULL when there is
+	// ReadTopSeq: () -> the floor's value, the largest value of any shard (NULL when
+	// there is none), NOW.
+	ReadTopSeq string
+	// ReadTip: (index, shard, index, shard, index, shard, index, shard, seq, index,
+	// shard, index, shard, upto) -> the shard's value (the floor's when it has no
+	// row), NOW, then kind, id, at, nonce of the shard's change at that value and of
+	// its change at seq, then seq, kind, id, at, nonce of its newest change at or
+	// below upto (each NULL when there is no such change), then the shard's below_seq
+	// in sl_pruned and the index_uid of its sequence row (each NULL when there is
 	// none).
 	ReadTip string
+	// Notify: (payloads) announces each payload on the commit notification channel,
+	// in a transaction of its own that does not wait for its flush: a notification is
+	// only a wake-up, which polling backs. Only where the dialect has Listen.
+	Notify string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
 	// DocumentState and QueryState: (index, shard, id) -> seq, version.
@@ -168,7 +200,7 @@ type Changelog struct {
 	// Tombstone: (index, shard, kind, id) -> version of sl_tombstones.
 	Tombstone string
 	// Write returns the statements that store w, in order, inside the
-	// transaction holding the counter lock, splitting a batch so that no
+	// transaction holding its shards' sequence rows, splitting a batch so that no
 	// statement passes l. The store prepares a statement text that runs
 	// several times in a row once for the run, so one row a statement costs
 	// no parse per row.
@@ -391,7 +423,7 @@ type Indexes struct {
 	// Drop: (name) deletes the index's row.
 	Drop string
 	// DropData: each (name), deletes the index's documents, queries, tombstones,
-	// changes, prune horizons and shard copies.
+	// changes, prune horizons, shard copies and sequence rows.
 	DropData []string
 }
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,8 +48,10 @@ type sqlStore struct {
 	compress atomic.Bool
 
 	// beforeCommit, when set (tests only), runs inside Apply's transaction
-	// after the changes are written and before COMMIT.
-	beforeCommit func(ctx context.Context, first, last int64)
+	// after w is written and before COMMIT.
+	beforeCommit func(ctx context.Context, w *dialect.Write)
+	// notify announces commits where the dialect has notifications.
+	notify *notifier
 
 	gateKey     string
 	dbPath      string
@@ -90,6 +94,9 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		ctx, cancel := context.WithCancel(context.Background())
 		s.stopBg = cancel
 		s.bg.Go(func() { s.checkpointLoop(ctx) })
+	}
+	if d.Listen != nil {
+		s.notify = startNotifier(s)
 	}
 	s.reg = &registry{s: s}
 	s.blobs = &blobStore{s: s}
@@ -155,6 +162,15 @@ func (s *sqlStore) retryable(err error) bool {
 
 func (s *sqlStore) Dialect() string { return s.d.Name }
 
+// writeConns is how many connections the write pool opens at most (64 when it has
+// no bound).
+func (s *sqlStore) writeConns() int {
+	if n := s.w.DB.Stats().MaxOpenConnections; n > 0 {
+		return n
+	}
+	return 64
+}
+
 func (s *sqlStore) Registry() RegistryStore { return s.reg }
 
 func (s *sqlStore) Blobs() BlobStore { return s.blobs }
@@ -189,6 +205,9 @@ func (s *sqlStore) Close() error {
 	if s.stopBg != nil {
 		s.stopBg()
 		s.bg.Wait()
+	}
+	if s.notify != nil {
+		s.notify.close()
 	}
 	if s.w.g != nil {
 		releaseGate(s.gateKey)
@@ -416,28 +435,28 @@ func (p *prepared) prepareOne(i int, c *Change, compress bool) error {
 	return nil
 }
 
-func (s *sqlStore) Apply(ctx context.Context, batch []Change) (first, last int64, err error) {
+func (s *sqlStore) Apply(ctx context.Context, batch []Change) error {
 	if len(batch) == 0 {
-		return 0, 0, nil
+		return nil
 	}
 	p, err := s.prepare(batch)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	return s.applyPrepared(ctx, batch, p)
 }
 
 // applyPrepared commits a batch prepare has accepted.
-func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepared) (first, last int64, err error) {
+func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepared) (err error) {
 	ctx, end := s.start(ctx, "apply", attribute.Int("changes", len(batch)))
 	defer end(&err)
 	if s.closed.Load() {
-		return 0, 0, ErrClosed
+		return ErrClosed
 	}
 	for attempt := 1; ; attempt++ {
-		first, last, err = s.applyOnce(ctx, batch, p)
+		err = s.applyOnce(ctx, batch, p)
 		if err == nil || attempt == applyAttempts || !s.retryable(err) || ctx.Err() != nil {
-			return first, last, err
+			return err
 		}
 		s.log.DebugContext(ctx, "retrying apply after a transient failure", slog.Int("attempt", attempt), slog.Any("error", err))
 	}
@@ -455,16 +474,37 @@ func keyOf(c *Change) recKey {
 	return recKey{query: c.Kind.isQuery(), index: c.Index, shard: c.Shard, id: c.ID}
 }
 
-// applyOnce runs one attempt of Apply. The counter row lock serializes every Apply, so
-// seqs commit in order. IfExists misses are dropped inside the transaction, and the
-// rest takes contiguous seqs (keptAt maps them back to their positions in the batch;
-// nil when all are kept). Each changelog row carries the uid of its index's
-// incarnation as of this Apply, so a tailer can tell a drop-and-recreate apart from a
-// continuing index without an extra query per batch.
-func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (first, last int64, err error) {
+// shardHead is a shard's sequence row as the transaction holding it read it (its
+// newest seq, its index's incarnation and mapping version), and last, the newest seq
+// the transaction has taken from it (value while none).
+type shardHead struct {
+	value, last    int64
+	uid            string
+	mappingVersion int64
+}
+
+// compareShards orders shards by key, index name (by bytes) and then shard: the order
+// every transaction takes sequence rows in.
+func compareShards(a, b ShardID) int {
+	if c := strings.Compare(a.Index, b.Index); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Shard, b.Shard)
+}
+
+// applyOnce runs one attempt of Apply. It locks the sequence row of every shard the
+// batch names, in key order, so each shard's seqs commit in order and two
+// transactions never wait on each other in a cycle. IfExists misses and noops are
+// dropped inside the transaction, and the rest takes contiguous seqs per shard
+// (keptAt maps them back to their positions in the batch; nil when all are kept).
+// Each changelog row carries its index's incarnation and mapping version as the
+// locked row holds them, so a tailer can tell a drop-and-recreate apart from a
+// continuing index without an extra query per batch. The commit is announced once
+// it is made.
+func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) error {
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	committed := false
 	defer func() {
@@ -473,26 +513,21 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 		}
 	}()
 
-	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
-		return 0, 0, fmt.Errorf("lock counter: %w", err)
-	}
 	for i := range batch {
 		batch[i].Seq = 0
 	}
+	heads, nowMs, err := s.lockShards(ctx, tx, batch)
+	if err != nil {
+		return err
+	}
 	all := batch
 	var keptAt []int
-
-	idx, err := s.checkIndexes(ctx, tx, batch)
-	if err != nil {
-		return 0, 0, err
-	}
 	var tombs map[recKey]tombAction
 	if p.conditional {
 		var skip []bool
-		skip, tombs, err = s.checkConditions(ctx, tx, batch, counter+1)
+		skip, tombs, err = s.checkConditions(ctx, tx, batch, provisionalSeqs(batch, heads))
 		if err != nil {
-			return 0, 0, err
+			return err
 		}
 		if skip != nil {
 			kept := make([]Change, 0, len(batch))
@@ -509,61 +544,184 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) (
 			batch, p = kept, kp
 		}
 	}
-	first, last = counter+1, counter+int64(len(batch))
-	if len(batch) == 0 {
-		if len(tombs) == 0 {
-			return first, last, nil
-		}
-		w := &dialect.Write{Counter: counter}
-		addTombs(w, tombs, nowMs)
-		if err := s.write(ctx, tx, w); err != nil {
-			return 0, 0, err
-		}
-		if err := tx.Commit(); err != nil {
-			return 0, 0, fmt.Errorf("commit: %w", err)
-		}
-		committed = true
-		return first, last, nil
+	if len(batch) == 0 && len(tombs) == 0 {
+		return nil
 	}
-
-	w := &dialect.Write{Changes: make([]dialect.ChangeRow, len(batch)), Counter: last}
+	seqs := takeSeqs(batch, heads)
+	w := &dialect.Write{Changes: make([]dialect.ChangeRow, len(batch)), Counters: counters(heads)}
 	for i := range batch {
 		c := &batch[i]
-		st := idx[c.Index]
+		h := heads[c.ShardID()]
 		w.Changes[i] = dialect.ChangeRow{
-			Seq: first + int64(i), Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID,
-			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: st.uid, MappingVersion: st.mappingVersion, Nonce: newNonce(),
+			Seq: seqs[i], Index: c.Index, Shard: c.Shard, Kind: string(c.Kind), ID: c.ID,
+			Payload: p.payload[i].plain, PayloadZ: p.payload[i].z, At: nowMs, IndexUID: h.uid, MappingVersion: h.mappingVersion, Nonce: newNonce(),
 		}
 	}
-	netState(w, batch, p, first)
+	netState(w, batch, p, seqs)
 	addTombs(w, tombs, nowMs)
-	if w.Notify, err = s.notifications(batch, first); err != nil {
-		return 0, 0, err
-	}
 	if err := s.write(ctx, tx, w); err != nil {
-		return 0, 0, err
+		return err
 	}
 	if s.beforeCommit != nil {
-		s.beforeCommit(ctx, first, last)
+		s.beforeCommit(ctx, w)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, fmt.Errorf("commit: %w", err)
+		return fmt.Errorf("commit: %w", err)
 	}
 	committed = true
+	s.announce(heads)
 	for k := range batch {
 		i := k
 		if keptAt != nil {
 			i = keptAt[k]
 		}
-		all[i].Seq = first + int64(k)
+		all[i].Seq = seqs[k]
 	}
-	return first, last, nil
+	return nil
 }
 
-// write runs the dialect's statements for w inside tx, which holds the
-// counter lock: the changelog rows, the net state, the counter's new value
-// and the notifications. A statement text that runs several times in a row
-// is prepared once for the run.
+// lockShards locks the sequence rows of the shards batch names, in key order, and
+// returns them, with the database clock as the last lock read it. A shard's row
+// exists exactly while its index has the shard, so a missing one fails the batch
+// (checkShards).
+func (s *sqlStore) lockShards(ctx context.Context, tx *sql.Tx, batch []Change) (map[ShardID]*shardHead, int64, error) {
+	heads := make(map[ShardID]*shardHead, 1)
+	ids := make([]ShardID, 0, 1)
+	for i := range batch {
+		id := batch[i].ShardID()
+		if _, ok := heads[id]; !ok {
+			heads[id] = nil
+			ids = append(ids, id)
+		}
+	}
+	slices.SortFunc(ids, compareShards)
+	var nowMs int64
+	missing := false
+	for _, id := range ids {
+		h := &shardHead{}
+		err := tx.QueryRowContext(ctx, s.d.Changelog.LockShard, id.Index, id.Shard).Scan(&h.value, &h.uid, &h.mappingVersion, &nowMs)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			missing = true
+			continue
+		case err != nil:
+			return nil, 0, fmt.Errorf("lock %s: %w", id, err)
+		}
+		h.last = h.value
+		heads[id] = h
+	}
+	if err := s.checkShards(ctx, tx, batch, heads, missing); err != nil {
+		return nil, 0, err
+	}
+	return heads, nowMs, nil
+}
+
+// checkShards fails with an *IndexNotFoundError naming every change whose index does
+// not exist, or is another incarnation than the one the change names
+// (Change.IndexUID), and otherwise with a *ChangeError at the first change of a shard
+// its index does not have. Only a missing sequence row costs a read of the
+// catalogue, to tell those apart.
+func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, heads map[ShardID]*shardHead, missing bool) error {
+	shards := map[string]int{} // a missing row's index's shard count, 0 when it does not exist
+	if missing {
+		for id, h := range heads {
+			if h != nil {
+				continue
+			}
+			if _, read := shards[id.Index]; read {
+				continue
+			}
+			var mapping, settings []byte
+			var version, mv int64
+			var uid string
+			err := tx.QueryRowContext(ctx, s.d.Indexes.Current, id.Index).Scan(&mapping, &settings, &version, &mv, &uid)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				shards[id.Index] = 0
+			case err != nil:
+				return err
+			default:
+				if shards[id.Index], err = settingsShards(settings); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	var nf *IndexNotFoundError
+	var bad error
+	for i := range batch {
+		c := &batch[i]
+		h := heads[c.ShardID()]
+		n := shards[c.Index]
+		switch {
+		case h == nil && n == 0, h != nil && c.IndexUID != "" && c.IndexUID != h.uid:
+			if nf == nil {
+				nf = &IndexNotFoundError{}
+			}
+			if !slices.Contains(nf.Indexes, c.Index) {
+				nf.Indexes = append(nf.Indexes, c.Index)
+			}
+			nf.Positions = append(nf.Positions, i)
+		case h == nil && c.Shard >= n && bad == nil:
+			bad = &ChangeError{Position: i, Err: invalidf("index %q has %d shard(s); shard %d does not exist", c.Index, n, c.Shard)}
+		case h == nil && bad == nil:
+			bad = fmt.Errorf("store: %s has no sequence row", c.ShardID())
+		}
+	}
+	if nf != nil {
+		return nf
+	}
+	return bad
+}
+
+// provisionalSeqs are the seqs batch's changes would take if every one applied, each
+// shard's in batch order from its newest seq on, as checkConditions judges them.
+func provisionalSeqs(batch []Change, heads map[ShardID]*shardHead) []int64 {
+	next := make(map[ShardID]int64, len(heads))
+	seqs := make([]int64, len(batch))
+	for i := range batch {
+		id := batch[i].ShardID()
+		n, ok := next[id]
+		if !ok {
+			n = heads[id].value
+		}
+		n++
+		next[id] = n
+		seqs[i] = n
+	}
+	return seqs
+}
+
+// takeSeqs gives batch's changes their seqs, each shard's contiguous in batch order
+// from its newest seq on, and moves each shard's last on to them.
+func takeSeqs(batch []Change, heads map[ShardID]*shardHead) []int64 {
+	seqs := make([]int64, len(batch))
+	for i := range batch {
+		h := heads[batch[i].ShardID()]
+		h.last++
+		seqs[i] = h.last
+	}
+	return seqs
+}
+
+// counters are the new values of the sequence rows a transaction took seqs from, in
+// key order.
+func counters(heads map[ShardID]*shardHead) []dialect.CounterRow {
+	var out []dialect.CounterRow
+	for id, h := range heads {
+		if h.last > h.value {
+			out = append(out, dialect.CounterRow{Index: id.Index, Shard: id.Shard, Value: h.last, MappingVersion: h.mappingVersion})
+		}
+	}
+	slices.SortFunc(out, func(a, b dialect.CounterRow) int {
+		return compareShards(ShardID{Index: a.Index, Shard: a.Shard}, ShardID{Index: b.Index, Shard: b.Shard})
+	})
+	return out
+}
+
+// write runs the dialect's statements for w inside tx, which holds the sequence rows
+// of w's shards: the changelog rows, the net state and the rows' new values. A
+// statement text that runs several times in a row is prepared once for the run.
 func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) error {
 	stmts := s.d.Changelog.Write(w, s.d.Changelog.Limits)
 	var run *sql.Stmt
@@ -598,62 +756,6 @@ func (s *sqlStore) write(ctx context.Context, tx *sql.Tx, w *dialect.Write) erro
 	return nil
 }
 
-// indexState is an index's incarnation and mapping version as of a
-// transaction, which every changelog row carries.
-type indexState struct {
-	uid            string
-	mappingVersion int64
-}
-
-// checkIndexes fails with an *IndexNotFoundError naming every change whose
-// index does not exist, and otherwise returns each named index's current
-// incarnation and mapping version, so the changelog row can carry them. A change
-// meant for an incarnation that was dropped finds its index missing.
-func (s *sqlStore) checkIndexes(ctx context.Context, tx *sql.Tx, batch []Change) (map[string]indexState, error) {
-	states := make(map[string]indexState, 1)
-	var missing *IndexNotFoundError
-	for i := range batch {
-		name := batch[i].Index
-		st, seen := states[name]
-		uid := st.uid
-		if !seen {
-			var mapping string
-			err := tx.QueryRowContext(ctx, s.d.Changelog.IndexState, name).Scan(&st.uid, &st.mappingVersion, &mapping)
-			switch {
-			case errors.Is(err, sql.ErrNoRows):
-				st = indexState{}
-			case err != nil:
-				return nil, err
-			}
-			states[name] = st
-			uid = st.uid
-			if uid == "" {
-				if missing == nil {
-					missing = &IndexNotFoundError{}
-				}
-				missing.Indexes = append(missing.Indexes, name)
-			}
-		}
-		if want := batch[i].IndexUID; uid != "" && want != "" && want != uid {
-			if missing == nil {
-				missing = &IndexNotFoundError{}
-			}
-			if !slices.Contains(missing.Indexes, name) {
-				missing.Indexes = append(missing.Indexes, name)
-			}
-			missing.Positions = append(missing.Positions, i)
-			continue
-		}
-		if uid == "" {
-			missing.Positions = append(missing.Positions, i)
-		}
-	}
-	if missing != nil {
-		return nil, missing
-	}
-	return states, nil
-}
-
 // keyState is what checkConditions knows of one target as the batch goes: its seq (0:
 // absent), its version (once versionKnown: an unconditional upsert of a target not read
 // yet leaves the stored version as it was, and the store's is read when a later change
@@ -682,8 +784,9 @@ type tombAction struct {
 // a version keeps it (the greater of the change's, the target's and its tombstone's; a
 // versioned delete of nothing, which skip drops, too), and a versioned upsert removes
 // a tombstone the target had. Versions only ever rise: an unversioned write keeps the
-// stored one.
-func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, first int64) (skip []bool, tombs map[recKey]tombAction, err error) {
+// stored one. A change that applies stands at its provisional seq in prov for the
+// changes after it.
+func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Change, prov []int64) (skip []bool, tombs map[recKey]tombAction, err error) {
 	cur := make(map[recKey]*keyState)
 	read := func(c *Change, k recKey, st *keyState) error {
 		q := s.d.Changelog.DocumentState
@@ -755,7 +858,7 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 				st = &keyState{}
 				cur[k] = st
 			}
-			st.seq = first + int64(i)
+			st.seq = prov[i]
 			continue
 		}
 		st, err := state(c, k)
@@ -801,9 +904,9 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 				st.tomb = 0
 				tombs = setTomb(tombs, k, tombAction{})
 			}
-			st.seq, st.version = first+int64(i), c.Version
+			st.seq, st.version = prov[i], c.Version
 		default:
-			st.seq = first + int64(i)
+			st.seq = prov[i]
 		}
 	}
 	if conflict != nil {
@@ -820,9 +923,10 @@ func setTomb(tombs map[recKey]tombAction, k recKey, a tombAction) map[recKey]tom
 	return tombs
 }
 
-// netState adds the batch's net effect on sl_documents and sl_queries to w:
-// the last change to each key wins, so each key appears once.
-func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
+// netState adds the batch's net effect on sl_documents and sl_queries to w, each
+// change at its seq in seqs: the last change to each key wins, so each key appears
+// once.
+func netState(w *dialect.Write, batch []Change, p *prepared, seqs []int64) {
 	lastPos := make(map[recKey]int, len(batch))
 	for i := range batch {
 		lastPos[keyOf(&batch[i])] = i
@@ -839,7 +943,7 @@ func netState(w *dialect.Write, batch []Change, p *prepared, first int64) {
 		if lastPos[k] != i {
 			continue
 		}
-		seq := first + int64(i)
+		seq := seqs[i]
 		switch c.Kind {
 		case KindUpsert:
 			w.Documents = append(w.Documents, dialect.DocumentRow{
@@ -882,37 +986,17 @@ func addTombs(w *dialect.Write, tombs map[recKey]tombAction, nowMs int64) {
 	}
 }
 
-// notifications are the payloads announcing each shard's highest new seq.
-// They are sent inside the transaction, so they are delivered exactly when
-// it commits. There are none where the dialect cannot listen.
-func (s *sqlStore) notifications(batch []Change, first int64) ([]string, error) {
-	if s.d.Listen == nil {
-		return nil, nil
+// announce hands the notifier the newest seq of each shard a committed transaction
+// took seqs from. There is no notifier where the dialect cannot listen.
+func (s *sqlStore) announce(heads map[ShardID]*shardHead) {
+	if s.notify == nil {
+		return
 	}
-	top := make(map[ShardID]int64)
-	var order []ShardID
-	for i := range batch {
-		id := batch[i].ShardID()
-		if _, ok := top[id]; !ok {
-			order = append(order, id)
+	for id, h := range heads {
+		if h.last > h.value {
+			s.notify.add(id, h.last)
 		}
-		top[id] = first + int64(i)
 	}
-	out := make([]string, 0, len(order))
-	for _, id := range order {
-		payload, err := json.Marshal(notification{Index: id.Index, Shard: id.Shard, Seq: top[id]})
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, string(payload))
-	}
-	return out, nil
-}
-
-type notification struct {
-	Index string `json:"index"`
-	Shard int    `json:"shard"`
-	Seq   int64  `json:"seq"`
 }
 
 // --- Reads ----------------------------------------------------------------
@@ -983,9 +1067,9 @@ func (s *sqlStore) ChangesAfter(ctx context.Context, shard ShardID, seq int64, l
 }
 
 // ScanShard implements [Store]. In the same snapshot as the rows, it reads first the
-// counter, the mark of the change at it and the shard's newest change at or below it,
-// then the index's current incarnation and mapping: the mapping is the first record,
-// and the incarnation and mapping version are stamped on every record.
+// shard's head, the mark of its change at the head and its newest change at or below
+// it, then the index's current incarnation and mapping: the mapping is the first
+// record, and the incarnation and mapping version are stamped on every record.
 func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (pt ScanPoint, err error) {
 	ctx, end := s.start(ctx, "scan_shard", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
@@ -1000,13 +1084,13 @@ func (s *sqlStore) ScanShard(ctx context.Context, shard ShardID, fn func(Record)
 		return pt, err
 	}
 	defer rollback(tx)
-	var mc markColumns
-	var own shardMarkColumns
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadCounterMark, s.customPlan(shard.Index, shard.Shard)...).Scan(&pt.Seq,
-		&mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
+	var at, own shardMarkColumns
+	i, n := shard.Index, shard.Shard
+	if err := tx.QueryRowContext(ctx, s.d.Changelog.ReadShardMark, s.customPlan(i, n, i, n, i, n, i, n)...).Scan(&pt.Seq,
+		&at.kind, &at.id, &at.at, &at.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
 		return pt, err
 	}
-	pt.Mark, pt.ShardMark = mc.mark(pt.Seq), own.mark(shard)
+	pt.Mark, pt.ShardMark = at.markAt(shard, pt.Seq), own.mark(shard)
 	var uid string
 	var mv int64
 	var mapping []byte
@@ -1061,15 +1145,32 @@ func scanRows(ctx context.Context, tx *sql.Tx, q string, shard ShardID, scan fun
 	return rows.Err()
 }
 
-func (s *sqlStore) HeadSeq(ctx context.Context) (seq int64, now time.Time, err error) {
-	ctx, end := s.start(ctx, "head_seq")
+func (s *sqlStore) HeadSeq(ctx context.Context, shard ShardID) (seq int64, now time.Time, err error) {
+	ctx, end := s.start(ctx, "head_seq", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
 	if s.closed.Load() {
 		return 0, time.Time{}, ErrClosed
 	}
+	if err := validShard(shard); err != nil {
+		return 0, time.Time{}, err
+	}
 	var nowMs int64
-	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadHead).Scan(&seq, &nowMs)
+	err = s.r.QueryRowContext(ctx, s.d.Changelog.ReadHead, shard.Index, shard.Shard).Scan(&seq, &nowMs)
 	return seq, millis(nowMs), err
+}
+
+func (s *sqlStore) TopSeq(ctx context.Context) (seq int64, now time.Time, err error) {
+	ctx, end := s.start(ctx, "top_seq")
+	defer end(&err)
+	if s.closed.Load() {
+		return 0, time.Time{}, ErrClosed
+	}
+	var top sql.NullInt64
+	var nowMs int64
+	if err := s.r.QueryRowContext(ctx, s.d.Changelog.ReadTopSeq).Scan(&seq, &top, &nowMs); err != nil {
+		return 0, time.Time{}, err
+	}
+	return max(seq, top.Int64), millis(nowMs), nil
 }
 
 func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
@@ -1084,25 +1185,25 @@ func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
 // readTip runs the per-poll statement (Changelog.ReadTip) on db.
 func (s *sqlStore) readTip(ctx context.Context, db queryer, q TipQuery) (tip Tip, err error) {
 	var nowMs int64
-	var head, at markColumns
-	var own shardMarkColumns
+	var head, at, own shardMarkColumns
 	var horizon sql.NullInt64
 	var uid sql.NullString
 	err = db.QueryRowContext(ctx, s.d.Changelog.ReadTip, s.tipArgs(q)...).Scan(&tip.Head, &nowMs,
-		&head.index, &head.shard, &head.kind, &head.id, &head.at, &head.nonce,
-		&at.index, &at.shard, &at.kind, &at.id, &at.at, &at.nonce,
+		&head.kind, &head.id, &head.at, &head.nonce,
+		&at.kind, &at.id, &at.at, &at.nonce,
 		&own.seq, &own.kind, &own.id, &own.at, &own.nonce, &horizon, &uid)
 	if err != nil {
 		return tip, err
 	}
-	tip.Now, tip.HeadMark, tip.AtMark = millis(nowMs), head.mark(tip.Head), at.mark(q.At)
+	tip.Now, tip.HeadMark, tip.AtMark = millis(nowMs), head.markAt(q.Shard, tip.Head), at.markAt(q.Shard, q.At)
 	tip.ShardMark, tip.Horizon, tip.IndexUID = own.mark(q.Shard), horizon.Int64, uid.String
 	return tip, nil
 }
 
 // tipArgs returns Changelog.ReadTip's arguments for q.
 func (s *sqlStore) tipArgs(q TipQuery) []any {
-	return s.customPlan(q.Shard.Index, q.Shard.Shard, q.Shard.Index, q.At, q.Shard.Index, q.Shard.Shard, q.UpTo)
+	i, n := q.Shard.Index, q.Shard.Shard
+	return s.customPlan(i, n, i, n, i, n, i, n, q.At, i, n, i, n, q.UpTo)
 }
 
 // customPlan returns the arguments of a statement the engine must plan for their
@@ -1112,7 +1213,8 @@ func (s *sqlStore) customPlan(args ...any) []any {
 }
 
 // shardMarkColumns scans the mark of a known shard's change from a LEFT JOIN, NULL
-// when there is none.
+// when there is none. seq is scanned only where the statement returns it, not where
+// it found the change by its seq.
 type shardMarkColumns struct {
 	kind, id       sql.NullString
 	seq, at, nonce sql.NullInt64
@@ -1122,20 +1224,15 @@ func (c *shardMarkColumns) mark(shard ShardID) ChangeMark {
 	if !c.seq.Valid {
 		return ChangeMark{}
 	}
-	return ChangeMark{Seq: c.seq.Int64, Index: shard.Index, Shard: shard.Shard, Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
+	return c.markAt(shard, c.seq.Int64)
 }
 
-// markColumns scans a change's mark from a LEFT JOIN, NULL when there is no change.
-type markColumns struct {
-	index, kind, id  sql.NullString
-	shard, at, nonce sql.NullInt64
-}
-
-func (c *markColumns) mark(seq int64) ChangeMark {
-	if !c.index.Valid {
+// markAt is the mark of shard's change at seq, which the statement found by its seq.
+func (c *shardMarkColumns) markAt(shard ShardID, seq int64) ChangeMark {
+	if !c.kind.Valid {
 		return ChangeMark{}
 	}
-	return ChangeMark{Seq: seq, Index: c.index.String, Shard: int(c.shard.Int64), Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
+	return ChangeMark{Seq: seq, Index: shard.Index, Shard: shard.Shard, Kind: Kind(c.kind.String), ID: c.id.String, At: millis(c.at.Int64), Nonce: c.nonce.Int64}
 }
 
 // --- Pruning ---------------------------------------------------------------
@@ -1145,7 +1242,8 @@ func (c *markColumns) mark(seq int64) ChangeMark {
 const pruneStep = 5000
 
 // Prune implements [Store]. Once the horizon is published, ChangesAfter refuses the
-// range, which is then deleted in short statements.
+// range, which is then deleted in short statements. A shard whose index is gone has
+// nothing left to prune: its drop deleted its changes.
 func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (err error) {
 	ctx, end := s.start(ctx, "prune", attribute.String("index", shard.Index), attribute.Int("shard", shard.Shard))
 	defer end(&err)
@@ -1158,8 +1256,8 @@ func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (er
 	if belowSeq <= 1 {
 		return nil
 	}
-	below, err := s.raiseHorizon(ctx, shard, belowSeq)
-	if err != nil {
+	below, ok, err := s.raiseHorizon(ctx, shard, belowSeq)
+	if err != nil || !ok {
 		return err
 	}
 	m := &s.d.Maintenance
@@ -1178,29 +1276,35 @@ func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (er
 	}
 }
 
-// raiseHorizon records belowSeq (clamped to the next seq) as the shard's
-// prune horizon unless it is already higher, and returns the horizon. It
-// takes the counter lock so it is serialized with Apply and other prunes.
-func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int64) (int64, error) {
+// raiseHorizon records belowSeq (clamped to the shard's next seq) as the shard's
+// prune horizon unless it is already higher, and returns the horizon. It takes the
+// shard's sequence row, so it is serialized with Apply and other prunes of the shard.
+// It reports false, and records nothing, when the shard has no row.
+func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int64) (int64, bool, error) {
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer rollback(tx)
-	var counter, nowMs int64
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockCounter).Scan(&counter, &nowMs); err != nil {
-		return 0, err
+	var h shardHead
+	var nowMs int64
+	err = tx.QueryRowContext(ctx, s.d.Changelog.LockShard, shard.Index, shard.Shard).Scan(&h.value, &h.uid, &h.mappingVersion, &nowMs)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return 0, false, nil
+	case err != nil:
+		return 0, false, err
 	}
-	belowSeq = min(belowSeq, counter+1)
+	belowSeq = min(belowSeq, h.value+1)
 	row, err := returningRow(ctx, tx, s.d.Maintenance.RaiseHorizon,
 		[]any{shard.Index, shard.Shard, belowSeq}, []any{shard.Index, shard.Shard})
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if err := row.Scan(&belowSeq); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return belowSeq, tx.Commit()
+	return belowSeq, true, tx.Commit()
 }
 
 // --- Notifications -----------------------------------------------------------

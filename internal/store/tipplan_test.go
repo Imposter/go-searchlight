@@ -34,8 +34,8 @@ func tipPlanCases() []tipPlanCase {
 // seedPlanChangelog fills the changelog with planChanges changes, numbered from 1 by
 // the n of from (a dialect's SELECT of n over 1..planChanges): shard 0 of quiet takes
 // every seventh of the first thousand, and the rest spread over four busy indexes of
-// five shards. The quiet and empty indexes exist, the changelog's head is the last
-// change, and the tables are analyzed.
+// five shards. The quiet and empty indexes exist, the floor (where the busy indexes,
+// which have no sequence rows, stand) is the last change, and the tables are analyzed.
 func seedPlanChangelog(t *testing.T, st Store, from, analyze string) {
 	t.Helper()
 	ctx := context.Background()

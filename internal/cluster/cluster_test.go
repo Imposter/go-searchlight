@@ -430,7 +430,7 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 			t.Fatal("no search fetched from a copy that stopped serving after its query phase: the restarts did not exercise the fetch path")
 		}
 		st := c.node(0).st
-		head, _, err := st.HeadSeq(tctx(t))
+		head, _, err := st.TopSeq(tctx(t))
 		if err != nil {
 			t.Fatal(err)
 		}

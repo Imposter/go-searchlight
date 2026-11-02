@@ -33,7 +33,7 @@ func (n *Single) checkHead(ctx context.Context, seq int64) error {
 	if seq <= n.head.Load() {
 		return nil
 	}
-	h, _, err := n.st.HeadSeq(ctx)
+	h, _, err := n.st.TopSeq(ctx) // temporary (write scaling M1): M2 keeps a head per shard
 	if err != nil {
 		n.noteDB(err)
 		return api.Unavailable(err, "wait_for_seq %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", seq, n.head.Load())

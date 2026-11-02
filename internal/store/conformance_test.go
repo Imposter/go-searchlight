@@ -18,6 +18,8 @@ import (
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
 // The conformance suite runs every test on SQLite, and on Postgres and MySQL
@@ -58,8 +60,8 @@ func TestMigrate(t *testing.T) {
 		if got := countRows(t, st, "SELECT COUNT(*) FROM sl_schema_migrations"); got != len(ms) {
 			t.Fatalf("version table has %d rows, want %d", got, len(ms))
 		}
-		if got := counterValue(t, st); got != 0 {
-			t.Fatalf("fresh counter = %d", got)
+		if got := floorSeq(t, st); got != 0 {
+			t.Fatalf("fresh floor = %d", got)
 		}
 
 		// A database migrated by a newer binary is refused.
@@ -73,11 +75,14 @@ func TestMigrate(t *testing.T) {
 	})
 }
 
+// TestApplyAndRead: each shard's changes take that shard's seqs, contiguous in batch
+// order, so seqs repeat across shards; every read sees them so; bad input and missing
+// indexes and shards are refused before anything is written.
 func TestApplyAndRead(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		mustCreateIndex(t, st, "products")
+		mustCreateShards(t, st, "products", 2)
 		s0 := ShardID{Index: "products", Shard: 0}
 		s1 := ShardID{Index: "products", Shard: 1}
 
@@ -86,25 +91,26 @@ func TestApplyAndRead(t *testing.T) {
 			t.Fatal(err)
 		}
 		long := strings.Repeat("ß", 256) // 512 bytes of non-ASCII: the longest id
-		first, last := mustApply(t, st,
+		first := []Change{
 			upsert("products", 0, "a", `{"name":"Straße","n":1}`),
 			upsert("products", 0, "b", `{"name":"b"}`),
 			upsert("products", 1, "c", `{"name":"c"}`),
-			Change{Index: "products", Shard: 0, Kind: KindQueryUpsert, ID: "q1", Payload: qp},
+			{Index: "products", Shard: 0, Kind: KindQueryUpsert, ID: "q1", Payload: qp},
 			upsert("products", 0, long, `{"İ":"ﬁ"}`),
-		)
-		if first != 1 || last != 5 {
-			t.Fatalf("first batch got %d..%d, want 1..5", first, last)
 		}
-		f2, l2 := mustApply(t, st,
+		mustApply(t, st, first...)
+		if got := fmt.Sprint(seqsOf(first)); got != "[1 2 1 3 4]" {
+			t.Fatalf("first batch took seqs %s, want [1 2 1 3 4]", got)
+		}
+		second := []Change{
 			upsert("products", 0, "a", `{"name":"a2"}`),
 			del("products", 0, "b"),
 			upsert("products", 0, "x", `{}`),
 			del("products", 0, "x"), // upsert then delete in one batch: gone
-			Change{Index: "products", Shard: 0, Kind: KindQueryDelete, ID: "nope"},
-		)
-		if f2 != 6 || l2 != 10 {
-			t.Fatalf("second batch got %d..%d, want 6..10", f2, l2)
+			{Index: "products", Shard: 0, Kind: KindQueryDelete, ID: "nope"},
+		}
+		if f, l := mustApply(t, st, second...); f != 5 || l != 9 {
+			t.Fatalf("second batch got %d..%d, want 5..9", f, l)
 		}
 
 		ch := allChanges(t, st, s0)
@@ -112,7 +118,7 @@ func TestApplyAndRead(t *testing.T) {
 		for _, c := range ch {
 			seqs = append(seqs, c.Seq)
 		}
-		if want := []int64{1, 2, 4, 5, 6, 7, 8, 9, 10}; fmt.Sprint(seqs) != fmt.Sprint(want) {
+		if want := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9}; fmt.Sprint(seqs) != fmt.Sprint(want) {
 			t.Fatalf("shard 0 seqs %v, want %v", seqs, want)
 		}
 		if c := ch[0]; c.Kind != KindUpsert || c.ID != "a" || string(c.Payload) != `{"name":"Straße","n":1}` || c.At.IsZero() {
@@ -127,31 +133,34 @@ func TestApplyAndRead(t *testing.T) {
 		if at := ch[0].At; time.Since(at).Abs() > time.Hour {
 			t.Fatalf("change time %s is not now", at)
 		}
+		if c1 := allChanges(t, st, s1); len(c1) != 1 || c1[0].Seq != 1 || c1[0].ID != "c" {
+			t.Fatalf("shard 1 changes %+v", c1)
+		}
 		// Paging with a limit.
 		page, err := st.ChangesAfter(ctx, s0, 2, 2)
-		if err != nil || len(page) != 2 || page[0].Seq != 4 || page[1].Seq != 5 {
+		if err != nil || len(page) != 2 || page[0].Seq != 3 || page[1].Seq != 4 {
 			t.Fatalf("page after 2: %v %v", page, err)
 		}
 
 		recs, asOf := scanAll(t, st, s0)
-		if asOf != 10 {
-			t.Fatalf("asOf = %d, want 10", asOf)
+		if asOf != 9 {
+			t.Fatalf("asOf = %d, want 9", asOf)
 		}
 		if len(recs) != 3 {
 			t.Fatalf("shard 0 records %v", recs)
 		}
-		if r := recs["d:a"]; string(r.Body) != `{"name":"a2"}` || r.Seq != 6 || r.Kind != RecordDocument {
+		if r := recs["d:a"]; string(r.Body) != `{"name":"a2"}` || r.Seq != 5 || r.Kind != RecordDocument {
 			t.Fatalf("doc a %+v", r)
 		}
-		if r := recs["d:"+long]; r.Seq != 5 {
+		if r := recs["d:"+long]; r.Seq != 4 {
 			t.Fatalf("long doc %+v", r)
 		}
-		if r := recs["q:q1"]; string(r.Body) != `{"eq":{"brand":"acme"}}` || string(r.Meta) != `{"search_id":7}` || r.Seq != 4 {
+		if r := recs["q:q1"]; string(r.Body) != `{"eq":{"brand":"acme"}}` || string(r.Meta) != `{"search_id":7}` || r.Seq != 3 {
 			t.Fatalf("query q1 %+v", r)
 		}
-		recs1, _ := scanAll(t, st, s1)
-		if len(recs1) != 1 || recs1["d:c"].Seq != 3 {
-			t.Fatalf("shard 1 records %v", recs1)
+		recs1, asOf1 := scanAll(t, st, s1)
+		if len(recs1) != 1 || recs1["d:c"].Seq != 1 || asOf1 != 1 {
+			t.Fatalf("shard 1 records %v at %d", recs1, asOf1)
 		}
 
 		// Bad input is refused before anything is written.
@@ -165,25 +174,51 @@ func TestApplyAndRead(t *testing.T) {
 			"query no dsl": {Index: "products", Kind: KindQueryUpsert, ID: "z", Payload: []byte(`{"meta":{}}`)},
 			"bad utf8":     upsert("products", 0, "z", "{\"x\":\"\xff\"}"),
 		} {
-			if _, _, err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrInvalid) {
+			if err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrInvalid) {
 				t.Errorf("%s: %v, want ErrInvalid", name, err)
 			}
 		}
 		var nf *IndexNotFoundError
-		_, _, err = st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("missing", 0, "z", `{}`), upsert("missing", 1, "y", `{}`)})
+		err = st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("missing", 0, "z", `{}`), upsert("missing", 1, "y", `{}`)})
 		if !errors.As(err, &nf) || fmt.Sprint(nf.Positions) != "[1 2]" || nf.Indexes[0] != "missing" || !errors.Is(err, ErrNotFound) {
 			t.Errorf("missing index: %v, want an IndexNotFoundError at [1 2]", err)
 		}
-		// An invalid change is reported by position.
+		// An invalid change is reported by position, and so is a shard the index does
+		// not have.
 		var che *ChangeError
-		if _, _, err := st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("products", 0, "", `{}`)}); !errors.As(err, &che) || che.Position != 1 {
+		if err := st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("products", 0, "", `{}`)}); !errors.As(err, &che) || che.Position != 1 {
 			t.Errorf("invalid change: %v, want a ChangeError at 1", err)
 		}
-		if got := counterValue(t, st); got != 10 {
-			t.Fatalf("counter = %d after refused batches, want 10", got)
+		if err := st.Apply(ctx, []Change{upsert("products", 0, "z", `{}`), upsert("products", 2, "y", `{}`)}); !errors.As(err, &che) || che.Position != 1 || !errors.Is(err, ErrInvalid) {
+			t.Errorf("a shard the index does not have: %v, want a ChangeError at 1", err)
 		}
-		if f, l, err := st.Apply(ctx, nil); f != 0 || l != 0 || err != nil {
-			t.Fatalf("empty apply: %d %d %v", f, l, err)
+		if h0, h1 := headSeq(t, st, s0), headSeq(t, st, s1); h0 != 9 || h1 != 1 {
+			t.Fatalf("heads %d and %d after refused batches, want 9 and 1", h0, h1)
+		}
+		if err := st.Apply(ctx, nil); err != nil {
+			t.Fatalf("empty apply: %v", err)
+		}
+	})
+}
+
+// TestApplyAcrossShardsIsAtomic: a direct Apply naming several shards commits as one
+// transaction: a conflict on one shard applies nothing on any.
+func TestApplyAcrossShardsIsAtomic(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateShards(t, st, "atomic", 3)
+		mustApply(t, st, upsert("atomic", 2, "taken", `{}`))
+		create := upsert("atomic", 2, "taken", `{}`)
+		create.IfSeq = IfAbsent
+		var ce *ConflictError
+		if err := st.Apply(ctx, []Change{upsert("atomic", 0, "a", `{}`), upsert("atomic", 1, "b", `{}`), create}); !errors.As(err, &ce) || fmt.Sprint(ce.Positions) != "[2]" {
+			t.Fatalf("a conflict on one shard: %v", err)
+		}
+		for sh := range 3 {
+			if n := len(allChanges(t, st, ShardID{Index: "atomic", Shard: sh})); n != min(sh/2, 1) {
+				t.Errorf("shard %d holds %d changes after the refused batch", sh, n)
+			}
 		}
 	})
 }
@@ -222,10 +257,9 @@ func TestBigBatch(t *testing.T) {
 }
 
 // writeLoad has writers on several nodes apply random batches over three
-// shards and returns each batch's seq range and changes.
+// shards and returns each batch, its changes' seqs set.
 type applied struct {
-	first, last int64
-	batch       []Change
+	batch []Change
 }
 
 func writeLoad(t *testing.T, appliers []Applier, writersPerNode, batchesPerWriter int) []applied {
@@ -245,13 +279,12 @@ func writeLoad(t *testing.T, appliers []Applier, writersPerNode, batchesPerWrite
 						id := fmt.Sprintf("n%d-w%d-b%d-i%d", n, w, b, i)
 						batch[i] = upsert("load", rng.IntN(3), id, fmt.Sprintf(`{"id":%q}`, id))
 					}
-					first, last, err := ap.Apply(context.Background(), batch)
-					if err != nil {
+					if err := ap.Apply(context.Background(), batch); err != nil {
 						errc <- fmt.Errorf("node %d writer %d: %w", n, w, err)
 						return
 					}
 					mu.Lock()
-					out = append(out, applied{first, last, batch})
+					out = append(out, applied{batch})
 					mu.Unlock()
 				}
 			})
@@ -265,46 +298,52 @@ func writeLoad(t *testing.T, appliers []Applier, writersPerNode, batchesPerWrite
 	return out
 }
 
-// checkLoad verifies that the ranges tile 1..N with no gap or overlap and
-// that every shard's changelog holds exactly the changes in seq order.
+// checkLoad verifies that each shard's seqs, over every batch, tile 1..N with no gap
+// or overlap, a batch's changes on one shard taking contiguous seqs in batch order,
+// and that every shard's changelog holds exactly those changes in seq order.
 func checkLoad(t *testing.T, st Store, got []applied) {
 	t.Helper()
-	sort.Slice(got, func(i, j int) bool { return got[i].first < got[j].first })
-	next := int64(1)
-	bySeq := make(map[int64]Change)
+	bySeq := map[int]map[int64]Change{}
 	for _, a := range got {
-		if a.first != next || a.last != a.first+int64(len(a.batch))-1 {
-			t.Fatalf("range %d..%d for %d changes, expected to start at %d", a.first, a.last, len(a.batch), next)
-		}
+		prev := map[int]int64{}
 		for i := range a.batch {
-			bySeq[a.first+int64(i)] = a.batch[i]
+			c := a.batch[i]
+			if p, ok := prev[c.Shard]; ok && c.Seq != p+1 {
+				t.Fatalf("a batch took seq %d on shard %d after %d", c.Seq, c.Shard, p)
+			}
+			prev[c.Shard] = c.Seq
+			if bySeq[c.Shard] == nil {
+				bySeq[c.Shard] = map[int64]Change{}
+			}
+			if dup, ok := bySeq[c.Shard][c.Seq]; ok {
+				t.Fatalf("shard %d seq %d taken by %s and %s", c.Shard, c.Seq, dup.ID, c.ID)
+			}
+			bySeq[c.Shard][c.Seq] = c
 		}
-		next = a.last + 1
 	}
 	total := 0
 	for shard := range 3 {
-		var prev int64
 		changes := allChanges(t, st, ShardID{Index: "load", Shard: shard})
+		if len(changes) != len(bySeq[shard]) {
+			t.Fatalf("shard %d's changelog holds %d changes, writers applied %d", shard, len(changes), len(bySeq[shard]))
+		}
 		for i := range changes {
 			c := &changes[i]
-			if c.Seq <= prev {
-				t.Fatalf("shard %d: seq %d after %d", shard, c.Seq, prev)
+			want, ok := bySeq[shard][int64(i+1)]
+			if c.Seq != int64(i+1) || !ok || want.ID != c.ID || !bytes.Equal(want.Payload, c.Payload) {
+				t.Fatalf("shard %d: change %d is seq %d %s, want seq %d %+v", shard, i, c.Seq, c.ID, i+1, want)
 			}
-			prev = c.Seq
-			want, ok := bySeq[c.Seq]
-			if !ok || want.ID != c.ID || want.Shard != shard || !bytes.Equal(want.Payload, c.Payload) {
-				t.Fatalf("shard %d seq %d: got %s, want %+v", shard, c.Seq, c.ID, want)
-			}
-			total++
 		}
+		total += len(changes)
 	}
-	if total != len(bySeq) {
-		t.Fatalf("changelog holds %d changes, writers applied %d", total, len(bySeq))
+	if total == 0 {
+		t.Fatal("nothing was written")
 	}
 }
 
 // TestConcurrentWriters is Review Focus 3: 32 writers on four nodes produce
-// contiguous, in-order sequence numbers with nothing lost or duplicated.
+// contiguous, in-order sequence numbers on each shard with nothing lost or
+// duplicated.
 func TestConcurrentWriters(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		nodes := make([]Applier, 4)
@@ -313,7 +352,7 @@ func TestConcurrentWriters(t *testing.T) {
 			st := h.open(t)
 			if first == nil {
 				first = st
-				mustCreateIndex(t, st, "load")
+				mustCreateShards(t, st, "load", 3)
 			}
 			nodes[i] = st
 		}
@@ -322,7 +361,8 @@ func TestConcurrentWriters(t *testing.T) {
 }
 
 // TestGroupCommitConcurrentWriters runs the same load through a
-// GroupCommitter on each of two nodes.
+// GroupCommitter on each of two nodes: a lane per shard where the store has several
+// write connections, one lane on SQLite. Either way requests share transactions.
 func TestGroupCommitConcurrentWriters(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		var gcs []*GroupCommitter
@@ -332,7 +372,7 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 			st := h.open(t)
 			if first == nil {
 				first = st
-				mustCreateIndex(t, st, "load")
+				mustCreateShards(t, st, "load", 3)
 			}
 			gc := NewGroupCommitter(st, GroupCommitOptions{})
 			t.Cleanup(func() { _ = gc.Close() })
@@ -342,30 +382,39 @@ func TestGroupCommitConcurrentWriters(t *testing.T) {
 		got := writeLoad(t, appliers, 16, 15)
 		checkLoad(t, first, got)
 		flushes := gcs[0].Flushes() + gcs[1].Flushes()
-		if flushes >= int64(len(got)) {
-			t.Fatalf("%d transactions for %d requests: nothing was coalesced", flushes, len(got))
+		parts := 0
+		for _, a := range got {
+			shards := map[int]bool{}
+			for _, c := range a.batch {
+				shards[c.Shard] = true
+			}
+			parts += len(shards)
 		}
-		t.Logf("%s: %d requests in %d transactions", h.dialect, len(got), flushes)
+		if flushes >= int64(parts) {
+			t.Fatalf("%d transactions for %d requests on %d shard parts: nothing was coalesced", flushes, len(got), parts)
+		}
+		t.Logf("%s: %d requests, %d shard parts, in %d transactions", h.dialect, len(got), parts, flushes)
 	})
 }
 
 // TestLateCommitNotSkipped holds one transaction open after it has taken
 // its seqs, starts a second, faster writer on another node, and tails the
 // shard throughout: the tailer must see the slow change before the fast one,
-// never skipping it.
+// never skipping it. Meanwhile a writer to another shard commits at once, where
+// the database has more than one writer.
 func TestLateCommitNotSkipped(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
-		slow, fast, tail := h.open(t), h.open(t), h.open(t)
-		mustCreateIndex(t, slow, "late")
+		slow, fast, tail, other := h.open(t), h.open(t), h.open(t), h.open(t)
+		mustCreateShards(t, slow, "late", 2)
 		shard := ShardID{Index: "late"}
 		mustApply(t, slow, upsert("late", 0, "seed", `{}`))
 
 		paused, release := make(chan int64), make(chan struct{})
 		var pauseNext atomic.Bool
-		engine(slow).beforeCommit = func(_ context.Context, first, _ int64) {
+		engine(slow).beforeCommit = func(_ context.Context, w *dialect.Write) {
 			if pauseNext.CompareAndSwap(true, false) {
-				paused <- first
+				paused <- w.Changes[0].Seq
 				<-release
 			}
 		}
@@ -403,34 +452,41 @@ func TestLateCommitNotSkipped(t *testing.T) {
 		}()
 
 		pauseNext.Store(true)
-		slowDone := make(chan [2]int64, 1)
+		slowDone := make(chan int64, 1)
 		go func() {
-			f, l, err := slow.Apply(ctx, []Change{upsert("late", 0, "slow", `{}`)})
-			if err != nil {
+			b := []Change{upsert("late", 0, "slow", `{}`)}
+			if err := slow.Apply(ctx, b); err != nil {
 				t.Errorf("slow apply: %v", err)
 			}
-			slowDone <- [2]int64{f, l}
+			slowDone <- b[0].Seq
 		}()
 		slowSeq := <-paused
 
-		fastDone := make(chan [2]int64, 1)
+		fastDone := make(chan int64, 1)
 		go func() {
-			f, l, err := fast.Apply(ctx, []Change{upsert("late", 0, "fast", `{}`)})
-			if err != nil {
+			b := []Change{upsert("late", 0, "fast", `{}`)}
+			if err := fast.Apply(ctx, b); err != nil {
 				t.Errorf("fast apply: %v", err)
 			}
-			fastDone <- [2]int64{f, l}
+			fastDone <- b[0].Seq
 		}()
+		if h.dialect != "sqlite" {
+			otherCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			b := []Change{upsert("late", 1, "other", `{}`)}
+			if err := other.Apply(otherCtx, b); err != nil || b[0].Seq != 1 {
+				t.Errorf("a write to another shard while shard 0's was held: seq %d, %v", b[0].Seq, err)
+			}
+			cancel()
+		}
 		select {
-		case r := <-fastDone:
-			t.Fatalf("fast writer committed seq %d while the slow one held the counter", r[0])
+		case seq := <-fastDone:
+			t.Fatalf("fast writer committed seq %d while the slow one held the shard", seq)
 		case <-time.After(300 * time.Millisecond):
 		}
 		close(release)
-		s := <-slowDone
-		f := <-fastDone
-		if s[0] != slowSeq || f[0] != slowSeq+1 {
-			t.Fatalf("slow got %d, fast got %d; want %d then %d", s[0], f[0], slowSeq, slowSeq+1)
+		s, f := <-slowDone, <-fastDone
+		if s != slowSeq || f != slowSeq+1 {
+			t.Fatalf("slow got %d, fast got %d; want %d then %d", s, f, slowSeq, slowSeq+1)
 		}
 		close(stopTail)
 		<-tailDone
@@ -444,9 +500,9 @@ func TestLateCommitNotSkipped(t *testing.T) {
 }
 
 // TestTailerNeverSkips is the randomized form: writers on three nodes hold
-// their transactions open for random times before committing while a tailer
-// polls one shard, and every seq the tailer sees must follow the previous
-// one exactly.
+// their transactions open for random times before committing, half of them to
+// another shard, while a tailer polls one shard, and every seq the tailer sees
+// must follow the previous one exactly.
 func TestTailerNeverSkips(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
@@ -454,12 +510,12 @@ func TestTailerNeverSkips(t *testing.T) {
 		for range 3 {
 			st := h.open(t)
 			var n atomic.Uint64
-			engine(st).beforeCommit = func(context.Context, int64, int64) {
+			engine(st).beforeCommit = func(context.Context, *dialect.Write) {
 				time.Sleep(time.Duration(n.Add(7)%5) * time.Millisecond)
 			}
 			nodes = append(nodes, st)
 		}
-		mustCreateIndex(t, nodes[0], "tail")
+		mustCreateShards(t, nodes[0], "tail", 2)
 		tail := h.open(t)
 		shard := ShardID{Index: "tail"}
 
@@ -481,7 +537,7 @@ func TestTailerNeverSkips(t *testing.T) {
 					}
 					after = c.Seq
 				}
-				if after == writers*perWriter {
+				if after == writers/2*perWriter {
 					tailErr <- nil
 					return
 				}
@@ -497,7 +553,7 @@ func TestTailerNeverSkips(t *testing.T) {
 		for w := range writers {
 			wg.Go(func() {
 				for i := range perWriter {
-					if _, _, err := nodes[w%3].Apply(ctx, []Change{upsert("tail", 0, fmt.Sprintf("w%d-%d", w, i), `{}`)}); err != nil {
+					if err := nodes[w%3].Apply(ctx, []Change{upsert("tail", w%2, fmt.Sprintf("w%d-%d", w, i), `{}`)}); err != nil {
 						t.Errorf("apply: %v", err)
 						return
 					}
@@ -534,11 +590,11 @@ func TestScanShardSnapshot(t *testing.T) {
 			}
 			if lateSeq == 0 {
 				// Commit more changes mid-scan; the scan must not see them.
-				f, _, err := writer.Apply(ctx, []Change{upsert("snap", 0, "d9", `{}`), upsert("snap", 0, "d0", `{"v":2}`)})
-				if err != nil {
+				late := []Change{upsert("snap", 0, "d9", `{}`), upsert("snap", 0, "d0", `{"v":2}`)}
+				if err := writer.Apply(ctx, late); err != nil {
 					return err
 				}
-				lateSeq = f
+				lateSeq = late[0].Seq
 			}
 			if r.ID == "d0" && string(r.Body) != `{"v":1}` {
 				t.Errorf("scan saw d0 = %s from after its snapshot", r.Body)
@@ -586,15 +642,15 @@ func TestConditionalWrites(t *testing.T) {
 		c.IfSeq = IfAbsent
 		s1, _ := mustApply(t, st, c)
 		var ce *ConflictError
-		if _, _, err := st.Apply(ctx, []Change{upsert("cond", 0, "other", `{}`), c}); !errors.As(err, &ce) ||
+		if err := st.Apply(ctx, []Change{upsert("cond", 0, "other", `{}`), c}); !errors.As(err, &ce) ||
 			fmt.Sprint(ce.Positions) != "[1]" || ce.Current[0] != s1 || !errors.Is(err, ErrConflict) {
 			t.Fatalf("second create: %v", err)
 		}
-		if got := counterValue(t, st); got != s1 {
-			t.Fatalf("a refused batch moved the counter to %d", got)
+		if got := headSeq(t, st, ShardID{Index: "cond"}); got != s1 {
+			t.Fatalf("a refused batch moved the shard's head to %d", got)
 		}
 		c.IfSeq = s1 + 100
-		if _, _, err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrConflict) {
+		if err := st.Apply(ctx, []Change{c}); !errors.Is(err, ErrConflict) {
 			t.Fatalf("stale if_seq: %v", err)
 		}
 		// A failed condition does not count as applied for later changes:
@@ -603,7 +659,7 @@ func TestConditionalWrites(t *testing.T) {
 		stale.IfSeq = 12345
 		create := upsert("cond", 0, "new", `{}`)
 		create.IfSeq = IfAbsent
-		if _, _, err := st.Apply(ctx, []Change{stale, create}); !errors.As(err, &ce) || fmt.Sprint(ce.Positions) != "[0]" {
+		if err := st.Apply(ctx, []Change{stale, create}); !errors.As(err, &ce) || fmt.Sprint(ce.Positions) != "[0]" {
 			t.Fatalf("stale then create: %v, want a conflict at [0] only", err)
 		}
 		c.IfSeq = s1
@@ -635,7 +691,7 @@ func TestCancellation(t *testing.T) {
 
 		done, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, _, err := st.Apply(done, []Change{upsert("cancel", 0, "b", `{}`)}); !errors.Is(err, context.Canceled) {
+		if err := st.Apply(done, []Change{upsert("cancel", 0, "b", `{}`)}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("apply with a cancelled context: %v", err)
 		}
 		if _, err := st.ChangesAfter(done, shard, 0, 10); !errors.Is(err, context.Canceled) {
@@ -645,11 +701,11 @@ func TestCancellation(t *testing.T) {
 			t.Fatalf("scan with a cancelled context: %v", err)
 		}
 
-		// An Apply waiting for the counter lock gives up with its context
+		// An Apply waiting for the shard's sequence row gives up with its context
 		// and leaves nothing behind.
 		paused, release := make(chan struct{}), make(chan struct{})
 		var pauseNext atomic.Bool
-		engine(st).beforeCommit = func(context.Context, int64, int64) {
+		engine(st).beforeCommit = func(context.Context, *dialect.Write) {
 			if pauseNext.CompareAndSwap(true, false) {
 				close(paused)
 				<-release
@@ -658,15 +714,15 @@ func TestCancellation(t *testing.T) {
 		pauseNext.Store(true)
 		holder := make(chan error, 1)
 		go func() {
-			_, _, err := st.Apply(context.Background(), []Change{upsert("cancel", 0, "holder", `{}`)})
+			err := st.Apply(context.Background(), []Change{upsert("cancel", 0, "holder", `{}`)})
 			holder <- err
 		}()
 		<-paused
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer waitCancel()
 		start := time.Now()
-		if _, _, err := st.Apply(waitCtx, []Change{upsert("cancel", 0, "waiter", `{}`)}); err == nil {
-			t.Fatal("a waiting apply committed while the counter was held")
+		if err := st.Apply(waitCtx, []Change{upsert("cancel", 0, "waiter", `{}`)}); err == nil {
+			t.Fatal("a waiting apply committed while the shard was held")
 		}
 		if took := time.Since(start); took > 10*time.Second {
 			t.Fatalf("cancelled apply took %s", took)
@@ -691,23 +747,23 @@ func TestPrune(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		mustCreateIndex(t, st, "pr")
+		mustCreateShards(t, st, "pr", 2)
 		s0, s1 := ShardID{Index: "pr"}, ShardID{Index: "pr", Shard: 1}
 		for i := range 10 {
 			mustApply(t, st, upsert("pr", 0, fmt.Sprintf("d%d", i), `{}`), upsert("pr", 1, fmt.Sprintf("e%d", i), `{}`))
 		}
-		// Shard 0 holds odd seqs 1..19, shard 1 even seqs 2..20.
-		if err := st.Prune(ctx, s0, 11); err != nil {
+		// Each shard holds seqs 1..10.
+		if err := st.Prune(ctx, s0, 6); err != nil {
 			t.Fatal(err)
 		}
 		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_changes WHERE index_name = ? AND shard = 0", "pr"); n != 5 {
 			t.Fatalf("%d shard 0 changes left, want 5", n)
 		}
-		got, err := st.ChangesAfter(ctx, s0, 10, 0)
-		if err != nil || len(got) != 5 || got[0].Seq != 11 {
+		got, err := st.ChangesAfter(ctx, s0, 5, 0)
+		if err != nil || len(got) != 5 || got[0].Seq != 6 {
 			t.Fatalf("changes after the horizon: %v %v", got, err)
 		}
-		for _, after := range []int64{0, 5, 9} {
+		for _, after := range []int64{0, 2, 4} {
 			if _, err := st.ChangesAfter(ctx, s0, after, 0); !errors.Is(err, ErrPruned) {
 				t.Fatalf("changes after %d: %v, want ErrPruned", after, err)
 			}
@@ -719,18 +775,25 @@ func TestPrune(t *testing.T) {
 		if err := st.Prune(ctx, s0, 3); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := st.ChangesAfter(ctx, s0, 5, 0); !errors.Is(err, ErrPruned) {
+		if _, err := st.ChangesAfter(ctx, s0, 3, 0); !errors.Is(err, ErrPruned) {
 			t.Fatalf("horizon went down: %v", err)
 		}
 		if err := st.Prune(ctx, s1, 1_000_000); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := st.ChangesAfter(ctx, s1, 20, 0); err != nil || len(got) != 0 {
+		if got, err := st.ChangesAfter(ctx, s1, 10, 0); err != nil || len(got) != 0 {
 			t.Fatalf("shard 1 after a full prune: %v %v", got, err)
 		}
+		if _, err := st.ChangesAfter(ctx, s1, 9, 0); !errors.Is(err, ErrPruned) {
+			t.Fatalf("shard 1 pruned past its head: %v", err)
+		}
 		f, _ := mustApply(t, st, upsert("pr", 1, "new", `{}`))
-		if got, err := st.ChangesAfter(ctx, s1, 20, 0); err != nil || len(got) != 1 || got[0].Seq != f {
+		if got, err := st.ChangesAfter(ctx, s1, 10, 0); err != nil || len(got) != 1 || got[0].Seq != f || f != 11 {
 			t.Fatalf("shard 1 after new writes: %v %v", got, err)
+		}
+		// A shard whose index is gone has nothing to prune.
+		if err := st.Prune(ctx, ShardID{Index: "gone"}, 5); err != nil {
+			t.Fatalf("prune of a missing index: %v", err)
 		}
 		// Pruning keeps the documents.
 		if recs, _ := scanAll(t, st, s0); len(recs) != 10 {
@@ -1006,8 +1069,8 @@ func TestRegistryFencing(t *testing.T) {
 			t.Fatalf("the new incarnation was touched: %+v %v", copies, err)
 		}
 		// Epochs never consume changelog sequence numbers.
-		if got := counterValue(t, st); got != 0 {
-			t.Fatalf("claims moved the seq counter to %d", got)
+		if got := floorSeq(t, st); got != 0 {
+			t.Fatalf("claims moved the seq floor to %d", got)
 		}
 	})
 }
@@ -1517,14 +1580,14 @@ func TestIndexes(t *testing.T) {
 		if n := len(allChanges(t, st, ShardID{Index: "b"})); n != 1 {
 			t.Fatalf("index b lost changes: %d", n)
 		}
-		if _, _, err := st.Apply(ctx, []Change{upsert("a", 0, "d", `{}`)}); !errors.Is(err, ErrNotFound) {
+		if err := st.Apply(ctx, []Change{upsert("a", 0, "d", `{}`)}); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("write to a dropped index: %v", err)
 		}
 	})
 }
 
 // TestWatch covers LISTEN/NOTIFY, which only Postgres has: once ready is
-// called, the very next commit is announced.
+// called, the very next commit is announced, after it commits.
 func TestWatch(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		if h.dialect != "postgres" {
@@ -1535,7 +1598,7 @@ func TestWatch(t *testing.T) {
 		if !ok {
 			t.Fatal("postgres store is not a Watcher")
 		}
-		mustCreateIndex(t, st, "w")
+		mustCreateShards(t, st, "w", 3)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		got := make(chan Notification, 16)
@@ -1558,6 +1621,9 @@ func TestWatch(t *testing.T) {
 				if n.Shard != (ShardID{Index: "w", Shard: 2}) || n.Seq != last {
 					continue // another test's schema shares the channel
 				}
+				if c, err := st.ChangesAfter(context.Background(), n.Shard, last-1, 1); err != nil || len(c) != 1 || c[0].ID != "b" {
+					t.Fatalf("the announced change is not committed: %v %v", c, err)
+				}
 				cancel()
 				if err := <-done; !errors.Is(err, context.Canceled) {
 					t.Fatalf("watch ended with %v", err)
@@ -1570,53 +1636,67 @@ func TestWatch(t *testing.T) {
 	})
 }
 
-// TestHeadSeq: the head is the newest committed seq across shards, and a
-// tailer reading it before ChangesAfter never advances past a change of its
-// shard that it has not seen.
+// TestHeadSeq: each shard's head is its own newest committed seq, and a tailer
+// reading it before ChangesAfter never advances past a change of its shard that it
+// has not seen. A shard whose index does not exist stands at the floor; TopSeq is the
+// highest head.
 func TestHeadSeq(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		if head, now, err := st.HeadSeq(ctx); err != nil || head != 0 || time.Since(now).Abs() > time.Minute {
+		s0, s1 := ShardID{Index: "h", Shard: 0}, ShardID{Index: "h", Shard: 1}
+		if head, now, err := st.HeadSeq(ctx, s0); err != nil || head != 0 || time.Since(now).Abs() > time.Minute {
 			t.Fatalf("empty store head = %d at %s, %v", head, now, err)
 		}
-		mustCreateIndex(t, st, "h")
+		mustCreateShards(t, st, "h", 2)
 		mustApply(t, st, upsert("h", 0, "a", `{}`), upsert("h", 1, "b", `{}`))
-		_, last := mustApply(t, st, upsert("h", 1, "c", `{}`))
-		head, _, err := st.HeadSeq(ctx)
-		if err != nil || head != last {
-			t.Fatalf("head = %d, %v; want %d", head, err, last)
+		mustApply(t, st, upsert("h", 1, "c", `{}`), upsert("h", 1, "d", `{}`))
+		for _, tc := range []struct {
+			shard ShardID
+			want  int64
+		}{{s0, 1}, {s1, 3}, {ShardID{Index: "gone"}, 0}} {
+			if head, _, err := st.HeadSeq(ctx, tc.shard); err != nil || head != tc.want {
+				t.Fatalf("%s head = %d, %v; want %d", tc.shard, head, err, tc.want)
+			}
 		}
-		page, err := st.ChangesAfter(ctx, ShardID{Index: "h", Shard: 0}, 1, 10)
+		if top, _, err := st.TopSeq(ctx); err != nil || top != 3 {
+			t.Fatalf("top = %d, %v; want 3", top, err)
+		}
+		page, err := st.ChangesAfter(ctx, s0, 1, 10)
 		if err != nil || len(page) != 0 {
 			t.Fatalf("shard 0 after 1: %v, %v", page, err)
 		}
+		if _, _, err := st.HeadSeq(ctx, ShardID{}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("head of no shard: %v", err)
+		}
 		_ = st.Close()
-		if _, _, err := st.HeadSeq(ctx); !errors.Is(err, ErrClosed) {
+		if _, _, err := st.HeadSeq(ctx, s0); !errors.Is(err, ErrClosed) {
 			t.Fatalf("head after close: %v", err)
 		}
 	})
 }
 
-// TestTip: Tip reads the head as HeadSeq does, with the marks of the changes at the
-// head and at the seq asked about, as ChangesAfter returns them; a seq with no change
-// (0, past the head, or pruned) has the zero mark.
+// TestTip: Tip reads the shard's head as HeadSeq does, with the marks of the shard's
+// changes at the head and at the seq asked about, as ChangesAfter returns them; a seq
+// with no change of the shard (0, past the head, pruned, or another shard's only) has
+// the zero mark.
 func TestTip(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		tip, err := st.Tip(ctx, TipQuery{})
+		shard0, shard1 := ShardID{Index: "t", Shard: 0}, ShardID{Index: "t", Shard: 1}
+		tip, err := st.Tip(ctx, TipQuery{Shard: shard1})
 		if err != nil || tip.Head != 0 || tip.HeadMark != (ChangeMark{}) || tip.AtMark != (ChangeMark{}) || time.Since(tip.Now).Abs() > time.Minute {
 			t.Fatalf("empty store tip = %+v, %v", tip, err)
 		}
-		mustCreateIndex(t, st, "t")
-		mustApply(t, st, upsert("t", 0, "a", `{}`), upsert("t", 1, "b", `{}`))
+		mustCreateShards(t, st, "t", 2)
+		mustApply(t, st, upsert("t", 0, "a", `{}`), upsert("t", 0, "z", `{}`), upsert("t", 1, "b", `{}`))
 		_, last := mustApply(t, st, upsert("t", 1, "c", `{}`))
-		changes, err := st.ChangesAfter(ctx, ShardID{Index: "t", Shard: 1}, 0, 10)
-		if err != nil || len(changes) != 2 {
+		changes, err := st.ChangesAfter(ctx, shard1, 0, 10)
+		if err != nil || len(changes) != 2 || changes[1].Seq != last {
 			t.Fatalf("shard 1: %v, %v", changes, err)
 		}
-		tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq})
+		tip, err = st.Tip(ctx, TipQuery{Shard: shard1, At: changes[0].Seq, UpTo: last})
 		if err != nil || tip.Head != last {
 			t.Fatalf("tip = %+v, %v; want head %d", tip, err, last)
 		}
@@ -1626,14 +1706,17 @@ func TestTip(t *testing.T) {
 		if tip.AtMark.Same(tip.HeadMark) {
 			t.Fatal("two changes have the same mark")
 		}
-		if tip, err = st.Tip(ctx, TipQuery{At: last + 1}); err != nil || tip.AtMark != (ChangeMark{}) {
+		if tip, err = st.Tip(ctx, TipQuery{Shard: shard1, At: last + 1}); err != nil || tip.AtMark != (ChangeMark{}) {
 			t.Fatalf("tip past the head = %+v, %v", tip, err)
+		}
+		// Shard 0's seqs are its own: its head is 2, and its change at 1 is "a".
+		if tip, err = st.Tip(ctx, TipQuery{Shard: shard0, At: 1}); err != nil || tip.Head != 2 || tip.AtMark.ID != "a" || tip.HeadMark.ID != "z" {
+			t.Fatalf("shard 0's tip = %+v, %v", tip, err)
 		}
 		meta, err := st.Indexes().Get(ctx, "t")
 		if err != nil {
 			t.Fatal(err)
 		}
-		shard1 := ShardID{Index: "t", Shard: 1}
 		for _, tc := range []struct {
 			upTo int64
 			want ChangeMark
@@ -1643,20 +1726,20 @@ func TestTip(t *testing.T) {
 				t.Fatalf("shard 1 up to %d: %+v, %v; want %+v, no horizon, uid %s", tc.upTo, tip, err, tc.want, meta.UID)
 			}
 		}
-		if tip, err = st.Tip(ctx, TipQuery{Shard: ShardID{Index: "gone", Shard: 0}, UpTo: last}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.IndexUID != "" {
+		if tip, err = st.Tip(ctx, TipQuery{Shard: ShardID{Index: "gone", Shard: 0}, UpTo: last}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.IndexUID != "" || tip.Head != 0 {
 			t.Fatalf("a missing index's tip: %+v, %v", tip, err)
 		}
 		if err := st.Prune(ctx, shard1, last); err != nil {
 			t.Fatal(err)
 		}
-		if tip, err = st.Tip(ctx, TipQuery{At: changes[0].Seq}); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
+		if tip, err = st.Tip(ctx, TipQuery{Shard: shard1, At: changes[0].Seq}); err != nil || tip.AtMark != (ChangeMark{}) || !tip.HeadMark.Same(changes[1].Mark()) {
 			t.Fatalf("tip at a pruned seq = %+v, %v", tip, err)
 		}
 		if tip, err = st.Tip(ctx, TipQuery{Shard: shard1, UpTo: last - 1}); err != nil || tip.ShardMark != (ChangeMark{}) || tip.Horizon != last {
 			t.Fatalf("shard 1 after a prune: %+v, %v; want no change and horizon %d", tip, err, last)
 		}
 		_ = st.Close()
-		if _, err := st.Tip(ctx, TipQuery{}); !errors.Is(err, ErrClosed) {
+		if _, err := st.Tip(ctx, TipQuery{Shard: shard1}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("tip after close: %v", err)
 		}
 	})
@@ -1665,18 +1748,19 @@ func TestTip(t *testing.T) {
 // TestGroupCommitIsolation is the reviewer's probe on every dialect: in one
 // group-commit batch, a stale IfSeq must not make a later IfAbsent on the
 // same new key fail, a genuine conflict still fails, and a missing index or
-// invalid change fails only its own request.
+// invalid change fails only its own request. It runs one lane, so the requests
+// share one batch whatever their indexes.
 func TestGroupCommitIsolation(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
 		mustCreateIndex(t, st, "gc")
 		collected := make(chan struct{}, 8)
-		g := NewGroupCommitter(st, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 5, received: func() { collected <- struct{}{} }})
+		g := NewGroupCommitter(st, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 5, MaxTransactions: 1, received: func() { collected <- struct{}{} }})
 		defer g.Close()
 
 		bad := upsert("gc", 0, "zz", "{")
-		if _, _, err := g.Apply(ctx, []Change{upsert("gc", 0, "ok", `{}`), bad}); !errors.Is(err, ErrInvalid) {
+		if err := g.Apply(ctx, []Change{upsert("gc", 0, "ok", `{}`), bad}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("invalid request: %v", err)
 		}
 
@@ -2065,9 +2149,9 @@ func TestBlobGetSpan(t *testing.T) {
 }
 
 // TestMappingChanges: an Update that changes the mapping moves the mapping version
-// and logs a mapping change to every shard, in its transaction and with contiguous
-// seqs; every later change carries the new version; ScanShard yields the mapping as
-// of its snapshot first; and only Update writes mapping changes.
+// and logs a mapping change to every shard, in its transaction, each at its shard's
+// next seq; every later change carries the new version; ScanShard yields the mapping
+// as of its snapshot first; and only Update writes mapping changes.
 func TestMappingChanges(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
@@ -2078,22 +2162,29 @@ func TestMappingChanges(t *testing.T) {
 			t.Fatalf("create: %+v %v", m, err)
 		}
 		mustApply(t, st, upsert("mc", 1, "a", `{}`))
+		heads := func() string {
+			var out []int64
+			for sh := range 3 {
+				out = append(out, headSeq(t, st, ShardID{Index: "mc", Shard: sh}))
+			}
+			return fmt.Sprint(out)
+		}
 		// A settings-only update logs nothing.
 		m.Settings = []byte(`{"shards":3,"refresh_interval":"2s"}`)
-		if m, err = ix.Update(ctx, m); err != nil || m.MappingVersion != 1 || counterValue(t, st) != 1 {
-			t.Fatalf("settings update: %+v %v (counter %d)", m, err, counterValue(t, st))
+		if m, err = ix.Update(ctx, m); err != nil || m.MappingVersion != 1 || heads() != "[0 1 0]" {
+			t.Fatalf("settings update: %+v %v (heads %s)", m, err, heads())
 		}
 		m.Mapping = []byte(`{"fields":{"brand":"keyword"}}`)
 		if m, err = ix.Update(ctx, m); err != nil || m.MappingVersion != 2 {
 			t.Fatalf("mapping update: %+v %v", m, err)
 		}
-		if counterValue(t, st) != 4 {
-			t.Fatalf("counter %d after a mapping change to 3 shards", counterValue(t, st))
+		if heads() != "[1 2 1]" {
+			t.Fatalf("heads %s after a mapping change to 3 shards", heads())
 		}
 		for sh := range 3 {
 			changes := allChanges(t, st, ShardID{Index: "mc", Shard: sh})
 			last := changes[len(changes)-1]
-			if last.Kind != KindMapping || last.ID != MappingChangeID || last.Seq != int64(2+sh) ||
+			if last.Kind != KindMapping || last.ID != MappingChangeID || last.Seq != int64(len(changes)) ||
 				last.MappingVersion != 2 || !bytes.Equal(last.Payload, m.Mapping) || last.IndexUID != m.UID {
 				t.Fatalf("shard %d: %+v", sh, last)
 			}
@@ -2115,7 +2206,7 @@ func TestMappingChanges(t *testing.T) {
 		if err != nil || len(mapping) != 1 || !bytes.Equal(mapping[0].Body, m.Mapping) || mapping[0].MappingVersion != 2 {
 			t.Fatalf("scan mapping %+v %v", mapping, err)
 		}
-		if _, _, err := st.Apply(ctx, []Change{{Index: "mc", Kind: KindMapping, ID: MappingChangeID, Payload: []byte(`{}`)}}); !errors.Is(err, ErrInvalid) {
+		if err := st.Apply(ctx, []Change{{Index: "mc", Kind: KindMapping, ID: MappingChangeID, Payload: []byte(`{}`)}}); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("Apply of a mapping change: %v", err)
 		}
 		m.Settings = []byte(`{"shards":0}`)
@@ -2143,7 +2234,7 @@ func TestMappingChangesOrderWithApply(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for i := range 25 {
-					if _, _, err := st.Apply(ctx, []Change{upsert("mo", 0, fmt.Sprintf("w%d-%d", w, i), `{}`)}); err != nil {
+					if err := st.Apply(ctx, []Change{upsert("mo", 0, fmt.Sprintf("w%d-%d", w, i), `{}`)}); err != nil {
 						t.Error(err)
 						return
 					}

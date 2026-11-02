@@ -23,11 +23,10 @@ func writeDocs(ctx context.Context, t *testing.T, st store.Store, index, prefix 
 	for i := range n {
 		batch = append(batch, upsert(index, 0, fmt.Sprintf("%s%d", prefix, i), docBody(prefix, i)))
 	}
-	_, last, err := st.Apply(ctx, batch)
-	if err != nil {
+	if err := st.Apply(ctx, batch); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	return last
+	return batch[len(batch)-1].Seq
 }
 
 // rewindCount is how many rewinds index's copies counted.
@@ -262,7 +261,7 @@ func TestNoFalseRewinds(t *testing.T) {
 					}
 					xMu.RLock()
 					batch = append(batch, upsert("x", 0, fmt.Sprintf("x%d", i%20), docBody("x", i)))
-					_, _, _ = st.Apply(context.WithoutCancel(ctx), batch)
+					_ = st.Apply(context.WithoutCancel(ctx), batch)
 					xMu.RUnlock()
 				}
 			})
@@ -270,8 +269,9 @@ func TestNoFalseRewinds(t *testing.T) {
 		wg.Go(func() {
 			for ctx.Err() == nil {
 				time.Sleep(150 * time.Millisecond)
-				if head, _, err := st.HeadSeq(context.WithoutCancel(ctx)); err == nil {
-					_ = st.Prune(context.WithoutCancel(ctx), store.ShardID{Index: "x", Shard: 0}, head+1)
+				x := store.ShardID{Index: "x", Shard: 0}
+				if head, _, err := st.HeadSeq(context.WithoutCancel(ctx), x); err == nil {
+					_ = st.Prune(context.WithoutCancel(ctx), x, head+1)
 				}
 			}
 		})

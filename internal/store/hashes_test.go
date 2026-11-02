@@ -12,7 +12,7 @@ func TestDocumentHashes(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		st := h.open(t)
-		mustCreateIndex(t, st, "h")
+		mustCreateShards(t, st, "h", 2)
 		mustApply(t, st,
 			upsert("h", 0, "a", `{"n":1}`),
 			upsert("h", 1, "b", `{"n":2}`),
@@ -32,7 +32,7 @@ func TestDocumentHashes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []DocHash{{Seq: 102}, {Seq: 4, Hash: BodyHash([]byte(`{"n":4}`)), Known: true}, {}, {}, {Seq: 4, Hash: BodyHash([]byte(`{"n":4}`)), Known: true}}
+		want := []DocHash{{Seq: 101}, {Seq: 3, Hash: BodyHash([]byte(`{"n":4}`)), Known: true}, {}, {}, {Seq: 3, Hash: BodyHash([]byte(`{"n":4}`)), Known: true}}
 		got[0].Hash = 0
 		for i := range want {
 			if got[i] != want[i] {
@@ -49,7 +49,7 @@ func TestDocumentHashes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if last := got[len(got)-1]; !last.Known || last.Seq != 4 {
+		if last := got[len(got)-1]; !last.Known || last.Seq != 3 {
 			t.Fatalf("a key past %d keys = %+v", 2*hashesPerStatement, last)
 		}
 	})

@@ -23,26 +23,31 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 
 // Writes run on the writer pool, whose transactions begin with BEGIN
 // IMMEDIATE: holding SQLite's write lock is holding every row lock, so no
-// statement here needs FOR UPDATE.
+// statement here needs FOR UPDATE, and the lock statements only read.
 var changelog = dialect.Changelog{
-	LockCounter:     withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadCounterMark: "SELECT c.value, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= c.value) WHERE c.id = 1",
-	ReadHead:        withNow("SELECT value, NOW FROM sl_counter WHERE id = 1"),
-	ReadTip:         withNow("SELECT c.value, NOW, h.index_name, h.shard, h.kind, h.id, h.at, h.nonce, a.index_name, a.shard, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, (SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?), (SELECT uid FROM sl_indexes WHERE name = ?) FROM sl_counter c LEFT JOIN sl_changes h ON h.seq = c.value LEFT JOIN sl_changes a ON a.seq = ? LEFT JOIN sl_changes o ON o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE c.id = 1"),
-	IndexState:      "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
-	DocumentState:   "SELECT seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
-	QueryState:      "SELECT seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
-	Tombstone:       "SELECT version FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?",
-	Write:           write,
-	ChangesAfter:    "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
-	Horizon:         "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
-	ScanDocuments:   "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
-	ScanQueries:     "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
+	LockShard:       withNow("SELECT value, index_uid, mapping_version, NOW FROM sl_shard_seq WHERE index_name = ? AND shard = ?"),
+	LockIndexShards: withNow("SELECT shard, value, index_uid, mapping_version, NOW FROM sl_shard_seq WHERE index_name = ? ORDER BY shard"),
+	SeedShard:       "INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) SELECT ?, ?, value, ?, 1 FROM sl_counter WHERE id = 1",
+	// SQLite's multi-argument MAX is the scalar function, not the aggregate.
+	RaiseFloor:    "UPDATE sl_counter SET value = MAX(value, ?) WHERE id = 1",
+	ReadShardMark: "SELECT COALESCE(s.value, f.value), h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = ? AND s.shard = ? LEFT JOIN sl_changes h ON h.index_name = ? AND h.shard = ? AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes o ON o.index_name = ? AND o.shard = ? AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= COALESCE(s.value, f.value)) WHERE f.id = 1",
+	ReadHead:      withNow("SELECT COALESCE(s.value, f.value), NOW FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = ? AND s.shard = ? WHERE f.id = 1"),
+	ReadTopSeq:    withNow("SELECT value, (SELECT MAX(value) FROM sl_shard_seq), NOW FROM sl_counter WHERE id = 1"),
+	ReadTip:       withNow("SELECT COALESCE(s.value, f.value), NOW, h.kind, h.id, h.at, h.nonce, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, p.below_seq, s.index_uid FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = ? AND s.shard = ? LEFT JOIN sl_pruned p ON p.index_name = ? AND p.shard = ? LEFT JOIN sl_changes h ON h.index_name = ? AND h.shard = ? AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes a ON a.index_name = ? AND a.shard = ? AND a.seq = ? LEFT JOIN sl_changes o ON o.index_name = ? AND o.shard = ? AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= ?) WHERE f.id = 1"),
+	IndexState:    "SELECT uid, mapping_version, mapping FROM sl_indexes WHERE name = ?",
+	DocumentState: "SELECT seq, version FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?",
+	QueryState:    "SELECT seq, version FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?",
+	Tombstone:     "SELECT version FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?",
+	Write:         write,
+	ChangesAfter:  "SELECT seq, kind, id, payload, payload_z, at, index_uid, mapping_version, nonce FROM sl_changes WHERE index_name = ? AND shard = ? AND seq > ? ORDER BY seq LIMIT ?",
+	Horizon:       "SELECT below_seq FROM sl_pruned WHERE index_name = ? AND shard = ?",
+	ScanDocuments: "SELECT id, body, body_z, seq FROM sl_documents WHERE index_name = ? AND shard = ? ORDER BY id",
+	ScanQueries:   "SELECT id, query, meta, seq, version FROM sl_queries WHERE index_name = ? AND shard = ? ORDER BY id",
 }
 
 // write spells w one row a statement; see the package comment for why.
 func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
-	out := make([]dialect.Stmt, 0, len(w.Changes)+len(w.Documents)+len(w.Queries)+len(w.DocumentDeletes)+len(w.QueryDeletes)+1)
+	out := make([]dialect.Stmt, 0, len(w.Changes)+len(w.Documents)+len(w.Queries)+len(w.DocumentDeletes)+len(w.QueryDeletes)+len(w.Counters))
 	for i := range w.Changes {
 		r := &w.Changes[i]
 		out = append(out, dialect.Stmt{
@@ -76,7 +81,10 @@ func write(w *dialect.Write, _ dialect.Limits) []dialect.Stmt {
 		r := &w.TombstoneDeletes[i]
 		out = append(out, dialect.Stmt{What: "delete tombstones", SQL: deleteTombstone, Args: []any{r.Index, r.Shard, r.Kind, r.ID}})
 	}
-	return append(out, dialect.Stmt{What: "advance counter", SQL: "UPDATE sl_counter SET value = ? WHERE id = 1", Args: []any{w.Counter}})
+	for _, k := range w.Counters {
+		out = append(out, dialect.Stmt{What: "advance sequence", SQL: advanceShard, Args: []any{k.Value, k.MappingVersion, k.Index, k.Shard}})
+	}
+	return out
 }
 
 const (
@@ -87,6 +95,7 @@ const (
 	deleteTombstone = "DELETE FROM sl_tombstones WHERE index_name = ? AND shard = ? AND kind = ? AND id = ?"
 	deleteDocument  = "DELETE FROM sl_documents WHERE index_name = ? AND shard = ? AND id = ?"
 	deleteQuery     = "DELETE FROM sl_queries WHERE index_name = ? AND shard = ? AND id = ?"
+	advanceShard    = "UPDATE sl_shard_seq SET value = ?, mapping_version = ? WHERE index_name = ? AND shard = ?"
 )
 
 var records = dialect.Records{
@@ -170,6 +179,7 @@ VALUES (?, ?, ?, 1, NOW, 1, ?) RETURNING ` + indexColumns)},
 		"DELETE FROM sl_changes WHERE index_name = ?",
 		"DELETE FROM sl_pruned WHERE index_name = ?",
 		"DELETE FROM sl_shard_copies WHERE index_name = ?",
+		"DELETE FROM sl_shard_seq WHERE index_name = ?",
 	},
 }
 

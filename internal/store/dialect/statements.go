@@ -169,6 +169,24 @@ type Changelog struct {
 	SeedShard string
 	// RaiseFloor: (seq) sets the floor to the larger of its value and seq.
 	RaiseFloor string
+	// LockGlobal: () -> value, NOW of sl_counter row 1, the global sequence every
+	// commit took its seqs from before shard sequences, locking it until the
+	// transaction ends. No row once shard sequences are on.
+	LockGlobal string
+	// SetGlobal: (value) sets the global sequence's value.
+	SetGlobal string
+	// LockFloor: () -> value of the floor (sl_counter row 3), locked. No row until
+	// shard sequences are on.
+	LockFloor string
+	// SeedFloor: (value) inserts the floor's row.
+	SeedFloor string
+	// RetireGlobal deletes the global sequence's row.
+	RetireGlobal string
+	// ClearShardSeqs deletes every sequence row.
+	ClearShardSeqs string
+	// InsertShardSeq: (index, shard, value, uid, mapping_version) inserts a sequence
+	// row.
+	InsertShardSeq string
 	// ReadShardMark: (index, shard, index, shard, index, shard, index, shard) ->
 	// the shard's value (the floor's when it has no row), without a lock, then kind,
 	// id, at, nonce of the shard's change at that value, then seq, kind, id, at, nonce
@@ -304,14 +322,14 @@ func byIDSQL(selectFrom string, counts []int, ph func(int) string) string {
 // copy.
 type Registry struct {
 	// Heartbeat: (node_id, address, version, capacity, body_codecs,
-	// mapping_types) inserts the node with heartbeat_at and started_at NOW, or
+	// mapping_types, seq_scheme) inserts the node with heartbeat_at and started_at NOW, or
 	// updates its address, version, capacity, body_codecs, mapping_types and
 	// heartbeat_at.
 	Heartbeat string
 	// RemoveNode: (node_id).
 	RemoveNode string
 	// Nodes: () -> node_id, address, version, capacity, body_codecs,
-	// mapping_types, heartbeat_at, started_at, NOW, by node_id.
+	// mapping_types, seq_scheme, heartbeat_at, started_at, NOW, by node_id.
 	Nodes string
 	// Features: () -> name, enabled_at of sl_features.
 	Features string
@@ -446,6 +464,11 @@ type Maintenance struct {
 	// ShardRows: () -> name, settings and the number of sequence rows (sl_shard_seq) of
 	// every index.
 	ShardRows string
+	// IndexShardRows: (index) -> the number of the index's sequence rows.
+	IndexShardRows string
+	// GlobalRows: () -> 1 while the global sequence (sl_counter row 1) exists, that is
+	// until shard sequences are on, then 0.
+	GlobalRows string
 
 	// VersionTable creates sl_schema_migrations if it is missing.
 	VersionTable string

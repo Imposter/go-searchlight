@@ -31,12 +31,19 @@ const indexColumns = "mapping, settings, version, created_at, uid, mapping_versi
 var changelog = dialect.Changelog{
 	LockShard:       withNow("SELECT value, index_uid, mapping_version, NOW FROM sl_shard_seq WHERE index_name = $1 AND shard = $2 FOR UPDATE"),
 	LockIndexShards: withNow("SELECT shard, value, index_uid, mapping_version, NOW FROM sl_shard_seq WHERE index_name = $1 ORDER BY shard FOR UPDATE"),
-	SeedShard:       "INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) SELECT $1::text, $2::int, value, $3::text, 1 FROM sl_counter WHERE id = 1",
-	RaiseFloor:      "UPDATE sl_counter SET value = GREATEST(value, $1) WHERE id = 1",
-	ReadShardMark:   "SELECT COALESCE(s.value, f.value), h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 LEFT JOIN sl_changes h ON h.index_name = $3 AND h.shard = $4 AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes o ON o.index_name = $5 AND o.shard = $6 AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $7 AND shard = $8 AND seq <= COALESCE(s.value, f.value)) WHERE f.id = 1",
-	ReadHead:        withNow("SELECT COALESCE(s.value, f.value), NOW FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 WHERE f.id = 1"),
-	ReadHeads:       "SELECT -1, value FROM sl_counter WHERE id = 1 UNION ALL SELECT shard, value FROM sl_shard_seq WHERE index_name = $1",
-	ReadTip:         withNow("SELECT COALESCE(s.value, f.value), NOW, h.kind, h.id, h.at, h.nonce, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, p.below_seq, s.index_uid FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 LEFT JOIN sl_pruned p ON p.index_name = $3 AND p.shard = $4 LEFT JOIN sl_changes h ON h.index_name = $5 AND h.shard = $6 AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes a ON a.index_name = $7 AND a.shard = $8 AND a.seq = $9 LEFT JOIN sl_changes o ON o.index_name = $10 AND o.shard = $11 AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $12 AND shard = $13 AND seq <= $14) WHERE f.id = 1"),
+	SeedShard:       "INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) SELECT $1::text, $2::int, value, $3::text, 1 FROM sl_counter WHERE id = 3",
+	RaiseFloor:      "UPDATE sl_counter SET value = GREATEST(value, $1) WHERE id = 3",
+	LockGlobal:      withNow("SELECT value, NOW FROM sl_counter WHERE id = 1 FOR UPDATE"),
+	SetGlobal:       "UPDATE sl_counter SET value = $1 WHERE id = 1",
+	LockFloor:       "SELECT value FROM sl_counter WHERE id = 3 FOR UPDATE",
+	SeedFloor:       "INSERT INTO sl_counter (id, value) VALUES (3, $1)",
+	RetireGlobal:    "DELETE FROM sl_counter WHERE id = 1",
+	ClearShardSeqs:  "DELETE FROM sl_shard_seq",
+	InsertShardSeq:  "INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) VALUES ($1, $2, $3, $4, $5)",
+	ReadShardMark:   "SELECT COALESCE(s.value, f.value), h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 LEFT JOIN sl_changes h ON h.index_name = $3 AND h.shard = $4 AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes o ON o.index_name = $5 AND o.shard = $6 AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $7 AND shard = $8 AND seq <= COALESCE(s.value, f.value)) WHERE f.id IN (1, 3)",
+	ReadHead:        withNow("SELECT COALESCE(s.value, f.value), NOW FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 WHERE f.id IN (1, 3)"),
+	ReadHeads:       "SELECT -1, value FROM sl_counter WHERE id IN (1, 3) UNION ALL SELECT shard, value FROM sl_shard_seq WHERE index_name = $1",
+	ReadTip:         withNow("SELECT COALESCE(s.value, f.value), NOW, h.kind, h.id, h.at, h.nonce, a.kind, a.id, a.at, a.nonce, o.seq, o.kind, o.id, o.at, o.nonce, p.below_seq, s.index_uid FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = $1 AND s.shard = $2 LEFT JOIN sl_pruned p ON p.index_name = $3 AND p.shard = $4 LEFT JOIN sl_changes h ON h.index_name = $5 AND h.shard = $6 AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes a ON a.index_name = $7 AND a.shard = $8 AND a.seq = $9 LEFT JOIN sl_changes o ON o.index_name = $10 AND o.shard = $11 AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = $12 AND shard = $13 AND seq <= $14) WHERE f.id IN (1, 3)"),
 	// set_config's third argument limits the setting to the statement's own
 	// transaction, which commits with it.
 	Notify:        "SELECT set_config('synchronous_commit', 'off', true), pg_notify('" + notifyChannel + "', p) FROM unnest($1::text[]) AS p",
@@ -308,10 +315,10 @@ var records = dialect.Records{
 }
 
 var registry = dialect.Registry{
-	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at) VALUES ($1, $2, $3, $4, $5, $6, NOW, NOW)
-ON CONFLICT (node_id) DO UPDATE SET address = EXCLUDED.address, version = EXCLUDED.version, capacity = EXCLUDED.capacity, body_codecs = EXCLUDED.body_codecs, mapping_types = EXCLUDED.mapping_types, heartbeat_at = EXCLUDED.heartbeat_at`),
+	Heartbeat: withNow(`INSERT INTO sl_nodes (node_id, address, version, capacity, body_codecs, mapping_types, seq_scheme, heartbeat_at, started_at) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW, NOW)
+ON CONFLICT (node_id) DO UPDATE SET address = EXCLUDED.address, version = EXCLUDED.version, capacity = EXCLUDED.capacity, body_codecs = EXCLUDED.body_codecs, mapping_types = EXCLUDED.mapping_types, seq_scheme = EXCLUDED.seq_scheme, heartbeat_at = EXCLUDED.heartbeat_at`),
 	RemoveNode:    "DELETE FROM sl_nodes WHERE node_id = $1",
-	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, mapping_types, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
+	Nodes:         withNow("SELECT node_id, address, version, capacity, body_codecs, mapping_types, seq_scheme, heartbeat_at, started_at, NOW FROM sl_nodes ORDER BY node_id"),
 	Features:      "SELECT name, enabled_at FROM sl_features",
 	EnableFeature: withNow("INSERT INTO sl_features (name, enabled_at) VALUES ($1, NOW) ON CONFLICT (name) DO NOTHING"),
 	IndexExists:   "SELECT COUNT(*) FROM sl_indexes WHERE name = $1",
@@ -386,6 +393,8 @@ VALUES ($1, $2, $3, 1, NOW, 1, $4) RETURNING ` + indexColumns)},
 
 var maintenance = dialect.Maintenance{
 	ShardRows:       "SELECT i.name, i.settings, (SELECT COUNT(*) FROM sl_shard_seq s WHERE s.index_name = i.name) FROM sl_indexes i",
+	IndexShardRows:  "SELECT COUNT(*) FROM sl_shard_seq WHERE index_name = $1",
+	GlobalRows:      "SELECT COUNT(*) FROM sl_counter WHERE id = 1",
 	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq < $3",
 	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = $1 AND at < NOW - $2"),
 	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq >= $3 AND seq < $4",

@@ -118,6 +118,16 @@ type Store interface {
 	// way every read takes both forms.
 	CompressBodies(on bool)
 
+	// ShardSeqs reports whether shard sequences are on (FeatureShardSeqs): until
+	// they are, every commit takes its seqs from the global sequence, as nodes from
+	// before them do. Once it has seen them on it answers without a query.
+	ShardSeqs(ctx context.Context) (bool, error)
+	// EnableShardSeqs turns shard sequences on, for good: every shard of every index
+	// starts at the global sequence's value, and a node from before them can neither
+	// write nor read the head from then on. Only once no such node is live; a no-op
+	// once they are on.
+	EnableShardSeqs(ctx context.Context) error
+
 	// Ping checks the database is reachable.
 	Ping(ctx context.Context) error
 
@@ -277,6 +287,7 @@ type options struct {
 	gateKey   string // the database a single-writer dialect's write gate is shared by
 	dbPath    string
 	dialect   func(*dialect.Dialect) // adjusts a copy of the dialect before the store starts
+	schema    int                    // Migrate's last migration; 0: the newest
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -293,6 +304,10 @@ func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l 
 // withDialect adjusts the store's dialect before it starts (tests that swap a
 // statement, which must not race the goroutines the store starts).
 func withDialect(f func(*dialect.Dialect)) Option { return func(o *options) { o.dialect = f } }
+
+// WithSchema stops Migrate at schema version v, as a binary that knows no later
+// migration would: tests use it to build a database as an earlier release left it.
+func WithSchema(v int) Option { return func(o *options) { o.schema = v } }
 
 // WithClock sets the clock the store's timers and durations run on (default:
 // clock.Real).

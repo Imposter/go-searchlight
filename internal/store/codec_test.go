@@ -411,7 +411,7 @@ func TestFeatures(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		reg := h.open(t).Registry()
-		if f, err := reg.Features(ctx); err != nil || len(f) != 0 {
+		if f, err := reg.Features(ctx); err != nil || len(f) != 1 || f[FeatureShardSeqs].IsZero() {
 			t.Fatalf("features of a new store: %v %v", f, err)
 		}
 		if err := reg.EnableFeature(ctx, FeatureZstdBodies); err != nil {
@@ -426,7 +426,7 @@ func TestFeatures(t *testing.T) {
 			t.Fatal(err)
 		}
 		again, err := reg.Features(ctx)
-		if err != nil || len(again) != 1 || !again[FeatureZstdBodies].Equal(first[FeatureZstdBodies]) {
+		if err != nil || len(again) != 2 || !again[FeatureZstdBodies].Equal(first[FeatureZstdBodies]) {
 			t.Fatalf("enabled twice: %v %v", again, err)
 		}
 	})

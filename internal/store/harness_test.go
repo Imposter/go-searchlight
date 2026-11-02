@@ -382,11 +382,12 @@ func headSeq(t *testing.T, st Store, shard ShardID) int64 {
 	return seq
 }
 
-// floorSeq is the floor every new shard starts at (sl_counter row 1).
+// floorSeq is the floor every new shard starts at: sl_counter row 3 once shard
+// sequences are on, row 1 (the global sequence) before.
 func floorSeq(t *testing.T, st Store) int64 {
 	t.Helper()
 	var v int64
-	if err := engine(st).r.QueryRowContext(context.Background(), "SELECT value FROM sl_counter WHERE id = 1").Scan(&v); err != nil {
+	if err := engine(st).r.QueryRowContext(context.Background(), "SELECT value FROM sl_counter WHERE id IN (1, 3)").Scan(&v); err != nil {
 		t.Fatal(err)
 	}
 	return v

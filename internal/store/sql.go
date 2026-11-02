@@ -45,9 +45,13 @@ type sqlStore struct {
 	lost   metric.Int64Counter
 	attr   attribute.KeyValue
 	chunk  int
+	schema int // the last migration Migrate applies; 0: the newest (WithSchema)
 	closed atomic.Bool
 	// compress makes Apply store document bodies compressed (CompressBodies).
 	compress atomic.Bool
+	// seqsOn is set once the store has found shard sequences on (upgrade.go); until
+	// then its writes take the global sequence, which tells them when it is gone.
+	seqsOn atomic.Bool
 
 	// beforeCommit, when set (tests only), runs inside Apply's transaction
 	// after w is written and before COMMIT.
@@ -83,6 +87,7 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		lost:     in.Counter(telemetry.MetricStoreNotificationsLost),
 		attr:     attribute.String("dialect", d.Name),
 		chunk:    o.blobChunk,
+		schema:   o.schema,
 		dbPath:   o.dbPath,
 		walGauge: in.Gauge(telemetry.MetricStoreWALSize),
 	}
@@ -461,7 +466,7 @@ func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepare
 	}
 	for attempt := 1; ; attempt++ {
 		err = s.applyOnce(ctx, batch, p)
-		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errNoShardRow) || ctx.Err() != nil {
+		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errNoShardRow) && !errors.Is(err, errShardSeqsOn) || ctx.Err() != nil {
 			return err
 		}
 		s.log.DebugContext(ctx, "retrying apply after a transient failure", slog.Int("attempt", attempt), slog.Any("error", err))
@@ -482,11 +487,23 @@ func keyOf(c *Change) recKey {
 
 // shardHead is a shard's sequence row as the transaction holding it read it (its
 // newest seq, its index's incarnation and mapping version), and last, the newest seq
-// the transaction has taken from it (value while none).
+// the transaction has taken from it (value while none). While shard sequences are off
+// the shard takes its seqs from global, the global sequence, which every head of the
+// transaction shares: value is then the global sequence's, and last the newest seq the
+// shard took.
 type shardHead struct {
 	value, last    int64
 	uid            string
 	mappingVersion int64
+	global         *shardHead
+}
+
+// seqs is the sequence h takes its seqs from: global, or its own.
+func (h *shardHead) seqs() *shardHead {
+	if h.global != nil {
+		return h.global
+	}
+	return h
 }
 
 // compareShards orders shards by key, index name (by bytes) and then shard: the order
@@ -522,7 +539,11 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) e
 	for i := range batch {
 		batch[i].Seq = 0
 	}
-	heads, nowMs, err := s.lockShards(ctx, tx, batch)
+	lock := s.lockShards
+	if !s.seqsOn.Load() {
+		lock = s.lockGlobalShards
+	}
+	heads, nowMs, err := lock(ctx, tx, batch)
 	if err != nil {
 		return err
 	}
@@ -566,6 +587,9 @@ func (s *sqlStore) applyOnce(ctx context.Context, batch []Change, p *prepared) e
 	netState(w, batch, p, seqs)
 	addTombs(w, tombs, nowMs)
 	if err := s.write(ctx, tx, w); err != nil {
+		return err
+	}
+	if err := s.setGlobal(ctx, tx, globalOf(heads)); err != nil {
 		return err
 	}
 	if s.beforeCommit != nil {
@@ -687,41 +711,43 @@ func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, 
 var errNoShardRow = errors.New("store: the shard has no sequence row")
 
 // provisionalSeqs are the seqs batch's changes would take if every one applied, each
-// shard's in batch order from its newest seq on, as checkConditions judges them.
+// sequence's in batch order from its newest seq on, as checkConditions judges them.
 func provisionalSeqs(batch []Change, heads map[ShardID]*shardHead) []int64 {
-	next := make(map[ShardID]int64, len(heads))
+	next := make(map[*shardHead]int64, len(heads))
 	seqs := make([]int64, len(batch))
 	for i := range batch {
-		id := batch[i].ShardID()
-		n, ok := next[id]
+		h := heads[batch[i].ShardID()].seqs()
+		n, ok := next[h]
 		if !ok {
-			n = heads[id].value
+			n = h.value
 		}
 		n++
-		next[id] = n
+		next[h] = n
 		seqs[i] = n
 	}
 	return seqs
 }
 
-// takeSeqs gives batch's changes their seqs, each shard's contiguous in batch order
+// takeSeqs gives batch's changes their seqs, each sequence's contiguous in batch order
 // from its newest seq on, and moves each shard's last on to them.
 func takeSeqs(batch []Change, heads map[ShardID]*shardHead) []int64 {
 	seqs := make([]int64, len(batch))
 	for i := range batch {
 		h := heads[batch[i].ShardID()]
-		h.last++
-		seqs[i] = h.last
+		g := h.seqs()
+		g.last++
+		h.last = g.last
+		seqs[i] = g.last
 	}
 	return seqs
 }
 
 // counters are the new values of the sequence rows a transaction took seqs from, in
-// key order.
+// key order. A shard taking its seqs from the global sequence has none.
 func counters(heads map[ShardID]*shardHead) []dialect.CounterRow {
 	var out []dialect.CounterRow
 	for id, h := range heads {
-		if h.last > h.value {
+		if h.last > h.value && h.global == nil {
 			out = append(out, dialect.CounterRow{Index: id.Index, Shard: id.Shard, Value: h.last, MappingVersion: h.mappingVersion})
 		}
 	}
@@ -1321,17 +1347,22 @@ func (s *sqlStore) Prune(ctx context.Context, shard ShardID, belowSeq int64) (er
 
 // raiseHorizon records belowSeq (clamped to the shard's next seq) as the shard's
 // prune horizon unless it is already higher, and returns the horizon. It takes the
-// shard's sequence row, so it is serialized with Apply and other prunes of the shard.
-// It reports false, and records nothing, when the shard has no row.
+// shard's sequence row (the global sequence while shard sequences are off), so it is
+// serialized with Apply and other prunes of the shard. It reports false, and records
+// nothing, when the shard has no row.
 func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int64) (int64, bool, error) {
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
 		return 0, false, err
 	}
 	defer rollback(tx)
-	var h shardHead
+	h := &shardHead{}
 	var nowMs int64
-	err = tx.QueryRowContext(ctx, s.d.Changelog.LockShard, shard.Index, shard.Shard).Scan(&h.value, &h.uid, &h.mappingVersion, &nowMs)
+	if s.seqsOn.Load() {
+		err = tx.QueryRowContext(ctx, s.d.Changelog.LockShard, shard.Index, shard.Shard).Scan(&h.value, &h.uid, &h.mappingVersion, &nowMs)
+	} else if h, _, err = s.lockGlobal(ctx, tx); errors.Is(err, errShardSeqsOn) {
+		return s.raiseHorizon(ctx, shard, belowSeq)
+	}
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return 0, false, nil

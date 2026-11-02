@@ -4,23 +4,20 @@
 -- index's incarnation (uid) and mapping version, so a commit reads them under its lock
 -- rather than from sl_indexes.
 --
--- Every shard starts at sl_counter row 1's value, the newest seq of the old global
--- sequence, so the seqs already stored (documents', queries', if_seq conditions) stay
--- below every new one. Row 1 stays as the floor every new shard starts at. MySQL's DDL
--- is not transactional, so unlike Postgres's the migration cannot hold row 1's lock
--- to its end: a node from before this schema that commits while it runs can take a
--- seq the seeding missed. A rolling upgrade's gate (write scaling M4) closes that.
+-- The table starts empty, and commits keep taking their seqs from the global sequence
+-- (sl_counter row 1) until the cluster turns shard sequences on: nodes from before
+-- this schema may still be writing through it, and know nothing of these rows. The
+-- switch, once every live node heartbeats sl_nodes.seq_scheme 1, seeds every shard's
+-- row at row 1's value in one transaction under row 1's lock, moves the floor to row
+-- 3 and deletes row 1 (internal/store/upgrade.go). A new database switches at once.
 --
--- settings.shards is a number, a string of one, null or absent; the last two mean
--- one shard. A value that is none of those fails the insert, rather than leaving the
--- index without rows.
---
--- sl_changes is keyed by shard and seq, since seqs repeat across shards now; that key
--- serves what sl_changes_shard_seq served. The index on seq alone serves nodes from
--- before this schema, which find a change by its seq, until every node runs this one.
--- Changing the primary key rebuilds sl_changes in place; writes go on meanwhile, and
--- the statement is atomic, so a rerun that finds sl_changes_shard_seq gone (1091) finds
--- it done.
+-- sl_changes is keyed by shard and seq, since seqs repeat across shards once they are
+-- on; that key serves what sl_changes_shard_seq served. The index on seq alone serves
+-- nodes from before this schema, which find a change by its seq, until every node runs
+-- this one. Changing the primary key rebuilds sl_changes in place; writes go on
+-- meanwhile (every seq is still unique), and the statement is atomic, so a rerun that
+-- finds sl_changes_shard_seq gone (1091) finds it done. MySQL's DDL is not
+-- transactional, so nothing here depends on what commits while it runs.
 
 CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	index_name VARBINARY(255) NOT NULL,
@@ -32,11 +29,6 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	PRIMARY KEY (index_name, shard)
 ) ENGINE=InnoDB;
 
-INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
-WITH RECURSIVE n (v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 31)
-SELECT i.name, a.v * 32 + b.v, c.value, i.uid, i.mapping_version
-FROM sl_indexes i JOIN n a JOIN n b JOIN sl_counter c ON c.id = 1
-WHERE a.v * 32 + b.v < COALESCE(CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(i.settings, '$.shards')), 'null') AS SIGNED), 1)
-ON DUPLICATE KEY UPDATE value = sl_shard_seq.value;
-
 ALTER TABLE sl_changes DROP PRIMARY KEY, ADD PRIMARY KEY (index_name, shard, seq), DROP INDEX sl_changes_shard_seq, ADD INDEX sl_changes_seq (seq);
+
+ALTER TABLE sl_nodes ADD COLUMN seq_scheme INT NOT NULL DEFAULT 0, ALGORITHM=INSTANT;

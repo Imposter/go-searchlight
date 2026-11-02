@@ -61,10 +61,11 @@ func shardSeqRows(t *testing.T, st Store) []shardSeqRow {
 	return out
 }
 
-// TestMigrateShardSeq: a database at schema v6 migrates to a sequence per shard. Every
-// shard of every index starts at the old global head with its index's uid and mapping
-// version, whether its settings name the shard count as a number, as a string or not at
-// all; every change stays readable; a seq may repeat across shards; a rerun changes
+// TestMigrateShardSeq: a database at schema v6 migrates to a sequence per shard, with
+// no sequence rows until shard sequences come on. Then every shard of every index
+// starts at the old global head with its index's uid and mapping version, whether its
+// settings name the shard count as a number, as a string or not at all; every change
+// stays readable; a seq may repeat across shards; a rerun of the migration changes
 // nothing; and each shard's next change takes the old head's next seq.
 func TestMigrateShardSeq(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
@@ -94,6 +95,12 @@ func TestMigrateShardSeq(t *testing.T) {
 		s.d.Migrations = all
 		if err := st.Migrate(ctx); err != nil {
 			t.Fatalf("migrate to shard sequences: %v", err)
+		}
+		if got := shardSeqRows(t, st); len(got) != 0 {
+			t.Fatalf("shard rows before shard sequences are on: %v", got)
+		}
+		if err := st.EnableShardSeqs(ctx); err != nil {
+			t.Fatal(err)
 		}
 		var want []shardSeqRow
 		for _, ix := range []struct {
@@ -337,6 +344,9 @@ func TestMigrateNullShards(t *testing.T) {
 		if err := st.Migrate(ctx); err != nil {
 			t.Fatalf("migrate with shards null: %v", err)
 		}
+		if err := st.EnableShardSeqs(ctx); err != nil {
+			t.Fatalf("shard sequences with shards null: %v", err)
+		}
 		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_shard_seq WHERE index_name = ?", "nul"); n != 1 {
 			t.Fatalf("%d sequence rows for an index of one shard", n)
 		}
@@ -344,9 +354,9 @@ func TestMigrateNullShards(t *testing.T) {
 	})
 }
 
-// TestMigrateChecksShardRows: once the schema has sequence rows, Migrate fails while an
-// index lacks some of its shards' rows, naming it, rather than leaving its writes to
-// fail one by one.
+// TestMigrateChecksShardRows: once shard sequences are on, Migrate fails while an index
+// lacks some of its shards' rows, naming it, rather than leaving its writes to fail
+// one by one. (An index lacking them all is seeded: TestIndexCreatedByOldNodeAfterTheSwitch.)
 func TestMigrateChecksShardRows(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()

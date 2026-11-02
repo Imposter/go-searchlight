@@ -1,18 +1,22 @@
 -- Searchlight schema v7: a sequence per shard. Each shard of each index takes its seqs
--- from its own row of sl_shard_seq, so the seqs of different shards are independent, as
--- on the other dialects. The row also holds the index's incarnation (uid) and mapping
--- version, so a commit reads them with its seqs rather than from sl_indexes.
+-- from its own row of sl_shard_seq, locked by the transactions that commit to it, so
+-- commits to different shards no longer wait on one another. The row also holds the
+-- index's incarnation (uid) and mapping version, so a commit reads them under its lock
+-- rather than from sl_indexes.
 --
--- Every shard starts at sl_counter row 1's value, the newest seq of the old global
--- sequence, so the seqs already stored (documents', queries', if_seq conditions) stay
--- below every new one. Row 1 stays as the floor every new shard starts at.
+-- The table starts empty, and commits keep taking their seqs from the global sequence
+-- (sl_counter row 1) until the cluster turns shard sequences on: nodes from before
+-- this schema may still be writing through it, and know nothing of these rows. The
+-- switch, once every live node heartbeats sl_nodes.seq_scheme 1, seeds every shard's
+-- row at row 1's value in one transaction under row 1's lock, moves the floor to row
+-- 3 and deletes row 1 (internal/store/upgrade.go). A new database switches at once.
 --
--- sl_changes is keyed by shard and seq, since seqs repeat across shards now. SQLite
--- cannot change a table's key, so it is rebuilt, inside the migration's transaction. It
--- stays a rowid table: its rows carry document bodies, larger than WITHOUT ROWID
--- suits, and the key's index serves the reads by shard and seq. Unlike the other
--- dialects it keeps no index on seq alone: nodes of two versions never share one
--- SQLite file.
+-- sl_changes is keyed by shard and seq, since seqs repeat across shards once they are
+-- on. SQLite cannot change a table's key, so it is rebuilt, inside the migration's
+-- transaction. It stays a rowid table: its rows carry document bodies, larger than
+-- WITHOUT ROWID suits, and the key's index serves the reads by shard and seq. Unlike
+-- the other dialects it keeps no index on seq alone: nodes of two versions never share
+-- one SQLite file.
 
 CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	index_name TEXT NOT NULL,
@@ -23,13 +27,6 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	mapping_version INTEGER NOT NULL,
 	PRIMARY KEY (index_name, shard)
 ) WITHOUT ROWID;
-
-WITH RECURSIVE g (shard) AS (SELECT 0 UNION ALL SELECT shard + 1 FROM g WHERE shard < 1023)
-INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
-SELECT i.name, g.shard, c.value, i.uid, i.mapping_version
-FROM sl_indexes i JOIN g JOIN sl_counter c ON c.id = 1
-WHERE g.shard < COALESCE(CAST(json_extract(i.settings, '$.shards') AS INTEGER), 1)
-ON CONFLICT (index_name, shard) DO NOTHING;
 
 CREATE TABLE sl_changes_v7 (
 	seq INTEGER NOT NULL,
@@ -52,3 +49,5 @@ SELECT seq, index_name, shard, kind, id, payload, at, mapping_version, index_uid
 DROP TABLE sl_changes;
 
 ALTER TABLE sl_changes_v7 RENAME TO sl_changes;
+
+ALTER TABLE sl_nodes ADD COLUMN seq_scheme INTEGER NOT NULL DEFAULT 0;

@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -104,12 +105,16 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	if s.schema > 0 {
+		ms = slices.DeleteFunc(ms, func(m migration) bool { return m.version > s.schema })
+	}
 	timedOut := s.d.Maintenance.LockTimedOut
 	wait := migrateRetryBase
 	for attempt := 1; ; attempt++ {
-		err = s.migrateOnce(ctx, ms)
-		if err == nil && len(ms) > 0 && ms[len(ms)-1].version >= shardSeqSchema {
-			err = s.checkShardRows(ctx)
+		var created bool
+		err = s.migrateOnce(ctx, ms, &created)
+		if err == nil {
+			err = s.afterMigrate(ctx, ms, created)
 		}
 		if err == nil || timedOut == nil || !timedOut(err) || attempt == migrateAttempts {
 			return err
@@ -123,46 +128,33 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	}
 }
 
-// shardSeqSchema is the schema version that gives every shard a sequence row.
+// shardSeqSchema is the schema version that brings shard sequences (upgrade.go).
 const shardSeqSchema = 7
 
-// checkShardRows fails unless every index has exactly a sequence row per shard: an
-// index without them takes no write, and one the migration could not seed is found at
-// once rather than at its first write.
-func (s *sqlStore) checkShardRows(ctx context.Context) error {
-	rows, err := s.r.QueryContext(ctx, s.d.Maintenance.ShardRows)
-	if err != nil {
-		return fmt.Errorf("check the shards' sequence rows: %w", err)
+// afterMigrate turns shard sequences on for a database this call created, which no node
+// from before them can be writing (one that had migrated it first would have made it
+// not new; one that comes after finds its schema too new and stops). On a database
+// with shard sequences on, it seeds the rows of an index a 1.x node created without
+// them, and fails naming an index whose rows do not match its shard count.
+func (s *sqlStore) afterMigrate(ctx context.Context, ms []migration, created bool) error {
+	if len(ms) == 0 || ms[len(ms)-1].version < shardSeqSchema {
+		return nil
 	}
-	defer rows.Close()
-	var bad []string
-	for rows.Next() {
-		var name string
-		var settings []byte
-		var n int
-		if err := rows.Scan(&name, &settings, &n); err != nil {
-			return err
-		}
-		shards, err := settingsShards(settings)
-		if err != nil {
-			return fmt.Errorf("index %q: %w", name, err)
-		}
-		if n != shards {
-			bad = append(bad, fmt.Sprintf("%q has %d shard(s) and %d sequence row(s)", name, shards, n))
+	if created {
+		if err := s.EnableShardSeqs(ctx); err != nil {
+			return fmt.Errorf("turn shard sequences on: %w", err)
 		}
 	}
-	if err := rows.Err(); err != nil {
+	on, err := s.ShardSeqs(ctx)
+	if err != nil || !on {
 		return err
 	}
-	if len(bad) > 0 {
-		return fmt.Errorf("store: the shards' sequence rows do not match their indexes: %s", strings.Join(bad, "; "))
-	}
-	return nil
+	return s.seedMissingShards(ctx)
 }
 
 // migrateOnce applies the pending migrations under the migration lock. A connection
 // whose lock timeout cannot be reset is not put back into the pool.
-func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
+func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration, created *bool) error {
 	m := &s.d.Maintenance
 	if m.MigrateInTx {
 		tx, err := s.w.BeginTx(ctx, nil)
@@ -180,7 +172,7 @@ func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
 				return fmt.Errorf("migration lock timeout: %w", err)
 			}
 		}
-		if err := s.migrateOn(ctx, tx, ms, false); err != nil {
+		if err := s.migrateOn(ctx, tx, ms, false, created); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -212,14 +204,14 @@ func (s *sqlStore) migrateOnce(ctx context.Context, ms []migration) error {
 			}
 		}()
 	}
-	return s.migrateOn(ctx, conn, ms, true)
+	return s.migrateOn(ctx, conn, ms, true, created)
 }
 
 // migrateOn applies the pending migrations, recording each version as it
-// completes. resumable says a migration may have been interrupted part way (DDL is
+// completes, and sets created when the first was among them. resumable says a migration may have been interrupted part way (DDL is
 // not transactional): a statement failing only because it was applied then is
 // passed over.
-func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration, resumable bool) error {
+func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration, resumable bool, created *bool) error {
 	if _, err := ex.ExecContext(ctx, s.d.Maintenance.VersionTable); err != nil {
 		return fmt.Errorf("create version table: %w", err)
 	}
@@ -249,6 +241,7 @@ func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration, res
 			return fmt.Errorf("%w: it has migration %d, this binary knows up to %d", ErrNewerSchema, v, known)
 		}
 	}
+	*created = len(ms) > 0 && !applied[ms[0].version]
 	record := s.d.Maintenance.RecordMigration
 	for _, m := range ms {
 		if applied[m.version] {

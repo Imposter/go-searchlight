@@ -48,7 +48,9 @@ func validMeta(m *IndexMeta) error {
 
 // Create implements [IndexStore]. It inserts the index and a sequence row for each of
 // its shards in one transaction, every shard starting at the floor: above any seq a
-// dropped index of the same name reached. An insert that returns its row in the same
+// dropped index of the same name reached. While shard sequences are off it inserts
+// the index alone, under the global sequence's lock, so it commits wholly before or
+// after they come on, and they seed its rows. An insert that returns its row in the same
 // statement answers with that row; a failed insert is told apart from an existing
 // index by looking the name up, since a key violation looks different on every
 // dialect.
@@ -84,6 +86,16 @@ func (x *indexStore) createOnce(ctx context.Context, m *IndexMeta, uid string) (
 		return IndexMeta{}, err
 	}
 	defer rollback(tx)
+	global := !s.seqsOn.Load()
+	if global {
+		if _, _, err := s.lockGlobal(ctx, tx); errors.Is(err, errShardSeqsOn) {
+			rollback(tx)
+			return x.createOnce(ctx, m, uid)
+		} else if err != nil {
+			return IndexMeta{}, err
+		}
+		shards = 0
+	}
 	row, err := returningRow(ctx, tx, s.d.Indexes.Create, []any{m.Name, string(m.Mapping), string(m.Settings), uid}, []any{m.Name})
 	if err != nil {
 		return IndexMeta{}, err
@@ -155,7 +167,7 @@ func (x *indexStore) Update(ctx context.Context, m IndexMeta) (out IndexMeta, er
 	}
 	for attempt := 1; ; attempt++ {
 		err = x.updateOnce(ctx, &m)
-		if err == nil || attempt == applyAttempts || !s.retryable(err) || ctx.Err() != nil {
+		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errShardSeqsOn) || ctx.Err() != nil {
 			break
 		}
 	}
@@ -197,7 +209,9 @@ func (s *sqlStore) lockIndex(ctx context.Context, tx *sql.Tx, name string) ([]in
 // updateOnce runs one attempt of Update. It locks every sequence row of the index
 // before it reads the index, so a mapping change commits wholly before or after any
 // Apply to the index (every change committed after it carries its mapping version
-// and follows it in its shard's log), and two updates of one index take turns. The
+// and follows it in its shard's log), and two updates of one index take turns. While
+// shard sequences are off it locks the global sequence instead, as 1.x does, and
+// logs the mapping changes at its next values. The
 // shard count is fixed at creation (spec section 2): documents are placed by it, so
 // changing it would orphan them.
 func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
@@ -212,7 +226,14 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 			rollback(tx)
 		}
 	}()
-	locked, nowMs, err := s.lockIndex(ctx, tx, m.Name)
+	var locked []indexShard
+	var global *shardHead
+	var nowMs int64
+	if s.seqsOn.Load() {
+		locked, nowMs, err = s.lockIndex(ctx, tx, m.Name)
+	} else {
+		global, nowMs, err = s.lockGlobal(ctx, tx)
+	}
 	if err != nil {
 		return err
 	}
@@ -239,6 +260,11 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	} else if newShards != oldShards {
 		return invalidf("settings: shards is %d and cannot change (to %d)", oldShards, newShards)
 	}
+	if global != nil {
+		for sh := range oldShards {
+			locked = append(locked, indexShard{shard: sh, head: shardHead{value: global.value, last: global.value, global: global}})
+		}
+	}
 	if len(locked) != oldShards {
 		return fmt.Errorf("store: index %q has %d shards and %d sequence rows", m.Name, oldShards, len(locked))
 	}
@@ -256,7 +282,9 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	w := &dialect.Write{Changes: make([]dialect.ChangeRow, len(locked))}
 	for i := range locked {
 		r := &locked[i]
-		r.head.last++
+		seqs := r.head.seqs()
+		seqs.last++
+		r.head.last = seqs.last
 		r.head.mappingVersion = mappingVersion
 		heads[ShardID{Index: m.Name, Shard: r.shard}] = &r.head
 		w.Changes[i] = dialect.ChangeRow{
@@ -267,6 +295,9 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 	w.Counters = counters(heads)
 	if err := s.write(ctx, tx, w); err != nil {
 		return fmt.Errorf("log mapping changes: %w", err)
+	}
+	if err := s.setGlobal(ctx, tx, global); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -279,7 +310,9 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 // Drop implements [IndexStore]. It locks every sequence row of the index, which orders
 // the drop with Apply: no change for the index commits after it. It raises the floor
 // to the newest seq of any of the index's shards, so an index created under the name
-// later starts above every seq this one took.
+// later starts above every seq this one took. While shard sequences are off it locks
+// the global sequence instead, as 1.x does: the global sequence is above every seq
+// already, and becomes the floor when they come on.
 func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	s := x.s
 	ctx, end := s.start(ctx, "index_drop", attribute.String("index", name))
@@ -287,12 +320,27 @@ func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	if err := validKey("index name", name, MaxIndexName); err != nil {
 		return err
 	}
+	err = x.dropOnce(ctx, name)
+	if errors.Is(err, errShardSeqsOn) {
+		err = x.dropOnce(ctx, name)
+	}
+	return err
+}
+
+func (x *indexStore) dropOnce(ctx context.Context, name string) error {
+	s := x.s
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
 		return err
 	}
 	defer rollback(tx)
-	locked, _, err := s.lockIndex(ctx, tx, name)
+	var locked []indexShard
+	global := !s.seqsOn.Load()
+	if global {
+		_, _, err = s.lockGlobal(ctx, tx)
+	} else {
+		locked, _, err = s.lockIndex(ctx, tx, name)
+	}
 	if err != nil {
 		return err
 	}
@@ -305,12 +353,14 @@ func (x *indexStore) Drop(ctx context.Context, name string) (err error) {
 	} else if n == 0 {
 		return fmt.Errorf("index %q: %w", name, ErrNotFound)
 	}
-	var top int64
-	for _, r := range locked {
-		top = max(top, r.head.value)
-	}
-	if _, err := tx.ExecContext(ctx, s.d.Changelog.RaiseFloor, top); err != nil {
-		return fmt.Errorf("drop index %q: %w", name, err)
+	if !global {
+		var top int64
+		for _, r := range locked {
+			top = max(top, r.head.value)
+		}
+		if _, err := tx.ExecContext(ctx, s.d.Changelog.RaiseFloor, top); err != nil {
+			return fmt.Errorf("drop index %q: %w", name, err)
+		}
 	}
 	for _, q := range s.d.Indexes.DropData {
 		if _, err := tx.ExecContext(ctx, q, name); err != nil {

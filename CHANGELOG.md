@@ -43,7 +43,8 @@ answers with a token in place of a seq, and reads wait on it shard by shard.
     `percolate=true`) and wait only on the shards they read; a `GET` only on its
     document's shard. A malformed token, a seq past its shard's newest committed seq, a
     token of another incarnation of the index, or one naming a shard the index lacks
-    is a 400 at `params.wait_for`.
+    is a 400 at `params.wait_for`; so is `wait_for` on `_bulk` without
+    `percolate=true`.
   - **`wait_for_seq` is removed**: it is refused by name with a 400 at
     `params.wait_for_seq` ("wait_for_seq was removed in 2.0: pass the token a write
     returned as wait_for").

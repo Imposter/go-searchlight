@@ -114,6 +114,9 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if withMatches && !perc {
 		return InvalidAt("params.percolate_matches", "percolate_matches and percolate_inner_hits detail a percolation: give percolate=true")
 	}
+	if wait != nil && !perc {
+		return InvalidAt("params.wait_for", "wait_for on _bulk is what a percolation reads saved queries up to: give percolate=true")
+	}
 	ops, err := s.parseBulk(r.Body)
 	if err != nil {
 		return err

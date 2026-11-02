@@ -70,6 +70,21 @@ func TestWaitForRefusals(t *testing.T) {
 	}
 }
 
+// TestBulkWaitForNeedsPercolate: _bulk's wait_for is what its percolation reads saved
+// queries up to; without percolate=true it is a 400 at params.wait_for, before
+// anything is written, rather than dropped.
+func TestBulkWaitForNeedsPercolate(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.createIndex("bw", `{"settings": {"shards": 2}}`)
+	tok := tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/bw/docs/a", `{"n": 1}`))
+	p := e.problem(e.do("POST", "/indexes/bw/_bulk?wait_for="+tok, ndjson(`{"upsert": {"id": "b"}}`, `{"n": 2}`)), http.StatusBadRequest, "invalid_request")
+	if !hasLoc(p, "params.wait_for") {
+		t.Errorf("_bulk with wait_for and no percolate: %v, want a problem at params.wait_for", p)
+	}
+	e.problem(e.do("GET", "/indexes/bw/docs/b", ""), http.StatusNotFound, "document_not_found")
+	e.must(http.StatusOK, "POST", "/indexes/bw/_bulk?percolate=true&wait_for="+tok, ndjson(`{"upsert": {"id": "b"}}`, `{"n": 2}`))
+}
+
 // TestTokenNamesTheShardsWritten: a bulk's token names each shard it committed to, at the
 // newest seq it took there, and no other shard.
 func TestTokenNamesTheShardsWritten(t *testing.T) {

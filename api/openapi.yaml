@@ -403,7 +403,8 @@ paths:
         queries it matches, as written: against every saved query committed through
         this node before the percolation, and every change up to `wait_for`'s seqs
         when it is given (a seq past its shard's newest committed one is a 400,
-        before anything is written). An operation of a shard that failed is not
+        before anything is written; without `percolate=true`, `wait_for` is a 400).
+        An operation of a shard that failed is not
         percolated. An unconditional upsert
         whose body is byte-identical to the stored document's is a noop at the stored
         document's seq (see `detect_noop`), and still lists its matching saved

@@ -304,7 +304,7 @@ type WriteOptions struct {
 	InnerHits bool
 	// WaitFor, with Percolate, waits for the copies percolating to have every change up
 	// to its seq of their shard searchable before percolating, so saved queries written
-	// up to it are seen.
+	// up to it are seen. Without Percolate it is refused (400).
 	WaitFor *Token
 	// KeepIdentical (detect_noop=false) writes an unconditional upsert whose body is
 	// byte-identical to the stored document's, as releases before 1.6 did, rather than

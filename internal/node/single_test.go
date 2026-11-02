@@ -1335,3 +1335,26 @@ func plus(t *api.Token, n int64) *api.Token {
 	}
 	return out
 }
+
+// TestWriteWaitForNeedsPercolate: a write's wait_for is what its percolation reads
+// saved queries up to, so without percolation it is refused (a 400 at
+// params.wait_for) before anything commits, rather than dropped.
+func TestWriteWaitForNeedsPercolate(t *testing.T) {
+	cfg := testConfig(t)
+	n := open(t, cfg, openStore(t, cfg), nil)
+	if _, err := n.CreateIndex(ctx(t), "wf", api.IndexSpec{Settings: api.IndexSettings{Shards: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	waitServing(t, n)
+	tok := mustWrite(t, n, "wf", upsert("a", `{"x": 1}`)).Token
+	var ae *api.Error
+	if _, err := n.Write(ctx(t), "wf", []api.WriteOp{upsert("b", `{"x": 2}`)}, api.WriteOptions{WaitFor: tok}); !errors.As(err, &ae) || ae.Status != 400 {
+		t.Fatalf("a write with wait_for and no percolation: %v, want a 400", err)
+	}
+	if doc, err := n.GetDocument(ctx(t), "wf", "b", api.ReadOptions{}); err == nil {
+		t.Fatalf("the refused write committed: %+v", doc)
+	}
+	if _, err := n.Write(ctx(t), "wf", []api.WriteOp{upsert("b", `{"x": 2}`)}, api.WriteOptions{WaitFor: tok, Percolate: true}); err != nil {
+		t.Fatalf("with percolation: %v", err)
+	}
+}

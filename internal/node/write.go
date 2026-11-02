@@ -40,10 +40,11 @@ type prepared struct {
 	whole bool
 }
 
-// Write implements [api.Coordinator]: see the package documentation. With percolation,
-// a wait_for past its shards' heads is refused before anything commits, and once the write
-// commits a percolation that cannot finish is reported in the result (Percolated
-// false), never as an error that hides the seqs.
+// Write implements [api.Coordinator]: see the package documentation. A wait_for
+// without percolation is refused (it is what a percolation reads saved queries up
+// to). With percolation, a wait_for past its shards' heads is refused before anything
+// commits, and once the write commits a percolation that cannot finish is reported in
+// the result (Percolated false), never as an error that hides the seqs.
 func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts api.WriteOptions) (res *api.WriteResult, err error) {
 	ctx, span := n.tr.Start(ctx, "node.write", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, name), attribute.Int("ops", len(ops)), attribute.Bool("percolate", opts.Percolate)))
@@ -57,6 +58,9 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	idx, err := n.lookup(ctx, name)
 	if err != nil {
 		return nil, err
+	}
+	if opts.WaitFor != nil && !opts.Percolate {
+		return nil, api.InvalidAt("params.wait_for", "wait_for on a write is what a percolation reads saved queries up to: give percolate=true")
 	}
 	if opts.Percolate && opts.WaitFor != nil {
 		if idx, err = n.checkTokenOf(ctx, idx, opts.WaitFor); err != nil {

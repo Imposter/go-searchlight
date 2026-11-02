@@ -61,7 +61,8 @@ format is given at the end.
 
 - **Reads that take it.** `_search`, `_count`, `_percolate`, `_fields`, `GET` of a
   document or saved query, the saved-query listing, and `_bulk` with `percolate=true`
-  take `?wait_for=<token>`. The read waits until each shard it reads has every change
+  take `?wait_for=<token>` (`_bulk` without `percolate=true` refuses it, a 400 at
+  `params.wait_for`). The read waits until each shard it reads has every change
   up to the token's seq of that shard searchable. A `GET` waits only on its document's
   shard. Past the deadline the answer is a 504.
 - **Merging.** Tokens of the same incarnation merge by per-shard maximum. A client

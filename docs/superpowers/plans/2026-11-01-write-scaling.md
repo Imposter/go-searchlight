@@ -2,7 +2,8 @@
 
 **Status:** approved for Change A (2026-11-02). The operator chose D1 (one commit per shard, per-item results), D2 (an
 opaque token, in Searchlight 2.0.0), and Change A now, re-measuring before any decision on Change B. D3 and D6 wait for
-that decision. Production's storage check is deferred, so the gain there is unconfirmed.
+that decision. Production's storage check is deferred, so the gain there is unconfirmed. The
+[implementation plan](2026-11-02-per-shard-seq-implementation.md) builds it; its corrections are folded in below.
 
 **Order changed by Phase 0:** several committers on today's single counter row were slower (by up to 54%), and moving
 `pg_notify` out gained nothing alone. So Phase 1 doesn't ship on its own: its items land with Phase 2, and the first
@@ -45,7 +46,7 @@ Neither pays off fully alone. A leaves one WAL, and B needs A.
 | # | Decision | Recommendation | Why | Cost |
 |---|---|---|---|---|
 | **D1** | Bulk atomicity | **One commit per shard, per-item results. No 2PC.** A request is whole-or-nothing only when all its ops land on one shard | Same model as Elasticsearch. Failure is partial and reported, rather than a stalled shard | **Breaking.** Reverses `docs/api.md:413-414,481-483`. A 5xx may mean some shards committed, so clients must retry safely |
-| **D2** | Read-your-writes | **Opaque token: a sparse vector of `(shard, seq)` plus epoch and shard-map version**, merged by per-shard maximum | No clock needed, stateless, waits only on shards a query hits | **Breaking.** Replaces scalar `wait_for_seq`, `seq` and `percolated_seq` on the bulk response. About 0.7 KB at 64 touched shards |
+| **D2** | Read-your-writes | **Opaque token: the index's uid and a sparse vector of `(shard, seq)`**, merged by per-shard maximum. No epoch or shard-map version in 2.0: a shard count never changes under Change A, and a generation stamp waits for Change B | No clock needed, stateless, waits only on shards a query hits | **Breaking.** Replaces scalar `wait_for_seq`, `seq` and `percolated_seq` on the bulk response. About 0.4 KB at 64 touched shards |
 | **D3** | How to shard | **Application-level, in Searchlight, over plain Postgres** | Searchlight already routes by shard, and needs no router tier. Citus would add a coordinator and 2PC we'd avoid anyway, and Neki and Multigres are young or have no shared snapshot | We build placement and shard moves ourselves |
 | **D4** | Dialects | **A on all three; B on Postgres only.** SQLite keeps one writer and gains nothing | MySQL measured 1.3-1.4k docs/s, so its limit is elsewhere (#69). Three dialects multiply failure testing | B-only features need a Postgres store |
 | **D5** | Version | **Searchlight 2.0.0**, with no compatibility shim for the scalar | D1 and D2 break the API either way | Clients must migrate, including scrape-bot |
@@ -92,28 +93,37 @@ row lose.
    poll. Measure wake latency.
 2. **A committer per shard** (or a bounded pool keyed by shard), replacing the one `run` loop. Bound total connections: the
    64-per-node pool matters here.
-3. **Stop `checkIndexes` reading `sl_indexes` per transaction** where a cached uid and mapping version will do, with the
-   conflict path re-reading.
+3. **Stop `checkIndexes` reading `sl_indexes` per transaction.** Done without a cache: each shard's sequence row carries
+   its index's uid and mapping version, which Apply reads under the row's lock, so only a missing row reads the
+   catalogue.
 
 ## Phase 2: per-shard sequences, Change A (3-5 weeks, breaking)
 
-1. **Schema.** New `sl_shard_seq (index_uid, shard, value)`. `sl_changes` primary key becomes `(index_name, shard, seq)`.
-   On Postgres, build the unique index concurrently and then swap. MySQL needs a table rebuild, so document the downtime.
-2. **Seeding.** Every shard's counter starts at the old global head. Stored `seq` values and `if_seq` stay valid, and
+1. **Schema.** New `sl_shard_seq (index_name, shard)`, holding `value`, `index_uid` and `mapping_version`: keyed by name
+   like every other data table and like what callers pass, with the incarnation as a column. `sl_changes` primary key
+   becomes `(index_name, shard, seq)`, and an index on `seq` alone stays until 2.1, because 1.x nodes find a change by
+   its seq at every poll in a rolling upgrade's window. On Postgres the key swap runs in the migration's transaction,
+   which holds `sl_changes`' lock while it builds: the runner runs every pending migration in one transaction, where a
+   concurrent build cannot run, so the hold is measured in M4 first. MySQL rebuilds the table in place, so document it.
+2. **Seeding.** Every shard's counter starts at the old global head, `sl_counter` row 1, which stays as the floor: new
+   shards start at it, and a drop raises it past the dropped shards' seqs. Stored `seq` values and `if_seq` stay valid, and
    per-shard order stays monotonic.
 3. **Commit.** Split a request by shard, then one transaction per shard, each taking one counter row. Conditions, tombstones
    and net state stay per shard. A request on one shard keeps full atomicity (D1).
 4. **Bulk response.** Per-item status, with a token (D2). A failed shard fails its own items only. The bulk's `errors` flag
    covers partial failure. Documents percolate after their shards commit, and the "queries as they stand at its end" promise
    narrows to shards that committed.
-5. **Index-level operations.** Update and Drop lock all of an index's shard rows, in sorted order, in one transaction. Plain
-   Apply locks one row, so these can't deadlock with it.
+5. **Index-level operations.** Update and Drop lock all of an index's shard rows, in sorted order, in one transaction. Apply
+   locks the rows of the shards it writes (one through the group committer's per-shard lanes, several for a direct
+   multi-shard Apply) in the same order, so none of them can deadlock.
 6. **Heads.** `HeadSeq`, `Tip`, `checkHead`, `noteHead`, `lowerHead`, `ReadCounterMark` and `ReadTip` become per shard. `Advance`
-   over gaps goes, because a shard's seqs are now its own. Lag becomes real per-shard lag. `ageFloor` and `logStart` search the
-   shard's own head.
-7. **Rewind.** Anchors now only name own-shard changes, so this logic shrinks. Rewrite the rewind tests rather than adapting them.
+   over other shards' gaps goes, because a shard's seqs are now its own; it stays only for a shard that stands above its last
+   change (a new shard starts at the floor). Lag becomes real per-shard lag. `ageFloor` and `logStart` search the shard's own
+   head.
+7. **Rewind.** Anchors now only name own-shard changes, so the cross-shard cases go. The own-shard check stays: a shard is
+   pruned up to its copies' oldest applied seq, which can pass an anchor. Rewrite the rewind tests rather than adapting them.
 8. **API.** Token on writes; `wait_for=<token>` on reads, waiting only on the query's shards, with 504 on timeout and a defined
-   response when the epoch or shard map changed. `if_seq`, `_seq` and `version` unchanged. Update `docs/api.md`, `api/openapi.yaml`,
+   response when the index was recreated (another uid). `if_seq`, `_seq` and `version` unchanged. Update `docs/api.md`, `api/openapi.yaml`,
    `docs/clustering.md`, the design spec §2, §8 and the README.
 9. **Rolling upgrade.** Mixed versions take different locks, so this is a gated cutover through `sl_features`: new code keeps
    using the global row until every node is on the new version, then the flag flips in a transaction holding the old lock. Test

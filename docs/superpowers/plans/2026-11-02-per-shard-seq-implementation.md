@@ -7,6 +7,10 @@ per shard, per-item results, no 2PC), D2 (an opaque token in place of the scalar
 set the performance bar. The spike (`spike/write-scaling`, never merged) showed the shape and its shortcuts; none
 of its code is reused as it stands.
 
+**Status: do not deploy this branch to a cluster.** Until M4's gated cutover lands, a 1.x node writing after
+migration 0007 loses and collides with 2.x writes (see M4's ship blockers). A single 2.x node, or a cluster of 2.x
+nodes on a fresh or fully migrated database, is what M1 and M2 test.
+
 **Branch:** `feat/per-shard-seq`, from `design/write-scaling` at `a0202bb`. Four milestones, each committed in small
 steps and each leaving its own layer green:
 
@@ -46,17 +50,31 @@ These refine the approved plan. Where one departs from it, the reason is given.
    them too, as they took the counter lock before: `Update`'s optimistic `UPDATE ... WHERE version` doesn't check
    its row count, and only the lock keeps two updates from both succeeding.
 5. **The committer pool.** A lane per shard, run by a goroutine while it has requests, and a semaphore bounding
-   the transactions in flight: `GroupCommitOptions.MaxTransactions`, by default half the store's write pool (32 of
-   Postgres's and MySQL's 64; Phase 0 found 32 better than 8 or 64). The batching window is waited out before a
+   the transactions in flight: `GroupCommitOptions.MaxTransactions`, the node's `write_transactions`, by default 16
+   and at most half the store's write pool (1 on SQLite). Phase 0 found 32 faster than 8 or 64, but every
+   transaction holds a connection, and three nodes at 32 pass Postgres's default `max_connections` of 100, which
+   refuses them with 53300 (not retryable): the store says so in the error, and `docs/operations.md` sizes
+   `max_connections`. The batching window is waited out before a
    slot is taken, so a waiting lane holds no connection. A lane takes everything pending when its slot comes, up to
    the change and byte limits, so a backlog commits in full batches.
 6. **Notifications leave the transaction.** After a commit, each shard's newest seq goes to a per-store notifier,
-   which coalesces them and sends them in one statement of its own with `synchronous_commit` off. A lost
-   notification costs at most one poll (500 ms). `Watcher`'s `ready` contract weakens accordingly: a change
+   which coalesces them and sends them in one statement of its own with `synchronous_commit` off, once more if it
+   fails. A lost notification costs a copy up to one poll, which while notifications flow is half `max_lag` (1 s by
+   default), not `changelog_poll_interval`; lost ones are counted (`searchlight_store_notifications_lost_total`) and
+   warned about at most once a minute. `Watcher`'s `ready` contract weakens accordingly: a change
    committed after ready is announced unless the committing node fails first.
 7. **`sl_changes`' new primary key is `(index_name, shard, seq)`**, which makes the old second index redundant. A
-   plain index on `seq` stays, for M4: until every node runs 2.0, 1.x nodes join `sl_changes` on `seq` alone at
-   every poll (`ReadTip`, `ReadCounterMark`), and without it each poll scans the table.
+   plain index on `seq` stays on Postgres and MySQL, for M4: until every node runs 2.0, 1.x nodes join `sl_changes`
+   on `seq` alone at every poll (`ReadTip`, `ReadCounterMark`), and without it each poll scans the table. SQLite
+   keeps none, since nodes of two versions never share its file. Its rebuilt `sl_changes` stays a rowid table: the
+   rows carry document bodies, larger than `WITHOUT ROWID` suits, and the key's index serves the reads by shard and
+   seq.
+9. **Migration 0007's seeding.** Every index gets a row per shard of its `settings.shards` (a number, a string of
+   one, or null or absent for one); a value that is none of those fails the migration rather than leaving the index
+   without rows, and `Migrate` checks every index has exactly its shard count of rows. Postgres's migration locks
+   `sl_counter` row 1 before it seeds, so no 1.x commit lands between the seeding and its end. MySQL's DDL is not
+   transactional and its key swap is online, so a 1.x commit during the migration can take a seq the seeding missed:
+   M4's gate must cover it there.
 8. **Partial results.** `GroupCommitter.Apply` returns a `*PartialError` when a request split over several shards
    had some fail: each failed shard with its changes' positions in the request and its error, positions
    translated. A request on one shard gets its error as before. Committed changes have their seqs set.
@@ -118,15 +136,17 @@ results. Moved forward from M2 (task 2.4): `waitWritten` waits each shard for it
 
 | # | Task | Files (code map §2, §4, §5) | Tests |
 |---|---|---|---|
-| 2.1 | **Heads per shard.** `noteHead`, `lowerHead`, `checkHead` and the node's `head` become per shard (a map keyed by `ShardID`, or a field of the shard's slot); `TailerEnv.Head` takes the shard; `TopSeq` goes | `internal/node/single.go`, `read.go`, `host.go`, `internal/store` | `node/single_test.go`'s head tests rewritten |
-| 2.2 | **Tailers.** `Advance` over gaps goes: an idle shard's head is its own, so the tailer's advance is a no-op unless the head moved, and `Shard.Advance` and its generation-publishing path are removed with their tests. Lag is the shard's head minus applied | `internal/replica/tailer.go`, `internal/shard/shard.go`, `manifest.go`, `generation.go` | `replica/tailer_test.go`, `shard/seqmark_test.go` |
-| 2.3 | **Rewind on own-shard anchors.** An anchor now always names an own-shard change, so `checkRewind`'s cross-shard cases and `ownCheck`'s separate state collapse into the anchor. Rewrite the rewind suite rather than adapt it | `internal/replica/rewind.go`, `recover.go` | `replica/rewind*_test.go` rewritten; `TestLateCommitNotSkipped` per shard in `replica` |
-| 2.4 | **`querySeq`, `written`, results.** Keep both per shard (they are already in the slot); `res.Seq` becomes a per-shard map for M3's token; `waitWritten` waits each shard for its own seq | `internal/node/write.go`, `target.go` | `node/write_test.go`, `api/endpoints_test.go`'s wait cases |
-| 2.5 | **Maintenance.** `ageFloor` and `logStart` search the shard's own head (done in M1), `pruneFloor` unchanged; check the retention tests | `internal/cluster/maintenance.go` | `cluster/maintenance_test.go` |
-| 2.6 | **Group commit wiring.** `MaxTransactions` from config (`write_transactions`, default half the pool), with the committer's batch-size metric labelled by lane | `internal/config`, `internal/node/single.go` | config tests |
+| 2.1 | **Heads per shard.** The node's single head becomes a head in each shard's slot, raised by the node's commits and its copy's applied seq and lowered by its copy's rewind; `TailerEnv.Head` and `Rewound` are the slot's; `checkHead` checks a `wait_for_seq` against the heads of the shards a read waits on, asking the store for each (`HeadSeq`) on a miss; `querySeq` starts at the shard's head when the index opens. `Store.TopSeq` and `Single.Head` go | `internal/node/single.go`, `read.go`, `target.go`, `host.go`, `write.go`, `internal/store` | `TestRewindLowersTheNodesHead`, `TestSettingsPatchLogsNoMappingChange`, `TestWriteValidation` |
+| 2.2 | **Tailers.** No cross-shard gaps are left, but `Shard.Advance` stays: a shard can stand above its last change (a new shard starts at the store's floor, a migrated one at the old global head), and an idle copy advances to its head once. The tailer is otherwise unchanged; its and the shard package's comments say so. Lag is the shard's head minus applied, as it already reads | `internal/replica/tailer.go`, `content_mark.go`, `internal/shard/shard.go` | `replica/tailer_test.go` |
+| 2.3 | **Rewind on own-shard anchors.** Every mark now names an own-shard change, so the cross-shard cases are gone, but the own-shard check stays: the shard is pruned up to the oldest seq its copies applied, which can pass a copy's anchor, and only the own-shard check sees a rewind then. The rewind helpers rewind the shards' sequence rows; the two tests that staged marks on another shard's rows are replaced by one where another shard writes and prunes across a copy's rewind | `internal/replica/rewind.go`, `rewind*_test.go`, `internal/node/refresh_test.go` | `replica/rewind*_test.go`, `TestNoFalseRewinds` waits each copy for its own shard's head |
+| 2.4 | **`querySeq`, `written`, results.** Per shard (in the slot); `waitWritten` waits each shard for its own seq (done in M1). The per-shard result for the token moves to M3 (3.2), where its shape is decided | `internal/node/write.go` | `cluster/focus_test.go`'s ack log keyed by shard and seq |
+| 2.5 | **Maintenance.** `ageFloor` and `logStart` search the shard's own head (done in M1) | `internal/cluster/maintenance.go` | `cluster` maintenance tests |
+| 2.6 | **`write_transactions`.** A node setting, default 0: half the store's write connections. Not labelled by lane: a label per shard would be unbounded | `internal/config`, `internal/node/single.go`, `docs/operations.md` | `config_test.go` |
 
-**What M2's tests prove:** a copy of an idle shard serves without advancing; a rewind is detected from own-shard
-marks alone, on every path the old suite covered; per-shard waits never wait on another shard's seq.
+**What M2's tests prove:** a node knows each shard's head and refuses a `wait_for_seq` past every head of the shards
+a read waits on; a rewind lowers only its shard's head; a rewind is detected from own-shard marks alone, also when
+another shard writes and prunes meanwhile; no rewind is counted under concurrent writers, prunes and a drop and
+recreate; acknowledged writes are in each shard's changelog at their seqs, contiguous per shard.
 
 ## M3: API
 
@@ -151,36 +171,46 @@ partial bulk names exactly the items that failed; nothing accepts the removed sc
 | 4.3 | **Benchmarks against Phase 0**, on NVMe with `fdatasync`: `BenchmarkCommitLoad` (64 × 4,096, 8 × 500, 64 × 500, 1-shard control) and `slbench writeload` at 1 and 64 shards, against base `c394860`. Exit bar: 64 × 4,096 at least 2× base sustained; the 1-shard control within 5% | `bench/` | Phase 0's script |
 | 4.4 | **Release notes**: breaking changes, the upgrade order (all nodes to 2.0, then the flag), MySQL's table rebuild, Postgres's in-transaction key swap and its lock time | `CHANGELOG.md`, `RELEASING.md` if needed | |
 
+**Ship blockers M4 must close** (from the M1 review, reproduced by its `TestReviewMixedVersionSkips`, kept at
+`E:\tmp\m1-review\review_mixed_test.go` as M4's starting point). With 1.x and 2.x nodes writing after migration 0007:
+
+1. A 1.x write takes row 1's next value on any shard; a tailer passes it, and a later 2.x write on the same shard
+   takes a lower seq from the shard's row, which the tailer never reads. On a shard 1.x wrote several times, a 2.x
+   write collides with 1.x's seqs.
+2. Indexes 1.x creates have no sequence rows (and `Migrate`'s row check then fails a 2.x node's start).
+3. A 1.x drop leaves the index's rows and raises no floor.
+4. A 1.x remap leaves stale mapping versions in the rows.
+5. 1.x's `ReadTip` and `ReadCounterMark` join `sl_changes` on `seq` alone, where a seq now names one row per shard,
+   and pick any of them.
+
+The gate's flip (4.1) must raise every shard row to row 1's value, seed rows for the indexes 1.x created, clear rows
+a 1.x drop left, resync mapping versions and uids from `sl_indexes`, and refuse 1.x writes from then on. M4's tests
+reproduce each of the five, before and after the flip.
+
+**Measured for M4** (M1 review, on the workstation): the key swap holds Postgres's ACCESS EXCLUSIVE lock on
+`sl_changes` for about 4.5 s per million rows, blocking reads too; MySQL's online rebuild takes about 18 s per
+million rows; SQLite's rebuild 33 s per 3 million. Measure production's changelog size before release, and if it
+is large, give the runner a non-transactional step for Postgres: `CREATE UNIQUE INDEX CONCURRENTLY`, then
+`ADD PRIMARY KEY USING INDEX`.
+
 **What M4's tests prove:** a 1.x cluster upgrades in place under load with no client error and nothing lost, and
 the gain Phase 0 measured survives the real implementation.
 
-## Open questions, with a recommendation
+## Open questions, decided
 
-None blocks M1.
+The coordinator accepted every recommendation (2026-11-02):
 
-1. **What is the token's "epoch"?** The approved D2 names an epoch and a shard-map version. Under Change A the
-   shard count never changes, so the index's uid is the only map version needed. A database failover that loses
-   commits reissues seqs, so a token can point at a seq that now names another change. **Recommend:** no epoch in
-   2.0's token; a token past a shard's head waits (as `wait_for_seq` does today) and documents that after a lossy
-   failover a token may be satisfied by a reissued seq. Add a generation stamp when Change B makes per-store rewinds
-   independent.
-2. **Small batches over many shards.** Phase 0 lost up to 0.44× on a hard disk with 64 shards and 500-change bulks.
-   **Recommend:** measure on NVMe in 4.3 first. If it still loses, let a lane take other shards' parts that are
-   waiting and small into one transaction (Apply already locks several rows in order), capped at a few shards.
-3. **The Postgres key swap holds `sl_changes`' lock while it builds.** The approved plan says to build the unique
-   index concurrently, but the migration runner runs every pending migration in one transaction
-   (`internal/store/migrate.go:127-147`), where `CREATE INDEX CONCURRENTLY` can't run. **Recommend:** keep it in the
-   transaction, measure the hold on a production-sized changelog (it is pruned, so it should be small) in 4.3, and
-   only if it passes a few seconds, teach the runner a non-transactional step.
-4. **When does `sl_changes_seq` go?** It only serves 1.x nodes in the upgrade window. **Recommend:** drop it in
-   2.1's first migration.
-5. **The committer budget's surface.** **Recommend:** a node setting, `write_transactions`, default half the pool,
-   documented with Phase 0's finding that more is not better.
-6. **Percolation's "queries as they stand at its end"** narrows to the shards that committed (approved plan, Phase 2
-   item 4). **Recommend:** percolate every committed document, report failed items without matches, and say so in
-   `docs/api.md`.
+1. **No epoch in 2.0's token:** the index uid and the shards' seqs. A token past a shard's head after a lossy failover
+   may be satisfied by a reissued seq; the docs say so. A generation stamp waits for Change B.
+2. **Small batches over many shards** are measured in M4 (4.3) before anything changes.
+3. **The Postgres key swap** stays in the migration's transaction; its lock time is measured in M4 (4.3).
+4. **`sl_changes_seq`** is dropped in 2.1's first migration.
+5. **`write_transactions`** is a node setting (M2, 2.6).
+6. **Percolation** runs on the shards that committed, and `docs/api.md` says so (M3).
 
-## Where the approved plan is wrong or out of date
+## Where the approved plan was wrong or out of date
+
+Accepted, and corrected in the approved plan (2026-11-02):
 
 1. **`sl_shard_seq` keyed by `index_uid`.** See decision 1: by name, the lock read replaces the `sl_indexes` read,
    and the uid is a column.

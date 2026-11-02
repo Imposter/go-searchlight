@@ -23,6 +23,9 @@ import (
 // commitLoadPool is the documents a load rewrites, loaded before the measuring starts.
 const commitLoadPool = 50_000
 
+// walStatsDelay outlasts the second a backend may hold its counts back from pg_stat_wal.
+const walStatsDelay = 1200 * time.Millisecond
+
 // commitLoad is one case of BenchmarkCommitLoad.
 type commitLoad struct {
 	nodes, writers, shards, bulk int
@@ -185,8 +188,9 @@ func runCommitLoad(b *testing.B, base string, c commitLoad) {
 	if e := failed.Load(); e != nil {
 		b.Fatal(*e)
 	}
-	wal := walStats(admin)
 	waits := stopWaits()
+	time.Sleep(walStatsDelay)
+	wal := walStats(admin)
 	report := tr.report()
 	commits := report["commit"].n
 	b.ReportMetric(float64(bulks)*float64(c.bulk)/elapsed.Seconds(), "changes/s")

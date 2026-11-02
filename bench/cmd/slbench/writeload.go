@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/slproc"
 )
 
@@ -296,7 +297,8 @@ func (c *wlClient) setup(ctx context.Context, n, shards int) error {
 		return err
 	}
 	const chunk = 1000
-	var seq atomic.Int64
+	var seqMu sync.Mutex
+	var seq *api.Token // the merge of the preload's tokens
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
@@ -316,13 +318,16 @@ func (c *wlClient) setup(ctx context.Context, n, shards int) error {
 					errs <- err
 					return
 				}
-				var r struct{ Seq int64 }
+				var r struct {
+					Token string `json:"token"`
+				}
 				_ = json.Unmarshal(body, &r)
-				for {
-					cur := seq.Load()
-					if r.Seq <= cur || seq.CompareAndSwap(cur, r.Seq) {
-						break
+				if t, err := api.ParseToken(r.Token); err == nil {
+					seqMu.Lock()
+					if seq == nil || !seq.Merge(t) {
+						seq = t
 					}
+					seqMu.Unlock()
 				}
 			}
 		})
@@ -333,7 +338,7 @@ func (c *wlClient) setup(ctx context.Context, n, shards int) error {
 		return err
 	default:
 	}
-	_, err := c.must(ctx, http.MethodPost, fmt.Sprintf("/indexes/%s/_count?wait_for_seq=%d", wlIndex, seq.Load()), []byte(`{}`))
+	_, err := c.must(ctx, http.MethodPost, fmt.Sprintf("/indexes/%s/_count?wait_for=%s", wlIndex, seq), []byte(`{}`))
 	return err
 }
 

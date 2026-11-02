@@ -92,7 +92,7 @@ func (t wakeHookTailer) Wake() {
 	t.Tailer.Wake()
 }
 
-// TestReadFallsBackToTheCopyHostedInPlace (L1): a wait_for_seq read parked on this
+// TestReadFallsBackToTheCopyHostedInPlace (L1): a wait_for read parked on this
 // node's copy, which is unhosted and hosted again at a new epoch while the read waits,
 // as the only peer restarts. The peer answers nothing, so the read is answered by the
 // copy hosted in place of the closed one, not failed with the peer's 503. The swap runs
@@ -130,7 +130,7 @@ func TestReadFallsBackToTheCopyHostedInPlace(t *testing.T) {
 		t.Fatal("no tailer for the copy at epoch 1")
 	}
 	old.Pause()
-	last := mustWrite(t, n, "hp", upsert("late", `{"n": 2}`)).Seq
+	last := mustWrite(t, n, "hp", upsert("late", `{"n": 2}`)).Token
 
 	id := store.ShardID{Index: "hp"}
 	swap := func() {
@@ -142,7 +142,7 @@ func TestReadFallsBackToTheCopyHostedInPlace(t *testing.T) {
 		}
 	}
 	hook.arm(2, swap)
-	resp, err := n.Search(ctx(t), "hp", &search.Request{Query: &query.All{}, Size: 10, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
+	resp, err := n.Search(ctx(t), "hp", &search.Request{Query: &query.All{}, Size: 10, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last})
 	if !hook.fired() {
 		t.Fatal("the read did not wait on the copy at epoch 1")
 	}

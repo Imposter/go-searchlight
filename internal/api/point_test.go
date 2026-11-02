@@ -45,7 +45,7 @@ func TestPointFields(t *testing.T) {
 	}
 
 	ago := func(d int) string { return t0.Add(-time.Duration(d) * 24 * time.Hour).Format(time.RFC3339) }
-	seq := seqOf(t, e.must(http.StatusOK, "POST", "/indexes/pt/_bulk?refresh=wait_for", ndjson(
+	seq := tokenOf(t, e.must(http.StatusOK, "POST", "/indexes/pt/_bulk?refresh=wait_for", ndjson(
 		`{"upsert": {"id": "a"}}`, fmt.Sprintf(`{"brand": "acme", "seen": [[%q, 5], [%q, 1]], "spot": [[1, 10], [10, 1]]}`, ago(2), ago(40)),
 		`{"upsert": {"id": "b"}}`, fmt.Sprintf(`{"brand": "acme", "seen": [%q, 9], "spot": [6, 6]}`, ago(20)),
 		`{"upsert": {"id": "c"}}`, `{"brand": "initech", "seen": []}`,
@@ -60,7 +60,7 @@ func TestPointFields(t *testing.T) {
 		`{"field": "spot", "op": "box", "value": {}}`: "[a b]",
 		`{"all": [{"field": "brand", "op": "eq", "value": "acme"}, {"field": "seen", "op": "box", "value": {"x": {"lt": "now-30d"}}}]}`: "[a]",
 	} {
-		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_search?wait_for_seq=%d", seq), `{"query": `+q+`, "sort": ["_id"]}`)
+		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_search?wait_for=%s", seq), `{"query": `+q+`, "sort": ["_id"]}`)
 		var ids []string
 		for _, h := range r["hits"].([]any) { //nolint:forcetypeassert,errcheck // the shape
 			ids = append(ids, fmt.Sprint(h.(map[string]any)["id"])) //nolint:forcetypeassert,errcheck // the shape
@@ -68,7 +68,7 @@ func TestPointFields(t *testing.T) {
 		if got := fmt.Sprint(ids); got != want {
 			t.Errorf("%s: %s, want %s", q, got, want)
 		}
-		c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_count?wait_for_seq=%d", seq), `{"query": `+q+`}`)
+		c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_count?wait_for=%s", seq), `{"query": `+q+`}`)
 		if got := fmt.Sprint(c["count"]); got != fmt.Sprint(strings.Count(want, " ")+1) {
 			t.Errorf("%s: count %s, want %s", q, got, want)
 		}
@@ -87,13 +87,13 @@ func TestPointFields(t *testing.T) {
 		}
 	}
 
-	seq = seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/pt/queries/week", `{"query": `+week+`}`))
+	seq = tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/pt/queries/week", `{"query": `+week+`}`))
 	got := e.must(http.StatusOK, "GET", "/indexes/pt/queries/week", "")
 	if q := fmt.Sprint(got["query"]); !strings.Contains(q, "gte:now-7d/d") {
 		t.Errorf("GET returns %s", q)
 	}
 	percolate := func() string {
-		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_percolate?wait_for_seq=%d", seq), `{"ids": ["a", "b"]}`)
+		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/pt/_percolate?wait_for=%s", seq), `{"ids": ["a", "b"]}`)
 		var out []string
 		for _, res := range r["results"].([]any) { //nolint:forcetypeassert,errcheck // the shape
 			m := res.(map[string]any) //nolint:forcetypeassert,errcheck // the shape

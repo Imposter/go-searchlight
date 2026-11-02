@@ -82,7 +82,7 @@ func TestBodyCodecGate(t *testing.T) {
 			t.Fatal("a node started after the gate opened writes text")
 		}
 		c.waitHealth(t, "green", 30*time.Second)
-		seq = max(seq, mustWrite(t, n1, "g", bigOp("d", 5)))
+		seq = merged(seq, mustWrite(t, n1, "g", bigOp("d", 5)))
 		want := map[string]int{"a": 4, "b": 2, "c": 3, "d": 5}
 		for _, n := range []*Node{n0, n1} {
 			if got, err := count(ctx, n, "g", seq); err != nil || got != int64(len(want)) {

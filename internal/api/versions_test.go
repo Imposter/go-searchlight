@@ -79,8 +79,8 @@ func TestBulkQueryActions(t *testing.T) {
 		t.Fatalf("d1 percolated against the queries before it: %v", got[2])
 	}
 	r = e.must(http.StatusOK, "POST", "/indexes/bq/_bulk?percolate=true", bulk)
-	if r["percolated"] != true || r["seq"] != 0.0 {
-		t.Fatalf("an all-noop bulk: percolated %v, seq %v; want true and 0", r["percolated"], r["seq"])
+	if r["percolated"] != true || r["token"] != nil {
+		t.Fatalf("an all-noop bulk: percolated %v, token %v; want true and none", r["percolated"], r["token"])
 	}
 	got = items(r)
 	for i := range 3 {
@@ -97,7 +97,7 @@ func TestBulkQueryActions(t *testing.T) {
 	if got[0]["seq"] == nil || got[1]["seq"] == nil || got[2]["result"] != "noop" {
 		t.Fatalf("versions 2 = %v", got)
 	}
-	l := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/bq/queries?fields=id,version&wait_for_seq=%d", seqOf(t, r)), "")
+	l := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/bq/queries?fields=id,version&wait_for=%s", tokenOf(t, r)), "")
 	if fmt.Sprint(l["queries"]) != "[map[id:acme version:2]]" {
 		t.Fatalf("lean listing = %v", l)
 	}

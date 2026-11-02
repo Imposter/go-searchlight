@@ -45,7 +45,7 @@ func TestPercolateBoxDateMath(t *testing.T) {
 		api.WriteOp{Kind: api.OpQueryUpsert, ID: "old", Query: json.RawMessage(`{"not": {"field": "seen", "op": "box", "value": {"x": {"gte": "now-30d"}}}}`)},
 		upsert("hot", fmt.Sprintf(`{"brand": "acme", "seen": [[%q, 5], [%q, 1]]}`, at(2), at(40))),
 		upsert("split", fmt.Sprintf(`{"brand": "acme", "seen": [[%q, 1], [%q, 9]]}`, at(1), at(20))),
-	).Seq
+	).Token
 	// The expectations at each now, recomputed from the points: hot holds (now-2d, 5)
 	// and (now-40d, 1); split holds (now-1d, 1) and (now-20d, 9).
 	for _, tc := range []struct {
@@ -59,7 +59,7 @@ func TestPercolateBoxDateMath(t *testing.T) {
 	} {
 		now := dateT0.Add(days(tc.later))
 		wall.set(now)
-		res, err := n.Percolate(ctx(t), "pt", &api.PercolateRequest{IDs: []string{"hot", "split"}}, api.ReadOptions{WaitForSeq: seq})
+		res, err := n.Percolate(ctx(t), "pt", &api.PercolateRequest{IDs: []string{"hot", "split"}}, api.ReadOptions{WaitFor: seq})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -70,7 +70,7 @@ func TestPercolateBoxDateMath(t *testing.T) {
 			t.Errorf("%d days on, split matches %s, want %s", tc.later, got, tc.split)
 		}
 		wall.set(now)
-		given, err := n.Percolate(ctx(t), "pt", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"brand": "acme", "seen": [%q, 7]}`, now.Format(time.RFC3339)))}}, api.ReadOptions{WaitForSeq: seq})
+		given, err := n.Percolate(ctx(t), "pt", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"brand": "acme", "seen": [%q, 7]}`, now.Format(time.RFC3339)))}}, api.ReadOptions{WaitFor: seq})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +79,7 @@ func TestPercolateBoxDateMath(t *testing.T) {
 		}
 	}
 	wall.set(dateT0)
-	wr, err := n.Write(ctx(t), "pt", []api.WriteOp{upsert("new", fmt.Sprintf(`{"brand": "acme", "seen": [[%q, 6]]}`, at(3)))}, api.WriteOptions{Percolate: true, WaitForSeq: seq})
+	wr, err := n.Write(ctx(t), "pt", []api.WriteOp{upsert("new", fmt.Sprintf(`{"brand": "acme", "seen": [[%q, 6]]}`, at(3)))}, api.WriteOptions{Percolate: true, WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestSearchBoxFollowsTheClock(t *testing.T) {
 			dateT0.Add(-days(d)).Format(time.RFC3339), d%2, dateT0.Format(time.RFC3339))))
 	}
 	ops = append(ops, upsert("none", `{"seen": []}`), upsert("bare", `{"brand": "x"}`))
-	seq := mustWrite(t, n, "pt", ops...).Seq
+	seq := mustWrite(t, n, "pt", ops...).Token
 	recentOdd := mustParseQuery(t, `{"field": "seen", "op": "box", "value": {"x": {"gte": "now-7d/d"}, "y": {"gte": 1}}}`)
 	for _, tc := range []struct {
 		at   time.Time
@@ -129,7 +129,7 @@ func TestPatchMappingAddsAPointField(t *testing.T) {
 	if err != nil || info.Mapping.Fields["spot"] != spot {
 		t.Fatalf("patch: %+v, %v", info, err)
 	}
-	seq := mustWrite(t, n, "pt", upsert("a", `{"spot": [[1, 10], [10, 1]]}`), upsert("b", `{"spot": [6, 6]}`)).Seq
+	seq := mustWrite(t, n, "pt", upsert("a", `{"spot": [[1, 10], [10, 1]]}`), upsert("b", `{"spot": [6, 6]}`)).Token
 	if got := count(t, n, "pt", mustParseQuery(t, `{"field": "spot", "op": "box", "value": {"x": {"gte": 5}, "y": {"gte": 5}}}`), seq); got != 1 {
 		t.Fatalf("the box counts %d, want 1 (the same point on both axes)", got)
 	}
@@ -137,7 +137,7 @@ func TestPatchMappingAddsAPointField(t *testing.T) {
 		!strings.Contains(err.Error(), "cannot become") {
 		t.Fatalf("retyping a point's axes: %v", err)
 	}
-	cat, err := n.Fields(ctx(t), "pt", 0, api.ReadOptions{WaitForSeq: seq})
+	cat, err := n.Fields(ctx(t), "pt", 0, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}

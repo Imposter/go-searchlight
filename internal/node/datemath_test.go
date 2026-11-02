@@ -69,7 +69,7 @@ func TestSearchDateMathFollowsTheClock(t *testing.T) {
 	for d := range 20 {
 		ops = append(ops, upsert(fmt.Sprintf("doc%d", d), fmt.Sprintf(`{"seen": %q}`, dateT0.Add(-days(d)).Format(time.RFC3339))))
 	}
-	seq := mustWrite(t, n, "d", ops...).Seq
+	seq := mustWrite(t, n, "d", ops...).Token
 	week := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-7d/d"}`)
 	exact := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-7d"}`)
 	for _, tc := range []struct {
@@ -107,7 +107,7 @@ func TestDateMathOneNowPerRequest(t *testing.T) {
 	for i := range 16 {
 		ops = append(ops, upsert(fmt.Sprintf("doc%02d", i), fmt.Sprintf(`{"seen": %q}`, dateT0.Format(time.RFC3339))))
 	}
-	seq := mustWrite(t, n, "d", ops...).Seq
+	seq := mustWrite(t, n, "d", ops...).Token
 	later := dateT0.Add(days(30))
 	all := make([]string, 16)
 	for i := range all {
@@ -116,7 +116,7 @@ func TestDateMathOneNowPerRequest(t *testing.T) {
 	want := "[" + strings.Join(all, ",") + "]"
 
 	wall.set(dateT0, later)
-	res, err := n.Percolate(ctx(t), "d", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %q}`, dateT0.Format(time.RFC3339)))}}, api.ReadOptions{WaitForSeq: seq})
+	res, err := n.Percolate(ctx(t), "d", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %q}`, dateT0.Format(time.RFC3339)))}}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestDateMathOneNowPerRequest(t *testing.T) {
 	}
 
 	wall.set(dateT0, later)
-	wr, err := n.Write(ctx(t), "d", []api.WriteOp{upsert("new", fmt.Sprintf(`{"seen": %q}`, dateT0.Format(time.RFC3339)))}, api.WriteOptions{Percolate: true, WaitForSeq: seq})
+	wr, err := n.Write(ctx(t), "d", []api.WriteOp{upsert("new", fmt.Sprintf(`{"seen": %q}`, dateT0.Format(time.RFC3339)))}, api.WriteOptions{Percolate: true, WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestFilterAggsAndPostFilterDateMathFollowTheClock(t *testing.T) {
 	for d := range 20 {
 		ops = append(ops, upsert(fmt.Sprintf("doc%d", d), fmt.Sprintf(`{"seen": %q, "brand": "b%d"}`, dateT0.Add(-days(d)).Format(time.RFC3339), d%2)))
 	}
-	seq := mustWrite(t, n, "d", ops...).Seq
+	seq := mustWrite(t, n, "d", ops...).Token
 	week := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-7d"}`)
 	day := mustParseQuery(t, `{"field": "seen", "op": "gte", "value": "now-1d/d"}`)
 	for _, tc := range []struct {
@@ -179,7 +179,7 @@ func TestFilterAggsAndPostFilterDateMathFollowTheClock(t *testing.T) {
 					"by":   {Type: search.AggFilters, Filters: map[string]query.Node{"week": week, "day": day}},
 				},
 			}
-			resp, err := n.Search(ctx(t), "d", r, api.ReadOptions{WaitForSeq: seq})
+			resp, err := n.Search(ctx(t), "d", r, api.ReadOptions{WaitFor: seq})
 			if err != nil {
 				t.Fatal(err)
 			}

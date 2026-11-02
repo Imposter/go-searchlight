@@ -67,6 +67,7 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 
 	var mu sync.Mutex
 	acked := map[string]int64{}
+	var ackedAt *api.Token // the merge of the acknowledged bulks' tokens
 	var bad []string
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -104,7 +105,8 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 				switch code {
 				case http.StatusOK:
 					var r struct {
-						Errors bool `json:"errors"`
+						Errors bool   `json:"errors"`
+						Token  string `json:"token"`
 						Items  []struct {
 							Seq int64 `json:"seq"`
 						} `json:"items"`
@@ -115,7 +117,16 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 						mu.Unlock()
 						continue
 					}
+					tok, err := api.ParseToken(r.Token)
 					mu.Lock()
+					switch {
+					case err != nil:
+						bad = append(bad, fmt.Sprintf("bulk token %q: %v", r.Token, err))
+					case ackedAt == nil:
+						ackedAt = tok
+					default:
+						ackedAt.Merge(tok)
+					}
 					for k, id := range ids {
 						acked[id] = r.Items[k].Seq
 					}
@@ -173,10 +184,6 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = n2.Close(context.Background()) }()
-	var maxSeq int64
-	for _, seq := range acked {
-		maxSeq = max(maxSeq, seq)
-	}
 	wctx, wcancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer wcancel()
 	// The copies recover before they serve; readiness says when, as a load
@@ -187,7 +194,7 @@ func TestGracefulShutdownUnderLoad(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	resp, err := n2.Search(wctx, "load", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: maxSeq})
+	resp, err := n2.Search(wctx, "load", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: ackedAt})
 	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("the restarted node did not catch up")
 	}

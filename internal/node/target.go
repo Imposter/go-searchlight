@@ -185,16 +185,14 @@ func isUnavailable(err error) bool {
 // targets are the read targets of one read, one per shard.
 type targets []ShardTarget
 
-// seq is the least of the targets' Seq: every change up to it is in what each answers
-// from (0 for none).
-func (ts targets) seq() int64 {
-	var out int64
-	for i, t := range ts {
-		if s := t.Seq(); i == 0 || s < out {
-			out = s
-		}
+// token is where each target stands: every change of its shard up to its seq is in
+// what it answers from.
+func (ts targets) token(uid string) *api.Token {
+	t := &api.Token{UID: uid}
+	for s, target := range ts {
+		t.Note(s, target.Seq())
 	}
-	return out
+	return t
 }
 
 func (ts targets) release() {
@@ -216,13 +214,16 @@ func (ts targets) stale() bool {
 }
 
 // acquireTargets returns a read target for every shard of idx, each with every change
-// up to waitSeq searchable and, forQueries, every saved query committed through this
-// node to its shard. Release them when done. Every copy is woken first, so idle ones
-// advance to waitSeq together.
-func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, forQueries bool) (targets, error) {
-	if waitSeq > 0 {
-		if err := n.checkHead(ctx, idx.shards, waitSeq); err != nil {
-			return nil, err
+// up to wait's seq of its shard searchable and, forQueries, every saved query committed
+// through this node to its shard. Release them when done. Every copy is woken first.
+func (n *Single) acquireTargets(ctx context.Context, idx *index, wait *api.Token, forQueries bool) (targets, error) {
+	if !wait.Empty() {
+		for s, sl := range idx.shards {
+			if seq := wait.Seq(s); seq > 0 {
+				if err := n.checkHead(ctx, []*shardSlot{sl}, seq); err != nil {
+					return nil, err
+				}
+			}
 		}
 		for _, c := range idx.copies() {
 			c.tailer.Wake()
@@ -230,7 +231,7 @@ func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, 
 	}
 	out := make(targets, len(idx.shards))
 	for s := range idx.shards {
-		t, err := n.acquireShard(ctx, idx, s, waitSeq, forQueries)
+		t, err := n.acquireShard(ctx, idx, s, wait.Seq(s), forQueries)
 		if err != nil {
 			out.release()
 			if idx.dropped.Load() {

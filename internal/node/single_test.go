@@ -131,9 +131,9 @@ func upsert(id, body string) api.WriteOp {
 	return api.WriteOp{Kind: api.OpUpsert, ID: id, Body: json.RawMessage(body)}
 }
 
-func count(t *testing.T, n *node.Single, index string, q query.Node, wait int64) int64 {
+func count(t *testing.T, n *node.Single, index string, q query.Node, wait *api.Token) int64 {
 	t.Helper()
-	resp, err := n.Search(ctx(t), index, &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: wait})
+	resp, err := n.Search(ctx(t), index, &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: wait})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestRestartKeepsData(t *testing.T) {
 		ops = append(ops, upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"n": %d}`, i)))
 	}
 	res := mustWrite(t, n, "r", ops...)
-	if got := count(t, n, "r", &query.All{}, res.Seq); got != 50 {
+	if got := count(t, n, "r", &query.All{}, res.Token); got != 50 {
 		t.Fatalf("count = %d", got)
 	}
 	if err := n.Close(ctx(t)); err != nil {
@@ -169,11 +169,11 @@ func TestRestartKeepsData(t *testing.T) {
 	n2 := open(t, cfg, st, nil)
 	// The copies reopen their segments and resume; once ready, all is searchable.
 	waitReady(t, n2)
-	if got := count(t, n2, "r", &query.All{}, 0); got != 50 {
+	if got := count(t, n2, "r", &query.All{}, nil); got != 50 {
 		t.Fatalf("after a restart count = %d", got)
 	}
 	res = mustWrite(t, n2, "r", api.WriteOp{Kind: api.OpDelete, ID: "d0"})
-	if got := count(t, n2, "r", &query.All{}, res.Seq); got != 49 {
+	if got := count(t, n2, "r", &query.All{}, res.Token); got != 49 {
 		t.Fatalf("after a delete count = %d", got)
 	}
 	info, err := n2.GetIndex(ctx(t), "r")
@@ -249,7 +249,7 @@ func TestSearchMatchesBruteForce(t *testing.T) {
 		})
 		size := 1 + rng.IntN(40)
 		resp, err := n.Search(ctx(t), "bf", &search.Request{Query: qn, Sort: []search.SortField{{Field: "price", Desc: true}}, Size: size, TrackTotal: search.TrackTotalAll},
-			api.ReadOptions{WaitForSeq: res.Seq})
+			api.ReadOptions{WaitFor: res.Token})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -278,7 +278,9 @@ func TestDynamicMappingUnderConcurrentWriters(t *testing.T) {
 	}
 	const writers, rounds = 32, 25
 	var wg sync.WaitGroup
-	var last, slowest atomic.Int64
+	var slowest atomic.Int64
+	var lastMu sync.Mutex
+	var last *api.Token
 	var failures atomic.Int64
 	began := time.Now()
 	for w := range writers {
@@ -308,12 +310,9 @@ func TestDynamicMappingUnderConcurrentWriters(t *testing.T) {
 					}
 				}
 				slowest.Store(max(slowest.Load(), int64(time.Since(start))))
-				for {
-					cur := last.Load()
-					if res.Seq <= cur || last.CompareAndSwap(cur, res.Seq) {
-						break
-					}
-				}
+				lastMu.Lock()
+				last = merged(last, res.Token)
+				lastMu.Unlock()
 			}
 		})
 	}
@@ -339,7 +338,7 @@ func TestDynamicMappingUnderConcurrentWriters(t *testing.T) {
 	if err := json.Unmarshal(meta.Mapping, &stored); err != nil || len(stored.Fields) != want {
 		t.Errorf("stored mapping holds %d fields: %v", len(stored.Fields), err)
 	}
-	if got := count(t, n, "dyn", &query.All{}, last.Load()); got != writers*rounds*3 {
+	if got := count(t, n, "dyn", &query.All{}, last); got != writers*rounds*3 {
 		t.Errorf("count = %d", got)
 	}
 }
@@ -565,8 +564,8 @@ func TestWriteValidation(t *testing.T) {
 	}
 	// Each shard's seqs are its own: the two committed ops are in order only on one shard.
 	ok, q2 := res.Items[0].Seq, res.Items[5].Seq
-	if ok == 0 || q2 == 0 || res.Seq != max(ok, q2) || node.ShardFor("ok", 2) == node.ShardFor("q2", 2) && ok >= q2 {
-		t.Errorf("seqs: %+v, last %d", res.Items, res.Seq)
+	if ok == 0 || q2 == 0 || maxSeq(res.Token) != max(ok, q2) || node.ShardFor("ok", 2) == node.ShardFor("q2", 2) && ok >= q2 {
+		t.Errorf("seqs: %+v, token %v", res.Items, res.Token.Seqs)
 	}
 	if _, err := n.Write(ctx(t), "nope", []api.WriteOp{upsert("a", `{}`)}, api.WriteOptions{}); err == nil {
 		t.Error("a write to a missing index succeeded")
@@ -612,7 +611,7 @@ func TestDropDoesNotBlockOtherIndexes(t *testing.T) {
 	<-bi.entered
 	// The drop is under way: other indexes answer, a new one is created, and the
 	// dropped name is taken by no one.
-	if got := count(t, n, "other", &query.All{}, res.Seq); got != 1 {
+	if got := count(t, n, "other", &query.All{}, res.Token); got != 1 {
 		t.Errorf("count = %d", got)
 	}
 	if _, err := n.CreateIndex(ctx(t), "third", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
@@ -734,7 +733,7 @@ func TestDatabaseUnreachable(t *testing.T) {
 	waitServing(t, n)
 	res := mustWrite(t, n, "s", upsert("a", `{"x": 1}`),
 		api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "x", "op": "eq", "value": 1}`), Meta: json.RawMessage(`{"m": 1}`)})
-	sr, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: res.Seq})
+	sr, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: res.Token})
 	if err != nil || sr.Stale || sr.Total != 1 {
 		t.Fatalf("a search with the database up: %+v %v", sr, err)
 	}
@@ -768,8 +767,8 @@ func TestDatabaseUnreachable(t *testing.T) {
 	}
 	// A seq another node may have committed cannot be checked: retryable, not invalid.
 	headDown.Store(true)
-	if _, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitForSeq: res.Seq + 10}); !errors.As(err, &ae) || ae.Status != 503 {
-		t.Errorf("a wait_for_seq past the node's head with the database down: %v, want a 503", err)
+	if _, err := n.Search(ctx(t), "s", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitFor: plus(res.Token, 10)}); !errors.As(err, &ae) || ae.Status != 503 {
+		t.Errorf("a wait_for past the node's head with the database down: %v, want a 503", err)
 	}
 	headDown.Store(false)
 	if h, _ := n.Health(ctx(t)); h.Status != api.StatusGreen {
@@ -912,7 +911,7 @@ func TestDatabaseHangs(t *testing.T) {
 	}
 	waitServing(t, n)
 	res := mustWrite(t, n, "h", upsert("a", `{"x": 1}`))
-	if got := count(t, n, "h", &query.All{}, res.Seq); got != 1 {
+	if got := count(t, n, "h", &query.All{}, res.Token); got != 1 {
 		t.Fatalf("count = %d", got)
 	}
 	hung.Store(true)
@@ -1104,7 +1103,7 @@ func TestAcquireRechecksTheCopy(t *testing.T) {
 
 // closedCopy writes 40 documents to a one-shard index on a node, closes the node and
 // returns the copy's directory and the last write's seq.
-func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, int64) {
+func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, *api.Token) {
 	t.Helper()
 	n := open(t, cfg, st, nil)
 	if _, err := n.CreateIndex(ctx(t), "c", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
@@ -1115,7 +1114,7 @@ func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, int64)
 		ops = append(ops, upsert(fmt.Sprintf("d%d", i), fmt.Sprintf(`{"n": %d, "title": "item %d"}`, i, i)))
 	}
 	res := mustWrite(t, n, "c", ops...)
-	if got := count(t, n, "c", &query.All{}, res.Seq); got != 40 {
+	if got := count(t, n, "c", &query.All{}, res.Token); got != 40 {
 		t.Fatalf("count = %d", got)
 	}
 	if err := n.Close(ctx(t)); err != nil {
@@ -1125,7 +1124,7 @@ func closedCopy(t *testing.T, cfg config.Config, st store.Store) (string, int64)
 	if err != nil || len(dirs) != 1 {
 		t.Fatalf("the copy's directory under %s: %v %v", cfg.DataDir, dirs, err)
 	}
-	return dirs[0], res.Seq
+	return dirs[0], res.Token
 }
 
 // segmentsOf lists the segment files in dir.
@@ -1239,8 +1238,8 @@ func TestWritePercolationFailureCarriesItsCause(t *testing.T) {
 	first := mustWrite(t, n, "wp", upsert("a", `{"x": 1}`))
 	c, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	res, err := n.Write(c, "wp", []api.WriteOp{upsert("b", `{"x": 2}`)}, api.WriteOptions{Percolate: true, WaitForSeq: first.Seq})
-	if err != nil || res.Seq == 0 {
+	res, err := n.Write(c, "wp", []api.WriteOp{upsert("b", `{"x": 2}`)}, api.WriteOptions{Percolate: true, WaitFor: first.Token})
+	if err != nil || res.Token == nil {
 		t.Fatalf("the write: %+v, %v", res, err)
 	}
 	if res.Percolated || !res.TimedOut || res.PercolateErr == nil {
@@ -1248,11 +1247,11 @@ func TestWritePercolationFailureCarriesItsCause(t *testing.T) {
 	}
 }
 
-// TestGetHonoursWaitForSeq: GET of a document or saved query takes wait_for_seq as
+// TestGetHonoursWaitFor: GET of a document or saved query takes wait_for as
 // every read does. A seq past the head is a 400. Realtime from the database every
 // committed seq is visible; from a copy (the database down) the read waits for the
 // copy to have the seq, a 504 at its deadline, rather than answering an older version.
-func TestGetHonoursWaitForSeq(t *testing.T) {
+func TestGetHonoursWaitFor(t *testing.T) {
 	cfg := testConfig(t)
 	base := openStore(t, cfg)
 	down := &atomic.Bool{}
@@ -1269,30 +1268,63 @@ func TestGetHonoursWaitForSeq(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := mustWrite(t, n, "g", upsert("a", `{"v": 1}`), api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
-	if got := count(t, n, "g", &query.All{}, first.Seq); got != 1 {
+	if got := count(t, n, "g", &query.All{}, first.Token); got != 1 {
 		t.Fatalf("count = %d", got)
 	}
 	fake.Pause()
 	second := mustWrite(t, n, "g", upsert("a", `{"v": 2}`))
 
 	var ae *api.Error
-	if _, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: second.Seq + 100}); !errors.As(err, &ae) || ae.Status != 400 {
-		t.Fatalf("GET with wait_for_seq past the head: %v, want a 400", err)
+	if _, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitFor: plus(second.Token, 100)}); !errors.As(err, &ae) || ae.Status != 400 {
+		t.Fatalf("GET with wait_for past the head: %v, want a 400", err)
 	}
-	if _, err := n.GetQuery(ctx(t), "g", "q", api.ReadOptions{WaitForSeq: second.Seq + 100}); !errors.As(err, &ae) || ae.Status != 400 {
-		t.Fatalf("GET of a query with wait_for_seq past the head: %v, want a 400", err)
+	if _, err := n.GetQuery(ctx(t), "g", "q", api.ReadOptions{WaitFor: plus(second.Token, 100)}); !errors.As(err, &ae) || ae.Status != 400 {
+		t.Fatalf("GET of a query with wait_for past the head: %v, want a 400", err)
 	}
-	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: second.Seq}); err != nil || string(doc.Body) != `{"v": 2}` {
+	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitFor: second.Token}); err != nil || string(doc.Body) != `{"v": 2}` {
 		t.Fatalf("realtime GET: %+v, %v", doc, err)
 	}
 
 	down.Store(true)
 	c, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if doc, err := n.GetDocument(c, "g", "a", api.ReadOptions{WaitForSeq: second.Seq}); !errors.As(err, &ae) || ae.Status != 504 {
+	if doc, err := n.GetDocument(c, "g", "a", api.ReadOptions{WaitFor: second.Token}); !errors.As(err, &ae) || ae.Status != 504 {
 		t.Fatalf("a stale GET waiting for a seq the copy lacks: %+v, %v, want a 504", doc, err)
 	}
-	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitForSeq: first.Seq}); err != nil || !doc.Stale || string(doc.Body) != `{"v": 1}` {
+	if doc, err := n.GetDocument(ctx(t), "g", "a", api.ReadOptions{WaitFor: first.Token}); err != nil || !doc.Stale || string(doc.Body) != `{"v": 1}` {
 		t.Fatalf("a stale GET of a seq the copy has: %+v, %v", doc, err)
 	}
+}
+
+// merged is a's seqs raised to b's, shard by shard (b when a is nil).
+func merged(a, b *api.Token) *api.Token {
+	if a == nil {
+		return b
+	}
+	out := &api.Token{UID: a.UID}
+	out.Merge(a)
+	if !out.Merge(b) {
+		return b
+	}
+	return out
+}
+
+// maxSeq is the highest seq a token names.
+func maxSeq(t *api.Token) int64 {
+	var top int64
+	if t != nil {
+		for _, s := range t.Seqs {
+			top = max(top, s)
+		}
+	}
+	return top
+}
+
+// plus is t with every seq raised by n: past what was committed.
+func plus(t *api.Token, n int64) *api.Token {
+	out := &api.Token{UID: t.UID}
+	for s, seq := range t.Seqs {
+		out.Note(s, seq+n)
+	}
+	return out
 }

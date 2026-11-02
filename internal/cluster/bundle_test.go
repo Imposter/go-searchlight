@@ -13,15 +13,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
 
 // publishUntil uploads bundles from tn until the newest bundle of id is at or past
-// seq, and returns the shard's bundles.
-func publishUntil(t *testing.T, tn *tnode, id store.ShardID, seq int64) []bundleRef {
+// at's seq of its shard, and returns the shard's bundles.
+func publishUntil(t *testing.T, tn *tnode, id store.ShardID, at *api.Token) []bundleRef {
 	t.Helper()
+	seq := at.Seq(id.Shard)
 	var list []bundleRef
 	eventually(t, time.Minute, fmt.Sprintf("a bundle of %s at seq %d", id, seq), func() error {
 		tn.n.publishBundles(context.Background())
@@ -38,12 +40,12 @@ func publishUntil(t *testing.T, tn *tnode, id store.ShardID, seq int64) []bundle
 	return list
 }
 
-// writeDocs writes docs k..k+n-1 of index and returns the last seq.
-func writeDocs(t *testing.T, n *Node, index string, from, count int) int64 {
+// writeDocs writes docs k..k+n-1 of index and returns the merge of their tokens.
+func writeDocs(t *testing.T, n *Node, index string, from, count int) *api.Token {
 	t.Helper()
-	var last int64
+	var last *api.Token
 	for k := from; k < from+count; k++ {
-		last = mustWrite(t, n, index, upsertOp(fmt.Sprintf("d%03d", k), k))
+		last = merged(last, mustWrite(t, n, index, upsertOp(fmt.Sprintf("d%03d", k), k)))
 	}
 	return last
 }
@@ -83,8 +85,8 @@ func TestBundleRecoveryWithoutPeer(t *testing.T) {
 	if got := a.n.fetch.rejected.Load(); got != 0 {
 		t.Fatalf("%d bundles rejected", got)
 	}
-	if b := bundles[len(bundles)-1]; b.seq >= last {
-		t.Fatalf("the bundle at seq %d already held every write (last %d): nothing was replayed after it", b.seq, last)
+	if b := bundles[len(bundles)-1]; b.seq >= last.Seq(0) {
+		t.Fatalf("the bundle at seq %d already held every write (last %d): nothing was replayed after it", b.seq, last.Seq(0))
 	}
 }
 
@@ -159,7 +161,7 @@ func TestPruningKeepsBundlePoints(t *testing.T) {
 		seq := writeDocs(t, a.n, "keep", 10*k, 10)
 		waitCount(t, a.n, "keep", seq, int64(10*(k+1)))
 		list = publishUntil(t, a, id, seq)
-		seqs = append(seqs, seq)
+		seqs = append(seqs, seq.Seq(0))
 	}
 	second := seqs[1]
 	if len(list) != a.n.opts.BundleRetention || list[0].seq != second {

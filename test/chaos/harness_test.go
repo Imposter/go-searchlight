@@ -31,6 +31,7 @@ import (
 
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/slproc"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -423,7 +424,7 @@ type model struct {
 	mu    sync.Mutex
 	docs  map[string]doc
 	maybe map[string][]outcome
-	head  int64
+	head  *api.Token
 	acked int64
 }
 
@@ -439,7 +440,7 @@ func newModel() *model { return &model{docs: map[string]doc{}, maybe: map[string
 type view struct {
 	docs  map[string]doc
 	maybe map[string][]outcome
-	head  int64
+	head  *api.Token
 }
 
 func (m *model) snapshot() view {
@@ -613,7 +614,7 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		var resp struct {
-			Seq   int64 `json:"seq"`
+			Token string `json:"token"`
 			Items []struct {
 				Status int             `json:"status"`
 				Error  json.RawMessage `json:"error"`
@@ -645,7 +646,11 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			l.m.docs[o.id] = doc{v: o.v, n: g*keysPerWriter + o.k, brand: o.brand}
 			versions[o.k], live[o.k] = o.v, true
 		}
-		l.m.head = max(l.m.head, resp.Seq)
+		if tok, err := api.ParseToken(resp.Token); err == nil {
+			if l.m.head == nil || !l.m.head.Merge(tok) {
+				l.m.head = tok
+			}
+		}
 		l.m.acked += int64(len(ops))
 		l.m.mu.Unlock()
 		l.writes.Add(int64(len(ops)))
@@ -669,10 +674,11 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 			path, body = "/indexes/"+index+"/_search", `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand", "size": 10}}}}`
 		}
 		if !c.write503 {
-			// Read-your-writes through the balancer: the newest acknowledged seq, which
-			// any node checks against the database's head. While the database is down a
-			// node cannot, and answers 503: that scenario reads without it.
-			path += fmt.Sprintf("?wait_for_seq=%d", head)
+			// Read-your-writes through the balancer: the merge of the acknowledged
+			// writes' tokens, which any node checks against the database's heads. While
+			// the database is down a node cannot, and answers 503: that scenario reads
+			// without it.
+			path += "?wait_for=" + head.String()
 		}
 		a, err := c.lb.do(ctx, http.MethodPost, path, body, time.Minute, false)
 		if err != nil {
@@ -798,9 +804,9 @@ func (c *cluster) settle(m *model) {
 			}
 			for _, sc := range copies {
 				s := sc.Shard
-				if sc.State != "serving" || sc.AppliedSeq < v.head || sc.Docs < lo[s] || sc.Docs > hi[s] || (k > 0 && sc.Docs != docs[s]) {
+				if sc.State != "serving" || sc.AppliedSeq < v.head.Seq(s) || sc.Docs < lo[s] || sc.Docs > hi[s] || (k > 0 && sc.Docs != docs[s]) {
 					return fmt.Errorf("%s shard %d: %s at seq %d with %d documents; want serving at %d with %d to %d (as the other copies: %d)",
-						mb.NodeID(), s, sc.State, sc.AppliedSeq, sc.Docs, v.head, lo[s], hi[s], docs[s])
+						mb.NodeID(), s, sc.State, sc.AppliedSeq, sc.Docs, v.head.Seq(s), lo[s], hi[s], docs[s])
 				}
 				docs[s] = sc.Docs
 			}
@@ -808,7 +814,7 @@ func (c *cluster) settle(m *model) {
 		return nil
 	})
 	c.t.Logf("converged in %s: %d acknowledged documents (%d ids unacknowledged) at seq %d",
-		time.Since(start).Round(time.Millisecond), len(v.docs), len(v.maybe), v.head)
+		time.Since(start).Round(time.Millisecond), len(v.docs), len(v.maybe), v.head.Seqs)
 }
 
 // verify checks every node answers with exactly the documents the model allows, all
@@ -845,7 +851,7 @@ func (c *cluster) verify(m *model) {
 			var cr struct {
 				Count int64 `json:"count"`
 			}
-			a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_count?wait_for_seq=%d", mb.URL, index, v.head),
+			a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_count?wait_for=%s", mb.URL, index, v.head),
 				fmt.Sprintf(`{"query": {"field": "brand", "op": "eq", "value": %q}}`, brand))
 			if err != nil || a.status != http.StatusOK || json.Unmarshal(a.body, &cr) != nil {
 				c.t.Errorf("%s: count of %s: %v HTTP %d %s", mb.NodeID(), brand, err, a.status, truncate(a.body))
@@ -888,9 +894,9 @@ func head5(s []string) []string {
 	return s[:min(5, len(s))]
 }
 
-// scan pages through every document of the index on mb, as of seq, and returns each
-// one's version.
-func (c *cluster) scan(mb *member, seq int64) map[string]int {
+// scan pages through every document of the index on mb, as of the token at, and returns
+// each one's version.
+func (c *cluster) scan(mb *member, at *api.Token) map[string]int {
 	c.t.Helper()
 	out := map[string]int{}
 	var after json.RawMessage
@@ -900,7 +906,7 @@ func (c *cluster) scan(mb *member, seq int64) map[string]int {
 			body += `, "search_after": ` + string(after)
 		}
 		body += "}"
-		a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_search?wait_for_seq=%d", mb.URL, index, seq), body)
+		a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_search?wait_for=%s", mb.URL, index, at), body)
 		if err != nil || a.status != http.StatusOK {
 			c.t.Fatalf("%s: scan: %v HTTP %d %s", mb.NodeID(), err, a.status, truncate(a.body))
 		}

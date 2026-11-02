@@ -320,7 +320,7 @@ func TestNodeLossMidBulk(t *testing.T) {
 			want += int64(len(truth(t, a.st, store.ShardID{Index: "mb", Shard: s})))
 		}
 		for _, tn := range c.live() {
-			waitCount(t, tn.n, "mb", 0, want)
+			waitCount(t, tn.n, "mb", nil, want)
 		}
 	})
 }
@@ -409,16 +409,16 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 		c.start(2)
 		createIndex(t, a.n, "ms", 6, 1)
 		waitCopies(t, a.st, "ms", 6, 1, time.Minute)
-		var last int64
+		var last *api.Token
 		for k := range 60 {
-			last = mustWrite(t, c.node(k%3).n, "ms", upsertOp(fmt.Sprintf("d%02d", k), k))
+			last = merged(last, mustWrite(t, c.node(k%3).n, "ms", upsertOp(fmt.Sprintf("d%02d", k), k)))
 		}
 		q := api.WriteOp{Kind: api.OpQueryUpsert, ID: "cheap", Query: json.RawMessage(`{"field":"price","op":"lt","value":10}`)}
-		last = max(last, mustWrite(t, a.n, "ms", q))
+		last = merged(last, mustWrite(t, a.n, "ms", q))
 		for _, tn := range c.live() {
 			res, err := tn.n.Search(tctx(t), "ms", &search.Request{
 				Query: &query.All{}, Sort: []search.SortField{{Field: "price", Desc: true}}, Size: 7, TrackTotal: search.TrackTotalAll,
-			}, api.ReadOptions{WaitForSeq: last})
+			}, api.ReadOptions{WaitFor: last})
 			if err != nil {
 				t.Fatalf("node %d: %v", tn.i, err)
 			}
@@ -438,7 +438,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			// Percolate a given document and a stored one.
 			pres, err := tn.n.Percolate(tctx(t), "ms", &api.PercolateRequest{
 				Docs: []json.RawMessage{json.RawMessage(`{"price":3}`)}, IDs: []string{"d05", "d50"},
-			}, api.ReadOptions{WaitForSeq: last})
+			}, api.ReadOptions{WaitFor: last})
 			if err != nil {
 				t.Fatalf("node %d percolate: %v", tn.i, err)
 			}
@@ -450,7 +450,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			if err != nil || info.Docs != 60 || info.Queries != 1 {
 				t.Fatalf("node %d describes %+v (%v)", tn.i, info, err)
 			}
-			cat, err := tn.n.Fields(tctx(t), "ms", 3, api.ReadOptions{WaitForSeq: last})
+			cat, err := tn.n.Fields(tctx(t), "ms", 3, api.ReadOptions{WaitFor: last})
 			if err != nil || len(cat.Fields) == 0 {
 				t.Fatalf("node %d fields %+v (%v)", tn.i, cat, err)
 			}
@@ -480,9 +480,9 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 	c.start(1)
 	createIndex(t, a.n, "pin", 4, 1)
 	waitCopies(t, a.st, "pin", 4, 1, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 20 {
-		last = mustWrite(t, a.n, "pin", upsertOp(fmt.Sprintf("p%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "pin", upsertOp(fmt.Sprintf("p%d", k), k)))
 	}
 	// Expire every pin the moment it is made, as the janitor would after a slow
 	// query phase.
@@ -502,7 +502,7 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 		})
 	}
 	for _, tn := range c.live() {
-		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
+		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last})
 		if err != nil {
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
@@ -531,7 +531,7 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 			continue
 		}
 		checked++
-		url := fmt.Sprintf("http://%s/indexes/pin/_search?wait_for_seq=%d", tn.addr, last)
+		url := fmt.Sprintf("http://%s/indexes/pin/_search?wait_for=%s", tn.addr, last)
 		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
 		if err != nil {
 			t.Fatal(err)
@@ -573,7 +573,7 @@ func TestDynamicFieldFromAnotherNode(t *testing.T) {
 	if len(problems) > 0 {
 		t.Fatal(problems)
 	}
-	res, err := b.n.Search(tctx(t), "dyn", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
+	res, err := b.n.Search(tctx(t), "dyn", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last})
 	if err != nil || res.Total != 1 {
 		t.Fatalf("node-1 searching a field node-0 added: %v (%v)", res, err)
 	}

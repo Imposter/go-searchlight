@@ -41,7 +41,7 @@ type prepared struct {
 }
 
 // Write implements [api.Coordinator]: see the package documentation. With percolation,
-// a wait_for_seq past the head is refused before anything commits, and once the write
+// a wait_for past its shards' heads is refused before anything commits, and once the write
 // commits a percolation that cannot finish is reported in the result (Percolated
 // false), never as an error that hides the seqs.
 func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts api.WriteOptions) (res *api.WriteResult, err error) {
@@ -58,9 +58,14 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	if err != nil {
 		return nil, err
 	}
-	if opts.Percolate && opts.WaitForSeq > 0 {
-		if err := n.checkHead(ctx, idx.shards, opts.WaitForSeq); err != nil {
+	if opts.Percolate && opts.WaitFor != nil {
+		if err := checkToken(idx, opts.WaitFor); err != nil {
 			return nil, err
+		}
+		for s, seq := range opts.WaitFor.Seqs {
+			if err := n.checkHead(ctx, idx.shards[s:s+1], seq); err != nil {
+				return nil, err
+			}
 		}
 	}
 	res = &api.WriteResult{Items: make([]api.ItemResult, len(ops))}
@@ -94,14 +99,16 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		s := batch[i].change.Shard
 		touched[s] = max(touched[s], batch[i].change.Seq)
 		written[s] = max(written[s], batch[i].change.Seq)
-		res.Seq = max(res.Seq, batch[i].change.Seq)
 	}
 	for i := range unchanged {
 		s := unchanged[i].change.Shard
 		touched[s] = max(touched[s], unchanged[i].change.Seq)
-		res.Seq = max(res.Seq, unchanged[i].change.Seq)
 	}
-	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
+	res.Token = &api.Token{UID: idx.uid}
+	for s, seq := range touched {
+		res.Token.Note(s, seq)
+	}
+	span.SetAttributes(attribute.Int("shards", len(touched)), attribute.Int("unchanged", len(unchanged)))
 	if handOff {
 		for i := range batch {
 			sl := idx.shards[batch[i].change.Shard]
@@ -121,19 +128,19 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	if opts.Refresh != api.RefreshNone {
 		if err := n.waitWritten(ctx, idx, touched, opts.Refresh); err != nil {
 			res.TimedOut = true
-			n.log.WarnContext(ctx, "refresh after a write did not finish", slog.String(telemetry.KeyIndex, name), slog.Int64("seq", res.Seq), slog.Any("error", err))
+			n.log.WarnContext(ctx, "refresh after a write did not finish", slog.String(telemetry.KeyIndex, name), slog.Any("error", err))
 		}
 	}
 	if opts.Percolate {
 		if len(unchanged) > 0 {
 			batch = mergeByPos(batch, unchanged)
 		}
-		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
+		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitFor, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				res.TimedOut = true
 			}
-			n.log.WarnContext(ctx, "percolating a committed write failed", slog.String(telemetry.KeyIndex, name), slog.Int64("seq", res.Seq), slog.Any("error", err))
+			n.log.WarnContext(ctx, "percolating a committed write failed", slog.String(telemetry.KeyIndex, name), slog.Any("error", err))
 		}
 	}
 	return res, nil
@@ -557,20 +564,20 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 	return nil
 }
 
-// commit commits batch through the group committer. An op whose if_seq fails, or
-// that the store refuses on its own, is answered in its item and the rest commit
-// without it. It returns the committed ops, with their seqs. A delete of nothing
-// (IfExists) is skipped in the transaction: it takes no seq and is a 404. A versioned
-// op whose version is not above the stored one is a noop: no seq, and no error.
+// commit commits batch through the group committer, each shard's ops in a
+// transaction of their own. An op whose if_seq fails, or that the store refuses on its
+// own, is answered in its item and the rest commit without it. It returns the
+// committed ops, with their seqs. A delete of nothing (IfExists) is skipped in the
+// transaction: it takes no seq and is a 404. A versioned op whose version is not above
+// the stored one is a noop: no seq, and no error.
 //
-// The committer commits each shard's ops apart (store.PartialError): the ops of the
-// shards that committed are answered as committed, a shard refused for a condition or
-// a bad op is retried without it, and any other failure of a shard fails the request,
-// although other shards' ops may have committed. Temporary (write scaling M1): M3
-// answers that last case per op, with the shards that committed.
+// A shard whose transaction fails otherwise (the database unreachable, a deadline)
+// answers each of its ops with that error, while the other shards' ops commit
+// (store.PartialError). Only when no op committed is the error the request's.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
 	var applied []prepared
 	defer func() { noteApplied(idx, applied, items) }()
+	var shardErr error
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
 		for i := range batch {
@@ -582,21 +589,22 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 		} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			n.noteDB(err)
 		}
-		failures := []error{err}
+		var failures []store.ShardFailure
 		failed := map[int]bool{}
 		var pe *store.PartialError
 		switch {
 		case errors.As(err, &pe):
-			failures = failures[:0]
-			for _, f := range pe.Failed {
-				failures = append(failures, f.Err)
-				for _, pos := range f.Positions {
-					failed[pos] = true
-				}
-			}
+			failures = pe.Failed
 		case err != nil:
-			for i := range batch {
-				failed[i] = true
+			all := make([]int, len(batch))
+			for i := range all {
+				all[i] = i
+			}
+			failures = []store.ShardFailure{{Positions: all, Err: err}}
+		}
+		for _, f := range failures {
+			for _, pos := range f.Positions {
+				failed[pos] = true
 			}
 		}
 		for i := range batch {
@@ -611,27 +619,28 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 				applied = append(applied, batch[i])
 			}
 		}
-		if err == nil {
-			break
-		}
 		drop := map[int]bool{}
-		for _, err := range failures {
+		for _, f := range failures {
 			var ce *store.ConflictError
 			var che *store.ChangeError
 			var inf *store.IndexNotFoundError
 			switch {
-			case errors.As(err, &ce):
+			case errors.As(f.Err, &ce):
 				for k, pos := range ce.Positions {
 					items[batch[pos].pos].Err = conditionFailed(&batch[pos].change, ce.Current[k])
 					drop[pos] = true
 				}
-			case errors.As(err, &che):
+			case errors.As(f.Err, &che):
 				items[batch[che.Position].pos].Err = api.InvalidAt("body", "%v", che.Err)
 				drop[che.Position] = true
-			case errors.As(err, &inf):
+			case errors.As(f.Err, &inf):
 				return nil, indexNotFound(idx.name)
 			default:
-				return nil, storeError(err, idx.name)
+				shardErr = storeError(f.Err, idx.name)
+				for _, pos := range f.Positions {
+					items[batch[pos].pos].Err = shardErr
+					drop[pos] = true
+				}
 			}
 		}
 		var retry []prepared
@@ -641,6 +650,9 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 			}
 		}
 		batch = retry
+	}
+	if shardErr != nil && len(applied) == 0 {
+		return nil, shardErr
 	}
 	return applied, nil
 }
@@ -810,9 +822,11 @@ func (n *Single) waitApplied(ctx context.Context, c *copyState, seq int64) error
 
 // percolateWritten fills each committed upsert's item with the saved queries its
 // document matches, as written: against every saved query committed through this node
-// before the percolation, and every change up to waitFor when it is set. With details,
-// each item's Matches carry them too.
-func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor int64, details MatchDetails) error {
+// before the percolation, and every change up to waitFor's seq of each shard when it is
+// set. Only committed upserts (and unchanged ones) are percolated: an op of a shard
+// whose transaction failed has no document here. With details, each item's Matches
+// carry them too.
+func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor *api.Token, details MatchDetails) error {
 	var docs []schema.Doc
 	var pos []int
 	for i := range batch {
@@ -834,7 +848,7 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 	if err != nil {
 		return err
 	}
-	res.PercolatedSeq = ts.seq()
+	res.PercolatedAt = ts.token(idx.uid)
 	for k, p := range pos {
 		res.Items[p].Queries = json.RawMessage(ids[k])
 		if matches != nil {

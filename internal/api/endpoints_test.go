@@ -153,7 +153,7 @@ func TestDocuments(t *testing.T) {
 }
 
 func TestReadYourWrites(t *testing.T) {
-	// The background refresh is off: only wait_for_seq and refresh make writes
+	// The background refresh is off: only wait_for and refresh make writes
 	// searchable, so the test sees each mechanism alone.
 	e := newEnv(t, envOpts{})
 	e.createIndex("ryw", `{"settings": {"shards": 3, "refresh_interval": -1}}`)
@@ -167,24 +167,25 @@ func TestReadYourWrites(t *testing.T) {
 
 	// Without a refresh the write is committed but not yet searchable ...
 	w := e.must(http.StatusOK, "PUT", "/indexes/ryw/docs/b", `{"n": 2}`)
-	seq := seqOf(t, w)
+	seq := tokenOf(t, w)
 	if r := search(""); totalOf(r) != 1 {
 		t.Fatalf("no refresh, refresh disabled: search sees %v", r)
 	}
 	// ... and GET is realtime.
 	e.must(http.StatusOK, "GET", "/indexes/ryw/docs/b", "")
 
-	// Turn the refresh on: wait_for_seq waits for the write, on every shard.
+	// Turn the refresh on: wait_for, the merge of the writes' tokens, waits for them on
+	// the shards they wrote.
 	e.must(http.StatusOK, "PATCH", "/indexes/ryw/settings", `{"refresh_interval": "10ms"}`)
 	for i := range 5 {
 		w = e.must(http.StatusOK, "PUT", fmt.Sprintf("/indexes/ryw/docs/c%d", i), `{"n": 3}`)
-		seq = seqOf(t, w)
-		r := search(fmt.Sprintf("?wait_for_seq=%d", seq))
+		seq = mergeTokens(t, seq, tokenOf(t, w))
+		r := search(fmt.Sprintf("?wait_for=%s", seq))
 		if totalOf(r) != 3+i || !slices.Contains(ids(r), fmt.Sprintf("c%d", i)) {
-			t.Fatalf("wait_for_seq=%d: search sees %v", seq, ids(r))
+			t.Fatalf("wait_for=%s: search sees %v", seq, ids(r))
 		}
 	}
-	c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/ryw/_count?wait_for_seq=%d", seq), `{"query": {"field": "n", "op": "eq", "value": 3}}`)
+	c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/ryw/_count?wait_for=%s", seq), `{"query": {"field": "n", "op": "eq", "value": 3}}`)
 	if c["count"] != 5.0 {
 		t.Errorf("count = %v", c)
 	}
@@ -203,7 +204,7 @@ func TestPatchMappingIndexesKeptFields(t *testing.T) {
 	w := e.must(http.StatusOK, "PUT", "/indexes/loose/docs/1", `{"title": "red chair", "colour": "Red"}`)
 	e.must(http.StatusOK, "PUT", "/indexes/loose/docs/2", `{"title": "blue chair", "colour": "Blue"}`)
 	// Unmapped, the field is kept in the body but cannot be queried.
-	e.problem(e.do("POST", fmt.Sprintf("/indexes/loose/_search?wait_for_seq=%d", seqOf(t, w)), `{"query": {"field": "colour", "op": "eq", "value": "red"}}`), http.StatusBadRequest, "invalid_request")
+	e.problem(e.do("POST", fmt.Sprintf("/indexes/loose/_search?wait_for=%s", tokenOf(t, w)), `{"query": {"field": "colour", "op": "eq", "value": "red"}}`), http.StatusBadRequest, "invalid_request")
 	p := e.must(http.StatusOK, "PATCH", "/indexes/loose/mapping", `{"fields": {"colour": "keyword"}}`)
 	if p["mapping"].(map[string]any)["fields"].(map[string]any)["colour"] != "keyword" { //nolint:forcetypeassert,errcheck // the shape
 		t.Fatalf("patched = %v", p)

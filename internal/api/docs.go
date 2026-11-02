@@ -8,8 +8,11 @@ import (
 type writeResponse struct {
 	ID string `json:"id"`
 	// Seq is the write's seq, omitted for a versioned noop; an unchanged document's
-	// (an upsert of its stored bytes) is its stored seq.
+	// (an upsert of its stored bytes) is its stored seq. It is the document's: pass it
+	// as if_seq.
 	Seq int64 `json:"seq,omitempty"`
+	// Token is where the write left its shard: pass it as wait_for to read it back.
+	Token string `json:"token,omitempty"`
 	// Version is the write's client version, when it named one.
 	Version int64 `json:"version,omitempty"`
 	// Result is "noop" for a versioned write whose version was not above the stored
@@ -56,7 +59,7 @@ func (s *Server) singleWrite(w http.ResponseWriter, r *http.Request, p params, o
 	if it.Err != nil {
 		return it.Err
 	}
-	out := writeResponse{ID: op.ID, Seq: it.Seq, Version: it.Version, TimedOut: res.TimedOut}
+	out := writeResponse{ID: op.ID, Seq: it.Seq, Token: res.Token.String(), Version: it.Version, TimedOut: res.TimedOut}
 	if it.Noop {
 		out.Result = resultNoop
 	}
@@ -79,11 +82,11 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, p params) err
 }
 
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
-	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitForSeq: wait})
+	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

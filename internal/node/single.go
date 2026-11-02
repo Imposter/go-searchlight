@@ -25,8 +25,8 @@
 // copies have a searchable generation covering that seq (shard.WaitRefreshed);
 // refresh=true waits until they have applied it, then refreshes them at once. On a
 // cluster node that is every serving copy of the written shards, here and elsewhere.
-// Any read takes wait_for_seq=N and waits the same way on every copy it reads, after
-// waking their tailers, so an idle copy advances to N without a change of its own.
+// Any read takes wait_for=<token> and waits the same way on every copy it reads, each
+// for the token's seq of its shard, after waking their tailers.
 // Every wait is bounded by the request's deadline.
 //
 // # Searches
@@ -168,6 +168,8 @@ var _ api.Coordinator = (*Single)(nil)
 // index is one open index: its catalogue entry and its shards.
 type index struct {
 	name string
+	// uid is the incarnation this index is: a token of another is refused.
+	uid string
 	// catalog serializes changes to the catalogue entry (mapping and settings),
 	// honouring deadlines; fields queues writes' new dynamic fields for it.
 	catalog catalogLock
@@ -444,8 +446,8 @@ func (c *copyState) shard() *shard.Shard { return c.tailer.Shard() }
 //
 // Without Options.NewTailer, every tailer shares the node's one Hub, or polls and is
 // woken by writes when the store pushes no notifications (SQLite, MySQL). The
-// wait_for_seq bound and every copy's saved-query wait start at the store's head, so
-// nothing committed before a restart is missed.
+// shards' heads, which bound wait_for, and every copy's saved-query wait start at the
+// store's heads of the shards, so nothing committed before a restart is missed.
 func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Store == nil {
 		return nil, errors.New("node: Options.Store is required")
@@ -611,7 +613,7 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	if err != nil {
 		return nil, err
 	}
-	idx := &index{name: m.Name, dir: filepath.Join(n.indexesDir(), m.UID), refreshWake: make(chan struct{}, 1), catalog: make(catalogLock, 1)}
+	idx := &index{name: m.Name, uid: m.UID, dir: filepath.Join(n.indexesDir(), m.UID), refreshWake: make(chan struct{}, 1), catalog: make(catalogLock, 1)}
 	idx.meta.Store(state)
 	idx.refresh.Store(int64(n.resolvedRefresh(state.settings)))
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
@@ -812,7 +814,7 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 
 // lowerHead lowers the shard's known head to head, when it is higher: its copy found
 // the changelog rewound (a failover that lost commits), so seqs past head are not
-// committed any more, and a wait_for_seq past it must be checked with the store again.
+// committed any more, and a wait_for past it must be checked with the store again.
 func (sl *shardSlot) lowerHead(head int64) {
 	for {
 		cur := sl.head.Load()
@@ -841,10 +843,36 @@ func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
 }
 
 // lookupForRead is lookup for a read, which may answer 404 from a recent store lookup
-// (absentTTL) unless it waits for a seq: a read that names one follows a write, and
-// must find the index that write found.
-func (n *Single) lookupForRead(ctx context.Context, name string, waitSeq int64) (*index, error) {
-	return n.lookupIndex(ctx, name, waitSeq <= 0)
+// (absentTTL) unless it waits for a token: a read that names one follows a write, and
+// must find the index that write found. A token of another incarnation of the index
+// (one dropped and created again since the write) is a 400: no seq of the new one
+// answers it.
+func (n *Single) lookupForRead(ctx context.Context, name string, wait *api.Token) (*index, error) {
+	idx, err := n.lookupIndex(ctx, name, wait == nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkToken(idx, wait); err != nil {
+		return nil, err
+	}
+	return idx, nil
+}
+
+// checkToken refuses (400) a token of another incarnation of idx (one dropped and
+// created again since the write), or one naming a shard idx does not have.
+func checkToken(idx *index, wait *api.Token) error {
+	if wait == nil {
+		return nil
+	}
+	if wait.UID != idx.uid {
+		return api.InvalidAt("params.wait_for", "wait_for is a token of another incarnation of index %q: it was dropped and created again since that write", idx.name)
+	}
+	for s := range wait.Seqs {
+		if s >= len(idx.shards) {
+			return api.InvalidAt("params.wait_for", "wait_for names shard %d, and index %q has %d", s, idx.name, len(idx.shards))
+		}
+	}
+	return nil
 }
 
 func (n *Single) lookupIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {

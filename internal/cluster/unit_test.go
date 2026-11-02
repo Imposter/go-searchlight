@@ -32,9 +32,9 @@ func TestWireRoundTrip(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	createIndex(t, a.n, "wire", 1, 0)
-	var last int64
+	var last *api.Token
 	for k := range 300 {
-		last = mustWrite(t, a.n, "wire", upsertOp(fmt.Sprintf("w%03d", k), k))
+		last = merged(last, mustWrite(t, a.n, "wire", upsertOp(fmt.Sprintf("w%03d", k), k)))
 	}
 	q, problems := query.Parse([]byte(`{"any":[{"field":"price","op":"between","value":[10,200]},{"field":"tags","op":"has","value":"t1"}]}`))
 	if len(problems) > 0 {
@@ -98,7 +98,7 @@ func TestWireRoundTrip(t *testing.T) {
 		t.Fatalf("the query changed on the wire")
 	}
 
-	tg, err := a.n.LocalTarget(tctx(t), "wire", 0, last)
+	tg, err := a.n.LocalTarget(tctx(t), "wire", 0, last.Seq(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,9 +293,9 @@ func TestPruneBehindLiveCopies(t *testing.T) {
 	createIndex(t, a.n, "pr", 1, 0)
 	c.start(1)
 	waitCopies(t, a.st, "pr", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 30 {
-		last = mustWrite(t, a.n, "pr", upsertOp(fmt.Sprintf("p%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "pr", upsertOp(fmt.Sprintf("p%d", k), k)))
 	}
 	id := store.ShardID{Index: "pr", Shard: 0}
 	eventually(t, time.Minute, "the changelog is pruned behind both copies", func() error {
@@ -304,7 +304,7 @@ func TestPruneBehindLiveCopies(t *testing.T) {
 		}
 		return nil
 	})
-	floor := last
+	floor := last.Seq(0)
 	for _, cp := range liveCopies(t, a.st, id) {
 		floor = min(floor, cp.AppliedSeq)
 	}
@@ -417,9 +417,9 @@ func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
 	a := c.start(0)
 	createIndex(t, a.n, "slow", 3, 0)
 	c.waitHealth(t, api.StatusGreen, 30*time.Second)
-	var last int64
+	var last *api.Token
 	for k := range 30 {
-		last = mustWrite(t, a.n, "slow", upsertOp(fmt.Sprintf("s%02d", k), k))
+		last = merged(last, mustWrite(t, a.n, "slow", upsertOp(fmt.Sprintf("s%02d", k), k)))
 	}
 	waitCount(t, a.n, "slow", last, 30)
 	hang := func(ctx context.Context) { <-ctx.Done() }
@@ -446,9 +446,9 @@ func TestStopStopsTheTailersBeforeMarkingRetiring(t *testing.T) {
 	a := c.start(0)
 	createIndex(t, a.n, "order", 3, 0)
 	c.waitHealth(t, api.StatusGreen, 30*time.Second)
-	var last int64
+	var last *api.Token
 	for k := range 30 {
-		last = mustWrite(t, a.n, "order", upsertOp(fmt.Sprintf("o%02d", k), k))
+		last = merged(last, mustWrite(t, a.n, "order", upsertOp(fmt.Sprintf("o%02d", k), k)))
 	}
 	waitCount(t, a.n, "order", last, 30)
 	var mu sync.Mutex

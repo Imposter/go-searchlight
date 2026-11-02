@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 )
 
@@ -324,8 +325,8 @@ func (c *cluster) fill(m *model, from, count int) {
 			c.t.Fatal(err)
 		}
 		var resp struct {
-			Seq    int64 `json:"seq"`
-			Errors bool  `json:"errors"`
+			Token  string `json:"token"`
+			Errors bool   `json:"errors"`
 		}
 		if a.status != http.StatusOK || json.Unmarshal(a.body, &resp) != nil || resp.Errors {
 			c.t.Fatalf("fill: HTTP %d %s", a.status, truncate(a.body))
@@ -334,7 +335,11 @@ func (c *cluster) fill(m *model, from, count int) {
 		for id, d := range ids {
 			m.docs[id] = d
 		}
-		m.head = max(m.head, resp.Seq)
+		if tok, err := api.ParseToken(resp.Token); err == nil {
+			if m.head == nil || !m.head.Merge(tok) {
+				m.head = tok
+			}
+		}
 		m.acked += int64(len(ids))
 		m.mu.Unlock()
 	}

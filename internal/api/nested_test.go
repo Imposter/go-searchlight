@@ -40,7 +40,7 @@ func TestNestedFields(t *testing.T) {
 		t.Fatalf("a strict mapping's unmapped sub-field: %v", p)
 	}
 
-	seq := seqOf(t, e.must(http.StatusOK, "POST", "/indexes/shop/_bulk?refresh=wait_for", ndjson(
+	seq := tokenOf(t, e.must(http.StatusOK, "POST", "/indexes/shop/_bulk?refresh=wait_for", ndjson(
 		`{"upsert": {"id": "a"}}`, `{"title": "tee", "_v": [{"_key": "a1", "size": "L", "price": 12999, "in_stock": false}, {"_key": "a2", "size": "M", "price": 9999, "in_stock": true}]}`,
 		`{"upsert": {"id": "b"}}`, `{"title": "hoodie", "_v": [{"_key": "b1", "size": "S", "price": 20000, "in_stock": true}, {"_key": "b2", "size": "L", "price": 14999, "in_stock": true}]}`,
 		`{"upsert": {"id": "c"}}`, `{"title": "cap", "_v": {"_key": "c1", "size": "L", "price": 1500, "in_stock": true}}`,
@@ -49,7 +49,7 @@ func TestNestedFields(t *testing.T) {
 	inStockL := `{"all": [{"field": "_v.size", "op": "eq", "value": "L"}, {"field": "_v.in_stock", "op": "eq", "value": true}, {"field": "_v.price", "op": "lt", "value": 15000}]}`
 	search := func(body string) map[string]any {
 		t.Helper()
-		return e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_search?wait_for_seq=%d", seq), body)
+		return e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_search?wait_for=%s", seq), body)
 	}
 	ids := func(r map[string]any) string {
 		var out []string
@@ -80,7 +80,7 @@ func TestNestedFields(t *testing.T) {
 			t.Errorf("%s: %s, want %s", q, got, want)
 		}
 	}
-	c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_count?wait_for_seq=%d", seq), `{"query": {"nested": {"path": "_v", "query": `+inStockL+`}}}`)
+	c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_count?wait_for=%s", seq), `{"query": {"nested": {"path": "_v", "query": `+inStockL+`}}}`)
 	if fmt.Sprint(c["count"]) != "2" {
 		t.Errorf("count %v", c["count"])
 	}
@@ -124,8 +124,8 @@ func TestNestedFields(t *testing.T) {
 		}
 	}
 
-	seq = seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/shop/queries/l", `{"query": {"nested": {"path": "_v", "query": `+inStockL+`}}}`))
-	pr := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_percolate?wait_for_seq=%d", seq), `{"ids": ["a", "b"]}`)
+	seq = tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/shop/queries/l", `{"query": {"nested": {"path": "_v", "query": `+inStockL+`}}}`))
+	pr := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/shop/_percolate?wait_for=%s", seq), `{"ids": ["a", "b"]}`)
 	var out []string
 	for _, res := range pr["results"].([]any) { //nolint:forcetypeassert,errcheck // the shape
 		m := res.(map[string]any) //nolint:forcetypeassert,errcheck // the shape

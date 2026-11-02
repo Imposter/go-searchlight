@@ -20,7 +20,7 @@ import (
 
 // TestRefreshDisabledReadsRefreshOnDemand: on an index whose refresh is disabled
 // nothing refreshes by itself, so a read that must see a write refreshes the copy on
-// demand: a percolation after a saved-query write, a search with wait_for_seq, and a
+// demand: a percolation after a saved-query write, a search with wait_for, and a
 // peer's read of the copy (LocalTarget) answer at once rather than at their deadline.
 // A deadline that passes all the same is a 504 problem.
 func TestRefreshDisabledReadsRefreshOnDemand(t *testing.T) {
@@ -49,18 +49,18 @@ func TestRefreshDisabledReadsRefreshOnDemand(t *testing.T) {
 
 	w := mustWrite(t, n, "p", upsert("d", `{"x": 2}`))
 	c, cancel = quick()
-	sr, err := n.Search(c, "p", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: w.Seq})
+	sr, err := n.Search(c, "p", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: w.Token})
 	cancel()
 	if err != nil || sr.Total != 1 {
-		t.Fatalf("search with wait_for_seq: %+v, %v", sr, err)
+		t.Fatalf("search with wait_for: %+v, %v", sr, err)
 	}
 
 	w = mustWrite(t, n, "p", upsert("e", `{"x": 3}`))
 	c, cancel = quick()
-	target, err := n.LocalTarget(c, "p", 0, w.Seq)
+	target, err := n.LocalTarget(c, "p", 0, w.Token.Seq(0))
 	if err != nil {
 		cancel()
-		t.Fatalf("a peer's read with wait_for_seq: %v", err)
+		t.Fatalf("a peer's read with wait_for: %v", err)
 	}
 	_, _, found, err := target.Get(c, "e")
 	target.Release()
@@ -88,7 +88,7 @@ func TestRefreshDisabledReadsRefreshOnDemand(t *testing.T) {
 }
 
 // TestRewindLowersTheNodesHead: once a copy finds the changelog rewound (a failover
-// that lost commits), the node forgets the head it knew: a wait_for_seq past the new
+// that lost commits), the node forgets the head it knew: a wait_for past the new
 // head is a 400 at once again, not a wait to the deadline for a seq the database will
 // reissue.
 func TestRewindLowersTheNodesHead(t *testing.T) {
@@ -101,10 +101,10 @@ func TestRewindLowersTheNodesHead(t *testing.T) {
 	waitServing(t, n)
 	kept := mustWrite(t, n, "r", upsert("kept", `{"x": 1}`))
 	lost := mustWrite(t, n, "r", upsert("l1", `{"x": 2}`), upsert("l2", `{"x": 3}`), upsert("l3", `{"x": 4}`))
-	if got := count(t, n, "r", &query.All{}, lost.Seq); got != 4 {
+	if got := count(t, n, "r", &query.All{}, lost.Token); got != 4 {
 		t.Fatalf("count = %d", got)
 	}
-	rewindSQLite(t, cfg.StoreURL, kept.Seq)
+	rewindSQLite(t, cfg.StoreURL, kept.Token.Seq(0))
 	deadline := time.Now().Add(30 * time.Second)
 	// The copy can find the rewind before this write, and refuses it with a retryable
 	// 503 while it recovers.
@@ -123,7 +123,7 @@ func TestRewindLowersTheNodesHead(t *testing.T) {
 	}
 	for {
 		c, cancel := context.WithTimeout(context.Background(), time.Second)
-		res, err := n.Search(c, "r", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: fresh.Seq})
+		res, err := n.Search(c, "r", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: fresh.Token})
 		cancel()
 		if err == nil && res.Total == 2 {
 			break
@@ -135,10 +135,10 @@ func TestRewindLowersTheNodesHead(t *testing.T) {
 	}
 	c, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_, err := n.Search(c, "r", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitForSeq: lost.Seq})
+	_, err := n.Search(c, "r", &search.Request{Query: &query.All{}}, api.ReadOptions{WaitFor: lost.Token})
 	var ae *api.Error
 	if !errors.As(err, &ae) || ae.Status != http.StatusBadRequest {
-		t.Fatalf("wait_for_seq %d past the rewound head %d: %v, want a 400", lost.Seq, fresh.Seq, err)
+		t.Fatalf("wait_for %v past the rewound head %v: %v, want a 400", lost.Token.Seqs, fresh.Token.Seqs, err)
 	}
 }
 

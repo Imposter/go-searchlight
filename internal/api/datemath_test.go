@@ -61,19 +61,19 @@ func TestDateMath(t *testing.T) {
 	}
 
 	const week = `{"field":"seen","op":"gte","value":"now-7d"}`
-	seq := seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/dm/queries/week", `{"query": `+week+`}`))
+	seq := tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/dm/queries/week", `{"query": `+week+`}`))
 	e.must(http.StatusOK, "PUT", "/indexes/dm/queries/this-month", `{"query": {"all": [{"field": "brand", "op": "eq", "value": "acme"}, {"field": "seen", "op": "between", "value": ["now/M", "now/M"]}]}}`)
 	got := e.must(http.StatusOK, "GET", "/indexes/dm/queries/week", "")
 	if q := fmt.Sprint(got["query"]); q != "map[field:seen op:gte value:now-7d]" {
 		t.Errorf("GET returns %s", q)
 	}
 
-	seq = seqOf(t, e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_bulk?percolate=true&refresh=wait_for&wait_for_seq=%d", seq), ndjson(
+	seq = tokenOf(t, e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_bulk?percolate=true&refresh=wait_for&wait_for=%s", seq), ndjson(
 		`{"upsert": {"id": "six"}}`, `{"brand": "acme", "seen": "`+ago(6)+`"}`,
 		`{"upsert": {"id": "eight"}}`, `{"brand": "acme", "seen": "`+ago(8)+`"}`,
 	)))
 	percolate := func() string {
-		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_percolate?wait_for_seq=%d", seq), `{"ids": ["six", "eight"]}`)
+		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_percolate?wait_for=%s", seq), `{"ids": ["six", "eight"]}`)
 		var out []string
 		for _, res := range r["results"].([]any) { //nolint:forcetypeassert,errcheck // the shape
 			m := res.(map[string]any) //nolint:forcetypeassert,errcheck // the shape
@@ -85,7 +85,7 @@ func TestDateMath(t *testing.T) {
 		t.Errorf("at t0: %s", got)
 	}
 	search := func(q string) int {
-		return totalOf(e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_search?wait_for_seq=%d", seq), `{"query": `+q+`}`))
+		return totalOf(e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_search?wait_for=%s", seq), `{"query": `+q+`}`))
 	}
 	if n := search(week); n != 1 {
 		t.Errorf("at t0 the search finds %d", n)
@@ -95,18 +95,18 @@ func TestDateMath(t *testing.T) {
 	if got := percolate(); got != "six[this-month] eight[this-month]" {
 		t.Errorf("two days on: %s", got)
 	}
-	// Before five is written: wait_for_seq is a floor, and a refresh may show five to a
+	// Before five is written: wait_for is a floor, and a refresh may show five to a
 	// search at the older seq.
 	if n := search(week); n != 0 {
 		t.Errorf("two days on the search finds %d", n)
 	}
-	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_bulk?percolate=true&wait_for_seq=%d", seq), ndjson(
+	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_bulk?percolate=true&wait_for=%s", seq), ndjson(
 		`{"upsert": {"id": "five"}}`, `{"brand": "acme", "seen": "`+ago(5)+`"}`,
 	))
 	if items := fmt.Sprint(r["items"].([]any)[0].(map[string]any)["queries"]); items != "[this-month week]" { //nolint:forcetypeassert,errcheck // the shape
 		t.Errorf("two days on, a bulk percolation: %s", items)
 	}
-	if n := totalOf(e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_search?wait_for_seq=%d", seqOf(t, r)), `{"query": `+week+`}`)); n != 1 {
+	if n := totalOf(e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/dm/_search?wait_for=%s", tokenOf(t, r)), `{"query": `+week+`}`)); n != 1 {
 		t.Errorf("two days on, with five: the search finds %d", n)
 	}
 

@@ -24,9 +24,11 @@ import (
 
 // bulkLoad writes n documents to index through node in batches, returning the last
 // seq.
-func bulkLoad(t testing.TB, n *Node, index string, from, count, batch int) int64 {
+// bulkLoad writes documents from..from+count-1 in bulks of batch and returns the
+// merge of the bulks' tokens.
+func bulkLoad(t testing.TB, n *Node, index string, from, count, batch int) *api.Token {
 	t.Helper()
-	var last int64
+	var last *api.Token
 	for lo := from; lo < from+count; lo += batch {
 		ops := make([]api.WriteOp, 0, batch)
 		for i := lo; i < min(lo+batch, from+count); i++ {
@@ -45,7 +47,7 @@ func bulkLoad(t testing.TB, n *Node, index string, from, count, batch int) int64
 				t.Fatalf("bulk op %d at %d: %v", i, lo, it.Err)
 			}
 		}
-		last = res.Seq
+		last = merged(last, res.Token)
 	}
 	return last
 }
@@ -57,9 +59,9 @@ func heavyLoad(_ int, o *Options) {
 	o.DeadAfter = 15 * time.Second
 }
 
-// waitCount waits until a match-all search on n with wait_for_seq counts want: a copy
+// waitCount waits until a match-all search on n waiting for seq counts want: a copy
 // re-claimed after a lapse recovers first.
-func waitCount(t testing.TB, n *Node, index string, seq, want int64) {
+func waitCount(t testing.TB, n *Node, index string, seq *api.Token, want int64) {
 	t.Helper()
 	eventually(t, 2*time.Minute, fmt.Sprintf("%s counts %d on %s", index, want, n.id), func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -233,7 +235,7 @@ func TestPeerRecovery100k(t *testing.T) {
 	}
 	waitCount(t, b.n, "big", last, int64(docs))
 	// The recovered copy tails on.
-	last = mustWrite(t, a.n, "big", upsertOp("after", 1))
+	last = merged(last, mustWrite(t, a.n, "big", upsertOp("after", 1)))
 	waitCount(t, b.n, "big", last, int64(docs)+1)
 	// The staging directory is gone once the copy is in.
 	if _, err := os.Stat(filepath.Join(b.cfg.DataDir, "recovery")); err == nil {

@@ -33,17 +33,18 @@ func bulkItems(t testing.TB, m map[string]any) []map[string]any {
 func TestUnchangedUpsertIsANoop(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.createIndex("n", `{"mapping": {"fields": {"brand": "keyword"}}, "settings": {"shards": 2}}`)
-	first := seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/n/docs/a", `{"brand": "x"}`))
+	put := e.must(http.StatusOK, "PUT", "/indexes/n/docs/a", `{"brand": "x"}`)
+	first, firstTok := seqOf(t, put), tokenOf(t, put)
 
 	r := e.must(http.StatusOK, "PUT", "/indexes/n/docs/a", `{"brand": "x"}`)
 	if r["result"] != "noop" || r["seq"] != float64(first) {
 		t.Fatalf("an unchanged PUT = %v, want a noop at seq %d", r, first)
 	}
 	r = e.must(http.StatusOK, "POST", "/indexes/n/_bulk", ndjson(`{"upsert": {"id": "a"}}`, `{"brand": "x"}`))
-	if it := bulkItems(t, r)[0]; it["result"] != "noop" || it["seq"] != float64(first) || r["seq"] != float64(first) || it["status"] != 200.0 {
+	if it := bulkItems(t, r)[0]; it["result"] != "noop" || it["seq"] != float64(first) || r["token"] == nil || it["status"] != 200.0 {
 		t.Fatalf("an unchanged bulk upsert = %v", r)
 	}
-	if c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/n/_count?wait_for_seq=%d", first), `{}`); c["count"] != 1.0 {
+	if c := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/n/_count?wait_for=%s", firstTok), `{}`); c["count"] != 1.0 {
 		t.Fatalf("count at the noop's seq = %v", c)
 	}
 
@@ -86,8 +87,8 @@ func TestUnchangedUpsertPercolates(t *testing.T) {
 	if it["result"] != "noop" || it["seq"] != written["seq"] || r["percolated"] != true {
 		t.Fatalf("an unchanged percolated upsert = %v", r)
 	}
-	if ps, _ := r["percolated_seq"].(float64); int64(ps) < large || r["seq"] != written["seq"] {
-		t.Fatalf("percolated_seq %v, seq %v: want percolated_seq at least the saved query's %d, seq the noop's", r["percolated_seq"], r["seq"], large)
+	if at, _ := r["percolated_at"].(string); at == "" || tokenSeq(t, at, 0) < large {
+		t.Fatalf("percolated_at %v: want shard 0 at least at the saved query's %d", r["percolated_at"], large)
 	}
 	if got, _ := json.Marshal(it["queries"]); string(got) != `["acme","large"]` {
 		t.Fatalf("queries = %s, want acme and large", got)
@@ -163,7 +164,10 @@ func TestUnchangedNoopProperty(t *testing.T) {
 			t.Fatalf("round %d: %d %s", round, resp.status, resp.body)
 		}
 		m := resp.json(t)
-		top, _ := m["seq"].(float64)
+		var top float64 // the highest seq the response's token names
+		if tok, _ := m["token"].(string); tok != "" {
+			top = float64(maxTokenSeq(t, tok))
+		}
 		for i, it := range bulkItems(t, m) {
 			if it["status"] != 200.0 && !(ops[i].del && it["status"] == 404.0) {
 				t.Fatalf("round %d item %d: %v", round, i, it)
@@ -173,7 +177,7 @@ func TestUnchangedNoopProperty(t *testing.T) {
 				t.Fatalf("round %d item %d (%+v): noop %v, want %v: %s", round, i, ops[i], noop, want[i], resp.body)
 			}
 			if seq, _ := it["seq"].(float64); seq > top {
-				t.Fatalf("round %d: item seq %v above the response's %v", round, seq, top)
+				t.Fatalf("round %d: item seq %v above the response's token's %v", round, seq, top)
 			}
 		}
 		for _, id := range ids {

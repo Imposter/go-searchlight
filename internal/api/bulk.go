@@ -47,10 +47,12 @@ type bulkItem struct {
 // bulkResponse answers a _bulk request.
 type bulkResponse struct {
 	TookMS int64 `json:"took_ms"`
-	// Seq is the newest seq the request committed: pass it as wait_for_seq.
-	Seq      int64 `json:"seq"`
-	Errors   bool  `json:"errors"`
-	TimedOut bool  `json:"timed_out"`
+	// Token is where the request left each shard it wrote: pass it as wait_for.
+	// Omitted when nothing was written.
+	Token string `json:"token,omitempty"`
+	// Errors is set when any item failed, on its own or with its shard's transaction.
+	Errors   bool `json:"errors"`
+	TimedOut bool `json:"timed_out"`
 	// Percolated, with percolate=true, says whether the items carry their
 	// matching saved queries: false when the percolation could not finish after
 	// the writes committed (a deadline, a closed copy, too many matches).
@@ -58,10 +60,10 @@ type bulkResponse struct {
 	// PercolateReason is CodeTooManyMatches when Percolated is false because the
 	// documents match more than percolate.MaxMatches saved queries together.
 	PercolateReason string `json:"percolate_reason,omitempty"`
-	// PercolatedSeq, with Percolated true, is a seq every saved query committed at or
-	// below which the documents were percolated against (WriteResult.PercolatedSeq).
-	PercolatedSeq int64      `json:"percolated_seq,omitempty"`
-	Items         []bulkItem `json:"items"`
+	// PercolatedAt, with Percolated true, is a token of where each shard stood for the
+	// percolation (WriteResult.PercolatedAt).
+	PercolatedAt string     `json:"percolated_at,omitempty"`
+	Items        []bulkItem `json:"items"`
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
@@ -80,10 +82,12 @@ type bulkResponse struct {
 // document's is a noop too, at the stored document's seq, unless detect_noop=false;
 // with percolate=true it still reports the document's matching saved queries.
 //
-// Every op commits in one transaction. An op refused on its own (an invalid document,
-// a failed if_seq) is reported in its item, with errors set, and the rest commit; a
-// malformed action line, a line over max_doc_bytes or more than max_bulk_ops ops
-// refuse the whole request before anything is written.
+// Each shard's ops commit in one transaction, the shards' apart: a request is whole or
+// nothing only on one shard. An op refused on its own (an invalid document, a failed
+// if_seq) is reported in its item, with errors set, and the rest commit; so is every op
+// of a shard whose transaction failed (a 5xx status in its item), while the other
+// shards' ops commit. A malformed action line, a line over max_doc_bytes or more than
+// max_bulk_ops ops refuse the whole request before anything is written.
 func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	start := s.clock.Now()
 	refresh, e := p.refresh()
@@ -94,7 +98,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if e != nil {
 		return e
 	}
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -115,7 +119,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 		return err
 	}
 	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{
-		Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitForSeq: wait, KeepIdentical: keep,
+		Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitFor: wait, KeepIdentical: keep,
 	})
 	if err != nil {
 		return err
@@ -123,7 +127,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if len(res.Items) != len(ops) {
 		return ProblemFor(errItemCount)
 	}
-	out := bulkResponse{Seq: res.Seq, TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
+	out := bulkResponse{Token: res.Token.String(), TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
 	switch {
 	case perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches:
 		res.Percolated = false
@@ -134,7 +138,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if perc {
 		out.Percolated = &res.Percolated
 		if res.Percolated {
-			out.PercolatedSeq = res.PercolatedSeq
+			out.PercolatedAt = res.PercolatedAt.String()
 		}
 	}
 	id := info(r.Context()).id

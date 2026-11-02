@@ -57,11 +57,11 @@ func BenchmarkHTTPBulkIndex(b *testing.B) {
 // shards: a filtered, sorted page of 10 (query then fetch), with p50 and p99.
 func BenchmarkHTTPSearch(b *testing.B) {
 	e := benchEnv(b)
-	var seq int64
+	var seq string
 	for i := range 20 {
-		seq = seqOf(b, e.must(http.StatusOK, "POST", "/indexes/bench/_bulk", benchBulk(i*1000, 1000)))
+		seq = mergeTokens(b, seq, tokenOf(b, e.must(http.StatusOK, "POST", "/indexes/bench/_bulk", benchBulk(i*1000, 1000))))
 	}
-	e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/bench/_count?wait_for_seq=%d", seq), "")
+	e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/bench/_count?wait_for=%s", seq), "")
 	queries := []string{
 		`{"query": {"all": [{"field": "brand", "op": "eq", "value": "Acme"}, {"field": "price", "op": "between", "value": [100, 400]}]}, "sort": [{"price": "desc"}], "size": 10}`,
 		`{"query": {"field": "tags", "op": "has_any", "value": ["tag3", "tag7"]}, "size": 10}`,
@@ -99,13 +99,13 @@ func BenchmarkHTTPBulkPercolate(b *testing.B) {
 		}
 		ops = append(ops, q)
 	}
-	var seq int64
+	var seq string
 	for i, q := range ops {
-		seq = seqOf(b, e.must(http.StatusOK, "PUT", fmt.Sprintf("/indexes/bench/queries/q%d", i), `{"query": `+q+`}`))
+		seq = mergeTokens(b, seq, tokenOf(b, e.must(http.StatusOK, "PUT", fmt.Sprintf("/indexes/bench/queries/q%d", i), `{"query": `+q+`}`)))
 	}
 	const batch = 500
 	bodies := []string{benchBulk(0, batch), benchBulk(batch, batch)}
-	path := fmt.Sprintf("/indexes/bench/_bulk?percolate=true&wait_for_seq=%d", seq)
+	path := fmt.Sprintf("/indexes/bench/_bulk?percolate=true&wait_for=%s", seq)
 	b.ResetTimer()
 	start := time.Now()
 	for i := 0; b.Loop(); i++ {

@@ -1,7 +1,8 @@
 // Package api is Searchlight's public HTTP/JSON API (spec section 5): the index,
 // document, bulk, search, count, saved-query, percolate, field-catalogue and cluster
 // endpoints, with bearer-token auth, request limits, problem JSON errors, request
-// deadlines and the read-your-writes controls (refresh, wait_for_seq, if_seq).
+// deadlines and the read-your-writes controls (refresh, wait_for and its [Token],
+// if_seq).
 //
 // The handlers are a thin layer over a [Coordinator], which owns the data: the
 // single-node coordinator (internal/node) serves every shard from local copies, and
@@ -41,17 +42,18 @@ type Coordinator interface {
 	// PatchSettings changes an index's refresh interval or replica target.
 	PatchSettings(ctx context.Context, name string, patch SettingsPatch) (*IndexInfo, error)
 
-	// Write commits ops to index in one transaction and returns each op's outcome
-	// in order. An op refused on its own (an invalid document, a failed if_seq, a
-	// delete of nothing) is reported in its item and the rest still commit; an
-	// error is returned only when nothing could be written. Write may release the
-	// ops' bodies once it holds its own copies.
+	// Write commits ops to index, each shard's ops in one transaction of their own,
+	// and returns each op's outcome in order. An op refused on its own (an invalid
+	// document, a failed if_seq, a delete of nothing) is reported in its item and the
+	// rest still commit; so is every op of a shard whose transaction failed, while the
+	// other shards' ops commit. An error is returned only when nothing was written.
+	// Write may release the ops' bodies once it holds its own copies.
 	Write(ctx context.Context, index string, ops []WriteOp, opts WriteOptions) (*WriteResult, error)
-	// GetDocument reads a document's current version (realtime), with every change up
-	// to opts.WaitForSeq in it.
+	// GetDocument reads a document's current version (realtime), with every change of
+	// its shard up to opts.WaitFor's seq in it.
 	GetDocument(ctx context.Context, index, id string, opts ReadOptions) (*Document, error)
-	// GetQuery reads a saved query's current version (realtime), with every change up
-	// to opts.WaitForSeq in it.
+	// GetQuery reads a saved query's current version (realtime), with every change of
+	// its shard up to opts.WaitFor's seq in it.
 	GetQuery(ctx context.Context, index, id string, opts ReadOptions) (*SavedQuery, error)
 	// ListQueries pages an index's saved queries by id: up to size of them with ids
 	// above after. With lean, each holds its id, seq and version alone.
@@ -300,10 +302,10 @@ type WriteOptions struct {
 	// document's nested objects their inner_hits match.
 	Matches   bool
 	InnerHits bool
-	// WaitForSeq, with Percolate, waits for this node's copies to have every change
-	// up to it searchable before percolating, so saved queries written up to it are
-	// seen.
-	WaitForSeq int64
+	// WaitFor, with Percolate, waits for the copies percolating to have every change up
+	// to its seq of their shard searchable before percolating, so saved queries written
+	// up to it are seen.
+	WaitFor *Token
 	// KeepIdentical (detect_noop=false) writes an unconditional upsert whose body is
 	// byte-identical to the stored document's, as releases before 1.6 did, rather than
 	// answering it as a noop (ItemResult.Unchanged).
@@ -312,10 +314,10 @@ type WriteOptions struct {
 
 // WriteResult is the outcome of a Write.
 type WriteResult struct {
-	// Seq is the newest seq the write committed or found an unchanged document at
-	// (ItemResult.Unchanged), 0 when there is none. Pass it as wait_for_seq to read the
-	// write back.
-	Seq int64
+	// Token is where the write left each shard it committed to, or found an unchanged
+	// document on (ItemResult.Unchanged): pass it as wait_for to read the write back.
+	// Nil when it wrote nothing.
+	Token *Token
 	// Items are the ops' outcomes, in order.
 	Items []ItemResult
 	// TimedOut is set when the request's deadline passed while waiting for a
@@ -323,15 +325,14 @@ type WriteResult struct {
 	TimedOut bool
 	// Percolated is set when WriteOptions.Percolate was asked and every upserted
 	// document's Queries were filled. When it is not (a deadline passed waiting for
-	// WaitForSeq, a copy closed), the writes are committed all the same.
+	// WaitFor, a copy closed), the writes are committed all the same.
 	Percolated bool
-	// PercolatedSeq, when Percolated and documents were percolated, is a seq every saved
-	// query committed at or below which they were percolated against: the least, over
-	// the shards, of the seq the copy percolating it held every change up to. A saved
-	// query written after it may or may not have been seen. It is not Seq: a noop's
-	// Seq can be far older than the percolation, and a write's newer than a copy's
-	// refresh.
-	PercolatedSeq int64
+	// PercolatedAt, when Percolated and documents were percolated, is where each shard
+	// stood for the percolation: every saved query committed to a shard at or below its
+	// seq was seen. A saved query written after it may or may not have been. It is not
+	// Token: a noop's seq can be far older than the percolation, and a write's newer
+	// than a copy's refresh.
+	PercolatedAt *Token
 	// PercolateErr is why the percolation asked for did not finish, nil when it did:
 	// a passed deadline, a closed copy, too many matches. It is reported in the
 	// response, never as the write's error.
@@ -365,9 +366,10 @@ type ItemResult struct {
 
 // ReadOptions are a read's parameters.
 type ReadOptions struct {
-	// WaitForSeq waits until every change up to this seq is searchable on the
-	// copies the read uses (read-your-writes).
-	WaitForSeq int64
+	// WaitFor waits until every shard the read uses has every change up to the token's
+	// seq of that shard searchable (read-your-writes). A token of another incarnation
+	// of the index is a 400.
+	WaitFor *Token
 }
 
 // Document is a stored document.

@@ -97,33 +97,41 @@ var benchWords = func() []string {
 }()
 
 func benchBatch(prefix string, n int) []Change {
+	return benchBatchOver(prefix, n, benchShards, 0)
+}
+
+// benchBatchOver is n changes spread evenly over shards, the first on shard offset.
+func benchBatchOver(prefix string, n, shards, offset int) []Change {
 	batch := make([]Change, n)
 	for j := range batch {
-		batch[j] = upsert("bench", j%benchShards, fmt.Sprintf("%s-%d", prefix, j), benchBody(j))
+		batch[j] = upsert("bench", (offset+j)%shards, fmt.Sprintf("%s-%d", prefix, j), benchBody(j))
 	}
 	return batch
 }
 
-// BenchmarkApply commits batches of new 1 KB documents: a group commit's
-// transaction of 1, 100 or 1000 changes.
+// BenchmarkApply commits batches of new 1 KB documents: a group commit's transaction of
+// 1, 100, 1000 or 4096 changes, spread evenly over 1, 8 or 64 shards (a batch of one
+// moves from shard to shard).
 func BenchmarkApply(b *testing.B) {
 	forEachDialectB(b, func(b *testing.B, fresh func(testing.TB) *harness) {
-		for _, n := range []int{1, 100, 1000} {
-			b.Run(fmt.Sprintf("batch=%d", n), func(b *testing.B) {
-				st := benchStore(b, fresh)
-				ctx := context.Background()
-				i := 0
-				for b.Loop() {
-					b.StopTimer()
-					batch := benchBatch(fmt.Sprintf("a%d", i), n)
-					i++
-					b.StartTimer()
-					if _, _, err := st.Apply(ctx, batch); err != nil {
-						b.Fatal(err)
+		for _, shards := range []int{1, 8, 64} {
+			for _, n := range []int{1, 100, 1000, 4096} {
+				b.Run(fmt.Sprintf("shards=%d/batch=%d", shards, n), func(b *testing.B) {
+					st := benchStore(b, fresh)
+					ctx := context.Background()
+					i := 0
+					for b.Loop() {
+						b.StopTimer()
+						batch := benchBatchOver(fmt.Sprintf("a%d", i), n, shards, i)
+						i++
+						b.StartTimer()
+						if _, _, err := st.Apply(ctx, batch); err != nil {
+							b.Fatal(err)
+						}
 					}
-				}
-				b.ReportMetric(float64(n*i)/b.Elapsed().Seconds(), "changes/s")
-			})
+					b.ReportMetric(float64(n*i)/b.Elapsed().Seconds(), "changes/s")
+				})
+			}
 		}
 	})
 }

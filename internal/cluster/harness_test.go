@@ -117,7 +117,7 @@ func randName(prefix string) string {
 }
 
 // postgresDB creates a schema for the test and points search_path at it.
-func postgresDB(t *testing.T, base string) *db {
+func postgresDB(t testing.TB, base string) *db {
 	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {

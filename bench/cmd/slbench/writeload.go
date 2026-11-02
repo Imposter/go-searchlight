@@ -46,6 +46,7 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	storeURL := fs.String("store-url", "", "the node's store_url (empty: SQLite in --dir)")
 	procs := fs.Int("gomaxprocs", 1, "GOMAXPROCS of the node (with --sl-bin)")
 	docsFlag := fs.String("docs", "150k", "listings preloaded")
+	shardCount := fs.Int("shards", 1, "shards of the index")
 	bulk := fs.Int("bulk", 500, "documents per measured bulk")
 	duration := fs.Duration("duration", 60*time.Second, "how long the measured load runs")
 	writers := fs.Int("writers", 1, "concurrent bulk writers")
@@ -60,6 +61,7 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	seed := fs.Uint64("seed", 1, "random seed")
 	out := fs.String("json", "", "write the result as JSON to this file too")
 	profile := fs.String("cpuprofile", "", "write a CPU profile of the node during the measured load to this file (with --sl-bin)")
+	pgURL := fs.String("pg-url", "", "a Postgres URL to sample during the measured load: wait events, pg_stat_wal and the like (--store-url's, usually)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,7 +111,7 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	c := &wlClient{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{}}
 
 	fmt.Fprintf(stdout, "writeload: preloading %d listings\n", n)
-	if err := c.setup(ctx, n); err != nil {
+	if err := c.setup(ctx, n, *shardCount); err != nil {
 		return err
 	}
 	if *profile != "" && admin != "" {
@@ -124,6 +126,14 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if admin != "" {
 		shards = startShardSampler(ctx, admin)
 	}
+	var pg *pgSampler
+	if *pgURL != "" {
+		if pg, err = startPGSampler(ctx, *pgURL); err != nil {
+			return fmt.Errorf("sampling postgres: %w", err)
+		}
+	}
+	commitsBefore := scrapeSums(ctx, admin, metricBatchSum, metricBatchCount)
+	began := time.Now()
 	res, err := c.run(ctx, wlRun{
 		n: n, bulk: *bulk, duration: *duration, writers: *writers, changed: *changed, readers: *readers,
 		readPause: *readPause, readParams: *readParams, staleness: *staleness, clientTimeout: *clientTimeout, percolate: *percolate, seed: *seed,
@@ -131,8 +141,18 @@ func cmdWriteload(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
+	res.Started, res.Shards, res.BulkSize, res.Writers, res.GOMAXPROCS = began, *shardCount, *bulk, *writers, *procs
 	if shards != nil {
 		shards.stop(res)
+	}
+	if pg != nil {
+		res.Postgres = pg.stop(ctx)
+	}
+	if admin != "" {
+		after := scrapeSums(ctx, admin, metricBatchSum, metricBatchCount, metricLagSeq)
+		res.GroupCommits = after[metricBatchCount] - commitsBefore[metricBatchCount]
+		res.GroupCommitChanges = after[metricBatchSum] - commitsBefore[metricBatchSum]
+		res.LagSeqEnd = after[metricLagSeq]
 	}
 	res.print(stdout)
 	if *out != "" {
@@ -195,14 +215,15 @@ func (c *wlClient) must(ctx context.Context, method, path string, body []byte) (
 
 const wlIndex = "listings"
 
-// wlMapping is a scrape-bot shaped index: listing fields and a nested field of variants.
+// wlMapping is a scrape-bot shaped index of %d shards: listing fields and a nested field
+// of variants.
 const wlMapping = `{"mapping": {"fields": {
   "source": "keyword", "key": "keyword", "title": "text", "url": "keyword", "gone": "bool",
   "brand": "keyword", "category": "keyword", "price": "number",
   "_links": "keyword_list", "_first_seen": "date", "_changed_at": "date", "_snapshot": "number",
   "_attrs": "keyword_list", "_vattrs": "keyword_list", "_derived": "keyword_list", "_digest": "keyword",
   "_v": {"type": "nested", "fields": {"_key": "text", "size": "keyword", "color": "keyword", "price": "number", "in_stock": "bool"}}}},
-  "settings": {"shards": 1, "refresh_interval": "1s"}}`
+  "settings": {"shards": %d, "refresh_interval": "1s"}}`
 
 // wlQueries are the saved searches every bulk percolates against.
 var wlQueries = []string{
@@ -261,9 +282,10 @@ func wlDoc(i, rev int) []byte {
 	return b
 }
 
-// setup creates the index and its saved searches, and preloads n listings at rev 0.
-func (c *wlClient) setup(ctx context.Context, n int) error {
-	if _, err := c.must(ctx, http.MethodPut, "/indexes/"+wlIndex, []byte(wlMapping)); err != nil {
+// setup creates the index with its shards and saved searches, and preloads n listings at
+// rev 0.
+func (c *wlClient) setup(ctx context.Context, n, shards int) error {
+	if _, err := c.must(ctx, http.MethodPut, "/indexes/"+wlIndex, fmt.Appendf(nil, wlMapping, shards)); err != nil {
 		return err
 	}
 	var b bytes.Buffer
@@ -327,22 +349,27 @@ type wlRun struct {
 
 // wlResult is a run's numbers.
 type wlResult struct {
-	Seconds      float64 `json:"seconds"`
-	Docs         int64   `json:"docs"`
-	DocsPerSec   float64 `json:"docs_per_sec"`
-	Bulks        int     `json:"bulks"`
-	BulkP50MS    float64 `json:"bulk_p50_ms"`
-	BulkP95MS    float64 `json:"bulk_p95_ms"`
-	BulkMaxMS    float64 `json:"bulk_max_ms"`
-	Retries      int64   `json:"retries"`
-	Noops        int64   `json:"noops"`
-	Reads        int     `json:"reads"`
-	ReadP50MS    float64 `json:"read_p50_ms"`
-	ReadP95MS    float64 `json:"read_p95_ms"`
-	ReadP99MS    float64 `json:"read_p99_ms"`
-	ReadMaxMS    float64 `json:"read_max_ms"`
-	ReadErrors   int64   `json:"read_errors"`
-	ReadTimeouts int64   `json:"read_timeouts"`
+	Started      time.Time `json:"started"`
+	Shards       int       `json:"shards"`
+	BulkSize     int       `json:"bulk"`
+	Writers      int       `json:"writers"`
+	GOMAXPROCS   int       `json:"gomaxprocs"`
+	Seconds      float64   `json:"seconds"`
+	Docs         int64     `json:"docs"`
+	DocsPerSec   float64   `json:"docs_per_sec"`
+	Bulks        int       `json:"bulks"`
+	BulkP50MS    float64   `json:"bulk_p50_ms"`
+	BulkP95MS    float64   `json:"bulk_p95_ms"`
+	BulkMaxMS    float64   `json:"bulk_max_ms"`
+	Retries      int64     `json:"retries"`
+	Noops        int64     `json:"noops"`
+	Reads        int       `json:"reads"`
+	ReadP50MS    float64   `json:"read_p50_ms"`
+	ReadP95MS    float64   `json:"read_p95_ms"`
+	ReadP99MS    float64   `json:"read_p99_ms"`
+	ReadMaxMS    float64   `json:"read_max_ms"`
+	ReadErrors   int64     `json:"read_errors"`
+	ReadTimeouts int64     `json:"read_timeouts"`
 	// Segments and MergeBacklog are the node's (every shard's together), sampled every
 	// 2 s during the load: the largest and the last.
 	SegmentsMax     float64 `json:"segments_max"`
@@ -352,6 +379,14 @@ type wlResult struct {
 	Samples         int     `json:"shard_samples"`
 	// Series is every sample, [seconds into the load, segments, merge backlog].
 	Series [][3]float64 `json:"shard_series,omitempty"`
+	// GroupCommits and GroupCommitChanges are the transactions the node's group committer
+	// ran during the load and the changes in them. LagSeqEnd is the changes its copies
+	// trailed by when the load ended, every shard's together.
+	GroupCommits       float64 `json:"group_commits"`
+	GroupCommitChanges float64 `json:"group_commit_changes"`
+	LagSeqEnd          float64 `json:"lag_seq_end"`
+	// Postgres is what --pg-url sampled.
+	Postgres *pgSample `json:"postgres,omitempty"`
 }
 
 func (r *wlResult) print(w io.Writer) {
@@ -362,6 +397,13 @@ func (r *wlResult) print(w io.Writer) {
 	if r.Samples > 0 {
 		fmt.Fprintf(w, "shards: segments max %.0f, last %.0f; merge backlog max %.0f, last %.0f (%d samples)\n",
 			r.SegmentsMax, r.SegmentsLast, r.MergeBacklogMax, r.MergeBacklogEnd, r.Samples)
+	}
+	if r.GroupCommits > 0 {
+		fmt.Fprintf(w, "commits: %.0f, %.0f changes each; copies trail by %.0f changes at the end\n",
+			r.GroupCommits, r.GroupCommitChanges/r.GroupCommits, r.LagSeqEnd)
+	}
+	if r.Postgres != nil {
+		r.Postgres.print(w)
 	}
 }
 
@@ -448,6 +490,47 @@ func scrapeShards(ctx context.Context, admin string) (segments, backlog float64,
 		}
 	}
 	return segments, backlog, ok
+}
+
+// The node's metrics a load reports.
+const (
+	metricBatchSum   = "searchlight_store_group_commit_batch_size_sum"
+	metricBatchCount = "searchlight_store_group_commit_batch_size_count"
+	metricLagSeq     = "searchlight_replica_lag_seq"
+)
+
+// scrapeSums sums each of names over its label sets in the node's Prometheus metrics. It
+// returns nil when they cannot be read: no admin URL, or the node is down.
+func scrapeSums(ctx context.Context, admin string, names ...string) map[string]float64 {
+	if admin == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, admin+"/metrics", http.NoBody)
+	if err != nil {
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	sums := make(map[string]float64, len(names))
+	for _, line := range strings.Split(string(b), "\n") {
+		for _, name := range names {
+			if strings.HasPrefix(line, name+"{") || strings.HasPrefix(line, name+" ") {
+				fields := strings.Fields(line)
+				var v float64
+				if _, err := fmt.Sscan(fields[len(fields)-1], &v); err == nil {
+					sums[name] += v
+				}
+			}
+		}
+	}
+	return sums
 }
 
 // readTimeout is a reader's client timeout, as a dashboard's would be.

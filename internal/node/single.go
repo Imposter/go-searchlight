@@ -208,9 +208,11 @@ type shardSlot struct {
 	// was opened (every saved query committed before then is at or below it).
 	written  atomic.Int64
 	querySeq atomic.Int64
-	// head is the newest seq of the shard this node knows committed: read from the
-	// store, committed by this node, or applied by its copy. A copy that finds the
-	// changelog rewound lowers it.
+	// head is the newest seq of the shard this node knows committed. It is read from
+	// the store when the index opens and when a wait_for names a seq past it, raised
+	// by every commit through this node and to the seq a copy held when it was hosted
+	// here; it does not follow the copy's tailer. A copy that finds the changelog
+	// rewound lowers it (with written and querySeq).
 	head atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
 	host           sync.Mutex

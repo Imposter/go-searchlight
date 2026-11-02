@@ -59,7 +59,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if opts.Percolate && opts.WaitFor != nil {
-		if err := checkToken(idx, opts.WaitFor); err != nil {
+		if idx, err = n.checkTokenOf(ctx, idx, opts.WaitFor); err != nil {
 			return nil, err
 		}
 		if err := n.checkWait(ctx, idx, opts.WaitFor.Seqs); err != nil {

@@ -863,6 +863,33 @@ func (n *Single) lookupForRead(ctx context.Context, name string, wait *api.Token
 	if err != nil {
 		return nil, err
 	}
+	return n.checkTokenOf(ctx, idx, wait)
+}
+
+// checkTokenOf is checkToken for an index this node looked up: it returns idx, or,
+// when wait is a token of the incarnation the catalogue has now and this cluster node
+// has not synced it yet (the index was dropped and created again through another
+// node), that incarnation, adopted. A token the catalogue's incarnation does not match
+// either is refused.
+func (n *Single) checkTokenOf(ctx context.Context, idx *index, wait *api.Token) (*index, error) {
+	if wait != nil && wait.UID != idx.uid && n.cl != nil {
+		m, err := n.st.Indexes().Get(ctx, idx.name)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return nil, indexNotFound(idx.name)
+		case err != nil:
+			return nil, storeError(err, idx.name)
+		case m.UID == wait.UID:
+			cur, err := n.adopt(ctx, m)
+			if err != nil {
+				return nil, err
+			}
+			if cur == nil {
+				return nil, api.Unavailable(nil, "index %q is being reopened as the catalogue's incarnation", idx.name)
+			}
+			idx = cur
+		}
+	}
 	if err := checkToken(idx, wait); err != nil {
 		return nil, err
 	}

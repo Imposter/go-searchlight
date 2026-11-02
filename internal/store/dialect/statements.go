@@ -481,10 +481,17 @@ type Maintenance struct {
 	// the transaction itself excludes other writers, as on SQLite). When false,
 	// migrations run on one connection holding SessionLock until
 	// SessionUnlock, and each file is recorded as it completes.
-	MigrateInTx   bool
-	MigrateLock   string
-	SessionLock   string // must return one row whose first column is 1 on success
-	SessionUnlock string
+	MigrateInTx bool
+	MigrateLock string
+	// ConcurrentLock tries a session lock, returning whether it got it, and
+	// ConcurrentUnlock releases it: where DDL is transactional but a migration's
+	// NNNN_name.concurrent.sql must run outside a transaction, a node holds it for
+	// the whole run, and MigrateLock only within each transaction. Empty where no
+	// migration has one.
+	ConcurrentLock   string
+	ConcurrentUnlock string
+	SessionLock      string // must return one row whose first column is 1 on success
+	SessionUnlock    string
 	// MigrateLockTimeout bounds how long a migration's DDL waits for a table lock,
 	// run after MigrateLock or SessionLock: a statement queued behind a long query
 	// would otherwise hold back every query on its table meanwhile. A migration that

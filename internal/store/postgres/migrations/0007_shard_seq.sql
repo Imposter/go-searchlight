@@ -14,7 +14,9 @@
 -- sl_changes is keyed by shard and seq, since seqs repeat across shards once they are
 -- on; that key serves what sl_changes_shard_seq served. The index on seq alone serves
 -- nodes from before this schema, which find a change by its seq, until every node runs
--- this one. The key swap holds sl_changes' lock while it builds.
+-- this one. Both are built CONCURRENTLY beforehand (0007_shard_seq.concurrent.sql), so the
+-- key swap holds sl_changes' lock only for the swap itself: the key's columns are NOT
+-- NULL already, so taking the built index as the key reads no row.
 
 CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	index_name TEXT COLLATE "C" NOT NULL,
@@ -26,7 +28,9 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	PRIMARY KEY (index_name, shard)
 );
 
-ALTER TABLE sl_changes DROP CONSTRAINT sl_changes_pkey, ADD PRIMARY KEY (index_name, shard, seq);
+ALTER TABLE sl_changes DROP CONSTRAINT sl_changes_pkey;
+
+ALTER TABLE sl_changes ADD CONSTRAINT sl_changes_pkey PRIMARY KEY USING INDEX sl_changes_key_v7;
 
 DROP INDEX IF EXISTS sl_changes_shard_seq;
 

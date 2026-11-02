@@ -23,6 +23,9 @@ func optionalStatements(d *dialect.Dialect) map[string]bool {
 		// a pooled session.
 		"Maintenance.MigrateLockTimeout": d.Name != "sqlite",
 		"Maintenance.MigrateLockReset":   d.Name != "sqlite" && !m.MigrateInTx,
+		// Only Postgres has a migration that builds outside a transaction.
+		"Maintenance.ConcurrentLock":   d.Name == "postgres",
+		"Maintenance.ConcurrentUnlock": d.Name == "postgres",
 		// Notifications are sent only where the engine can listen.
 		"Changelog.Notify": d.Listen != nil,
 	}

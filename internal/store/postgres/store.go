@@ -34,6 +34,15 @@ var migrations embed.FS
 // migrateLockKey is the advisory lock key migrations hold ("searchlight").
 const migrateLockKey = 0x5345415243484c54
 
+// concurrentLockKey is the advisory lock key a node holds, for the whole run, while it
+// migrates a database where some migration builds CONCURRENTLY. It is not
+// migrateLockKey: a node of an earlier release starting meanwhile waits for that one
+// inside a transaction, and CREATE INDEX CONCURRENTLY, which waits for every
+// transaction running, would deadlock with it. That node takes migrateLockKey and
+// finds nothing it knows to apply; this one takes migrateLockKey only for its
+// transactions.
+const concurrentLockKey = migrateLockKey + 1
+
 // Dialect returns the PostgreSQL dialect. It panics only if the binary lacks its
 // embedded migrations directory.
 func Dialect() *dialect.Dialect {

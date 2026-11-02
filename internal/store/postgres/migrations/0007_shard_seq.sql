@@ -6,7 +6,9 @@
 --
 -- Every shard starts at sl_counter row 1's value, the newest seq of the old global
 -- sequence, so the seqs already stored (documents', queries', if_seq conditions) stay
--- below every new one. Row 1 stays as the floor every new shard starts at.
+-- below every new one. Row 1 stays as the floor every new shard starts at. The
+-- migration locks row 1 before it reads it, so no commit of a node from before this
+-- schema (which takes the same lock) lands between the seeding and the migration's end.
 --
 -- sl_changes is keyed by shard and seq, since seqs repeat across shards now; that key
 -- serves what sl_changes_shard_seq served. The index on seq alone serves nodes from
@@ -22,6 +24,8 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	mapping_version BIGINT NOT NULL,
 	PRIMARY KEY (index_name, shard)
 );
+
+SELECT value FROM sl_counter WHERE id = 1 FOR UPDATE;
 
 INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
 SELECT i.name, g.shard, c.value, i.uid, i.mapping_version

@@ -385,6 +385,7 @@ VALUES ($1, $2, $3, 1, NOW, 1, $4) RETURNING ` + indexColumns)},
 }
 
 var maintenance = dialect.Maintenance{
+	ShardRows:       "SELECT i.name, i.settings, (SELECT COUNT(*) FROM sl_shard_seq s WHERE s.index_name = i.name) FROM sl_indexes i",
 	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq < $3",
 	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = $1 AND at < NOW - $2"),
 	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = $1 AND shard = $2 AND seq >= $3 AND seq < $4",

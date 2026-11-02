@@ -8,9 +8,11 @@
 -- below every new one. Row 1 stays as the floor every new shard starts at.
 --
 -- sl_changes is keyed by shard and seq, since seqs repeat across shards now. SQLite
--- cannot change a table's key, so it is rebuilt, inside the migration's transaction.
--- The index on seq alone serves nodes from before this schema, which find a change by
--- its seq, until every node runs this one.
+-- cannot change a table's key, so it is rebuilt, inside the migration's transaction. It
+-- stays a rowid table: its rows carry document bodies, larger than WITHOUT ROWID
+-- suits, and the key's index serves the reads by shard and seq. Unlike the other
+-- dialects it keeps no index on seq alone: nodes of two versions never share one
+-- SQLite file.
 
 CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	index_name TEXT NOT NULL,
@@ -23,10 +25,11 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 ) WITHOUT ROWID;
 
 WITH RECURSIVE g (shard) AS (SELECT 0 UNION ALL SELECT shard + 1 FROM g WHERE shard < 1023)
-INSERT OR IGNORE INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
+INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
 SELECT i.name, g.shard, c.value, i.uid, i.mapping_version
 FROM sl_indexes i JOIN g JOIN sl_counter c ON c.id = 1
-WHERE g.shard < COALESCE(CAST(json_extract(i.settings, '$.shards') AS INTEGER), 1);
+WHERE g.shard < COALESCE(CAST(json_extract(i.settings, '$.shards') AS INTEGER), 1)
+ON CONFLICT (index_name, shard) DO NOTHING;
 
 CREATE TABLE sl_changes_v7 (
 	seq INTEGER NOT NULL,
@@ -49,5 +52,3 @@ SELECT seq, index_name, shard, kind, id, payload, at, mapping_version, index_uid
 DROP TABLE sl_changes;
 
 ALTER TABLE sl_changes_v7 RENAME TO sl_changes;
-
-CREATE INDEX sl_changes_seq ON sl_changes (seq);

@@ -6,7 +6,14 @@
 --
 -- Every shard starts at sl_counter row 1's value, the newest seq of the old global
 -- sequence, so the seqs already stored (documents', queries', if_seq conditions) stay
--- below every new one. Row 1 stays as the floor every new shard starts at.
+-- below every new one. Row 1 stays as the floor every new shard starts at. MySQL's DDL
+-- is not transactional, so unlike Postgres's the migration cannot hold row 1's lock
+-- to its end: a node from before this schema that commits while it runs can take a
+-- seq the seeding missed. A rolling upgrade's gate (write scaling M4) closes that.
+--
+-- settings.shards is a number, a string of one, null or absent; the last two mean
+-- one shard. A value that is none of those fails the insert, rather than leaving the
+-- index without rows.
 --
 -- sl_changes is keyed by shard and seq, since seqs repeat across shards now; that key
 -- serves what sl_changes_shard_seq served. The index on seq alone serves nodes from
@@ -25,10 +32,11 @@ CREATE TABLE IF NOT EXISTS sl_shard_seq (
 	PRIMARY KEY (index_name, shard)
 ) ENGINE=InnoDB;
 
-INSERT IGNORE INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
+INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version)
 WITH RECURSIVE n (v) AS (SELECT 0 UNION ALL SELECT v + 1 FROM n WHERE v < 31)
 SELECT i.name, a.v * 32 + b.v, c.value, i.uid, i.mapping_version
 FROM sl_indexes i JOIN n a JOIN n b JOIN sl_counter c ON c.id = 1
-WHERE a.v * 32 + b.v < COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(i.settings, '$.shards')) AS SIGNED), 1);
+WHERE a.v * 32 + b.v < COALESCE(CAST(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(i.settings, '$.shards')), 'null') AS SIGNED), 1)
+ON DUPLICATE KEY UPDATE value = sl_shard_seq.value;
 
 ALTER TABLE sl_changes DROP PRIMARY KEY, ADD PRIMARY KEY (index_name, shard, seq), DROP INDEX sl_changes_shard_seq, ADD INDEX sl_changes_seq (seq);

@@ -443,6 +443,10 @@ type Maintenance struct {
 	// (index, shard) -> the horizon after the write.
 	RaiseHorizon Returning
 
+	// ShardRows: () -> name, settings and the number of sequence rows (sl_shard_seq) of
+	// every index.
+	ShardRows string
+
 	// VersionTable creates sl_schema_migrations if it is missing.
 	VersionTable string
 	// AppliedMigrations: () -> version of every applied migration.

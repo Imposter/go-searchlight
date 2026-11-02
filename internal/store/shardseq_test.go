@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -315,4 +316,42 @@ func TestNotifierCoalesces(t *testing.T) {
 	if fmt.Sprint(n.pending) != fmt.Sprint(map[ShardID]int64{a: 5, b: 2}) || len(n.wake) != 1 {
 		t.Fatalf("pending %v, wake %d", n.pending, len(n.wake))
 	}
+}
+
+// TestMigrateNullShards: settings whose shards are null mean one shard, as the store
+// reads them, and the migration seeds that shard's row (from the M1 review).
+func TestMigrateNullShards(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st, all := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql", "0003_change_nonce.sql",
+			"0004_mapping_types.sql", "0005_versions.sql", "0006_body_hash.sql")
+		createOldIndex(t, st, "nul", `{"shards": null}`)
+		engine(st).d.Migrations = all
+		if err := st.Migrate(ctx); err != nil {
+			t.Fatalf("migrate with shards null: %v", err)
+		}
+		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_shard_seq WHERE index_name = ?", "nul"); n != 1 {
+			t.Fatalf("%d sequence rows for an index of one shard", n)
+		}
+		mustApply(t, st, upsert("nul", 0, "a", `{}`))
+	})
+}
+
+// TestMigrateChecksShardRows: once the schema has sequence rows, Migrate fails while an
+// index lacks some of its shards' rows, naming it, rather than leaving its writes to
+// fail one by one.
+func TestMigrateChecksShardRows(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateShards(t, st, "rows", 3)
+		s := engine(st)
+		if _, err := s.w.ExecContext(ctx, rebind(s, "DELETE FROM sl_shard_seq WHERE index_name = ? AND shard = 1"), "rows"); err != nil {
+			t.Fatal(err)
+		}
+		err := st.Migrate(ctx)
+		if err == nil || !strings.Contains(err.Error(), `"rows" has 3 shard(s) and 2 sequence row(s)`) {
+			t.Fatalf("migrate with a sequence row missing: %v", err)
+		}
+	})
 }

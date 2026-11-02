@@ -188,6 +188,7 @@ var indexes = dialect.Indexes{
 }
 
 var maintenance = dialect.Maintenance{
+	ShardRows:       "SELECT i.name, i.settings, (SELECT COUNT(*) FROM sl_shard_seq s WHERE s.index_name = i.name) FROM sl_indexes i",
 	MinSeq:          "SELECT MIN(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq < ?",
 	PruneTombstones: withNow("DELETE FROM sl_tombstones WHERE index_name = ? AND at < NOW - ?"),
 	DeleteChanges:   "DELETE FROM sl_changes WHERE index_name = ? AND shard = ? AND seq >= ? AND seq < ?",

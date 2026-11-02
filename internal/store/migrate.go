@@ -108,6 +108,9 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 	wait := migrateRetryBase
 	for attempt := 1; ; attempt++ {
 		err = s.migrateOnce(ctx, ms)
+		if err == nil && len(ms) > 0 && ms[len(ms)-1].version >= shardSeqSchema {
+			err = s.checkShardRows(ctx)
+		}
 		if err == nil || timedOut == nil || !timedOut(err) || attempt == migrateAttempts {
 			return err
 		}
@@ -118,6 +121,43 @@ func (s *sqlStore) Migrate(ctx context.Context) (err error) {
 		}
 		wait = min(2*wait, migrateRetryCap)
 	}
+}
+
+// shardSeqSchema is the schema version that gives every shard a sequence row.
+const shardSeqSchema = 7
+
+// checkShardRows fails unless every index has exactly a sequence row per shard: an
+// index without them takes no write, and one the migration could not seed is found at
+// once rather than at its first write.
+func (s *sqlStore) checkShardRows(ctx context.Context) error {
+	rows, err := s.r.QueryContext(ctx, s.d.Maintenance.ShardRows)
+	if err != nil {
+		return fmt.Errorf("check the shards' sequence rows: %w", err)
+	}
+	defer rows.Close()
+	var bad []string
+	for rows.Next() {
+		var name string
+		var settings []byte
+		var n int
+		if err := rows.Scan(&name, &settings, &n); err != nil {
+			return err
+		}
+		shards, err := settingsShards(settings)
+		if err != nil {
+			return fmt.Errorf("index %q: %w", name, err)
+		}
+		if n != shards {
+			bad = append(bad, fmt.Sprintf("%q has %d shard(s) and %d sequence row(s)", name, shards, n))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("store: the shards' sequence rows do not match their indexes: %s", strings.Join(bad, "; "))
+	}
+	return nil
 }
 
 // migrateOnce applies the pending migrations under the migration lock. A connection

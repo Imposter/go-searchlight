@@ -246,6 +246,27 @@ var specRouter = sync.OnceValues(func() (routers.Router, error) {
 	return legacyrouter.NewRouter(doc)
 })
 
+// validateRequest checks a request's parameters against api/openapi.yaml.
+func validateRequest(t testing.TB, method, path string) error {
+	t.Helper()
+	router, err := specRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, "http://x"+path, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, params, err := router.FindRoute(req)
+	if err != nil {
+		t.Fatalf("%s %s is no operation of api/openapi.yaml: %v", method, path, err)
+	}
+	return openapi3filter.ValidateRequest(context.Background(), &openapi3filter.RequestValidationInput{
+		Request: req, PathParams: params, Route: route,
+		Options: &openapi3filter.Options{ExcludeRequestBody: true, AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+	})
+}
+
 // validateResponse checks a response against api/openapi.yaml: its status is one the
 // operation lists, and its body matches that response's schema. A request no
 // operation serves (an unmatched path) is skipped.

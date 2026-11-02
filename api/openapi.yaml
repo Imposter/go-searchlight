@@ -351,6 +351,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -605,6 +606,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -712,6 +714,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 
@@ -778,10 +781,11 @@ components:
         deadline, until each shard the read uses has every change up to the token's seq
         of that shard searchable. Shards the token does not name are not waited for.
         The token is opaque and at most 16 KiB; a malformed one, one whose seq is past
-        its shard's newest committed seq, or one of another incarnation of the index
-        (dropped and created again since the write) is a 400. `wait_for_seq`, its
-        predecessor before 2.0, is refused by name.
-      schema: { type: string, maxLength: 16384, pattern: "^[A-Za-z0-9_-]+$" }
+        its shard's newest committed seq, one of another incarnation of the index
+        (dropped and created again since the write), or one naming a shard the index
+        lacks is a 400. Empty, it waits for nothing. `wait_for_seq`, its predecessor
+        before 2.0, is refused by name.
+      schema: { type: string, maxLength: 16384, pattern: "^[A-Za-z0-9_-]*$" }
 
   responses:
     Error:
@@ -840,7 +844,7 @@ components:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
     Timeout:
-      description: The request's deadline passed while it waited (wait_for).
+      description: The request's deadline passed while it waited (wait_for), or, on _bulk, before any of its shards committed.
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }

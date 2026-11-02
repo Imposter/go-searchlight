@@ -73,16 +73,28 @@ func TestTokenRefusesMalformed(t *testing.T) {
 	}
 }
 
+// FuzzParseToken: no input panics, and a token that parses names 1 to MaxTokenShards
+// shards in range, each at a seq in range, and survives a round trip.
 func FuzzParseToken(f *testing.F) {
 	good := &Token{UID: testUID}
 	good.Note(0, 5)
 	good.Note(9, 1<<40)
 	f.Add(good.String())
 	f.Add("")
+	f.Add("AQAAAAAAAAAAAAAAAAAAAAABAQE")
+	f.Add("AQAAAAAAAAAAAAAAAAAAAAD_____________________AQ")
 	f.Fuzz(func(t *testing.T, s string) {
 		tok, err := ParseToken(s)
 		if err != nil {
 			return
+		}
+		if len(tok.Seqs) == 0 || len(tok.Seqs) > MaxTokenShards {
+			t.Fatalf("%q names %d shards", s, len(tok.Seqs))
+		}
+		for sh, seq := range tok.Seqs {
+			if sh < 0 || sh >= MaxTokenShards || seq < 1 || seq > 1<<62 {
+				t.Fatalf("%q names shard %d at seq %d", s, sh, seq)
+			}
 		}
 		again, err := ParseToken(tok.String())
 		if err != nil || fmt.Sprint(again.Seqs) != fmt.Sprint(tok.Seqs) || again.UID != tok.UID {

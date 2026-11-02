@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 )
@@ -114,6 +115,48 @@ func TestBulkWaitForNeedsPercolate(t *testing.T) {
 	}
 	e.problem(e.do("GET", "/indexes/bw/docs/b", ""), http.StatusNotFound, "document_not_found")
 	e.must(http.StatusOK, "POST", "/indexes/bw/_bulk?percolate=true&wait_for="+tok, ndjson(`{"upsert": {"id": "b"}}`, `{"n": 2}`))
+}
+
+// TestWaitForEdges: an empty wait_for (which api/openapi.yaml allows) reads without
+// waiting; a token naming a shard the index lacks is a 400; _fields with entries waits
+// for the token's shards, a 504 at the deadline (which the spec lists); and a token of
+// MaxTokenShards shards at the largest seq fits MaxTokenBytes and parses.
+func TestWaitForEdges(t *testing.T) {
+	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = time.Second }})
+	e.createIndex("we", `{"settings": {"shards": 2}, "mapping": {"fields": {"kl": "keyword_list"}}}`)
+	on := idsOnShards(2)
+	tok := tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/we/docs/"+on[0], `{"kl": ["x"]}`))
+
+	if err := validateRequest(t, "POST", "/indexes/we/_count?wait_for="); err != nil {
+		t.Errorf("api/openapi.yaml refuses an empty wait_for: %v", err)
+	}
+	e.must(http.StatusOK, "POST", "/indexes/we/_count?wait_for=", `{}`)
+
+	pt, err := api.ParseToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pt.Seqs[5] = 1
+	p := e.problem(e.do("POST", "/indexes/we/_count?wait_for="+pt.String(), `{}`), http.StatusBadRequest, "invalid_request")
+	if !hasLoc(p, "params.wait_for") {
+		t.Errorf("a token naming shard 5 of 2: %v", p)
+	}
+
+	e.tailer("we", 0).Pause()
+	tok = tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/we/docs/"+on[0], `{"kl": ["y"]}`))
+	e.problem(e.do("GET", "/indexes/we/_fields?entries=5&wait_for="+tok, ""), http.StatusGatewayTimeout, "timeout")
+	e.tailer("we", 0).Resume()
+
+	big := &api.Token{UID: pt.UID, Seqs: map[int]int64{}}
+	for s := range api.MaxTokenShards {
+		big.Seqs[s] = 1 << 62
+	}
+	if l := len(big.String()); l > api.MaxTokenBytes {
+		t.Errorf("a token of %d shards at the largest seq is %d bytes, over %d", api.MaxTokenShards, l, api.MaxTokenBytes)
+	}
+	if _, err := api.ParseToken(big.String()); err != nil {
+		t.Errorf("the largest token does not parse: %v", err)
+	}
 }
 
 // TestTokenNamesTheShardsWritten: a bulk's token names each shard it committed to, at the

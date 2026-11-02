@@ -6,6 +6,87 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 
 ## [Unreleased]
 
+Searchlight 2.0.0 (unreleased).
+
+Every shard has its own sequence, and a node commits to several shards at once. A write
+answers with a token in place of a seq, and reads wait on it shard by shard.
+
+### Changed (breaking)
+
+- **Per-shard sequences** ([docs/api.md](docs/api.md#conventions)): a change's `seq` is
+  its position in its shard's changelog. Seqs are contiguous per shard and commit in
+  order there; they repeat across shards. Each shard has a row in a new table,
+  `sl_shard_seq`, locked by the transactions that commit to that shard, in key order
+  (index name, shard), so commits to different shards run in parallel and never
+  deadlock; a mapping change or a drop locks every shard row of the index, in shard
+  order. `sl_counter` row 1 is now the floor: new shards start at it, a dropped index
+  raises it past its shards' seqs, and a shard with no row stands at it. Row 2 still
+  issues copy epochs.
+- **A bulk commits shard by shard** ([docs/api.md](docs/api.md#bulk)): each shard's
+  operations commit in one transaction of their own, so a request is whole or nothing
+  only on one shard. On SQLite the whole request is still one transaction, but clients
+  must not rely on it.
+- **Per-item results for a failed shard**: when a shard's transaction fails (the
+  database cannot be reached, the deadline passes), every operation of that shard is
+  answered with that 5xx error in its item while the other shards' commit, and
+  `errors` is true. Only when nothing was written is the request itself an error
+  (5xx). With `percolate=true` only committed documents are percolated: a failed
+  shard's operations carry no `queries`.
+- **The token replaces the scalar seq for read-your-writes**
+  ([docs/api.md](docs/api.md#tokens)). Every write response carries `token`, an opaque
+  string naming, for each shard the write committed to (or found an unchanged document
+  on), the newest seq there, plus the index's incarnation. Tokens merge by per-shard
+  maximum.
+  - Reads take `wait_for=<token>` (`_search`, `_count`, `_percolate`, `_fields`, `GET`
+    of a document or saved query, the saved-query listing, and `_bulk` with
+    `percolate=true`) and wait only on the shards they read; a `GET` only on its
+    document's shard. A malformed token, a seq past its shard's newest committed seq, a
+    token of another incarnation of the index, or one naming a shard the index lacks
+    is a 400 at `params.wait_for`.
+  - **`wait_for_seq` is removed**: it is refused by name with a 400 at
+    `params.wait_for_seq` ("wait_for_seq was removed in 2.0: pass the token a write
+    returned as wait_for").
+  - **`_bulk` responses lose their top-level `seq`** and gain `token` (absent when
+    nothing was written). Items keep their `seq`.
+  - **`percolated_seq` is replaced by `percolated_at`**, a token of where each shard
+    stood for the percolation.
+  - Single-document and saved-query writes keep `seq` (the document's own, for
+    `if_seq`) and add `token`. `if_seq`, `_seq` on hits, `version` and `current_seq` are
+    unchanged and remain per document.
+- **Commit notifications** on Postgres are sent after the commit, coalesced, with
+  `synchronous_commit` off. A lost one costs a copy up to half `max_lag` (1 s by
+  default).
+
+### Added
+
+- **`write_transactions`** ([docs/operations.md](docs/operations.md#every-setting)), a
+  node setting: a node's group committer has a lane per shard and runs up to this many
+  transactions at once (16 by default, at most half the store's write pool; 1 on
+  SQLite, where a request's shards commit together in one transaction). Postgres's
+  `max_connections` must cover nodes × (`write_transactions` + about 16 for reads); a
+  refused connection (53300) fails with an error saying so.
+- **Retry guidance** ([docs/api.md](docs/api.md#retrying-after-a-5xx)): a 5xx response,
+  or a 5xx bulk item, may or may not have committed. Retry with conditions that make a
+  repeat safe: the same unconditional upsert body (an unchanged upsert is a noop,
+  unless `detect_noop=false`), `if_seq`, `version`, or `op_type=create`. A delete of
+  nothing is a 404.
+- Schema migration 7 creates `sl_shard_seq`, seeding every shard at the old global
+  head, and re-keys `sl_changes` by (index name, shard, seq). On Postgres and MySQL it
+  keeps an index on `seq` alone for the rolling-upgrade window, to be dropped in 2.1.
+
+### Upgrading
+
+- **Do not deploy 2.0 to a cluster with 1.x nodes.** Mixed 1.x and 2.x clusters are not
+  supported until the rolling-upgrade gate lands (planned). Stop every 1.x node before
+  the first 2.0 node starts.
+- **Move clients to the token first.** Clients (scrape-bot among them) must move from
+  `wait_for_seq`, the bulk response's `seq` and `percolated_seq` to `token`,
+  `wait_for` and `percolated_at` before they talk to a 2.0 node.
+- **Migration 7 takes time on a large changelog.** Postgres's key swap holds
+  `sl_changes`' ACCESS EXCLUSIVE lock while it builds, about 4.5 s per million
+  changelog rows measured on a workstation; MySQL rebuilds in place online, about 18 s
+  per million; SQLite rebuilds the table, about 33 s per 3 million. Plan for the pause.
+
 ## [1.8.0] - 2026-10-31
 
 ### Added

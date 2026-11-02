@@ -17,7 +17,7 @@ database (Postgres, MySQL or SQLite), and nowhere else:
   record, each row with the seq of its last write and the client version it named.
   `sl_tombstones` keeps the version of each id a delete removed, with when, for the
   index's `gc_deletes`. A versioned change is checked inside its transaction, under the
-  counter lock, against the greater of the row's version and the tombstone's: at or below
+  shard's `sl_shard_seq` row lock, against the greater of the row's version and the tombstone's: at or below
   it, the change is dropped as a noop and takes no seq. An unversioned upsert keeps the
   row's version (the upsert statement leaves it), so versions only rise. A saved query's
   version also rides its changelog payload, so copies index it with the query
@@ -48,7 +48,7 @@ flowchart LR
 |---|---|
 | `cmd/searchlight` | Wiring: config, telemetry and the admin listener, store, cluster node, public listener, signals and the shutdown order |
 | `internal/config` | Every setting from flags, `SEARCHLIGHT_*` variables and `*_FILE` secrets, validated at start |
-| `internal/api` | The public HTTP API: routing, auth, limits and backpressure, problem JSON, `refresh` and `wait_for_seq`, readiness, graceful drain |
+| `internal/api` | The public HTTP API: routing, auth, limits and backpressure, problem JSON, `refresh` and `wait_for` tokens, readiness, graceful drain |
 | `internal/cluster` | `cluster.Node`, the only coordinator, a cluster of one included. It covers membership, leases and fencing, the allocator, peer recovery, routing with adaptive replica selection and retries, push hints, maintenance (pruning), cluster health and the rolling shutdown |
 | `internal/node` | The engine under the cluster node: the index catalogue, the write path (analysis, mapping updates, group commit), one hosted copy and tailer per shard, reads with read-your-writes, scatter-gather and reduce |
 | `internal/replica` | The tailer: keeps one shard copy in step with the changelog (recovering, tailing, halted) |
@@ -79,9 +79,9 @@ sequenceDiagram
   participant P as peer nodes
   Cl->>Co: PUT doc / _bulk
   Co->>Co: analyze and validate, add new dynamic fields to the stored mapping
-  Co->>DB: group commit: lock sl_counter, take contiguous seqs, insert changes and records
+  Co->>DB: group commit, one transaction per shard: lock its sl_shard_seq row, take contiguous seqs, insert changes and records
   DB-->>Co: committed
-  Co-->>Cl: 200 {seq}
+  Co-->>Cl: 200 {token}
   Co->>T: wake local tailers
   Co->>P: push hint "shard S has seq N"
   P->>T: wake their tailers
@@ -95,22 +95,33 @@ sequenceDiagram
    write. If the write brings new dynamic fields, it adds them to the stored mapping
    first: the database's mapping is the one arbiter of a field's type, so every copy
    analyzes the document alike.
-2. **Commit.** The changes go through the node's group committer. Concurrent requests on
-   a node are coalesced into one transaction every few milliseconds, as Elasticsearch
-   amortizes translog fsyncs.
-   - `Apply` locks the counter row and takes contiguous seqs, then inserts the change
-     rows and the document or query rows, and commits.
-   - Commit order therefore equals seq order, and a tailer never skips a change that
-     commits late.
-   - The write is acknowledged with its seq only after the commit.
+2. **Commit.** Every shard has its own sequence, and the changes go through the node's
+   group committer, which has a lane per shard. A request is split by shard, and
+   concurrent requests to a shard on a node are coalesced into one transaction every
+   few milliseconds, as Elasticsearch amortizes translog fsyncs. Lanes commit at the
+   same time, up to the node's `write_transactions` (1 on SQLite, where a request's
+   shards commit together in one transaction).
+   - `Apply` locks the shard's row in `sl_shard_seq` and takes contiguous seqs of that
+     shard, then inserts the change rows and the document or query rows, and commits.
+     Rows are locked in key order (index name, shard), so transactions on different
+     shards run in parallel and never deadlock.
+   - Commit order on a shard therefore equals seq order, and a tailer never skips a
+     change that commits late.
+   - A request is whole or nothing only on one shard: a shard whose transaction fails
+     fails its own operations, and the other shards' commit.
+   - The write is acknowledged with its token, each written shard's newest seq, only
+     after the commit.
 3. **Wake-up.** The node never writes a shard itself. It wakes its own tailers, and the
    cluster pushes a hint to the peers holding copies of the written shards.
-   - On Postgres, `LISTEN/NOTIFY` also wakes every tailer.
+   - On Postgres, `NOTIFY`, sent after the commit and coalesced, also wakes every
+     tailer. A lost one costs a copy up to half `max_lag`.
    - Polling every `changelog_poll_interval` is the safety net everywhere.
 4. **Apply.** Each copy's tailer reads `ChangesAfter(shard, appliedSeq)`, analyzes the
-   changes and applies them to the shard's write buffer. Seqs are global, so a shard
-   sees gaps. A short page proves that nothing below the head is missing, and the copy
-   advances past the gap.
+   changes and applies them to the shard's write buffer. Seqs are contiguous per shard.
+   A shard can still start above its last change (a new shard starts at the floor,
+   `sl_counter` row 1, and the 2.0 migration seeded every shard at the old global
+   head), so the tailer reads the shard's head before each page: a short page proves
+   that nothing below the head is missing, and the copy advances to it.
 5. **Refresh is visibility.** Refreshes tick on a fixed grid, every `refresh_interval`
    from the copy's open, so a refresh's own cost never stretches the period. One that
    overruns skips the ticks it missed. `refresh=true` forces one at once, and a full
@@ -171,10 +182,11 @@ seq, which is at most `flush_interval` of changes.
   attempt's work. The group committer drops a caller gone before its batch flushes and
   cancels a transaction once every caller in it has gone; a cancel that reaches a
   transaction already in its commit does not stop it, so a request can commit after
-  its caller has been answered with the cancellation (a 499 nobody reads). A request
-  commits in one transaction, so it is committed whole or not at all, and the client's
-  retry is idempotent: an attempt that committed makes the retry's upserts noops at
-  their stored seqs.
+  its caller has been answered with the cancellation (a 499 nobody reads). Each shard's
+  part of a request commits in one transaction, so it is committed whole or not at
+  all, though some shards may commit and others not. The client's retry of the same
+  upserts is idempotent: a shard that committed makes the retry's upserts there noops
+  at their stored seqs.
 
 **Why the changelog keeps the body.** Each upsert writes its body twice, in its
 `sl_changes` row and in its `sl_documents` row, in the one statement of the commit
@@ -182,12 +194,12 @@ seq, which is at most `flush_interval` of changes.
 that row holds only the newest version of the document, so a tailer applying change
 `s` of a document rewritten at `s' > s` (or deleted) would find another body or none.
 It would then either skip `s`, leaving a copy that reports `s` applied without the
-write a client waits for with `wait_for_seq=s`, or apply `s'`'s body early, leaving a
+write a client waits for with a token naming `s`, or apply `s'`'s body early, leaving a
 copy whose state at `s` never existed and whose per-document seqs (`_seq`) and halts
 point at the wrong change; recovery replays the changelog from a snapshot's seq and
 would hit the same. Keeping a hash in the changelog in place of the body has the same
 problem. The cost of the second copy is the database's (its WAL and storage, the time
-the counter lock is held), not Searchlight's CPU: on a one-core node writing to
+the shard's row lock is held), not Searchlight's CPU: on a one-core node writing to
 Postgres (slbench writeload, 150k listings), the whole commit is about 4% of the
 node's CPU, against 20% for analysis (before it was done once) and 28% for merges.
 
@@ -507,7 +519,7 @@ flowchart LR
   `store_url`, plus `advertise_address` when its listen address is not what peers dial.
 - **Slots and epochs.** Each shard copy is a slot in `sl_shard_copies`, held under a
   lease (`lease_ttl`: 10 s, or 30 s on SQLite) with a **fencing epoch** taken from a
-  database counter at each claim. Every registry write a copy makes is conditional on
+  database counter (`sl_counter` row 2) at each claim. Every registry write a copy makes is conditional on
   its slot, node and epoch, so a node that lost its lease gets `ErrLeaseLost` and can
   never overwrite its successor.
 - **Local deadline.** The node renews its leases on the heartbeat tick. It keeps a local

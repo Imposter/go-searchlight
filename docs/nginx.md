@@ -157,7 +157,7 @@ http_502 http_503` rather than add to them.)
   `request_timeout` (30 s by default), the node's own per-request deadline — not above
   any `timeout` a client puts *inside* a search body, which is Searchlight's own
   concern and answered with `timed_out: true` rather than by hanging, and not
-  specially raised for `refresh=wait_for` or `?wait_for_seq=N` either: both run under
+  specially raised for `refresh=wait_for` or `?wait_for=<token>` either: both run under
   the same request deadline, they don't get their own budget. 35 s (`request_timeout`
   plus 5 s of margin) is the shipped default; raise both together if you raise
   `request_timeout`.

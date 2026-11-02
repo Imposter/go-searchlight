@@ -491,7 +491,7 @@ the same shard contents from them, as Elasticsearch's shard request cache does
   replay after a crash. A clean shutdown always flushes.
 - **Refresh on demand.** An index whose `refresh_interval` is `-1` never refreshes on a
   timer. A request that waits for a seq refreshes the copy itself once the copy has
-  applied it: a read's `wait_for_seq`, a write's `refresh=wait_for` or `true`, and a
+  applied it: a read's `wait_for` token, a write's `refresh=wait_for` or `true`, and a
   percolation, which waits for the saved queries written through its node. Without such
   a wait, writes stay invisible until one comes.
 

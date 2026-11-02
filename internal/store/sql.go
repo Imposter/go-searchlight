@@ -455,7 +455,7 @@ func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepare
 	}
 	for attempt := 1; ; attempt++ {
 		err = s.applyOnce(ctx, batch, p)
-		if err == nil || attempt == applyAttempts || !s.retryable(err) || ctx.Err() != nil {
+		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errNoShardRow) || ctx.Err() != nil {
 			return err
 		}
 		s.log.DebugContext(ctx, "retrying apply after a transient failure", slog.Int("attempt", attempt), slog.Any("error", err))
@@ -665,7 +665,7 @@ func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, 
 		case h == nil && c.Shard >= n && bad == nil:
 			bad = &ChangeError{Position: i, Err: invalidf("index %q has %d shard(s); shard %d does not exist", c.Index, n, c.Shard)}
 		case h == nil && bad == nil:
-			bad = fmt.Errorf("store: %s has no sequence row", c.ShardID())
+			bad = fmt.Errorf("%s: %w", c.ShardID(), errNoShardRow)
 		}
 	}
 	if nf != nil {
@@ -673,6 +673,12 @@ func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, 
 	}
 	return bad
 }
+
+// errNoShardRow is a shard of an existing index found without its sequence row: the
+// index was dropped and created again between the lock and the catalogue's read (the
+// lock waited on the drop, and read committed shows the new index only to the next
+// statement), so the attempt is run again.
+var errNoShardRow = errors.New("store: the shard has no sequence row")
 
 // provisionalSeqs are the seqs batch's changes would take if every one applied, each
 // shard's in batch order from its newest seq on, as checkConditions judges them.

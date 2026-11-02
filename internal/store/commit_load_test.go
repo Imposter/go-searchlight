@@ -71,8 +71,13 @@ func commitLoads() []commitLoad {
 			)
 		}
 	}
-	for _, writers := range []int{1, 16, 64} {
-		for _, shards := range []int{1, 64} {
+	for _, shards := range []int{1, 64} {
+		out = append(out,
+			commitLoad{nodes: 1, writers: 1, shards: shards, bulk: 1},
+			commitLoad{nodes: 1, writers: 1, shards: shards, bulk: 1, direct: true, noNotify: true},
+			commitLoad{nodes: 1, writers: 1, shards: shards, bulk: 1, direct: true, asyncCommit: true},
+		)
+		for _, writers := range []int{1, 16, 64} {
 			for _, bulk := range []int{1, 64} {
 				out = append(out, commitLoad{nodes: 1, writers: writers, shards: shards, bulk: bulk, direct: true})
 			}

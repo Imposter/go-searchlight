@@ -55,7 +55,7 @@ func TestBodyCodecGate(t *testing.T) {
 		if n0.zstdBodies.Load() {
 			t.Fatal("compressing bodies while a node without codecs is live")
 		}
-		if f, err := old.Registry().Features(ctx); err != nil || len(f) != 0 {
+		if f, err := old.Registry().Features(ctx); err != nil || !f[store.FeatureZstdBodies].IsZero() {
 			t.Fatalf("features while a node without codecs is live: %v %v", f, err)
 		}
 
@@ -139,7 +139,7 @@ func TestEveryNodeReadsCodecs(t *testing.T) {
 			for _, c := range tc.copies {
 				v.copies[c.Shard] = append(v.copies[c.Shard], c)
 			}
-			if got := n.everyNodeReadsCodecs(v); got != tc.want {
+			if got := n.everyNode(v, func(nd store.Node) bool { return nd.BodyCodecs >= store.BodyCodecs }); got != tc.want {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})

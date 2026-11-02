@@ -78,6 +78,14 @@ format is given at the end.
   `wait_for_seq`, the scalar it replaces, is refused by name, a 400 at
   `params.wait_for_seq`: "wait_for_seq was removed in 2.0: pass the token a write
   returned as wait_for".
+- **After a failover that lost commits** (asynchronous replication; see
+  [Failures](clustering.md#failures)), the new primary issues the lost seqs again. A
+  token taken before the failover may name a seq past its shard's head: it is a 400
+  until new writes reach that seq, and from then on the reissued change satisfies it,
+  though it is not the write the token came from. The 2.0 token carries no epoch to
+  tell the two apart; a generation stamp that does is left to a later change. The lost
+  writes themselves are gone (see [Retrying after a 5xx](#retrying-after-a-5xx) for
+  writing them again safely).
 - **Format.** base64url, unpadded, of: a version byte (1), the uid's 16 bytes, a uvarint
   count n, then n pairs, shards ascending: a uvarint shard delta (the shard less the
   previous one, the previous being -1 at the start) and a uvarint seq (at least 1). It

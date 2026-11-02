@@ -71,10 +71,12 @@ func lockTimedOut(err error) bool {
 }
 
 // alreadyApplied reports DDL that an interrupted migration had already run: a
-// duplicate column (1060), table (1050) or index name (1061).
+// duplicate column (1060), table (1050) or index name (1061), or a column or index to
+// drop that is gone (1091). An ALTER TABLE is atomic, so one that fails that way had
+// run whole.
 func alreadyApplied(err error) bool {
 	var me *mysql.MySQLError
-	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061)
+	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061 || me.Number == 1091)
 }
 
 // Config converts a store URL of the form

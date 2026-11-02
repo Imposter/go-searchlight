@@ -72,7 +72,6 @@ func TestTokenOfRecreatedIndexOnLaggingNode(t *testing.T) {
 	})
 }
 
-
 // TestFieldsWithTokenOnLaggingNode: a write through node 0 maps a new field; node 1,
 // which has not synced its catalogue since, lists it in _fields given that write's
 // token (read-your-writes), with entries or without.

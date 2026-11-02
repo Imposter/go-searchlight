@@ -435,6 +435,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 

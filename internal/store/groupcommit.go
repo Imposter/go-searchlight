@@ -226,14 +226,7 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 	if err := g.submit(parts); err != nil { //nolint:contextcheck // a lane outlives its requests; each transaction carries its callers' contexts
 		return err
 	}
-	errs := make([]error, len(parts))
-	for i, part := range parts {
-		select {
-		case errs[i] = <-part.req.result:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	errs := await(ctx, parts)
 	if len(parts) == 1 {
 		if errs[0] == nil {
 			parts[0].copyBack(batch)
@@ -255,6 +248,40 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 		return pe
 	}
 	return nil
+}
+
+// await collects each part's result. When ctx ends first, a part whose result is
+// already back keeps it and the rest get ctx's error, so a request split by shard
+// still reports the shards that committed before the deadline. A part given up on may
+// yet commit; its items then answer with the deadline although their changes landed,
+// as any transaction whose outcome the caller did not see. Once ctx has ended, a part
+// that failed by cancellation (its transaction is cancelled when every caller in it
+// has given up, this one included) answers with ctx's own error.
+func await(ctx context.Context, parts []*gcPart) []error {
+	errs := make([]error, len(parts))
+	for i, part := range parts {
+		select {
+		case errs[i] = <-part.req.result:
+			continue
+		case <-ctx.Done():
+		}
+		for k := i; k < len(parts); k++ {
+			select {
+			case errs[k] = <-parts[k].req.result:
+			default:
+				errs[k] = ctx.Err()
+			}
+		}
+		break
+	}
+	if done := ctx.Err(); done != nil {
+		for i, err := range errs {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				errs[i] = done
+			}
+		}
+	}
+	return errs
 }
 
 // copyBack sets the request's changes' seqs and noops from the part's, once the part

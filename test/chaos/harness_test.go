@@ -3,6 +3,7 @@
 package chaos
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -117,6 +118,115 @@ func binaries(t *testing.T) (old, cur string) {
 	return builds.old, builds.cur
 }
 
+// envFromRelease names the release tag TestRollingUpgradeFromRelease upgrades from
+// (default fromRelease); the test skips when the checkout lacks it.
+const (
+	envFromRelease = "SEARCHLIGHT_CHAOS_FROM_RELEASE"
+	fromRelease    = "v1.8.0"
+)
+
+var release struct {
+	once     sync.Once
+	tag, bin string
+	skip     string
+	err      error
+}
+
+// releaseBinary builds the release the cross-release upgrade starts from, from its tag's
+// tree (git archive), or skips the test when git or the tag is missing.
+func releaseBinary(t *testing.T) (tag, bin string) {
+	t.Helper()
+	release.once.Do(func() {
+		tag := os.Getenv(envFromRelease)
+		if tag == "" {
+			tag = fromRelease
+		}
+		release.tag = tag
+		if err := exec.Command("git", "rev-parse", "--verify", "--quiet", tag+"^{commit}").Run(); err != nil {
+			release.skip = fmt.Sprintf("tag %s is not in this checkout (git fetch --tags)", tag)
+			return
+		}
+		_, _ = binaries(t)
+		src := filepath.Join(builds.dir, "src-"+tag)
+		if err := os.MkdirAll(src, 0o750); err != nil {
+			release.err = err
+			return
+		}
+		if err := unpackTag(tag, src); err != nil {
+			release.err = err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		dir := filepath.Join(builds.dir, tag)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			release.err = err
+			return
+		}
+		release.bin, release.err = slproc.BuildFrom(ctx, src, dir, strings.TrimPrefix(tag, "v"))
+	})
+	if release.skip != "" {
+		t.Skip(release.skip)
+	}
+	if release.err != nil {
+		t.Fatal(release.err)
+	}
+	return release.tag, release.bin
+}
+
+// unpackTag writes the whole tree of tag into dir.
+func unpackTag(tag, dir string) error {
+	top, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return fmt.Errorf("find the repository: %w", err)
+	}
+	cmd := exec.Command("git", "archive", "--format=tar", tag)
+	cmd.Dir = strings.TrimSpace(string(top))
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("git archive %s: %w", tag, err)
+	}
+	tr := tar.NewReader(out)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read the archive of %s: %w", tag, err)
+		}
+		path := filepath.Join(dir, filepath.FromSlash(h.Name))
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(path, 0o750); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(f, tr)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		return err
+	}
+	return cmd.Wait()
+}
+
 // pgURL creates a schema for the test on the Postgres in SEARCHLIGHT_TEST_PG_URL and
 // returns a store_url whose search_path is it, or skips the test without one.
 func pgURL(t *testing.T) string {
@@ -170,6 +280,9 @@ type cluster struct {
 	// was refused: set while nodes stop gracefully, which must never cut a request they
 	// accepted.
 	refusedOnly bool
+	// mixed is set while nodes of two releases serve: a read then asks for no
+	// read-your-writes position, since each release refuses the other's parameter.
+	mixed atomic.Bool
 }
 
 // member is one node of the cluster, as the load balancer sees it.
@@ -673,7 +786,7 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 		default:
 			path, body = "/indexes/"+index+"/_search", `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand", "size": 10}}}}`
 		}
-		if !c.write503 {
+		if !c.write503 && !c.mixed.Load() {
 			// Read-your-writes through the balancer: the merge of the acknowledged
 			// writes' tokens, which any node checks against the database's heads. While
 			// the database is down a node cannot, and answers 503: that scenario reads

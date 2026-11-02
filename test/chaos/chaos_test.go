@@ -471,3 +471,48 @@ func orphanSegments(t *testing.T, dataDir string) []string {
 	}
 	return out
 }
+
+// TestRollingUpgradeFromRelease: a rolling upgrade from the last release before shard
+// sequences (fromRelease) under write and read load. Each node in turn stops gracefully
+// and starts on this build; while nodes of both serve, every commit takes the global
+// sequence and reads ask for no position (each release refuses the other's
+// read-your-writes parameter). Once every node runs this build the leader turns shard
+// sequences on, and reads wait for the writes' tokens again. No client sees an error,
+// nothing acknowledged is lost, and the copies converge.
+func TestRollingUpgradeFromRelease(t *testing.T) {
+	tag, old := releaseBinary(t)
+	_, cur := binaries(t)
+	c := newCluster(t, 3, old)
+	c.refusedOnly = true
+	c.mixed.Store(true)
+	c.createIndex()
+	m := newModel()
+	l := c.startLoad(m, 4, 3)
+	l.waitWrites(t, 2000)
+	for i, mb := range c.members {
+		mb.disrupted.Store(true)
+		start := time.Now()
+		if err := mb.Stop(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		mb.UseBinary(cur)
+		c.restart(i)
+		c.assertReopened(i, true)
+		c.waitGreen(3 * time.Minute)
+		t.Logf("upgraded %s from %s in %s", mb.NodeID(), tag, time.Since(start).Round(time.Millisecond))
+		l.waitWrites(t, 1000)
+	}
+	waitUntil(t, 2*time.Minute, "the leader turns shard sequences on", func() bool {
+		for _, mb := range c.members {
+			if strings.Contains(mb.Logs().TailExcept(100000, "request served"), "turned the cluster's shard_seqs feature on") {
+				return true
+			}
+		}
+		return false
+	})
+	c.mixed.Store(false)
+	l.waitWrites(t, 2000)
+	l.stop()
+	c.settle(m)
+	c.verify(m)
+}

@@ -46,7 +46,15 @@ func Build(ctx context.Context, dir, version string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("slproc: go env GOMOD: %w", err)
 	}
-	root := filepath.Dir(strings.TrimSpace(string(gomod)))
+	return BuildFrom(ctx, filepath.Dir(strings.TrimSpace(string(gomod))), dir, version)
+}
+
+// BuildFrom is Build of the source tree at root, such as an earlier release's.
+func BuildFrom(ctx context.Context, root, dir, version string) (string, error) {
+	goTool, err := exec.LookPath("go")
+	if err != nil {
+		return "", fmt.Errorf("slproc: no go tool on PATH to build searchlight with: %w", err)
+	}
 	script := exec.CommandContext(ctx, "sh", "tools/ldflags.sh", version)
 	script.Dir = root
 	ldflags, err := script.Output()

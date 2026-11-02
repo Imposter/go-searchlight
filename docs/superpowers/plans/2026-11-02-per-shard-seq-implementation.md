@@ -85,10 +85,34 @@ multi-shard writes without deadlock and every change after a remap carries its v
 start above its past; heads, tips, snapshots and horizons are per shard; and a database from 1.x migrates with
 every shard at the old head, on every dialect.
 
-**Left for M2 and M3** (to be listed exactly when M1 ends, from the runs of 1.9): the node's single head (`n.head`,
-`checkHead`, `noteHead`, `lowerHead`) reads `TopSeq`; `waitWritten` and `wait_for_seq` wait every shard for one
-seq, so a multi-shard write or read with a wait times out (504) where the shards' seqs differ; `res.Seq` is a
-maximum over shards; tailer lag still counts against the shard's own head only, which is already right.
+**Left for M2 and M3**, as M1 ended (the short tier of `api`, `cluster`, `node` and `replica` on SQLite and
+Postgres, 2026-11-02). Everything compiles, `go vet` (also `GOOS=linux` and `-tags chaos`) and `golangci-lint` are
+clean. What fails falls into three causes:
+
+1. **`wait_for_seq` is a scalar waited on every shard (M3).** A seq taken on one shard is waited for on every shard,
+   whose seqs are their own now, so a read with `wait_for_seq` on a multi-shard index times out (504). All 11
+   `api` failures (`TestSearch`, `TestSavedQueriesAndPercolate`, `TestFieldsAndCluster`, `TestDateMath`,
+   `TestEndToEndOnEveryDialect`, `TestReadYourWrites`, `TestNestedFields`, `TestUnchangedUpsertIsANoop`,
+   `TestPointFields`, `TestMaxStalenessServesCachedResults`, `TestSuitesOnSingleNodeCluster`); in `node`
+   `TestSearchDateMathFollowsTheClock`, `TestFilterAggsAndPostFilterDateMathFollowTheClock`, `TestPercolateBoxDateMath`,
+   `TestSearchBoxFollowsTheClock`, `TestPatchMappingAddsAPointField`, `TestRequestCacheOnANode`,
+   `TestRestartKeepsData`, `TestSearchMatchesBruteForce`, `TestDatabaseUnreachable`; in `cluster` the peer reads that
+   answer 503 "no copy of shard N answered" (`TestReadRightAfterCreateOnAnotherNode`, the `OlderPeerRefused*`,
+   `*ThroughPeers`, `TestWireNestedSubAggs`, `TestReadRereadsTheCopyTable`) and the 60 s waits
+   (`TestMultiShardSearchAcrossNodes`, `TestFetchAfterPinLostRetries`, `TestFromAcrossNodes`,
+   `TestDatePercolationMovesPastAnOlderCopy`). `TestStopStopsTheTailersBeforeMarkingRetiring` waits forever in a
+   test helper's read with `wait_for_seq` and no deadline, so the `cluster` run hits its timeout.
+2. **Tests that assert one global sequence (M2, M3).** `node`'s `TestWriteValidation` (contiguous seqs across a
+   bulk) and `TestRewindLowersTheNodesHead` (the node's single head), `cluster`'s `TestConcurrentWritersOnEveryNode`
+   (the changelog's global contiguity).
+3. **The rewind suite (M2, task 2.3).** `replica`'s `TestChangelogRewindRebuildsTheCopy`,
+   `TestRebuiltCopyReportsItsOwnSeq`, `TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy` and
+   `TestStoppedAcrossARewindAfterIdleAdvancesRebuildsTheCopy`: their `rewind` helper moves `sl_counter` row 1, not the
+   shard's sequence row, and two of them stage idle advances over another shard's seqs, which no longer exist.
+
+Temporary code M2 removes: `Store.TopSeq` and the node's single head that reads it (`read.go` `checkHead`,
+`single.go`'s start), and the commit loop's PartialError handling in `node/write.go`, which M3 replaces with per-item
+results. Moved forward from M2 (task 2.4): `waitWritten` waits each shard for its own seq.
 
 ## M2: node and replica
 

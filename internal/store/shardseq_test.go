@@ -424,7 +424,8 @@ func TestTooManyConnectionsSaysSo(t *testing.T) {
 	_, end := s.start(context.Background(), "apply")
 	err := fmt.Errorf("begin: %w", refused)
 	end(&err)
-	if !errors.Is(err, refused) || !strings.Contains(err.Error(), "max_connections") || !strings.Contains(err.Error(), "write_transactions") {
+	msg := err.Error()
+	if !errors.Is(err, refused) || !strings.Contains(msg, "max_connections") || !strings.Contains(msg, fmt.Sprintf("pools up to %d connections", s.writeConns())) || strings.Contains(msg, "write_transactions") {
 		t.Fatalf("got %v", err)
 	}
 }

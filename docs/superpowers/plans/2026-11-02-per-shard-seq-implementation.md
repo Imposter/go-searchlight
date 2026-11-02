@@ -51,10 +51,11 @@ These refine the approved plan. Where one departs from it, the reason is given.
    its row count, and only the lock keeps two updates from both succeeding.
 5. **The committer pool.** A lane per shard, run by a goroutine while it has requests, and a semaphore bounding
    the transactions in flight: `GroupCommitOptions.MaxTransactions`, the node's `write_transactions`, by default 16
-   and at most half the store's write pool (1 on SQLite). Phase 0 found 32 faster than 8 or 64, but every
-   transaction holds a connection, and three nodes at 32 pass Postgres's default `max_connections` of 100, which
-   refuses them with 53300 (not retryable): the store says so in the error, and `docs/operations.md` sizes
-   `max_connections`. The batching window is waited out before a
+   and at most half the store's write pool (1 on SQLite). Phase 0 found 32 faster than 8 or 64. Every
+   transaction holds a connection of the node's one pool of 64, which its reads share, so a busy node can hold 64
+   (plus `LISTEN`) whatever `write_transactions` is: `max_connections` must cover nodes × 65 (M2 review), and
+   Postgres's default of 100 refuses a second busy node with 53300 (not retryable). The store's error names the
+   pool size and `max_connections`, and `docs/operations.md` sizes it. The batching window is waited out before a
    slot is taken, so a waiting lane holds no connection. A lane takes everything pending when its slot comes, up to
    the change and byte limits, so a backlog commits in full batches.
 6. **Notifications leave the transaction.** After a commit, each shard's newest seq goes to a per-store notifier,

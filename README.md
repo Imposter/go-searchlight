@@ -38,7 +38,8 @@ SQLite; write throughput on Postgres and MySQL is not measured yet
 - **Search scales with nodes.** Matching, sorting, aggregations and percolation run in the
   nodes, on memory-mapped segments on local disk; the database does no text work. Add
   nodes for read and percolation load; each node opens up to 64 pooled database
-  connections (plus one for `LISTEN` on Postgres).
+  connections, shared by its reads and writes (plus one for `LISTEN` on Postgres), so
+  the database's connection limit must cover nodes × 65.
 - **Near-real-time, not instant.** A write is searchable within the refresh interval (1 s
   by default). `refresh=wait_for`, or passing the token a write returns as `wait_for` on
   a read, gives read-your-writes.

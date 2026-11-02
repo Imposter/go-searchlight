@@ -304,13 +304,15 @@ target doesn't drop below it just because one copy is being rebuilt.
 
 ## Postgres sizing and settings
 
-- **`max_connections`.** Each node opens up to 64 connections for its own pool plus one
-  dedicated connection for `LISTEN`, so set Postgres's `max_connections` to at least 65
-  per node, plus headroom for `psql`, backups and migrations (operations.md's
-  [Databases](operations.md#databases) table has the exact per-dialect connection
-  counts; `deploy/compose.yml`'s three-node example sets `max_connections=300`). At the
-  least, it must cover nodes × (`write_transactions` + about 16 for reads); a refused
-  connection (SQLSTATE 53300) fails with an error saying so.
+- **`max_connections`.** Each node opens up to 64 connections, one pool shared by its
+  reads and writes, plus one dedicated connection for `LISTEN`. A busy node can hold all
+  65, so set Postgres's `max_connections` to at least nodes × 65, plus headroom for
+  `psql`, backups and migrations: three nodes need 195 and more (operations.md's
+  [Databases](operations.md#databases) table has the per-dialect connection counts;
+  `deploy/compose.yml`'s three-node example sets `max_connections=300`).
+  `write_transactions` bounds only the writes' share of the pool, so lowering it does
+  not lower the total. A refused connection (SQLSTATE 53300) fails the operation with an
+  error that names the pool size and `max_connections`.
 - **PgBouncer: session mode only if you need `LISTEN/NOTIFY`.** A node holds one
   connection open for the lifetime of the process and issues a raw `LISTEN` on it
   (`internal/store/postgres/store.go`); that only works if the pooler keeps that

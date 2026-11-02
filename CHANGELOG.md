@@ -62,9 +62,11 @@ answers with a token in place of a seq, and reads wait on it shard by shard.
 - **`write_transactions`** ([docs/operations.md](docs/operations.md#every-setting)), a
   node setting: a node's group committer has a lane per shard and runs up to this many
   transactions at once (16 by default, at most half the store's write pool; 1 on
-  SQLite, where a request's shards commit together in one transaction). Postgres's
-  `max_connections` must cover nodes × (`write_transactions` + about 16 for reads); a
-  refused connection (53300) fails with an error saying so.
+  SQLite, where a request's shards commit together in one transaction). It bounds the
+  writes' share of a node's 64-connection pool, which its reads share: Postgres's
+  `max_connections` must still cover nodes × 65 (the pool and `LISTEN`). A refused
+  connection (53300) fails with an error that names the pool size and
+  `max_connections`.
 - **Retry guidance** ([docs/api.md](docs/api.md#retrying-after-a-5xx)): a 5xx response,
   or a 5xx bulk item, may or may not have committed. Retry with conditions that make a
   repeat safe: the same unconditional upsert body (an unchanged upsert is a noop,

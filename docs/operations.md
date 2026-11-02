@@ -376,7 +376,7 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
-| `write_transactions` | `0`: 16 (1 on SQLite) | write transactions the node runs at once, each on one shard and holding a connection: commits to different shards run side by side up to it. On SQLite it is 1, and a request's shards commit together. Size the database's connection limit for it: Postgres's `max_connections` (100 by default) must cover every node's `write_transactions` plus its reads, about 16 more a node, so three nodes at the default fit and three at 32 do not. A refused connection fails the request with an error that says so. More is not always faster: in Phase 0's measurements 32 beat 8 and 64 on 64-shard bulks |
+| `write_transactions` | `0`: 16 (1 on SQLite) | write transactions the node runs at once, each on one shard and holding a connection: commits to different shards run side by side up to it. On SQLite it is 1, and a request's shards commit together. It bounds the writes' share of the node's 64-connection pool, which its reads share, so it does not change how many connections a node can hold: size Postgres's `max_connections` for nodes × 65 (see [Databases](#databases)). A refused connection fails the request with an error that names the pool size and `max_connections`. More is not always faster: in Phase 0's measurements 32 beat 8 and 64 on 64-shard bulks |
 | `background_share` | `0.25` at GOMAXPROCS 1, else `1` | the share of each 100 ms background work runs while searches occupy every processor, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints for the rest (see [CPU](#cpu)). `1` gives searches no priority |
 | `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
@@ -559,8 +559,8 @@ whichever node gets there first.
 
 | Database | Supported | Notes |
 |---|---|---|
-| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections plus one for `LISTEN`, so set `max_connections` to at least 65 per node plus headroom |
-| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node |
+| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections, one pool shared by its reads and writes, plus one for `LISTEN`, so set `max_connections` to at least nodes × 65 plus headroom (Postgres's default of 100 fits one node) |
+| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node, shared by its reads and writes: `max_connections` must cover nodes × 64 plus headroom |
 | SQLite | 3.35+, bundled (pure Go) | **one node only.** A second live node on the same file refuses to start (`cluster: a SQLite store serves a single node`). The lease TTL defaults to 30 s, because the single writer can delay a renewal |
 
 SQLite suits a laptop, a test, or a small single-node deployment. Its file must sit on a

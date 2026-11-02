@@ -214,6 +214,10 @@ type shardSlot struct {
 	// here; it does not follow the copy's tailer. A copy that finds the changelog
 	// rewound lowers it (with written and querySeq).
 	head atomic.Int64
+	// commits counts the changes committed through this node to the shard, noted
+	// before their seqs raise the marks above: a lowering to a head read from the
+	// store tells by it that a commit landed while it read (slotMarks).
+	commits atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
 	host           sync.Mutex
 	local          atomic.Pointer[copyState]
@@ -707,7 +711,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
 	raise(&sl.head, sh.AppliedSeq())
-	env := sl.tailerEnv(spec.Fetcher)
+	env := n.tailerEnv(sl, spec.Fetcher)
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -814,35 +818,70 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 	return errors.Join(errs...)
 }
 
-// lowerHead lowers the shard's known head, newest write and newest saved-query seq to
-// head, each when it is higher: its copy found the changelog rewound (a failover that
-// lost commits), so seqs past head are not committed any more. A wait_for past it must
-// be checked with the store again, and a percolation must not wait for saved queries
-// the rewind lost.
-func (sl *shardSlot) lowerHead(head int64) {
-	for _, v := range []*atomic.Int64{&sl.head, &sl.written, &sl.querySeq} {
-		lowerTo(v, head)
+// rewound lowers the shard's known head, newest write and newest saved-query seq to
+// its head, each when it is higher: its copy found the changelog rewound (a failover
+// that lost commits) at pollHead, so seqs past the head are not committed any more. A
+// wait_for past it must be checked with the store again, and a percolation must not
+// wait for saved queries the rewind lost. The head is read from the store again after
+// the marks are loaded, so a commit through this node since the copy's poll is not
+// lowered under; while the store cannot be asked, pollHead stands in for it.
+func (n *Single) rewound(sl *shardSlot, pollHead int64) {
+	m := sl.load(&sl.head, &sl.written, &sl.querySeq)
+	ctx, cancel := context.WithTimeout(context.Background(), clampTimeout)
+	defer cancel()
+	head := pollHead
+	if h, _, err := n.st.HeadSeq(ctx, sl.id); err == nil {
+		head = h
 	}
+	m.lowerTo(head)
 }
 
-// lowerTo lowers v to at most n.
-func lowerTo(v *atomic.Int64, n int64) {
-	for {
-		cur := v.Load()
-		if n >= cur || v.CompareAndSwap(cur, n) {
-			return
+// slotMarks are some of a slot's marks (head, written, querySeq) as loaded before a
+// read of the store's head, with the slot's commit count before them, to lower them
+// to that head without lowering under a commit that landed while it was read.
+type slotMarks struct {
+	sl      *shardSlot
+	commits int64
+	vs      []*atomic.Int64
+	was     []int64
+}
+
+// load loads vs, marks of sl, for a lowering to a head read after it.
+func (sl *shardSlot) load(vs ...*atomic.Int64) slotMarks {
+	m := slotMarks{sl: sl, commits: sl.commits.Load(), vs: vs, was: make([]int64, len(vs))}
+	for i, v := range vs {
+		m.was[i] = v.Load()
+	}
+	return m
+}
+
+// lowerTo lowers each mark past head to it, from its loaded value only: a mark
+// raised since (by a commit's seq) stays. A commit noted since the load whose seq did
+// not raise its mark (the mark was past it, as after a rewind) may have been lowered
+// under: then each mark is raised back to its loaded value, as if the lowering had not
+// happened, and a later one tries again.
+func (m slotMarks) lowerTo(head int64) {
+	lowered := false
+	for i, v := range m.vs {
+		if m.was[i] > head && v.CompareAndSwap(m.was[i], head) {
+			lowered = true
+		}
+	}
+	if lowered && m.sl.commits.Load() != m.commits {
+		for i, v := range m.vs {
+			raise(v, m.was[i])
 		}
 	}
 }
 
 // tailerEnv is what the node offers the tailer of the shard's copy.
-func (sl *shardSlot) tailerEnv(fetcher replica.Fetcher) TailerEnv {
-	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: sl.lowerHead, Analyzed: sl.analyzed.take}
+func (n *Single) tailerEnv(sl *shardSlot, fetcher replica.Fetcher) TailerEnv {
+	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: func(head int64) { n.rewound(sl, head) }, Analyzed: sl.analyzed.take}
 }
 
 // tailerEnvWith is tailerEnv for a copy the registry holds as cp.
-func (sl *shardSlot) tailerEnvWith(fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
-	env := sl.tailerEnv(fetcher)
+func (n *Single) tailerEnvWith(sl *shardSlot, fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
+	env := n.tailerEnv(sl, fetcher)
 	env.Copy = cp
 	return env
 }

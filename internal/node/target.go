@@ -347,18 +347,24 @@ func (n *Single) runQueryTargets(ctx context.Context, idx *index, wait *api.Toke
 }
 
 // clampQuerySeqs lowers each shard's querySeq (and newest write) to its head in the
-// store, reporting whether any fell. Its read of the store gets a deadline of its own:
-// the request's may have passed.
+// store, reporting whether any was past it. The marks are loaded before the store is
+// read and lowered from those values only (slotMarks), so a saved query committed
+// through this node meanwhile is not lowered under. Its read of the store gets a
+// deadline of its own: the request's may have passed.
 func (n *Single) clampQuerySeqs(ctx context.Context, shards []*shardSlot) bool {
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clampTimeout)
 	defer cancel()
+	before := make(map[*shardSlot]slotMarks, len(shards))
+	for _, sl := range shards {
+		before[sl] = sl.load(&sl.querySeq, &sl.written)
+	}
 	fell := false
 	_ = n.readHeads(hctx, shards, func(sl *shardSlot, h int64) {
-		if sl.querySeq.Load() > h {
+		m := before[sl]
+		if m.was[0] > h {
 			fell = true
 		}
-		lowerTo(&sl.querySeq, h)
-		lowerTo(&sl.written, h)
+		m.lowerTo(h)
 	})
 	return fell
 }

@@ -666,6 +666,7 @@ func noteApplied(idx *index, applied []prepared, items []api.ItemResult) {
 		c := &applied[i].change
 		items[applied[i].pos].Seq, items[applied[i].pos].Version = c.Seq, c.Version
 		sl := idx.shards[c.Shard]
+		sl.commits.Add(1)
 		raise(&sl.written, c.Seq)
 		raise(&sl.head, c.Seq)
 		if c.Kind == store.KindQueryUpsert || c.Kind == store.KindQueryDelete {

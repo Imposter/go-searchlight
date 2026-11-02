@@ -247,3 +247,49 @@ func TestStoppedAcrossARewindWhileAnotherShardPrunesRebuildsTheCopy(t *testing.T
 		}
 	})
 }
+
+// TestOwnShardPrunedAnchorRewind (from the M2 review): the copy checks its anchor at k,
+// applies two more changes and stops before a poll checks them. A lossy failover loses
+// those two; the new primary reissues their seqs and one more, and prunes the shard up
+// to k (every copy applied it). On restart the anchor's row is gone, so the anchor is
+// dropped unchecked and the next page would be read on top of the lost changes: only
+// the own-shard check sees the rewind, and the copy rebuilds.
+func TestOwnShardPrunedAnchorRewind(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "w", testMapping)
+		id := ShardID{Index: "w", Shard: 0}
+		opts, reader := meteredOptions()
+		c := newCopy(t, d.open(t), id, opts)
+		c.withFakeClock(time.Second)
+		c.start()
+		mustApply(t, st, upsert("w", 0, "a", docBody("a", 1)))
+		k := mustApply(t, st, upsert("w", 0, "b", docBody("b", 1)))
+		c.waitApplied(k)
+		c.until("anchor at k", func() bool { return decodeMark(c.shard().AnchorMark()).Seq == k })
+		last := mustApply(t, st, upsert("w", 0, "lost0", docBody("lost", 0)), upsert("w", 0, "lost1", docBody("lost", 1)))
+		c.until("lost applied", func() bool { return c.current().Applied() >= last })
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		sh := c.shard()
+		if anchor := decodeMark(sh.AnchorMark()); anchor.Seq != k {
+			t.Skipf("a poll checked the lost changes before the stop (anchor %d): the anchor alone covers this run", anchor.Seq)
+		}
+		if err := sh.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		rewind(ctx, t, d, k)
+		mustApply(t, st, upsert("w", 0, "new0", docBody("new", 0)), upsert("w", 0, "new1", docBody("new", 1)), upsert("w", 0, "new2", docBody("new", 2)))
+		if err := st.Prune(ctx, id, k+1); err != nil { // the new primary's leader prunes what every copy applied
+			t.Fatal(err)
+		}
+		c.clk, c.opts.Clock = nil, nil
+		c.start()
+		waitMatches(t, c, st, id)
+		if n := rewindCount(t, reader, "w"); n < 1 {
+			t.Fatalf("%d rewinds counted", n)
+		}
+	})
+}

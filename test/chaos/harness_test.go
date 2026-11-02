@@ -45,10 +45,12 @@ const (
 	// uploads them when the suite fails).
 	envDir = "SEARCHLIGHT_CHAOS_DIR"
 
-	index        = "chaos"
-	shards       = 3
-	apiToken     = "chaos-api-token-0123456789abcdef"
-	clusterToken = "chaos-cluster-token-0123456789"
+	index = "chaos"
+	// defaultShards is the chaos index's shard count; a scenario may set another
+	// (cluster.shards) before it creates the index.
+	defaultShards = 3
+	apiToken      = "chaos-api-token-0123456789abcdef"
+	clusterToken  = "chaos-cluster-token-0123456789"
 
 	// oldVersion and newVersion label the two builds of the binary a rolling upgrade
 	// moves between; every other scenario runs newVersion.
@@ -280,6 +282,8 @@ type cluster struct {
 	// was refused: set while nodes stop gracefully, which must never cut a request they
 	// accepted.
 	refusedOnly bool
+	// shards is the chaos index's shard count.
+	shards int
 	// mixed is set while nodes of two releases serve: a read then asks for no
 	// read-your-writes position, since each release refuses the other's parameter.
 	mixed atomic.Bool
@@ -296,7 +300,10 @@ type member struct {
 	disrupted atomic.Bool
 	// bulks counts the _bulk requests in flight on it.
 	bulks atomic.Int64
-	log   *os.File
+	// current is set once it runs this build (a cross-release upgrade starts it on
+	// the release before).
+	current atomic.Bool
+	log     *os.File
 	// holdRecovery is the node's SEARCHLIGHT_TEST_HOLD_RECOVERY file: while it exists,
 	// every copy recovery but the first the process starts waits.
 	holdRecovery string
@@ -319,7 +326,7 @@ func newCluster(t *testing.T, n int, bin string, extra ...string) *cluster {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &cluster{t: t, store: store, dir: dir, stop: cancel}
+	c := &cluster{t: t, store: store, dir: dir, stop: cancel, shards: defaultShards}
 	c.lb = &balancer{c: c, client: &http.Client{Timeout: time.Minute}, retries: map[string]int{}}
 	t.Cleanup(c.close)
 	for i := range n {
@@ -614,7 +621,7 @@ func (v *view) bounds(keep func(id string, d doc) bool) (lo, hi int64) {
 // serves it.
 func (c *cluster) createIndex() {
 	c.t.Helper()
-	body := fmt.Sprintf(`{"mapping": {"dynamic": "strict", "fields": {"w": "keyword", "k": "number", "v": "number", "n": "number", "brand": "keyword", "title": "text"}}, "settings": {"shards": %d}}`, shards)
+	body := fmt.Sprintf(`{"mapping": {"dynamic": "strict", "fields": {"w": "keyword", "k": "number", "v": "number", "n": "number", "brand": "keyword", "title": "text"}}, "settings": {"shards": %d}}`, c.shards)
 	a, err := call(c.t.Context(), c.lb.client, http.MethodPut, c.members[0].URL+"/indexes/"+index, body)
 	if err != nil || a.status != http.StatusCreated {
 		c.t.Fatalf("create the index: %v HTTP %d %s", err, a.status, a.body)
@@ -629,6 +636,11 @@ type load struct {
 	m      *model
 	reads  atomic.Int64
 	writes atomic.Int64
+	// mixedReads counts the reads mixedRead made.
+	mixedReads atomic.Int64
+	// partial counts the bulk items answered with a 5xx while the rest of their
+	// bulk committed.
+	partial atomic.Int64
 }
 
 // writer ids: each writer owns keys of its own, so it alone writes them, one batch at a
@@ -738,9 +750,16 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		ok := true
+		failed := make([]bool, len(ops))
 		for i, it := range resp.Items {
 			gone := ops[i].delete && it.Status == http.StatusNotFound
-			if it.Status != http.StatusOK && !gone {
+			switch {
+			case it.Status == http.StatusOK || gone:
+			case it.Status >= http.StatusInternalServerError && c.write503:
+				// A shard's transaction failed while the database was down; the other
+				// shards' ops committed. The failed ones may or may not have.
+				failed[i] = true
+			default:
 				c.lb.violate("_bulk item %s: HTTP %d %s", ops[i].id, it.Status, it.Error)
 				ok = false
 			}
@@ -749,7 +768,18 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		l.m.mu.Lock()
-		for _, o := range ops {
+		acked := 0
+		for i, o := range ops {
+			if failed[i] {
+				d := doc{v: o.v, n: g*keysPerWriter + o.k, brand: o.brand}
+				l.m.maybe[o.id] = append(l.m.maybe[o.id], outcome{present: !o.delete, d: d})
+				if !o.delete {
+					versions[o.k] = o.v
+				}
+				l.partial.Add(1)
+				continue
+			}
+			acked++
 			delete(l.m.maybe, o.id)
 			if o.delete {
 				delete(l.m.docs, o.id)
@@ -764,9 +794,9 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 				l.m.head = tok
 			}
 		}
-		l.m.acked += int64(len(ops))
+		l.m.acked += int64(acked)
 		l.m.mu.Unlock()
-		l.writes.Add(int64(len(ops)))
+		l.writes.Add(int64(acked))
 		time.Sleep(writerPause)
 	}
 }
@@ -793,6 +823,10 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 			// without it.
 			path += "?wait_for=" + head.String()
 		}
+		if c.mixed.Load() && head != nil && rnd.IntN(3) == 0 {
+			c.mixedRead(ctx, l, path, body, head)
+			continue
+		}
 		a, err := c.lb.do(ctx, http.MethodPost, path, body, time.Minute, false)
 		if err != nil {
 			continue
@@ -803,6 +837,31 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 		}
 		l.reads.Add(1)
 		time.Sleep(time.Duration(rnd.IntN(20)) * time.Millisecond)
+	}
+}
+
+// mixedRead sends a read waiting for head straight to a ready node of this build while
+// nodes of the release before still serve: it reads its shards' copies wherever they
+// are, so waiting on a copy of either release for a seq a node of this build gave out.
+func (c *cluster) mixedRead(ctx context.Context, l *load, path, body string, head *api.Token) {
+	var picks []*member
+	for _, m := range c.members {
+		if m.current.Load() && m.ready.Load() && !m.disrupted.Load() {
+			picks = append(picks, m)
+		}
+	}
+	if len(picks) == 0 {
+		return
+	}
+	m := picks[rand.IntN(len(picks))]
+	a, err := c.lb.send(ctx, m, http.MethodPost, path+"?wait_for="+head.String(), body, false)
+	switch {
+	case err != nil || m.disrupted.Load():
+	case a.status != http.StatusOK:
+		c.lb.violate("POST %s waiting for %s on %s: HTTP %d %s", path, head, m.NodeID(), a.status, truncate(a.body))
+	default:
+		l.reads.Add(1)
+		l.mixedReads.Add(1)
 	}
 }
 
@@ -835,7 +894,7 @@ func (c *cluster) waitDurable(i int) {
 		if err != nil {
 			return err
 		}
-		if len(copies) != shards {
+		if len(copies) != c.shards {
 			return fmt.Errorf("%d copies", len(copies))
 		}
 		for _, sc := range copies {
@@ -897,13 +956,13 @@ func (c *cluster) waitGreen(d time.Duration) {
 func (c *cluster) settle(m *model) {
 	c.t.Helper()
 	v := m.snapshot()
-	lo, hi := make([]int64, shards), make([]int64, shards)
-	for s := range shards {
-		lo[s], hi[s] = v.bounds(func(id string, _ doc) bool { return node.ShardFor(id, shards) == s })
+	lo, hi := make([]int64, c.shards), make([]int64, c.shards)
+	for s := range c.shards {
+		lo[s], hi[s] = v.bounds(func(id string, _ doc) bool { return node.ShardFor(id, c.shards) == s })
 	}
 	start := time.Now()
 	eventually(c.t, 5*time.Minute, "every copy converges on the acknowledged writes", func() error {
-		docs := make([]int64, shards)
+		docs := make([]int64, c.shards)
 		for k, mb := range c.members {
 			if !slproc.Ready(c.t.Context(), mb.AdminURL) {
 				return fmt.Errorf("%s is not ready", mb.NodeID())
@@ -912,7 +971,7 @@ func (c *cluster) settle(m *model) {
 			if err != nil {
 				return fmt.Errorf("%s: %w", mb.NodeID(), err)
 			}
-			if len(copies) != shards {
+			if len(copies) != c.shards {
 				return fmt.Errorf("%s holds %d copies: %+v", mb.NodeID(), len(copies), copies)
 			}
 			for _, sc := range copies {

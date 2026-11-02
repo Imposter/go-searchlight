@@ -115,7 +115,7 @@ func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {
 	next := &copyState{
 		id:      c.id,
 		slot:    c.slot,
-		tailer:  n.opts.NewTailer(n.st, sh, c.id, TailerEnv{Head: n.head.Load, Fetcher: c.spec.Fetcher, Copy: &copyCopy, Rewound: n.lowerHead, Analyzed: c.slot.analyzed.take}),
+		tailer:  n.opts.NewTailer(n.st, sh, c.id, c.slot.tailerEnvWith(c.spec.Fetcher, &copyCopy)),
 		startup: c.startup,
 		spec:    c.spec,
 		copy:    &copyCopy,
@@ -351,9 +351,6 @@ func (n *Single) Counts(ctx context.Context, id store.ShardID) (docs, queries ui
 	}
 	return lt.g.NumDocs(), lt.g.NumQueries(), nil
 }
-
-// Head returns the newest seq this node knows committed.
-func (n *Single) Head() int64 { return n.head.Load() }
 
 // NoteDB records whether the database just answered a call the cluster made: reads are
 // marked stale while it does not (spec section 10).

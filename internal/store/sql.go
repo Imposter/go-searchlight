@@ -1168,20 +1168,6 @@ func (s *sqlStore) HeadSeq(ctx context.Context, shard ShardID) (seq int64, now t
 	return seq, millis(nowMs), err
 }
 
-func (s *sqlStore) TopSeq(ctx context.Context) (seq int64, now time.Time, err error) {
-	ctx, end := s.start(ctx, "top_seq")
-	defer end(&err)
-	if s.closed.Load() {
-		return 0, time.Time{}, ErrClosed
-	}
-	var top sql.NullInt64
-	var nowMs int64
-	if err := s.r.QueryRowContext(ctx, s.d.Changelog.ReadTopSeq).Scan(&seq, &top, &nowMs); err != nil {
-		return 0, time.Time{}, err
-	}
-	return max(seq, top.Int64), millis(nowMs), nil
-}
-
 func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
 	ctx, end := s.start(ctx, "tip")
 	defer end(&err)

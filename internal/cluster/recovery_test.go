@@ -62,7 +62,9 @@ func heavyLoad(_ int, o *Options) {
 func waitCount(t testing.TB, n *Node, index string, seq, want int64) {
 	t.Helper()
 	eventually(t, 2*time.Minute, fmt.Sprintf("%s counts %d on %s", index, want, n.id), func() error {
-		got, err := count(context.Background(), n, index, seq)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		got, err := count(ctx, n, index, seq)
 		if err != nil {
 			return err
 		}

@@ -85,12 +85,6 @@ type Store interface {
 	// dialect reads from the primary (dialect.Pools.Read is the primary's).
 	HeadSeq(ctx context.Context, shard ShardID) (seq int64, now time.Time, err error)
 
-	// TopSeq returns the highest seq any shard has reached, or the floor when it
-	// is higher, and the database clock's time as it read it. It is temporary:
-	// it serves the node's single head (wait_for_seq's check) until the node keeps
-	// a head per shard.
-	TopSeq(ctx context.Context) (seq int64, now time.Time, err error)
-
 	// Tip is HeadSeq of q.Shard that also reads, in the same statement, the marks
 	// of the shard's change at the head and at q.At, its newest change at or below
 	// q.UpTo, its prune horizon and its index's incarnation. A tailer compares them

@@ -177,9 +177,6 @@ type Changelog struct {
 	// ReadHead: (index, shard) -> the shard's value (the floor's when it has no row),
 	// NOW.
 	ReadHead string
-	// ReadTopSeq: () -> the floor's value, the largest value of any shard (NULL when
-	// there is none), NOW.
-	ReadTopSeq string
 	// ReadTip: (index, shard, index, shard, index, shard, index, shard, seq, index,
 	// shard, index, shard, upto) -> the shard's value (the floor's when it has no
 	// row), NOW, then kind, id, at, nonce of the shard's change at that value and of

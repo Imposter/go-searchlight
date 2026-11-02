@@ -59,7 +59,7 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		return nil, err
 	}
 	if opts.Percolate && opts.WaitForSeq > 0 {
-		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+		if err := n.checkHead(ctx, idx.shards, opts.WaitForSeq); err != nil {
 			return nil, err
 		}
 	}
@@ -570,7 +570,7 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 // answers that last case per op, with the shards that committed.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
 	var applied []prepared
-	defer func() { n.noteApplied(idx, applied, items) }()
+	defer func() { noteApplied(idx, applied, items) }()
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
 		for i := range batch {
@@ -645,22 +645,18 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 	return applied, nil
 }
 
-// noteApplied answers the committed ops' items and moves the shards' written and
-// query seqs, and the node's head, on to them.
-func (n *Single) noteApplied(idx *index, applied []prepared, items []api.ItemResult) {
-	var top int64
+// noteApplied answers the committed ops' items and moves their shards' written, query
+// and head seqs on to them.
+func noteApplied(idx *index, applied []prepared, items []api.ItemResult) {
 	for i := range applied {
 		c := &applied[i].change
 		items[applied[i].pos].Seq, items[applied[i].pos].Version = c.Seq, c.Version
 		sl := idx.shards[c.Shard]
 		raise(&sl.written, c.Seq)
+		raise(&sl.head, c.Seq)
 		if c.Kind == store.KindQueryUpsert || c.Kind == store.KindQueryDelete {
 			raise(&sl.querySeq, c.Seq)
 		}
-		top = max(top, c.Seq)
-	}
-	if top > 0 {
-		n.noteHead(top)
 	}
 }
 

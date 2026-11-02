@@ -563,7 +563,9 @@ func TestWriteValidation(t *testing.T) {
 	if fmt.Sprint(statuses) != "[200 400 413 400 400 200 400]" {
 		t.Errorf("statuses = %v", statuses)
 	}
-	if res.Items[0].Seq == 0 || res.Items[5].Seq != res.Seq || res.Items[0].Seq >= res.Items[5].Seq {
+	// Each shard's seqs are its own: the two committed ops are in order only on one shard.
+	ok, q2 := res.Items[0].Seq, res.Items[5].Seq
+	if ok == 0 || q2 == 0 || res.Seq != max(ok, q2) || node.ShardFor("ok", 2) == node.ShardFor("q2", 2) && ok >= q2 {
 		t.Errorf("seqs: %+v, last %d", res.Items, res.Seq)
 	}
 	if _, err := n.Write(ctx(t), "nope", []api.WriteOp{upsert("a", `{}`)}, api.WriteOptions{}); err == nil {
@@ -692,13 +694,6 @@ func (s flakyStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.
 		return 0, time.Time{}, errUnreachable
 	}
 	return s.Store.HeadSeq(ctx, id)
-}
-
-func (s flakyStore) TopSeq(ctx context.Context) (int64, time.Time, error) {
-	if s.headDown != nil && s.headDown.Load() {
-		return 0, time.Time{}, errUnreachable
-	}
-	return s.Store.TopSeq(ctx)
 }
 
 func (s flakyStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {

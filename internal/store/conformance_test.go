@@ -1638,8 +1638,7 @@ func TestWatch(t *testing.T) {
 
 // TestHeadSeq: each shard's head is its own newest committed seq, and a tailer
 // reading it before ChangesAfter never advances past a change of its shard that it
-// has not seen. A shard whose index does not exist stands at the floor; TopSeq is the
-// highest head.
+// has not seen. A shard whose index does not exist stands at the floor.
 func TestHeadSeq(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
@@ -1658,9 +1657,6 @@ func TestHeadSeq(t *testing.T) {
 			if head, _, err := st.HeadSeq(ctx, tc.shard); err != nil || head != tc.want {
 				t.Fatalf("%s head = %d, %v; want %d", tc.shard, head, err, tc.want)
 			}
-		}
-		if top, _, err := st.TopSeq(ctx); err != nil || top != 3 {
-			t.Fatalf("top = %d, %v; want 3", top, err)
 		}
 		page, err := st.ChangesAfter(ctx, s0, 1, 10)
 		if err != nil || len(page) != 0 {

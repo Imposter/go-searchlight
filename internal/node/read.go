@@ -25,24 +25,37 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// checkHead refuses (400) a wait_for_seq past the newest committed seq, which no
-// copy would ever reach: the node's head is raised from the store's first. While the
-// store cannot be asked, a seq past this node's head may well be committed (by another
-// node): it is unavailable (503, retryable), not invalid.
-func (n *Single) checkHead(ctx context.Context, seq int64) error {
-	if seq <= n.head.Load() {
+// checkHead refuses (400) a wait_for_seq past the newest committed seq of every shard
+// in shards, which none of their copies would ever reach: the shards' heads this node
+// knows are raised from the store's first. While the store cannot be asked, a seq
+// past them may well be committed (by another node): it is unavailable (503,
+// retryable), not invalid.
+func (n *Single) checkHead(ctx context.Context, shards []*shardSlot, seq int64) error {
+	top := knownHead(shards)
+	if seq <= top {
 		return nil
 	}
-	h, _, err := n.st.TopSeq(ctx) // temporary (write scaling M1): M2 keeps a head per shard
-	if err != nil {
-		n.noteDB(err)
-		return api.Unavailable(err, "wait_for_seq %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", seq, n.head.Load())
+	for _, sl := range shards {
+		h, _, err := n.st.HeadSeq(ctx, sl.id)
+		if err != nil {
+			n.noteDB(err)
+			return api.Unavailable(err, "wait_for_seq %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", seq, top)
+		}
+		raise(&sl.head, h)
 	}
-	n.noteHead(h)
-	if head := n.head.Load(); seq > head {
+	if head := knownHead(shards); seq > head {
 		return api.InvalidAt("params.wait_for_seq", "wait_for_seq %d is past the newest committed seq, %d", seq, head)
 	}
 	return nil
+}
+
+// knownHead is the highest head this node knows of shards.
+func knownHead(shards []*shardSlot) int64 {
+	var top int64
+	for _, sl := range shards {
+		top = max(top, sl.head.Load())
+	}
+	return top
 }
 
 // acquireTries bounds acquire's retries when the copy's shard is swapped under it.
@@ -558,7 +571,7 @@ func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.Read
 		return nil, err
 	}
 	if opts.WaitForSeq > 0 {
-		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+		if err := n.checkHead(ctx, idx.shards[ShardFor(id, len(idx.shards)):][:1], opts.WaitForSeq); err != nil {
 			return nil, err
 		}
 	}
@@ -586,7 +599,7 @@ func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOpt
 		return nil, err
 	}
 	if opts.WaitForSeq > 0 {
-		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+		if err := n.checkHead(ctx, idx.shards[ShardFor(id, len(idx.shards)):][:1], opts.WaitForSeq); err != nil {
 			return nil, err
 		}
 	}

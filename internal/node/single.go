@@ -142,9 +142,6 @@ type Single struct {
 	openFailed metric.Int64Counter
 	splits     percolate.SplitBudget
 
-	// head is the newest seq committed or seen applied.
-	head atomic.Int64
-
 	// dbOK is when the database last answered (Unix nanoseconds); dbDown is set
 	// while it does not. Reads served meanwhile are marked stale (spec section 10).
 	dbOK   atomic.Int64
@@ -205,9 +202,14 @@ type indexState struct {
 type shardSlot struct {
 	id store.ShardID
 	// written is the newest seq the node committed to this shard; querySeq the
-	// newest that wrote one of its saved queries.
+	// newest that wrote one of its saved queries, or the shard's head when the index
+	// was opened (every saved query committed before then is at or below it).
 	written  atomic.Int64
 	querySeq atomic.Int64
+	// head is the newest seq of the shard this node knows committed: read from the
+	// store, committed by this node, or applied by its copy. A copy that finds the
+	// changelog rewound lowers it.
+	head atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
 	host           sync.Mutex
 	local          atomic.Pointer[copyState]
@@ -421,7 +423,7 @@ type LagReporter interface {
 
 // backlog is how far the copy trails its writes: the tailer's own measure when it has
 // one, else the seqs between what the node committed to the shard and what the copy
-// has applied (an over-estimate, since other shards' changes share the seq space).
+// has applied.
 func (c *copyState) backlog() int64 {
 	if lr, ok := c.tailer.(LagReporter); ok {
 		seq, _ := lr.Lag()
@@ -466,6 +468,9 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	}
 	if o.Clock == nil {
 		o.Clock = clock.Real{}
+	}
+	if o.GroupCommit.MaxTransactions == 0 {
+		o.GroupCommit.MaxTransactions = o.Config.WriteTransactions
 	}
 	if o.GroupCommit.Clock == nil {
 		o.GroupCommit.Clock = o.Clock
@@ -532,12 +537,6 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		return nil, fmt.Errorf("node: list indexes: %w", err)
 	}
 	n.noteDB(nil)
-	if head, _, err := o.Store.TopSeq(ctx); err == nil { // temporary (write scaling M1): M2 keeps a head per shard
-		n.noteHead(head)
-	} else {
-		_ = n.Close(ctx)
-		return nil, fmt.Errorf("node: read the head seq: %w", err)
-	}
 	n.bg.Go(func() { n.pingLoop(bgCtx) })
 	keep := map[string]bool{}
 	for _, m := range metas {
@@ -605,8 +604,8 @@ func (n *Single) resolvedRefresh(s api.IndexSettings) time.Duration {
 
 // openIndex opens an index and starts its refresher. A single node hosts every shard's
 // copy at once; a cluster node hosts the copies the cluster gives it (HostCopy). A
-// percolation waits until a copy has every change up to the head as of its opening
-// (its saved queries among them), then only for queries saved since.
+// percolation waits until a copy has every change up to its shard's head as of the
+// index's opening (its saved queries among them), then only for queries saved since.
 func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, error) {
 	state, err := parseState(m)
 	if err != nil {
@@ -619,7 +618,13 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	for s := range state.settings.Shards {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
 		sl.analyzed.budget = &n.handoffs
-		sl.querySeq.Store(n.head.Load())
+		head, _, err := n.st.HeadSeq(ctx, sl.id)
+		if err != nil {
+			idx.cancel()
+			return nil, fmt.Errorf("node: read the head of %s: %w", sl.id, err)
+		}
+		sl.head.Store(head)
+		sl.querySeq.Store(head)
 		idx.shards = append(idx.shards, sl)
 	}
 	if n.cl == nil {
@@ -697,8 +702,8 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	if err != nil {
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
-	n.noteHead(sh.AppliedSeq())
-	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher, Rewound: n.lowerHead, Analyzed: sl.analyzed.take}
+	raise(&sl.head, sh.AppliedSeq())
+	env := sl.tailerEnv(spec.Fetcher)
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -805,26 +810,28 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 	return errors.Join(errs...)
 }
 
-// noteHead raises the node's head to seq.
-func (n *Single) noteHead(seq int64) {
+// lowerHead lowers the shard's known head to head, when it is higher: its copy found
+// the changelog rewound (a failover that lost commits), so seqs past head are not
+// committed any more, and a wait_for_seq past it must be checked with the store again.
+func (sl *shardSlot) lowerHead(head int64) {
 	for {
-		cur := n.head.Load()
-		if seq <= cur || n.head.CompareAndSwap(cur, seq) {
+		cur := sl.head.Load()
+		if head >= cur || sl.head.CompareAndSwap(cur, head) {
 			return
 		}
 	}
 }
 
-// lowerHead lowers the node's known head to head, when it is higher: a copy found the
-// changelog rewound (a failover that lost commits), so seqs past head are not
-// committed any more, and a wait_for_seq past it must be checked with the store again.
-func (n *Single) lowerHead(head int64) {
-	for {
-		cur := n.head.Load()
-		if head >= cur || n.head.CompareAndSwap(cur, head) {
-			return
-		}
-	}
+// tailerEnv is what the node offers the tailer of the shard's copy.
+func (sl *shardSlot) tailerEnv(fetcher replica.Fetcher) TailerEnv {
+	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: sl.lowerHead, Analyzed: sl.analyzed.take}
+}
+
+// tailerEnvWith is tailerEnv for a copy the registry holds as cp.
+func (sl *shardSlot) tailerEnvWith(fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
+	env := sl.tailerEnv(fetcher)
+	env.Copy = cp
+	return env
 }
 
 // lookup returns an open index, or a 404. A cluster node that does not know the index

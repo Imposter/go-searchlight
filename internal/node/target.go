@@ -221,7 +221,7 @@ func (ts targets) stale() bool {
 // advance to waitSeq together.
 func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, forQueries bool) (targets, error) {
 	if waitSeq > 0 {
-		if err := n.checkHead(ctx, waitSeq); err != nil {
+		if err := n.checkHead(ctx, idx.shards, waitSeq); err != nil {
 			return nil, err
 		}
 		for _, c := range idx.copies() {
@@ -306,7 +306,7 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 		return nil, err
 	}
 	if waitSeq > 0 {
-		if err := n.checkHead(ctx, waitSeq); err != nil {
+		if err := n.checkHead(ctx, idx.shards[s:s+1], waitSeq); err != nil {
 			return nil, err
 		}
 	}

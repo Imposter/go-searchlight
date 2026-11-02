@@ -168,9 +168,14 @@ func rewindSQLite(t *testing.T, storeURL string, k int64) {
 		"DELETE FROM sl_changes WHERE seq > ?",
 		"DELETE FROM sl_documents WHERE seq > ?",
 		"DELETE FROM sl_queries WHERE seq > ?",
-		"UPDATE sl_counter SET value = ? WHERE id = 1",
+		"UPDATE sl_shard_seq SET value = ? WHERE value > ?",
+		"UPDATE sl_counter SET value = ? WHERE id = 1 AND value > ?",
 	} {
-		if _, err := tx.ExecContext(context.Background(), q, k); err != nil {
+		args := []any{k}
+		if strings.Count(q, "?") == 2 {
+			args = append(args, k)
+		}
+		if _, err := tx.ExecContext(context.Background(), q, args...); err != nil {
 			t.Fatalf("rewind %q: %v", q, err)
 		}
 	}

@@ -945,6 +945,52 @@ Notes:
     from its stale hash; its next write on an upgraded node stores a fresh one.
   - `max_staleness` reaches peers without a wire level: a 1.5 peer ignores it and
     answers with a current result.
+- **Upgrading to shard sequences** (schema migration 7; 2.0) is a rolling upgrade from
+  1.8, in two steps: the nodes, then a switch the cluster makes on its own. Upgrade from
+  an earlier 1.x to 1.8 first. [CHANGELOG.md](../CHANGELOG.md) has the client side,
+  which must be ready before the first node moves.
+  1. **The migration**, on the first 2.0 node: it creates `sl_shard_seq` empty, adds
+     `sl_nodes.seq_scheme`, and re-keys `sl_changes` by (index, shard, seq), keeping an
+     index on `seq` alone for 1.x's reads. The re-key builds new indexes on the
+     changelog. On Postgres they're built `CONCURRENTLY`, outside the migration's
+     transaction, and the migration then holds `sl_changes`' lock only to swap the key
+     onto one of them: reads and writes go on meanwhile (on an NVMe workstation, three
+     million changelog rows took 7.5 s, and no read or write waited on a lock). Other
+     nodes starting meanwhile wait for it. On MySQL the key change rebuilds the table in
+     place online, about 18 s per million rows. On SQLite it rebuilds the table, about
+     33 s per three million, while the node is down. Run `SELECT count(*) FROM
+     sl_changes` first to see what to expect; the changelog holds a few
+     `flush_interval`s of writes in steady state. As before, a 1.x
+     binary refuses to start once it has run, so finish the rollout.
+  2. **While 1.x and 2.0 nodes both run**, every node commits as 1.x does: under the
+     global sequence's lock (`sl_counter` row 1), at its next values. Every seq is unique
+     and in commit order, so 1.x and 2.0 copies, tailers and peer reads agree on what a
+     seq means, and nothing 1.x creates, drops or remaps is missed. Writes don't run in
+     parallel yet. 2.0 nodes heartbeat `seq_scheme = 1`.
+  3. **The switch.** Once every node in `sl_nodes` heartbeats `seq_scheme = 1`, or has
+     been silent for longer than `dead_after` plus `lease_ttl`, and no other node holds
+     a copy under a live lease (the test compressed bodies use), the leader turns shard
+     sequences on, in one transaction under row 1's lock: it gives every shard of every
+     index a row at row 1's value, with the index's current incarnation and mapping
+     version, moves the floor to `sl_counter` row 3, deletes row 1, and writes
+     `shard_seqs` into `sl_features`. It logs `every node commits by shard sequences:
+     turned the cluster's shard_seqs feature on`. No shard's head moves back, so tokens
+     from before it still read back. From then on each shard commits on its own
+     sequence; nodes that haven't seen the switch find row 1 gone at their next write
+     and move over. A single node switches within a second of starting (or, if its
+     `node_id` changed, once its old row has been silent past the fence).
+  - **If a 1.x node never goes away**, the switch never comes: the cluster stays correct
+    on the global sequence, without the parallel writes. `SELECT * FROM sl_features`
+    shows whether `shard_seqs` is on; `SELECT node_id, version, seq_scheme FROM sl_nodes`
+    shows who holds it back.
+  - **An old pod must be gone, not merely silent**, as for compressed bodies. A 1.x
+    node that comes back after the switch without restarting (a partition healed, a
+    paused VM) fails every write, mapping change, drop and head read, since each needs
+    row 1: its clients see errors, but it writes nothing outside the shard sequences.
+    It can still create an index (1.x's create takes no lock); the next 2.0 node to
+    start gives that index its rows. Terminate old pods rather than isolating them.
+  - **Rollback** means restoring the database, as for every migration. After the
+    switch, seqs repeat across shards and row 1 is gone: no 1.x binary can use it.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

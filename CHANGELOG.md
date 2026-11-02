@@ -19,9 +19,10 @@ answers with a token in place of a seq, and reads wait on it shard by shard.
   `sl_shard_seq`, locked by the transactions that commit to that shard, in key order
   (index name, shard), so commits to different shards run in parallel and never
   deadlock; a mapping change or a drop locks every shard row of the index, in shard
-  order. `sl_counter` row 1 is now the floor: new shards start at it, a dropped index
-  raises it past its shards' seqs, and a shard with no row stands at it. Row 2 still
-  issues copy epochs.
+  order. `sl_counter` row 3 is the floor: new shards start at it, a dropped index
+  raises it past its shards' seqs, and a shard with no row stands at it. Row 1, the
+  1.x global sequence, is deleted when shard sequences come on (see Upgrading). Row 2
+  still issues copy epochs.
 - **A bulk commits shard by shard** ([docs/api.md](docs/api.md#bulk)): each shard's
   operations commit in one transaction of their own, so a request is whole or nothing
   only on one shard. On SQLite the whole request is still one transaction, but clients
@@ -72,22 +73,47 @@ answers with a token in place of a seq, and reads wait on it shard by shard.
   repeat safe: the same unconditional upsert body (an unchanged upsert is a noop,
   unless `detect_noop=false`), `if_seq`, `version`, or `op_type=create`. A delete of
   nothing is a 404.
-- Schema migration 7 creates `sl_shard_seq`, seeding every shard at the old global
-  head, and re-keys `sl_changes` by (index name, shard, seq). On Postgres and MySQL it
-  keeps an index on `seq` alone for the rolling-upgrade window, to be dropped in 2.1.
+- Schema migration 7 creates `sl_shard_seq` (empty until shard sequences come on) and
+  `sl_nodes.seq_scheme`, and re-keys `sl_changes` by (index name, shard, seq). On
+  Postgres and MySQL it keeps an index on `seq` alone for the rolling-upgrade window, to
+  be dropped in 2.1.
+- **`shard_seqs`**, a feature in `sl_features` the leader turns on once no node from
+  before 2.0 is live. Until then every commit takes the global sequence, as 1.x's do,
+  so a cluster upgrades in place.
 
 ### Upgrading
 
-- **Do not deploy 2.0 to a cluster with 1.x nodes.** Mixed 1.x and 2.x clusters are not
-  supported until the rolling-upgrade gate lands (planned). Stop every 1.x node before
-  the first 2.0 node starts.
-- **Move clients to the token first.** Clients (scrape-bot among them) must move from
-  `wait_for_seq`, the bulk response's `seq` and `percolated_seq` to `token`,
-  `wait_for` and `percolated_at` before they talk to a 2.0 node.
-- **Migration 7 takes time on a large changelog.** Postgres's key swap holds
-  `sl_changes`' ACCESS EXCLUSIVE lock while it builds, about 4.5 s per million
-  changelog rows measured on a workstation; MySQL rebuilds in place online, about 18 s
-  per million; SQLite rebuilds the table, about 33 s per 3 million. Plan for the pause.
+A cluster upgrades from 1.8 in place, one node at a time, under load
+([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)). From an earlier
+1.x, upgrade to 1.8 first. The chaos suite's `TestRollingUpgradeFromRelease` does it
+from v1.8.0, with no client error and nothing lost.
+
+1. **Make clients work with both releases.** While 1.8 and 2.0 nodes both serve, the
+   same request may reach either. 1.8 refuses `wait_for` and 2.0 refuses
+   `wait_for_seq`, so send neither until every node runs 2.0, or send each node its own.
+   Accept a bulk response with either `seq` (1.8) or `token` (2.0). Once every node runs
+   2.0, use `token`, `wait_for` and `percolated_at` (scrape-bot among the clients).
+2. **Upgrade the nodes one at a time.** The first 2.0 node runs migration 7, after which
+   no 1.x binary starts against the database: finish the rollout, and terminate old pods
+   rather than isolating them. Until every node runs 2.0, every commit takes the global
+   sequence, as 1.8's do. That's correct for both releases, but writes don't run in
+   parallel yet.
+3. **The switch is automatic.** Once every node heartbeats 2.0, and any other has been
+   silent past `dead_after` plus `lease_ttl` with no live lease, the leader turns shard
+   sequences on (`shard_seqs` in `sl_features`, and a log line). If a 1.8 node never
+   leaves, the cluster stays on the global sequence. A 1.8 node that comes back after
+   the switch without restarting gets an error for every write, mapping change, drop
+   and head read: it writes nothing outside the shard sequences.
+4. **No rollback but a restore.** As with every migration, going back to 1.8 means
+   restoring the database.
+
+**Migration 7 builds indexes on the changelog.** On Postgres it builds them
+`CONCURRENTLY`, outside its transaction, then holds `sl_changes`' lock only to swap the
+key onto one: three million changelog rows took 7.5 s on an NVMe workstation, with no
+read or write waiting on a lock (swapped in the transaction, every read waited 5.9 s).
+MySQL rebuilds the table in place online, about 18 s per million rows. SQLite rebuilds
+it, about 33 s per three million, while its one node is down. `SELECT count(*) FROM
+sl_changes` beforehand tells you what to expect.
 
 ## [1.8.0] - 2026-10-31
 

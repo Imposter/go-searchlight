@@ -119,8 +119,8 @@ sequenceDiagram
 4. **Apply.** Each copy's tailer reads `ChangesAfter(shard, appliedSeq)`, analyzes the
    changes and applies them to the shard's write buffer. Seqs are contiguous per shard.
    A shard can still start above its last change (a new shard starts at the floor,
-   `sl_counter` row 1, and the 2.0 migration seeded every shard at the old global
-   head), so the tailer reads the shard's head before each page: a short page proves
+   `sl_counter` row 3, and the switch from 1.x's global sequence seeded every shard at
+   its value), so the tailer reads the shard's head before each page: a short page proves
    that nothing below the head is missing, and the copy advances to it.
 5. **Refresh is visibility.** Refreshes tick on a fixed grid, every `refresh_interval`
    from the copy's open, so a refresh's own cost never stretches the period. One that

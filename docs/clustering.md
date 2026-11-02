@@ -74,8 +74,11 @@ is why:
 each index's mapping and settings; neither changes the picture above. `sl_shard_seq`
 holds one row per shard of every index, its newest `seq`: a transaction that commits to
 a shard locks that shard's row to hand out contiguous `seq` values there (spec §8).
-`sl_counter` row 1 is the floor (a new shard starts at it, and a dropped index raises
-it past its shards' seqs), and row 2 issues copy epochs.
+`sl_counter` row 3 is the floor (a new shard starts at it, and a dropped index raises
+it past its shards' seqs), and row 2 issues copy epochs. Row 1 is the global sequence
+of 1.x, which every commit takes while a cluster upgrades from it; the switch to shard
+sequences seeds every shard's row at its value and deletes it
+([upgrading](operations.md#upgrades-and-rolling-restarts)).
 
 ## Joining
 

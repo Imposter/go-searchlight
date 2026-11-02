@@ -733,3 +733,46 @@ func TestGroupCommitPartialFailure(t *testing.T) {
 		t.Fatalf("seqs %v: only shard 0's changes committed", seqsOf(batch))
 	}
 }
+
+// A caller that gives up while its transaction commits on another caller's behalf
+// gets its context's error, and its slice is never written afterwards: the committer
+// sets the seqs of its own copy. (Under -race, a write after the return is also a
+// reported race.)
+func TestGroupCommitLeavesAGoneCallersSliceAlone(t *testing.T) {
+	f := &fakeApplier{block: make(chan struct{})}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 2, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	a, b := changes("a", 1), changes("b", 1)
+	resA, resB := make(chan error, 1), make(chan error, 1)
+	go func() { resA <- g.Apply(ctxA, a) }()
+	<-collected
+	go func() { resB <- g.Apply(context.Background(), b) }()
+	<-collected
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		running := f.running
+		f.mu.Unlock()
+		if running == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the transaction never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelA()
+	if err := <-resA; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the caller that gave up got %v", err)
+	}
+	a[0].Seq = -7
+	close(f.block)
+	if err := <-resB; err != nil || b[0].Seq == 0 {
+		t.Fatalf("the caller that waited: %v %v", seqsOf(b), err)
+	}
+	if a[0].Seq != -7 {
+		t.Fatalf("the committer wrote seq %d into the slice of a caller that had returned", a[0].Seq)
+	}
+}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -176,7 +177,9 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 }
 
 // gcPart is the changes of one lane of a request, at their positions in it (at is
-// nil when the part is the whole request).
+// nil when the part is the whole request). The changes are a copy of the request's,
+// which the committer owns: it sets their seqs, possibly after the caller has given
+// up and returned, so it never touches the caller's own slice.
 type gcPart struct {
 	key     ShardID
 	at      []int
@@ -226,14 +229,15 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 		}
 	}
 	if len(parts) == 1 {
+		if errs[0] == nil {
+			parts[0].copyBack(batch)
+		}
 		return errs[0]
 	}
 	var pe *PartialError
 	for i, part := range parts {
 		if errs[i] == nil {
-			for k, at := range part.at {
-				batch[at].Seq, batch[at].Noop = part.changes[k].Seq, part.changes[k].Noop
-			}
+			part.copyBack(batch)
 			continue
 		}
 		if pe == nil {
@@ -247,11 +251,23 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 	return nil
 }
 
-// split cuts a request into its lanes' parts: one, the request itself, unless the
+// copyBack sets the request's changes' seqs and noops from the part's, once the part
+// committed. The caller runs it, after the part's result came back.
+func (part *gcPart) copyBack(batch []Change) {
+	for k := range part.changes {
+		at := k
+		if part.at != nil {
+			at = part.at[k]
+		}
+		batch[at].Seq, batch[at].Noop = part.changes[k].Seq, part.changes[k].Noop
+	}
+}
+
+// split cuts a request into its lanes' parts: one, the whole request, unless the
 // committer has a lane per shard and the request names several shards.
 func (g *GroupCommitter) split(batch []Change, p *prepared) []*gcPart {
 	if !g.byShard {
-		return []*gcPart{{changes: batch, prep: p}}
+		return []*gcPart{{changes: slices.Clone(batch), prep: p}}
 	}
 	first := batch[0].ShardID()
 	one := true
@@ -262,7 +278,7 @@ func (g *GroupCommitter) split(batch []Change, p *prepared) []*gcPart {
 		}
 	}
 	if one {
-		return []*gcPart{{key: first, changes: batch, prep: p}}
+		return []*gcPart{{key: first, changes: slices.Clone(batch), prep: p}}
 	}
 	byShard := map[ShardID]*gcPart{}
 	var parts []*gcPart

@@ -118,7 +118,8 @@ func rewind(ctx context.Context, t *testing.T, d *db, k int64, then ...string) {
 		"DELETE FROM sl_changes WHERE seq > %d",
 		"DELETE FROM sl_documents WHERE seq > %d",
 		"DELETE FROM sl_queries WHERE seq > %d",
-		"UPDATE sl_counter SET value = %d WHERE id = 1",
+		"UPDATE sl_shard_seq SET value = %[1]d WHERE value > %[1]d",
+		"UPDATE sl_counter SET value = %[1]d WHERE id = 1 AND value > %[1]d",
 	} {
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(q, k)); err != nil {
 			t.Fatalf("rewind %q: %v", q, err)

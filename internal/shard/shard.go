@@ -8,8 +8,8 @@
 //
 // # Writes
 //
-// [Shard.Apply] takes changes in changelog order (seq strictly increasing; the global
-// changelog leaves gaps, which are fine). Each document or saved query id keeps only
+// [Shard.Apply] takes changes in changelog order (seq strictly increasing; a shard's
+// seqs are contiguous, but gaps are fine). Each document or saved query id keeps only
 // its newest version: within the buffer an upsert or delete replaces the entry; at
 // refresh every id the buffer touched masks every older copy of that id in every
 // segment, so a reader never sees two live copies of one id, nor a deleted one, and an
@@ -91,8 +91,9 @@ func (k ChangeKind) String() string {
 
 // Change is one changelog entry for this shard, already analyzed.
 type Change struct {
-	// Seq is the change's position in the global changelog. Apply requires it to
-	// increase strictly; gaps (other shards' changes) are expected.
+	// Seq is the change's position in its shard's changelog. Apply requires it to
+	// increase strictly; gaps are allowed (a copy may start above a shard's first
+	// change, or skip pruned ones it has).
 	Seq  int64
 	Kind ChangeKind
 	// DocID is the document an Upsert or Delete targets. For an Upsert it may be left
@@ -889,7 +890,8 @@ func (s *Shard) check(c *Change) error {
 }
 
 // Advance records that every change up to seq has been applied, when the changelog
-// holds none for this shard past the last one applied: the next refresh then covers
+// holds none for this shard past the last one applied (a shard starts at the store's
+// floor, above any change it has): the next refresh then covers
 // seq, so WaitRefreshed(seq) returns, and the flush after it moves CommittedSeq on
 // without a replay. A seq at or below the applied one is a no-op.
 func (s *Shard) Advance(seq int64) error {

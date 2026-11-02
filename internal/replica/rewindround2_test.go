@@ -202,14 +202,12 @@ func TestRewindRightAfterASnapshotLoadRebuildsTheCopy(t *testing.T) {
 	})
 }
 
-// TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy: a copy whose marks
-// name another shard's row (the head it advanced to) is stopped across a lossy
-// failover. The lost seqs are reissued, two to the copy's own shard and the rest to
-// the other shard, which then prunes them all (its copies applied them) before the
-// copy starts again: no row is left at its marks' seqs. The copy's own shard shows
-// the rewind all the same (a change of its shard it never applied, at or below the
-// seq it checked), and the copy rebuilds.
-func TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy(t *testing.T) {
+// TestStoppedAcrossARewindWhileAnotherShardPrunesRebuildsTheCopy: a copy is stopped
+// across a lossy failover that reissues seqs of its own shard, while another shard
+// writes and prunes every row it has. Each shard's seqs are its own, so the copy's
+// marks name only its own shard's changes, which no other shard's pruning touches: the
+// copy finds its anchor's seq holding another change, and rebuilds.
+func TestStoppedAcrossARewindWhileAnotherShardPrunesRebuildsTheCopy(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		ctx := context.Background()
 		st := d.open(t)
@@ -220,13 +218,12 @@ func TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy(t *testing.T) 
 		c := newCopy(t, d.open(t), id, opts)
 		c.start()
 		k := mustApply(t, st, upsert("w", 0, "kept", docBody("kept", 1)))
-		mustApply(t, st, upsert("w", 0, "lost0", docBody("lost", 0)))
-		var last int64
+		last := mustApply(t, st, upsert("w", 0, "lost0", docBody("lost", 0)), upsert("w", 0, "lost1", docBody("lost", 1)))
 		for i := range 4 {
-			last = mustApply(t, st, upsert("x", 0, fmt.Sprintf("xl%d", i), docBody("xl", i)))
+			mustApply(t, st, upsert("x", 0, fmt.Sprintf("x%d", i), docBody("x", i)))
 		}
 		c.waitApplied(last)
-		for range 3 { // polls check and promote the marks, the last an x/0 row
+		for range 3 { // polls check the pending mark and make it the anchor
 			c.current().Wake()
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -237,69 +234,10 @@ func TestStoppedAcrossARewindWhoseMarkRowWasPrunedRebuildsTheCopy(t *testing.T) 
 			t.Fatal(err)
 		}
 		rewind(ctx, t, d, k)
-		var batch []store.Change
-		for i := range 6 {
-			index := "x"
-			if i < 2 {
-				index = "w"
-			}
-			batch = append(batch, upsert(index, 0, fmt.Sprintf("new%d", i), docBody("new", i)))
-		}
-		head := mustApply(t, st, batch...)
-		if err := st.Prune(ctx, store.ShardID{Index: "x", Shard: 0}, head+1); err != nil {
-			t.Fatal(err)
-		}
-		c.start()
-		waitMatches(t, c, st, id)
-		if n := rewindCount(t, reader, "w"); n < 1 {
-			t.Fatalf("%d rewinds counted", n)
-		}
-	})
-}
-
-// TestStoppedAcrossARewindAfterIdleAdvancesRebuildsTheCopy: the copy's own shard is
-// idle while another shard writes over several polls, so the copy only advances past
-// its last own change. It is then stopped across a lossy failover whose reissued seqs
-// land on its own shard above that change, and the other shard prunes its rows before
-// the copy starts again. The own-shard check followed the idle advances, so it covers
-// the reissued own changes, and the copy rebuilds.
-func TestStoppedAcrossARewindAfterIdleAdvancesRebuildsTheCopy(t *testing.T) {
-	forEachDialect(t, func(t *testing.T, d *db) {
-		ctx := context.Background()
-		st := d.open(t)
-		createIndex(t, st, "w", testMapping)
-		createIndex(t, st, "x", testMapping)
-		id := ShardID{Index: "w", Shard: 0}
-		opts, reader := meteredOptions()
-		c := newCopy(t, d.open(t), id, opts)
-		c.start()
-		c.waitApplied(mustApply(t, st, upsert("w", 0, "a", docBody("a", 1))))
-		time.Sleep(100 * time.Millisecond)
-		var k int64
-		for i := range 10 {
-			last := mustApply(t, st, upsert("x", 0, fmt.Sprintf("x%d", i), docBody("x", i)))
-			if i == 4 {
-				k = last
-			}
-			c.current().Wake()
-			c.waitApplied(last)
-			time.Sleep(30 * time.Millisecond)
-		}
-		if err := c.stop(); err != nil {
-			t.Fatal(err)
-		}
-		if err := c.shard().Close(ctx); err != nil {
-			t.Fatal(err)
-		}
-		rewind(ctx, t, d, k)
-		mustApply(t, st, upsert("x", 0, "nx1", docBody("nx", 1)))
-		mustApply(t, st, upsert("w", 0, "new0", docBody("new", 0)), upsert("w", 0, "new1", docBody("new", 1)))
-		var batch []store.Change
-		for i := range 4 {
-			batch = append(batch, upsert("x", 0, fmt.Sprintf("nx%d", i+2), docBody("nx", i)))
-		}
-		head := mustApply(t, st, batch...)
-		if err := st.Prune(ctx, store.ShardID{Index: "x", Shard: 0}, head+1); err != nil {
+		mustApply(t, st, upsert("w", 0, "new0", docBody("new", 0)), upsert("w", 0, "new1", docBody("new", 1)), upsert("w", 0, "new2", docBody("new", 2)))
+		x := store.ShardID{Index: "x", Shard: 0}
+		head := mustApply(t, st, upsert("x", 0, "nx", docBody("nx", 1)))
+		if err := st.Prune(ctx, x, head+1); err != nil {
 			t.Fatal(err)
 		}
 		c.start()

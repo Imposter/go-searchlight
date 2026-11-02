@@ -289,13 +289,18 @@ func TestNoFalseRewinds(t *testing.T) {
 		c1.restart()
 		wg.Wait()
 
-		head := mustApply(t, st, upsert("w", 0, "last", docBody("last", 1)))
-		c0.waitApplied(head)
-		c1.waitApplied(head)
+		head := mustApply(t, st, upsert("w", 0, "last", docBody("last", 1)), upsert("v", 0, "last", docBody("last", 1)))
+		w := headOf(t, st, ShardID{Index: "w", Shard: 0})
+		v := headOf(t, st, ShardID{Index: "v", Shard: 0})
+		if head != max(w, v) {
+			t.Fatalf("heads %d and %d, the last write took %d", w, v, head)
+		}
+		c0.waitApplied(w)
+		c1.waitApplied(v)
 		c0.restart()
 		c1.restart()
-		c0.waitApplied(head)
-		c1.waitApplied(head)
+		c0.waitApplied(w)
+		c1.waitApplied(v)
 		if n := rewindCount(t, reader, "w") + rewindCount(t, reader, "v"); n != 0 {
 			t.Fatalf("%d rewinds counted with no rewind", n)
 		}

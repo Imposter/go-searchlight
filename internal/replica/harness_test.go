@@ -252,6 +252,16 @@ func mustApply(t testing.TB, st store.Store, batch ...store.Change) int64 {
 	return last
 }
 
+// headOf is the head of shard id.
+func headOf(t testing.TB, st store.Store, id ShardID) int64 {
+	t.Helper()
+	head, _, err := st.HeadSeq(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return head
+}
+
 // testShardOptions are quick: a short background refresh, no merges unless asked.
 func testShardOptions(id ShardID) shard.Options {
 	return shard.Options{

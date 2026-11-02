@@ -69,6 +69,11 @@ Everything after this depends on the result.
 **Gate:** if the spike doesn't show at least 2× on a multi-shard load on one instance, stop and find the real limit before
 Phase 1. If one instance already far exceeds what's needed, stop altogether and write that down.
 
+**Outcome (2026-11-02): not met on the test machine; [results](../specs/2026-11-01-write-scaling-phase0-results.md).**
+Per-shard counters reached about 2× only in seconds-long bursts on a flush the disk didn't honour, and at most 1.32×
+sustained. That machine's hard disk limits WAL bandwidth before the serializers do. The gate must be rerun on
+production's storage, with the script in the results, before Phase 1.
+
 ## Phase 1: remove the serializers, inside one database (2-3 weeks)
 
 Non-breaking and useful on its own.

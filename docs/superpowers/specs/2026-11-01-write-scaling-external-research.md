@@ -24,6 +24,11 @@ and some are dated, and the last section lists what couldn't be verified.
 - **I:** The lock spans the WAL flush, so group commit can't batch two commits on one counter.
   Per-shard commits cap near 1/(flush + lock-held round trips), about 670/s at a 1.5 ms flush. **Rows per
   commit, not commits, is the lever.**
+- **Measured (Phase 0):** the formula holds for one writer: 84/s at an 11.3 ms commit, against 85/s
+  predicted. Writers queued on the row lower it by a further 10-50%: 777/s with 16 and 606/s with 64, against
+  1,286/s for one, at a 0.2 ms commit. So 670/s is an upper bound for one row. Rows on separate shards share
+  Postgres's flushes and multiply nearly linearly: 5,299/s over 64 rows
+  ([results](2026-11-01-write-scaling-phase0-results.md#per-row-commit-cap-against-the-researchs-670s)).
 
 **Alternatives.**
 - **Advisory locks.** **S:** MessageDB takes a per-category lock, so one category has no gaps but `$all`
@@ -221,6 +226,6 @@ reported rather than a stall. Callers who need atomicity use a single routing ke
 - Citus 2PC mechanics rest on a 2017 post and an old regression test, plus the 14.1 notes. Whether current Citus
   lacks a distributed read snapshot is unconfirmed ([PR #6489](https://github.com/citusdata/citus/pull/6489), merge
   state unchecked). No source documents a specific event in Citus's community history.
-- Dated: Elastic 2017, Vondra 2022; the OpenZFS page is undated. Per-shard commit caps in §1 are arithmetic, not
-  measurements.
-- The `NOTIFY` lock was read on `REL_18_STABLE`. Later versions weren't checked.
+- Dated: Elastic 2017, Vondra 2022; the OpenZFS page is undated. The per-shard commit cap in §1 was arithmetic;
+  Phase 0 has since measured it, on a hard disk and on a flush its cache absorbs.
+- The `NOTIFY` lock was read on `REL_18_STABLE`. Phase 0 found it unchanged on `REL_17_STABLE` and master.

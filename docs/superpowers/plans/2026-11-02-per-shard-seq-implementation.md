@@ -75,7 +75,9 @@ These refine the approved plan. Where one departs from it, the reason is given.
    without rows, and `Migrate` checks every index has exactly its shard count of rows. Postgres's migration locks
    `sl_counter` row 1 before it seeds, so no 1.x commit lands between the seeding and its end. MySQL's DDL is not
    transactional and its key swap is online, so a 1.x commit during the migration can take a seq the seeding missed:
-   M4's gate must cover it there.
+   M4's gate must cover it there. `c33e22c` (an M1 review fix) rewrote 0007 after M1 was committed: a dev or CI
+   database migrated by M1's first 0007 keeps that schema 7 (no null-shard seeding, the post-check never ran) and
+   is not migrated again. Recreate such a database. No user has one: 0007 was never released.
 8. **Partial results.** `GroupCommitter.Apply` returns a `*PartialError` when a request split over several shards
    had some fail: each failed shard with its changes' positions in the request and its error, positions
    translated. A request on one shard gets its error as before. Committed changes have their seqs set.
@@ -162,6 +164,23 @@ recreate; acknowledged writes are in each shard's changelog at their seqs, conti
 
 **What M3's tests prove:** a client reads its own writes with the token, waiting on only the shards it reads; a
 partial bulk names exactly the items that failed; nothing accepts the removed scalars.
+
+**M3 as built.** Where it differs from the table:
+
+- The token: version byte 1, the uid's 16 bytes, a uvarint count, then per entry the shard's uvarint delta from
+  the previous shard (−1 before the first) and the seq's uvarint, shards ascending; base64url without padding. At
+  most 1024 entries and 16 KiB of text. 30 bytes of text for 1 shard, 67 for 8, 366 for 64 (seqs near 10⁶). It
+  names only the shards a write committed to; reads merge tokens by per-shard maximum.
+- A token for another incarnation of the index is a 400 at `params.wait_for`, like a malformed one, a seq past its
+  shard's head and a shard out of range (not 409 `index_recreated`): the coordinator asked for one clear 400.
+- `percolated_seq` became `percolated_at`, a token of where each shard stood for the percolation. Only committed
+  documents are percolated; the items of a failed shard carry its error and no matches.
+- The M2 review's fixes: a rewind lowers a slot's `written` and `querySeq` with its head; a node that hosts no copy
+  of a shard (and so hears of no rewind) lowers its `querySeq` to the store's head when a percolation's wait for it
+  fails (a peer's 400, or a 504), and percolates once more when one fell; `Store.IndexHeads` reads an index's
+  heads in one statement, for opening an index and for checking a token's shards; the 53300 error and the docs
+  size `max_connections` for the shared pool of 64 (nodes × 65); a notification in flight at `Close` is sent,
+  not counted as lost.
 
 ## M4: rolling upgrade and verification
 

@@ -85,6 +85,10 @@ type Store interface {
 	// dialect reads from the primary (dialect.Pools.Read is the primary's).
 	HeadSeq(ctx context.Context, shard ShardID) (seq int64, now time.Time, err error)
 
+	// IndexHeads is HeadSeq of shards 0 to shards-1 of index, read in one statement:
+	// heads[s] is shard s's.
+	IndexHeads(ctx context.Context, index string, shards int) (heads []int64, err error)
+
 	// Tip is HeadSeq of q.Shard that also reads, in the same statement, the marks
 	// of the shard's change at the head and at q.At, its newest change at or below
 	// q.UpTo, its prune horizon and its index's incarnation. A tailer compares them

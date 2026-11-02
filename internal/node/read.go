@@ -25,37 +25,68 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// checkHead refuses (400) a wait for seq past the newest committed seq of every shard
-// in shards, which none of their copies would ever reach: the shards' heads this node
-// knows are raised from the store's first. While the store cannot be asked, a seq
-// past them may well be committed (by another node): it is unavailable (503,
-// retryable), not invalid.
-func (n *Single) checkHead(ctx context.Context, shards []*shardSlot, seq int64) error {
-	top := knownHead(shards)
-	if seq <= top {
+// checkHead refuses (400) a wait for seq past the newest committed seq of shard s of
+// idx, which none of its copies would ever reach. See checkWait.
+func (n *Single) checkHead(ctx context.Context, idx *index, s int, seq int64) error {
+	return n.checkWait(ctx, idx, map[int]int64{s: seq})
+}
+
+// checkWait refuses (400) a wait for a seq past the newest committed seq of its shard
+// of idx (wait maps a shard to its seq), which none of the shard's copies would ever
+// reach. The heads this node knows are raised from the store's first, in one read for
+// every shard waited past them. While the store cannot be asked, a seq past them may
+// well be committed (by another node): it is unavailable (503, retryable), not invalid.
+func (n *Single) checkWait(ctx context.Context, idx *index, wait map[int]int64) error {
+	var past []*shardSlot
+	for s, seq := range wait {
+		if s < 0 || s >= len(idx.shards) {
+			return api.InvalidAt("params.wait_for", "wait_for names shard %d; index %q has %d", s, idx.name, len(idx.shards))
+		}
+		if sl := idx.shards[s]; seq > sl.head.Load() {
+			past = append(past, sl)
+		}
+	}
+	if len(past) == 0 {
 		return nil
 	}
-	for _, sl := range shards {
-		h, _, err := n.st.HeadSeq(ctx, sl.id)
-		if err != nil {
-			n.noteDB(err)
-			return api.Unavailable(err, "wait_for's seq %d of shard %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", seq, sl.id.Shard, top)
-		}
-		raise(&sl.head, h)
+	slices.SortFunc(past, func(a, b *shardSlot) int { return a.id.Shard - b.id.Shard })
+	if err := n.readHeads(ctx, past, func(sl *shardSlot, h int64) { raise(&sl.head, h) }); err != nil {
+		sl := past[0]
+		return api.Unavailable(err, "wait_for's seq %d of shard %d is past the newest seq this node knows, %d, and the database cannot be asked for its newest", wait[sl.id.Shard], sl.id.Shard, sl.head.Load())
 	}
-	if head := knownHead(shards); seq > head {
-		return api.InvalidAt("params.wait_for", "wait_for's seq %d is past the newest committed seq of its shard, %d", seq, head)
+	for _, sl := range past {
+		if seq, head := wait[sl.id.Shard], sl.head.Load(); seq > head {
+			return api.InvalidAt("params.wait_for", "wait_for's seq %d of shard %d is past its newest committed seq, %d", seq, sl.id.Shard, head)
+		}
 	}
 	return nil
 }
 
-// knownHead is the highest head this node knows of shards.
-func knownHead(shards []*shardSlot) int64 {
-	var top int64
-	for _, sl := range shards {
-		top = max(top, sl.head.Load())
+// readHeads reads the store's head of each of shards (all of one index) and hands it
+// to fn: one shard's with HeadSeq, more with one IndexHeads.
+func (n *Single) readHeads(ctx context.Context, shards []*shardSlot, fn func(*shardSlot, int64)) error {
+	if len(shards) == 1 {
+		h, _, err := n.st.HeadSeq(ctx, shards[0].id)
+		if err != nil {
+			n.noteDB(err)
+			return err
+		}
+		fn(shards[0], h)
+		return nil
 	}
-	return top
+	top := 0
+	for _, sl := range shards {
+		top = max(top, sl.id.Shard+1)
+	}
+	heads, err := n.st.IndexHeads(ctx, shards[0].id.Index, top)
+	if err != nil {
+		n.noteDB(err)
+		return err
+	}
+	for _, sl := range shards {
+		fn(sl, heads[sl.id.Shard])
+	}
+	return nil
 }
 
 // acquireTries bounds acquire's retries when the copy's shard is swapped under it.
@@ -573,7 +604,7 @@ func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.Read
 	s := ShardFor(id, len(idx.shards))
 	wait := opts.WaitFor.Seq(s)
 	if wait > 0 {
-		if err := n.checkHead(ctx, idx.shards[s:s+1], wait); err != nil {
+		if err := n.checkHead(ctx, idx, s, wait); err != nil {
 			return nil, err
 		}
 	}
@@ -603,7 +634,7 @@ func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOpt
 	s := ShardFor(id, len(idx.shards))
 	wait := opts.WaitFor.Seq(s)
 	if wait > 0 {
-		if err := n.checkHead(ctx, idx.shards[s:s+1], wait); err != nil {
+		if err := n.checkHead(ctx, idx, s, wait); err != nil {
 			return nil, err
 		}
 	}

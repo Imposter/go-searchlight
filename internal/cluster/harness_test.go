@@ -762,6 +762,13 @@ func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time
 	return f.Store.HeadSeq(ctx, id)
 }
 
+func (f *faultStore) IndexHeads(ctx context.Context, index string, shards int) ([]int64, error) {
+	if f.isDown() {
+		return nil, errPartitioned
+	}
+	return f.Store.IndexHeads(ctx, index, shards)
+}
+
 func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
 	if f.isDown() {
 		return store.Tip{}, errPartitioned

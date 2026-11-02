@@ -62,10 +62,8 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		if err := checkToken(idx, opts.WaitFor); err != nil {
 			return nil, err
 		}
-		for s, seq := range opts.WaitFor.Seqs {
-			if err := n.checkHead(ctx, idx.shards[s:s+1], seq); err != nil {
-				return nil, err
-			}
+		if err := n.checkWait(ctx, idx, opts.WaitFor.Seqs); err != nil {
+			return nil, err
 		}
 	}
 	res = &api.WriteResult{Items: make([]api.ItemResult, len(ops))}

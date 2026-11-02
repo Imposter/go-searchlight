@@ -1171,6 +1171,51 @@ func (s *sqlStore) HeadSeq(ctx context.Context, shard ShardID) (seq int64, now t
 	return seq, millis(nowMs), err
 }
 
+func (s *sqlStore) IndexHeads(ctx context.Context, index string, shards int) (heads []int64, err error) {
+	ctx, end := s.start(ctx, "index_heads", attribute.String("index", index))
+	defer end(&err)
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
+	if shards < 0 {
+		return nil, invalidf("shard count %d out of range", shards)
+	}
+	if err := validShard(ShardID{Index: index, Shard: max(shards-1, 0)}); err != nil {
+		return nil, err
+	}
+	rows, err := s.r.QueryContext(ctx, s.d.Changelog.ReadHeads, index)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	heads = make([]int64, shards)
+	rowHeads := map[int]int64{}
+	var floor int64
+	for rows.Next() {
+		var shard int
+		var v int64
+		if err := rows.Scan(&shard, &v); err != nil {
+			return nil, err
+		}
+		if shard < 0 {
+			floor = v
+		} else {
+			rowHeads[shard] = v
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for sh := range heads {
+		v, ok := rowHeads[sh]
+		if !ok {
+			v = floor
+		}
+		heads[sh] = v
+	}
+	return heads, nil
+}
+
 func (s *sqlStore) Tip(ctx context.Context, q TipQuery) (tip Tip, err error) {
 	ctx, end := s.start(ctx, "tip")
 	defer end(&err)

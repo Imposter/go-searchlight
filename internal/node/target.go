@@ -218,12 +218,8 @@ func (ts targets) stale() bool {
 // through this node to its shard. Release them when done. Every copy is woken first.
 func (n *Single) acquireTargets(ctx context.Context, idx *index, wait *api.Token, forQueries bool) (targets, error) {
 	if !wait.Empty() {
-		for s, sl := range idx.shards {
-			if seq := wait.Seq(s); seq > 0 {
-				if err := n.checkHead(ctx, []*shardSlot{sl}, seq); err != nil {
-					return nil, err
-				}
-			}
+		if err := n.checkWait(ctx, idx, wait.Seqs); err != nil {
+			return nil, err
 		}
 		for _, c := range idx.copies() {
 			c.tailer.Wake()
@@ -307,7 +303,7 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 		return nil, err
 	}
 	if waitSeq > 0 {
-		if err := n.checkHead(ctx, idx.shards[s:s+1], waitSeq); err != nil {
+		if err := n.checkHead(ctx, idx, s, waitSeq); err != nil {
 			return nil, err
 		}
 	}

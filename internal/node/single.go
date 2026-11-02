@@ -617,14 +617,14 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 	idx.meta.Store(state)
 	idx.refresh.Store(int64(n.resolvedRefresh(state.settings)))
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
-	for s := range state.settings.Shards {
+	heads, err := n.st.IndexHeads(ctx, m.Name, state.settings.Shards)
+	if err != nil {
+		idx.cancel()
+		return nil, fmt.Errorf("node: read the heads of index %q: %w", m.Name, err)
+	}
+	for s, head := range heads {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
 		sl.analyzed.budget = &n.handoffs
-		head, _, err := n.st.HeadSeq(ctx, sl.id)
-		if err != nil {
-			idx.cancel()
-			return nil, fmt.Errorf("node: read the head of %s: %w", sl.id, err)
-		}
 		sl.head.Store(head)
 		sl.querySeq.Store(head)
 		idx.shards = append(idx.shards, sl)

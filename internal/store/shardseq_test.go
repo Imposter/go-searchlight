@@ -428,3 +428,35 @@ func TestTooManyConnectionsSaysSo(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// TestIndexHeadsMatchHeadSeq: IndexHeads reads every shard's head in one statement, each
+// as HeadSeq reads it: a shard's own value, the floor for a shard with no row (a
+// dropped index's).
+func TestIndexHeadsMatchHeadSeq(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateShards(t, st, "ih", 3)
+		mustApply(t, st, upsert("ih", 1, "a", `{}`), upsert("ih", 1, "b", `{}`), upsert("ih", 2, "c", `{}`))
+		check := func(what string) {
+			t.Helper()
+			heads, err := st.IndexHeads(ctx, "ih", 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for sh, got := range heads {
+				if want := headSeq(t, st, ShardID{Index: "ih", Shard: sh}); got != want {
+					t.Fatalf("%s: IndexHeads says shard %d is at %d, HeadSeq %d", what, sh, got, want)
+				}
+			}
+		}
+		check("live")
+		if err := st.Indexes().Drop(ctx, "ih"); err != nil {
+			t.Fatal(err)
+		}
+		check("dropped")
+		if heads, err := st.IndexHeads(ctx, "ih", 0); err != nil || len(heads) != 0 {
+			t.Fatalf("no shards: %v, %v", heads, err)
+		}
+	})
+}

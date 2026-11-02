@@ -695,6 +695,13 @@ func (s flakyStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.
 	return s.Store.HeadSeq(ctx, id)
 }
 
+func (s flakyStore) IndexHeads(ctx context.Context, index string, shards int) ([]int64, error) {
+	if s.headDown != nil && s.headDown.Load() {
+		return nil, errUnreachable
+	}
+	return s.Store.IndexHeads(ctx, index, shards)
+}
+
 func (s flakyStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
 	if s.headDown != nil && s.headDown.Load() {
 		return store.Tip{}, errUnreachable

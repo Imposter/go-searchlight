@@ -97,8 +97,8 @@ func (t *Token) String() string {
 	b = binary.AppendUvarint(b, uint64(len(t.Seqs)))
 	prev := -1
 	for _, s := range slices.Sorted(maps.Keys(t.Seqs)) {
-		b = binary.AppendUvarint(b, uint64(s-prev))
-		b = binary.AppendUvarint(b, uint64(t.Seqs[s]))
+		b = binary.AppendUvarint(b, uint64(s-prev))    //nolint:gosec // shards ascend, so the delta is positive
+		b = binary.AppendUvarint(b, uint64(t.Seqs[s])) //nolint:gosec // Note keeps only positive seqs
 		prev = s
 	}
 	return tokenEncoding.EncodeToString(b)

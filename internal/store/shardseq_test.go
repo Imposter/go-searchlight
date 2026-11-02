@@ -486,7 +486,11 @@ func TestIndexHeadsMatchHeadSeq(t *testing.T) {
 				t.Fatal(err)
 			}
 			for sh, got := range heads {
-				if want := headSeq(t, st, ShardID{Index: "ih", Shard: sh}); got != want {
+				want, _, err := st.HeadSeq(ctx, ShardID{Index: "ih", Shard: sh})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
 					t.Fatalf("%s: IndexHeads says shard %d is at %d, HeadSeq %d", what, sh, got, want)
 				}
 			}

@@ -3,6 +3,7 @@ package api_test
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,36 @@ func TestWaitForRefusals(t *testing.T) {
 	p := e.problem(e.do("POST", "/indexes/rf/_search?wait_for="+tok, `{}`), http.StatusBadRequest, "invalid_request")
 	if !hasLoc(p, "params.wait_for") {
 		t.Errorf("a token of the dropped index: %v", p)
+	}
+}
+
+// TestWaitForCheckedByReadsThatDoNotWait: the saved-query listing (realtime from the
+// store) and _fields without entries (the mapping alone) wait on no copy, but check
+// wait_for as every read does: a token past its shard's head, or of another
+// incarnation, is a 400 at params.wait_for, and a current one is answered.
+func TestWaitForCheckedByReadsThatDoNotWait(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.createIndex("nw", `{"settings": {"shards": 2}}`)
+	tok := tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/nw/queries/q1", `{"query": {"all": []}}`))
+	past := tokenPast(t, tok, 1000)
+	for _, path := range []string{"/indexes/nw/queries", "/indexes/nw/_fields", "/indexes/nw/_fields?entries=0"} {
+		sep := "?"
+		if strings.Contains(path, "?") {
+			sep = "&"
+		}
+		p := e.problem(e.do("GET", path+sep+"wait_for="+past, ""), http.StatusBadRequest, "invalid_request")
+		if !hasLoc(p, "params.wait_for") {
+			t.Errorf("%s with a token past the head: %v, want a problem at params.wait_for", path, p)
+		}
+		e.must(http.StatusOK, "GET", path+sep+"wait_for="+tok, "")
+	}
+	e.must(http.StatusOK, "DELETE", "/indexes/nw", "")
+	e.createIndex("nw", `{"settings": {"shards": 2}}`)
+	for _, path := range []string{"/indexes/nw/queries", "/indexes/nw/_fields"} {
+		p := e.problem(e.do("GET", path+"?wait_for="+tok, ""), http.StatusBadRequest, "invalid_request")
+		if !hasLoc(p, "params.wait_for") {
+			t.Errorf("%s with a token of the dropped index: %v", path, p)
+		}
 	}
 }
 

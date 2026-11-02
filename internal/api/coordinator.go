@@ -56,8 +56,9 @@ type Coordinator interface {
 	// its shard up to opts.WaitFor's seq in it.
 	GetQuery(ctx context.Context, index, id string, opts ReadOptions) (*SavedQuery, error)
 	// ListQueries pages an index's saved queries by id: up to size of them with ids
-	// above after. With lean, each holds its id, seq and version alone.
-	ListQueries(ctx context.Context, index, after string, size int, lean bool) ([]*SavedQuery, error)
+	// above after. With lean, each holds its id, seq and version alone. It reads the
+	// store, so realtime; opts.WaitFor is checked as every read checks it.
+	ListQueries(ctx context.Context, index, after string, size int, lean bool, opts ReadOptions) ([]*SavedQuery, error)
 
 	// Search runs a search over every shard of index.
 	Search(ctx context.Context, index string, r *search.Request, opts ReadOptions) (*SearchResult, error)

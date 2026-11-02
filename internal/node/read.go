@@ -580,6 +580,11 @@ func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.
 		}
 	}
 	if len(aggs) == 0 {
+		if opts.WaitFor != nil {
+			if err := n.checkWait(ctx, idx, opts.WaitFor.Seqs); err != nil {
+				return nil, err
+			}
+		}
 		return cat, nil
 	}
 	ts, err := n.acquireTargets(ctx, idx, opts.WaitFor, false)
@@ -756,10 +761,18 @@ func (n *Single) getRecord(ctx context.Context, idx *index, kind store.RecordKin
 	return r, storeError(err, idx.name)
 }
 
-// ListQueries implements [api.Coordinator]: read from the store, so realtime.
-func (n *Single) ListQueries(ctx context.Context, name, after string, size int, lean bool) ([]*api.SavedQuery, error) {
-	if _, err := n.lookupForRead(ctx, name, nil); err != nil {
+// ListQueries implements [api.Coordinator]: read from the store, so realtime, and so
+// with every committed seq in it; a wait_for past its shards' heads, of another
+// incarnation or naming a shard the index lacks is a 400, as on every read.
+func (n *Single) ListQueries(ctx context.Context, name, after string, size int, lean bool, opts api.ReadOptions) ([]*api.SavedQuery, error) {
+	idx, err := n.lookupForRead(ctx, name, opts.WaitFor)
+	if err != nil {
 		return nil, err
+	}
+	if opts.WaitFor != nil {
+		if err := n.checkWait(ctx, idx, opts.WaitFor.Seqs); err != nil {
+			return nil, err
+		}
 	}
 	recs, err := n.records.ListQueries(ctx, name, after, size, lean)
 	if err != nil {

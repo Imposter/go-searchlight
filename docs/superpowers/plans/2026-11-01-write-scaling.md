@@ -1,6 +1,12 @@
 # Plan: scaling writes with per-shard sequences and sharded databases
 
-**Status:** proposed, no code written. Decisions D1 to D6 need the operator's approval before Phase 1.
+**Status:** approved for Change A (2026-11-02). The operator chose D1 (one commit per shard, per-item results), D2 (an
+opaque token, in Searchlight 2.0.0), and Change A now, re-measuring before any decision on Change B. D3 and D6 wait for
+that decision. Production's storage check is deferred, so the gain there is unconfirmed.
+
+**Order changed by Phase 0:** several committers on today's single counter row were slower (by up to 54%), and moving
+`pg_notify` out gained nothing alone. So Phase 1 doesn't ship on its own: its items land with Phase 2, and the first
+release with any of this is 2.0.0.
 
 **Research:** [what the code depends on](../specs/2026-11-01-write-scaling-code-map.md) and
 [external research](../specs/2026-11-01-write-scaling-external-research.md).
@@ -77,10 +83,13 @@ the results' script before Phase 1, and keep rows per commit high, since small b
 
 ## Phase 1: remove the serializers, inside one database (2-3 weeks)
 
-Non-breaking and useful on its own.
+Built with Phase 2 and released with it: Phase 0 showed neither item gains alone, and several committers on one counter
+row lose.
 
-1. **Move `pg_notify` out of the transaction.** Notify after commit. It's only a wake-up: push hints and the 500 ms poll
-   cover a lost one, so a crash between commit and notify costs at most one poll. Measure wake latency.
+1. **Move `pg_notify` out of the transaction.** Notify after commit, in its own transaction with
+   `synchronous_commit = off`: the notifying transaction gets a commit record of its own, which cost 17% when flushed. It's
+   only a wake-up: push hints and the 500 ms poll cover a lost one, so a crash between commit and notify costs at most one
+   poll. Measure wake latency.
 2. **A committer per shard** (or a bounded pool keyed by shard), replacing the one `run` loop. Bound total connections: the
    64-per-node pool matters here.
 3. **Stop `checkIndexes` reading `sl_indexes` per transaction** where a cached uid and mapping version will do, with the

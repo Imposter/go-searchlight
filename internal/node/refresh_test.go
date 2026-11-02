@@ -183,3 +183,59 @@ func rewindSQLite(t *testing.T, storeURL string, k int64) {
 		t.Fatalf("rewind: %v", err)
 	}
 }
+
+// TestRewindLowersTheQuerySeq (from the M2 review): saved queries written after the
+// kept seq are lost in a failover. The shard's querySeq must fall with its head, or
+// every percolation would wait for a seq the rewound shard has not reached again.
+func TestRewindLowersTheQuerySeq(t *testing.T) {
+	cfg := testConfig(t)
+	st := openStore(t, cfg)
+	n := open(t, cfg, st, nil)
+	if _, err := n.CreateIndex(ctx(t), "r", api.IndexSpec{Settings: api.IndexSettings{Shards: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	waitServing(t, n)
+	kept := mustWrite(t, n, "r", upsert("kept", `{"x": 1}`))
+	var ops []api.WriteOp
+	for _, id := range []string{"q1", "q2", "q3", "q4"} {
+		ops = append(ops, api.WriteOp{Kind: api.OpQueryUpsert, ID: id, Query: json.RawMessage(`{"field": "x", "op": "exists"}`)})
+	}
+	lost := mustWrite(t, n, "r", ops...)
+	req := &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"x": 1}`)}}
+	if _, err := n.Percolate(ctx(t), "r", req, api.ReadOptions{WaitFor: lost.Token}); err != nil {
+		t.Fatal(err)
+	}
+	rewindSQLite(t, cfg.StoreURL, kept.Token.Seq(0))
+	deadline := time.Now().Add(30 * time.Second)
+	var fresh *api.WriteResult
+	for {
+		var err error
+		fresh, err = n.Write(ctx(t), "r", []api.WriteOp{upsert("n1", `{"x": 5}`)}, api.WriteOptions{})
+		if err == nil {
+			break
+		}
+		var refused *api.Error
+		if !errors.As(err, &refused) || refused.Status != http.StatusServiceUnavailable || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for {
+		c, cancel := context.WithTimeout(context.Background(), time.Second)
+		res, err := n.Search(c, "r", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: fresh.Token})
+		cancel()
+		if err == nil && res.Total == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the copy never rebuilt: %+v, %v", res, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Logf("kept %d, lost queries at %d, fresh write at %d", kept.Token.Seq(0), lost.Token.Seq(0), fresh.Token.Seq(0))
+	c, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := n.Percolate(c, "r", req, api.ReadOptions{}); err != nil {
+		t.Fatalf("a percolation with no wait_for after the rewind: %v", err)
+	}
+}

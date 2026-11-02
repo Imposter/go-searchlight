@@ -480,15 +480,22 @@ func (n *Single) Percolate(ctx context.Context, name string, req *api.PercolateR
 	if err != nil {
 		return nil, err
 	}
+	err = n.withQueryTargets(ctx, idx, opts.WaitFor, func(ts targets) error {
+		res, err = n.percolateOn(ctx, idx, ts, req, slices.Clip(docs))
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// percolateOn is Percolate on targets ts, for docs analyzed from req.Docs.
+func (n *Single) percolateOn(ctx context.Context, idx *index, ts targets, req *api.PercolateRequest, docs []schema.Doc) (*api.PercolateResponse, error) {
 	out := make([]api.PercolateResult, 0, len(req.Docs)+len(req.IDs))
 	for range req.Docs {
 		out = append(out, api.PercolateResult{Found: true})
 	}
-	ts, err := n.acquireTargets(ctx, idx, opts.WaitFor, true)
-	if err != nil {
-		return nil, err
-	}
-	defer ts.release()
 	m := idx.meta.Load().mapping
 	storedPositions := make([]int, 0, len(req.IDs))
 	for i, id := range req.IDs {

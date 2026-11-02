@@ -837,16 +837,19 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 		res.Percolated = true
 		return nil
 	}
-	ts, err := n.acquireTargets(ctx, idx, waitFor, true)
+	var ids []percolate.IDs
+	var matches [][]api.PercolateMatch
+	err := n.withQueryTargets(ctx, idx, waitFor, func(ts targets) error {
+		var err error
+		ids, matches, err = n.percolateDocs(ctx, idx, ts, docs, details)
+		if err == nil {
+			res.PercolatedAt = ts.token(idx.uid)
+		}
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	defer ts.release()
-	ids, matches, err := n.percolateDocs(ctx, idx, ts, docs, details)
-	if err != nil {
-		return err
-	}
-	res.PercolatedAt = ts.token(idx.uid)
 	for k, p := range pos {
 		res.Items[p].Queries = json.RawMessage(ids[k])
 		if matches != nil {

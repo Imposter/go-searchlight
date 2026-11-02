@@ -812,13 +812,22 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 	return errors.Join(errs...)
 }
 
-// lowerHead lowers the shard's known head to head, when it is higher: its copy found
-// the changelog rewound (a failover that lost commits), so seqs past head are not
-// committed any more, and a wait_for past it must be checked with the store again.
+// lowerHead lowers the shard's known head, newest write and newest saved-query seq to
+// head, each when it is higher: its copy found the changelog rewound (a failover that
+// lost commits), so seqs past head are not committed any more. A wait_for past it must
+// be checked with the store again, and a percolation must not wait for saved queries
+// the rewind lost.
 func (sl *shardSlot) lowerHead(head int64) {
+	for _, v := range []*atomic.Int64{&sl.head, &sl.written, &sl.querySeq} {
+		lowerTo(v, head)
+	}
+}
+
+// lowerTo lowers v to at most n.
+func lowerTo(v *atomic.Int64, n int64) {
 	for {
-		cur := sl.head.Load()
-		if head >= cur || sl.head.CompareAndSwap(cur, head) {
+		cur := v.Load()
+		if n >= cur || v.CompareAndSwap(cur, n) {
 			return
 		}
 	}

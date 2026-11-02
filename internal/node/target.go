@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
@@ -313,6 +314,83 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 		return nil, c.peerServing()
 	}
 	return t, err
+}
+
+// withQueryTargets runs fn on read targets for every shard of idx that wait for wait's
+// seqs and for the saved queries committed through this node (acquireTargets with
+// forQueries), released when fn returns. When that fails waiting for a saved query's
+// seq, here (504) or at a peer that refuses the seq as past the shard's head (400 at
+// params.wait_for: the caller's own wait was checked first), a lossy failover may have
+// lost those queries: only a node hosting a copy of the shard hears of a rewind from
+// its tailer. The shards' querySeqs are then lowered to the store's heads, and when
+// one fell, fn runs once more (but not after a 504: its deadline has passed).
+func (n *Single) withQueryTargets(ctx context.Context, idx *index, wait *api.Token, fn func(targets) error) error {
+	for try := 0; ; try++ {
+		err := n.runQueryTargets(ctx, idx, wait, fn)
+		if err == nil || !queryWaitFailed(err) {
+			return err
+		}
+		if !n.clampQuerySeqs(ctx, idx.shards) || try > 0 || isTimeout(err) || ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+// runQueryTargets is one try of withQueryTargets.
+func (n *Single) runQueryTargets(ctx context.Context, idx *index, wait *api.Token, fn func(targets) error) error {
+	ts, err := n.acquireTargets(ctx, idx, wait, true)
+	if err != nil {
+		return err
+	}
+	defer ts.release()
+	return fn(ts)
+}
+
+// clampQuerySeqs lowers each shard's querySeq (and newest write) to its head in the
+// store, reporting whether any fell. Its read of the store gets a deadline of its own:
+// the request's may have passed.
+func (n *Single) clampQuerySeqs(ctx context.Context, shards []*shardSlot) bool {
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clampTimeout)
+	defer cancel()
+	fell := false
+	_ = n.readHeads(hctx, shards, func(sl *shardSlot, h int64) {
+		if sl.querySeq.Load() > h {
+			fell = true
+		}
+		lowerTo(&sl.querySeq, h)
+		lowerTo(&sl.written, h)
+	})
+	return fell
+}
+
+// clampTimeout bounds clampQuerySeqs' read of the store.
+const clampTimeout = 2 * time.Second
+
+// queryWaitFailed reports whether err is how a wait for a seq past a shard's copies
+// fails: a 504 at the deadline, or a peer's 400 refusing the seq as past the head.
+func queryWaitFailed(err error) bool {
+	var ae *api.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	if ae.Status == http.StatusGatewayTimeout {
+		return true
+	}
+	if ae.Status != http.StatusBadRequest {
+		return false
+	}
+	for _, p := range ae.Problems {
+		if p.Loc == "params.wait_for" {
+			return true
+		}
+	}
+	return false
+}
+
+// isTimeout reports whether err is a read's 504: the deadline passed while it waited.
+func isTimeout(err error) bool {
+	var ae *api.Error
+	return errors.As(err, &ae) && ae.Status == http.StatusGatewayTimeout
 }
 
 // localTarget holds a generation of copy c of idx once it has waitSeq searchable and

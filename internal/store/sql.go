@@ -41,6 +41,8 @@ type sqlStore struct {
 	clock  clock.Clock
 	dur    metric.Float64Histogram
 	errs   metric.Int64Counter
+	// lost counts commit notifications the notifier gave up on.
+	lost   metric.Int64Counter
 	attr   attribute.KeyValue
 	chunk  int
 	closed atomic.Bool
@@ -78,6 +80,7 @@ func newSQLStore(d *dialect.Dialect, pools dialect.Pools, o *options) (*sqlStore
 		clock:    o.clock,
 		dur:      in.Histogram(telemetry.MetricStoreOperationDuration),
 		errs:     in.Counter(telemetry.MetricStoreErrors),
+		lost:     in.Counter(telemetry.MetricStoreNotificationsLost),
 		attr:     attribute.String("dialect", d.Name),
 		chunk:    o.blobChunk,
 		dbPath:   o.dbPath,

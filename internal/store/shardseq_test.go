@@ -4,11 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
 // createOldIndex adds an index the way a binary from before shard sequences does: its
@@ -354,4 +360,54 @@ func TestMigrateChecksShardRows(t *testing.T) {
 			t.Fatalf("migrate with a sequence row missing: %v", err)
 		}
 	})
+}
+
+// TestLostNotificationsAreCountedAndWarned: a notification statement that fails is
+// sent once more, and then counted as lost and warned about, once a minute at most.
+func TestLostNotificationsAreCountedAndWarned(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect != "postgres" {
+			t.Skip("no notifications on " + h.dialect)
+		}
+		logs := &captureHandler{}
+		reader := sdkmetric.NewManualReader()
+		st := h.open(t, WithLogger(slog.New(logs)), WithMeter(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")))
+		s := engine(st)
+		d := *s.d
+		d.Changelog.Notify = "SELECT no_such_function($1::text[])"
+		s.d = &d
+		mustCreateIndex(t, st, "lost")
+		mustApply(t, st, upsert("lost", 0, "a", `{}`))
+		mustApply(t, st, upsert("lost", 0, "b", `{}`))
+		deadline := time.Now().Add(10 * time.Second)
+		for lostCount(t, reader) < 1 {
+			if time.Now().After(deadline) {
+				t.Fatal("no lost notification was counted")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if !logs.has("commit notifications could not be sent") {
+			t.Fatal("the loss was not warned about")
+		}
+	})
+}
+
+// lostCount reads the lost notifications counter.
+func lostCount(t *testing.T, reader *sdkmetric.ManualReader) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == telemetry.MetricStoreNotificationsLost {
+				for _, dp := range sum.DataPoints {
+					n += dp.Value
+				}
+			}
+		}
+	}
+	return n
 }

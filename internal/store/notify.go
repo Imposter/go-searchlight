@@ -7,10 +7,15 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 )
 
 // notifyTimeout bounds one announcement.
 const notifyTimeout = 5 * time.Second
+
+// notifyWarnEvery spaces the warnings of lost notifications.
+const notifyWarnEvery = time.Minute
 
 // notifier announces each shard's newest seq once the transactions that took it have
 // committed, on the dialect's notification channel (Changelog.Notify). It runs apart
@@ -18,8 +23,11 @@ const notifyTimeout = 5 * time.Second
 // instance-wide notify lock from that transaction's commit record to its end, so
 // commits to different shards would commit one at a time. Announcements coalesce, the
 // newest seq of a shard replacing an older one not yet sent, and go out in one
-// statement that does not wait for its own flush. A notification is only a wake-up: one
-// lost to a crash or a failed statement costs a tailer at most one poll.
+// statement that does not wait for its own flush; a statement that fails is sent once
+// more. A notification is only a wake-up: one lost to a crash or to a statement that
+// fails twice costs a tailer at most one poll, and while notifications flow a tailer
+// polls only every half max_lag (1 s by default). Lost ones are counted and warned
+// about.
 type notifier struct {
 	s       *sqlStore
 	mu      sync.Mutex
@@ -27,6 +35,7 @@ type notifier struct {
 	wake    chan struct{}
 	stop    context.CancelFunc
 	done    chan struct{}
+	warned  time.Time // when a loss was last warned about; only run touches it
 }
 
 // startNotifier starts s's notifier; close stops it.
@@ -92,10 +101,20 @@ func (n *notifier) send(ctx context.Context) {
 		}
 		payloads = append(payloads, string(b))
 	}
-	ctx, cancel := context.WithTimeout(ctx, notifyTimeout)
-	defer cancel()
-	if _, err := n.s.w.ExecContext(ctx, n.s.d.Changelog.Notify, payloads); err != nil {
-		n.s.log.DebugContext(ctx, "a commit notification was lost; tailers poll for it", slog.Int("shards", len(payloads)), slog.Any("error", err))
+	var err error
+	for range 2 {
+		sctx, cancel := context.WithTimeout(ctx, notifyTimeout)
+		_, err = n.s.w.ExecContext(sctx, n.s.d.Changelog.Notify, payloads)
+		cancel()
+		if err == nil {
+			return
+		}
+	}
+	n.s.lost.Add(ctx, int64(len(payloads)), metric.WithAttributes(n.s.attr))
+	if now := n.s.clock.Now(); now.Sub(n.warned) >= notifyWarnEvery {
+		n.warned = now
+		n.s.log.WarnContext(ctx, "commit notifications could not be sent; tailers poll for those changes instead",
+			slog.Int("shards", len(payloads)), slog.Any("error", err))
 	}
 }
 

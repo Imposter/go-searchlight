@@ -411,3 +411,20 @@ func lostCount(t *testing.T, reader *sdkmetric.ManualReader) int64 {
 	}
 	return n
 }
+
+// TestTooManyConnectionsSaysSo: an operation that fails because the database refused a
+// connection past its limit says what to change, and still wraps the cause.
+func TestTooManyConnectionsSaysSo(t *testing.T) {
+	st := sqliteHarness(t).open(t)
+	s := engine(st)
+	refused := errors.New("too many clients already")
+	d := *s.d
+	d.TooManyConnections = func(err error) bool { return errors.Is(err, refused) }
+	s.d = &d
+	_, end := s.start(context.Background(), "apply")
+	err := fmt.Errorf("begin: %w", refused)
+	end(&err)
+	if !errors.Is(err, refused) || !strings.Contains(err.Error(), "max_connections") || !strings.Contains(err.Error(), "write_transactions") {
+		t.Fatalf("got %v", err)
+	}
+}

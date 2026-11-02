@@ -42,20 +42,22 @@ func Dialect() *dialect.Dialect {
 		panic(err)
 	}
 	return &dialect.Dialect{
-		Name:        "postgres",
-		Open:        open,
-		Migrations:  sub,
-		ApplyTx:     &sql.TxOptions{Isolation: sql.LevelReadCommitted},
-		SnapshotTx:  &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
-		Retryable:   retryable,
-		CustomPlan:  []any{pgx.QueryExecModeExec},
-		Listen:      listen,
-		Changelog:   changelog,
-		Records:     records,
-		Registry:    registry,
-		Blobs:       blobs,
-		Indexes:     indexes,
-		Maintenance: maintenance,
+		Name:       "postgres",
+		Open:       open,
+		Migrations: sub,
+		ApplyTx:    &sql.TxOptions{Isolation: sql.LevelReadCommitted},
+		SnapshotTx: &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
+		Retryable:  retryable,
+		// Postgres refuses a connection past max_connections with 53300.
+		TooManyConnections: tooManyConnections,
+		CustomPlan:         []any{pgx.QueryExecModeExec},
+		Listen:             listen,
+		Changelog:          changelog,
+		Records:            records,
+		Registry:           registry,
+		Blobs:              blobs,
+		Indexes:            indexes,
+		Maintenance:        maintenance,
 	}
 }
 
@@ -63,6 +65,12 @@ func Dialect() *dialect.Dialect {
 func retryable(err error) bool {
 	var pe *pgconn.PgError
 	return errors.As(err, &pe) && (pe.Code == "40001" || pe.Code == "40P01")
+}
+
+// tooManyConnections reports a connection refused past max_connections (53300).
+func tooManyConnections(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "53300"
 }
 
 // lockTimedOut reports a statement that waited past lock_timeout (55P03).

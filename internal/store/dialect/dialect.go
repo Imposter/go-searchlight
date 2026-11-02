@@ -97,6 +97,11 @@ type Dialect struct {
 	// engine, may simply be run again. Nil means none are.
 	Retryable func(error) bool
 
+	// TooManyConnections, when set, reports the server refusing a connection because
+	// it has as many as it allows (Postgres's max_connections). The store says so in
+	// the error, since the cure is the server's limit or the nodes' pools.
+	TooManyConnections func(error) bool
+
 	// CustomPlan, when set, goes before the arguments of the statements that must be
 	// planned for their arguments' values at every run: the changelog reads that find
 	// a shard's newest change at or below a seq (Changelog.ReadTip, run at every

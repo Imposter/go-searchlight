@@ -28,6 +28,12 @@ const (
 	DefaultGroupCommitBytes   = 16 << 20
 )
 
+// DefaultWriteTransactions is how many write transactions a node runs at once by
+// default. Each holds a connection, so a cluster's nodes together need that many on
+// top of their reads: three nodes at 16 each fit Postgres's default max_connections of
+// 100 with room for their reads, where Phase 0's best, 32, would not.
+const DefaultWriteTransactions = 16
+
 // GroupCommitOptions tune a GroupCommitter. Zero values take the defaults.
 type GroupCommitOptions struct {
 	// MaxDelay is the longest a request waits for company before its batch
@@ -44,10 +50,10 @@ type GroupCommitOptions struct {
 	// share of the store's connections. Above 1, every shard has a lane of its own:
 	// a request is split by shard, and each shard's part commits in a transaction
 	// of that shard's alone, beside other shards'. At 1 there is one lane, and a
-	// request commits whole, its shards together. The default is half the store's
-	// write connections where the Applier is a Store (1 on SQLite, whose one writer
-	// gains nothing from the split, and would pay a commit per shard), and 1
-	// otherwise.
+	// request commits whole, its shards together. The default is DefaultWriteTransactions
+	// where the Applier is a Store, at most half its write connections (1 on SQLite,
+	// whose one writer gains nothing from the split, and would pay a commit per shard),
+	// and 1 otherwise.
 	MaxTransactions int
 	// Tracer and Meter default to the global providers'.
 	Tracer trace.Tracer
@@ -147,7 +153,7 @@ func NewGroupCommitter(st Applier, o GroupCommitOptions) *GroupCommitter {
 	if o.MaxTransactions <= 0 {
 		o.MaxTransactions = 1
 		if w, ok := st.(writeConns); ok {
-			o.MaxTransactions = max(w.writeConns()/2, 1)
+			o.MaxTransactions = max(min(DefaultWriteTransactions, w.writeConns()/2), 1)
 		}
 	}
 	if o.Tracer == nil {

@@ -1,12 +1,15 @@
 package postgres
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
@@ -98,4 +101,14 @@ func column[T any](t *testing.T, arg any) []T {
 		t.Fatalf("argument %T, want %T", arg, c)
 	}
 	return c
+}
+
+// A connection refused past max_connections is told apart from other errors.
+func TestTooManyConnections(t *testing.T) {
+	if !tooManyConnections(fmt.Errorf("open: %w", &pgconn.PgError{Code: "53300"})) {
+		t.Fatal("53300 is not too many connections")
+	}
+	if tooManyConnections(&pgconn.PgError{Code: "40001"}) || tooManyConnections(errors.New("x")) {
+		t.Fatal("other errors are too many connections")
+	}
 }

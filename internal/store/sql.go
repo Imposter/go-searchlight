@@ -146,6 +146,9 @@ func (s *sqlStore) start(ctx context.Context, op string, attrs ...attribute.KeyV
 		trace.WithAttributes(append(attrs, attribute.String("db.system.name", s.d.Name))...))
 	t0 := s.clock.Now()
 	return ctx, func(errp *error) {
+		if *errp != nil && s.d.TooManyConnections != nil && s.d.TooManyConnections(*errp) {
+			*errp = fmt.Errorf("store: the database refused a connection: it has as many as it allows; raise its limit (Postgres's max_connections) or lower the nodes' write_transactions: %w", *errp)
+		}
 		set := metric.WithAttributeSet(attribute.NewSet(attribute.String("operation", op), s.attr))
 		s.dur.Record(ctx, s.clock.Since(t0).Seconds(), set)
 		if err := *errp; err != nil {

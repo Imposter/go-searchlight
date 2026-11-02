@@ -25,7 +25,13 @@ func TestWaitForWaitsOnlyOnTheTokensShards(t *testing.T) {
 		t.Fatalf("a count waiting for shard 0's write = %v, want 1 (shard 1 stands still)", r)
 	}
 	e.problem(e.do("POST", "/indexes/tk/_count?wait_for="+tok1, `{}`), http.StatusGatewayTimeout, "timeout")
-	e.tailer("tk", 1).Resume()
+	tl := e.tailer("tk", 1)
+	tl.Resume()
+	for deadline := time.Now().Add(30 * time.Second); tl.Shard().RefreshedSeq() < tokenSeq(t, tok1, 1); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("shard 1 never caught up after Resume (at %d)", tl.Shard().RefreshedSeq())
+		}
+	}
 	if r := e.must(http.StatusOK, "POST", "/indexes/tk/_count?wait_for="+mergeTokens(t, tok0, tok1), `{}`); r["count"] != 2.0 {
 		t.Fatalf("a count waiting for both writes = %v", r)
 	}

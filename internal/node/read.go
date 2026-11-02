@@ -556,13 +556,19 @@ func docProblem(err error, loc string) error {
 }
 
 // Fields implements [api.Coordinator]: the fields are the mapping's; a keyword_list
-// field's top entries come from a terms aggregation over every document.
+// field's top entries come from a terms aggregation over every document. A cluster
+// node given a token re-reads the catalogue first, so the fields a write through
+// another node mapped are listed (while the database cannot be asked, the mapping
+// this node has is listed, as a search validates against it).
 func (n *Single) Fields(ctx context.Context, name string, entries int, opts api.ReadOptions) (cat *api.FieldCatalog, err error) {
 	ctx, span := n.readSpan(ctx, "node.fields", name)
 	defer func() { endSpan(span, err) }()
 	idx, err := n.lookupForRead(ctx, name, opts.WaitFor)
 	if err != nil {
 		return nil, err
+	}
+	if opts.WaitFor != nil && n.cl != nil {
+		_, _ = n.reloadIfNewer(ctx, idx)
 	}
 	m := idx.meta.Load().mapping
 	cat = &api.FieldCatalog{Dynamic: m.Dynamic, Fields: make([]api.FieldInfo, 0, len(m.Fields))}

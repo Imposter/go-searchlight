@@ -3,6 +3,7 @@ package cluster
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -71,3 +72,34 @@ func TestTokenOfRecreatedIndexOnLaggingNode(t *testing.T) {
 	})
 }
 
+
+// TestFieldsWithTokenOnLaggingNode: a write through node 0 maps a new field; node 1,
+// which has not synced its catalogue since, lists it in _fields given that write's
+// token (read-your-writes), with entries or without.
+func TestFieldsWithTokenOnLaggingNode(t *testing.T) {
+	forSQLiteAndPostgres(t, func(t *testing.T, d *db) {
+		c := newCluster(t, d, func(i int, o *Options) {
+			if i == 1 {
+				o.CatalogInterval = time.Hour
+			}
+		})
+		n0 := c.start(0).n
+		n1 := c.start(1).n
+		createIndex(t, n0, "fl", 1, 1)
+		tok := mustWrite(t, n0, "fl", upsertOp("a", 1))
+		eventually(t, 20*time.Second, "node 1 reads the index", func() error {
+			_, err := count(tctx(t), n1, "fl", tok)
+			return err
+		})
+		tok = mustWrite(t, n0, "fl", api.WriteOp{Kind: api.OpUpsert, ID: "b", Body: []byte(`{"brandnew": "x"}`)})
+		for _, entries := range []int{0, 5} {
+			cat, err := n1.Fields(tctx(t), "fl", entries, api.ReadOptions{WaitFor: tok})
+			if err != nil {
+				t.Fatalf("entries %d: %v", entries, err)
+			}
+			if !slices.ContainsFunc(cat.Fields, func(f api.FieldInfo) bool { return f.Name == "brandnew" }) {
+				t.Errorf("entries=%d: node 1's fields given the write's token lack the field it mapped: %+v", entries, cat.Fields)
+			}
+		}
+	})
+}

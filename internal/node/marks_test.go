@@ -59,7 +59,7 @@ func TestLoweringToTheHeadKeepsACommitThatLanded(t *testing.T) {
 				if path == "clamp" {
 					n.clampQuerySeqs(t.Context(), idx.shards)
 				} else {
-					n.rewound(sl, head)
+					n.rewound(t.Context(), sl, head)
 				}
 				if got := sl.querySeq.Load(); got != tc.want {
 					t.Errorf("querySeq = %d, want %d", got, tc.want)

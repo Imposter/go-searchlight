@@ -711,7 +711,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
 	raise(&sl.head, sh.AppliedSeq())
-	env := n.tailerEnv(sl, spec.Fetcher)
+	env := n.tailerEnv(idx, sl, spec.Fetcher)
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -824,10 +824,11 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 // wait_for past it must be checked with the store again, and a percolation must not
 // wait for saved queries the rewind lost. The head is read from the store again after
 // the marks are loaded, so a commit through this node since the copy's poll is not
-// lowered under; while the store cannot be asked, pollHead stands in for it.
-func (n *Single) rewound(sl *shardSlot, pollHead int64) {
+// lowered under; while the store cannot be asked, pollHead stands in for it. ctx is
+// the index's run context, which the copy's tailer runs under.
+func (n *Single) rewound(ctx context.Context, sl *shardSlot, pollHead int64) {
 	m := sl.load(&sl.head, &sl.written, &sl.querySeq)
-	ctx, cancel := context.WithTimeout(context.Background(), clampTimeout)
+	ctx, cancel := context.WithTimeout(ctx, clampTimeout)
 	defer cancel()
 	head := pollHead
 	if h, _, err := n.st.HeadSeq(ctx, sl.id); err == nil {
@@ -874,14 +875,15 @@ func (m slotMarks) lowerTo(head int64) {
 	}
 }
 
-// tailerEnv is what the node offers the tailer of the shard's copy.
-func (n *Single) tailerEnv(sl *shardSlot, fetcher replica.Fetcher) TailerEnv {
-	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: func(head int64) { n.rewound(sl, head) }, Analyzed: sl.analyzed.take}
+// tailerEnv is what the node offers the tailer of the copy of idx's shard sl.
+func (n *Single) tailerEnv(idx *index, sl *shardSlot, fetcher replica.Fetcher) TailerEnv {
+	rewound := func(head int64) { n.rewound(idx.runCtx, sl, head) }
+	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: rewound, Analyzed: sl.analyzed.take}
 }
 
 // tailerEnvWith is tailerEnv for a copy the registry holds as cp.
-func (n *Single) tailerEnvWith(sl *shardSlot, fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
-	env := n.tailerEnv(sl, fetcher)
+func (n *Single) tailerEnvWith(idx *index, sl *shardSlot, fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
+	env := n.tailerEnv(idx, sl, fetcher)
 	env.Copy = cp
 	return env
 }

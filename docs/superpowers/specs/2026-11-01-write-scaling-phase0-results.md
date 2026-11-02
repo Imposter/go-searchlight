@@ -1,31 +1,47 @@
 # Write scaling Phase 0: results
 
 Phase 0 of [the write scaling plan](../plans/2026-11-01-write-scaling.md), measured 2026-11-01 and 2026-11-02 on
-one Windows workstation. Read with the [code map](2026-11-01-write-scaling-code-map.md) and the
+one Windows workstation: first on a hard disk, then the decisive cases again on an NVMe drive. Read with the [code map](2026-11-01-write-scaling-code-map.md) and the
 [external research](2026-11-01-write-scaling-external-research.md).
 
 ## Verdict
 
-**The gate is not met on this machine.** No sustained multi-shard load on one instance doubled. The serializers
-can be removed: on one node, the spike's per-shard counters took the lock wait from up to 183 ms (under step b's
-lanes) to about 1 ms. They reached a median 1.9-2.3× in **bursts of 2-15 seconds**, but only on a WAL flush the disk
-doesn't honour. Over a million
-changes the best gain was **1.32× durable and 1.30× with that unsafe flush**. Several loads got slower: small bulks
-over many shards, and three nodes.
+**On NVMe the gate is met: step c sustained 4.0-4.4× base on one instance, durably, and 2.2× end to end.** On the
+hard disk it is not met, because the disk binds first. The [NVMe section](#nvme-rerun) has the numbers.
 
-**On this machine, the limit is the disk, not the serializers.** The data directory is on a 7,200 rpm hard disk.
-A durable flush costs 8.5 ms, and WAL plus checkpoint writes run at only 15-45 MB/s. Each change writes about 2 KB
-of WAL, which caps the instance near 7-25k changes/s whatever Searchlight does. With fsync and synchronous commit
-both off, the cap comes from WAL writes: 22-24k changes/s, and 20-28k with the spike.
+| Storage | Load | base | c | c/base |
+|---|---|---|---|---|
+| NVMe, `fdatasync` 0.38 ms | 64 shards, 4,096 bulk, 3M changes | 28,581 [26,883-32,033] 3 | 119,158 [113,887-121,609] 3 | **4.17** |
+| NVMe | 8 shards, 500 bulk, 1M changes | 29,838 [29,518-31,113] 3 | 118,879 [117,860-119,892] 3 | **3.98** |
+| NVMe | 1 shard, 4,096 bulk (control) | 28,162 [26,889-30,011] 3 | 28,911 [28,384-31,151] 3 | 1.03 |
+| NVMe, end to end | 64 shards, 4,096 bulk, docs/s | 12,512 [12,159-12,896] 3 | 27,557 [27,332-27,793] 3 | **2.20** |
+| Hard disk, `fdatasync` 8.5 ms, tuned | 64 shards, 4,096 bulk, 1M changes | 12,685 | 16,741 | 1.32 |
 
-**The question isn't settled for production or NVMe.** The base design has a second, CPU limit: one backend writes
-the whole 4,096-change statement, at about 27 µs per change. That caps one node near 25-35k changes/s on any
-storage. The spike removes that cap, so it could pay on storage that sustains more than about 70 MB/s of WAL. This
-disk can't show it. **Before Phase 1, rerun the script in "Running it on production's storage"** on production's
-ZFS (and, if wanted, on this machine's NVMe drive), and apply the gate to that. If production also caps near
-these numbers, stop. Production's needs are another reason not to hurry: scrape-bot's 2026-11-01 load test found
-Searchlight and Postgres "nowhere near a limit in steady state", and scrape-bot creates its indexes with one shard
-(the default). With one shard, Change A gains nothing.
+**On NVMe, base is limited by one backend's CPU, not by WAL.** Its one committer writes the 4,096-change statement in
+130 ms, about 32 µs per change. One backend sits on CPU, the WAL runs at 55 MB/s, and the flush takes 4-5 ms of a
+140 ms cycle.
+
+**c removes that limit.** About 7-8 backends write at once and the WAL runs at 180-210 MB/s. The next limits show up
+in the wait events: `Lock/extend` (4-5 backends: relation extension on `sl_changes` and `sl_documents`),
+`LWLock/WALWrite` and `WALInsert` (2-3 each), and the load generator itself (`Client/ClientRead` 3-4).
+
+**End to end, the node is now the limit.** With c, 19 backends wait in `Client/ClientRead` for a node using 4.3
+cores.
+
+**On the 7,200 rpm hard disk, the limit is the disk, not the serializers.** A durable flush costs 8.5 ms, and WAL
+plus checkpoint writes run at only 15-45 MB/s. Each change writes about 2 KB of WAL, which caps the instance near
+7-25k changes/s whatever Searchlight does. There, c gained at most 1.32× sustained. It reached about 2× only in
+2-15 s bursts on a flush the disk didn't honour.
+
+**c needs enough rows per shard per commit.** With 64 shards and bulks of 500 or fewer, or few writers, c was slower
+than base on the hard disk, by up to 0.44-0.64×. That wasn't rerun on NVMe.
+
+**Before Phase 1, check production.** The NVMe drive is a consumer Crucial P5 without power-loss protection. Its 0.38
+ms `fdatasync` is plausible for a real cache flush, but no power-loss test proved it. Production runs ZFS under a
+4-core VM, whose flush and WAL bandwidth are unknown. The script in "Running it on production's storage" settles
+which of these two machines production resembles. Production's needs are another reason not to hurry:
+- scrape-bot's 2026-11-01 load test found Searchlight and Postgres "nowhere near a limit in steady state";
+- scrape-bot creates its indexes with one shard (the default), where Change A gains nothing (the control row).
 
 ## Environment
 
@@ -116,6 +132,94 @@ runs. Cells over 20% apart were run again where the verdict depends on them, whi
 **median [min-max] n**. Each store-level case has a fresh schema, and each end-to-end run a fresh database. A
 `CHECKPOINT` came before every run. The runner, analysis script, raw JSON lines (`runs.jsonl`), machine samples and
 summaries are kept in `E:\tmp\writescale-phase0\` (`scripts\`, `results\`).
+
+## NVMe rerun
+
+The decisive cases, rerun on 2026-11-02 on the same machine with the data directory on its NVMe drive. The drive
+holds the operator's own files: the run used only `F:\tmp\writescale-nvme\`, which was deleted afterwards. Results
+are in `E:\tmp\writescale-phase0\results\nvme\`.
+
+**Drive:** Crucial P5 2 TB (CT2000P5SSD8, firmware P4CR324), NVMe, NTFS with 4 KB clusters, no power-loss
+protection.
+
+**`pg_test_fsync`**, 3 s per test:
+
+| Method | 8 kB write ops/s | µs/op |
+|---|---|---|
+| open_datasync | 27,778 | 36 |
+| fdatasync | 2,649 | 378 |
+| fsync | 2,371 | 422 |
+
+`open_datasync` at 36 µs again stops in the drive's cache. `fdatasync` at 378 µs is in the range of a real cache
+flush on a consumer NVMe. It was used, and no power-loss test confirmed it.
+
+**Postgres:** a fresh 17.6 cluster on port 55441, with these non-default settings:
+- `wal_sync_method=fdatasync`, `shared_buffers=8GB`, `max_wal_size=8GB`, `checkpoint_timeout=30min`;
+- `max_connections=300`, `track_io_timing` and `track_wal_io_timing` on;
+- `timezone=UTC`, `log_checkpoints=on`.
+
+`max_wal_size` was 8 GB, not the hard disk's tuned 32 GB, to keep the data small on the operator's drive. A 1.5 GB
+insert warmed the WAL first. The 3M runs went past `max_wal_size`, and checkpoints started on WAL during them.
+
+**Method:** the same binaries, base at `c394860` and c at `4c7207c`, and the same `BenchmarkCommitLoad` cases.
+- **Store level:** 16 writers, one node.
+- **End to end:** `slbench writeload` as before (`--gomaxprocs 8`), with the node's files on the NVMe drive too.
+- **Runs:** base and c ran round robin, three rounds each.
+
+Store level, durable, sustained. Changes/s, with WAL and waits from the c runs:
+
+| Shards, bulk, changes | base | c | c/base | base WAL | c WAL |
+|---|---|---|---|---|---|
+| 64, 4,096, 3M | 28,581 [26,883-32,033] 3 | 119,158 [113,887-121,609] 3 | **4.17** | 55.5 MB/s | 182 MB/s |
+| 64, 4,096, 1M | 27,578 [27,247-30,090] 3 | 120,873 [114,527-121,483] 3 | **4.38** | 53.5 MB/s | 187 MB/s |
+| 8, 500, 1M | 29,838 [29,518-31,113] 3 | 118,879 [117,860-119,892] 3 | **3.98** | 57.7 MB/s | 210 MB/s |
+| 1, 4,096, 1M (control) | 28,162 [26,889-30,011] 3 | 28,911 [28,384-31,151] 3 | 1.03 | 54.4 MB/s | 52.9 MB/s |
+
+What each transaction did, mean ms:
+
+| Case | Commits/s | Changes per commit | lock | write | commit | WAL flush (server) |
+|---|---|---|---|---|---|---|
+| base, 64 × 4,096, 3M | 7.0 | 4,096 | 0.14 | 130.3 | 9.8 | 3.8 ms, 14/s |
+| c, 64 × 4,096, 3M | 428 | 274 | 2.05 | 40.1 | 8.7 | 1.8 ms, 169/s |
+| c, 8 × 500, 1M | 255 | 464 | 0.24 | 24.0 | 5.0 | 1.7 ms, 181/s |
+
+Wait events, mean backends:
+- **base:** client CPU 0.73-0.82, walwriter, `IO/WalSync` under 0.1. One backend is busy, so the statement's CPU is
+  the limit.
+- **c, 64 shards:**
+  - client CPU 7.2-7.9;
+  - `Lock/extend` 4.0-5.0 (relation extension);
+  - `Client/ClientRead` 3.2-4.6 (waiting for the benchmark process);
+  - `LWLock/WALWrite` 2.0-3.3 and `LWLock/WALInsert` 1.6-2.5;
+  - `LWLock/BufferContent` 1.4-1.6.
+- **c, 8 shards:** client CPU 4.9-5.0, `Client/ClientRead` 0.7-0.9, `WALWrite` 0.7-0.8.
+
+So on NVMe, WAL bandwidth isn't yet the limit at 180-210 MB/s. The next are relation extension, WAL locks, CPU, and
+the single benchmark process feeding 16 writers. c's figures may therefore be a little low.
+
+End to end, 64 shards, 16 writers, 4,096-document bulks, 30 s. Docs/s:
+
+| | base | c | c/base |
+|---|---|---|---|
+| Docs/s | 12,512 [12,159-12,896] 3 | 27,557 [27,332-27,793] 3 | **2.20** |
+| Bulks refused (429) and resent | 227-294 | 186-195 | |
+| Changes per group-commit transaction | 4,096 | 157 | |
+| WAL | 17.1 MB/s, flushes 1.6 ms × 46/s | 31.2 MB/s, flushes 0.9 ms × 145/s | |
+| Top waits | client CPU 4.2, checkpointer, bgwriter | `Client/ClientRead` 18.8, client CPU 2.1 | |
+
+The copies caught up by the end of every run (lag 0). With c, Postgres waits on the node, which used 4.3 cores
+(machine CPU 57%). End to end, the node's write path and indexing are the limit, not the commit path.
+
+**NVMe verdict:** the gate (at least 2× on a multi-shard load on one instance) is met. That holds at store level
+(4.0-4.4× durable, sustained, with the one-shard control unchanged) and end to end (2.2×).
+
+Not rerun on NVMe:
+- the small-batch cases where c lost on the hard disk (64 shards with 500-change bulks, 4 writers, three nodes);
+- the cluster benchmark;
+- the no-flush bound.
+
+The small-batch cases are where Phase 2 must keep rows per commit high, for example with a per-shard batching
+window or a cap on the shards one request is split into.
 
 ## Where a commit's time goes
 
@@ -391,7 +495,8 @@ Production runs Postgres 17 in a Docker container in a 4-core VM on TrueNAS Scal
 
 ## Not verified
 
-- **Production storage, and NVMe:** the verdict is for this disk only.
+- **Production storage:** unknown, and the NVMe drive's flush isn't proven by a power-loss test. On NVMe, c's
+  small-batch losses and the cluster bench weren't rerun.
 - **The causes of end-to-end losses:** why more shards slow the baseline (4-11 backends on CPU at 64 shards), and how
   much the node's shard fsyncs on the same disk take. Neither was profiled.
 - **Sampled CPU per process:** Postgres backends exit when a run's pool closes, so their CPU seconds didn't add

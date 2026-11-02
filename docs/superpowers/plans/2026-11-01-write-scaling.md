@@ -69,10 +69,11 @@ Everything after this depends on the result.
 **Gate:** if the spike doesn't show at least 2× on a multi-shard load on one instance, stop and find the real limit before
 Phase 1. If one instance already far exceeds what's needed, stop altogether and write that down.
 
-**Outcome (2026-11-02): not met on the test machine; [results](../specs/2026-11-01-write-scaling-phase0-results.md).**
-Per-shard counters reached about 2× only in seconds-long bursts on a flush the disk didn't honour, and at most 1.32×
-sustained. That machine's hard disk limits WAL bandwidth before the serializers do. The gate must be rerun on
-production's storage, with the script in the results, before Phase 1.
+**Outcome (2026-11-02): met on NVMe, not on a hard disk; [results](../specs/2026-11-01-write-scaling-phase0-results.md).**
+On NVMe with a real flush, per-shard counters sustained 4.0-4.4× base durably on one instance (64 shards with 4,096
+changes, 8 with 500; one shard unchanged), and 2.2× end to end. There, base is limited by one backend's statement
+CPU. On a 7,200 rpm disk, WAL bandwidth binds first and the gain was at most 1.32×. Check production's storage with
+the results' script before Phase 1, and keep rows per commit high, since small batches over many shards lost.
 
 ## Phase 1: remove the serializers, inside one database (2-3 weeks)
 

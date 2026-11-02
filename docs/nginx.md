@@ -153,6 +153,12 @@ http_502 http_503` rather than add to them.)
   request anyway. There's no need to additionally size for `max_doc_bytes` or
   `max_bulk_ops` at the proxy — those are Searchlight's own, more specific limits
   inside a body that already fits under `max_body_bytes`.
+- **`large_client_header_buffers`** bounds the request line, and nginx's default
+  (`4 8k`) answers a longer one with a 414 itself. A `?wait_for=<token>` is up to
+  16 KiB (the node's `MaxTokenBytes`): a token naming many shards at high seqs, such as
+  one merged across a 1,024-shard index, can pass 8 KiB. If clients pass such tokens,
+  raise it to fit them, for example `large_client_header_buffers 4 32k;` in the
+  `server` block.
 - **`proxy_read_timeout`** (and `proxy_send_timeout`) need to sit above
   `request_timeout` (30 s by default), the node's own per-request deadline — not above
   any `timeout` a client puts *inside* a search body, which is Searchlight's own

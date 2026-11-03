@@ -41,11 +41,11 @@ call() {
 # jq on Windows ends its lines with CRLF.
 call PUT /indexes/smoke \
   '{"mapping": {"dynamic": "strict", "fields": {"title": "text", "brand": "keyword", "price": "number"}}}' > /dev/null
-seq=$(call PUT /indexes/smoke/docs/sku-1 '{"title": "Oak chair", "brand": "Acme", "price": 30}' | jq -er .seq | tr -d '\r')
-found=$(call POST "/indexes/smoke/_search?wait_for_seq=$seq" \
+token=$(call PUT /indexes/smoke/docs/sku-1 '{"title": "Oak chair", "brand": "Acme", "price": 30}' | jq -er .token | tr -d '\r')
+found=$(call POST "/indexes/smoke/_search?wait_for=$token" \
   '{"query": {"all": [{"field": "brand", "op": "eq", "value": "ACME"}, {"field": "price", "op": "lt", "value": 50}]}}')
 if ! jq -e '.total.value == 1 and .hits[0].id == "sku-1"' > /dev/null <<< "$found"; then
   echo "smoke: the search did not find sku-1: $found" >&2
   exit 1
 fi
-echo "smoke: created an index, indexed sku-1 at seq $seq and found it"
+echo "smoke: created an index, indexed sku-1 at token $token and found it"

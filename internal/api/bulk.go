@@ -30,10 +30,15 @@ type bulkItem struct {
 	Op     string `json:"op"`
 	ID     string `json:"id"`
 	Status int    `json:"status"`
-	Seq    int64  `json:"seq,omitempty"`
+	// Shard is the shard the id routes to; with Seq, where the item stands, which a
+	// client can put in a token of its own (docs/api.md, Tokens).
+	Shard *int `json:"shard,omitempty"`
+	// Seq is the op's seq on Shard when it committed; on a noop, the stored target's
+	// (omitted when there is none).
+	Seq int64 `json:"seq,omitempty"`
 	// Version is the op's client version, when it named one; Result is "noop" when it
 	// was not above the stored one, or when an upsert's body was byte-identical to the
-	// stored document's (Seq is then the stored document's).
+	// stored document's.
 	Version int64  `json:"version,omitempty"`
 	Result  string `json:"result,omitempty"`
 	// Queries are the upserted document's matching saved queries, with
@@ -47,8 +52,9 @@ type bulkItem struct {
 // bulkResponse answers a _bulk request.
 type bulkResponse struct {
 	TookMS int64 `json:"took_ms"`
-	// Token is where the request left each shard it wrote: pass it as wait_for.
-	// Omitted when nothing was written.
+	// Token is where the request left each shard it wrote or found its target on (an
+	// unchanged upsert, a versioned noop): pass it as wait_for. Omitted when it names
+	// no shard.
 	Token string `json:"token,omitempty"`
 	// Errors is set when any item failed, on its own or with its shard's transaction.
 	Errors   bool `json:"errors"`
@@ -147,7 +153,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	id := info(r.Context()).id
 	for i := range ops {
 		it := &res.Items[i]
-		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Seq: it.Seq, Version: it.Version}
+		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Shard: it.Shard, Seq: it.Seq, Version: it.Version}
 		if it.Noop {
 			item.Result = resultNoop
 		}

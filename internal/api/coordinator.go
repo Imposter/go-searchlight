@@ -317,7 +317,7 @@ type WriteOptions struct {
 type WriteResult struct {
 	// Token is where the write left each shard it committed to, or found an unchanged
 	// document on (ItemResult.Unchanged): pass it as wait_for to read the write back.
-	// Nil when it wrote nothing.
+	// Nil when it wrote nothing. It names versioned noops' stored seqs too.
 	Token *Token
 	// Items are the ops' outcomes, in order.
 	Items []ItemResult
@@ -342,11 +342,15 @@ type WriteResult struct {
 
 // ItemResult is one op's outcome.
 type ItemResult struct {
-	// Seq is the op's seq when it committed, or the stored document's when it was
-	// Unchanged.
+	// Shard is the shard the op's id routes to (ShardFor), nil when the op has no
+	// valid id.
+	Shard *int
+	// Seq is the op's seq on Shard when it committed; when it was a noop, the stored
+	// target's (its Version not above the stored one, or Unchanged), 0 when there is
+	// none.
 	Seq int64
 	// Noop is set when nothing was written for the op: its Version was not above the
-	// stored one (Seq is 0), or it was Unchanged.
+	// stored one, or it was Unchanged.
 	Noop bool
 	// Unchanged is set, with Noop, on an unconditional upsert whose body was
 	// byte-identical to the stored document's: nothing was analyzed, committed or
@@ -376,8 +380,12 @@ type ReadOptions struct {
 // Document is a stored document.
 type Document struct {
 	ID string `json:"id"`
-	// Seq is the change that last wrote it; 0 (omitted) on a stale read.
+	// Shard is the shard the id routes to.
+	Shard int `json:"shard"`
+	// Seq is the change that last wrote it, on Shard; 0 (omitted) on a stale read.
 	Seq int64 `json:"seq,omitempty"`
+	// Token is where the document stands: its shard at Seq (omitted with Seq).
+	Token string `json:"token,omitempty"`
 	// Version is the client version its last write named (omitted for none).
 	Version int64           `json:"version,omitempty"`
 	Body    json.RawMessage `json:"body"`
@@ -388,8 +396,13 @@ type Document struct {
 
 // SavedQuery is a stored saved query.
 type SavedQuery struct {
-	ID  string `json:"id"`
-	Seq int64  `json:"seq"`
+	ID string `json:"id"`
+	// Shard is the shard the id routes to.
+	Shard int `json:"shard"`
+	// Seq is the change that last wrote it, on Shard.
+	Seq int64 `json:"seq"`
+	// Token is where the saved query stands: its shard at Seq.
+	Token string `json:"token,omitempty"`
 	// Version is the client version its last write named (omitted for none).
 	Version int64           `json:"version,omitempty"`
 	Query   json.RawMessage `json:"query,omitempty"`

@@ -972,10 +972,12 @@ components:
     Document:
       type: object
       additionalProperties: false
-      required: [id, body]
+      required: [id, shard, body]
       properties:
         id: { type: string }
-        seq: { type: integer, description: The seq of the change that last wrote it; pass it as if_seq. Absent on a stale read. }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard; pass it as if_seq. Absent on a stale read." }
+        token: { type: string, description: "Where the document stands: a token naming its shard at seq. Absent with seq." }
         version: { type: integer, description: "The client version its last write named; absent for none." }
         body: { $ref: "#/components/schemas/DocumentBody" }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy, which may trail the latest write." }
@@ -985,8 +987,9 @@ components:
       required: [id]
       properties:
         id: { type: string }
-        seq: { type: integer, description: "The seq the write committed on its shard: the document's, to pass as if_seq. Absent for a versioned noop; for an unchanged upsert's noop, the seq the stored document was written at." }
-        token: { type: string, description: "Where the write left its shard (for an unchanged upsert, where it found the stored document): pass it as wait_for to read it back. Absent for a versioned noop." }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq the write committed on its shard: the document's, to pass as if_seq. For a noop (a versioned write not above the stored version, or an unchanged upsert), the stored target's seq; absent when there is none." }
+        token: { type: string, description: "Where the write left its shard (for a noop, where it found the stored target): pass it as wait_for to read it back. Absent when there is no seq." }
         version: { type: integer, description: "The write's client version, when it named one." }
         result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, or an unconditional upsert's body was byte-identical to the stored document's (unless detect_noop=false); nothing was written." }
         timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
@@ -996,7 +999,7 @@ components:
       required: [took_ms, errors, timed_out, items]
       properties:
         took_ms: { type: integer }
-        token: { type: string, description: "Where the request left each shard it committed to, or an unchanged upsert's noop found its document on: pass it as wait_for. Absent when nothing was written." }
+        token: { type: string, description: "Where the request left each shard it committed to, or found a noop's stored target on (an unchanged upsert, a versioned noop): pass it as wait_for. Absent when it names no shard." }
         errors: { type: boolean, description: "Set when any item failed: on its own (a 4xx item) or with its shard's transaction (a 5xx item, which may or may not have committed)." }
         timed_out: { type: boolean }
         percolated:
@@ -1019,9 +1022,10 @@ components:
               op: { type: string, enum: [upsert, delete, query_upsert, query_delete] }
               id: { type: string }
               status: { type: integer }
-              seq: { type: integer }
+              shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+              seq: { type: integer, description: "The seq the op committed at on its shard; for a noop, the stored target's (absent when there is none). With shard, where the item stands: a client can form a token of its own from them (docs/api.md, Tokens)." }
               version: { type: integer, description: "The op's client version, when it named one." }
-              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written; seq is the stored document's, and with percolate=true queries and matches are reported as for a write)." }
+              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written, and with percolate=true queries and matches are reported as for a write). Either way seq is the stored target's." }
               queries:
                 type: array
                 items: { type: string }
@@ -1667,10 +1671,12 @@ components:
     SavedQuery:
       type: object
       additionalProperties: false
-      required: [id, seq, query, meta]
+      required: [id, shard, seq, query, meta]
       properties:
         id: { type: string }
-        seq: { type: integer }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard." }
+        token: { type: string, description: "Where the saved query stands: a token naming its shard at seq." }
         version: { type: integer, description: "The client version its last write named; absent for none." }
         query: { $ref: "#/components/schemas/Query" }
         meta: { type: object }

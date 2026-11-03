@@ -54,10 +54,11 @@ segments.
 
 ### Tokens
 
-A write's `token` names, for each shard the write committed to (or found an unchanged
-document on), the newest seq there, plus the index's incarnation (its uid). Pass it
-back as `wait_for`. Treat it as opaque, except to merge tokens (below), for which the
-format is given at the end.
+A write's `token` names, for each shard the write committed to (or found a noop's
+stored target on: an unchanged upsert, a versioned write not above the stored one), the
+newest seq there, plus the index's incarnation (its uid). Pass it back as `wait_for`.
+Treat it as opaque, except to merge tokens or form one (below), for which the format is
+given at the end.
 
 - **Reads that take it.** `_search`, `_count`, `_percolate`, `_fields`, `GET` of a
   document or saved query, the saved-query listing, and `_bulk` with `percolate=true`
@@ -68,6 +69,15 @@ format is given at the end.
 - **Merging.** Tokens of the same incarnation merge by per-shard maximum. A client
   that writes several times may keep, per shard, the newest seq it was given, and pass
   the merge as one token.
+- **Where one item stands.** Every `_bulk` item answers its `shard` (the shard its id
+  routes to, see [Routing](#routing)) and its `seq` there: the seq it committed at, or,
+  for a noop, the stored target's (absent when there is none). A single write and a
+  `GET` of a document or saved query answer the same `shard` and `seq`, and a `token`
+  naming that shard alone. To wait for exactly some items, form a token of their
+  positions: the uid of any token of the index's incarnation (every token of a write,
+  `GET` or percolation of that incarnation carries the same one), and per shard the
+  highest seq among the items on it, encoded as the format below says. A `GET` (or a
+  versioned noop) tells where a document stands without writing it again.
 - **Refusals.** Each is a 400 `invalid_request` at `params.wait_for`:
   - a malformed token, or one over 16 KiB;
   - a seq past its shard's newest committed seq;
@@ -407,16 +417,18 @@ new target, or [`gc_deletes`](#documents), how long deletes keep their versions.
 curl -sS -X PUT 'localhost:8780/indexes/products/docs/sku-1?refresh=wait_for' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"title": "Oak chair", "brand": "Acme", "tags": ["wood", "chair"], "price": 30}'
-# {"id":"sku-1","seq":42,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo"}
+# {"id":"sku-1","shard":1,"seq":42,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo"}
 
 curl -sS 'localhost:8780/indexes/products/docs/sku-1?wait_for=AXZ1E5NJpY_aM8Cv_KlQbqkBASo' \
   -H "Authorization: Bearer $TOKEN"
-# {"id":"sku-1","seq":42,"body":{"title":"Oak chair",...}}
+# {"id":"sku-1","shard":1,"seq":42,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo","body":{"title":"Oak chair",...}}
 ```
 
-- **`seq` and `token`.** A write answers with the document's `seq` on its shard, to pass
-  as `if_seq`, and a [`token`](#tokens), to pass as `wait_for`. Saved-query writes
-  answer the same way.
+- **`shard`, `seq` and `token`.** A write answers with the document's `shard`
+  ([Routing](#routing)) and its `seq` there, to pass as `if_seq`, and a
+  [`token`](#tokens), to pass as `wait_for`. A `GET` answers `shard`, `seq` and a `token` of the
+  document at its seq (no `seq` or `token` on a stale read). Saved-query writes and
+  `GET`s answer the same way.
 
 - **`if_seq=N`.** Applies only if the document's current seq is N. Otherwise the answer
   is a 409 `conflict` carrying `current_seq`, which gives optimistic concurrency.
@@ -424,9 +436,11 @@ curl -sS 'localhost:8780/indexes/products/docs/sku-1?wait_for=AXZ1E5NJpY_aM8Cv_K
   otherwise).
 - **`version=N`**, Elasticsearch's external versioning (`version_type=external`): the
   client's own version of the document, 1 to 2^62. The write applies only when N is
-  higher than the stored version, and answers `{"id", "seq", "token", "version"}`; otherwise it is
-  a noop, `{"id", "version", "result": "noop"}` (200, no `seq`), and writes nothing. It
-  excludes `if_seq` and `op_type=create` (400 at `params.version`).
+  higher than the stored version, and answers `{"id", "shard", "seq", "token",
+  "version"}`; otherwise it is a noop, `{"id", "shard", "seq", "token", "version",
+  "result": "noop"}` (200, with the stored target's `seq` and a `token` of it, both absent
+  when the target is gone), and writes nothing. It excludes `if_seq` and
+  `op_type=create` (400 at `params.version`).
   - The stored version is the greater of the document's and its tombstone's. Versions
     only rise: a write without `version` keeps the stored version (so a stale replay
     of a lower one after it is still a noop), and a delete keeps the document's
@@ -507,11 +521,15 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 {"took_ms": 4, "token": "AXZ1E5NJpY_aM8Cv_KlQbqkCATcBHw", "errors": true, "timed_out": false,
  "percolated": true, "percolated_at": "AXZ1E5NJpY_aM8Cv_KlQbqkCATcBIA",
  "items": [
-   {"op": "upsert", "id": "sku-2", "status": 200, "seq": 55, "queries": []},
-   {"op": "upsert", "id": "sku-3", "status": 200, "seq": 31, "queries": ["cheap"]},
-   {"op": "delete", "id": "sku-9", "status": 409, "error": {"code": "conflict", "current_seq": 30, "...": "..."}}
+   {"op": "upsert", "id": "sku-2", "status": 200, "shard": 1, "seq": 55, "queries": []},
+   {"op": "upsert", "id": "sku-3", "status": 200, "shard": 0, "seq": 31, "queries": ["cheap"]},
+   {"op": "delete", "id": "sku-9", "status": 409, "shard": 0, "error": {"code": "conflict", "current_seq": 30, "...": "..."}}
  ]}
 ```
+
+- **Positions.** Every item names its `shard` and, unless it failed, its `seq` there
+  (the seq it committed at; for a noop, the stored target's). `token` names, per shard,
+  the newest of those. See [Tokens](#tokens) for forming a token of some items.
 
 - **Actions.** Each operation is an action line, `upsert`, `create` or `delete`,
   followed by the document for an upsert or a create. `index` is an alias of `upsert`,
@@ -535,12 +553,13 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 
 - **`version`** in an action's metadata is the [`version=N`](#documents) of its op, on
   documents and saved queries alike: an item at or below the stored version answers
-  `{"status": 200, "version": N, "result": "noop"}`, with no `seq` and, under
-  `percolate=true`, no `queries`. It excludes `if_seq` and `create` (400 at
+  `{"status": 200, "shard": S, "seq": <the stored target's>, "version": N, "result":
+  "noop"}` (no `seq` when the target is gone) and, under `percolate=true`, no
+  `queries`. It excludes `if_seq` and `create` (400 at
   `line.N.<action>.version`).
 - **Unchanged documents** are [noops](#documents) item by item: an `upsert` (no
   `if_seq`, `create` or `version`) of the stored document's bytes answers `{"status":
-  200, "seq": <the stored document's>, "result": "noop"}`, and under `percolate=true`
+  200, "shard": S, "seq": <the stored document's>, "result": "noop"}`, and under `percolate=true`
   still lists its `queries` (and `matches`): it is percolated as a write of the same
   body would be, against the saved queries as they stand. An id that more than one
   operation of the request names is always written. `detect_noop=false` writes every
@@ -1174,7 +1193,7 @@ bound of a [box](#box-queries) on a point field's `date` axis.
 curl -sS -X PUT localhost:8780/indexes/products/queries/cheap \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"search_id": 7}}'
-# {"id":"cheap","seq":32,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBAiA"}
+# {"id":"cheap","shard":0,"seq":32,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBAiA"}
 
 curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: Bearer $TOKEN"
 # {"queries":[{"id":"cheap","seq":32,"query":{...},"meta":{"search_id":7}}],"next":null}

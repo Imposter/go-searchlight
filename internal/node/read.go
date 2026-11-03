@@ -620,6 +620,26 @@ func (n *Single) GetDocument(ctx context.Context, name, id string, opts api.Read
 		return nil, err
 	}
 	s := ShardFor(id, len(idx.shards))
+	doc, err := n.getDocument(ctx, idx, s, id, opts)
+	if err != nil {
+		return nil, err
+	}
+	doc.Shard, doc.Token = s, standing(idx, s, doc.Seq)
+	return doc, nil
+}
+
+// standing is the token of a record at seq of shard s: "" for none (seq 0).
+func standing(idx *index, s int, seq int64) string {
+	if seq <= 0 {
+		return ""
+	}
+	t := &api.Token{UID: idx.uid}
+	t.Note(s, seq)
+	return t.String()
+}
+
+// getDocument is GetDocument of the document id on shard s of idx.
+func (n *Single) getDocument(ctx context.Context, idx *index, s int, id string, opts api.ReadOptions) (*api.Document, error) {
 	wait := opts.WaitFor.Seq(s)
 	if wait > 0 {
 		if err := n.checkHead(ctx, idx, s, wait); err != nil {
@@ -650,6 +670,16 @@ func (n *Single) GetQuery(ctx context.Context, name, id string, opts api.ReadOpt
 		return nil, err
 	}
 	s := ShardFor(id, len(idx.shards))
+	q, err := n.getQuery(ctx, idx, s, id, opts)
+	if err != nil {
+		return nil, err
+	}
+	q.Shard, q.Token = s, standing(idx, s, q.Seq)
+	return q, nil
+}
+
+// getQuery is GetQuery of the saved query id on shard s of idx.
+func (n *Single) getQuery(ctx context.Context, idx *index, s int, id string, opts api.ReadOptions) (*api.SavedQuery, error) {
 	wait := opts.WaitFor.Seq(s)
 	if wait > 0 {
 		if err := n.checkHead(ctx, idx, s, wait); err != nil {

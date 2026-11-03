@@ -58,6 +58,14 @@ documents per second; one shard is unchanged below overload.
   - Single-document and saved-query writes keep `seq` (the document's own, for
     `if_seq`) and add `token`. `if_seq`, `_seq` on hits, `version` and `current_seq` are
     unchanged and remain per document.
+  - **Every write names where each item stands.** A `_bulk` item and a single write
+    answer `shard` (the shard the id routes to) and `seq` there: the seq it committed
+    at, or for a noop the stored target's. A versioned noop now answers that stored
+    `seq` (it had none) and a `token`, and a request's `token` names where its noops
+    stand. A client forms a token of exactly the items it cares about from their
+    `shard`, `seq` and the index's uid ([docs/api.md](docs/api.md#tokens)).
+  - **A `GET` of a document or saved query answers `shard` and a `token`** of it at
+    its seq.
   - **Routing is a documented contract** ([docs/api.md](docs/api.md#routing)): an id's
     shard is the 32-bit FNV-1a hash of its UTF-8 bytes modulo the shard count.
 - **Commit notifications** on Postgres are sent after the commit, coalesced, with

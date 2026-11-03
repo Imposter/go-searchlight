@@ -91,11 +91,18 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 			return nil, err
 		}
 	}
+	stood := placeItems(idx, ops, res.Items)
 	if len(batch) == 0 && len(unchanged) == 0 {
 		res.Percolated = opts.Percolate
+		if len(stood) > 0 {
+			res.Token = &api.Token{UID: idx.uid}
+			for s, seq := range stood {
+				res.Token.Note(s, seq)
+			}
+		}
 		return res, nil
 	}
-	touched := map[int]int64{} // each shard's newest seq the write commits or stands at
+	touched := stood // each shard's newest seq the write commits or stands at
 	written := map[int]int64{}
 	for i := range batch {
 		s := batch[i].change.Shard
@@ -106,9 +113,11 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		s := unchanged[i].change.Shard
 		touched[s] = max(touched[s], unchanged[i].change.Seq)
 	}
-	res.Token = &api.Token{UID: idx.uid}
-	for s, seq := range touched {
-		res.Token.Note(s, seq)
+	if len(touched) > 0 {
+		res.Token = &api.Token{UID: idx.uid}
+		for s, seq := range touched {
+			res.Token.Note(s, seq)
+		}
 	}
 	span.SetAttributes(attribute.Int("shards", len(touched)), attribute.Int("unchanged", len(unchanged)))
 	if handOff {
@@ -613,7 +622,8 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 			switch {
 			case failed[i]:
 			case changes[i].Noop:
-				items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
+				it := &items[batch[i].pos]
+				it.Noop, it.Version, it.Seq = true, changes[i].Version, changes[i].StoredSeq
 			case changes[i].Seq == 0:
 				items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
 			default:
@@ -657,6 +667,24 @@ func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items
 		return nil, shardErr
 	}
 	return applied, nil
+}
+
+// placeItems sets each item's shard (for an op whose id is valid) and returns, by
+// shard, the newest stored seq a versioned noop found there: where those ops stand.
+func placeItems(idx *index, ops []api.WriteOp, items []api.ItemResult) map[int]int64 {
+	stood := map[int]int64{}
+	for i := range ops {
+		if schema.ValidateID(ops[i].ID) != nil {
+			continue
+		}
+		s := ShardFor(ops[i].ID, len(idx.shards))
+		it := &items[i]
+		it.Shard = &s
+		if it.Noop && !it.Unchanged && it.Err == nil && it.Seq > 0 {
+			stood[s] = max(stood[s], it.Seq)
+		}
+	}
+	return stood
 }
 
 // noteApplied answers the committed ops' items and moves their shards' written, query

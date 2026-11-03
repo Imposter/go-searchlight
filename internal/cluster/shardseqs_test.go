@@ -123,3 +123,37 @@ func TestShardSeqGate(t *testing.T) {
 		}
 	})
 }
+
+// TestOldNodeAfterTheSwitchIsNotLive: once shard sequences are on, a node that
+// heartbeats no seq scheme (a 1.x node revived after the switch) is not live, even
+// with the lowest id: it does not lead (so 2.0 nodes keep pruning), and reads are not
+// routed to it.
+func TestOldNodeAfterTheSwitchIsNotLive(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		c := newCluster(t, d, nil)
+		n0 := c.start(0).n
+		if !n0.shardSeqs.Load() {
+			t.Fatal("shard sequences are off on a new database")
+		}
+		old := d.open(t)
+		t.Cleanup(func() { _ = old.Close() })
+		if err := old.Registry().Heartbeat(ctx, store.Node{ID: "0-old", Address: "127.0.0.1:1", Version: "v1.8.0", BodyCodecs: store.BodyCodecs, MappingTypes: store.MappingTypes}); err != nil {
+			t.Fatal(err)
+		}
+		if err := n0.refreshView(ctx); err != nil {
+			t.Fatal(err)
+		}
+		v := n0.view.Load()
+		if _, ok := v.nodes["0-old"]; !ok {
+			t.Fatal("the old node is not in the view")
+		}
+		if v.live["0-old"] {
+			t.Error("a node with no seq scheme is live after the switch")
+		}
+		if !n0.leader() {
+			t.Errorf("%s does not lead beside an old node with a lower id", n0.id)
+		}
+	})
+}

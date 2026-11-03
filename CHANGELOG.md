@@ -4,9 +4,7 @@ Searchlight's releases. The format follows [Keep a Changelog](https://keepachang
 and versions follow [Semantic Versioning](https://semver.org/). The release workflow
 publishes each version's section here as its GitHub release notes (RELEASING.md).
 
-## [Unreleased]
-
-Searchlight 2.0.0 (unreleased).
+## [2.0.0] - 2026-11-03
 
 Every shard has its own sequence, and a node commits to several shards at once. A write
 answers with a token in place of a seq, and reads wait on it shard by shard. On Postgres
@@ -771,6 +769,7 @@ From [docs/architecture.md](docs/architecture.md#known-gaps):
 - No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
   SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
 
+[2.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v2.0.0
 [1.8.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.8.0
 [1.7.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.7.0
 [1.6.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.6.0

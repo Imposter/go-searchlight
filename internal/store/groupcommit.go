@@ -216,7 +216,7 @@ func (g *GroupCommitter) Apply(ctx context.Context, batch []Change) error {
 		return err
 	}
 	for i := range batch {
-		batch[i].Seq, batch[i].Noop = 0, false
+		batch[i].Seq, batch[i].Noop, batch[i].StoredSeq = 0, false, 0
 	}
 	parts := g.split(batch, p)
 	arrived := g.clock.Now()
@@ -292,7 +292,7 @@ func (part *gcPart) copyBack(batch []Change) {
 		if part.at != nil {
 			at = part.at[k]
 		}
-		batch[at].Seq, batch[at].Noop = part.changes[k].Seq, part.changes[k].Noop
+		batch[at].Seq, batch[at].Noop, batch[at].StoredSeq = part.changes[k].Seq, part.changes[k].Noop, part.changes[k].StoredSeq
 	}
 }
 
@@ -564,7 +564,7 @@ func (g *GroupCommitter) flush(batch []*gcRequest) {
 			off := 0
 			for _, i := range live {
 				for j := range batch[i].changes {
-					batch[i].changes[j].Seq, batch[i].changes[j].Noop = changes[off+j].Seq, changes[off+j].Noop
+					batch[i].changes[j].Seq, batch[i].changes[j].Noop, batch[i].changes[j].StoredSeq = changes[off+j].Seq, changes[off+j].Noop, changes[off+j].StoredSeq
 				}
 				off += len(batch[i].changes)
 				state[i] = gcDone

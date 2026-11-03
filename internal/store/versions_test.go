@@ -120,3 +120,34 @@ func TestVersions(t *testing.T) {
 		apply("a", doc("d", 1))
 	})
 }
+
+// TestNoopStoredSeq: a change its Version makes a noop reports the target's seq as the
+// changes before it left it (StoredSeq), 0 for a target that is gone.
+func TestNoopStoredSeq(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st := h.open(t)
+		mustCreateShards(t, st, "ns", 2)
+		w := upsert("ns", 1, "a", `{}`)
+		w.Version = 5
+		b := []Change{w}
+		mustApply(t, st, b...)
+		stored := b[0].Seq
+		again := upsert("ns", 1, "a", `{}`)
+		again.Version = 4
+		gone := del("ns", 1, "b")
+		gone.Version = 3
+		gone2 := del("ns", 1, "b")
+		gone2.Version = 2
+		batch := []Change{again, gone, gone2}
+		if err := st.Apply(ctx, batch); err != nil {
+			t.Fatal(err)
+		}
+		if !batch[0].Noop || batch[0].StoredSeq != stored {
+			t.Errorf("a versioned noop over a stored document: noop %v, stored seq %d, want %d", batch[0].Noop, batch[0].StoredSeq, stored)
+		}
+		if !batch[2].Noop || batch[2].StoredSeq != 0 {
+			t.Errorf("a versioned noop over a tombstone: noop %v, stored seq %d, want 0", batch[2].Noop, batch[2].StoredSeq)
+		}
+	})
+}

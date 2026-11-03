@@ -121,6 +121,9 @@ type Change struct {
 	Version int64
 	// Noop is set by Apply on a change its Version made a noop.
 	Noop bool
+	// StoredSeq is set by Apply with Noop: the seq of the target as the changes before
+	// it in the batch left it, 0 when there is none (it was deleted, or never written).
+	StoredSeq int64
 	// MappingVersion is the index's mapping version when the change committed,
 	// set by the store. The KindMapping change of that version precedes it in
 	// the shard's changelog (Update holds every sequence row of the index and Apply

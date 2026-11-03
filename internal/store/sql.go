@@ -911,7 +911,7 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 	var conflict *ConflictError
 	for i := range batch {
 		c := &batch[i]
-		c.Noop = false
+		c.Noop, c.StoredSeq = false, 0
 		k := keyOf(c)
 		if c.IfSeq == 0 && c.Version == 0 && c.Kind.isUpsert() {
 			st, ok := cur[k]
@@ -933,7 +933,7 @@ func (s *sqlStore) checkConditions(ctx context.Context, tx *sql.Tx, batch []Chan
 			}
 		}
 		if c.Version > 0 && c.Version <= max(st.version, stone) {
-			c.Noop = true
+			c.Noop, c.StoredSeq = true, st.seq
 			skipAt(i)
 			continue
 		}

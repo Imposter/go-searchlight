@@ -519,7 +519,15 @@ func (s *sqlStore) migrateOn(ctx context.Context, ex execer, ms []migration, kno
 		}
 		applied := s.d.Maintenance.AlreadyApplied
 		for i, st := range m.stmts {
-			if _, err := ex.ExecContext(ctx, st); err != nil && (!resumable || applied == nil || !applied(err)) {
+			_, err := ex.ExecContext(ctx, st)
+			if blocking := s.d.Maintenance.Blocking; err != nil && blocking != nil {
+				if alt, ok := blocking(st, err); ok {
+					s.log.WarnContext(ctx, "a migration statement's online form logged more of the writes beside it than the database allows; running it again holding the table's writes",
+						slog.String("migration", m.name), slog.Int("statement", i+1), slog.Any("error", err))
+					_, err = ex.ExecContext(ctx, alt)
+				}
+			}
+			if err != nil && (!resumable || applied == nil || !applied(err)) {
 				return fmt.Errorf("migration %s statement %d: %w", m.name, i+1, err)
 			}
 		}

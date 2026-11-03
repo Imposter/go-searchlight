@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -289,3 +290,83 @@ func TestConcurrentStepBuildsOnce(t *testing.T) {
 type instant struct{ clock.Real }
 
 func (instant) Sleep(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+
+// TestMySQLMigrationBesideHeavyWrites: MySQL's online key change (migration 7) logs the
+// writes 1.x nodes make beside it, and fails (1799) once they outgrow
+// innodb_online_alter_log_max_size (lowered here to make it quick); the migration then
+// runs it again holding the table's writes, and completes.
+func TestMySQLMigrationBesideHeavyWrites(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect != "mysql" {
+			t.Skip("only MySQL logs the writes beside its online key change")
+		}
+		ctx := context.Background()
+		st, all := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql", "0003_change_nonce.sql",
+			"0004_mapping_types.sql", "0005_versions.sql", "0006_body_hash.sql")
+		s := engine(st)
+		old := legacy(t, st)
+		old.create("big", 4)
+		if _, err := s.w.ExecContext(ctx, "SET SESSION cte_max_recursion_depth = 1000000"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.w.ExecContext(ctx, `INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version)
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300000)
+SELECT i + 10, 'big', i % 4, 'upsert', CONCAT('s', i), REPEAT('x', 200), 0, 'u', 1 FROM n`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.w.ExecContext(ctx, "UPDATE sl_counter SET value = 300010 WHERE id = 1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.w.ExecContext(ctx, "SET GLOBAL innodb_online_alter_log_max_size = 65536"); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = s.w.ExecContext(context.Background(), "SET GLOBAL innodb_online_alter_log_max_size = 134217728")
+		})
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		var writes atomic.Int64
+		payload := strings.Repeat("y", 3000)
+		var maxLat atomic.Int64
+		wg.Go(func() {
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				t1 := time.Now()
+				tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
+				if err != nil {
+					return
+				}
+				c, err := old.lockCounter(ctx, tx)
+				if err == nil {
+					_, err = tx.ExecContext(ctx, "INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version) VALUES (?, 'big', ?, 'upsert', ?, ?, 0, 'u', 1)", c+1, i%4, fmt.Sprint("w", i), payload)
+				}
+				if err == nil {
+					_, err = tx.ExecContext(ctx, "UPDATE sl_counter SET value = ? WHERE id = 1", c+1)
+				}
+				if err == nil {
+					err = tx.Commit()
+				}
+				_ = tx.Rollback()
+				if err == nil {
+					writes.Add(1)
+					if d := int64(time.Since(t1)); d > maxLat.Load() {
+						maxLat.Store(d)
+					}
+				}
+			}
+		})
+		s.d.Migrations = all
+		t0 := time.Now()
+		err := st.Migrate(ctx)
+		close(stop)
+		wg.Wait()
+		t.Logf("migrate beside %d 1.x writes of 3 KB took %s (slowest write %s): %v", writes.Load(), time.Since(t0).Round(time.Millisecond), time.Duration(maxLat.Load()).Round(time.Millisecond), err)
+		if err != nil {
+			t.Errorf("migration failed: %v", err)
+		}
+	})
+}

@@ -79,6 +79,18 @@ func alreadyApplied(err error) bool {
 	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061 || me.Number == 1091)
 }
 
+// blocking is dialect.Maintenance's Blocking: an ALTER TABLE that failed with 1799
+// (its rebuild's log of the writes running beside it passed
+// innodb_online_alter_log_max_size) runs again with LOCK=SHARED, which holds writes, so
+// that it logs none. Reads go on.
+func blocking(stmt string, err error) (string, bool) {
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) || me.Number != 1799 || !strings.HasPrefix(strings.ToUpper(stmt), "ALTER TABLE") {
+		return "", false
+	}
+	return stmt + ", LOCK=SHARED", true
+}
+
 // Config converts a store URL of the form
 // mysql://user:pass@host[:port]/db[?param=value...] into a driver config. The
 // query parameters are go-sql-driver DSN parameters (tls, timeout, ...) or

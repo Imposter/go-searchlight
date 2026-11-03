@@ -526,4 +526,9 @@ type Maintenance struct {
 	// interrupted earlier run of a non-transactional migration had applied it (a
 	// column that exists already), so a retry goes on past it.
 	AlreadyApplied func(err error) bool
+	// Blocking returns the form of a migration statement that failed with err that
+	// holds the table's writes while it runs, when the online form failed only because
+	// the writes running beside it outgrew what the engine logs of them (MySQL's
+	// innodb_online_alter_log_max_size): that one needs no log. Nil where there is none.
+	Blocking func(stmt string, err error) (string, bool)
 }

@@ -222,6 +222,7 @@ var maintenance = dialect.Maintenance{
 	MigrateLockReset:   "SET SESSION lock_wait_timeout = DEFAULT",
 	LockTimedOut:       lockTimedOut,
 	AlreadyApplied:     alreadyApplied,
+	Blocking:           blocking,
 }
 
 // question is the engine's placeholder, whatever its position.

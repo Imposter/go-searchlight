@@ -89,6 +89,11 @@ func TestStatementTables(t *testing.T) {
 					if (x == nil) == (d.Name != "sqlite") && (name == "Maintenance.LockTimedOut" || !d.Maintenance.MigrateInTx) {
 						t.Errorf("%s: %s set = %v", scheme, name, x != nil)
 					}
+				case func(string, error) (string, bool):
+					// Blocking: MySQL's online DDL alone logs the writes beside it.
+					if (x != nil) != (d.Name == "mysql") {
+						t.Errorf("%s: %s set = %v", scheme, name, x != nil)
+					}
 				case dialect.Limits, bool:
 				default:
 					t.Errorf("%s: %s has unexpected type %T", scheme, name, x)

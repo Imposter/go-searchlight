@@ -957,7 +957,11 @@ Notes:
      onto one of them: reads and writes go on meanwhile (on an NVMe workstation, three
      million changelog rows took 7.5 s, and no read or write waited on a lock). Other
      nodes starting meanwhile wait for it. On MySQL the key change rebuilds the table in
-     place online, about 18 s per million rows. On SQLite it rebuilds the table, about
+     place online, about 18 s per million rows, while writes go on; MySQL logs those
+     writes meanwhile, and if they outgrow `innodb_online_alter_log_max_size` (128 MiB
+     by default) the online change fails (error 1799) and the migration runs it again
+     with `LOCK=SHARED`, which holds writes (reads go on) until it ends. Raise that
+     setting before a busy upgrade to keep writes going. On SQLite it rebuilds the table, about
      33 s per three million, while the node is down. Run `SELECT count(*) FROM
      sl_changes` first to see what to expect; the changelog holds a few
      `flush_interval`s of writes in steady state. As before, a 1.x

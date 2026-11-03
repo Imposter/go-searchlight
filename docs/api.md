@@ -92,6 +92,17 @@ format is given at the end.
   is at most 16 KiB, which fits 1,024 shards. With seqs near a million a token is 30
   bytes at 1 shard, 67 at 8, 366 at 64 and 5,487 at 1,024.
 
+### Routing
+
+A document or saved query lives on one shard, which its id alone decides: the 32-bit
+FNV-1a hash of the id's bytes as UTF-8 (offset basis 2166136261, prime 16777619, each
+byte XORed in and then multiplied), taken modulo the index's shard count. An index of
+one shard has everything on shard 0. The id is hashed exactly as it is stored, with no
+normalization, and documents and saved queries route alike. The shard count is fixed at
+creation, so an id never moves. This is a stable contract: a client may compute an id's
+shard itself (for `"a"` the hash is 3826002220, so shard 4 of 8, or 44 of 64), and it
+does not change within a major release.
+
 ### Retrying after a 5xx
 
 A 5xx answer, or a 5xx item in a `_bulk`, may or may not have committed. Retry with

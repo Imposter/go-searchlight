@@ -58,6 +58,8 @@ documents per second; one shard is unchanged below overload.
   - Single-document and saved-query writes keep `seq` (the document's own, for
     `if_seq`) and add `token`. `if_seq`, `_seq` on hits, `version` and `current_seq` are
     unchanged and remain per document.
+  - **Routing is a documented contract** ([docs/api.md](docs/api.md#routing)): an id's
+    shard is the 32-bit FNV-1a hash of its UTF-8 bytes modulo the shard count.
 - **Commit notifications** on Postgres are sent after the commit, coalesced, with
   `synchronous_commit` off. A lost one costs a copy up to half `max_lag` (1 s by
   default).

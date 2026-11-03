@@ -220,3 +220,61 @@ func TestSwitchStall(t *testing.T) {
 		t.Logf("%s: the switch seeded %d rows in %s; a write waited at most %s", h.dialect, indexes*shards+2, took.Round(time.Millisecond), time.Duration(maxWait.Load()).Round(time.Millisecond))
 	})
 }
+
+// TestThreeMigratorsBesideOldWrites: three nodes migrate a v6 database at once while a
+// 1.x node writes: every migration succeeds, every 1.x write too, and no two changes
+// share a seq.
+func TestThreeMigratorsBesideOldWrites(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect == "sqlite" {
+			t.Skip("SQLite serves one node")
+		}
+		ctx := context.Background()
+		st, _ := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql", "0003_change_nonce.sql",
+			"0004_mapping_types.sql", "0005_versions.sql", "0006_body_hash.sql")
+		old := legacy(t, st)
+		old.create("m", 4)
+		for i := range 2000 {
+			old.mustApply("m", i%4, fmt.Sprint("p", i))
+		}
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		var oldErrs atomic.Int64
+		wg.Go(func() {
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := old.apply("m", i%4, fmt.Sprint("q", i)); err != nil {
+					oldErrs.Add(1)
+				}
+			}
+		})
+		var errs [3]error
+		var mg sync.WaitGroup
+		for i := range 3 {
+			o, err := Open(ctx, h.url, quiet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = o.Close() })
+			mg.Go(func() { errs[i] = o.Migrate(ctx) })
+		}
+		mg.Wait()
+		close(stop)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Errorf("migrator %d: %v", i, err)
+			}
+		}
+		if n := oldErrs.Load(); n > 0 {
+			t.Errorf("%d 1.x writes failed during the migrations", n)
+		}
+		if n := len(sharedSeqs(t, st, 0)); n != 0 {
+			t.Errorf("%d shared seqs", n)
+		}
+	})
+}

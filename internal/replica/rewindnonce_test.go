@@ -58,7 +58,7 @@ func TestIdenticalReissueIsARewind(t *testing.T) {
 					fmt.Sprintf("INSERT INTO sl_changes (seq, index_name, shard, kind, id, payload, at, index_uid, mapping_version, nonce) VALUES (%d, 'w', 0, 'upsert', '%s', '%s', %d, '%s', %d, %s)",
 						lc.Seq, tc.id, body, lc.At.UnixMilli(), lc.IndexUID, lc.MappingVersion, tc.nonce),
 					fmt.Sprintf("INSERT INTO sl_documents (index_name, shard, id, body, seq) VALUES ('w', 0, '%s', '%s', %d)", tc.id, body, lc.Seq),
-					fmt.Sprintf("UPDATE sl_counter SET value = %d WHERE id = 1", lc.Seq))
+					fmt.Sprintf("UPDATE sl_shard_seq SET value = %d WHERE index_name = 'w' AND shard = 0", lc.Seq))
 				if tc.restart {
 					c.start()
 				}

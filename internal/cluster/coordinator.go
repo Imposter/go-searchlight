@@ -347,6 +347,11 @@ type Node struct {
 	// zstdBodies is set once this node stores document bodies compressed
 	// (bodyCodecGate).
 	zstdBodies atomic.Bool
+	// shardSeqs is set once this node has seen shard sequences on (shardSeqGate).
+	shardSeqs atomic.Bool
+	// lastSeed is when shardSeqGate last looked for indexes without sequence rows; only
+	// the view loop and Start touch it.
+	lastSeed time.Time
 
 	started  atomic.Bool
 	draining atomic.Bool
@@ -482,6 +487,9 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	if err := n.bodyCodecGate(ctx); err != nil {
 		n.log.WarnContext(ctx, "reading the cluster's features failed; the view loop retries", slog.Any("error", err))
+	}
+	if err := n.shardSeqGate(ctx); err != nil {
+		n.log.WarnContext(ctx, "turning shard sequences on failed; the view loop retries", slog.Any("error", err))
 	}
 	if err := n.singleSQLite(ctx); err != nil {
 		return err

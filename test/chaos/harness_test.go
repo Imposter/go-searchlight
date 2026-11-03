@@ -3,6 +3,7 @@
 package chaos
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/slproc"
 	"github.com/Imposter/go-searchlight/internal/store/postgres"
@@ -43,10 +45,12 @@ const (
 	// uploads them when the suite fails).
 	envDir = "SEARCHLIGHT_CHAOS_DIR"
 
-	index        = "chaos"
-	shards       = 3
-	apiToken     = "chaos-api-token-0123456789abcdef"
-	clusterToken = "chaos-cluster-token-0123456789"
+	index = "chaos"
+	// defaultShards is the chaos index's shard count; a scenario may set another
+	// (cluster.shards) before it creates the index.
+	defaultShards = 3
+	apiToken      = "chaos-api-token-0123456789abcdef"
+	clusterToken  = "chaos-cluster-token-0123456789"
 
 	// oldVersion and newVersion label the two builds of the binary a rolling upgrade
 	// moves between; every other scenario runs newVersion.
@@ -116,6 +120,115 @@ func binaries(t *testing.T) (old, cur string) {
 	return builds.old, builds.cur
 }
 
+// envFromRelease names the release tag TestRollingUpgradeFromRelease upgrades from
+// (default fromRelease); the test skips when the checkout lacks it.
+const (
+	envFromRelease = "SEARCHLIGHT_CHAOS_FROM_RELEASE"
+	fromRelease    = "v1.8.0"
+)
+
+var release struct {
+	once     sync.Once
+	tag, bin string
+	skip     string
+	err      error
+}
+
+// releaseBinary builds the release the cross-release upgrade starts from, from its tag's
+// tree (git archive), or skips the test when git or the tag is missing.
+func releaseBinary(t *testing.T) (tag, bin string) {
+	t.Helper()
+	release.once.Do(func() {
+		tag := os.Getenv(envFromRelease)
+		if tag == "" {
+			tag = fromRelease
+		}
+		release.tag = tag
+		if err := exec.Command("git", "rev-parse", "--verify", "--quiet", tag+"^{commit}").Run(); err != nil {
+			release.skip = fmt.Sprintf("tag %s is not in this checkout (git fetch --tags)", tag)
+			return
+		}
+		_, _ = binaries(t)
+		src := filepath.Join(builds.dir, "src-"+tag)
+		if err := os.MkdirAll(src, 0o750); err != nil {
+			release.err = err
+			return
+		}
+		if err := unpackTag(tag, src); err != nil {
+			release.err = err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		dir := filepath.Join(builds.dir, tag)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			release.err = err
+			return
+		}
+		release.bin, release.err = slproc.BuildFrom(ctx, src, dir, strings.TrimPrefix(tag, "v"))
+	})
+	if release.skip != "" {
+		t.Skip(release.skip)
+	}
+	if release.err != nil {
+		t.Fatal(release.err)
+	}
+	return release.tag, release.bin
+}
+
+// unpackTag writes the whole tree of tag into dir.
+func unpackTag(tag, dir string) error {
+	top, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return fmt.Errorf("find the repository: %w", err)
+	}
+	cmd := exec.Command("git", "archive", "--format=tar", tag)
+	cmd.Dir = strings.TrimSpace(string(top))
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("git archive %s: %w", tag, err)
+	}
+	tr := tar.NewReader(out)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read the archive of %s: %w", tag, err)
+		}
+		path := filepath.Join(dir, filepath.FromSlash(h.Name))
+		switch h.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(path, 0o750); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(f, tr)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		return err
+	}
+	return cmd.Wait()
+}
+
 // pgURL creates a schema for the test on the Postgres in SEARCHLIGHT_TEST_PG_URL and
 // returns a store_url whose search_path is it, or skips the test without one.
 func pgURL(t *testing.T) string {
@@ -169,6 +282,11 @@ type cluster struct {
 	// was refused: set while nodes stop gracefully, which must never cut a request they
 	// accepted.
 	refusedOnly bool
+	// shards is the chaos index's shard count.
+	shards int
+	// mixed is set while nodes of two releases serve: a read then asks for no
+	// read-your-writes position, since each release refuses the other's parameter.
+	mixed atomic.Bool
 }
 
 // member is one node of the cluster, as the load balancer sees it.
@@ -182,7 +300,10 @@ type member struct {
 	disrupted atomic.Bool
 	// bulks counts the _bulk requests in flight on it.
 	bulks atomic.Int64
-	log   *os.File
+	// current is set once it runs this build (a cross-release upgrade starts it on
+	// the release before).
+	current atomic.Bool
+	log     *os.File
 	// holdRecovery is the node's SEARCHLIGHT_TEST_HOLD_RECOVERY file: while it exists,
 	// every copy recovery but the first the process starts waits.
 	holdRecovery string
@@ -205,7 +326,7 @@ func newCluster(t *testing.T, n int, bin string, extra ...string) *cluster {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &cluster{t: t, store: store, dir: dir, stop: cancel}
+	c := &cluster{t: t, store: store, dir: dir, stop: cancel, shards: defaultShards}
 	c.lb = &balancer{c: c, client: &http.Client{Timeout: time.Minute}, retries: map[string]int{}}
 	t.Cleanup(c.close)
 	for i := range n {
@@ -423,7 +544,7 @@ type model struct {
 	mu    sync.Mutex
 	docs  map[string]doc
 	maybe map[string][]outcome
-	head  int64
+	head  *api.Token
 	acked int64
 }
 
@@ -439,7 +560,7 @@ func newModel() *model { return &model{docs: map[string]doc{}, maybe: map[string
 type view struct {
 	docs  map[string]doc
 	maybe map[string][]outcome
-	head  int64
+	head  *api.Token
 }
 
 func (m *model) snapshot() view {
@@ -500,7 +621,7 @@ func (v *view) bounds(keep func(id string, d doc) bool) (lo, hi int64) {
 // serves it.
 func (c *cluster) createIndex() {
 	c.t.Helper()
-	body := fmt.Sprintf(`{"mapping": {"dynamic": "strict", "fields": {"w": "keyword", "k": "number", "v": "number", "n": "number", "brand": "keyword", "title": "text"}}, "settings": {"shards": %d}}`, shards)
+	body := fmt.Sprintf(`{"mapping": {"dynamic": "strict", "fields": {"w": "keyword", "k": "number", "v": "number", "n": "number", "brand": "keyword", "title": "text"}}, "settings": {"shards": %d}}`, c.shards)
 	a, err := call(c.t.Context(), c.lb.client, http.MethodPut, c.members[0].URL+"/indexes/"+index, body)
 	if err != nil || a.status != http.StatusCreated {
 		c.t.Fatalf("create the index: %v HTTP %d %s", err, a.status, a.body)
@@ -515,6 +636,11 @@ type load struct {
 	m      *model
 	reads  atomic.Int64
 	writes atomic.Int64
+	// mixedReads counts the reads mixedRead made.
+	mixedReads atomic.Int64
+	// partial counts the bulk items answered with a 5xx while the rest of their
+	// bulk committed.
+	partial atomic.Int64
 }
 
 // writer ids: each writer owns keys of its own, so it alone writes them, one batch at a
@@ -613,7 +739,7 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		var resp struct {
-			Seq   int64 `json:"seq"`
+			Token string `json:"token"`
 			Items []struct {
 				Status int             `json:"status"`
 				Error  json.RawMessage `json:"error"`
@@ -624,9 +750,16 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		ok := true
+		failed := make([]bool, len(ops))
 		for i, it := range resp.Items {
 			gone := ops[i].delete && it.Status == http.StatusNotFound
-			if it.Status != http.StatusOK && !gone {
+			switch {
+			case it.Status == http.StatusOK || gone:
+			case it.Status >= http.StatusInternalServerError && c.write503:
+				// A shard's transaction failed while the database was down; the other
+				// shards' ops committed. The failed ones may or may not have.
+				failed[i] = true
+			default:
 				c.lb.violate("_bulk item %s: HTTP %d %s", ops[i].id, it.Status, it.Error)
 				ok = false
 			}
@@ -635,7 +768,18 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			continue
 		}
 		l.m.mu.Lock()
-		for _, o := range ops {
+		acked := 0
+		for i, o := range ops {
+			if failed[i] {
+				d := doc{v: o.v, n: g*keysPerWriter + o.k, brand: o.brand}
+				l.m.maybe[o.id] = append(l.m.maybe[o.id], outcome{present: !o.delete, d: d})
+				if !o.delete {
+					versions[o.k] = o.v
+				}
+				l.partial.Add(1)
+				continue
+			}
+			acked++
 			delete(l.m.maybe, o.id)
 			if o.delete {
 				delete(l.m.docs, o.id)
@@ -645,10 +789,14 @@ func (c *cluster) writer(ctx context.Context, l *load, g int) {
 			l.m.docs[o.id] = doc{v: o.v, n: g*keysPerWriter + o.k, brand: o.brand}
 			versions[o.k], live[o.k] = o.v, true
 		}
-		l.m.head = max(l.m.head, resp.Seq)
-		l.m.acked += int64(len(ops))
+		if tok, err := api.ParseToken(resp.Token); err == nil {
+			if l.m.head == nil || !l.m.head.Merge(tok) {
+				l.m.head = tok
+			}
+		}
+		l.m.acked += int64(acked)
 		l.m.mu.Unlock()
-		l.writes.Add(int64(len(ops)))
+		l.writes.Add(int64(acked))
 		time.Sleep(writerPause)
 	}
 }
@@ -668,11 +816,16 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 		default:
 			path, body = "/indexes/"+index+"/_search", `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand", "size": 10}}}}`
 		}
-		if !c.write503 {
-			// Read-your-writes through the balancer: the newest acknowledged seq, which
-			// any node checks against the database's head. While the database is down a
-			// node cannot, and answers 503: that scenario reads without it.
-			path += fmt.Sprintf("?wait_for_seq=%d", head)
+		if !c.write503 && !c.mixed.Load() {
+			// Read-your-writes through the balancer: the merge of the acknowledged
+			// writes' tokens, which any node checks against the database's heads. While
+			// the database is down a node cannot, and answers 503: that scenario reads
+			// without it.
+			path += "?wait_for=" + head.String()
+		}
+		if c.mixed.Load() && head != nil && rnd.IntN(3) == 0 {
+			c.mixedRead(ctx, l, path, body, head)
+			continue
 		}
 		a, err := c.lb.do(ctx, http.MethodPost, path, body, time.Minute, false)
 		if err != nil {
@@ -684,6 +837,31 @@ func (c *cluster) reader(ctx context.Context, l *load, g int) {
 		}
 		l.reads.Add(1)
 		time.Sleep(time.Duration(rnd.IntN(20)) * time.Millisecond)
+	}
+}
+
+// mixedRead sends a read waiting for head straight to a ready node of this build while
+// nodes of the release before still serve: it reads its shards' copies wherever they
+// are, so waiting on a copy of either release for a seq a node of this build gave out.
+func (c *cluster) mixedRead(ctx context.Context, l *load, path, body string, head *api.Token) {
+	var picks []*member
+	for _, m := range c.members {
+		if m.current.Load() && m.ready.Load() && !m.disrupted.Load() {
+			picks = append(picks, m)
+		}
+	}
+	if len(picks) == 0 {
+		return
+	}
+	m := picks[rand.IntN(len(picks))]
+	a, err := c.lb.send(ctx, m, http.MethodPost, path+"?wait_for="+head.String(), body, false)
+	switch {
+	case err != nil || m.disrupted.Load():
+	case a.status != http.StatusOK:
+		c.lb.violate("POST %s waiting for %s on %s: HTTP %d %s", path, head, m.NodeID(), a.status, truncate(a.body))
+	default:
+		l.reads.Add(1)
+		l.mixedReads.Add(1)
 	}
 }
 
@@ -716,7 +894,7 @@ func (c *cluster) waitDurable(i int) {
 		if err != nil {
 			return err
 		}
-		if len(copies) != shards {
+		if len(copies) != c.shards {
 			return fmt.Errorf("%d copies", len(copies))
 		}
 		for _, sc := range copies {
@@ -778,13 +956,13 @@ func (c *cluster) waitGreen(d time.Duration) {
 func (c *cluster) settle(m *model) {
 	c.t.Helper()
 	v := m.snapshot()
-	lo, hi := make([]int64, shards), make([]int64, shards)
-	for s := range shards {
-		lo[s], hi[s] = v.bounds(func(id string, _ doc) bool { return node.ShardFor(id, shards) == s })
+	lo, hi := make([]int64, c.shards), make([]int64, c.shards)
+	for s := range c.shards {
+		lo[s], hi[s] = v.bounds(func(id string, _ doc) bool { return node.ShardFor(id, c.shards) == s })
 	}
 	start := time.Now()
 	eventually(c.t, 5*time.Minute, "every copy converges on the acknowledged writes", func() error {
-		docs := make([]int64, shards)
+		docs := make([]int64, c.shards)
 		for k, mb := range c.members {
 			if !slproc.Ready(c.t.Context(), mb.AdminURL) {
 				return fmt.Errorf("%s is not ready", mb.NodeID())
@@ -793,14 +971,14 @@ func (c *cluster) settle(m *model) {
 			if err != nil {
 				return fmt.Errorf("%s: %w", mb.NodeID(), err)
 			}
-			if len(copies) != shards {
+			if len(copies) != c.shards {
 				return fmt.Errorf("%s holds %d copies: %+v", mb.NodeID(), len(copies), copies)
 			}
 			for _, sc := range copies {
 				s := sc.Shard
-				if sc.State != "serving" || sc.AppliedSeq < v.head || sc.Docs < lo[s] || sc.Docs > hi[s] || (k > 0 && sc.Docs != docs[s]) {
+				if sc.State != "serving" || sc.AppliedSeq < v.head.Seq(s) || sc.Docs < lo[s] || sc.Docs > hi[s] || (k > 0 && sc.Docs != docs[s]) {
 					return fmt.Errorf("%s shard %d: %s at seq %d with %d documents; want serving at %d with %d to %d (as the other copies: %d)",
-						mb.NodeID(), s, sc.State, sc.AppliedSeq, sc.Docs, v.head, lo[s], hi[s], docs[s])
+						mb.NodeID(), s, sc.State, sc.AppliedSeq, sc.Docs, v.head.Seq(s), lo[s], hi[s], docs[s])
 				}
 				docs[s] = sc.Docs
 			}
@@ -808,7 +986,7 @@ func (c *cluster) settle(m *model) {
 		return nil
 	})
 	c.t.Logf("converged in %s: %d acknowledged documents (%d ids unacknowledged) at seq %d",
-		time.Since(start).Round(time.Millisecond), len(v.docs), len(v.maybe), v.head)
+		time.Since(start).Round(time.Millisecond), len(v.docs), len(v.maybe), v.head.Seqs)
 }
 
 // verify checks every node answers with exactly the documents the model allows, all
@@ -845,7 +1023,7 @@ func (c *cluster) verify(m *model) {
 			var cr struct {
 				Count int64 `json:"count"`
 			}
-			a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_count?wait_for_seq=%d", mb.URL, index, v.head),
+			a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_count?wait_for=%s", mb.URL, index, v.head),
 				fmt.Sprintf(`{"query": {"field": "brand", "op": "eq", "value": %q}}`, brand))
 			if err != nil || a.status != http.StatusOK || json.Unmarshal(a.body, &cr) != nil {
 				c.t.Errorf("%s: count of %s: %v HTTP %d %s", mb.NodeID(), brand, err, a.status, truncate(a.body))
@@ -888,9 +1066,9 @@ func head5(s []string) []string {
 	return s[:min(5, len(s))]
 }
 
-// scan pages through every document of the index on mb, as of seq, and returns each
-// one's version.
-func (c *cluster) scan(mb *member, seq int64) map[string]int {
+// scan pages through every document of the index on mb, as of the token at, and returns
+// each one's version.
+func (c *cluster) scan(mb *member, at *api.Token) map[string]int {
 	c.t.Helper()
 	out := map[string]int{}
 	var after json.RawMessage
@@ -900,7 +1078,7 @@ func (c *cluster) scan(mb *member, seq int64) map[string]int {
 			body += `, "search_after": ` + string(after)
 		}
 		body += "}"
-		a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_search?wait_for_seq=%d", mb.URL, index, seq), body)
+		a, err := call(c.t.Context(), c.lb.client, http.MethodPost, fmt.Sprintf("%s/indexes/%s/_search?wait_for=%s", mb.URL, index, at), body)
 		if err != nil || a.status != http.StatusOK {
 			c.t.Fatalf("%s: scan: %v HTTP %d %s", mb.NodeID(), err, a.status, truncate(a.body))
 		}

@@ -106,7 +106,8 @@ type rereadRig struct {
 	coord    *tnode
 	b, c     *tnode
 	id       store.ShardID
-	seq      int64
+	seq      *api.Token // rd's write
+	rr, rm   *api.Token // rr's and rm's writes
 	trailing *view
 }
 
@@ -133,9 +134,9 @@ func newRereadRig(t *testing.T) *rereadRig {
 	if _, err := r.b.n.CreateIndex(tctx(t), "rd", spec); err != nil {
 		t.Fatal(err)
 	}
-	mustWrite(t, r.b.n, "rr", upsertOp("x", 1), api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
+	r.rr = mustWrite(t, r.b.n, "rr", upsertOp("x", 1), api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"all": []}`)})
 	for k := range 8 {
-		mustWrite(t, r.b.n, "rm", upsertOp(fmt.Sprintf("m%d", k), k))
+		r.rm = merged(r.rm, mustWrite(t, r.b.n, "rm", upsertOp(fmt.Sprintf("m%d", k), k)))
 	}
 	r.seq = mustWrite(t, r.b.n, "rd", api.WriteOp{Kind: api.OpUpsert, ID: "d", Body: json.RawMessage(`{"seen": 1900000000000}`)},
 		api.WriteOp{Kind: api.OpQueryUpsert, ID: "recent", Query: json.RawMessage(`{"field": "seen", "op": "gte", "value": "now-7d"}`)})
@@ -152,8 +153,8 @@ func newRereadRig(t *testing.T) *rereadRig {
 	waitCopies(t, r.b.st, "rr", 1, 2, time.Minute)
 	waitCopies(t, r.b.st, "rm", 4, 2, time.Minute)
 	waitCopies(t, r.b.st, "rd", 1, 2, time.Minute)
-	waitCount(t, r.c.n, "rr", r.seq, 1)
-	waitCount(t, r.c.n, "rm", r.seq, 8)
+	waitCount(t, r.c.n, "rr", r.rr, 1)
+	waitCount(t, r.c.n, "rm", r.rm, 8)
 	r.id = store.ShardID{Index: "rr", Shard: 0}
 	r.trailing = r.coord.n.view.Load()
 	for _, id := range []store.ShardID{r.id, {Index: "rm", Shard: 3}, {Index: "rd", Shard: 0}} {
@@ -174,7 +175,7 @@ func (r *rereadRig) reset(down ...string) {
 // one was: a re-read reads the registry again (or takes a view read since).
 func (r *rereadRig) target(cands ...candidate) *remoteTarget {
 	_, routed := r.coord.n.route(r.id)
-	return &remoteTarget{n: r.coord.n, id: r.id, waitSeq: r.seq, routed: routed, cands: cands}
+	return &remoteTarget{n: r.coord.n, id: r.id, waitSeq: r.rr.Seq(r.id.Shard), routed: routed, cands: cands}
 }
 
 func (r *rereadRig) at(tn *tnode) candidate {
@@ -286,7 +287,7 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 		r.reset(r.b.addr)
 		before := r.rereads(t, "search", "found")
 		reads := r.coord.wrap.tableReads.Load()
-		got, err := count(tctx(t), r.coord.n, "rm", r.seq)
+		got, err := count(tctx(t), r.coord.n, "rm", r.rm)
 		if err != nil || got != 8 {
 			t.Fatalf("a search of rm with b down: %d, %v; want 8", got, err)
 		}
@@ -319,7 +320,7 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 	t.Run("older wire level", func(t *testing.T) {
 		r.reset()
 		before := r.rereads(t, "percolate", "found")
-		res, err := r.coord.n.Percolate(tctx(t), "rd", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))}}, api.ReadOptions{WaitForSeq: r.seq})
+		res, err := r.coord.n.Percolate(tctx(t), "rd", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))}}, api.ReadOptions{WaitFor: r.seq})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -331,9 +332,9 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 		}
 	})
 
-	// A copy that has not reached wait_for_seq answers in time with a timeout: the
+	// A copy that has not reached wait_for's seq answers in time with a timeout: the
 	// read re-reads, and the copy that has it answers.
-	t.Run("lagging copy under wait_for_seq", func(t *testing.T) {
+	t.Run("lagging copy under wait_for", func(t *testing.T) {
 		r.reset()
 		stall := make(chan struct{})
 		r.b.wrap.stallTail.Store(&stall)
@@ -357,7 +358,7 @@ func TestReadRereadsTheCopyTable(t *testing.T) {
 		before := r.rereads(t, "search", "found")
 		got, err := count(tctx(t), r.coord.n, "rr", seq)
 		if err != nil || got != 2 {
-			t.Fatalf("a wait_for_seq search with b behind: %d, %v; want 2", got, err)
+			t.Fatalf("a wait_for search with b behind: %d, %v; want 2", got, err)
 		}
 		if n := r.rereads(t, "search", "found") - before; n != 1 {
 			t.Fatalf("%d re-reads found a copy, want 1", n)

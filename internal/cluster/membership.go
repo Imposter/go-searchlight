@@ -201,7 +201,7 @@ func (n *Node) dropLease(l *lease) {
 func (n *Node) heartbeat(ctx context.Context) error {
 	err := n.reg.Heartbeat(ctx, store.Node{
 		ID: n.id, Address: n.cfg.AdvertiseAddress, Version: n.opts.Version, Capacity: n.opts.Capacity,
-		BodyCodecs: store.BodyCodecs, MappingTypes: store.MappingTypes,
+		BodyCodecs: store.BodyCodecs, MappingTypes: store.MappingTypes, SeqScheme: store.SeqScheme,
 	})
 	n.NoteDB(err)
 	return err
@@ -517,7 +517,9 @@ func (v *view) takenOver(l *lease) bool {
 
 // refreshView reads the registry and publishes the view, unless a read that began
 // later has published one already (reads run concurrently: the view loop, the
-// allocator, routing misses).
+// allocator, routing misses). Once shard sequences are on, a node that heartbeats no
+// seq scheme (a 1.x node left running past the switch) is not live: it leads nothing,
+// and no read is routed to its copies, which no longer follow the changelog.
 func (n *Node) refreshView(ctx context.Context) error {
 	readAt := n.lc.Now()
 	nodes, err := n.reg.Nodes(ctx)
@@ -531,10 +533,11 @@ func (n *Node) refreshView(ctx context.Context) error {
 		return err
 	}
 	v := &view{at: n.clock.Now(), readBegan: readAt, nodes: map[string]store.Node{}, live: map[string]bool{n.id: true}, copies: map[store.ShardID][]store.Copy{}}
+	seqsOn := n.shardSeqs.Load()
 	for i := range nodes {
 		nd := &nodes[i]
 		v.nodes[nd.ID] = *nd
-		if nd.HeartbeatAge < n.opts.DeadAfter {
+		if nd.HeartbeatAge < n.opts.DeadAfter && (!seqsOn || nd.SeqScheme >= store.SeqScheme) {
 			v.live[nd.ID] = true
 		}
 	}
@@ -579,6 +582,9 @@ func (n *Node) viewLoop(ctx context.Context) {
 		err := n.refreshView(ctx)
 		if err == nil {
 			err = n.bodyCodecGate(ctx)
+		}
+		if err == nil {
+			err = n.shardSeqGate(ctx)
 		}
 		if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			n.log.DebugContext(ctx, "reading the registry failed", slog.Any("error", err))

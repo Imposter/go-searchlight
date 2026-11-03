@@ -1,10 +1,10 @@
 // Package mysql is the MySQL (InnoDB) dialect of the SQL store, on
 // go-sql-driver/mysql.
 //
-// Apply locks the counter row with SELECT ... FOR UPDATE under READ
-// COMMITTED, so sequence numbers are assigned and committed in order, and
-// writes a batch as multi-row INSERTs sized to MySQL's placeholder and packet
-// limits.
+// Apply locks its shards' sequence rows with SELECT ... FOR UPDATE under READ
+// COMMITTED, so each shard's sequence numbers are assigned and committed in
+// order, and writes a batch as multi-row INSERTs sized to MySQL's placeholder
+// and packet limits.
 // MySQL DDL is not transactional, so migrations run on one connection holding
 // a GET_LOCK named after an MD5 hash of the database (a name can run to 64
 // bytes, which a long database name alone could exceed), and each file is
@@ -71,10 +71,24 @@ func lockTimedOut(err error) bool {
 }
 
 // alreadyApplied reports DDL that an interrupted migration had already run: a
-// duplicate column (1060), table (1050) or index name (1061).
+// duplicate column (1060), table (1050) or index name (1061), or a column or index to
+// drop that is gone (1091). An ALTER TABLE is atomic, so one that fails that way had
+// run whole.
 func alreadyApplied(err error) bool {
 	var me *mysql.MySQLError
-	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061)
+	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061 || me.Number == 1091)
+}
+
+// blocking is dialect.Maintenance's Blocking: an ALTER TABLE that failed with 1799
+// (its rebuild's log of the writes running beside it passed
+// innodb_online_alter_log_max_size) runs again with LOCK=SHARED, which holds writes, so
+// that it logs none. Reads go on.
+func blocking(stmt string, err error) (string, bool) {
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) || me.Number != 1799 || !strings.HasPrefix(strings.ToUpper(stmt), "ALTER TABLE") {
+		return "", false
+	}
+	return stmt + ", LOCK=SHARED", true
 }
 
 // Config converts a store URL of the form

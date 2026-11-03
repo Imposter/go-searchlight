@@ -3,8 +3,8 @@
 //
 // The database runs in WAL mode so readers never block the writer. Writes go
 // through a one-connection pool whose transactions begin with BEGIN
-// IMMEDIATE, taking SQLite's write lock up front: that lock is the counter
-// lock, so sequence numbers are assigned and committed in order, and no
+// IMMEDIATE, taking SQLite's write lock up front: that lock is every shard's
+// sequence lock, so sequence numbers are assigned and committed in order, and no
 // writer ever blocks mid-transaction trying to upgrade a deferred lock to a
 // write lock (the SQLITE_BUSY livelock that class of locking invites). Other
 // connections to the same file — another node's Store, or SQLite's own

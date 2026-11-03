@@ -40,7 +40,7 @@ type hit struct {
 // set.
 func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error {
 	start := s.clock.Now()
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -79,7 +79,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 		}
 		defer s.readBytes.release(cost)
 	}
-	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
+	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}
@@ -107,7 +107,7 @@ type countBody struct {
 
 // count serves POST /indexes/{index}/_count: {query}, an exact count.
 func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -134,7 +134,7 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 		}
 		sr.MaxStaleness = d
 	}
-	resp, err := s.c.Search(r.Context(), r.PathValue("index"), sr, ReadOptions{WaitForSeq: wait})
+	resp, err := s.c.Search(r.Context(), r.PathValue("index"), sr, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

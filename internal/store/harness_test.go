@@ -279,6 +279,15 @@ func mustCreateIndex(t testing.TB, st Store, name string) {
 	}
 }
 
+// mustCreateShards creates an index of n shards.
+func mustCreateShards(t testing.TB, st Store, name string, n int) {
+	t.Helper()
+	settings := fmt.Appendf(nil, `{"shards": %d}`, n)
+	if _, err := st.Indexes().Create(context.Background(), IndexMeta{Name: name, Settings: settings}); err != nil && !errors.Is(err, ErrExists) {
+		t.Fatalf("create index %s: %v", name, err)
+	}
+}
+
 func upsert(index string, shard int, id, body string) Change {
 	return Change{Index: index, Shard: shard, Kind: KindUpsert, ID: id, Payload: []byte(body)}
 }
@@ -287,16 +296,36 @@ func del(index string, shard int, id string) Change {
 	return Change{Index: index, Shard: shard, Kind: KindDelete, ID: id}
 }
 
-func mustApply(t *testing.T, st Applier, batch ...Change) (int64, int64) {
+// mustApply applies batch, every change of which must apply, and returns the lowest
+// and the highest seq it took. Each shard's changes must take contiguous seqs, in
+// batch order.
+func mustApply(t *testing.T, st Applier, batch ...Change) (first, last int64) {
 	t.Helper()
-	first, last, err := st.Apply(context.Background(), batch)
-	if err != nil {
+	if err := st.Apply(context.Background(), batch); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if last-first+1 != int64(len(batch)) {
-		t.Fatalf("apply returned %d..%d for %d changes", first, last, len(batch))
+	prev := map[ShardID]int64{}
+	for i := range batch {
+		c := &batch[i]
+		if p, ok := prev[c.ShardID()]; c.Seq == 0 || ok && c.Seq != p+1 {
+			t.Fatalf("change %d on %s took seq %d after %d", i, c.ShardID(), c.Seq, p)
+		}
+		prev[c.ShardID()] = c.Seq
+		if first == 0 || c.Seq < first {
+			first = c.Seq
+		}
+		last = max(last, c.Seq)
 	}
 	return first, last
+}
+
+// seqsOf returns batch's seqs.
+func seqsOf(batch []Change) []int64 {
+	out := make([]int64, len(batch))
+	for i := range batch {
+		out[i] = batch[i].Seq
+	}
+	return out
 }
 
 // allChanges pages through a shard's changelog.
@@ -343,13 +372,22 @@ func scanAll(t *testing.T, st Store, shard ShardID) (map[string]Record, int64) {
 	return out, pt.Seq
 }
 
-func counterValue(t *testing.T, st Store) int64 {
+// headSeq is shard's head.
+func headSeq(t *testing.T, st Store, shard ShardID) int64 {
+	t.Helper()
+	seq, _, err := st.HeadSeq(context.Background(), shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// floorSeq is the floor every new shard starts at: sl_counter row 3 once shard
+// sequences are on, row 1 (the global sequence) before.
+func floorSeq(t *testing.T, st Store) int64 {
 	t.Helper()
 	var v int64
-	var mc markColumns
-	var own shardMarkColumns
-	s := engine(st)
-	if err := s.r.QueryRowContext(context.Background(), s.d.Changelog.ReadCounterMark, "", 0).Scan(&v, &mc.index, &mc.shard, &mc.kind, &mc.id, &mc.at, &mc.nonce, &own.seq, &own.kind, &own.id, &own.at, &own.nonce); err != nil {
+	if err := engine(st).r.QueryRowContext(context.Background(), "SELECT value FROM sl_counter WHERE id IN (1, 3)").Scan(&v); err != nil {
 		t.Fatal(err)
 	}
 	return v

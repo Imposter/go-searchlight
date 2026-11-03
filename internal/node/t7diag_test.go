@@ -156,7 +156,7 @@ func TestT7Diag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var last int64
+	var last *api.Token
 	for lo := 0; lo < preload; lo += 1000 {
 		ops := make([]api.WriteOp, 0, 1000)
 		for i := lo; i < min(lo+1000, preload); i++ {
@@ -171,12 +171,12 @@ func TestT7Diag(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			last = res.Seq
+			last = merged(last, res.Token)
 			break
 		}
 	}
 	wctx, cancel := context.WithTimeout(bg, 5*time.Minute)
-	if _, err := n.Search(wctx, "t7", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil {
+	if _, err := n.Search(wctx, "t7", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last}); err != nil {
 		t.Fatal(err)
 	}
 	cancel()
@@ -225,7 +225,7 @@ func TestT7Diag(t *testing.T) {
 			if err != nil || res.TimedOut {
 				t.Fatalf("%s: wait_for write: %v", mode, err)
 			}
-			raws = append(raws, raw{res.Seq, t0, seen})
+			raws = append(raws, raw{maxSeq(res.Token), t0, seen})
 		}
 		stop.Store(true)
 		bgWG.Wait()

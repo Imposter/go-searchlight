@@ -40,10 +40,11 @@ type prepared struct {
 	whole bool
 }
 
-// Write implements [api.Coordinator]: see the package documentation. With percolation,
-// a wait_for_seq past the head is refused before anything commits, and once the write
-// commits a percolation that cannot finish is reported in the result (Percolated
-// false), never as an error that hides the seqs.
+// Write implements [api.Coordinator]: see the package documentation. A wait_for
+// without percolation is refused (it is what a percolation reads saved queries up
+// to). With percolation, a wait_for past its shards' heads is refused before anything
+// commits, and once the write commits a percolation that cannot finish is reported in
+// the result (Percolated false), never as an error that hides the seqs.
 func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts api.WriteOptions) (res *api.WriteResult, err error) {
 	ctx, span := n.tr.Start(ctx, "node.write", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, name), attribute.Int("ops", len(ops)), attribute.Bool("percolate", opts.Percolate)))
@@ -58,8 +59,14 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 	if err != nil {
 		return nil, err
 	}
-	if opts.Percolate && opts.WaitForSeq > 0 {
-		if err := n.checkHead(ctx, opts.WaitForSeq); err != nil {
+	if opts.WaitFor != nil && !opts.Percolate {
+		return nil, api.InvalidAt("params.wait_for", "wait_for on a write is what a percolation reads saved queries up to: give percolate=true")
+	}
+	if opts.Percolate && opts.WaitFor != nil {
+		if idx, err = n.checkTokenOf(ctx, idx, opts.WaitFor); err != nil {
+			return nil, err
+		}
+		if err := n.checkWait(ctx, idx, opts.WaitFor.Seqs); err != nil {
 			return nil, err
 		}
 	}
@@ -84,22 +91,41 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 			return nil, err
 		}
 	}
+	stood := placeItems(idx, ops, res.Items)
 	if len(batch) == 0 && len(unchanged) == 0 {
 		res.Percolated = opts.Percolate
+		if len(stood) > 0 {
+			res.Token = &api.Token{UID: idx.uid}
+			for s, seq := range stood {
+				res.Token.Note(s, seq)
+			}
+		}
 		return res, nil
 	}
-	touched := map[int]bool{}
+	touched := stood // each shard's newest seq the write commits or stands at
 	written := map[int]int64{}
 	for i := range batch {
-		touched[batch[i].change.Shard] = true
-		written[batch[i].change.Shard] = max(written[batch[i].change.Shard], batch[i].change.Seq)
-		res.Seq = max(res.Seq, batch[i].change.Seq)
+		s := batch[i].change.Shard
+		touched[s] = max(touched[s], batch[i].change.Seq)
+		written[s] = max(written[s], batch[i].change.Seq)
 	}
 	for i := range unchanged {
-		touched[unchanged[i].change.Shard] = true
-		res.Seq = max(res.Seq, unchanged[i].change.Seq)
+		s := unchanged[i].change.Shard
+		touched[s] = max(touched[s], unchanged[i].change.Seq)
 	}
-	span.SetAttributes(attribute.Int64("seq", res.Seq), attribute.Int("unchanged", len(unchanged)))
+	if len(touched) > 0 {
+		res.Token = &api.Token{UID: idx.uid}
+		for s, seq := range touched {
+			res.Token.Note(s, seq)
+		}
+	}
+	if len(written) > 0 {
+		res.Committed = &api.Token{UID: idx.uid}
+		for s, seq := range written {
+			res.Committed.Note(s, seq)
+		}
+	}
+	span.SetAttributes(attribute.Int("shards", len(touched)), attribute.Int("unchanged", len(unchanged)))
 	if handOff {
 		for i := range batch {
 			sl := idx.shards[batch[i].change.Shard]
@@ -117,21 +143,21 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 		n.cl.Committed(idx.name, written)
 	}
 	if opts.Refresh != api.RefreshNone {
-		if err := n.waitWritten(ctx, idx, touched, res.Seq, opts.Refresh); err != nil {
+		if err := n.waitWritten(ctx, idx, touched, opts.Refresh); err != nil {
 			res.TimedOut = true
-			n.log.WarnContext(ctx, "refresh after a write did not finish", slog.String(telemetry.KeyIndex, name), slog.Int64("seq", res.Seq), slog.Any("error", err))
+			n.log.WarnContext(ctx, "refresh after a write did not finish", slog.String(telemetry.KeyIndex, name), slog.Any("error", err))
 		}
 	}
 	if opts.Percolate {
 		if len(unchanged) > 0 {
 			batch = mergeByPos(batch, unchanged)
 		}
-		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitForSeq, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
+		if err := n.percolateWritten(ctx, idx, batch, res, opts.WaitFor, MatchDetails{Versions: opts.Matches || opts.InnerHits, InnerHits: opts.InnerHits}); err != nil {
 			res.Percolated, res.PercolateErr = false, err
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				res.TimedOut = true
 			}
-			n.log.WarnContext(ctx, "percolating a committed write failed", slog.String(telemetry.KeyIndex, name), slog.Int64("seq", res.Seq), slog.Any("error", err))
+			n.log.WarnContext(ctx, "percolating a committed write failed", slog.String(telemetry.KeyIndex, name), slog.Any("error", err))
 		}
 	}
 	return res, nil
@@ -555,72 +581,132 @@ func (n *Single) admit(idx *index, batch []prepared) error {
 	return nil
 }
 
-// commit commits batch through the group committer. An op whose if_seq fails, or
-// that the store refuses on its own, is answered in its item and the rest commit
-// without it. It returns the committed ops, with their seqs. A delete of nothing
-// (IfExists) is skipped in the transaction: it takes no seq and is a 404. A versioned
-// op whose version is not above the stored one is a noop: no seq, and no error.
+// commit commits batch through the group committer, each shard's ops in a
+// transaction of their own. An op whose if_seq fails, or that the store refuses on its
+// own, is answered in its item and the rest commit without it. It returns the
+// committed ops, with their seqs. A delete of nothing (IfExists) is skipped in the
+// transaction: it takes no seq and is a 404. A versioned op whose version is not above
+// the stored one is a noop: no seq, and no error.
+//
+// A shard whose transaction fails otherwise (the database unreachable, a deadline)
+// answers each of its ops with that error, while the other shards' ops commit
+// (store.PartialError). Only when no op committed is the error the request's.
 func (n *Single) commit(ctx context.Context, idx *index, batch []prepared, items []api.ItemResult) ([]prepared, error) {
+	var applied []prepared
+	defer func() { noteApplied(idx, applied, items) }()
+	var shardErr error
 	for len(batch) > 0 {
 		changes := make([]store.Change, len(batch))
 		for i := range batch {
 			changes[i] = batch[i].change
 		}
-		_, _, err := n.gc.Apply(ctx, changes)
+		err := n.gc.Apply(ctx, changes)
 		if err == nil || !store.IsTransient(err) {
 			n.noteDB(nil)
 		} else if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			n.noteDB(err)
 		}
-		var ce *store.ConflictError
-		var che *store.ChangeError
-		var inf *store.IndexNotFoundError
+		var failures []store.ShardFailure
+		failed := map[int]bool{}
+		var pe *store.PartialError
 		switch {
-		case err == nil:
-			var applied []prepared
-			for i := range batch {
-				if changes[i].Noop {
-					items[batch[i].pos].Noop, items[batch[i].pos].Version = true, changes[i].Version
-					continue
-				}
-				if changes[i].Seq == 0 {
-					items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
-					continue
-				}
+		case errors.As(err, &pe):
+			failures = pe.Failed
+		case err != nil:
+			all := make([]int, len(batch))
+			for i := range all {
+				all[i] = i
+			}
+			failures = []store.ShardFailure{{Positions: all, Err: err}}
+		}
+		for _, f := range failures {
+			for _, pos := range f.Positions {
+				failed[pos] = true
+			}
+		}
+		for i := range batch {
+			switch {
+			case failed[i]:
+			case changes[i].Noop:
+				it := &items[batch[i].pos]
+				it.Noop, it.Version, it.Seq = true, changes[i].Version, changes[i].StoredSeq
+			case changes[i].Seq == 0:
+				items[batch[i].pos].Err = conditionFailed(&batch[i].change, 0)
+			default:
 				batch[i].change.Seq = changes[i].Seq
 				applied = append(applied, batch[i])
 			}
-			batch = applied
-			if len(batch) == 0 {
-				return nil, nil
-			}
-			for i := range batch {
-				items[batch[i].pos].Seq, items[batch[i].pos].Version = batch[i].change.Seq, batch[i].change.Version
-				sl := idx.shards[batch[i].change.Shard]
-				raise(&sl.written, batch[i].change.Seq)
-				if k := batch[i].change.Kind; k == store.KindQueryUpsert || k == store.KindQueryDelete {
-					raise(&sl.querySeq, batch[i].change.Seq)
+		}
+		drop := map[int]bool{}
+		for _, f := range failures {
+			var ce *store.ConflictError
+			var che *store.ChangeError
+			var inf *store.IndexNotFoundError
+			switch {
+			case errors.As(f.Err, &ce):
+				for k, pos := range ce.Positions {
+					items[batch[pos].pos].Err = conditionFailed(&batch[pos].change, ce.Current[k])
+					drop[pos] = true
+				}
+			case errors.As(f.Err, &che):
+				items[batch[che.Position].pos].Err = api.InvalidAt("body", "%v", che.Err)
+				drop[che.Position] = true
+			case errors.As(f.Err, &inf):
+				return nil, indexNotFound(idx.name)
+			default:
+				shardErr = storeError(f.Err, idx.name)
+				for _, pos := range f.Positions {
+					items[batch[pos].pos].Err = shardErr
+					drop[pos] = true
 				}
 			}
-			n.noteHead(batch[len(batch)-1].change.Seq)
-			return batch, nil
-		case errors.As(err, &ce):
-			drop := map[int]bool{}
-			for k, pos := range ce.Positions {
-				items[batch[pos].pos].Err = conditionFailed(&batch[pos].change, ce.Current[k])
-				drop[pos] = true
+		}
+		var retry []prepared
+		for i := range batch {
+			if failed[i] && !drop[i] {
+				retry = append(retry, batch[i])
 			}
-			batch = without(batch, drop)
-		case errors.As(err, &che):
-			items[batch[che.Position].pos].Err = api.InvalidAt("body", "%v", che.Err)
-			batch = without(batch, map[int]bool{che.Position: true})
-		case errors.As(err, &inf):
-			return nil, indexNotFound(idx.name)
-		default:
-			return nil, storeError(err, idx.name)
+		}
+		batch = retry
+	}
+	if shardErr != nil && len(applied) == 0 {
+		return nil, shardErr
+	}
+	return applied, nil
+}
+
+// placeItems sets each item's shard (for an op whose id is valid) and returns, by
+// shard, the newest stored seq a versioned noop found there: where those ops stand.
+func placeItems(idx *index, ops []api.WriteOp, items []api.ItemResult) map[int]int64 {
+	stood := map[int]int64{}
+	for i := range ops {
+		if schema.ValidateID(ops[i].ID) != nil {
+			continue
+		}
+		s := ShardFor(ops[i].ID, len(idx.shards))
+		it := &items[i]
+		it.Shard = &s
+		if it.Noop && !it.Unchanged && it.Err == nil && it.Seq > 0 {
+			stood[s] = max(stood[s], it.Seq)
 		}
 	}
-	return nil, nil
+	return stood
+}
+
+// noteApplied answers the committed ops' items and moves their shards' written, query
+// and head seqs on to them.
+func noteApplied(idx *index, applied []prepared, items []api.ItemResult) {
+	for i := range applied {
+		c := &applied[i].change
+		items[applied[i].pos].Seq, items[applied[i].pos].Version = c.Seq, c.Version
+		sl := idx.shards[c.Shard]
+		sl.commits.Add(1)
+		raise(&sl.written, c.Seq)
+		raise(&sl.head, c.Seq)
+		if c.Kind == store.KindQueryUpsert || c.Kind == store.KindQueryDelete {
+			raise(&sl.querySeq, c.Seq)
+		}
+	}
 }
 
 // conditionFailed answers a change whose condition failed: a delete of nothing is a
@@ -640,16 +726,6 @@ func conditionFailed(c *store.Change, current int64) *api.Error {
 	return e
 }
 
-func without(batch []prepared, drop map[int]bool) []prepared {
-	out := batch[:0:0]
-	for i := range batch {
-		if !drop[i] {
-			out = append(out, batch[i])
-		}
-	}
-	return out
-}
-
 // raise sets v to seq if seq is higher.
 func raise(v *atomic.Int64, seq int64) {
 	for {
@@ -660,21 +736,22 @@ func raise(v *atomic.Int64, seq int64) {
 	}
 }
 
-// waitWritten waits, under ctx's deadline, for the written shards to have seq
-// searchable: by their next refresh (wait_for), or at once (true: once applied, the
-// copies are refreshed). wait_for waits on this node's copy when it hosts a serving
+// waitWritten waits, under ctx's deadline, for each written shard to have its seq in
+// seqs searchable: by their next refresh (wait_for), or at once (true: once applied,
+// the copies are refreshed). wait_for waits on this node's copy when it hosts a serving
 // one, else (a cluster node) on the first other copy that has seq; true waits on this
 // node's copy and every other serving copy of the shard. A copy of this node being
 // rebuilt aside applies nothing until its replacement is swapped in: a cluster node
 // waits on the other copies instead, and on the replacement only when none of them
 // reaches seq.
-func (n *Single) waitWritten(ctx context.Context, idx *index, touched map[int]bool, seq int64, mode api.RefreshMode) error {
-	shards := make([]int, 0, len(touched))
-	for s := range touched {
+func (n *Single) waitWritten(ctx context.Context, idx *index, seqs map[int]int64, mode api.RefreshMode) error {
+	shards := make([]int, 0, len(seqs))
+	for s := range seqs {
 		shards = append(shards, s)
 	}
 	slices.Sort(shards)
 	for _, s := range shards {
+		seq := seqs[s]
 		sl := idx.shards[s]
 		c := sl.local.Load()
 		if c != nil && n.cl != nil && c.peerServing() != nil {
@@ -782,9 +859,11 @@ func (n *Single) waitApplied(ctx context.Context, c *copyState, seq int64) error
 
 // percolateWritten fills each committed upsert's item with the saved queries its
 // document matches, as written: against every saved query committed through this node
-// before the percolation, and every change up to waitFor when it is set. With details,
-// each item's Matches carry them too.
-func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor int64, details MatchDetails) error {
+// before the percolation, and every change up to waitFor's seq of each shard when it is
+// set. Only committed upserts (and unchanged ones) are percolated: an op of a shard
+// whose transaction failed has no document here. With details, each item's Matches
+// carry them too.
+func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepared, res *api.WriteResult, waitFor *api.Token, details MatchDetails) error {
 	var docs []schema.Doc
 	var pos []int
 	for i := range batch {
@@ -797,16 +876,19 @@ func (n *Single) percolateWritten(ctx context.Context, idx *index, batch []prepa
 		res.Percolated = true
 		return nil
 	}
-	ts, err := n.acquireTargets(ctx, idx, waitFor, true)
+	var ids []percolate.IDs
+	var matches [][]api.PercolateMatch
+	err := n.withQueryTargets(ctx, idx, waitFor, func(ts targets) error {
+		var err error
+		ids, matches, err = n.percolateDocs(ctx, idx, ts, docs, details)
+		if err == nil {
+			res.PercolatedAt = ts.token(idx.uid)
+		}
+		return err
+	})
 	if err != nil {
 		return err
 	}
-	defer ts.release()
-	ids, matches, err := n.percolateDocs(ctx, idx, ts, docs, details)
-	if err != nil {
-		return err
-	}
-	res.PercolatedSeq = ts.seq()
 	for k, p := range pos {
 		res.Items[p].Queries = json.RawMessage(ids[k])
 		if matches != nil {

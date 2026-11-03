@@ -66,7 +66,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
   - immutable, memory-mapped segment files on local disk;
   - an in-memory write buffer that is refreshed into a new segment every `refresh_interval` (1 s);
   - background merges of small segments into larger ones.
-- **The SQL database is the write-ahead log and the system of record.** Every write commits the change rows and the documents or queries in one transaction, before it is acknowledged, and every shard copy applies the changelog in sequence order. Local segments are a cache of the database that can always be rebuilt or fetched from a peer.
+- **The SQL database is the write-ahead log and the system of record.** Every write commits the change rows and the documents or queries before it is acknowledged, in one transaction per shard it writes (2.0: a request is whole or nothing only on one shard), and every shard copy applies its shard's changelog in sequence order. Every shard has its own sequence. Local segments are a cache of the database that can always be rebuilt or fetched from a peer.
 - **Coordinator role.** Any replica can coordinate. It routes single-document operations to the database and the affected shard, and for searches it scatters to one copy of each shard (local copies first, else a peer over internal HTTP) and gathers the results.
 
 ### Packages
@@ -84,7 +84,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `internal/cluster` | replica registry, shard allocation by database leases, peer recovery, health, internal RPC |
 | `internal/replica` | the changelog tailer and apply loop for each hosted shard |
 | `internal/store` | the SQL storage interface, dialect implementations, migrations |
-| `internal/api` | public HTTP handlers, limits, auth, problem JSON, `wait_for_seq` and `refresh` |
+| `internal/api` | public HTTP handlers, limits, auth, problem JSON, `wait_for` tokens and `refresh` |
 | `internal/telemetry` | slog, OTel traces and metrics, Prometheus, pprof |
 
 ## 3. Data model
@@ -115,7 +115,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
   - numbers are finite floats only, never bools.
 
   Parity fixtures from scrape-bot pin these rules.
-- **Document:** an id (1–512 bytes) and a JSON object. Its version is the `seq` of its last change, which also supports optimistic concurrency (`if_seq`).
+- **Document:** an id (1–512 bytes) and a JSON object. Its version is the `seq` of its last change on its shard, which also supports optimistic concurrency (`if_seq`).
 - **Saved query:** an id, a DSL tree and an opaque `meta` JSON object (16 KB or less).
 
 ## 4. Query language
@@ -162,7 +162,7 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
 The API is in the Elasticsearch style:
 - requests and responses are JSON, except `_bulk`, which is NDJSON;
 - errors are problem JSON;
-- every write answers with its `seq`.
+- every write answers with a `token` (each written shard's newest `seq` and the index's incarnation); a single-document write also with the document's `seq`.
 
 | Endpoint | Purpose |
 |---|---|
@@ -170,7 +170,7 @@ The API is in the Elasticsearch style:
 | `PUT/GET/DELETE /indexes/{i}` | Create (with mapping and settings), inspect, drop an index |
 | `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` (applied at once, `-1` for on demand only) or the replica target |
 | `PUT/GET/DELETE /indexes/{i}/docs/{id}` | One document (`if_seq`, `refresh=true\|wait_for`) |
-| `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per request; `?percolate=true` also returns each upserted document's matching saved queries |
+| `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per shard (2.0), each shard's operations whole or nothing, a failed shard's reported per item; `?percolate=true` also returns each upserted document's matching saved queries |
 | `POST /indexes/{i}/_search` | `{query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout}` |
 | `POST /indexes/{i}/_count` | Matching count |
 | `PUT/GET/DELETE /indexes/{i}/queries/{id}`, `GET /indexes/{i}/queries` | Saved queries |
@@ -181,7 +181,7 @@ The API is in the Elasticsearch style:
 
 - **Consistency:**
   - `refresh=wait_for` returns once the write is searchable on the coordinator's copy, or, on a node that hosts none, on the first copy that has it;
-  - any read takes `?wait_for_seq=N`;
+  - any read takes `?wait_for=<token>` and waits until each shard it reads has the token's seq of that shard searchable, and on no other shard (2.0; `wait_for_seq` is refused by name);
   - by default, writes become visible within `refresh_interval` everywhere.
 - **Auth:** bearer tokens, read-only or read-write. The internal peer API uses a separate cluster token.
 - **Limits:** request body size, bulk operation count, and per-request deadlines (`timeout`, with partial results flagged like Elasticsearch's `timed_out`).
@@ -286,8 +286,9 @@ The percolator reverse-indexes the saved queries.
 ```go
 type Store interface {
     Migrate(ctx) error
-    Apply(ctx, batch []Change) (firstSeq, lastSeq int64, err error) // one transaction, ordered seq
+    Apply(ctx, batch []Change) error // sets each change's Seq: contiguous per shard, shard rows locked in key order
     ChangesAfter(ctx, shard ShardID, seq int64, limit int) ([]Change, error)
+    HeadSeq(ctx, shard ShardID) (seq int64, now time.Time, err error) // the shard's newest committed seq
     ScanShard(ctx, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
     Registry(ctx) RegistryStore // nodes, heartbeats, shard leases
     Blobs(ctx) BlobStore        // optional segment and snapshot blobs
@@ -305,15 +306,18 @@ The logical schema is the same in every dialect.
 | `sl_indexes` | name, mapping, settings |
 | `sl_documents` | index, shard, id, body, body_z, seq |
 | `sl_queries` | index, shard, id, query, meta, seq |
-| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at, nonce (a random BIGINT, migration 3; NULL on older rows); index on (index, shard, seq) |
-| `sl_counter` | the sequence row, locked per `Apply` |
+| `sl_changes` | index, shard, `seq` (PK (index, shard, seq) from migration 7), kind, id, payload, payload_z, at, nonce (a random BIGINT, migration 3; NULL on older rows); on Postgres and MySQL an index on `seq` alone for the rolling-upgrade window (dropped in 2.1) |
+| `sl_shard_seq` | index, shard, value (the shard's newest seq), index_uid, mapping_version: one row per shard, locked by every transaction that commits to it (migration 7) |
+| `sl_counter` | row 1, the floor: new shards start at it, a dropped index raises it past its shards' seqs, a shard with no row stands at it; row 2 issues copy epochs |
+| `sl_tombstones` | index, shard, kind, id, version, at: the version of each id a delete removed, kept for `gc_deletes` |
+| `sl_pruned` | index, shard, below_seq: where the changelog of each shard was pruned |
 | `sl_nodes` | node_id, address, version, heartbeat_at, capacity, body_codecs |
 | `sl_features` | name, enabled_at: cluster features turned on for good (`zstd_bodies`) |
 | `sl_shard_copies` | index, shard, node_id, state (`recovering` / `serving` / `retiring`), applied_seq, lease_until |
 | `sl_blobs` | optional segment bundles for recovery without a peer |
 
-- **Write ordering.** `Apply` locks the counter row, takes contiguous `seq` values and commits. Visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: concurrent requests on a coordinator are coalesced into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs.
-- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
+- **Write ordering** (2.0: per shard). Every shard has its own sequence. `Apply` locks the `sl_shard_seq` row of each shard it writes, in key order (index name, shard), takes contiguous `seq` values of each and commits, so commits to different shards run in parallel and never deadlock; a mapping change or a drop locks every shard row of the index, in shard order. On a shard, visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: a node's committer has a lane per shard, splits a request by shard, and coalesces each shard's concurrent requests into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs; it runs up to `write_transactions` of them at once (1 on SQLite, where a request's shards commit together). A request is whole or nothing only on one shard.
+- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the shard rows' locks, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
 - **Drivers:** `pgx/v5/stdlib`, `go-sql-driver/mysql`, `modernc.org/sqlite`.
 - **Supported versions:** Postgres (tested on 17), MySQL 8.0.19+ (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default), SQLite 3.35+ (bundled by modernc.org/sqlite).
 - **Migrations** are embedded and run under a lock.

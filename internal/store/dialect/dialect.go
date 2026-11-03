@@ -4,7 +4,7 @@
 // store runs, grouped by area (see statements.go).
 //
 // The store (package store) holds the logic that must be the same on every
-// engine: transaction shapes, retries, seq allocation under the counter lock,
+// engine: transaction shapes, retries, seq allocation under shards' sequence locks,
 // lease fencing, the blob protocol and the Apply guards. Each engine package
 // (sqlite, postgres, mysql) owns its SQL, written in its own spelling. Keeping
 // the description in its own package lets the store import every engine
@@ -59,7 +59,7 @@ type Dialect struct {
 	Migrations fs.FS
 
 	// ApplyTx and SnapshotTx are the transaction options for the writes that
-	// take the counter lock (or another row lock) and for consistent
+	// take shards' sequence rows (or another row lock) and for consistent
 	// multi-statement reads.
 	ApplyTx    *sql.TxOptions
 	SnapshotTx *sql.TxOptions
@@ -97,20 +97,24 @@ type Dialect struct {
 	// engine, may simply be run again. Nil means none are.
 	Retryable func(error) bool
 
+	// TooManyConnections, when set, reports the server refusing a connection because
+	// it has as many as it allows (Postgres's max_connections). The store says so in
+	// the error, since the cure is the server's limit or the nodes' pools.
+	TooManyConnections func(error) bool
+
 	// CustomPlan, when set, goes before the arguments of the statements that must be
 	// planned for their arguments' values at every run: the changelog reads that find
 	// a shard's newest change at or below a seq (Changelog.ReadTip, run at every
-	// poll, and ReadCounterMark). A plan made once for any shard may not use the
+	// poll, and ReadShardMark). A plan made once for any shard may not use the
 	// shard's index, and then walks the changelog down from the seq past every newer
 	// change of every other shard. PostgreSQL makes such a generic plan for a
 	// prepared statement after five runs.
 	CustomPlan []any
 
 	// Listen, when set, subscribes conn to the commit notifications that
-	// Changelog.Write sends with Write.Notify, calls ready (when not nil) once
-	// it is subscribed, and calls fn with each payload until ctx ends. It is
-	// nil where the engine has no notifications, and then the store never
-	// fills Write.Notify.
+	// Changelog.Notify sends, calls ready (when not nil) once it is subscribed,
+	// and calls fn with each payload until ctx ends. It is nil where the engine
+	// has no notifications, and then the store never sends any.
 	Listen func(ctx context.Context, conn *sql.Conn, ready func(), fn func(payload string)) error
 
 	// The statements, by area.

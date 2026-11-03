@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
@@ -185,16 +186,14 @@ func isUnavailable(err error) bool {
 // targets are the read targets of one read, one per shard.
 type targets []ShardTarget
 
-// seq is the least of the targets' Seq: every change up to it is in what each answers
-// from (0 for none).
-func (ts targets) seq() int64 {
-	var out int64
-	for i, t := range ts {
-		if s := t.Seq(); i == 0 || s < out {
-			out = s
-		}
+// token is where each target stands: every change of its shard up to its seq is in
+// what it answers from.
+func (ts targets) token(uid string) *api.Token {
+	t := &api.Token{UID: uid}
+	for s, target := range ts {
+		t.Note(s, target.Seq())
 	}
-	return out
+	return t
 }
 
 func (ts targets) release() {
@@ -216,12 +215,11 @@ func (ts targets) stale() bool {
 }
 
 // acquireTargets returns a read target for every shard of idx, each with every change
-// up to waitSeq searchable and, forQueries, every saved query committed through this
-// node to its shard. Release them when done. Every copy is woken first, so idle ones
-// advance to waitSeq together.
-func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, forQueries bool) (targets, error) {
-	if waitSeq > 0 {
-		if err := n.checkHead(ctx, waitSeq); err != nil {
+// up to wait's seq of its shard searchable and, forQueries, every saved query committed
+// through this node to its shard. Release them when done. Every copy is woken first.
+func (n *Single) acquireTargets(ctx context.Context, idx *index, wait *api.Token, forQueries bool) (targets, error) {
+	if !wait.Empty() {
+		if err := n.checkWait(ctx, idx, wait.Seqs); err != nil {
 			return nil, err
 		}
 		for _, c := range idx.copies() {
@@ -230,7 +228,7 @@ func (n *Single) acquireTargets(ctx context.Context, idx *index, waitSeq int64, 
 	}
 	out := make(targets, len(idx.shards))
 	for s := range idx.shards {
-		t, err := n.acquireShard(ctx, idx, s, waitSeq, forQueries)
+		t, err := n.acquireShard(ctx, idx, s, wait.Seq(s), forQueries)
 		if err != nil {
 			out.release()
 			if idx.dropped.Load() {
@@ -306,7 +304,7 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 		return nil, err
 	}
 	if waitSeq > 0 {
-		if err := n.checkHead(ctx, waitSeq); err != nil {
+		if err := n.checkHead(ctx, idx, s, waitSeq); err != nil {
 			return nil, err
 		}
 	}
@@ -316,6 +314,89 @@ func (n *Single) LocalTarget(ctx context.Context, index string, s int, waitSeq i
 		return nil, c.peerServing()
 	}
 	return t, err
+}
+
+// withQueryTargets runs fn on read targets for every shard of idx that wait for wait's
+// seqs and for the saved queries committed through this node (acquireTargets with
+// forQueries), released when fn returns. When that fails waiting for a saved query's
+// seq, here (504) or at a peer that refuses the seq as past the shard's head (400 at
+// params.wait_for: the caller's own wait was checked first), a lossy failover may have
+// lost those queries: only a node hosting a copy of the shard hears of a rewind from
+// its tailer. The shards' querySeqs are then lowered to the store's heads, and when
+// one fell, fn runs once more (but not after a 504: its deadline has passed).
+func (n *Single) withQueryTargets(ctx context.Context, idx *index, wait *api.Token, fn func(targets) error) error {
+	for try := 0; ; try++ {
+		err := n.runQueryTargets(ctx, idx, wait, fn)
+		if err == nil || !queryWaitFailed(err) {
+			return err
+		}
+		if !n.clampQuerySeqs(ctx, idx.shards) || try > 0 || isTimeout(err) || ctx.Err() != nil {
+			return err
+		}
+	}
+}
+
+// runQueryTargets is one try of withQueryTargets.
+func (n *Single) runQueryTargets(ctx context.Context, idx *index, wait *api.Token, fn func(targets) error) error {
+	ts, err := n.acquireTargets(ctx, idx, wait, true)
+	if err != nil {
+		return err
+	}
+	defer ts.release()
+	return fn(ts)
+}
+
+// clampQuerySeqs lowers each shard's querySeq (and newest write) to its head in the
+// store, reporting whether any was past it. The marks are loaded before the store is
+// read and lowered from those values only (slotMarks), so a saved query committed
+// through this node meanwhile is not lowered under. Its read of the store gets a
+// deadline of its own: the request's may have passed.
+func (n *Single) clampQuerySeqs(ctx context.Context, shards []*shardSlot) bool {
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), clampTimeout)
+	defer cancel()
+	before := make(map[*shardSlot]slotMarks, len(shards))
+	for _, sl := range shards {
+		before[sl] = sl.load(&sl.querySeq, &sl.written)
+	}
+	fell := false
+	_ = n.readHeads(hctx, shards, func(sl *shardSlot, h int64) {
+		m := before[sl]
+		if m.was[0] > h {
+			fell = true
+		}
+		m.lowerTo(h)
+	})
+	return fell
+}
+
+// clampTimeout bounds clampQuerySeqs' read of the store.
+const clampTimeout = 2 * time.Second
+
+// queryWaitFailed reports whether err is how a wait for a seq past a shard's copies
+// fails: a 504 at the deadline, or a peer's 400 refusing the seq as past the head.
+func queryWaitFailed(err error) bool {
+	var ae *api.Error
+	if !errors.As(err, &ae) {
+		return false
+	}
+	if ae.Status == http.StatusGatewayTimeout {
+		return true
+	}
+	if ae.Status != http.StatusBadRequest {
+		return false
+	}
+	for _, p := range ae.Problems {
+		if p.Loc == "params.wait_for" {
+			return true
+		}
+	}
+	return false
+}
+
+// isTimeout reports whether err is a read's 504: the deadline passed while it waited.
+func isTimeout(err error) bool {
+	var ae *api.Error
+	return errors.As(err, &ae) && ae.Status == http.StatusGatewayTimeout
 }
 
 // localTarget holds a generation of copy c of idx once it has waitSeq searchable and

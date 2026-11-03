@@ -127,6 +127,11 @@ type Config struct {
 	MergeThreads int
 	// SearchThreads sizes the search worker pool.
 	SearchThreads int
+	// WriteTransactions bounds the write transactions this node runs at once, one a
+	// shard: its group committer's share of the store's connections. 0 means
+	// store.DefaultWriteTransactions (16), at most half the store's write connections
+	// (SQLite's one writer gets 1, which commits a request's shards together).
+	WriteTransactions int
 	// BackgroundShare is the share of each prio.Period background work (merges, refresh
 	// builds, write and apply analysis, file removal) runs while searches occupy every
 	// processor: it steps aside for them at its checkpoints for the rest (see package
@@ -494,6 +499,18 @@ var settings = []setting{
 		name: "search_threads", usage: "search worker pool size (default: GOMAXPROCS)",
 		parse:  func(c *Config, v string) error { return positiveInt(&c.SearchThreads, v) },
 		format: func(c *Config) string { return strconv.Itoa(c.SearchThreads) },
+	},
+	{
+		name: "write_transactions", usage: "write transactions this node runs at once, one a shard (0 = 16, at most half the store's write connections)",
+		parse: func(c *Config, v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return fmt.Errorf("want 0 or a positive integer, got %q", v)
+			}
+			c.WriteTransactions = n
+			return nil
+		},
+		format: func(c *Config) string { return strconv.Itoa(c.WriteTransactions) },
 	},
 	{
 		name:  "background_share",

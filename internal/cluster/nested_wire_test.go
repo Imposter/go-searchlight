@@ -104,7 +104,7 @@ func TestWireNested(t *testing.T) {
 // field, one saved nested query and twenty products with variants, every node playing
 // older as older and level say; it returns a node lacking a copy of some shard, and the
 // last write's seq.
-func nestedCluster(t *testing.T, older olderPeer, level int) (*tnode, int64) {
+func nestedCluster(t *testing.T, older olderPeer, level int) (*tnode, *api.Token) {
 	t.Helper()
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
 		o.hooks.olderPeer, o.hooks.olderLevel = older, level
@@ -135,12 +135,12 @@ func nestedCluster(t *testing.T, older olderPeer, level int) (*tnode, int64) {
 	return coord, seq
 }
 
-func percolateNestedDoc(t *testing.T, coord *tnode, seq int64) (string, error) {
+func percolateNestedDoc(t *testing.T, coord *tnode, seq *api.Token) (string, error) {
 	t.Helper()
 	res, err := coord.n.Percolate(tctx(t), "nw", &api.PercolateRequest{Docs: []json.RawMessage{
 		json.RawMessage(`{"_v": [{"size": "L", "price": 50}, {"size": "M", "price": 1}]}`),
 		json.RawMessage(`{"_v": [{"size": "L", "price": 5}]}`),
-	}}, api.ReadOptions{WaitForSeq: seq})
+	}}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +164,7 @@ func TestNestedThroughPeers(t *testing.T) {
 			"top":   {Type: search.AggMax, Field: "_v.price", Where: where},
 		},
 	}
-	res, err := coord.n.Search(tctx(t), "nw", r, api.ReadOptions{WaitForSeq: seq})
+	res, err := coord.n.Search(tctx(t), "nw", r, api.ReadOptions{WaitFor: seq})
 	if err != nil || res.Total != 10 || len(res.Hits) != 10 {
 		t.Fatalf("a nested search through a peer: %+v, %v; want 10", res, err)
 	}
@@ -205,14 +205,14 @@ func TestOlderPeerRefusedForNested(t *testing.T) {
 	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
 		t.Run(name, func(t *testing.T) {
 			coord, seq := nestedCluster(t, older, levelBox)
-			if res, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: seq}); err != nil || res.Total != 20 {
+			if res, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: seq}); err != nil || res.Total != 20 {
 				t.Fatalf("a level-0 search through a level-5 peer: %v, %v", res, err)
 			}
-			_, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: nestedNode(t, nestedL)}, api.ReadOptions{WaitForSeq: seq})
+			_, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: nestedNode(t, nestedL)}, api.ReadOptions{WaitFor: seq})
 			unavailable(t, "a nested search", err)
-			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"t": {Type: search.AggTerms, Field: "_v.size"}}}, api.ReadOptions{WaitForSeq: seq})
+			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"t": {Type: search.AggTerms, Field: "_v.size"}}}, api.ReadOptions{WaitFor: seq})
 			unavailable(t, "an aggregation on a sub-field", err)
-			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Sort: []search.SortField{{Field: "_v.price"}}}, api.ReadOptions{WaitForSeq: seq})
+			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Sort: []search.SortField{{Field: "_v.price"}}}, api.ReadOptions{WaitFor: seq})
 			unavailable(t, "a sort on a sub-field", err)
 
 			coord, seq = nestedCluster(t, older, percolatePoints)
@@ -262,7 +262,7 @@ func TestWireNestedSubAggs(t *testing.T) {
 	}
 
 	coord, seq := nestedCluster(t, olderNone, 0)
-	res, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitForSeq: seq})
+	res, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,10 +284,10 @@ func TestWireNestedSubAggs(t *testing.T) {
 	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
 		t.Run(name, func(t *testing.T) {
 			coord, seq := nestedCluster(t, older, levelNested)
-			if _, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"t": {Type: search.AggTerms, Field: "_v.size"}}}, api.ReadOptions{WaitForSeq: seq}); err != nil {
+			if _, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"t": {Type: search.AggTerms, Field: "_v.size"}}}, api.ReadOptions{WaitFor: seq}); err != nil {
 				t.Fatalf("a level-6 search through a level-6 peer: %v", err)
 			}
-			_, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitForSeq: seq})
+			_, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Aggs: nestedSubAggs()}, api.ReadOptions{WaitFor: seq})
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
 				t.Fatalf("nested sub-aggregations through an older peer: %v; want a 503", err)
@@ -305,7 +305,7 @@ func TestDetailsAndSeqNoThroughPeers(t *testing.T) {
 		Docs:    []json.RawMessage{json.RawMessage(`{"_v": [{"size": "M", "price": 1}, {"size": "L", "price": 5}]}`)},
 		IDs:     []string{"p03"},
 		Matches: true, InnerHits: true,
-	}, api.ReadOptions{WaitForSeq: seq})
+	}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,15 +315,15 @@ func TestDetailsAndSeqNoThroughPeers(t *testing.T) {
 			t.Fatalf("result %d's matches %s, want %s", i, got, want)
 		}
 	}
-	if res.Results[1].Seq <= 0 || res.Results[1].Seq > seq {
+	if res.Results[1].Seq <= 0 || res.Results[1].Seq > seq.Seq(1) && res.Results[1].Seq > seq.Seq(0) {
 		t.Fatalf("p03's _seq %d", res.Results[1].Seq)
 	}
-	s, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 20, SeqNo: true, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: seq})
+	s, err := coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 20, SeqNo: true, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: seq})
 	if err != nil || len(s.Hits) != 20 {
 		t.Fatalf("a seq_no search: %v, %v", s, err)
 	}
 	for _, h := range s.Hits {
-		if h.Seq <= 0 || h.Seq > seq {
+		if h.Seq <= 0 || h.Seq > maxSeq(seq) {
 			t.Fatalf("hit %s's seq %d", h.ID, h.Seq)
 		}
 	}
@@ -336,13 +336,13 @@ func TestDetailsAndSeqNoThroughPeers(t *testing.T) {
 			if _, err := percolateNestedDoc(t, coord, seq); err != nil {
 				t.Fatalf("a percolation without details through a level-3 peer: %v", err)
 			}
-			_, err := coord.n.Percolate(tctx(t), "nw", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{}`)}, Matches: true}, api.ReadOptions{WaitForSeq: seq})
+			_, err := coord.n.Percolate(tctx(t), "nw", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{}`)}, Matches: true}, api.ReadOptions{WaitFor: seq})
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
 				t.Fatalf("details through an older peer: %v; want a 503", err)
 			}
 			coord, seq = nestedCluster(t, older, levelNestedSubAggs)
-			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 5, SeqNo: true}, api.ReadOptions{WaitForSeq: seq})
+			_, err = coord.n.Search(tctx(t), "nw", &search.Request{Query: &query.All{}, Size: 5, SeqNo: true}, api.ReadOptions{WaitFor: seq})
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
 				t.Fatalf("seq_no through an older peer: %v; want a 503", err)
 			}

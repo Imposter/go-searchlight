@@ -120,13 +120,21 @@ type DeleteGroup struct {
 	IDs   []string
 }
 
-// Write is everything a transaction holding the counter lock writes once
-// the store has allocated its seqs: the changelog rows, the net effect on
+// CounterRow is a shard's sequence row (sl_shard_seq) as a write leaves it: the
+// shard's newest seq and its index's mapping version.
+type CounterRow struct {
+	Index          string
+	Shard          int
+	Value          int64
+	MappingVersion int64
+}
+
+// Write is everything a transaction holding its shards' sequence rows writes once
+// the store has allocated their seqs: the changelog rows, the net effect on
 // sl_documents and sl_queries (at most one entry per key across the upserts
 // and deletes of a table), the tombstones versioned deletes keep and those
-// versioned upserts replace (at most one entry per key across both), the
-// counter's new value, and the notification payloads (only when the dialect has
-// Listen).
+// versioned upserts replace (at most one entry per key across both), and the new
+// values of the sequence rows of the shards it wrote changes to (one per shard).
 type Write struct {
 	Changes          []ChangeRow
 	Documents        []DocumentRow
@@ -135,31 +143,73 @@ type Write struct {
 	QueryDeletes     []DeleteGroup
 	Tombstones       []TombstoneRow
 	TombstoneDeletes []TombstoneRow
-	Counter          int64
-	Notify           []string
+	Counters         []CounterRow
 }
 
 // Changelog is the write-ahead log and the documents and saved queries it
 // maintains.
+//
+// Each shard of each index takes its seqs from its own row of sl_shard_seq, whose
+// value is the shard's newest seq, and which holds the index's uid and mapping
+// version. A shard with no row (its index does not exist) stands at the floor,
+// sl_counter row 1: every shard starts there, and a dropped index raises it past its
+// shards' seqs. A transaction locks the rows of the shards it writes in key order
+// (index name, then shard), so transactions on several shards never deadlock.
 type Changelog struct {
-	// LockCounter: () -> value, NOW of sl_counter row 1, locking the row
-	// until the transaction ends ("" FOR UPDATE where the transaction already
-	// holds the database's write lock).
-	LockCounter string
-	// ReadCounterMark: (index, shard) -> value of sl_counter row 1, without a lock,
-	// then index_name, shard, kind, id, at, nonce of the change at that value, then
-	// seq, kind, id, at, nonce of the shard's newest change at or below it; NULL
-	// when there is no such change.
-	ReadCounterMark string
-	// ReadHead: () -> value of sl_counter row 1, NOW.
+	// LockShard: (index, shard) -> value, index_uid, mapping_version, NOW of the
+	// shard's sequence row, locking it until the transaction ends ("" FOR UPDATE where
+	// the transaction already holds the database's write lock). No row when the shard
+	// has none.
+	LockShard string
+	// LockIndexShards: (index) -> shard, value, index_uid, mapping_version, NOW of
+	// every sequence row of the index, by shard, locking them in that order.
+	LockIndexShards string
+	// SeedShard: (index, shard, uid) inserts the shard's sequence row at the floor's
+	// value, with mapping_version 1.
+	SeedShard string
+	// RaiseFloor: (seq) sets the floor to the larger of its value and seq.
+	RaiseFloor string
+	// LockGlobal: () -> value, NOW of sl_counter row 1, the global sequence every
+	// commit took its seqs from before shard sequences, locking it until the
+	// transaction ends. No row once shard sequences are on.
+	LockGlobal string
+	// SetGlobal: (value) sets the global sequence's value.
+	SetGlobal string
+	// LockFloor: () -> value of the floor (sl_counter row 3), locked. No row until
+	// shard sequences are on.
+	LockFloor string
+	// SeedFloor: (value) inserts the floor's row.
+	SeedFloor string
+	// RetireGlobal deletes the global sequence's row.
+	RetireGlobal string
+	// ClearShardSeqs deletes every sequence row.
+	ClearShardSeqs string
+	// InsertShardSeqs returns the statement that inserts n sequence rows: (index,
+	// shard, value, uid, mapping_version) for each.
+	InsertShardSeqs func(n int) string
+	// ReadShardMark: (index, shard, index, shard, index, shard, index, shard) ->
+	// the shard's value (the floor's when it has no row), without a lock, then kind,
+	// id, at, nonce of the shard's change at that value, then seq, kind, id, at, nonce
+	// of the shard's newest change at or below it; NULL when there is no such change.
+	ReadShardMark string
+	// ReadHead: (index, shard) -> the shard's value (the floor's when it has no row),
+	// NOW.
 	ReadHead string
-	// ReadTip: (index, shard, index, seq, index, shard, upto) -> value of sl_counter
-	// row 1, NOW, then index_name, shard, kind, id, at, nonce of the change at that
-	// value and of the change at seq, then seq, kind, id, at, nonce of the shard's
-	// newest change at or below upto (each NULL when there is no such change), then
-	// the shard's below_seq in sl_pruned and the index's uid (NULL when there is
+	// ReadHeads: (index) -> rows of shard, value: -1 and the floor's value, then each
+	// of the index's sequence rows (a shard with no row stands at the floor).
+	ReadHeads string
+	// ReadTip: (index, shard, index, shard, index, shard, index, shard, seq, index,
+	// shard, index, shard, upto) -> the shard's value (the floor's when it has no
+	// row), NOW, then kind, id, at, nonce of the shard's change at that value and of
+	// its change at seq, then seq, kind, id, at, nonce of its newest change at or
+	// below upto (each NULL when there is no such change), then the shard's below_seq
+	// in sl_pruned and the index_uid of its sequence row (each NULL when there is
 	// none).
 	ReadTip string
+	// Notify: (payloads) announces each payload on the commit notification channel,
+	// in a transaction of its own that does not wait for its flush: a notification is
+	// only a wake-up, which polling backs. Only where the dialect has Listen.
+	Notify string
 	// IndexState: (name) -> uid, mapping_version, mapping of sl_indexes.
 	IndexState string
 	// DocumentState and QueryState: (index, shard, id) -> seq, version.
@@ -168,7 +218,7 @@ type Changelog struct {
 	// Tombstone: (index, shard, kind, id) -> version of sl_tombstones.
 	Tombstone string
 	// Write returns the statements that store w, in order, inside the
-	// transaction holding the counter lock, splitting a batch so that no
+	// transaction holding its shards' sequence rows, splitting a batch so that no
 	// statement passes l. The store prepares a statement text that runs
 	// several times in a row once for the run, so one row a statement costs
 	// no parse per row.
@@ -229,6 +279,21 @@ func QueryPageSQL(shards []int, ph func(int) string) string {
 	return b.String()
 }
 
+// InsertShardSeqsSQL is Changelog.InsertShardSeqs in a dialect whose n-th
+// placeholder ph spells.
+func InsertShardSeqsSQL(rows int, ph func(int) string) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) VALUES ")
+	for r := range rows {
+		if r > 0 {
+			b.WriteString(", ")
+		}
+		n := r*5 + 1
+		fmt.Fprintf(&b, "(%s, %s, %s, %s, %s)", ph(n), ph(n+1), ph(n+2), ph(n+3), ph(n+4))
+	}
+	return b.String()
+}
+
 // QueriesByIDSQL is Records.QueriesByID in a dialect whose n-th placeholder ph spells.
 func QueriesByIDSQL(counts []int, ph func(int) string) string {
 	return byIDSQL("SELECT shard, id, query, meta FROM sl_queries", counts, ph)
@@ -272,14 +337,14 @@ func byIDSQL(selectFrom string, counts []int, ph func(int) string) string {
 // copy.
 type Registry struct {
 	// Heartbeat: (node_id, address, version, capacity, body_codecs,
-	// mapping_types) inserts the node with heartbeat_at and started_at NOW, or
+	// mapping_types, seq_scheme) inserts the node with heartbeat_at and started_at NOW, or
 	// updates its address, version, capacity, body_codecs, mapping_types and
 	// heartbeat_at.
 	Heartbeat string
 	// RemoveNode: (node_id).
 	RemoveNode string
 	// Nodes: () -> node_id, address, version, capacity, body_codecs,
-	// mapping_types, heartbeat_at, started_at, NOW, by node_id.
+	// mapping_types, seq_scheme, heartbeat_at, started_at, NOW, by node_id.
 	Nodes string
 	// Features: () -> name, enabled_at of sl_features.
 	Features string
@@ -391,7 +456,7 @@ type Indexes struct {
 	// Drop: (name) deletes the index's row.
 	Drop string
 	// DropData: each (name), deletes the index's documents, queries, tombstones,
-	// changes, prune horizons and shard copies.
+	// changes, prune horizons, shard copies and sequence rows.
 	DropData []string
 }
 
@@ -411,6 +476,15 @@ type Maintenance struct {
 	// (index, shard) -> the horizon after the write.
 	RaiseHorizon Returning
 
+	// ShardRows: () -> name, settings and the number of sequence rows (sl_shard_seq) of
+	// every index.
+	ShardRows string
+	// IndexShardRows: (index) -> the number of the index's sequence rows.
+	IndexShardRows string
+	// GlobalRows: () -> 1 while the global sequence (sl_counter row 1) exists, that is
+	// until shard sequences are on, then 0.
+	GlobalRows string
+
 	// VersionTable creates sl_schema_migrations if it is missing.
 	VersionTable string
 	// AppliedMigrations: () -> version of every applied migration.
@@ -422,8 +496,19 @@ type Maintenance struct {
 	// the transaction itself excludes other writers, as on SQLite). When false,
 	// migrations run on one connection holding SessionLock until
 	// SessionUnlock, and each file is recorded as it completes.
-	MigrateInTx   bool
-	MigrateLock   string
+	MigrateInTx bool
+	MigrateLock string
+	// ConcurrentLock tries a session lock, returning whether it got it, and
+	// ConcurrentUnlock releases it: where DDL is transactional but a migration's
+	// NNNN_name.concurrent.sql must run outside a transaction, a node holds it for
+	// the whole run, and MigrateLock only within each transaction. Empty where no
+	// migration has one.
+	ConcurrentLock   string
+	ConcurrentUnlock string
+	// ValidIndex: (name) -> 1 when the schema has a valid index of that name, else 0;
+	// a migration's concurrent statements are not run again once every index they build
+	// is. With ConcurrentLock.
+	ValidIndex    string
 	SessionLock   string // must return one row whose first column is 1 on success
 	SessionUnlock string
 	// MigrateLockTimeout bounds how long a migration's DDL waits for a table lock,
@@ -441,4 +526,9 @@ type Maintenance struct {
 	// interrupted earlier run of a non-transactional migration had applied it (a
 	// column that exists already), so a retry goes on past it.
 	AlreadyApplied func(err error) bool
+	// Blocking returns the form of a migration statement that failed with err that
+	// holds the table's writes while it runs, when the online form failed only because
+	// the writes running beside it outgrew what the engine logs of them (MySQL's
+	// innodb_online_alter_log_max_size): that one needs no log. Nil where there is none.
+	Blocking func(stmt string, err error) (string, bool)
 }

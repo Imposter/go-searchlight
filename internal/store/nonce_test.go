@@ -23,7 +23,7 @@ func TestChangeNonces(t *testing.T) {
 		mustApply(t, st, upsert("n", 0, "a", `{}`), upsert("n", 0, "b", `{}`))
 		g := NewGroupCommitter(st, GroupCommitOptions{MaxDelay: time.Millisecond})
 		defer g.Close()
-		if _, _, err := g.Apply(ctx, []Change{upsert("n", 0, "c", `{}`)}); err != nil {
+		if err := g.Apply(ctx, []Change{upsert("n", 0, "c", `{}`)}); err != nil {
 			t.Fatal(err)
 		}
 		meta.Mapping = []byte(`{"fields":{"x":"keyword"}}`)
@@ -85,10 +85,7 @@ func TestMigrateChangeNonce(t *testing.T) {
 		ctx := context.Background()
 		st, all := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql")
 		s := engine(st)
-		meta, err := st.Indexes().Create(ctx, IndexMeta{Name: "old"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		meta := IndexMeta{UID: createOldIndex(t, st, "old", "{}")}
 		old := oldStatements(h.dialect)
 		for i := range 3 {
 			if _, err := s.w.ExecContext(ctx, rebind(s, old.change), i+1, "old", fmt.Sprint("d", i), `{}`, meta.UID); err != nil {

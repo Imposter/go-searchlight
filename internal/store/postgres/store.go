@@ -1,12 +1,12 @@
 // Package postgres is the PostgreSQL dialect of the SQL store, on
 // jackc/pgx/v5 through database/sql.
 //
-// Apply locks the counter row with SELECT ... FOR UPDATE, so sequence numbers
-// are assigned and committed in order, and writes a whole batch with one
-// statement whose rows travel as arrays (see writeSQL). Writes that are read
-// back use RETURNING. Migrations run in one transaction under a
-// transaction-scoped advisory lock. Committed changes are announced with
-// NOTIFY, which Listen turns into tailer wake-ups. The changelog reads that find a
+// Apply locks its shards' sequence rows with SELECT ... FOR UPDATE, so each
+// shard's sequence numbers are assigned and committed in order, and writes a
+// whole batch with one statement whose rows travel as arrays (see writeSQL).
+// Writes that are read back use RETURNING. Migrations run in one transaction
+// under a transaction-scoped advisory lock. Committed changes are announced with
+// NOTIFY after they commit, which Listen turns into tailer wake-ups. The changelog reads that find a
 // shard's newest change run as unnamed statements (pgx.QueryExecModeExec), which
 // PostgreSQL plans for their values at every run (dialect.Dialect.CustomPlan).
 package postgres
@@ -34,6 +34,15 @@ var migrations embed.FS
 // migrateLockKey is the advisory lock key migrations hold ("searchlight").
 const migrateLockKey = 0x5345415243484c54
 
+// concurrentLockKey is the advisory lock key a node holds, for the whole run, while it
+// migrates a database where some migration builds CONCURRENTLY. It is not
+// migrateLockKey: a node of an earlier release starting meanwhile waits for that one
+// inside a transaction, and CREATE INDEX CONCURRENTLY, which waits for every
+// transaction running, would deadlock with it. That node takes migrateLockKey and
+// finds nothing it knows to apply; this one takes migrateLockKey only for its
+// transactions.
+const concurrentLockKey = migrateLockKey + 1
+
 // Dialect returns the PostgreSQL dialect. It panics only if the binary lacks its
 // embedded migrations directory.
 func Dialect() *dialect.Dialect {
@@ -42,20 +51,22 @@ func Dialect() *dialect.Dialect {
 		panic(err)
 	}
 	return &dialect.Dialect{
-		Name:        "postgres",
-		Open:        open,
-		Migrations:  sub,
-		ApplyTx:     &sql.TxOptions{Isolation: sql.LevelReadCommitted},
-		SnapshotTx:  &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
-		Retryable:   retryable,
-		CustomPlan:  []any{pgx.QueryExecModeExec},
-		Listen:      listen,
-		Changelog:   changelog,
-		Records:     records,
-		Registry:    registry,
-		Blobs:       blobs,
-		Indexes:     indexes,
-		Maintenance: maintenance,
+		Name:       "postgres",
+		Open:       open,
+		Migrations: sub,
+		ApplyTx:    &sql.TxOptions{Isolation: sql.LevelReadCommitted},
+		SnapshotTx: &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
+		Retryable:  retryable,
+		// Postgres refuses a connection past max_connections with 53300.
+		TooManyConnections: tooManyConnections,
+		CustomPlan:         []any{pgx.QueryExecModeExec},
+		Listen:             listen,
+		Changelog:          changelog,
+		Records:            records,
+		Registry:           registry,
+		Blobs:              blobs,
+		Indexes:            indexes,
+		Maintenance:        maintenance,
 	}
 }
 
@@ -63,6 +74,12 @@ func Dialect() *dialect.Dialect {
 func retryable(err error) bool {
 	var pe *pgconn.PgError
 	return errors.As(err, &pe) && (pe.Code == "40001" || pe.Code == "40P01")
+}
+
+// tooManyConnections reports a connection refused past max_connections (53300).
+func tooManyConnections(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "53300"
 }
 
 // lockTimedOut reports a statement that waited past lock_timeout (55P03).

@@ -109,10 +109,10 @@ func TestGroupCommitSurvivesSQLiteBusy(t *testing.T) {
 
 	batch := []Change{upsert("gcbusy", 0, "a", `{}`), upsert("gcbusy", 0, "b", `{}`)}
 	start := time.Now()
-	first, last, err := g.Apply(context.Background(), batch)
+	err = g.Apply(context.Background(), batch)
 	elapsed := time.Since(start)
-	if err != nil || last-first+1 != int64(len(batch)) {
-		t.Fatalf("apply during contention: %d..%d %v (after %s)", first, last, err, elapsed)
+	if err != nil || batch[0].Seq == 0 || batch[1].Seq != batch[0].Seq+1 {
+		t.Fatalf("apply during contention: %v %v (after %s)", seqsOf(batch), err, elapsed)
 	}
 	if elapsed < busyTimeout {
 		t.Fatalf("apply succeeded in %s without ever waiting out a busy lock", elapsed)

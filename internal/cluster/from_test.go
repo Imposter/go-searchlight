@@ -71,7 +71,7 @@ func TestFromAcrossNodes(t *testing.T) {
 	for k := range ops {
 		ops[k] = api.WriteOp{Kind: api.OpUpsert, ID: fmt.Sprintf("f%02d", k), Body: json.RawMessage(fmt.Sprintf(`{"brand":"b%d","price":%d}`, k%3, k%9))}
 	}
-	last := map[string]int64{"pg": mustWrite(t, a.n, "pg", ops...), "one": mustWrite(t, a.n, "one", ops...)}
+	last := map[string]*api.Token{"pg": mustWrite(t, a.n, "pg", ops...), "one": mustWrite(t, a.n, "one", ops...)}
 	sorts := []search.SortField{{Field: "price", Desc: true}}
 	for _, index := range []string{"pg", "one"} {
 		var remote bool
@@ -84,7 +84,7 @@ func TestFromAcrossNodes(t *testing.T) {
 					remote = true
 				}
 			}
-			read := api.ReadOptions{WaitForSeq: last[index]}
+			read := api.ReadOptions{WaitFor: last[index]}
 			full, err := tn.n.Search(tctx(t), index, &search.Request{Query: &query.All{}, Sort: sorts, Size: 100, TrackTotal: search.TrackTotalAll}, read)
 			if err != nil || len(full.Hits) != len(ops) {
 				t.Fatalf("%s: the whole result: %v, %v", index, full, err)

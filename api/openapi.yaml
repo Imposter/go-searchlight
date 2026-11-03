@@ -1,21 +1,31 @@
 openapi: 3.1.0
 info:
   title: Searchlight API
-  version: "1"
+  version: "2"
   summary: Search and percolation over SQL-backed, memory-mapped segments.
   description: |
     Searchlight's public HTTP/JSON API (spec section 5). Requests and responses are
     JSON, except `_bulk`, which is NDJSON. Every error is problem JSON (RFC 9457) with
     a machine-readable `code` and, for a refused request, `problems` whose `loc` is a
-    dotted path into the request (`query.all.2.any.0.value`, `params.wait_for_seq`,
+    dotted path into the request (`query.all.2.any.0.value`, `params.wait_for`,
     `line.3.upsert.id`).
 
-    **Consistency.** Every write answers with the `seq` it committed (acknowledged =
-    committed to SQL). Writes become searchable within the index's refresh interval;
-    `refresh=wait_for` returns once the write is searchable on this node, and
+    **Consistency.** Every shard of an index has its own sequence: a change's `seq` is
+    its position in its shard's changelog, and seqs repeat across shards. Each shard's
+    operations of a write commit in one transaction of their own (acknowledged =
+    committed to SQL): a request is whole or nothing only on one shard. Every write
+    answers with a `token`, an opaque string naming where it left each shard it wrote
+    (with the index's incarnation). Writes become searchable within the index's refresh
+    interval; `refresh=wait_for` returns once the write is searchable on this node, and
     `refresh=true` refreshes the written shards at once. Any read takes
-    `wait_for_seq=N` and waits, under the request deadline, until every change up to N
-    is searchable (read-your-writes). GET of one document or saved query is realtime.
+    `wait_for=<token>` and waits, under the request deadline, until each shard it reads
+    has every change up to the token's seq of that shard searchable (read-your-writes);
+    it waits on no other shard. Tokens of several writes may be merged: a client keeps
+    the newest per shard. GET of one document or saved query is realtime.
+
+    **Retries.** A 5xx, or an item with a 5xx status in a `_bulk`, may have committed
+    or not. Retry with conditions that make a repeat safe: an upsert of the same body
+    (a byte-identical upsert is a noop), `if_seq`, `version`, or `op_type=create`.
 
     **Limits.** Bodies over `max_body_bytes` and documents over `max_doc_bytes` are
     413, as is a `_bulk` of more than `max_bulk_ops` operations. A copy whose write
@@ -331,7 +341,7 @@ paths:
       operationId: getDocument
       summary: Read a document (realtime).
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The document.
@@ -341,6 +351,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -379,16 +390,23 @@ paths:
             {"delete": {"id": "c", "if_seq": 12}}
 
         `index` is an alias of `upsert` and `_id` of `id`; `create` requires the
-        document to be new. An operation refused on its own (an invalid document, a
-        failed `if_seq`) is reported in its item, with `errors` set, and the rest
-        commit. A malformed action line, a line over `max_doc_bytes` or more than
-        `max_bulk_ops` operations refuse the whole request before anything is
-        written. A delete of a document that does not exist is a 404 item (result
-        not_found) and writes nothing. With `percolate=true` each upserted
-        document's item lists the saved queries it matches, as written: against
-        every saved query committed through this node before the percolation, and
-        every change up to `wait_for_seq` when it is given (a seq past the newest
-        committed one is a 400, before anything is written). An unconditional upsert
+        document to be new. Each shard's operations commit in one transaction of their
+        own, the shards' apart: a request is whole or nothing only on one shard. An
+        operation refused on its own (an invalid document, a failed `if_seq`) is
+        reported in its item, with `errors` set, and the rest commit; so is every
+        operation of a shard whose transaction failed (a 5xx item status: it may or
+        may not have committed), while the other shards' commit. Only when nothing
+        was written is the request itself an error. A malformed action line, a line
+        over `max_doc_bytes` or more than `max_bulk_ops` operations refuse the whole
+        request before anything is written. A delete of a document that does not
+        exist is a 404 item (result not_found) and writes nothing. With
+        `percolate=true` each committed upserted document's item lists the saved
+        queries it matches, as written: against every saved query committed through
+        this node before the percolation, and every change up to `wait_for`'s seqs
+        when it is given (a seq past its shard's newest committed one is a 400,
+        before anything is written; without `percolate=true`, `wait_for` is a 400).
+        An operation of a shard that failed is not
+        percolated. An unconditional upsert
         whose body is byte-identical to the stored document's is a noop at the stored
         document's seq (see `detect_noop`), and still lists its matching saved
         queries.
@@ -400,7 +418,7 @@ paths:
           description: Return each upserted document's matching saved queries.
         - $ref: "#/components/parameters/PercolateMatches"
         - $ref: "#/components/parameters/PercolateInnerHits"
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
         - $ref: "#/components/parameters/DetectNoop"
       requestBody:
         required: true
@@ -419,6 +437,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 
@@ -430,7 +449,7 @@ paths:
       operationId: search
       summary: Search an index.
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: false
         content:
@@ -458,7 +477,7 @@ paths:
       operationId: count
       summary: Count the matching documents exactly.
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: false
         content:
@@ -510,7 +529,7 @@ paths:
         - name: size
           in: query
           schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: A page of saved queries.
@@ -577,7 +596,7 @@ paths:
       operationId: getQuery
       summary: Read a saved query (realtime).
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The saved query.
@@ -587,6 +606,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -615,11 +635,11 @@ paths:
       tags: [percolate]
       operationId: percolate
       summary: The saved queries each document matches.
-      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it), and at most 1000000 matches, every document's together (422 too_many_matches past it; an answer is never truncated).
+      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it), and at most 1000000 matches, every document's together (422 too_many_matches past it; an answer is never truncated).
       parameters:
         - $ref: "#/components/parameters/PercolateMatches"
         - $ref: "#/components/parameters/PercolateInnerHits"
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: true
         content:
@@ -683,7 +703,7 @@ paths:
           in: query
           schema: { type: integer, minimum: 0, maximum: 1000, default: 0 }
           description: How many of each keyword_list field's most frequent entries to list.
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The fields.
@@ -694,6 +714,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 
@@ -752,11 +773,19 @@ components:
       in: query
       description: true refreshes the written shards at once; wait_for returns once the write is searchable on this node.
       schema: { type: string, enum: ["true", wait_for, "false"] }
-    WaitForSeq:
-      name: wait_for_seq
+    WaitFor:
+      name: wait_for
       in: query
-      description: Wait, under the request deadline, until every change up to this seq is searchable on the copies the read uses.
-      schema: { type: integer, minimum: 0 }
+      description: |
+        A token a write returned (or a merge of several): wait, under the request
+        deadline, until each shard the read uses has every change up to the token's seq
+        of that shard searchable. Shards the token does not name are not waited for.
+        The token is opaque and at most 16 KiB; a malformed one, one whose seq is past
+        its shard's newest committed seq, one of another incarnation of the index
+        (dropped and created again since the write), or one naming a shard the index
+        lacks is a 400. Empty, it waits for nothing. `wait_for_seq`, its predecessor
+        before 2.0, is refused by name.
+      schema: { type: string, maxLength: 16384, pattern: "^[A-Za-z0-9_-]*$" }
 
   responses:
     Error:
@@ -815,7 +844,7 @@ components:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
     Timeout:
-      description: The request's deadline passed while it waited (wait_for_seq).
+      description: The request's deadline passed while it waited (wait_for), or, on _bulk, before any of its shards committed.
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
@@ -943,10 +972,12 @@ components:
     Document:
       type: object
       additionalProperties: false
-      required: [id, body]
+      required: [id, shard, body]
       properties:
         id: { type: string }
-        seq: { type: integer, description: The seq of the change that last wrote it; pass it as if_seq. Absent on a stale read. }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard; pass it as if_seq. Absent on a stale read." }
+        token: { type: string, description: "Where the document stands: a token naming its shard at seq. Absent with seq." }
         version: { type: integer, description: "The client version its last write named; absent for none." }
         body: { $ref: "#/components/schemas/DocumentBody" }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy, which may trail the latest write." }
@@ -956,18 +987,22 @@ components:
       required: [id]
       properties:
         id: { type: string }
-        seq: { type: integer, description: "The seq the write committed; pass it as wait_for_seq. Absent for a versioned noop; for an unchanged upsert's noop, the seq the stored document was written at." }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq the write committed on its shard: the document's, to pass as if_seq. For a noop (a versioned write not above the stored version, or an unchanged upsert), the stored target's seq; absent when there is none." }
+        token: { type: string, description: "Where the write left its shard (for a noop, where it found the stored target): pass it as wait_for to read it back. Absent when there is no seq." }
+        committed: { type: string, description: "A token of where the write's commit left its shard; absent for a noop. A shard committing at or below a seq an earlier commit took means the database lost commits (docs/api.md, Tokens)." }
         version: { type: integer, description: "The write's client version, when it named one." }
         result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, or an unconditional upsert's body was byte-identical to the stored document's (unless detect_noop=false); nothing was written." }
         timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
     BulkResponse:
       type: object
       additionalProperties: false
-      required: [took_ms, seq, errors, timed_out, items]
+      required: [took_ms, errors, timed_out, items]
       properties:
         took_ms: { type: integer }
-        seq: { type: integer, description: "The newest seq the request committed, or an unchanged upsert's noop found its document at (0 when none): pass it as wait_for_seq." }
-        errors: { type: boolean }
+        token: { type: string, description: "Where the request left each shard it committed to, or found a noop's stored target on (an unchanged upsert, a versioned noop): pass it as wait_for. Absent when it names no shard." }
+        committed: { type: string, description: "A token of where the request's commits left each shard: only what it committed, never a noop's stored seq. Absent when nothing committed. A shard committing at or below a seq an earlier commit took means the database lost commits (docs/api.md, Tokens)." }
+        errors: { type: boolean, description: "Set when any item failed: on its own (a 4xx item) or with its shard's transaction (a 5xx item, which may or may not have committed)." }
         timed_out: { type: boolean }
         percolated:
           type: boolean
@@ -976,9 +1011,9 @@ components:
           type: string
           enum: [too_many_matches]
           description: Why percolated is false when the documents match more than 1000000 saved queries together; the writes stay committed.
-        percolated_seq:
-          type: integer
-          description: "With percolated true (and an upsert to percolate): a seq every saved query committed at or below which the documents were percolated against, the least over the shards of the seq the copy percolating it held every change up to. A saved query written after it may or may not have been seen. Use it, not seq, to tell which saved queries an answer covers: seq is the newest the request committed or an unchanged upsert's noop found its document at, which can be far older than the percolation."
+        percolated_at:
+          type: string
+          description: "With percolated true (and an upsert to percolate): a token of where each shard stood for the percolation: every saved query committed to a shard at or below its seq was seen; one written after may or may not have been. A shard it does not name held no change, so no saved query of it was seen. Use it, not token, to tell which saved queries an answer covers: token names what the request committed, or where an unchanged upsert's noop found its document, which can be far older than the percolation."
         items:
           type: array
           items:
@@ -989,9 +1024,10 @@ components:
               op: { type: string, enum: [upsert, delete, query_upsert, query_delete] }
               id: { type: string }
               status: { type: integer }
-              seq: { type: integer }
+              shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+              seq: { type: integer, description: "The seq the op committed at on its shard; for a noop, the stored target's (absent when there is none). With shard, where the item stands: a client can form a token of its own from them (docs/api.md, Tokens)." }
               version: { type: integer, description: "The op's client version, when it named one." }
-              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written; seq is the stored document's, and with percolate=true queries and matches are reported as for a write)." }
+              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written, and with percolate=true queries and matches are reported as for a write). Either way seq is the stored target's." }
               queries:
                 type: array
                 items: { type: string }
@@ -1584,7 +1620,7 @@ components:
         than search what it holds now: under continuous writes, counts and facets then compute
         about once per max_staleness instead of at every refresh. The result may miss the
         writes of the last max_staleness (beyond the refresh interval). 0, the default, asks
-        for a current result; wait_for_seq ignores it (read-your-writes). Peers before 1.6
+        for a current result; wait_for ignores it (read-your-writes). Peers before 1.6
         ignore it and answer with a current result.
       oneOf:
         - type: string
@@ -1637,10 +1673,12 @@ components:
     SavedQuery:
       type: object
       additionalProperties: false
-      required: [id, seq, query, meta]
+      required: [id, shard, seq, query, meta]
       properties:
         id: { type: string }
-        seq: { type: integer }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard." }
+        token: { type: string, description: "Where the saved query stands: a token naming its shard at seq." }
         version: { type: integer, description: "The client version its last write named; absent for none." }
         query: { $ref: "#/components/schemas/Query" }
         meta: { type: object }

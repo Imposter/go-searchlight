@@ -63,16 +63,17 @@ func (r *readLoop) err() error {
 	return nil
 }
 
-// bulkLoad writes count documents made by body, in bulks, returning the last seq.
-func bulkLoad(t *testing.T, n *node.Single, index string, count int, body func(i int) string) int64 {
+// bulkLoad writes count documents made by body, in bulks, returning the merge of their
+// tokens.
+func bulkLoad(t *testing.T, n *node.Single, index string, count int, body func(i int) string) *api.Token {
 	t.Helper()
-	var seq int64
+	var seq *api.Token
 	for start := 0; start < count; start += 2000 {
 		var ops []api.WriteOp
 		for i := start; i < min(count, start+2000); i++ {
 			ops = append(ops, upsert(fmt.Sprintf("d%05d", i), body(i)))
 		}
-		seq = mustWrite(t, n, index, ops...).Seq
+		seq = merged(seq, mustWrite(t, n, index, ops...).Token)
 	}
 	return seq
 }
@@ -128,10 +129,10 @@ func TestEmptyListTypingNeedsNoRebuild(t *testing.T) {
 	if got, _ := n.GetIndex(ctx(t), "e"); got.Mapping.Fields["images"] != schema.KeywordList {
 		t.Fatalf("mapping = %v", got.Mapping.Fields)
 	}
-	if got := count(t, n, "e", mustParse(t, `{"field": "images", "op": "has", "value": "a.jpg"}`), 0); got != 1 {
+	if got := count(t, n, "e", mustParse(t, `{"field": "images", "op": "has", "value": "a.jpg"}`), nil); got != 1 {
 		t.Errorf("has a.jpg = %d", got)
 	}
-	if got := count(t, n, "e", mustParse(t, `{"field": "images", "op": "empty"}`), 0); got != 10_000 {
+	if got := count(t, n, "e", mustParse(t, `{"field": "images", "op": "empty"}`), nil); got != 10_000 {
 		t.Errorf("empty images = %d, want the 10,000 [] holders", got)
 	}
 }
@@ -184,7 +185,7 @@ func TestRetypeRebuildsAside(t *testing.T) {
 	if !rebuiltAside(t, cfg.DataDir, info.UID) {
 		t.Error("the copy was not rebuilt aside")
 	}
-	if got := count(t, n, "r", &query.All{}, 0); got != 10_000 {
+	if got := count(t, n, "r", &query.All{}, nil); got != 10_000 {
 		t.Errorf("after the swap the index holds %d documents", got)
 	}
 	// The swapped-in copy is the one a restart opens.
@@ -193,7 +194,7 @@ func TestRetypeRebuildsAside(t *testing.T) {
 	}
 	n2 := open(t, cfg, st, nil)
 	waitReady(t, n2)
-	if got := count(t, n2, "r", red, 0); got != 5_000 {
+	if got := count(t, n2, "r", red, nil); got != 5_000 {
 		t.Errorf("after a restart red = %d", got)
 	}
 }

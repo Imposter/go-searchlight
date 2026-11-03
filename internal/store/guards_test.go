@@ -26,7 +26,7 @@ func TestApplyGuards(t *testing.T) {
 
 		// A document a segment could not store never commits, by any path.
 		big := upsert("g", 0, "big", `{"t":"`+strings.Repeat("x", MaxPayloadBytes)+`"}`)
-		_, _, err := st.Apply(ctx, []Change{upsert("g", 0, "ok", `{}`), big})
+		err := st.Apply(ctx, []Change{upsert("g", 0, "ok", `{}`), big})
 		var ce *ChangeError
 		if !errors.As(err, &ce) || ce.Position != 1 || !errors.Is(err, ErrInvalid) {
 			t.Fatalf("an oversized payload: err = %v, want a ChangeError at 1", err)
@@ -44,9 +44,8 @@ func TestApplyGuards(t *testing.T) {
 			{Index: "g", Kind: KindDelete, ID: "there", IfSeq: IfExists},
 			{Index: "g", Kind: KindDelete, ID: "none2", IfSeq: IfExists},
 		}
-		first, last, err := st.Apply(ctx, batch)
-		if err != nil || first != seq+1 || last != seq+2 {
-			t.Fatalf("a batch with deletes of nothing: %d..%d %v", first, last, err)
+		if err := st.Apply(ctx, batch); err != nil {
+			t.Fatalf("a batch with deletes of nothing: %v", err)
 		}
 		if got := []int64{batch[0].Seq, batch[1].Seq, batch[2].Seq, batch[3].Seq}; fmt.Sprint(got) != fmt.Sprint([]int64{0, seq + 1, seq + 2, 0}) {
 			t.Errorf("seqs = %v", got)
@@ -54,17 +53,17 @@ func TestApplyGuards(t *testing.T) {
 		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_changes WHERE id IN ('none', 'none2')"); n != 0 {
 			t.Errorf("%d changes written for deletes of nothing", n)
 		}
-		// Through the group committer, a request of only deletes of nothing gets
-		// 0, 0 and fails no other request.
+		// Through the group committer, a request of only deletes of nothing takes
+		// no seq and fails no other request.
 		gc := NewGroupCommitter(st, GroupCommitOptions{})
 		defer gc.Close()
 		only := []Change{{Index: "g", Kind: KindDelete, ID: "nothing", IfSeq: IfExists}}
-		if f, l, err := gc.Apply(ctx, only); err != nil || f != 0 || l != 0 || only[0].Seq != 0 {
-			t.Errorf("a request of a delete of nothing: %d..%d %v", f, l, err)
+		if err := gc.Apply(ctx, only); err != nil || only[0].Seq != 0 {
+			t.Errorf("a request of a delete of nothing: %v %v", seqsOf(only), err)
 		}
 		mixed := []Change{upsert("g", 0, "y", `{}`), {Index: "g", Kind: KindDelete, ID: "nothing", IfSeq: IfExists}}
-		if f, l, err := gc.Apply(ctx, mixed); err != nil || f == 0 || f != l || mixed[0].Seq != f || mixed[1].Seq != 0 {
-			t.Errorf("a mixed request: %d..%d %v %+v", f, l, err, mixed)
+		if err := gc.Apply(ctx, mixed); err != nil || mixed[0].Seq != seq+3 || mixed[1].Seq != 0 {
+			t.Errorf("a mixed request: %v %+v", err, mixed)
 		}
 
 		// An expected incarnation that is gone is a missing index.
@@ -79,7 +78,7 @@ func TestApplyGuards(t *testing.T) {
 			t.Fatal(err)
 		}
 		mustCreateIndex(t, st, "g")
-		_, _, err = st.Apply(ctx, []Change{upsert("g", 0, "b", `{}`), c})
+		err = st.Apply(ctx, []Change{upsert("g", 0, "b", `{}`), c})
 		var nf *IndexNotFoundError
 		if !errors.As(err, &nf) || len(nf.Positions) != 1 || nf.Positions[0] != 1 || !errors.Is(err, ErrNotFound) {
 			t.Fatalf("a stale incarnation: err = %v", err)

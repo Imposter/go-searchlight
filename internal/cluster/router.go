@@ -353,6 +353,9 @@ type remoteTarget struct {
 	chosen  *candidate
 	pin     string
 	stale   bool
+	// seen is the seq of the generation the peer's copy percolated at, as its reply
+	// says (percolateReply.Seq); 0 until one says.
+	seen int64
 }
 
 var _ node.ShardTarget = (*remoteTarget)(nil)
@@ -593,6 +596,7 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (%s): %w; retry once the upgrade is done", reply.Level, needs, percolateLevelNeeds(needs), errOlderLevel)}
 		}
 		t.noteStale(c, reply.Stale)
+		t.seen = reply.Seq
 		return nil
 	})
 	if err != nil {
@@ -644,8 +648,12 @@ func (t *remoteTarget) GetQuery(ctx context.Context, id string) (*api.SavedQuery
 
 func (t *remoteTarget) Stale() bool { return t.stale }
 
-// Seq is the seq the read asked of the copy, which it answers with every change up to.
-func (t *remoteTarget) Seq() int64 { return t.waitSeq }
+// Seq is where the copy stood for what it answered: the generation seq its percolation
+// reply named, else the seq the read asked of it (a peer that names none, a 1.8 node
+// in a rolling upgrade, answered with every change up to that one, and while 1.8 nodes
+// run every seq is global, so that holds of the shard too). It is never below the seq
+// asked: the copy waited for it.
+func (t *remoteTarget) Seq() int64 { return max(t.waitSeq, t.seen) }
 
 // Release unpins the generation the fetch phase held, in the background: the pin
 // expires on its own if the call is lost.

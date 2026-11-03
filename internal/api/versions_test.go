@@ -18,7 +18,7 @@ func TestVersionedWrites(t *testing.T) {
 	}
 	for _, v := range []string{"3", "2"} {
 		r = e.must(http.StatusOK, "PUT", "/indexes/v/docs/a?version="+v, `{"brand": "y"}`)
-		if r["result"] != "noop" || r["seq"] != nil || r["version"] != 3.0-map[string]float64{"3": 0, "2": 1}[v] {
+		if r["result"] != "noop" || r["seq"] != 1.0 || r["shard"] != 0.0 || r["token"] == nil || r["committed"] != nil || r["version"] != 3.0-map[string]float64{"3": 0, "2": 1}[v] {
 			t.Fatalf("version %s over 3 = %v", v, r)
 		}
 	}
@@ -79,12 +79,13 @@ func TestBulkQueryActions(t *testing.T) {
 		t.Fatalf("d1 percolated against the queries before it: %v", got[2])
 	}
 	r = e.must(http.StatusOK, "POST", "/indexes/bq/_bulk?percolate=true", bulk)
-	if r["percolated"] != true || r["seq"] != 0.0 {
-		t.Fatalf("an all-noop bulk: percolated %v, seq %v; want true and 0", r["percolated"], r["seq"])
+	if r["percolated"] != true || r["token"] == nil || r["committed"] != nil {
+		t.Fatalf("an all-noop bulk: percolated %v, token %v, committed %v; want true, where the targets stand, and none", r["percolated"], r["token"], r["committed"])
 	}
+	first := got
 	got = items(r)
 	for i := range 3 {
-		if got[i]["result"] != "noop" || got[i]["seq"] != nil || got[i]["queries"] != nil {
+		if got[i]["result"] != "noop" || got[i]["seq"] != first[i]["seq"] || got[i]["shard"] == nil || got[i]["queries"] != nil {
 			t.Fatalf("replayed item %d = %v", i, got[i])
 		}
 	}
@@ -97,7 +98,7 @@ func TestBulkQueryActions(t *testing.T) {
 	if got[0]["seq"] == nil || got[1]["seq"] == nil || got[2]["result"] != "noop" {
 		t.Fatalf("versions 2 = %v", got)
 	}
-	l := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/bq/queries?fields=id,version&wait_for_seq=%d", seqOf(t, r)), "")
+	l := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/bq/queries?fields=id,version&wait_for=%s", tokenOf(t, r)), "")
 	if fmt.Sprint(l["queries"]) != "[map[id:acme version:2]]" {
 		t.Fatalf("lean listing = %v", l)
 	}

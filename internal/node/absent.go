@@ -7,7 +7,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
-// absentTTL is how long a cluster node answers a read (one with no wait_for_seq) 404 for
+// absentTTL is how long a cluster node answers a read (one with no wait_for) 404 for
 // an index name the store did not have, without asking it again. An index another node
 // creates meanwhile is found by such reads once it passes, or at the next catalogue
 // sync, whichever comes first; writes, index management and reads that wait for a seq

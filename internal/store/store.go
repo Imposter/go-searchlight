@@ -4,14 +4,17 @@
 // (spec §9), and optional segment blobs.
 //
 // The logic is written once, here, for every dialect (sqlite, postgres,
-// mysql): transaction shapes and retries, seq allocation under the counter
-// lock, lease and epoch fencing, the blob protocol and the Apply guards. Each
-// dialect package owns its SQL, as the statement tables of package dialect,
-// and spells each statement its engine's best way. Apply locks the single
-// counter row, takes contiguous sequence numbers and commits, so commit order
-// equals seq order and a tailer reading ChangesAfter never skips a change
-// that commits later. GroupCommitter coalesces concurrent Apply calls on a
-// node into one transaction.
+// mysql): transaction shapes and retries, seq allocation under each shard's
+// sequence lock, lease and epoch fencing, the blob protocol and the Apply
+// guards. Each dialect package owns its SQL, as the statement tables of package
+// dialect, and spells each statement its engine's best way.
+//
+// Every shard has its own sequence: its seqs are its own, contiguous, and commit
+// in order. Apply locks the sequence row of each shard it writes, takes the
+// shard's next seqs and commits, so within a shard commit order equals seq order
+// and a tailer reading ChangesAfter never skips a change that commits later.
+// Commits to different shards do not wait on each other. GroupCommitter
+// coalesces concurrent Apply calls on a node into one transaction per shard.
 package store
 
 import (
@@ -44,13 +47,13 @@ type Store interface {
 	// node may call it at start; each migration is applied once.
 	Migrate(ctx context.Context) error
 
-	// Apply commits batch as one transaction and returns its sequence
-	// numbers, firstSeq..lastSeq in batch order, and sets each applied
-	// change's Seq in batch. Every change's index must exist. When an IfSeq
-	// condition fails it returns a *ConflictError and applies nothing. A
-	// change whose IfExists target does not exist is skipped instead: it
-	// writes nothing, takes no seq (its Seq stays 0) and fails nothing else.
-	Apply(ctx context.Context, batch []Change) (firstSeq, lastSeq int64, err error)
+	// Apply commits batch as one transaction and sets each applied change's
+	// Seq in batch: each shard's changes take that shard's next seqs, contiguous
+	// in batch order. Every change's index must exist and have its shard. When an
+	// IfSeq condition fails it returns a *ConflictError and applies nothing. A
+	// change whose IfExists target does not exist is skipped instead: it writes
+	// nothing, takes no seq (its Seq stays 0) and fails nothing else.
+	Apply(ctx context.Context, batch []Change) error
 
 	// ChangesAfter returns up to limit changes of shard with seq > seq, in
 	// seq order (limit <= 0 means DefaultChangesLimit). It returns ErrPruned
@@ -60,30 +63,37 @@ type Store interface {
 
 	// ScanShard calls fn with the index's mapping (a RecordMapping; none when
 	// the index does not exist), then every document and every saved query of
-	// shard, from one consistent snapshot, and returns the seq that snapshot
-	// reflects (replaying ChangesAfter on top of it from that seq is exact), with
-	// the marks of the change at that seq and of the shard's newest change at or
-	// below it as the snapshot holds them, so a copy loaded from it knows what the
-	// changelog held where it stands. A document whose body does not decode ends
-	// the scan with a *CorruptError.
+	// shard, from one consistent snapshot, and returns the shard's seq that
+	// snapshot reflects (replaying ChangesAfter on top of it from that seq is
+	// exact), with the marks of the shard's change at that seq and of its newest
+	// change at or below it as the snapshot holds them, so a copy loaded from it
+	// knows what the changelog held where it stands. A document whose body does not
+	// decode ends the scan with a *CorruptError.
 	ScanShard(ctx context.Context, shard ShardID, fn func(Record) error) (ScanPoint, error)
 
-	// HeadSeq returns the newest committed seq across every shard (0 before
-	// the first change), and the database clock's time as it read it. Every
-	// change with a seq at or below it has committed, so a ChangesAfter that
-	// starts after HeadSeq returns and yields fewer than its limit holds every
-	// change of its shard up to HeadSeq: a tailer may advance its copy to it.
+	// HeadSeq returns shard's newest committed seq, and the database clock's
+	// time as it read it. Every change of the shard with a seq at or below it
+	// has committed, so a ChangesAfter that starts after HeadSeq returns and
+	// yields fewer than its limit holds every change of the shard up to HeadSeq:
+	// a tailer may advance its copy to it. A shard whose index does not exist
+	// stands at the floor every new shard starts at, which no seq of a dropped
+	// index's shards passes, so a copy of a dropped incarnation never sees a head
+	// behind its seq.
 	//
 	// That holds only while HeadSeq and ChangesAfter read the same database
 	// (the primary): a read replica lagging the primary would break it. Every
 	// dialect reads from the primary (dialect.Pools.Read is the primary's).
-	HeadSeq(ctx context.Context) (seq int64, now time.Time, err error)
+	HeadSeq(ctx context.Context, shard ShardID) (seq int64, now time.Time, err error)
 
-	// Tip is HeadSeq that also reads, in the same statement, the marks of the
-	// change at the head and of the change at q.At, and q.Shard's newest change at
-	// or below q.UpTo, its prune horizon and its index's incarnation. A tailer
-	// compares them with what it applied, to see the changelog rewound under its
-	// copy: a database failover that lost commits reissues their seqs.
+	// IndexHeads is HeadSeq of shards 0 to shards-1 of index, read in one statement:
+	// heads[s] is shard s's.
+	IndexHeads(ctx context.Context, index string, shards int) (heads []int64, err error)
+
+	// Tip is HeadSeq of q.Shard that also reads, in the same statement, the marks
+	// of the shard's change at the head and at q.At, its newest change at or below
+	// q.UpTo, its prune horizon and its index's incarnation. A tailer compares them
+	// with what it applied, to see the changelog rewound under its copy: a
+	// database failover that lost commits reissues their seqs.
 	Tip(ctx context.Context, q TipQuery) (Tip, error)
 
 	// Registry is the cluster registry: nodes, heartbeats and shard leases.
@@ -108,6 +118,21 @@ type Store interface {
 	// way every read takes both forms.
 	CompressBodies(on bool)
 
+	// ShardSeqs reports whether shard sequences are on (FeatureShardSeqs): until
+	// they are, every commit takes its seqs from the global sequence, as nodes from
+	// before them do. Once it has seen them on it answers without a query.
+	ShardSeqs(ctx context.Context) (bool, error)
+	// EnableShardSeqs turns shard sequences on, for good: every shard of every index
+	// starts at the global sequence's value, and a node from before them can neither
+	// write nor read the head from then on. Only once no such node is live; a no-op
+	// once they are on.
+	EnableShardSeqs(ctx context.Context) error
+	// SeedMissingShards gives every index with no sequence row at all (one a 1.x node
+	// created after shard sequences came on) a row per shard at the floor. A write to
+	// such an index seeds it too; this does it ahead of the first write. A no-op while
+	// shard sequences are off.
+	SeedMissingShards(ctx context.Context) error
+
 	// Ping checks the database is reachable.
 	Ping(ctx context.Context) error
 
@@ -118,9 +143,10 @@ type Store interface {
 	Close() error
 }
 
-// Applier is the part of Store that GroupCommitter needs.
+// Applier is the part of Store that GroupCommitter needs. Apply sets the Seq of
+// each change it applied.
 type Applier interface {
-	Apply(ctx context.Context, batch []Change) (firstSeq, lastSeq int64, err error)
+	Apply(ctx context.Context, batch []Change) error
 }
 
 // RegistryStore is the cluster registry in sl_nodes and sl_shard_copies.
@@ -240,9 +266,11 @@ type IndexStore interface {
 type Watcher interface {
 	// Watch calls fn for each committed batch's shards until ctx ends or the
 	// connection fails. ready, when not nil, is called once the subscription
-	// is active: every change that commits after ready is announced, so a
-	// tailer that polls from ready on misses nothing a lost connection
-	// dropped. Neither fn nor ready may block.
+	// is active: every change that commits after ready is announced, unless the
+	// node that committed it fails before it sends the announcement, so a
+	// tailer that polls from ready on misses nothing a lost connection dropped,
+	// and waits at most one poll for what a failed node did not announce.
+	// Neither fn nor ready may block.
 	Watch(ctx context.Context, ready func(), fn func(Notification)) error
 }
 
@@ -263,6 +291,8 @@ type options struct {
 	blobChunk int
 	gateKey   string // the database a single-writer dialect's write gate is shared by
 	dbPath    string
+	dialect   func(*dialect.Dialect) // adjusts a copy of the dialect before the store starts
+	schema    int                    // Migrate's last migration; 0: the newest
 }
 
 // WithTracer sets the tracer for store spans (default: the global
@@ -275,6 +305,14 @@ func WithMeter(m metric.Meter) Option { return func(o *options) { o.meter = m } 
 
 // WithLogger sets the logger (default: slog.Default()).
 func WithLogger(l *slog.Logger) Option { return func(o *options) { o.logger = l } }
+
+// withDialect adjusts the store's dialect before it starts (tests that swap a
+// statement, which must not race the goroutines the store starts).
+func withDialect(f func(*dialect.Dialect)) Option { return func(o *options) { o.dialect = f } }
+
+// WithSchema stops Migrate at schema version v, as a binary that knows no later
+// migration would: tests use it to build a database as an earlier release left it.
+func WithSchema(v int) Option { return func(o *options) { o.schema = v } }
 
 // WithClock sets the clock the store's timers and durations run on (default:
 // clock.Real).
@@ -329,6 +367,11 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if o.dialect != nil {
+		adjusted := *d
+		o.dialect(&adjusted)
+		d = &adjusted
+	}
 	if d.Name == "sqlite" {
 		if p, err := sqlite.Path(u); err == nil {
 			if abs, err := filepath.Abs(p); err == nil {
@@ -351,7 +394,7 @@ func Open(ctx context.Context, rawURL string, opts ...Option) (Store, error) {
 		return nil, err
 	}
 	if err := s.Ping(ctx); err != nil {
-		_ = pools.Close()
+		_ = s.Close()
 		return nil, fmt.Errorf("open %s store: %w", d.Name, err)
 	}
 	if d.Listen != nil {

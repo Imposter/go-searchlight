@@ -50,9 +50,10 @@ type StateReporter interface {
 
 // TailerEnv is what the node offers a tailer beyond the store and the shard.
 type TailerEnv struct {
-	// Head is the newest seq this node has committed or seen applied. A tailer that
-	// cannot ask the store for its head (store.HeadSeq) may advance an idle copy to
-	// it: every change at or below it is committed. The replica tailer ignores it.
+	// Head is the newest seq of the copy's shard this node has committed or seen
+	// applied. A tailer that cannot ask the store for its head (store.HeadSeq) may
+	// advance an idle copy to it: every change at or below it is committed. The
+	// replica tailer ignores it.
 	Head func() int64
 	// Copy is the registry copy the tailer reports for (a cluster node): its applied
 	// seq and state, fenced by its epoch. Nil on a single node.

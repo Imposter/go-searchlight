@@ -7,7 +7,8 @@ import "encoding/json"
 // own (the copy's own mark, [shard.Shard.OwnMark], as of a generation of seq) says
 // which it is up to seq, and a poll has checked it against the changelog. Every copy
 // that holds the shard's changes up to that change holds the same documents, however
-// far its seq moved with other shards' and indexes' writes. Nil when it is not known:
+// far its seq moved past the shard's last change (an advance to the head a shard
+// started at). Nil when it is not known:
 // no own mark, a state up to another seq, no change of the shard yet, or a newer
 // change of the shard than the checked one, not yet checked (a copy that applied a
 // page read across a changelog rewind holds a mix no other copy does, until the next

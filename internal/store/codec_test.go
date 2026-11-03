@@ -105,7 +105,7 @@ func TestMixedVersionWrites(t *testing.T) {
 		old := oldStatements(h.dialect)
 		s := engine(st)
 		want["a"], want["c"] = benchBody(11), benchBody(12)
-		seq := counterValue(t, st)
+		seq := headSeq(t, st, shard)
 		for _, w := range []struct{ id, body string }{{"a", want["a"]}, {"c", want["c"]}} {
 			seq++
 			if _, err := s.w.ExecContext(ctx, rebind(s, old.change), seq, "mix", w.id, w.body, meta.UID); err != nil {
@@ -115,7 +115,7 @@ func TestMixedVersionWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if _, err := s.w.ExecContext(ctx, rebind(s, "UPDATE sl_counter SET value = ? WHERE id = 1"), seq); err != nil {
+		if _, err := s.w.ExecContext(ctx, rebind(s, "UPDATE sl_shard_seq SET value = ? WHERE index_name = 'mix' AND shard = 0"), seq); err != nil {
 			t.Fatal(err)
 		}
 		if c := columns(t, st, "a"); c.docText != want["a"] || c.docZ == nil {
@@ -211,10 +211,7 @@ func TestMigrateBodyCodecs(t *testing.T) {
 		ctx := context.Background()
 		st, all := openV1(t, h)
 		s := engine(st)
-		meta, err := st.Indexes().Create(ctx, IndexMeta{Name: "old"})
-		if err != nil {
-			t.Fatal(err)
-		}
+		meta := IndexMeta{UID: createOldIndex(t, st, "old", "{}")}
 		old := oldStatements(h.dialect)
 		want := map[string]string{}
 		for i := range 3 {
@@ -414,7 +411,7 @@ func TestFeatures(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		reg := h.open(t).Registry()
-		if f, err := reg.Features(ctx); err != nil || len(f) != 0 {
+		if f, err := reg.Features(ctx); err != nil || len(f) != 1 || f[FeatureShardSeqs].IsZero() {
 			t.Fatalf("features of a new store: %v %v", f, err)
 		}
 		if err := reg.EnableFeature(ctx, FeatureZstdBodies); err != nil {
@@ -429,7 +426,7 @@ func TestFeatures(t *testing.T) {
 			t.Fatal(err)
 		}
 		again, err := reg.Features(ctx)
-		if err != nil || len(again) != 1 || !again[FeatureZstdBodies].Equal(first[FeatureZstdBodies]) {
+		if err != nil || len(again) != 2 || !again[FeatureZstdBodies].Equal(first[FeatureZstdBodies]) {
 			t.Fatalf("enabled twice: %v %v", again, err)
 		}
 	})

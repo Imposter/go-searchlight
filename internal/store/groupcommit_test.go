@@ -13,7 +13,8 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 )
 
-// fakeApplier assigns seqs like the store and records each transaction.
+// fakeApplier assigns seqs in one sequence, in batch order, and records each
+// transaction.
 type fakeApplier struct {
 	mu      sync.Mutex
 	next    int64
@@ -21,19 +22,26 @@ type fakeApplier struct {
 	fail    func(batch []Change) error
 	block   chan struct{} // when set, Apply waits for it or for ctx
 	ended   int           // Apply calls that have returned
+	running int           // Apply calls under way
+	most    int           // the most Apply calls ever under way at once
 }
 
-func (f *fakeApplier) Apply(ctx context.Context, batch []Change) (int64, int64, error) {
+func (f *fakeApplier) Apply(ctx context.Context, batch []Change) error {
+	f.mu.Lock()
+	f.running++
+	f.most = max(f.most, f.running)
+	f.mu.Unlock()
 	defer func() {
 		f.mu.Lock()
 		f.ended++
+		f.running--
 		f.mu.Unlock()
 	}()
 	if f.block != nil {
 		select {
 		case <-f.block:
 		case <-ctx.Done():
-			return 0, 0, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	f.mu.Lock()
@@ -41,12 +49,34 @@ func (f *fakeApplier) Apply(ctx context.Context, batch []Change) (int64, int64, 
 	f.batches = append(f.batches, append([]Change(nil), batch...))
 	if f.fail != nil {
 		if err := f.fail(batch); err != nil {
-			return 0, 0, err
+			return err
 		}
 	}
-	first := f.next + 1
-	f.next += int64(len(batch))
-	return first, f.next, nil
+	for i := range batch {
+		f.next++
+		batch[i].Seq = f.next
+	}
+	return nil
+}
+
+// gcOutcome is a request's result: the lowest and highest seq it took, and its error.
+type gcOutcome struct {
+	first, last int64
+	err         error
+}
+
+// applyRange applies batch through g and returns its outcome.
+func applyRange(ctx context.Context, g *GroupCommitter, batch []Change) (first, last int64, err error) {
+	err = g.Apply(ctx, batch)
+	for i := range batch {
+		if s := batch[i].Seq; s != 0 {
+			if first == 0 || s < first {
+				first = s
+			}
+			last = max(last, s)
+		}
+	}
+	return first, last, err
 }
 
 func (f *fakeApplier) txCount() int {
@@ -78,7 +108,7 @@ func TestGroupCommitBatches(t *testing.T) {
 	for c := range 50 {
 		wg.Go(func() {
 			tag := fmt.Sprintf("c%d", c)
-			first, last, err := g.Apply(context.Background(), changes(tag, 1+c%4))
+			first, last, err := applyRange(context.Background(), g, changes(tag, 1+c%4))
 			if err != nil {
 				t.Error(err)
 				return
@@ -122,13 +152,13 @@ func TestGroupCommitMaxChanges(t *testing.T) {
 	var wg sync.WaitGroup
 	for c := range 6 {
 		wg.Go(func() {
-			if _, _, err := g.Apply(context.Background(), changes(fmt.Sprint(c), 400)); err != nil {
+			if err := g.Apply(context.Background(), changes(fmt.Sprint(c), 400)); err != nil {
 				t.Error(err)
 			}
 		})
 	}
 	wg.Go(func() {
-		if _, _, err := g.Apply(context.Background(), changes("big", 1500)); err != nil {
+		if err := g.Apply(context.Background(), changes("big", 1500)); err != nil {
 			t.Error(err)
 		}
 	})
@@ -183,7 +213,7 @@ func TestGroupCommitFlushesAfterDelay(t *testing.T) {
 	defer g.Close()
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := g.Apply(context.Background(), changes("solo", 1))
+		err := g.Apply(context.Background(), changes("solo", 1))
 		done <- err
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -211,7 +241,7 @@ func TestGroupCommitErrorReachesEveryCaller(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 10)
 	for c := range errs {
-		wg.Go(func() { _, _, errs[c] = g.Apply(context.Background(), changes(fmt.Sprint(c), 2)) })
+		wg.Go(func() { errs[c] = g.Apply(context.Background(), changes(fmt.Sprint(c), 2)) })
 	}
 	wg.Wait()
 	for c, err := range errs {
@@ -241,7 +271,7 @@ func TestGroupCommitConflictIsPerRequest(t *testing.T) {
 	var mu sync.Mutex
 	for _, tag := range []string{"a", "bad", "b", "c"} {
 		wg.Go(func() {
-			_, _, err := g.Apply(context.Background(), changes(tag, 3))
+			err := g.Apply(context.Background(), changes(tag, 3))
 			mu.Lock()
 			errs[tag] = err
 			mu.Unlock()
@@ -280,7 +310,7 @@ func TestGroupCommitCancellation(t *testing.T) {
 	// error; with nobody left waiting, the transaction is cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, err := g.Apply(ctx, changes("x", 1)); !errors.Is(err, context.DeadlineExceeded) {
+	if err := g.Apply(ctx, changes("x", 1)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v", err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -295,7 +325,7 @@ func TestGroupCommitCancellation(t *testing.T) {
 	}
 	close(f.block)
 	// The cancelled transaction never reached the store.
-	if _, _, err := g.Apply(context.Background(), changes("y", 1)); err != nil {
+	if err := g.Apply(context.Background(), changes("y", 1)); err != nil {
 		t.Fatal(err)
 	}
 	if f.next != 1 || len(f.batches) != 1 || f.batches[0][0].ID != "y-0" {
@@ -305,7 +335,7 @@ func TestGroupCommitCancellation(t *testing.T) {
 	// An already-cancelled context never enqueues.
 	done, cancelDone := context.WithCancel(context.Background())
 	cancelDone()
-	if _, _, err := g.Apply(done, changes("z", 1)); !errors.Is(err, context.Canceled) {
+	if err := g.Apply(done, changes("z", 1)); !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -316,7 +346,7 @@ func TestGroupCommitClose(t *testing.T) {
 	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, received: func() { collected <- struct{}{} }})
 	res := make(chan error, 1)
 	go func() {
-		_, _, err := g.Apply(context.Background(), changes("pending", 2))
+		err := g.Apply(context.Background(), changes("pending", 2))
 		res <- err
 	}()
 	// The request is collected but would wait an hour for company; Close
@@ -328,7 +358,7 @@ func TestGroupCommitClose(t *testing.T) {
 	if err := <-res; err != nil {
 		t.Fatalf("pending request: %v", err)
 	}
-	if _, _, err := g.Apply(context.Background(), changes("late", 1)); !errors.Is(err, ErrClosed) {
+	if err := g.Apply(context.Background(), changes("late", 1)); !errors.Is(err, ErrClosed) {
 		t.Fatalf("apply after close: %v", err)
 	}
 	if err := g.Close(); err != nil {
@@ -338,9 +368,9 @@ func TestGroupCommitClose(t *testing.T) {
 
 // gather starts the requests in order, each only after the committer has
 // taken the one before into its batch, and returns their results.
-func gather(t *testing.T, g *GroupCommitter, collected <-chan struct{}, ctxs []context.Context, batches [][]Change) []gcResult {
+func gather(t *testing.T, g *GroupCommitter, collected <-chan struct{}, ctxs []context.Context, batches [][]Change) []gcOutcome {
 	t.Helper()
-	out := make([]gcResult, len(batches))
+	out := make([]gcOutcome, len(batches))
 	var wg sync.WaitGroup
 	for i, b := range batches {
 		ctx := context.Background()
@@ -348,8 +378,8 @@ func gather(t *testing.T, g *GroupCommitter, collected <-chan struct{}, ctxs []c
 			ctx = ctxs[i]
 		}
 		wg.Go(func() {
-			first, last, err := g.Apply(ctx, b)
-			out[i] = gcResult{first, last, err}
+			first, last, err := applyRange(ctx, g, b)
+			out[i] = gcOutcome{first, last, err}
 		})
 		<-collected
 	}
@@ -364,7 +394,7 @@ func TestGroupCommitInvalidRequestFailsAlone(t *testing.T) {
 	defer g.Close()
 	bad := changes("bad", 3)
 	bad[2].Payload = []byte("{\"x\":\"\xff\"}") // invalid UTF-8
-	if _, _, err := g.Apply(context.Background(), bad); err == nil {
+	if err := g.Apply(context.Background(), bad); err == nil {
 		t.Fatal("invalid request accepted")
 	} else {
 		var ce *ChangeError
@@ -420,7 +450,7 @@ func TestGroupCommitMissingIndexFailsAlone(t *testing.T) {
 // names only its own index, not the whole batch's.
 func TestGroupCommitMissingIndexNamesOwnIndex(t *testing.T) {
 	f := &fakeApplier{fail: func(batch []Change) error {
-		// Mirrors sql.go's checkIndexes: Indexes is every missing name in
+		// Mirrors sql.go's checkShards: Indexes is every missing name in
 		// the combined batch, first-use order; Positions is every position
 		// naming any of them.
 		var e *IndexNotFoundError
@@ -531,5 +561,218 @@ func TestGroupCommitHeldConflictReopensOnAnEarlierHold(t *testing.T) {
 	}
 	if res[1].err != nil || res[1].first != 1 {
 		t.Fatalf("B got %+v; its conflict depended on A, which never committed", res[1])
+	}
+}
+
+// shardChanges are n changes of shard sh of index "i", tagged tag.
+func shardChanges(tag string, sh, n int) []Change {
+	out := changes(tag, n)
+	for i := range out {
+		out[i].Shard = sh
+	}
+	return out
+}
+
+// With a lane per shard, a request over several shards is split into one transaction
+// per shard, each holding only that shard's changes, and every change gets its seq
+// back at its own position.
+func TestGroupCommitSplitsAcrossShards(t *testing.T) {
+	f := &fakeApplier{}
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Millisecond, MaxTransactions: 4})
+	defer g.Close()
+	batch := append(append(shardChanges("a", 0, 2), shardChanges("b", 1, 3)...), shardChanges("c", 0, 1)...)
+	if err := g.Apply(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	if f.txCount() != 2 {
+		t.Fatalf("%d transactions for a request on 2 shards", f.txCount())
+	}
+	byID := map[string]int64{}
+	for _, b := range f.batches {
+		for _, c := range b {
+			if c.Shard != b[0].Shard {
+				t.Fatalf("a transaction mixes shards %d and %d", b[0].Shard, c.Shard)
+			}
+		}
+	}
+	for _, b := range f.batches {
+		for i, c := range b {
+			byID[c.ID] = int64(i)
+		}
+	}
+	for i, c := range batch {
+		if c.Seq == 0 {
+			t.Fatalf("change %d (%s) has no seq", i, c.ID)
+		}
+	}
+	// Each shard's changes are in request order in their transaction.
+	if byID["a-0"] != 0 || byID["a-1"] != 1 || byID["c-0"] != 2 || byID["b-2"] != 2 {
+		t.Fatalf("order within transactions: %v", byID)
+	}
+	if batch[5].Seq != batch[1].Seq+1 {
+		t.Fatalf("shard 0's changes took seqs %v", seqsOf(batch))
+	}
+}
+
+// Lanes commit at the same time, up to MaxTransactions transactions.
+func TestGroupCommitBoundsTransactions(t *testing.T) {
+	f := &fakeApplier{block: make(chan struct{})}
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Millisecond, MaxTransactions: 3})
+	defer g.Close()
+	var wg sync.WaitGroup
+	for sh := range 6 {
+		wg.Go(func() {
+			if err := g.Apply(context.Background(), shardChanges(fmt.Sprint(sh), sh, 1)); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		running := f.running
+		f.mu.Unlock()
+		if running == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d transactions under way, want 3", running)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(f.block)
+	wg.Wait()
+	if f.most != 3 || f.txCount() != 6 {
+		t.Fatalf("at most %d transactions at once, %d in all; want 3 and 6", f.most, f.txCount())
+	}
+}
+
+// A lane collecting its batch holds no transaction slot: with one slot held by a
+// commit under way, another shard's request still waits out its window and joins the
+// requests that came during it.
+func TestGroupCommitLanesRunInParallel(t *testing.T) {
+	f := &fakeApplier{}
+	release := make(chan struct{})
+	f.fail = func(batch []Change) error {
+		if batch[0].Shard == 0 {
+			f.mu.Unlock()
+			<-release
+			f.mu.Lock()
+		}
+		return nil
+	}
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: 20 * time.Millisecond, MaxTransactions: 2})
+	defer g.Close()
+	held := make(chan error, 1)
+	go func() { held <- g.Apply(context.Background(), shardChanges("slow", 0, 1)) }()
+	deadline := time.Now().Add(10 * time.Second)
+	for f.txCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("shard 0's transaction never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	var wg sync.WaitGroup
+	for i := range 5 {
+		wg.Go(func() {
+			if err := g.Apply(context.Background(), shardChanges(fmt.Sprint("fast", i), 1, 1)); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if n := f.txCount(); n > 3 {
+		t.Errorf("%d transactions: shard 1's requests were not coalesced", n)
+	}
+	close(release)
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+}
+
+// When some shards of a split request fail, the request gets a *PartialError naming
+// each failed shard with its changes' positions in the request and its error, those
+// positions translated; the other shards' changes committed with their seqs.
+func TestGroupCommitPartialFailure(t *testing.T) {
+	boom := errors.New("shard 2 is down")
+	f := &fakeApplier{fail: func(batch []Change) error {
+		for i, c := range batch {
+			switch {
+			case c.Shard == 1 && c.ID == "x-4":
+				return &ConflictError{Positions: []int{i}, Current: []int64{42}}
+			case c.Shard == 2:
+				return boom
+			}
+		}
+		return nil
+	}}
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Millisecond, MaxTransactions: 4})
+	defer g.Close()
+	batch := changes("x", 6)
+	for i := range batch {
+		batch[i].Shard = i % 3
+	}
+	err := g.Apply(context.Background(), batch)
+	var pe *PartialError
+	if !errors.As(err, &pe) || len(pe.Failed) != 2 {
+		t.Fatalf("got %v, want a PartialError of two shards", err)
+	}
+	conflict, down := pe.Failed[0], pe.Failed[1]
+	var ce *ConflictError
+	if conflict.Shard.Shard != 1 || fmt.Sprint(conflict.Positions) != "[1 4]" || !errors.As(conflict.Err, &ce) || fmt.Sprint(ce.Positions) != "[4]" || ce.Current[0] != 42 {
+		t.Fatalf("shard 1's failure %+v (%v)", conflict, conflict.Err)
+	}
+	if down.Shard.Shard != 2 || fmt.Sprint(down.Positions) != "[2 5]" || !errors.Is(down.Err, boom) {
+		t.Fatalf("shard 2's failure %+v", down)
+	}
+	if !errors.Is(err, boom) || !errors.Is(err, ErrConflict) {
+		t.Fatalf("the error does not wrap both shards' errors: %v", err)
+	}
+	if fmt.Sprint(seqsOf(batch)) != "[1 0 0 2 0 0]" {
+		t.Fatalf("seqs %v: only shard 0's changes committed", seqsOf(batch))
+	}
+}
+
+// A caller that gives up while its transaction commits on another caller's behalf
+// gets its context's error, and its slice is never written afterwards: the committer
+// sets the seqs of its own copy. (Under -race, a write after the return is also a
+// reported race.)
+func TestGroupCommitLeavesAGoneCallersSliceAlone(t *testing.T) {
+	f := &fakeApplier{block: make(chan struct{})}
+	collected := make(chan struct{}, 8)
+	g := NewGroupCommitter(f, GroupCommitOptions{MaxDelay: time.Hour, MaxChanges: 2, received: func() { collected <- struct{}{} }})
+	defer g.Close()
+	ctxA, cancelA := context.WithCancel(context.Background())
+	a, b := changes("a", 1), changes("b", 1)
+	resA, resB := make(chan error, 1), make(chan error, 1)
+	go func() { resA <- g.Apply(ctxA, a) }()
+	<-collected
+	go func() { resB <- g.Apply(context.Background(), b) }()
+	<-collected
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		running := f.running
+		f.mu.Unlock()
+		if running == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the transaction never started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancelA()
+	if err := <-resA; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the caller that gave up got %v", err)
+	}
+	a[0].Seq = -7
+	close(f.block)
+	if err := <-resB; err != nil || b[0].Seq == 0 {
+		t.Fatalf("the caller that waited: %v %v", seqsOf(b), err)
+	}
+	if a[0].Seq != -7 {
+		t.Fatalf("the committer wrote seq %d into the slice of a caller that had returned", a[0].Seq)
 	}
 }

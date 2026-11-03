@@ -20,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/bench/report"
+	"github.com/Imposter/go-searchlight/internal/api"
 )
 
 // SearchlightOptions configure a [Searchlight] engine.
@@ -55,7 +56,7 @@ type Searchlight struct {
 	opts SearchlightOptions
 	// seq is the newest seq any write answered, per index: Refresh waits for it.
 	mu  sync.Mutex
-	seq map[string]int64
+	seq map[string]*api.Token
 }
 
 // NewSearchlight returns the engine at opts.URL.
@@ -63,24 +64,30 @@ func NewSearchlight(opts SearchlightOptions) *Searchlight {
 	if opts.QueryWriters <= 0 {
 		opts.QueryWriters = 32
 	}
-	return &Searchlight{c: newClient(opts.URL, opts.Token, opts.Log), opts: opts, seq: map[string]int64{}}
+	return &Searchlight{c: newClient(opts.URL, opts.Token, opts.Log), opts: opts, seq: map[string]*api.Token{}}
 }
 
 // Name implements Engine.
 func (*Searchlight) Name() string { return "searchlight" }
 
-func (s *Searchlight) noteSeq(index string, seq int64) {
+// noteToken merges a write's token into what index's reads wait for.
+func (s *Searchlight) noteToken(index, text string) {
+	t, err := api.ParseToken(text)
+	if err != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if seq > s.seq[index] {
-		s.seq[index] = seq
+	if cur := s.seq[index]; cur == nil || !cur.Merge(t) {
+		s.seq[index] = t
 	}
 }
 
-func (s *Searchlight) lastSeq(index string) int64 {
+// lastToken is the merge of index's writes' tokens, "" before any.
+func (s *Searchlight) lastToken(index string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.seq[index]
+	return s.seq[index].String()
 }
 
 func ipath(index string, rest ...string) string {
@@ -162,8 +169,8 @@ func (s *Searchlight) DeleteIndex(ctx context.Context, index string) error {
 }
 
 type slBulkResponse struct {
-	Seq    int64 `json:"seq"`
-	Errors bool  `json:"errors"`
+	Token  string `json:"token"`
+	Errors bool   `json:"errors"`
 	Items  []struct {
 		ID      string          `json:"id"`
 		Status  int             `json:"status"`
@@ -196,7 +203,7 @@ func (s *Searchlight) bulk(ctx context.Context, index string, docs []Doc, query 
 	if err := json.Unmarshal(body, &res); err != nil {
 		return nil, fmt.Errorf("searchlight bulk: %w", err)
 	}
-	s.noteSeq(index, res.Seq)
+	s.noteToken(index, res.Token)
 	if res.Errors {
 		for _, it := range res.Items {
 			if len(it.Error) > 0 {
@@ -236,7 +243,7 @@ func (s *Searchlight) BulkPercolate(ctx context.Context, index string, docs []Do
 
 // Refresh implements Engine: a count that waits for the newest seq written.
 func (s *Searchlight) Refresh(ctx context.Context, index string) error {
-	_, err := s.c.do(ctx, http.MethodPost, ipath(index, "_count")+"?wait_for_seq="+strconv.FormatInt(s.lastSeq(index), 10), "application/json", []byte(`{}`))
+	_, err := s.c.do(ctx, http.MethodPost, ipath(index, "_count")+"?wait_for="+url.QueryEscape(s.lastToken(index)), "application/json", []byte(`{}`))
 	return err
 }
 
@@ -338,14 +345,14 @@ func (s *Searchlight) PutQueries(ctx context.Context, index string, qs []dataset
 					return
 				}
 				var res struct {
-					Seq int64 `json:"seq"`
+					Token string `json:"token"`
 				}
 				body := map[string]any{"query": qs[i].Query, "meta": qs[i].Meta}
 				if err := s.c.json(ctx, http.MethodPut, ipath(index, "queries", url.PathEscape(qs[i].ID)), body, &res); err != nil {
 					once.Do(func() { first = fmt.Errorf("saved query %s: %w", qs[i].ID, err); cancel() })
 					return
 				}
-				s.noteSeq(index, res.Seq)
+				s.noteToken(index, res.Token)
 			}
 		})
 	}

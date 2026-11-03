@@ -30,11 +30,13 @@ import (
 // mark itself. A head behind the copy's seq is a rewind too, once two polls in a row see
 // it: one read that reached a lagging server is not enough to rebuild every copy.
 //
-// A mark may name another shard's change (the head an idle copy advanced to), whose
-// row that shard prunes once its own copies are past it: a copy stopped across the
-// failover may find nothing to compare at that seq. So each poll also checks the
-// copy's own shard, whose rows only a rewind can change while the copy counts for
-// pruning: the shard's newest change at or below the seq the copy checked (own.upTo)
+// Each shard's seqs are its own, so a mark names a change of the copy's own shard (or
+// none, at a head the shard started at). Its row can still be gone when the copy
+// compares it: the shard is pruned up to the oldest seq its copies applied, which may
+// pass the anchor, and a copy stopped across the failover may find nothing to compare
+// at that seq. So each poll also checks the copy's own shard, whose rows only a rewind
+// can change while the copy counts for pruning: the shard's newest change at or below
+// the seq the copy checked (own.upTo)
 // must be the last change of the shard the copy applied there (own.last). A newer one
 // is a change the copy skipped, another one at that seq a reissue, and a missing one
 // whose seq the shard's prune horizon has not passed was lost. Its state follows the

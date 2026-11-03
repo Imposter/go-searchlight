@@ -100,7 +100,7 @@ func TestEndToEndOnEveryDialect(t *testing.T) {
 		}})
 		e.createIndex("e2e", `{"mapping": {"fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 2}}`)
 		q := e.must(http.StatusOK, "PUT", "/indexes/e2e/queries/cheap", `{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"owner": "x"}}`)
-		w := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/e2e/_bulk?percolate=true&wait_for_seq=%d", seqOf(t, q)), ndjson(
+		w := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/e2e/_bulk?percolate=true&wait_for=%s", tokenOf(t, q)), ndjson(
 			`{"upsert": {"id": "a"}}`, `{"brand": "acme", "price": 5}`,
 			`{"upsert": {"id": "b"}}`, `{"brand": "globex", "price": 50}`,
 		))
@@ -108,7 +108,7 @@ func TestEndToEndOnEveryDialect(t *testing.T) {
 		if fmt.Sprint(items[0].(map[string]any)["queries"], items[1].(map[string]any)["queries"]) != "[cheap] []" { //nolint:forcetypeassert,errcheck // the shape
 			t.Errorf("bulk percolation = %v", items)
 		}
-		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/e2e/_search?wait_for_seq=%d", seqOf(t, w)), `{"sort": [{"price": "desc"}]}`)
+		r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/e2e/_search?wait_for=%s", tokenOf(t, w)), `{"sort": [{"price": "desc"}]}`)
 		if fmt.Sprint(ids(r)) != "[b a]" {
 			t.Errorf("search = %v", r)
 		}

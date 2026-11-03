@@ -266,9 +266,9 @@ func TestChangelogAgeCap(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) { o.PruneInterval = time.Hour })
 	a := c.start(0)
 	createIndex(t, a.n, "age", 1, 0)
-	var old int64
+	var old *api.Token
 	for k := range 5 {
-		old = mustWrite(t, a.n, "age", upsertOp(fmt.Sprintf("o%d", k), k))
+		old = merged(old, mustWrite(t, a.n, "age", upsertOp(fmt.Sprintf("o%d", k), k)))
 	}
 	time.Sleep(50 * time.Millisecond)
 	cutoff := time.Now()
@@ -278,8 +278,8 @@ func TestChangelogAgeCap(t *testing.T) {
 	}
 	id := store.ShardID{Index: "age", Shard: 0}
 	got, err := a.n.ageFloor(tctx(t), id, 0, cutoff)
-	if err != nil || got != old {
-		t.Fatalf("ageFloor %d (%v), want %d: the newest change before the cutoff", got, err, old)
+	if err != nil || got != old.Seq(0) {
+		t.Fatalf("ageFloor %d (%v), want %d: the newest change before the cutoff", got, err, old.Seq(0))
 	}
 	if got, err := a.n.ageFloor(tctx(t), id, 0, cutoff.Add(-time.Hour)); err != nil || got != 0 {
 		t.Fatalf("ageFloor before every change: %d (%v)", got, err)
@@ -288,8 +288,8 @@ func TestChangelogAgeCap(t *testing.T) {
 	if err := a.st.Prune(tctx(t), id, 3); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := a.n.ageFloor(tctx(t), id, 0, cutoff); err != nil || got != old {
-		t.Fatalf("ageFloor after a prune: %d (%v), want %d", got, err, old)
+	if got, err := a.n.ageFloor(tctx(t), id, 0, cutoff); err != nil || got != old.Seq(0) {
+		t.Fatalf("ageFloor after a prune: %d (%v), want %d", got, err, old.Seq(0))
 	}
 }
 
@@ -310,7 +310,7 @@ func TestStoppedNodeKeepsItsTail(t *testing.T) {
 	var applied, epoch int64
 	eventually(t, time.Minute, "node-1 reports its applied seq", func() error {
 		for _, cp := range liveCopies(t, a.st, id) {
-			if cp.NodeID == b.n.id && cp.AppliedSeq >= last {
+			if cp.NodeID == b.n.id && cp.AppliedSeq >= last.Seq(0) {
 				applied, epoch = cp.AppliedSeq, cp.Epoch
 				return nil
 			}

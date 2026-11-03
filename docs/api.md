@@ -32,9 +32,13 @@ Each section below names the `operationId`s it covers.
 - **Names.** An index name is 1 to 255 bytes: lowercase letters, digits, `-`, `_` and
   `.`, starting with a letter or a digit. A document or saved-query id is 1 to 512
   bytes of UTF-8 without NUL. Percent-encode a `/` in an id.
-- **Sequence numbers.** Every write answers with the `seq` it committed. A write is
-  acknowledged only after its SQL transaction commits, so an acknowledged write is
-  durable. Seqs are global, contiguous and increase in commit order.
+- **Sequence numbers.** Every shard of an index has its own sequence: a change's `seq`
+  is its position in its shard's changelog. Seqs are contiguous per shard and increase
+  in commit order there; they repeat across shards. A write is acknowledged only after
+  its SQL transaction commits, so an acknowledged write is durable. Each shard's
+  operations of a write commit in one transaction of their own, so a request is whole
+  or nothing only on one shard. Every write answers with a [`token`](#tokens), and a
+  single-document write also with the document's `seq`.
 
 ### Consistency
 
@@ -42,11 +46,95 @@ Each section below names the `operationId`s it covers.
 |---|---|
 | The write to be searchable before the answer | `?refresh=wait_for` on the write. It returns once the write is searchable on the node that took it, or, on a node that hosts no copy, the first copy that has it. |
 | The written shards refreshed now | `?refresh=true`. It costs a small segment per call, so don't use it per document under load. |
-| Read-your-writes on any node | Pass the write's `seq` as `?wait_for_seq=N` on the read. The read waits, under its deadline, until every change up to N is searchable on the copies it reads. An N past the newest committed seq is a 400 `invalid_request`. While the database cannot be reached, an N past the newest seq the node knows cannot be confirmed: it is a 503 `unavailable` with `Retry-After`. |
+| Read-your-writes on any node | Pass the write's `token` as `?wait_for=<token>` on the read. The read waits, under its deadline, until each shard it reads has every change up to the token's seq of that shard searchable, and waits on no other shard (see [Tokens](#tokens)). While the database cannot be reached, a seq past the newest the node knows for its shard cannot be confirmed: it is a 503 `unavailable` with `Retry-After`. |
 | Nothing special | Writes become searchable everywhere within the index's `refresh_interval` (1 s by default). |
 
 `GET` of one document or one saved query is realtime: it reads the database, not the
 segments.
+
+### Tokens
+
+A write's `token` names, for each shard the write committed to (or found a noop's
+stored target on: an unchanged upsert, a versioned write not above the stored one), the
+newest seq there, plus the index's incarnation (its uid). Pass it back as `wait_for`.
+Treat it as opaque, except to merge tokens or form one (below), for which the format is
+given at the end.
+
+- **Reads that take it.** `_search`, `_count`, `_percolate`, `_fields`, `GET` of a
+  document or saved query, the saved-query listing, and `_bulk` with `percolate=true`
+  take `?wait_for=<token>` (`_bulk` without `percolate=true` refuses it, a 400 at
+  `params.wait_for`). The read waits until each shard it reads has every change
+  up to the token's seq of that shard searchable. A `GET` waits only on its document's
+  shard. Past the deadline the answer is a 504.
+- **Merging.** Tokens of the same incarnation merge by per-shard maximum. A client
+  that writes several times may keep, per shard, the newest seq it was given, and pass
+  the merge as one token.
+- **Where one item stands.** Every `_bulk` item answers its `shard` (the shard its id
+  routes to, see [Routing](#routing)) and its `seq` there: the seq it committed at, or,
+  for a noop, the stored target's (absent when there is none). A single write and a
+  `GET` of a document or saved query answer the same `shard` and `seq`, and a `token`
+  naming that shard alone. To wait for exactly some items, form a token of their
+  positions: the uid of any token of the index's incarnation (every token of a write,
+  `GET` or percolation of that incarnation carries the same one), and per shard the
+  highest seq among the items on it, encoded as the format below says. A `GET` (or a
+  versioned noop) tells where a document stands without writing it again.
+- **`committed`: telling that the database lost commits.** A write's `token` mixes
+  what it committed with where its noops found their targets, at their old seqs. Its
+  `committed` token (a `_bulk`'s and a single write's; absent when nothing committed)
+  names only the seqs this request committed. A shard's seqs only rise: every commit
+  takes a seq above every commit before it on that shard. So a client that keeps, per
+  shard, the highest seq a `committed` token showed it, and later sees a `committed`
+  (or a committed item's `seq`) at or below that on the same shard of the same
+  incarnation, knows the database lost commits and has issued those seqs again (a
+  failover with asynchronous replication, a restore from backup). A `wait_for` naming a
+  seq past a shard's head (a 400, below) shows the same before any new write.
+- **Refusals.** Each is a 400 `invalid_request` at `params.wait_for`:
+  - a malformed token, or one over 16 KiB;
+  - a seq past its shard's newest committed seq;
+  - a token of another incarnation of the index (dropped and created again since the
+    write);
+  - a token naming a shard the index lacks.
+
+  `wait_for_seq`, the scalar it replaces, is refused by name, a 400 at
+  `params.wait_for_seq`: "wait_for_seq was removed in 2.0: pass the token a write
+  returned as wait_for".
+- **After a failover that lost commits** (asynchronous replication; see
+  [Failures](clustering.md#failures)), the new primary issues the lost seqs again. A
+  token taken before the failover may name a seq past its shard's head: it is a 400
+  until new writes reach that seq, and from then on the reissued change satisfies it,
+  though it is not the write the token came from. The 2.0 token carries no epoch to
+  tell the two apart; a generation stamp that does is left to a later change. The lost
+  writes themselves are gone (see [Retrying after a 5xx](#retrying-after-a-5xx) for
+  writing them again safely).
+- **Format.** base64url, unpadded, of: a version byte (1), the uid's 16 bytes, a uvarint
+  count n, then n pairs, shards ascending: a uvarint shard delta (the shard less the
+  previous one, the previous being -1 at the start) and a uvarint seq (at least 1). It
+  is at most 16 KiB, which fits 1,024 shards. With seqs near a million a token is 30
+  bytes at 1 shard, 67 at 8, 366 at 64 and 5,487 at 1,024.
+
+### Routing
+
+A document or saved query lives on one shard, which its id alone decides: the 32-bit
+FNV-1a hash of the id's bytes as UTF-8 (offset basis 2166136261, prime 16777619, each
+byte XORed in and then multiplied), taken modulo the index's shard count. An index of
+one shard has everything on shard 0. The id is hashed exactly as it is stored, with no
+normalization, and documents and saved queries route alike. The shard count is fixed at
+creation, so an id never moves. This is a stable contract: a client may compute an id's
+shard itself (for `"a"` the hash is 3826002220, so shard 4 of 8, or 44 of 64), and it
+does not change within a major release.
+
+### Retrying after a 5xx
+
+A 5xx answer, or a 5xx item in a `_bulk`, may or may not have committed. Retry with
+conditions that make a repeat safe:
+
+- the same unconditional upsert body: an unchanged upsert is a noop (unless
+  `detect_noop=false`);
+- `if_seq`;
+- `version` (external versioning);
+- `op_type=create`.
+
+A delete retried after it committed is a 404: there is nothing left to delete.
 
 ### Limits
 
@@ -339,11 +427,19 @@ new target, or [`gc_deletes`](#documents), how long deletes keep their versions.
 curl -sS -X PUT 'localhost:8780/indexes/products/docs/sku-1?refresh=wait_for' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"title": "Oak chair", "brand": "Acme", "tags": ["wood", "chair"], "price": 30}'
-# {"id":"sku-1","seq":42}
+# {"id":"sku-1","shard":1,"seq":42,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo","committed":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo"}
 
-curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $TOKEN"
-# {"id":"sku-1","seq":42,"body":{"title":"Oak chair",...}}
+curl -sS 'localhost:8780/indexes/products/docs/sku-1?wait_for=AXZ1E5NJpY_aM8Cv_KlQbqkBASo' \
+  -H "Authorization: Bearer $TOKEN"
+# {"id":"sku-1","shard":1,"seq":42,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBASo","body":{"title":"Oak chair",...}}
 ```
+
+- **`shard`, `seq`, `token` and `committed`.** A write answers with the document's
+  `shard` ([Routing](#routing)) and its `seq` there, to pass as `if_seq`, a
+  [`token`](#tokens), to pass as `wait_for`, and `committed`, the token of what it
+  committed (absent for a noop). A `GET` answers `shard`, `seq` and a `token` of the
+  document at its seq (no `seq` or `token` on a stale read). Saved-query writes and
+  `GET`s answer the same way.
 
 - **`if_seq=N`.** Applies only if the document's current seq is N. Otherwise the answer
   is a 409 `conflict` carrying `current_seq`, which gives optimistic concurrency.
@@ -351,9 +447,11 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   otherwise).
 - **`version=N`**, Elasticsearch's external versioning (`version_type=external`): the
   client's own version of the document, 1 to 2^62. The write applies only when N is
-  higher than the stored version, and answers `{"id", "seq", "version"}`; otherwise it is
-  a noop, `{"id", "version", "result": "noop"}` (200, no `seq`), and writes nothing. It
-  excludes `if_seq` and `op_type=create` (400 at `params.version`).
+  higher than the stored version, and answers `{"id", "shard", "seq", "token", "committed",
+  "version"}`; otherwise it is a noop, `{"id", "shard", "seq", "token", "version",
+  "result": "noop"}` (200, with the stored target's `seq` and a `token` of it, both absent
+  when the target is gone; no `committed`), and writes nothing. It excludes `if_seq` and
+  `op_type=create` (400 at `params.version`).
   - The stored version is the greater of the document's and its tombstone's. Versions
     only rise: a write without `version` keeps the stored version (so a stale replay
     of a lower one after it is still a noop), and a delete keeps the document's
@@ -379,13 +477,13 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
     nodes, and trust `version` in `GET` and percolation matches once the rollout is
     done.
 - **Unchanged documents.** An upsert without `if_seq`, `op_type=create` or `version`
-  whose body is byte for byte the stored document's is a noop: `{"id", "seq",
+  whose body is byte for byte the stored document's is a noop: `{"id", "seq", "token",
   "result": "noop"}`, where `seq` is the seq the stored document was written at, and
   nothing is analyzed, committed, indexed or logged for it. Each document row keeps a
   hash of its body (the first 8 bytes of its SHA-256) for this, read by id before the
   write is analyzed. The bytes must match exactly: the same document with its keys
-  reordered or its whitespace changed is written. `seq` still reads it back:
-  `wait_for_seq` with it waits until the document is searchable, as after a write.
+  reordered or its whitespace changed is written. `token` still reads it back:
+  `wait_for` with it waits until the document is searchable, as after a write.
   `detect_noop=false` writes it anyway, as releases before 1.6 did (a new seq, the
   document indexed again). A document written by a release before 1.6 has no hash
   until it is next written, and during a rolling upgrade a 1.5 node's write leaves the
@@ -396,13 +494,13 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
   that another request commits after that read and before this request answers is
   not undone: the document then holds the other request's body, as if this request's
   upsert had committed first. Within one request the noops and the writes are not one
-  atomic step (the writes still commit together); send `detect_noop=false` for a bulk
-  whose upserts must all commit in its transaction. A noop writes nothing, so it is neither checked against
+  atomic step (each shard's writes still commit together); send `detect_noop=false` for
+  a bulk whose upserts on a shard must all commit in its transaction. A noop writes nothing, so it is neither checked against
   the mapping again (a document stored before the index turned `dynamic: "strict"` is
   a noop where a write of it would be a 400) nor held back by write backpressure (a
   request of noops alone answers while its shards refuse writes with 429 or 503).
 - **`refresh`.** `true`, `wait_for` or `false` (see [Consistency](#consistency)).
-- **Deletes.** A delete answers `{"id", "seq"}`. Deleting a document that does not exist
+- **Deletes.** A delete answers `{"id", "seq", "token"}`. Deleting a document that does not exist
   is a 404 `document_not_found` with `result: "not_found"`, and writes nothing (but the
   version of a versioned one).
 - **Stale reads.** While the database cannot be reached, `GET` answers from this node's
@@ -410,8 +508,12 @@ curl -sS localhost:8780/indexes/products/docs/sku-1 -H "Authorization: Bearer $T
 
 ## Bulk
 
-`bulk`: `POST /indexes/{index}/_bulk`. Every operation in one request commits in one
-transaction.
+`bulk`: `POST /indexes/{index}/_bulk`. A request is split by shard: each shard's
+operations commit in one transaction of their own, and the shards commit independently.
+A request is whole or nothing only on one shard. (On SQLite the whole request is one
+transaction, but clients must not rely on it.) How many transactions a node runs at once
+is its `write_transactions` setting (see
+[Every setting](operations.md#every-setting)).
 
 ```sh
 cat > ops.ndjson <<'EOF'
@@ -427,13 +529,21 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 ```
 
 ```json
-{"took_ms": 4, "seq": 57, "errors": true, "timed_out": false, "percolated": true,
+{"took_ms": 4, "token": "AXZ1E5NJpY_aM8Cv_KlQbqkCATcBHw",
+ "committed": "AXZ1E5NJpY_aM8Cv_KlQbqkCATcBHw", "errors": true, "timed_out": false,
+ "percolated": true, "percolated_at": "AXZ1E5NJpY_aM8Cv_KlQbqkCATcBIA",
  "items": [
-   {"op": "upsert", "id": "sku-2", "status": 200, "seq": 55, "queries": []},
-   {"op": "upsert", "id": "sku-3", "status": 200, "seq": 56, "queries": ["cheap"]},
-   {"op": "delete", "id": "sku-9", "status": 409, "error": {"code": "conflict", "current_seq": 30, "...": "..."}}
+   {"op": "upsert", "id": "sku-2", "status": 200, "shard": 1, "seq": 55, "queries": []},
+   {"op": "upsert", "id": "sku-3", "status": 200, "shard": 0, "seq": 31, "queries": ["cheap"]},
+   {"op": "delete", "id": "sku-9", "status": 409, "shard": 0, "error": {"code": "conflict", "current_seq": 30, "...": "..."}}
  ]}
 ```
+
+- **Positions.** Every item names its `shard` and, unless it failed, its `seq` there
+  (the seq it committed at; for a noop, the stored target's). `token` names, per shard,
+  the newest of those; `committed` only what the request committed (absent when nothing
+  did). See [Tokens](#tokens) for forming a token of some items and for telling that
+  the database lost commits.
 
 - **Actions.** Each operation is an action line, `upsert`, `create` or `delete`,
   followed by the document for an upsert or a create. `index` is an alias of `upsert`,
@@ -441,10 +551,11 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 - **Saved queries.** `query_upsert` is followed by the saved query, as `PUT
   .../queries/{id}` takes it (`{"query": ..., "meta": {...}}`; a line of another shape
   refuses the whole request), and `query_delete` takes none. Documents and saved queries
-  mix in one request, in one transaction. With `percolate=true` every document of the
-  request percolates after the whole request commits, so against the saved queries as
-  they stand at its end: those its `query_upsert`s write, wherever they are in the
-  request, included, and those its `query_delete`s remove left out:
+  mix in one request, each committing with its own shard's operations. With
+  `percolate=true` every committed document of the request percolates after every
+  shard's transaction has ended, so against the saved queries as they stand at its
+  end: those its committed `query_upsert`s write, wherever they are in the request,
+  included, and those its committed `query_delete`s remove left out:
 
   ```
   {"query_upsert": {"id": "s7", "version": 3}}
@@ -456,33 +567,43 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 
 - **`version`** in an action's metadata is the [`version=N`](#documents) of its op, on
   documents and saved queries alike: an item at or below the stored version answers
-  `{"status": 200, "version": N, "result": "noop"}`, with no `seq` and, under
-  `percolate=true`, no `queries`. It excludes `if_seq` and `create` (400 at
+  `{"status": 200, "shard": S, "seq": <the stored target's>, "version": N, "result":
+  "noop"}` (no `seq` when the target is gone) and, under `percolate=true`, no
+  `queries`. It excludes `if_seq` and `create` (400 at
   `line.N.<action>.version`).
 - **Unchanged documents** are [noops](#documents) item by item: an `upsert` (no
   `if_seq`, `create` or `version`) of the stored document's bytes answers `{"status":
-  200, "seq": <the stored document's>, "result": "noop"}`, and under `percolate=true`
+  200, "shard": S, "seq": <the stored document's>, "result": "noop"}`, and under `percolate=true`
   still lists its `queries` (and `matches`): it is percolated as a write of the same
   body would be, against the saved queries as they stand. An id that more than one
   operation of the request names is always written. `detect_noop=false` writes every
   upsert.
 - **Partial failure.** An operation refused on its own (an invalid document, a failed
-  `if_seq`) is reported in its item, with `errors` set, and the rest commit.
+  `if_seq`, a delete of nothing) is reported in its item, with `errors` set, and the
+  rest commit. When a shard's transaction fails (the database cannot be reached, the
+  deadline passes), every operation of that shard is answered with that 5xx error in
+  its item, while the other shards' operations commit. `errors` is true when any item
+  failed. Only when nothing was written is the request itself an error (5xx). A 5xx
+  item may or may not have committed: see
+  [Retrying after a 5xx](#retrying-after-a-5xx).
 - **Whole-request refusal.** A malformed action line, a line over `max_doc_bytes`, or
   more than `max_bulk_ops` operations refuse the whole request before anything is
   written.
-- **`seq`.** The newest seq the request committed, or an unchanged upsert found its
-  document at. Pass it as `wait_for_seq` to read your writes.
+- **`token`.** Where the request left each shard it committed to, or an unchanged
+  upsert found its document on. Pass it as `wait_for` to read your writes. It is absent
+  when nothing was written. Each item keeps its own `seq`, the document's on its
+  shard.
 - **A client that gives up.** When the client disconnects before the answer (its
   timeout, say), the request stops at its next step that has not committed: before the
-  next document it would analyze, before the transaction of its group commit begins, or,
-  once committed, before its percolation or refresh wait. Once that transaction is
+  next document it would analyze, before the transactions of its group commit begin, or,
+  once committed, before its percolation or refresh wait. Once a shard's transaction is
   under way, it may still commit after the client has gone: it is cancelled only while
-  it has not reached its commit, and only when every request sharing it has gone too. The
-  request commits in one transaction, so it is committed whole or not at all, never in
-  part, but the client cannot tell which. Sending the same bulk again is then safe and
-  cheap: an attempt that committed makes the retry's upserts noops at their stored
-  seqs (still percolated, with their matches), and one that did not is written now. A
+  it has not reached its commit, and only when every request sharing it has gone too.
+  Each shard's operations are committed whole or not at all, but some shards may have
+  committed and others not, and the client cannot tell which. Sending the same bulk
+  again is then safe and cheap: a shard that committed makes the retry's upserts there
+  noops at their stored seqs (still percolated, with their matches), and one that did
+  not is written now. A
   retry sent while the abandoned attempt is still committing may write some documents
   again (the same bodies, at new seqs) rather than find them unchanged; the stored
   state is the same either way. Deletes and versioned or conditional operations retried after a commit answer
@@ -496,15 +617,21 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
   - Past 1,000,000 matches, every document's together, `percolated` is false and
     `percolate_reason` is `too_many_matches`, with no item's `queries`. Percolate
     those documents in smaller requests.
-  - `percolated_seq`, with `percolated` true, is a seq every saved query committed at
-    or below which the documents were percolated against: the least, over the shards,
-    of the seq the copy percolating it held every change up to. A saved query written
-    after it may or may not have been seen. It is not `seq`: an unchanged document's
-    noop puts its stored seq, which can be far older, in `seq`, and a written
-    document's seq can be newer than the copies' last refresh. On a cluster, a shard
-    percolated by a copy on another node counts up to the seq the percolation asked of
-    it (`wait_for_seq`, or the newest saved query this node wrote to the shard), so pass
-    `wait_for_seq` there to raise it.
+  - Only documents that committed are percolated: the operations of a shard whose
+    transaction failed carry no `queries`.
+  - `percolated_at`, with `percolated` true, is a [token](#tokens) of where each shard
+    stood for the percolation: every saved query committed to a shard at or below its
+    seq there was seen. A saved query written after it may or may not have been seen.
+    It is not `token`: an unchanged document's noop puts its stored document's shard
+    and seq, which can be far older, in `token`, and a written document's seq can be
+    newer than the copies' last refresh. On a cluster, a shard percolated by a copy on
+    another node counts as that copy reports it: the seq of the generation it
+    percolated at, whichever node the saved queries were written through. While nodes
+    of 1.8 still serve (a rolling upgrade), one of them reports nothing, and its shard
+    counts up to the seq the percolation asked of it (`wait_for`'s seq of that shard, or
+    the newest saved query this node wrote there); every seq is global then, so that
+    holds. A shard `percolated_at` does not name stood at no seq: its copy held no
+    change of it, so the percolation saw no saved query of it.
 - **`refresh`.** As on single-document writes.
 
 ## Search and count
@@ -512,7 +639,7 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
 `search`: `POST /indexes/{index}/_search`, and `count`: `POST /indexes/{index}/_count`.
 
 ```sh
-curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
+curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for=AXZ1E5NJpY_aM8Cv_KlQbqkCATcBHw' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{
     "query": {"all": [
       {"field": "brand", "op": "in", "value": ["acme", "initech"]},
@@ -794,7 +921,7 @@ curl -sS -X POST 'localhost:8780/indexes/products/_search?wait_for_seq=57' \
   `max_staleness` per shard copy, however often it is asked. The answer may miss the
   writes of the last `max_staleness`, on top of the refresh interval every search
   misses. A mapping change is never served across; `request_cache: false` and
-  `wait_for_seq` (read-your-writes) ignore it. It is answered from this node's memory
+  `wait_for` (read-your-writes) ignore it. It is answered from this node's memory
   cache, not the shared Redis. Peers before 1.6 ignore it and answer with a current
   result.
 
@@ -1084,10 +1211,10 @@ bound of a [box](#box-queries) on a point field's `date` axis.
 curl -sS -X PUT localhost:8780/indexes/products/queries/cheap \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"search_id": 7}}'
-# {"id":"cheap","seq":58}
+# {"id":"cheap","shard":0,"seq":32,"token":"AXZ1E5NJpY_aM8Cv_KlQbqkBAiA","committed":"AXZ1E5NJpY_aM8Cv_KlQbqkBAiA"}
 
 curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: Bearer $TOKEN"
-# {"queries":[{"id":"cheap","seq":58,"query":{...},"meta":{"search_id":7}}],"next":null}
+# {"queries":[{"id":"cheap","seq":32,"query":{...},"meta":{"search_id":7}}],"next":null}
 ```
 
 - **Validation.** A saved query is validated against the index's mapping, so an
@@ -1118,7 +1245,7 @@ curl -sS 'localhost:8780/indexes/products/queries?size=100' -H "Authorization: B
 document matches, for given documents (`docs`), stored ones (`ids`), or both.
 
 ```sh
-curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
+curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for=AXZ1E5NJpY_aM8Cv_KlQbqkBAiA' \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"docs": [{"brand": "Acme", "price": 5}], "ids": ["sku-1", "missing"]}'
 ```
@@ -1135,8 +1262,9 @@ curl -sS -X POST 'localhost:8780/indexes/products/_percolate?wait_for_seq=58' \
   order.
 - **Analysis.** Given documents are analyzed under the index's mapping.
 - **Stored documents** are read from this node's copies, as a search reads them, so
-  pass `wait_for_seq` to see a recent write. Each found one's result carries `_seq`,
-  the seq of the change that wrote the version the copy percolated (absent for a
+  pass the write's token as `wait_for` to see a recent write. Each found one's result
+  carries `_seq`, the seq on its shard of the change that wrote the version the copy
+  percolated (absent for a
   document indexed by a release before 1.5), so a client can order its decisions by
   document version.
 - **Shards at once.** The node sends the documents to every peer's copy at once (its own
@@ -1241,7 +1369,7 @@ Every error is RFC 9457 problem JSON (`application/problem+json`):
   - `timeout`, `request_timeout` and `client_closed_request`;
   - `unavailable` and `internal`.
 - **`problems[].loc`** is a dotted path into the request, for example
-  `query.all.2.any.0.value`, `params.wait_for_seq` or `line.3.upsert.id`.
+  `query.all.2.any.0.value`, `params.wait_for` or `line.3.upsert.id`.
 - **`request_id`** echoes `X-Request-Id`, or a fresh id when the client sent none. Logs
   carry it too.
 - **Retries.** 429 and 503 carry `Retry-After`. Both are safe to retry. A write that got

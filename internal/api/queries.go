@@ -36,11 +36,11 @@ func (s *Server) deleteQuery(w http.ResponseWriter, r *http.Request, p params) e
 }
 
 func (s *Server) getQuery(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
-	q, err := s.c.GetQuery(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitForSeq: wait})
+	q, err := s.c.GetQuery(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}
@@ -57,7 +57,8 @@ const (
 var listFields = []string{"id", "seq", "version", "query", "meta"}
 
 func (s *Server) listQueries(w http.ResponseWriter, r *http.Request, p params) error {
-	if _, e := p.waitForSeq(); e != nil {
+	wait, e := p.waitFor()
+	if e != nil {
 		return e
 	}
 	size, e := p.int("size", DefaultListSize, 1, MaxListSize)
@@ -78,7 +79,7 @@ func (s *Server) listQueries(w http.ResponseWriter, r *http.Request, p params) e
 	}
 	lean := fields != nil && !slices.Contains(fields, "query") && !slices.Contains(fields, "meta")
 	after := p.values["after"]
-	list, err := s.c.ListQueries(r.Context(), r.PathValue("index"), after, int(size), lean)
+	list, err := s.c.ListQueries(r.Context(), r.PathValue("index"), after, int(size), lean, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

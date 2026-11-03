@@ -47,7 +47,7 @@ func BenchmarkPercolateShards(b *testing.B) {
 		b.Fatal(err)
 	}
 	rng := rand.New(rand.NewPCG(7, 7))
-	var seq int64
+	var seq *api.Token
 	for batch := range 20 {
 		ops := make([]api.WriteOp, 1000)
 		for i := range ops {
@@ -61,7 +61,7 @@ func BenchmarkPercolateShards(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		seq = res.Seq
+		seq = merged(seq, res.Token)
 	}
 	for _, docs := range []int{1, 20, 200} {
 		b.Run(fmt.Sprintf("docs=%d", docs), func(b *testing.B) {
@@ -70,7 +70,7 @@ func BenchmarkPercolateShards(b *testing.B) {
 				body[i] = json.RawMessage(fmt.Sprintf(`{"brand": "b%d", "price": %d, "tags": ["t%d", "t%d"]}`, rng.IntN(500), rng.IntN(100), rng.IntN(2000), rng.IntN(2000)))
 			}
 			req := &api.PercolateRequest{Docs: body}
-			if _, err := n.Percolate(ctx, "pb", req, api.ReadOptions{WaitForSeq: seq}); err != nil {
+			if _, err := n.Percolate(ctx, "pb", req, api.ReadOptions{WaitFor: seq}); err != nil {
 				b.Fatal(err)
 			}
 			b.ResetTimer()

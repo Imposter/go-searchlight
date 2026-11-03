@@ -55,7 +55,7 @@ func TestBodyCodecGate(t *testing.T) {
 		if n0.zstdBodies.Load() {
 			t.Fatal("compressing bodies while a node without codecs is live")
 		}
-		if f, err := old.Registry().Features(ctx); err != nil || len(f) != 0 {
+		if f, err := old.Registry().Features(ctx); err != nil || !f[store.FeatureZstdBodies].IsZero() {
 			t.Fatalf("features while a node without codecs is live: %v %v", f, err)
 		}
 
@@ -82,7 +82,7 @@ func TestBodyCodecGate(t *testing.T) {
 			t.Fatal("a node started after the gate opened writes text")
 		}
 		c.waitHealth(t, "green", 30*time.Second)
-		seq = max(seq, mustWrite(t, n1, "g", bigOp("d", 5)))
+		seq = merged(seq, mustWrite(t, n1, "g", bigOp("d", 5)))
 		want := map[string]int{"a": 4, "b": 2, "c": 3, "d": 5}
 		for _, n := range []*Node{n0, n1} {
 			if got, err := count(ctx, n, "g", seq); err != nil || got != int64(len(want)) {
@@ -139,7 +139,7 @@ func TestEveryNodeReadsCodecs(t *testing.T) {
 			for _, c := range tc.copies {
 				v.copies[c.Shard] = append(v.copies[c.Shard], c)
 			}
-			if got := n.everyNodeReadsCodecs(v); got != tc.want {
+			if got := n.everyNode(v, func(nd store.Node) bool { return nd.BodyCodecs >= store.BodyCodecs }); got != tc.want {
 				t.Fatalf("got %v, want %v", got, tc.want)
 			}
 		})

@@ -36,7 +36,7 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 	for i := range burst {
 		burst[i] = Change{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("b%d", i), Payload: body}
 	}
-	if _, _, err := st.Apply(ctx, burst); err != nil {
+	if err := st.Apply(ctx, burst); err != nil {
 		t.Fatal(err)
 	}
 	if size := s.walSize(); size < 4*sqlite.JournalSizeLimit {
@@ -44,7 +44,7 @@ func TestCheckpointGateAfterBurst(t *testing.T) {
 	}
 	small := func(n int) {
 		for i := range n {
-			if _, _, err := st.Apply(ctx, []Change{{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("s%d", i), Payload: []byte(`{"n":1}`)}}); err != nil {
+			if err := st.Apply(ctx, []Change{{Index: "wal", Kind: KindUpsert, ID: fmt.Sprintf("s%d", i), Payload: []byte(`{"n":1}`)}}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -105,7 +105,7 @@ func TestPinnedLogWarns(t *testing.T) {
 		for i := range batch {
 			batch[i] = Change{Index: "pin", Kind: KindUpsert, ID: fmt.Sprintf("b%d-%d", b, i), Payload: body}
 		}
-		if _, _, err := st.Apply(ctx, batch); err != nil {
+		if err := st.Apply(ctx, batch); err != nil {
 			t.Fatal(err)
 		}
 	}

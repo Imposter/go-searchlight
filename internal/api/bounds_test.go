@@ -64,11 +64,11 @@ func TestPercolateMatchesAreBounded(t *testing.T) {
 	for _, shards := range []int{1, 2} {
 		index := fmt.Sprintf("p%d", shards)
 		e.createIndex(index, fmt.Sprintf(`{"mapping": {"fields": {"n": "number"}}, "settings": {"shards": %d}}`, shards))
-		var seq int64
+		var seq string
 		for i := range queries {
-			seq = seqOf(t, e.must(http.StatusOK, "PUT", fmt.Sprintf("/indexes/%s/queries/q%03d", index, i), `{"query": {"all": []}}`))
+			seq = mergeTokens(t, seq, tokenOf(t, e.must(http.StatusOK, "PUT", fmt.Sprintf("/indexes/%s/queries/q%03d", index, i), `{"query": {"all": []}}`)))
 		}
-		path := fmt.Sprintf("/indexes/%s/_percolate?wait_for_seq=%d", index, seq)
+		path := fmt.Sprintf("/indexes/%s/_percolate?wait_for=%s", index, seq)
 		e.problem(e.do("POST", path, `{"docs": [`+strings.Join(docs, ",")+`]}`), http.StatusUnprocessableEntity, api.CodeTooManyMatches)
 		r := e.must(http.StatusOK, "POST", path, `{"docs": [`+strings.Join(docs[:percolate.MaxMatches/queries], ",")+`]}`)
 		if n := len(r["results"].([]any)); n != percolate.MaxMatches/queries { //nolint:forcetypeassert,errcheck // the shape
@@ -80,8 +80,8 @@ func TestPercolateMatchesAreBounded(t *testing.T) {
 		lines = append(lines, fmt.Sprintf(`{"upsert": {"id": "d%05d"}}`, i), `{"n": 1}`)
 	}
 	r := e.must(http.StatusOK, "POST", "/indexes/p2/_bulk?percolate=true", ndjson(lines...))
-	if r["percolated"] != false || r["percolate_reason"] != api.CodeTooManyMatches || seqOf(t, r) == 0 || r["errors"] != false {
-		t.Fatalf("bulk past the bound: percolated %v, reason %v, seq %v, errors %v", r["percolated"], r["percolate_reason"], r["seq"], r["errors"])
+	if r["percolated"] != false || r["percolate_reason"] != api.CodeTooManyMatches || r["token"] == nil || r["errors"] != false {
+		t.Fatalf("bulk past the bound: percolated %v, reason %v, token %v, errors %v", r["percolated"], r["percolate_reason"], r["token"], r["errors"])
 	}
 	for _, it := range r["items"].([]any) { //nolint:forcetypeassert,errcheck // the shape
 		if q, ok := it.(map[string]any)["queries"]; ok { //nolint:forcetypeassert,errcheck // the shape
@@ -106,7 +106,7 @@ func TestBulkPercolateReasonFromTheCoordinator(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &stub{write: func(context.Context) (*api.WriteResult, error) {
-				return &api.WriteResult{Seq: 7, Items: []api.ItemResult{{Seq: 7}}, PercolateErr: tc.err}, nil
+				return &api.WriteResult{Token: &api.Token{UID: "0123456789abcdef0123456789abcdef", Seqs: map[int]int64{0: 7}}, Items: []api.ItemResult{{Seq: 7}}, PercolateErr: tc.err}, nil
 			}}
 			url := stubServer(t, c, nil)
 			resp, err := http.Post(url+"/indexes/b/_bulk?percolate=true", "application/x-ndjson", strings.NewReader(ndjson(`{"upsert": {"id": "a"}}`, `{"n": 1}`)))

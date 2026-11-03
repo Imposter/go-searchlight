@@ -281,7 +281,7 @@ func (n *Node) ageFloor(ctx context.Context, id store.ShardID, from int64, cutof
 	if err != nil || !ok || !first.At.Before(cutoff) {
 		return 0, err
 	}
-	head, _, err := n.st.HeadSeq(ctx)
+	head, _, err := n.st.HeadSeq(ctx, id)
 	if err != nil {
 		return 0, err
 	}
@@ -308,7 +308,7 @@ func (n *Node) ageFloor(ctx context.Context, id store.ShardID, from int64, cutof
 // logStart returns the smallest seq at or above lo after which id's changelog, pruned
 // past lo, still holds the changes.
 func (n *Node) logStart(ctx context.Context, id store.ShardID, lo int64) (int64, error) {
-	head, _, err := n.st.HeadSeq(ctx)
+	head, _, err := n.st.HeadSeq(ctx, id)
 	if err != nil {
 		return 0, err
 	}

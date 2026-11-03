@@ -40,7 +40,7 @@ func TestRequestCacheOnANode(t *testing.T) {
 	}
 	res := mustWrite(t, n, "rc", ops...)
 	const raw = `{"size": 0, "aggs": {"brands": {"terms": {"field": "brand"}}, "n": {"stats": {"field": "n"}}}}`
-	first, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitForSeq: res.Seq})
+	first, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitFor: res.Token})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestRequestCacheOnANode(t *testing.T) {
 	waitKeys(2)
 
 	res = mustWrite(t, n, "rc", upsert("late", `{"brand": "b9", "n": 100}`))
-	after, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitForSeq: res.Seq})
+	after, err := n.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitFor: res.Token})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestRequestCacheOnANode(t *testing.T) {
 
 	n2 := open(t, cfg, st, nil)
 	waitReady(t, n2)
-	again, err := n2.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitForSeq: res.Seq})
+	again, err := n2.Search(ctx(t), "rc", aggSearch(t, raw), api.ReadOptions{WaitFor: res.Token})
 	if err != nil {
 		t.Fatal(err)
 	}

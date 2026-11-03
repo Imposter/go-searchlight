@@ -30,16 +30,19 @@ SQLite; write throughput on Postgres and MySQL is not measured yet
 
 ## What it is, and what it is not
 
-- **The database is the write path.** A write is acknowledged once its SQL transaction
-  commits; that transaction is the write-ahead log, so there is no queue or second copy to
-  keep in sync. Every node also tails that changelog, so write throughput is bounded by
-  the database: scale the database for writes.
+- **The database is the write path.** A write is acknowledged once its SQL transactions
+  commit, one per shard it writes; they are the write-ahead log, so there is no queue or
+  second copy to keep in sync. Every shard has its own sequence, so commits to different
+  shards run in parallel. Every node also tails that changelog, so write throughput is
+  bounded by the database: scale the database for writes.
 - **Search scales with nodes.** Matching, sorting, aggregations and percolation run in the
   nodes, on memory-mapped segments on local disk; the database does no text work. Add
   nodes for read and percolation load; each node opens up to 64 pooled database
-  connections (plus one for `LISTEN` on Postgres).
+  connections, shared by its reads and writes (plus one for `LISTEN` on Postgres), so
+  the database's connection limit must cover nodes × 65.
 - **Near-real-time, not instant.** A write is searchable within the refresh interval (1 s
-  by default). `refresh=wait_for` or `wait_for_seq` gives read-your-writes.
+  by default). `refresh=wait_for`, or passing the token a write returns as `wait_for` on
+  a read, gives read-your-writes.
 - **Boolean matching, no relevance scoring.** Queries match or do not; results sort by
   field. Text matching folds case and Unicode (NFKC), and offers words and phrases,
   substrings (`contains`, backed by 3-grams), prefixes and trigram similarity (`similar`)

@@ -32,7 +32,7 @@ func (n *Node) bodyCodecGate(ctx context.Context) error {
 	}
 	if _, on := features[store.FeatureZstdBodies]; !on {
 		v := n.view.Load()
-		if !n.leader() || !n.everyNodeReadsCodecs(v) {
+		if !n.leader() || !n.everyNode(v, func(nd store.Node) bool { return nd.BodyCodecs >= store.BodyCodecs }) {
 			return nil
 		}
 		if err := n.reg.EnableFeature(ctx, store.FeatureZstdBodies); err != nil {
@@ -47,13 +47,13 @@ func (n *Node) bodyCodecGate(ctx context.Context) error {
 	return nil
 }
 
-// everyNodeReadsCodecs reports whether every node v registers reads compressed bodies
-// or has been silent past the fence time, and no node that does not read them (or
-// that v does not register) holds a copy under a live lease.
-func (n *Node) everyNodeReadsCodecs(v *view) bool {
+// everyNode reports whether every node v registers is new enough (ok) or has been
+// silent past the fence time, and no node that is not (or that v does not register)
+// holds a copy under a live lease.
+func (n *Node) everyNode(v *view, ok func(store.Node) bool) bool {
 	reads := func(id string) bool {
-		nd, ok := v.nodes[id]
-		return ok && nd.BodyCodecs >= store.BodyCodecs
+		nd, found := v.nodes[id]
+		return found && ok(nd)
 	}
 	fence := n.opts.DeadAfter + n.opts.LeaseTTL
 	for id := range v.nodes {

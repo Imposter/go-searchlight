@@ -82,8 +82,9 @@ const MaxPayloadBytes = 32 << 20
 // Change is one entry of the changelog: a document or saved-query upsert or
 // delete on one shard. Apply assigns Seq and At; callers leave them zero.
 type Change struct {
-	// Seq is the change's position in the global changelog. Sequence numbers
-	// are contiguous and commit in order.
+	// Seq is the change's position in its shard's changelog. A shard's sequence
+	// numbers are its own, contiguous, and commit in order; another shard's may
+	// repeat them.
 	Seq   int64
 	Index string
 	Shard int
@@ -120,12 +121,15 @@ type Change struct {
 	Version int64
 	// Noop is set by Apply on a change its Version made a noop.
 	Noop bool
+	// StoredSeq is set by Apply with Noop: the seq of the target as the changes before
+	// it in the batch left it, 0 when there is none (it was deleted, or never written).
+	StoredSeq int64
 	// MappingVersion is the index's mapping version when the change committed,
 	// set by the store. The KindMapping change of that version precedes it in
-	// the shard's changelog (Update and Apply both hold the counter lock, so a
-	// mapping change commits wholly before or after any Apply); for a
-	// KindMapping change it is the version that change introduces. Callers leave
-	// it zero.
+	// the shard's changelog (Update holds every sequence row of the index and Apply
+	// the rows of its shards, so a mapping change commits wholly before or after
+	// any Apply); for a KindMapping change it is the version that change
+	// introduces. Callers leave it zero.
 	MappingVersion int64
 	// Nonce is a random number the store gave the change when it wrote it (never
 	// 0): with Seq it tells this change apart from any other that ever takes the
@@ -138,9 +142,9 @@ type Change struct {
 func (c *Change) ShardID() ShardID { return ShardID{Index: c.Index, Shard: c.Shard} }
 
 // ChangeMark identifies one change of the changelog by what its row carries: its seq,
-// shard, kind, id, commit time and nonce. While the database keeps its commits a seq
-// is never reissued, so the change at a seq keeps its mark until it is pruned or its
-// index dropped. A failover that loses commits reissues their seqs to other changes,
+// shard, kind, id, commit time and nonce. While the database keeps its commits a
+// shard's seq is never reissued, so the change at a seq keeps its mark until it is
+// pruned or its index dropped. A failover that loses commits reissues their seqs to other changes,
 // with other marks: that is how a tailer sees the changelog rewound under its copy.
 // The zero mark (Seq 0) names no change.
 type ChangeMark struct {
@@ -181,35 +185,36 @@ func newNonce() int64 {
 	}
 }
 
-// Tip is the changelog's head as a tailer polls it ([Store.Tip]).
+// Tip is a shard's changelog head as a tailer polls it ([Store.Tip]).
 type Tip struct {
-	// Head is HeadSeq's seq, and Now the database clock as the head was read.
+	// Head is the shard's HeadSeq, and Now the database clock as the head was read.
 	Head int64
 	Now  time.Time
-	// HeadMark is the change at Head, and AtMark the change at the seq Tip was
-	// asked about; each is the zero mark when that change is gone (pruned, or its
-	// index dropped) or the seq is 0.
+	// HeadMark is the shard's change at Head, and AtMark its change at the seq Tip
+	// was asked about; each is the zero mark when that change is gone (pruned, or
+	// its index dropped) or there is none.
 	HeadMark, AtMark ChangeMark
-	// ShardMark is the mark of the queried shard's newest change at or below
+	// ShardMark is the mark of the shard's newest change at or below
 	// TipQuery.UpTo, the zero mark when there is none. Horizon is the shard's prune
 	// horizon (its changes below it are pruned; 0 when it was never pruned), and
-	// IndexUID the incarnation of its index ("" when the index does not exist).
+	// IndexUID the incarnation of its index ("" when the index does not exist or
+	// does not have the shard).
 	ShardMark ChangeMark
 	Horizon   int64
 	IndexUID  string
 }
 
-// TipQuery is what a tailer reads the changelog's tip for: the change at At, and
-// what Shard (its own) holds at or below UpTo.
+// TipQuery is what a tailer reads its shard's tip for: Shard's change at At, and
+// what Shard holds at or below UpTo.
 type TipQuery struct {
 	At    int64
 	Shard ShardID
 	UpTo  int64
 }
 
-// ScanPoint is where a ScanShard snapshot stands: the seq it reflects, the mark of
-// the change at that seq (the zero mark when it is gone), and the mark of the
-// shard's newest change at or below it (the zero mark when there is none).
+// ScanPoint is where a ScanShard snapshot stands: the shard's seq it reflects, the
+// mark of the shard's change at that seq (the zero mark when it is gone), and the
+// mark of its newest change at or below it (the zero mark when there is none).
 type ScanPoint struct {
 	Seq             int64
 	Mark, ShardMark ChangeMark
@@ -345,6 +350,9 @@ type Node struct {
 	// MappingTypes is the field types the node reads ([MappingTypes]); 0 for a node
 	// from before point fields, whose heartbeat leaves the column at its default.
 	MappingTypes int
+	// SeqScheme is how the node's commits take their seqs ([SeqScheme]); 0 for a node
+	// from before shard sequences, which takes them from the global sequence alone.
+	SeqScheme int
 	// HeartbeatAt is the last heartbeat by the database clock, and
 	// HeartbeatAge how long ago that was, also by the database clock, so a
 	// caller judges liveness without comparing clocks.
@@ -448,7 +456,8 @@ func (e *CorruptError) Error() string {
 func (e *CorruptError) Unwrap() []error { return []error{ErrCorrupt, e.Err} }
 
 // ConflictError is returned by Apply when changes' IfSeq conditions fail.
-// Nothing in the batch was applied.
+// Nothing in the batch was applied (for GroupCommitter, nothing on the shard; see
+// PartialError).
 type ConflictError struct {
 	// Positions are the failing changes' indexes in the batch, ascending.
 	Positions []int
@@ -478,7 +487,8 @@ func (e *ChangeError) Error() string { return fmt.Sprintf("change %d: %v", e.Pos
 func (e *ChangeError) Unwrap() error { return e.Err }
 
 // IndexNotFoundError is returned by Apply when changes name indexes that do
-// not exist. Nothing in the batch was applied.
+// not exist, or another incarnation than the one they name. Nothing in the batch
+// was applied (for GroupCommitter, nothing on the shard; see PartialError).
 type IndexNotFoundError struct {
 	Indexes []string // the missing indexes, in first-use order
 	// Positions are the changes naming them, ascending.
@@ -491,6 +501,40 @@ func (e *IndexNotFoundError) Error() string {
 
 // Is makes an IndexNotFoundError match ErrNotFound.
 func (e *IndexNotFoundError) Is(target error) bool { return target == ErrNotFound }
+
+// PartialError is GroupCommitter.Apply's error for a request it split by shard when
+// some shards' transactions failed: those shards' changes did not commit, and every
+// other shard's did, with their seqs set. A request whose changes are on one shard
+// gets that shard's error as it is, and commits whole or not at all.
+type PartialError struct {
+	// Failed are the shards whose changes did not commit, in the order of their
+	// first change in the request.
+	Failed []ShardFailure
+}
+
+// ShardFailure is one shard of a PartialError.
+type ShardFailure struct {
+	Shard ShardID
+	// Positions are the shard's changes' positions in the request, ascending.
+	Positions []int
+	// Err is why they did not commit. Positions it names (a *ConflictError's, an
+	// *IndexNotFoundError's) are positions in the request too.
+	Err error
+}
+
+func (e *PartialError) Error() string {
+	f := e.Failed[0]
+	return fmt.Sprintf("store: %d of the request's shards did not commit (%s, %d change(s): %v)", len(e.Failed), f.Shard, len(f.Positions), f.Err)
+}
+
+// Unwrap returns each failed shard's error.
+func (e *PartialError) Unwrap() []error {
+	out := make([]error, len(e.Failed))
+	for i, f := range e.Failed {
+		out[i] = f.Err
+	}
+	return out
+}
 
 func invalidf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))

@@ -34,14 +34,14 @@ func TestPinnedFetchSurvivesRetire(t *testing.T) {
 	p := c.start(1)
 	createIndex(t, a.n, "ret", 1, 0)
 	waitCopies(t, a.st, "ret", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 10 {
-		last = mustWrite(t, a.n, "ret", upsertOp(fmt.Sprintf("r%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "ret", upsertOp(fmt.Sprintf("r%d", k), k)))
 	}
 	waitCount(t, p.n, "ret", last, 10)
 
 	id := store.ShardID{Index: "ret", Shard: 0}
-	rt := &remoteTarget{n: a.n, id: id, waitSeq: last, cands: []candidate{{node: p.n.ID(), addr: p.addr, shard: id}}}
+	rt := &remoteTarget{n: a.n, id: id, waitSeq: last.Seq(0), cands: []candidate{{node: p.n.ID(), addr: p.addr, shard: id}}}
 	defer rt.Release()
 	res, err := rt.Search(tctx(t), &search.Request{Index: "ret", Query: &query.All{}, Size: 10, NoBodies: true, TrackTotal: search.TrackTotalAll})
 	if err != nil {
@@ -92,18 +92,18 @@ func TestPinnedFetchSurvivesRetire(t *testing.T) {
 	fetch("after the copy retired")
 }
 
-// TestWaitForSeqReadSurvivesDrain (#66): a wait_for_seq search parked on a node's own
+// TestWaitForReadSurvivesDrain (#66): a wait_for search parked on a node's own
 // copy, which has not applied the seq, while that node drains and retires the copy. The
 // read is answered by the copy on the other node, a 200, not a 503 from the closed one.
-func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
+func TestWaitForReadSurvivesDrain(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	p := c.start(1)
 	createIndex(t, a.n, "dr", 1, 0)
 	waitCopies(t, a.st, "dr", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 10 {
-		last = mustWrite(t, a.n, "dr", upsertOp(fmt.Sprintf("d%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "dr", upsertOp(fmt.Sprintf("d%d", k), k)))
 	}
 	waitCount(t, p.n, "dr", last, 10)
 
@@ -116,7 +116,7 @@ func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
 		}
 		return nil
 	})
-	last = mustWrite(t, a.n, "dr", upsertOp("late", 10))
+	last = merged(last, mustWrite(t, a.n, "dr", upsertOp("late", 10)))
 	waitCount(t, a.n, "dr", last, 11)
 
 	type answer struct {
@@ -126,7 +126,7 @@ func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
 	}
 	got := make(chan answer, 1)
 	go func() {
-		url := fmt.Sprintf("http://%s/indexes/dr/_search?wait_for_seq=%d", p.addr, last)
+		url := fmt.Sprintf("http://%s/indexes/dr/_search?wait_for=%s", p.addr, last)
 		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
 		if err != nil {
 			got <- answer{err: err}
@@ -182,9 +182,9 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 	c.start(1)
 	createIndex(t, a.n, "rq", 4, 1)
 	waitCopies(t, a.st, "rq", 4, 1, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 20 {
-		last = mustWrite(t, a.n, "rq", upsertOp(fmt.Sprintf("q%02d", k), k))
+		last = merged(last, mustWrite(t, a.n, "rq", upsertOp(fmt.Sprintf("q%02d", k), k)))
 	}
 	var coord *tnode
 	var remote []int
@@ -224,7 +224,7 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		{search.Request{Query: &query.All{}, Size: 3, Sort: []search.SortField{{Field: "price", Desc: true}}, TrackTotal: 5, Aggs: aggs}, false},
 	} {
 		base := tc.r
-		want, err := coord.n.Search(tctx(t), "rq", &base, api.ReadOptions{WaitForSeq: last})
+		want, err := coord.n.Search(tctx(t), "rq", &base, api.ReadOptions{WaitFor: last})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +244,7 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		}
 		probe.start(drop)
 		r := tc.r
-		got, err := coord.n.Search(tctx(t), "rq", &r, api.ReadOptions{WaitForSeq: last})
+		got, err := coord.n.Search(tctx(t), "rq", &r, api.ReadOptions{WaitFor: last})
 		pins, fetches, timeouts := probe.stop()
 		if err != nil {
 			t.Fatalf("search with shard %d's pins lost twice: %v", drop, err)
@@ -480,7 +480,7 @@ func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
 	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
 		t.Fatal(err)
 	}
-	remapped, _, err := a.st.HeadSeq(tctx(t))
+	remapped, _, err := a.st.HeadSeq(tctx(t), store.ShardID{Index: "rb"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -540,7 +540,7 @@ func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
 		t.Fatal(err)
 	}
 	seq := mustWrite(t, a.n, "pc", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "tags", "op": "has", "value": "x"}`)})
-	res, err := b.n.Percolate(tctx(t), "pc", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"tags": ["x"]}`)}}, api.ReadOptions{WaitForSeq: seq})
+	res, err := b.n.Percolate(tctx(t), "pc", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"tags": ["x"]}`)}}, api.ReadOptions{WaitFor: seq})
 	if err != nil || string(res.Results[0].Queries) != `["q"]` {
 		t.Fatalf("percolating on the node with a stale catalogue: %+v, %v", res, err)
 	}
@@ -596,9 +596,9 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 	c.start(1)
 	createIndex(t, a.n, "lv", 4, 1)
 	waitCopies(t, a.st, "lv", 4, 1, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 20 {
-		last = mustWrite(t, a.n, "lv", upsertOp(fmt.Sprintf("l%02d", k), k))
+		last = merged(last, mustWrite(t, a.n, "lv", upsertOp(fmt.Sprintf("l%02d", k), k)))
 	}
 	var coord *tnode
 	for _, tn := range c.live() {
@@ -615,7 +615,7 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 		t.Fatal("every node hosts every shard: no search reads a peer")
 	}
 	cheap := &query.Leaf{Field: "price", Op: query.OpLt, Value: json.RawMessage(`5`)}
-	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last}); err != nil || res.Total != 20 {
 		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
 	}
 	refused := map[string]*search.Request{}
@@ -645,16 +645,16 @@ func testOlderPeer(t *testing.T, older olderPeer, level int) {
 			continue
 		}
 		for name, r := range rs {
-			if res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last}); err != nil {
+			if res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitFor: last}); err != nil {
 				t.Fatalf("%s through a level-%d peer: %v, %v", name, level, res, err)
 			}
 		}
 	}
-	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, From: 5, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last}); err != nil || res.Total != 20 {
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, From: 5, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last}); err != nil || res.Total != 20 {
 		t.Fatalf("a from with size 0 through a level-%d peer: %v, %v", level, res, err)
 	}
 	for name, r := range refused {
-		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitForSeq: last})
+		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitFor: last})
 		var ae *api.Error
 		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
 			t.Fatalf("%s through an older peer: %v, %v; want a 503", name, res, err)

@@ -480,6 +480,9 @@ type percolateReply struct {
 	Details [][]api.PercolateMatch `json:"details,omitempty"`
 	Stale   bool                   `json:"stale,omitempty"`
 	Level   int                    `json:"level,omitempty"`
+	// Seq is the seq of the generation the copy percolated at: it held every change of
+	// its shard up to it. 0 from a peer of a release before (1.8), which sends none.
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // getMsg reads a document or a saved query from a peer's copy.

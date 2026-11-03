@@ -72,7 +72,7 @@ func TestDateMathResolvesAtTheCoordinator(t *testing.T) {
 	}
 	seq := mustWrite(t, a.n, "dm", ops...)
 
-	res, err := a.n.Percolate(tctx(t), "dm", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, t0.UnixMilli()))}}, api.ReadOptions{WaitForSeq: seq})
+	res, err := a.n.Percolate(tctx(t), "dm", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, t0.UnixMilli()))}}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestDateMathResolvesAtTheCoordinator(t *testing.T) {
 	if len(problems) > 0 {
 		t.Fatal(problems)
 	}
-	sr, err := a.n.Search(tctx(t), "dm", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: seq})
+	sr, err := a.n.Search(tctx(t), "dm", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestDateMathSurvivesARequery(t *testing.T) {
 	req := func() *search.Request {
 		return &search.Request{Query: q, Size: 40, Sort: []search.SortField{{Field: "seen", Desc: true}}, TrackTotal: search.TrackTotalAll}
 	}
-	want, err := nodes[coord].n.Search(tctx(t), "rq", req(), api.ReadOptions{WaitForSeq: seq})
+	want, err := nodes[coord].n.Search(tctx(t), "rq", req(), api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestDateMathSurvivesARequery(t *testing.T) {
 	tap.queries = nil
 	tap.mu.Unlock()
 	probe.start(remote[0])
-	got, err := nodes[coord].n.Search(tctx(t), "rq", req(), api.ReadOptions{WaitForSeq: seq})
+	got, err := nodes[coord].n.Search(tctx(t), "rq", req(), api.ReadOptions{WaitFor: seq})
 	pins, _, _ := probe.stop()
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +274,7 @@ func TestDateMathSurvivesAPeerRetry(t *testing.T) {
 		ops = append(ops, api.WriteOp{Kind: api.OpQueryUpsert, ID: fmt.Sprintf("q%02d", i), Query: json.RawMessage(window)})
 	}
 	seq := mustWrite(t, nodes[coord].n, "pr", ops...)
-	res, err := nodes[coord].n.Percolate(tctx(t), "pr", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, at.UnixMilli()))}}, api.ReadOptions{WaitForSeq: seq})
+	res, err := nodes[coord].n.Percolate(tctx(t), "pr", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(fmt.Sprintf(`{"seen": %d}`, at.UnixMilli()))}}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,7 +341,7 @@ func TestFilterDateMathResolvesAtTheCoordinator(t *testing.T) {
 			"all":  {Type: search.AggGlobal, Aggs: map[string]search.Agg{"seen": {Type: search.AggStats, Field: "seen"}}},
 		},
 	}
-	res, err := nodes[coord].n.Search(tctx(t), "fd", r, api.ReadOptions{WaitForSeq: seq})
+	res, err := nodes[coord].n.Search(tctx(t), "fd", r, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestFilterDateMathResolvesAtTheCoordinator(t *testing.T) {
 // dateIndexAndQueries creates index name (4 shards, replicas copies each) with seen of
 // type typ, saves eight copies of query and the document "doc" seen now, and returns
 // the seq of the write.
-func dateIndexAndQueries(t *testing.T, n *Node, st store.Store, name string, typ schema.FieldType, replicas int, raw string) int64 {
+func dateIndexAndQueries(t *testing.T, n *Node, st store.Store, name string, typ schema.FieldType, replicas int, raw string) *api.Token {
 	t.Helper()
 	spec := api.IndexSpec{
 		Mapping:  &schema.Mapping{Fields: map[string]schema.FieldType{"seen": typ}},
@@ -392,25 +392,25 @@ func lacking(t *testing.T, nodes []*tnode, index string) (*tnode, int) {
 
 // The three percolations of one document: given, stored (its id: a Get pins the copy
 // before the percolation) and a bulk write's. Each returns the matches and the error.
-func percolations(t *testing.T, n *Node, index string, seq int64) map[string]func() (string, error) {
+func percolations(t *testing.T, n *Node, index string, seq *api.Token) map[string]func() (string, error) {
 	doc := json.RawMessage(fmt.Sprintf(`{"seen": %d}`, time.Now().UnixMilli()))
 	return map[string]func() (string, error){
 		"given": func() (string, error) {
-			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{Docs: []json.RawMessage{doc}}, api.ReadOptions{WaitForSeq: seq})
+			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{Docs: []json.RawMessage{doc}}, api.ReadOptions{WaitFor: seq})
 			if err != nil {
 				return "", err
 			}
 			return string(res.Results[0].Queries), nil
 		},
 		"stored": func() (string, error) {
-			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{IDs: []string{"doc"}}, api.ReadOptions{WaitForSeq: seq})
+			res, err := n.Percolate(tctx(t), index, &api.PercolateRequest{IDs: []string{"doc"}}, api.ReadOptions{WaitFor: seq})
 			if err != nil {
 				return "", err
 			}
 			return string(res.Results[0].Queries), nil
 		},
 		"bulk": func() (string, error) {
-			res, err := n.Write(tctx(t), index, []api.WriteOp{{Kind: api.OpUpsert, ID: "new", Body: doc}}, api.WriteOptions{Percolate: true, WaitForSeq: seq})
+			res, err := n.Write(tctx(t), index, []api.WriteOp{{Kind: api.OpUpsert, ID: "new", Body: doc}}, api.WriteOptions{Percolate: true, WaitFor: seq})
 			if err != nil {
 				return "", err
 			}

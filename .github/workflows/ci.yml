@@ -197,11 +197,11 @@ jobs:
           auth="Authorization: Bearer $token"
           curl -fsS -X PUT -H "$auth" -H 'Content-Type: application/json' http://127.0.0.1:8780/indexes/ci \
             -d '{"mapping": {"fields": {"brand": "keyword", "price": "number"}}, "settings": {"shards": 2}}'
-          seq=$(printf '%s\n' '{"upsert": {"id": "a"}}' '{"brand": "acme", "price": 5}' '{"upsert": {"id": "b"}}' '{"brand": "other", "price": 50}' |
+          written=$(printf '%s\n' '{"upsert": {"id": "a"}}' '{"brand": "acme", "price": 5}' '{"upsert": {"id": "b"}}' '{"brand": "other", "price": 50}' |
             curl -fsS -X POST -H "$auth" -H 'Content-Type: application/x-ndjson' --data-binary @- http://127.0.0.1:8782/indexes/ci/_bulk |
-            jq -er .seq)
+            jq -er .token)
           total=$(curl -fsS -X POST -H "$auth" -H 'Content-Type: application/json' \
-            "http://127.0.0.1:8784/indexes/ci/_search?wait_for_seq=$seq" \
+            "http://127.0.0.1:8784/indexes/ci/_search?wait_for=$written" \
             -d '{"query": {"field": "brand", "op": "eq", "value": "ACME"}}' | jq -er .total.value)
           test "$total" = 1
           curl -fsS -H "$auth" http://127.0.0.1:8780/_cluster/health | jq -e '.nodes == 3'

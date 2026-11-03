@@ -117,7 +117,7 @@ func randName(prefix string) string {
 }
 
 // postgresDB creates a schema for the test and points search_path at it.
-func postgresDB(t *testing.T, base string) *db {
+func postgresDB(t testing.TB, base string) *db {
 	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {
@@ -553,7 +553,8 @@ func upsertOp(id string, v int) api.WriteOp {
 	return api.WriteOp{Kind: api.OpUpsert, ID: id, Body: json.RawMessage(fmt.Sprintf(`{"title":"item %s","brand":"b%d","price":%d,"tags":["t%d"]}`, id, v%7, v, v%5))}
 }
 
-func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) int64 {
+// mustWrite writes ops through n and returns the write's token.
+func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) *api.Token {
 	t.Helper()
 	res, err := n.Write(tctx(t), index, ops, api.WriteOptions{})
 	if err != nil {
@@ -564,12 +565,12 @@ func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) int64 {
 			t.Fatalf("op %d: %v", i, it.Err)
 		}
 	}
-	return res.Seq
+	return res.Token
 }
 
-// count runs a match-all search with wait_for_seq on n.
-func count(ctx context.Context, n *Node, index string, wait int64) (int64, error) {
-	res, err := n.Search(ctx, index, &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: wait})
+// count runs a match-all search waiting for wait on n.
+func count(ctx context.Context, n *Node, index string, wait *api.Token) (int64, error) {
+	res, err := n.Search(ctx, index, &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: wait})
 	if err != nil {
 		return 0, err
 	}
@@ -730,10 +731,10 @@ func (x *faultIndexes) Drop(ctx context.Context, name string) error {
 	return x.IndexStore.Drop(ctx, name)
 }
 
-func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
+func (f *faultStore) Apply(ctx context.Context, batch []store.Change) error {
 	defer f.timed("Apply")()
 	if f.isDown() {
-		return 0, 0, errPartitioned
+		return errPartitioned
 	}
 	return f.Store.Apply(ctx, batch)
 }
@@ -754,11 +755,18 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return f.Store.ChangesAfter(ctx, id, seq, limit)
 }
 
-func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if f.isDown() {
 		return 0, time.Time{}, errPartitioned
 	}
-	return f.Store.HeadSeq(ctx)
+	return f.Store.HeadSeq(ctx, id)
+}
+
+func (f *faultStore) IndexHeads(ctx context.Context, index string, shards int) ([]int64, error) {
+	if f.isDown() {
+		return nil, errPartitioned
+	}
+	return f.Store.IndexHeads(ctx, index, shards)
 }
 
 func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
@@ -915,4 +923,28 @@ func (r *faultRegistry) ReleaseCopy(ctx context.Context, c store.Copy) error {
 		return errPartitioned
 	}
 	return r.RegistryStore.ReleaseCopy(ctx, c)
+}
+
+// merged is a's seqs raised to b's, shard by shard (b when a is nil).
+func merged(a, b *api.Token) *api.Token {
+	if a == nil {
+		return b
+	}
+	out := &api.Token{UID: a.UID}
+	out.Merge(a)
+	if !out.Merge(b) {
+		return b
+	}
+	return out
+}
+
+// maxSeq is the highest seq a token names.
+func maxSeq(t *api.Token) int64 {
+	var top int64
+	if t != nil {
+		for _, s := range t.Seqs {
+			top = max(top, s)
+		}
+	}
+	return top
 }

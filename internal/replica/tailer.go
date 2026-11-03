@@ -19,8 +19,9 @@
 //     directory, and rebuilt if that fails.
 //   - Tailing: the head (store Tip), then ChangesAfter from the applied seq; each page
 //     is analyzed and applied, and a page shorter than its limit proves no change of
-//     the shard up to the head is missing, so the copy Advances there (seqs are global,
-//     so a shard's own have gaps). Between polls it sleeps until woken by a local
+//     the shard up to the head is missing, so the copy Advances there (a shard's seqs
+//     are its own and contiguous, but it may stand above its last change: a new shard
+//     starts at the store's floor). Between polls it sleeps until woken by a local
 //     write, a Postgres notification ([Hub]) or the poll interval. Each poll also
 //     checks that the changelog still holds what the copy applied (rewind.go): a
 //     change the copy applied, replaced at its seq, or a head behind the copy's seq

@@ -24,7 +24,7 @@ type percolateBody struct {
 // Documents matching more than percolate.MaxMatches saved queries together are
 // refused with a 422, never answered in part.
 func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -52,7 +52,7 @@ func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) err
 		return e
 	}
 	defer release()
-	res, err := s.c.Percolate(r.Context(), r.PathValue("index"), &PercolateRequest{Docs: req.Docs, IDs: req.IDs, Matches: withMatches, InnerHits: innerHits}, ReadOptions{WaitForSeq: wait})
+	res, err := s.c.Percolate(r.Context(), r.PathValue("index"), &PercolateRequest{Docs: req.Docs, IDs: req.IDs, Matches: withMatches, InnerHits: innerHits}, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

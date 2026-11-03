@@ -23,6 +23,12 @@ func optionalStatements(d *dialect.Dialect) map[string]bool {
 		// a pooled session.
 		"Maintenance.MigrateLockTimeout": d.Name != "sqlite",
 		"Maintenance.MigrateLockReset":   d.Name != "sqlite" && !m.MigrateInTx,
+		// Only Postgres has a migration that builds outside a transaction.
+		"Maintenance.ConcurrentLock":   d.Name == "postgres",
+		"Maintenance.ConcurrentUnlock": d.Name == "postgres",
+		"Maintenance.ValidIndex":       d.Name == "postgres",
+		// Notifications are sent only where the engine can listen.
+		"Changelog.Notify": d.Listen != nil,
 	}
 }
 
@@ -73,10 +79,19 @@ func TestStatementTables(t *testing.T) {
 					if x == nil || x([]int{0, 1}) == "" {
 						t.Errorf("%s: %s builds no statement", scheme, name)
 					}
+				case func(int) string:
+					if x == nil || x(2) == "" {
+						t.Errorf("%s: %s builds no statement", scheme, name)
+					}
 				case func(error) bool:
 					// Optional: LockTimedOut comes with MigrateLockTimeout, and
 					// AlreadyApplied with non-transactional DDL.
 					if (x == nil) == (d.Name != "sqlite") && (name == "Maintenance.LockTimedOut" || !d.Maintenance.MigrateInTx) {
+						t.Errorf("%s: %s set = %v", scheme, name, x != nil)
+					}
+				case func(string, error) (string, bool):
+					// Blocking: MySQL's online DDL alone logs the writes beside it.
+					if (x != nil) != (d.Name == "mysql") {
 						t.Errorf("%s: %s set = %v", scheme, name, x != nil)
 					}
 				case dialect.Limits, bool:

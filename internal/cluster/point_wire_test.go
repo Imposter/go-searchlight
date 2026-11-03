@@ -86,7 +86,7 @@ func TestWireBox(t *testing.T) {
 // field, one saved box query and twenty documents, every node playing older as older
 // and level say; it returns a node lacking a copy of some shard, and the last write's
 // seq.
-func pointCluster(t *testing.T, older olderPeer, level int) (*tnode, int64) {
+func pointCluster(t *testing.T, older olderPeer, level int) (*tnode, *api.Token) {
 	t.Helper()
 	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
 		o.hooks.olderPeer, o.hooks.olderLevel = older, level
@@ -113,9 +113,9 @@ func pointCluster(t *testing.T, older olderPeer, level int) (*tnode, int64) {
 	return coord, seq
 }
 
-func percolatePoint(t *testing.T, coord *tnode, seq int64) (string, error) {
+func percolatePoint(t *testing.T, coord *tnode, seq *api.Token) (string, error) {
 	t.Helper()
-	res, err := coord.n.Percolate(tctx(t), "pw", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"spot": [7, 1]}`)}, IDs: []string{"p03", "p07"}}, api.ReadOptions{WaitForSeq: seq})
+	res, err := coord.n.Percolate(tctx(t), "pw", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"spot": [7, 1]}`)}, IDs: []string{"p03", "p07"}}, api.ReadOptions{WaitFor: seq})
 	if err != nil {
 		return "", err
 	}
@@ -134,7 +134,7 @@ func TestBoxThroughPeers(t *testing.T) {
 		Query: boxNode(t), TrackTotal: search.TrackTotalAll,
 		Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: boxNode(t)}},
 	}
-	res, err := coord.n.Search(tctx(t), "pw", r, api.ReadOptions{WaitForSeq: seq})
+	res, err := coord.n.Search(tctx(t), "pw", r, api.ReadOptions{WaitFor: seq})
 	if err != nil || res.Total != 13 || res.Aggs["f"].DocCount != 13 {
 		t.Fatalf("a box search through a peer: %+v, %v; want 13", res, err)
 	}
@@ -161,18 +161,18 @@ func TestOlderPeerRefusedForBox(t *testing.T) {
 			if res, err := coord.n.Search(tctx(t), "pw", &search.Request{
 				Query: &query.All{}, TrackTotal: search.TrackTotalAll,
 				Aggs: map[string]search.Agg{"lo": {Type: search.AggMin, Field: "price"}},
-			}, api.ReadOptions{WaitForSeq: seq}); err != nil || res.Total != 20 {
+			}, api.ReadOptions{WaitFor: seq}); err != nil || res.Total != 20 {
 				t.Fatalf("a level-4 search through a level-4 peer: %v, %v", res, err)
 			}
-			_, err := coord.n.Search(tctx(t), "pw", &search.Request{Query: boxNode(t), TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: seq})
+			_, err := coord.n.Search(tctx(t), "pw", &search.Request{Query: boxNode(t), TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: seq})
 			unavailable(t, "a box search", err)
-			_, err = coord.n.Search(tctx(t), "pw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: boxNode(t)}}}, api.ReadOptions{WaitForSeq: seq})
+			_, err = coord.n.Search(tctx(t), "pw", &search.Request{Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: boxNode(t)}}}, api.ReadOptions{WaitFor: seq})
 			unavailable(t, "a box filter aggregation", err)
 
 			coord, seq = pointCluster(t, older, percolateDates)
 			_, err = percolatePoint(t, coord, seq)
 			unavailable(t, "a percolation of a point index", err)
-			if _, err := coord.n.Search(tctx(t), "pw", &search.Request{Query: boxNode(t)}, api.ReadOptions{WaitForSeq: seq}); err == nil {
+			if _, err := coord.n.Search(tctx(t), "pw", &search.Request{Query: boxNode(t)}, api.ReadOptions{WaitFor: seq}); err == nil {
 				t.Fatal("a box search through a level-1 peer answered")
 			}
 		})

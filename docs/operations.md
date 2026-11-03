@@ -376,6 +376,7 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
+| `write_transactions` | `0`: 16 (1 on SQLite) | write transactions the node runs at once, each on one shard and holding a connection: commits to different shards run side by side up to it. On SQLite it is 1, and a request's shards commit together. It bounds the writes' share of the node's 64-connection pool, which its reads share, so it does not change how many connections a node can hold: size Postgres's `max_connections` for nodes × 65 (see [Databases](#databases)). A refused connection fails the request with an error that names the pool size and `max_connections`. More is not always faster: in Phase 0's measurements 32 beat 8 and 64 on 64-shard bulks |
 | `background_share` | `0.25` at GOMAXPROCS 1, else `1` | the share of each 100 ms background work runs while searches occupy every processor, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints for the rest (see [CPU](#cpu)). `1` gives searches no priority |
 | `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
@@ -490,7 +491,7 @@ the same shard contents from them, as Elasticsearch's shard request cache does
   replay after a crash. A clean shutdown always flushes.
 - **Refresh on demand.** An index whose `refresh_interval` is `-1` never refreshes on a
   timer. A request that waits for a seq refreshes the copy itself once the copy has
-  applied it: a read's `wait_for_seq`, a write's `refresh=wait_for` or `true`, and a
+  applied it: a read's `wait_for` token, a write's `refresh=wait_for` or `true`, and a
   percolation, which waits for the saved queries written through its node. Without such
   a wait, writes stay invisible until one comes.
 
@@ -558,8 +559,8 @@ whichever node gets there first.
 
 | Database | Supported | Notes |
 |---|---|---|
-| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections plus one for `LISTEN`, so set `max_connections` to at least 65 per node plus headroom |
-| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node |
+| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections, one pool shared by its reads and writes, plus one for `LISTEN`, so set `max_connections` to at least nodes × 65 plus headroom (Postgres's default of 100 fits one node) |
+| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node, shared by its reads and writes: `max_connections` must cover nodes × 64 plus headroom |
 | SQLite | 3.35+, bundled (pure Go) | **one node only.** A second live node on the same file refuses to start (`cluster: a SQLite store serves a single node`). The lease TTL defaults to 30 s, because the single writer can delay a renewal |
 
 SQLite suits a laptop, a test, or a small single-node deployment. Its file must sit on a
@@ -944,6 +945,69 @@ Notes:
     from its stale hash; its next write on an upgraded node stores a fresh one.
   - `max_staleness` reaches peers without a wire level: a 1.5 peer ignores it and
     answers with a current result.
+- **Upgrading to shard sequences** (schema migration 7; 2.0) is a rolling upgrade from
+  1.8, in two steps: the nodes, then a switch the cluster makes on its own. Upgrade from
+  an earlier 1.x to 1.8 first. [CHANGELOG.md](../CHANGELOG.md) has the client side,
+  which must be ready before the first node moves.
+  1. **The migration**, on the first 2.0 node: it creates `sl_shard_seq` empty, adds
+     `sl_nodes.seq_scheme`, and re-keys `sl_changes` by (index, shard, seq), keeping an
+     index on `seq` alone for 1.x's reads. The re-key builds new indexes on the
+     changelog. On Postgres they're built `CONCURRENTLY`, outside the migration's
+     transaction, and the migration then holds `sl_changes`' lock only to swap the key
+     onto one of them: reads and writes go on meanwhile (on an NVMe workstation, three
+     million changelog rows took 7.5 s, and no read or write waited on a lock). Other
+     2.0 nodes starting on Postgres meanwhile wait for it; a 1.x node starting meanwhile
+     finds migrations 1 to 6 applied and starts (it is a 1.x node like the others). On
+     a database the first node creates, every migration runs in one transaction, and a
+     1.x node starting meanwhile waits for it and then refuses the newer schema. On MySQL the key change rebuilds the table in
+     place online, about 18 s per million rows, while writes go on; MySQL logs those
+     writes meanwhile, and if they outgrow `innodb_online_alter_log_max_size` (128 MiB
+     by default) the online change fails (error 1799) and the migration runs it again
+     with `LOCK=SHARED`, which holds writes (reads go on) until it ends. Raising that
+     setting before a busy upgrade keeps writes going; it is optional, and takes a
+     database administrator (`SYSTEM_VARIABLES_ADMIN`): Searchlight's own account needs
+     no such privilege, the fallback included. On SQLite it rebuilds the table, about
+     33 s per three million, while the node is down. Run `SELECT count(*) FROM
+     sl_changes` first to see what to expect; the changelog holds a few
+     `flush_interval`s of writes in steady state. As before, a 1.x
+     binary refuses to start once it has run, so finish the rollout.
+  2. **While 1.x and 2.0 nodes both run**, every node commits as 1.x does: under the
+     global sequence's lock (`sl_counter` row 1), at its next values. Every seq is unique
+     and in commit order, so 1.x and 2.0 copies, tailers and peer reads agree on what a
+     seq means, and nothing 1.x creates, drops or remaps is missed. Writes don't run in
+     parallel yet. 2.0 nodes heartbeat `seq_scheme = 1`.
+  3. **The switch.** Once every node in `sl_nodes` heartbeats `seq_scheme = 1`, or has
+     been silent for longer than `dead_after` plus `lease_ttl`, and no other node holds
+     a copy under a live lease (the test compressed bodies use), the leader turns shard
+     sequences on, in one transaction under row 1's lock: it gives every shard of every
+     index a row at row 1's value, with the index's current incarnation and mapping
+     version, moves the floor to `sl_counter` row 3, deletes row 1, and writes
+     `shard_seqs` into `sl_features`. It logs `every node commits by shard sequences:
+     turned the cluster's shard_seqs feature on`. Every write waits for that
+     transaction, which inserts the rows a thousand per statement: on a workstation, 200
+     indexes of 64 shards (12,800 rows) held writes for 83 ms on Postgres, 121 ms on MySQL
+     and 181 ms on SQLite. No shard's head moves back, so tokens
+     from before it still read back. From then on each shard commits on its own
+     sequence; nodes that haven't seen the switch find row 1 gone at their next write
+     and move over. A single node switches within a second of starting (or, if its
+     `node_id` changed, once its old row has been silent past the fence).
+  - **If a 1.x node never goes away**, the switch never comes: the cluster stays correct
+    on the global sequence, without the parallel writes. `SELECT * FROM sl_features`
+    shows whether `shard_seqs` is on; `SELECT node_id, version, seq_scheme FROM sl_nodes`
+    shows who holds it back.
+  - **An old pod must be gone, not merely silent**, as for compressed bodies. A 1.x
+    node that comes back after the switch without restarting (a partition healed, a
+    paused VM) fails every write, mapping change, drop and head read, since each needs
+    row 1: its clients see errors, but it writes nothing outside the shard sequences.
+    It can still create an index (1.x's create takes no lock), without sequence rows:
+    the first 2.0 write or mapping change to it gives it its rows, and so does the
+    leader within 30 s. Terminate old pods rather than isolating them.
+  - **Rollback** means restoring the database, as for every migration. After the
+    switch, seqs repeat across shards and row 1 is gone: no 1.x binary can use it.
+    **Restart every node after a restore.** A 2.0 store that saw shard sequences on
+    notices a database restored to before the switch at its next write and goes back
+    to the global sequence, but a node's cluster view still counts nodes without a seq
+    scheme out until it restarts.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and
@@ -993,7 +1057,7 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
 | Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total`, `searchlight_changelog_rewinds_total` |
 | Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total`, `searchlight_cluster_read_rereads_total` (by op and result: `found`, `none`, `timeout`) |
-| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`) |
+| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`), `searchlight_store_notifications_lost_total` (Postgres commit notifications sent after their commits that failed twice: copies poll for those changes instead, up to half `max_lag` later, 1 s by default) |
 | Runtime | `go_*` and `process_*` |
 
 Counters and histograms with no observations yet do not appear until their first one.

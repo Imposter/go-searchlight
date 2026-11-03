@@ -64,6 +64,9 @@ documents per second; one shard is unchanged below overload.
     `seq` (it had none) and a `token`, and a request's `token` names where its noops
     stand. A client forms a token of exactly the items it cares about from their
     `shard`, `seq` and the index's uid ([docs/api.md](docs/api.md#tokens)).
+  - **`committed`**, on `_bulk` and single writes: a token of only what the request
+    committed, never a noop's old seq. A shard committing at or below a seq an earlier
+    commit took means the database lost commits.
   - **A `GET` of a document or saved query answers `shard` and a `token`** of it at
     its seq.
   - **Routing is a documented contract** ([docs/api.md](docs/api.md#routing)): an id's

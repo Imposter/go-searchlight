@@ -319,6 +319,11 @@ type WriteResult struct {
 	// document on (ItemResult.Unchanged): pass it as wait_for to read the write back.
 	// Nil when it wrote nothing. It names versioned noops' stored seqs too.
 	Token *Token
+	// Committed is where the write's commits left each shard they were on: only the
+	// changes this request committed, never a noop's stored seq. Seqs only rise on a
+	// shard, so a client that sees a shard commit at or below a seq an earlier commit
+	// it saw took knows the database lost commits. Nil when nothing committed.
+	Committed *Token
 	// Items are the ops' outcomes, in order.
 	Items []ItemResult
 	// TimedOut is set when the request's deadline passed while waiting for a

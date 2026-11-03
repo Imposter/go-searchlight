@@ -56,6 +56,10 @@ type bulkResponse struct {
 	// unchanged upsert, a versioned noop): pass it as wait_for. Omitted when it names
 	// no shard.
 	Token string `json:"token,omitempty"`
+	// Committed is where the request's commits left each shard: only what it committed.
+	// A client detects a database that lost commits by it (docs/api.md, Tokens).
+	// Omitted when nothing committed.
+	Committed string `json:"committed,omitempty"`
 	// Errors is set when any item failed, on its own or with its shard's transaction.
 	Errors   bool `json:"errors"`
 	TimedOut bool `json:"timed_out"`
@@ -136,7 +140,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if len(res.Items) != len(ops) {
 		return ProblemFor(errItemCount)
 	}
-	out := bulkResponse{Token: res.Token.String(), TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
+	out := bulkResponse{Token: res.Token.String(), Committed: res.Committed.String(), TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
 	switch {
 	case perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches:
 		res.Percolated = false

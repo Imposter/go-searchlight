@@ -18,7 +18,7 @@ func TestVersionedWrites(t *testing.T) {
 	}
 	for _, v := range []string{"3", "2"} {
 		r = e.must(http.StatusOK, "PUT", "/indexes/v/docs/a?version="+v, `{"brand": "y"}`)
-		if r["result"] != "noop" || r["seq"] != 1.0 || r["shard"] != 0.0 || r["token"] == nil || r["version"] != 3.0-map[string]float64{"3": 0, "2": 1}[v] {
+		if r["result"] != "noop" || r["seq"] != 1.0 || r["shard"] != 0.0 || r["token"] == nil || r["committed"] != nil || r["version"] != 3.0-map[string]float64{"3": 0, "2": 1}[v] {
 			t.Fatalf("version %s over 3 = %v", v, r)
 		}
 	}
@@ -79,8 +79,8 @@ func TestBulkQueryActions(t *testing.T) {
 		t.Fatalf("d1 percolated against the queries before it: %v", got[2])
 	}
 	r = e.must(http.StatusOK, "POST", "/indexes/bq/_bulk?percolate=true", bulk)
-	if r["percolated"] != true || r["token"] == nil {
-		t.Fatalf("an all-noop bulk: percolated %v, token %v; want true and where the targets stand", r["percolated"], r["token"])
+	if r["percolated"] != true || r["token"] == nil || r["committed"] != nil {
+		t.Fatalf("an all-noop bulk: percolated %v, token %v, committed %v; want true, where the targets stand, and none", r["percolated"], r["token"], r["committed"])
 	}
 	first := got
 	got = items(r)

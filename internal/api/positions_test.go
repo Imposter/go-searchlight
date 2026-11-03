@@ -56,6 +56,41 @@ func TestItemPositions(t *testing.T) {
 	}
 }
 
+// TestCommittedToken: a bulk's committed token names only what it committed, while its
+// token also names where its noops found their targets; a bulk that commits nothing has
+// no committed token. A later commit to a shard is above every seq an earlier one took
+// there.
+func TestCommittedToken(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	e.createIndex("ct", `{"settings": {"shards": 2}}`)
+	ids := idsOnShards(2)
+	first := e.must(http.StatusOK, "POST", "/indexes/ct/_bulk", fmt.Sprintf("{\"upsert\": {\"id\": %q}}\n{\"n\": 0}\n", ids[0]))
+	committed0 := first["committed"].(string) //nolint:forcetypeassert,errcheck // checked below
+	if committed0 != first["token"] {
+		t.Fatalf("a bulk that committed everything: token %v, committed %v", first["token"], first["committed"])
+	}
+	r := e.must(http.StatusOK, "POST", "/indexes/ct/_bulk", fmt.Sprintf("{\"upsert\": {\"id\": %q}}\n{\"n\": 0}\n{\"upsert\": {\"id\": %q}}\n{\"n\": 1}\n", ids[0], ids[1]))
+	tok, err := api.ParseToken(tokenOf(t, r))
+	if err != nil {
+		t.Fatal(err)
+	}
+	com, err := api.ParseToken(r["committed"].(string)) //nolint:forcetypeassert,errcheck // ParseToken refuses ""
+	if err != nil {
+		t.Fatal(err)
+	}
+	if com.Seq(0) != 0 || com.Seq(1) == 0 || tok.Seq(0) != tokenSeq(t, committed0, 0) || tok.Seq(1) != com.Seq(1) {
+		t.Fatalf("token %v, committed %v: want the unchanged upsert's stored seq in token alone", tok.Seqs, com.Seqs)
+	}
+	noop := e.must(http.StatusOK, "POST", "/indexes/ct/_bulk", fmt.Sprintf("{\"upsert\": {\"id\": %q}}\n{\"n\": 0}\n", ids[0]))
+	if noop["committed"] != nil || noop["token"] == nil {
+		t.Fatalf("a bulk of an unchanged upsert: token %v, committed %v", noop["token"], noop["committed"])
+	}
+	later := e.must(http.StatusOK, "PUT", "/indexes/ct/docs/"+ids[0], `{"n": 5}`)
+	if got := tokenSeq(t, later["committed"].(string), 0); got <= tokenSeq(t, committed0, 0) { //nolint:forcetypeassert,errcheck // the shape
+		t.Fatalf("a later commit to shard 0 took seq %d, not above the earlier %d", got, tokenSeq(t, committed0, 0))
+	}
+}
+
 // TestGetReturnsItsPosition: a GET of a document or a saved query names its shard and a
 // token of it at its seq, which reads it back.
 func TestGetReturnsItsPosition(t *testing.T) {

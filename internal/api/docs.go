@@ -16,6 +16,8 @@ type writeResponse struct {
 	// Token is where the write left its shard, or found its target: pass it as wait_for
 	// to read it back.
 	Token string `json:"token,omitempty"`
+	// Committed is where the write's commit left its shard, omitted for a noop.
+	Committed string `json:"committed,omitempty"`
 	// Version is the write's client version, when it named one.
 	Version int64 `json:"version,omitempty"`
 	// Result is "noop" for a versioned write whose version was not above the stored
@@ -62,7 +64,7 @@ func (s *Server) singleWrite(w http.ResponseWriter, r *http.Request, p params, o
 	if it.Err != nil {
 		return it.Err
 	}
-	out := writeResponse{ID: op.ID, Shard: it.Shard, Seq: it.Seq, Token: res.Token.String(), Version: it.Version, TimedOut: res.TimedOut}
+	out := writeResponse{ID: op.ID, Shard: it.Shard, Seq: it.Seq, Token: res.Token.String(), Committed: res.Committed.String(), Version: it.Version, TimedOut: res.TimedOut}
 	if it.Noop {
 		out.Result = resultNoop
 	}

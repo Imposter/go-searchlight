@@ -119,6 +119,12 @@ func (n *Single) Write(ctx context.Context, name string, ops []api.WriteOp, opts
 			res.Token.Note(s, seq)
 		}
 	}
+	if len(written) > 0 {
+		res.Committed = &api.Token{UID: idx.uid}
+		for s, seq := range written {
+			res.Committed.Note(s, seq)
+		}
+	}
 	span.SetAttributes(attribute.Int("shards", len(touched)), attribute.Int("unchanged", len(unchanged)))
 	if handOff {
 		for i := range batch {

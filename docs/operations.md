@@ -963,8 +963,10 @@ Notes:
      place online, about 18 s per million rows, while writes go on; MySQL logs those
      writes meanwhile, and if they outgrow `innodb_online_alter_log_max_size` (128 MiB
      by default) the online change fails (error 1799) and the migration runs it again
-     with `LOCK=SHARED`, which holds writes (reads go on) until it ends. Raise that
-     setting before a busy upgrade to keep writes going. On SQLite it rebuilds the table, about
+     with `LOCK=SHARED`, which holds writes (reads go on) until it ends. Raising that
+     setting before a busy upgrade keeps writes going; it is optional, and takes a
+     database administrator (`SYSTEM_VARIABLES_ADMIN`): Searchlight's own account needs
+     no such privilege, the fallback included. On SQLite it rebuilds the table, about
      33 s per three million, while the node is down. Run `SELECT count(*) FROM
      sl_changes` first to see what to expect; the changelog holds a few
      `flush_interval`s of writes in steady state. As before, a 1.x

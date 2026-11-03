@@ -294,7 +294,9 @@ func (instant) Sleep(ctx context.Context, _ time.Duration) error { return ctx.Er
 // TestMySQLMigrationBesideHeavyWrites: MySQL's online key change (migration 7) logs the
 // writes 1.x nodes make beside it, and fails (1799) once they outgrow
 // innodb_online_alter_log_max_size (lowered here to make it quick); the migration then
-// runs it again holding the table's writes, and completes.
+// runs it again holding the table's writes, and completes. Lowering a global takes
+// SYSTEM_VARIABLES_ADMIN (or SUPER), which the store never needs: the test skips on an
+// account without it.
 func TestMySQLMigrationBesideHeavyWrites(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		if h.dialect != "mysql" {
@@ -304,6 +306,16 @@ func TestMySQLMigrationBesideHeavyWrites(t *testing.T) {
 		st, all := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql", "0003_change_nonce.sql",
 			"0004_mapping_types.sql", "0005_versions.sql", "0006_body_hash.sql")
 		s := engine(st)
+		var logMax int64
+		if err := s.r.QueryRowContext(ctx, "SELECT @@GLOBAL.innodb_online_alter_log_max_size").Scan(&logMax); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.w.ExecContext(ctx, "SET GLOBAL innodb_online_alter_log_max_size = ?", logMax); err != nil {
+			if strings.Contains(err.Error(), "1227") {
+				t.Skipf("the test account may not set innodb_online_alter_log_max_size (SYSTEM_VARIABLES_ADMIN): %v", err)
+			}
+			t.Fatal(err)
+		}
 		old := legacy(t, st)
 		old.create("big", 4)
 		if _, err := s.w.ExecContext(ctx, "SET SESSION cte_max_recursion_depth = 1000000"); err != nil {
@@ -321,7 +333,7 @@ SELECT i + 10, 'big', i % 4, 'upsert', CONCAT('s', i), REPEAT('x', 200), 0, 'u',
 			t.Fatal(err)
 		}
 		t.Cleanup(func() {
-			_, _ = s.w.ExecContext(context.Background(), "SET GLOBAL innodb_online_alter_log_max_size = 134217728")
+			_, _ = s.w.ExecContext(context.Background(), "SET GLOBAL innodb_online_alter_log_max_size = ?", logMax)
 		})
 		stop := make(chan struct{})
 		var wg sync.WaitGroup

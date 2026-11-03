@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -48,11 +49,18 @@ func TestRewindLowersAQuerySeqWithNoCopy(t *testing.T) {
 	fresh := mustWriteEventually(t, holder.n, "rq", upsertOp("fresh", 5))
 	waitCount(t, holder.n, "rq", fresh, 2) // the copy rebuilt: kept and fresh
 	t.Logf("kept %d, lost queries at %d, fresh write at %d; copy on %v, writer %s", kept.Seq(0), lost.Seq(0), fresh.Seq(0), holders, writer.cfg.NodeID)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := writer.n.Percolate(ctx, "rq", req, api.ReadOptions{}); err != nil {
-		t.Fatalf("a percolation through the writer after the rewind: %v", err)
-	}
+	// The copy rebuilt on the holder serves again once the writer's routing view shows
+	// it: until then a read through the writer is a retryable 503 (no serving copy),
+	// as a client would see, and retries.
+	eventually(t, 30*time.Second, "a percolation through the writer after the rewind", func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := writer.n.Percolate(ctx, "rq", req, api.ReadOptions{})
+		if err != nil && !errors.Is(err, ErrNoServingCopy) {
+			t.Fatalf("a percolation through the writer after the rewind: %v", err)
+		}
+		return err
+	})
 }
 
 // mustWriteEventually retries a write a rewound store refuses (503) for a while.

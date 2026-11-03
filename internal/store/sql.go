@@ -1361,6 +1361,7 @@ func (s *sqlStore) raiseHorizon(ctx context.Context, shard ShardID, belowSeq int
 	if s.seqsOn.Load() {
 		err = tx.QueryRowContext(ctx, s.d.Changelog.LockShard, shard.Index, shard.Shard).Scan(&h.value, &h.uid, &h.mappingVersion, &nowMs)
 	} else if h, _, err = s.lockGlobal(ctx, tx); errors.Is(err, errShardSeqsOn) {
+		rollback(tx)
 		return s.raiseHorizon(ctx, shard, belowSeq)
 	}
 	switch {

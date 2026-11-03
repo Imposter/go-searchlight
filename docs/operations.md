@@ -987,8 +987,9 @@ Notes:
     node that comes back after the switch without restarting (a partition healed, a
     paused VM) fails every write, mapping change, drop and head read, since each needs
     row 1: its clients see errors, but it writes nothing outside the shard sequences.
-    It can still create an index (1.x's create takes no lock); the next 2.0 node to
-    start gives that index its rows. Terminate old pods rather than isolating them.
+    It can still create an index (1.x's create takes no lock), without sequence rows:
+    the first 2.0 write or mapping change to it gives it its rows, and so does the
+    leader within 30 s. Terminate old pods rather than isolating them.
   - **Rollback** means restoring the database, as for every migration. After the
     switch, seqs repeat across shards and row 1 is gone: no 1.x binary can use it.
 - **Segment format.** It is versioned by a major number, and each binary reads its own

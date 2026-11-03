@@ -127,6 +127,11 @@ type Store interface {
 	// write nor read the head from then on. Only once no such node is live; a no-op
 	// once they are on.
 	EnableShardSeqs(ctx context.Context) error
+	// SeedMissingShards gives every index with no sequence row at all (one a 1.x node
+	// created after shard sequences came on) a row per shard at the floor. A write to
+	// such an index seeds it too; this does it ahead of the first write. A no-op while
+	// shard sequences are off.
+	SeedMissingShards(ctx context.Context) error
 
 	// Ping checks the database is reachable.
 	Ping(ctx context.Context) error

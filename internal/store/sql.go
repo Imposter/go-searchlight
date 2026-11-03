@@ -466,7 +466,13 @@ func (s *sqlStore) applyPrepared(ctx context.Context, batch []Change, p *prepare
 	}
 	for attempt := 1; ; attempt++ {
 		err = s.applyOnce(ctx, batch, p)
-		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errNoShardRow) && !errors.Is(err, errShardSeqsOn) || ctx.Err() != nil {
+		var nr *noShardRowError
+		if errors.As(err, &nr) {
+			if serr := s.seedIndex(ctx, nr.index); serr != nil && !errors.Is(serr, errShardSeqsOff) {
+				return errors.Join(err, serr)
+			}
+		}
+		if err == nil || attempt == applyAttempts || !s.retryable(err) && !rerun(err) || ctx.Err() != nil {
 			return err
 		}
 		s.log.DebugContext(ctx, "retrying apply after a transient failure", slog.Int("attempt", attempt), slog.Any("error", err))
@@ -695,7 +701,7 @@ func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, 
 		case h == nil && c.Shard >= n && bad == nil:
 			bad = &ChangeError{Position: i, Err: invalidf("index %q has %d shard(s); shard %d does not exist", c.Index, n, c.Shard)}
 		case h == nil && bad == nil:
-			bad = fmt.Errorf("%s: %w", c.ShardID(), errNoShardRow)
+			bad = &noShardRowError{shard: c.ShardID(), index: c.Index}
 		}
 	}
 	if nf != nil {
@@ -707,8 +713,25 @@ func (s *sqlStore) checkShards(ctx context.Context, tx *sql.Tx, batch []Change, 
 // errNoShardRow is a shard of an existing index found without its sequence row: the
 // index was dropped and created again between the lock and the catalogue's read (the
 // lock waited on the drop, and read committed shows the new index only to the next
-// statement), so the attempt is run again.
+// statement), or a 1.x node created it after shard sequences came on and it has no
+// rows at all, which seedIndex gives it. Either way the attempt is run again.
 var errNoShardRow = errors.New("store: the shard has no sequence row")
+
+// noShardRowError is errNoShardRow for a shard of index.
+type noShardRowError struct {
+	shard ShardID
+	index string
+}
+
+func (e *noShardRowError) Error() string { return fmt.Sprintf("%s: %v", e.shard, errNoShardRow) }
+
+func (e *noShardRowError) Is(target error) bool { return target == errNoShardRow }
+
+// rerun reports whether a write failed only because what it found changed under it,
+// and runs again: a shard without its row, or shard sequences found on or off.
+func rerun(err error) bool {
+	return errors.Is(err, errNoShardRow) || errors.Is(err, errShardSeqsOn) || errors.Is(err, errShardSeqsOff)
+}
 
 // provisionalSeqs are the seqs batch's changes would take if every one applied, each
 // sequence's in batch order from its newest seq on, as checkConditions judges them.

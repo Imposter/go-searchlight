@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -18,10 +19,20 @@ import (
 // the shard sequences, should one still be running. Nodes learn of it at their next
 // write.
 
+// seedEvery is how often the leader looks for indexes without sequence rows once shard
+// sequences are on.
+const seedEvery = 30 * time.Second
+
 // shardSeqGate turns shard sequences on, on the leader, once every node commits by them.
+// Once they are on, the leader gives an index a 1.x node created after the switch (with
+// no sequence rows) its rows, every seedEvery, ahead of its first write.
 func (n *Node) shardSeqGate(ctx context.Context) error {
 	if n.shardSeqs.Load() {
-		return nil
+		if !n.leader() || n.clock.Since(n.lastSeed) < seedEvery {
+			return nil
+		}
+		n.lastSeed = n.clock.Now()
+		return n.st.SeedMissingShards(ctx)
 	}
 	on, err := n.st.ShardSeqs(ctx)
 	if err != nil {

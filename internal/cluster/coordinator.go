@@ -349,6 +349,9 @@ type Node struct {
 	zstdBodies atomic.Bool
 	// shardSeqs is set once this node has seen shard sequences on (shardSeqGate).
 	shardSeqs atomic.Bool
+	// lastSeed is when shardSeqGate last looked for indexes without sequence rows; only
+	// the view loop and Start touch it.
+	lastSeed time.Time
 
 	started  atomic.Bool
 	draining atomic.Bool

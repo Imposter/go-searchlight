@@ -43,6 +43,25 @@ const SeqScheme = 1
 // on, and the write runs again on them.
 var errShardSeqsOn = errors.New("store: shard sequences are on")
 
+// errShardSeqsOff is a write that found the floor gone where it expected shard
+// sequences on: the database was restored to before they came on. The store forgets
+// that it saw them on, and the write runs again on the global sequence.
+var errShardSeqsOff = errors.New("store: shard sequences are off")
+
+// SeedMissingShards implements [Store].
+func (s *sqlStore) SeedMissingShards(ctx context.Context) (err error) {
+	ctx, end := s.start(ctx, "seed_missing_shards")
+	defer end(&err)
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	on, err := s.ShardSeqs(ctx)
+	if err != nil || !on {
+		return err
+	}
+	return s.seedMissingShards(ctx)
+}
+
 // ShardSeqs implements [Store]. Once it has seen them on it answers from memory.
 func (s *sqlStore) ShardSeqs(ctx context.Context) (on bool, err error) {
 	if s.seqsOn.Load() {
@@ -284,7 +303,10 @@ func (s *sqlStore) seedMissingShards(ctx context.Context) error {
 }
 
 // seedIndex seeds the sequence rows of an index that has none, under the floor's
-// lock, at the floor, with its index's incarnation and mapping version.
+// lock, at the floor, with its index's incarnation and mapping version. It does nothing
+// to an index that has some, or is gone. With no floor, shard sequences are off (the
+// database was restored to before they came on): it forgets having seen them on and
+// fails with errShardSeqsOff.
 func (s *sqlStore) seedIndex(ctx context.Context, name string) error {
 	tx, err := s.w.BeginTx(ctx, s.d.ApplyTx)
 	if err != nil {
@@ -292,7 +314,11 @@ func (s *sqlStore) seedIndex(ctx context.Context, name string) error {
 	}
 	defer rollback(tx)
 	var floor int64
-	if err := tx.QueryRowContext(ctx, s.d.Changelog.LockFloor).Scan(&floor); err != nil {
+	switch err := tx.QueryRowContext(ctx, s.d.Changelog.LockFloor).Scan(&floor); {
+	case errors.Is(err, sql.ErrNoRows):
+		s.seqsOn.Store(false)
+		return errShardSeqsOff
+	case err != nil:
 		return fmt.Errorf("lock the floor: %w", err)
 	}
 	var mapping, settings []byte

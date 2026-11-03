@@ -167,7 +167,12 @@ func (x *indexStore) Update(ctx context.Context, m IndexMeta) (out IndexMeta, er
 	}
 	for attempt := 1; ; attempt++ {
 		err = x.updateOnce(ctx, &m)
-		if err == nil || attempt == applyAttempts || !s.retryable(err) && !errors.Is(err, errShardSeqsOn) || ctx.Err() != nil {
+		if errors.Is(err, errNoShardRow) {
+			if serr := s.seedIndex(ctx, m.Name); serr != nil && !errors.Is(serr, errShardSeqsOff) {
+				return out, errors.Join(err, serr)
+			}
+		}
+		if err == nil || attempt == applyAttempts || !s.retryable(err) && !rerun(err) || ctx.Err() != nil {
 			break
 		}
 	}
@@ -264,6 +269,9 @@ func (x *indexStore) updateOnce(ctx context.Context, m *IndexMeta) error {
 		for sh := range oldShards {
 			locked = append(locked, indexShard{shard: sh, head: shardHead{value: global.value, last: global.value, global: global}})
 		}
+	}
+	if len(locked) == 0 && oldShards > 0 {
+		return fmt.Errorf("index %q: %w", m.Name, errNoShardRow)
 	}
 	if len(locked) != oldShards {
 		return fmt.Errorf("store: index %q has %d shards and %d sequence rows", m.Name, oldShards, len(locked))

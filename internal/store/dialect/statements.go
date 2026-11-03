@@ -184,9 +184,9 @@ type Changelog struct {
 	RetireGlobal string
 	// ClearShardSeqs deletes every sequence row.
 	ClearShardSeqs string
-	// InsertShardSeq: (index, shard, value, uid, mapping_version) inserts a sequence
-	// row.
-	InsertShardSeq string
+	// InsertShardSeqs returns the statement that inserts n sequence rows: (index,
+	// shard, value, uid, mapping_version) for each.
+	InsertShardSeqs func(n int) string
 	// ReadShardMark: (index, shard, index, shard, index, shard, index, shard) ->
 	// the shard's value (the floor's when it has no row), without a lock, then kind,
 	// id, at, nonce of the shard's change at that value, then seq, kind, id, at, nonce
@@ -276,6 +276,21 @@ func QueryPageSQL(shards []int, ph func(int) string) string {
 		n += 3
 	}
 	fmt.Fprintf(&b, ") AS page ORDER BY id LIMIT %s", ph(n))
+	return b.String()
+}
+
+// InsertShardSeqsSQL is Changelog.InsertShardSeqs in a dialect whose n-th
+// placeholder ph spells.
+func InsertShardSeqsSQL(rows int, ph func(int) string) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) VALUES ")
+	for r := range rows {
+		if r > 0 {
+			b.WriteString(", ")
+		}
+		n := r*5 + 1
+		fmt.Fprintf(&b, "(%s, %s, %s, %s, %s)", ph(n), ph(n+1), ph(n+2), ph(n+3), ph(n+4))
+	}
 	return b.String()
 }
 

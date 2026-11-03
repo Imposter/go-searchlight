@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,5 +98,125 @@ func TestRestoreToBeforeTheSwitch(t *testing.T) {
 		if next := old.mustApply("mx", 0, "old")[0]; next != global+3 {
 			t.Errorf("1.x took seq %d after the restore, want %d", next, global+3)
 		}
+	})
+}
+
+// TestSwitchFailsMidway: a switch that fails part way leaves nothing behind (no
+// sequence row, the global sequence still there, no floor), the writes of both
+// releases go on, and the switch succeeds when run again.
+func TestSwitchFailsMidway(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st, old := openMixed(t, h)
+		old.create("late", 3)
+		s := engine(st)
+		saved := s.d.Changelog.RetireGlobal
+		s.d.Changelog.RetireGlobal = "DELETE FROM sl_no_such_table"
+		err := st.EnableShardSeqs(ctx)
+		s.d.Changelog.RetireGlobal = saved
+		if err == nil {
+			t.Fatal("the broken switch succeeded")
+		}
+		if n := len(shardSeqRows(t, st)); n != 0 {
+			t.Errorf("%d sequence rows after a failed switch", n)
+		}
+		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_counter WHERE id = 1"); n != 1 {
+			t.Error("the global sequence is gone after a failed switch")
+		}
+		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_counter WHERE id = 3"); n != 0 {
+			t.Error("a floor after a failed switch")
+		}
+		if on, err := st.ShardSeqs(ctx); err != nil || on {
+			t.Errorf("ShardSeqs after a failed switch: %v %v", on, err)
+		}
+		mustApply(t, st, upsert("mx", 0, "after-fail", `{}`))
+		old.mustApply("mx", 1, "old-after-fail")
+		if err := st.EnableShardSeqs(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := len(shardSeqRows(t, st)); n != 5 {
+			t.Errorf("%d sequence rows after the switch ran again, want 5", n)
+		}
+	})
+}
+
+// TestTwoLeadersSwitch: two nodes switching at once (a leadership handover) both
+// succeed, and the rows are seeded once.
+func TestTwoLeadersSwitch(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st, _ := openMixed(t, h)
+		other := openAgain(t, h, st)
+		var e1, e2 error
+		var wg sync.WaitGroup
+		wg.Go(func() { e1 = st.EnableShardSeqs(ctx) })
+		wg.Go(func() { e2 = other.EnableShardSeqs(ctx) })
+		wg.Wait()
+		if e1 != nil || e2 != nil {
+			t.Errorf("switches: %v / %v", e1, e2)
+		}
+		if n := len(shardSeqRows(t, st)); n != 2 {
+			t.Errorf("%d sequence rows, want 2", n)
+		}
+	})
+}
+
+// TestSwitchStall: the switch holds the global sequence while it seeds a row per shard
+// of every index, so every write waits for it; with 200 indexes of 64 shards (12,800
+// rows) it logs how long the switch took and the longest a write waited, which
+// docs/operations.md quotes.
+func TestSwitchStall(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		st, _ := openMixed(t, h)
+		const indexes, shards = 200, 64
+		s := engine(st)
+		tx, err := s.w.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q := rebind(s, "INSERT INTO sl_indexes (name, mapping, settings, version, created_at, mapping_version, uid) VALUES (?, '{}', ?, 1, 0, 1, ?)")
+		for i := range indexes {
+			if _, err := tx.ExecContext(ctx, q, fmt.Sprintf("big%03d", i), fmt.Sprintf(`{"shards": %d}`, shards), randName("uid")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		other := openAgain(t, h, st)
+		var maxWait atomic.Int64
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				t0 := time.Now()
+				if err := other.Apply(ctx, []Change{upsert("mx", i%2, fmt.Sprint("w", i), `{}`)}); err != nil {
+					t.Errorf("writer: %v", err)
+					return
+				}
+				if d := int64(time.Since(t0)); d > maxWait.Load() {
+					maxWait.Store(d)
+				}
+			}
+		})
+		time.Sleep(200 * time.Millisecond)
+		t0 := time.Now()
+		if err := st.EnableShardSeqs(ctx); err != nil {
+			t.Fatal(err)
+		}
+		took := time.Since(t0)
+		time.Sleep(200 * time.Millisecond)
+		close(stop)
+		wg.Wait()
+		if n := countRows(t, st, "SELECT COUNT(*) FROM sl_shard_seq"); n != indexes*shards+2 {
+			t.Errorf("%d sequence rows, want %d", n, indexes*shards+2)
+		}
+		t.Logf("%s: the switch seeded %d rows in %s; a write waited at most %s", h.dialect, indexes*shards+2, took.Round(time.Millisecond), time.Duration(maxWait.Load()).Round(time.Millisecond))
 	})
 }

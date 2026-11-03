@@ -78,6 +78,10 @@ func TestStatementTables(t *testing.T) {
 					if x == nil || x([]int{0, 1}) == "" {
 						t.Errorf("%s: %s builds no statement", scheme, name)
 					}
+				case func(int) string:
+					if x == nil || x(2) == "" {
+						t.Errorf("%s: %s builds no statement", scheme, name)
+					}
 				case func(error) bool:
 					// Optional: LockTimedOut comes with MigrateLockTimeout, and
 					// AlreadyApplied with non-transactional DDL.

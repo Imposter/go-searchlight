@@ -104,7 +104,8 @@ from v1.8.0, with no client error and nothing lost.
    parallel yet.
 3. **The switch is automatic.** Once every node heartbeats 2.0, and any other has been
    silent past `dead_after` plus `lease_ttl` with no live lease, the leader turns shard
-   sequences on (`shard_seqs` in `sl_features`, and a log line). If a 1.8 node never
+   sequences on (`shard_seqs` in `sl_features`, and a log line). Writes wait while it
+   seeds a row per shard of every index: about 0.1 s for 12,800 shards. If a 1.8 node never
    leaves, the cluster stays on the global sequence. A 1.8 node that comes back after
    the switch without restarting gets an error for every write, mapping change, drop
    and head read: it writes nothing outside the shard sequences.

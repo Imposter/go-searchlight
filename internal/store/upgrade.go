@@ -225,18 +225,19 @@ func (s *sqlStore) enableShardSeqs(ctx context.Context) error {
 	if _, err := tx.ExecContext(ctx, s.d.Changelog.ClearShardSeqs); err != nil {
 		return fmt.Errorf("clear the sequence rows: %w", err)
 	}
-	seeded := 0
+	var seed []any
 	for _, x := range indexes {
 		shards, err := settingsShards(x.settings)
 		if err != nil {
 			return fmt.Errorf("index %q: %w", x.name, err)
 		}
 		for sh := range shards {
-			if _, err := tx.ExecContext(ctx, s.d.Changelog.InsertShardSeq, x.name, sh, g.value, x.uid, x.mv); err != nil {
-				return fmt.Errorf("seed %s/%d: %w", x.name, sh, err)
-			}
+			seed = append(seed, x.name, sh, g.value, x.uid, x.mv)
 		}
-		seeded += shards
+	}
+	seeded := len(seed) / 5
+	if err := s.insertShardSeqs(ctx, tx, seed); err != nil {
+		return fmt.Errorf("seed the sequence rows: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, s.d.Changelog.SeedFloor, g.value); err != nil {
 		return fmt.Errorf("seed the floor: %w", err)
@@ -253,6 +254,24 @@ func (s *sqlStore) enableShardSeqs(ctx context.Context) error {
 	s.seqsOn.Store(true)
 	s.log.InfoContext(ctx, "shard sequences are on", slog.Int64("seq", g.value),
 		slog.Int("indexes", len(indexes)), slog.Int("shards", seeded))
+	return nil
+}
+
+// seedChunk bounds the sequence rows one statement inserts: 5 arguments each, well
+// within every dialect's limit on a statement's arguments (SQLite's 32,766 the least).
+const seedChunk = 1000
+
+// insertShardSeqs inserts sequence rows, rows holding 5 arguments for each, a chunk
+// per statement: the switch inserts a row per shard of every index while it holds the
+// global sequence, so every write waits for it.
+func (s *sqlStore) insertShardSeqs(ctx context.Context, tx *sql.Tx, rows []any) error {
+	for len(rows) > 0 {
+		n := min(len(rows)/5, seedChunk)
+		if _, err := tx.ExecContext(ctx, s.d.Changelog.InsertShardSeqs(n), rows[:5*n]...); err != nil {
+			return err
+		}
+		rows = rows[5*n:]
+	}
 	return nil
 }
 
@@ -341,10 +360,12 @@ func (s *sqlStore) seedIndex(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	rows := make([]any, 0, 5*shards)
 	for sh := range shards {
-		if _, err := tx.ExecContext(ctx, s.d.Changelog.InsertShardSeq, name, sh, floor, uid, mv); err != nil {
-			return err
-		}
+		rows = append(rows, name, sh, floor, uid, mv)
+	}
+	if err := s.insertShardSeqs(ctx, tx, rows); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err

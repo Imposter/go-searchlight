@@ -41,7 +41,7 @@ var changelog = dialect.Changelog{
 	SeedFloor:       "INSERT INTO sl_counter (id, value) VALUES (3, ?)",
 	RetireGlobal:    "DELETE FROM sl_counter WHERE id = 1",
 	ClearShardSeqs:  "DELETE FROM sl_shard_seq",
-	InsertShardSeq:  "INSERT INTO sl_shard_seq (index_name, shard, value, index_uid, mapping_version) VALUES (?, ?, ?, ?, ?)",
+	InsertShardSeqs: func(n int) string { return dialect.InsertShardSeqsSQL(n, question) },
 	ReadShardMark:   "SELECT COALESCE(s.value, f.value), h.kind, h.id, h.at, h.nonce, o.seq, o.kind, o.id, o.at, o.nonce FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = ? AND s.shard = ? LEFT JOIN sl_changes h ON h.index_name = ? AND h.shard = ? AND h.seq = COALESCE(s.value, f.value) LEFT JOIN sl_changes o ON o.index_name = ? AND o.shard = ? AND o.seq = (SELECT MAX(seq) FROM sl_changes WHERE index_name = ? AND shard = ? AND seq <= COALESCE(s.value, f.value)) WHERE f.id IN (1, 3)",
 	ReadHead:        withNow("SELECT COALESCE(s.value, f.value), NOW FROM sl_counter f LEFT JOIN sl_shard_seq s ON s.index_name = ? AND s.shard = ? WHERE f.id IN (1, 3)"),
 	ReadHeads:       "SELECT -1, value FROM sl_counter WHERE id IN (1, 3) UNION ALL SELECT shard, value FROM sl_shard_seq WHERE index_name = ?",

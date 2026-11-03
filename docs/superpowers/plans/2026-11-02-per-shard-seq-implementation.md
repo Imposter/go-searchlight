@@ -7,9 +7,8 @@ per shard, per-item results, no 2PC), D2 (an opaque token in place of the scalar
 set the performance bar. The spike (`spike/write-scaling`, never merged) showed the shape and its shortcuts; none
 of its code is reused as it stands.
 
-**Status: do not deploy this branch to a cluster.** Until M4's gated cutover lands, a 1.x node writing after
-migration 0007 loses and collides with 2.x writes (see M4's ship blockers). A single 2.x node, or a cluster of 2.x
-nodes on a fresh or fully migrated database, is what M1 and M2 test.
+**Status:** M4's gated cutover has landed: a 1.8 cluster upgrades in place (see "M4 as built"). Before it, a 1.x
+node writing after migration 0007 lost and collided with 2.x writes (M4's ship blockers).
 
 **Branch:** `feat/per-shard-seq`, from `design/write-scaling` at `a0202bb`. Four milestones, each committed in small
 steps and each leaving its own layer green:
@@ -32,7 +31,8 @@ These refine the approved plan. Where one departs from it, the reason is given.
    replaces `checkIndexes`' read of `sl_indexes` (Phase 1, item 3) outright: nothing is cached, so nothing goes
    stale and there is no conflict path to re-read on. The row is also the "local mapping copy" Change B's item 3
    asks for, minus the mapping text.
-2. **`sl_counter` row 1 becomes the seq floor.** The migration seeds every shard at its value (the old global head).
+2. **`sl_counter` row 1 becomes the seq floor** (M4: row 3, once shard sequences are on; row 1 stays the global
+   sequence until then). The migration seeds every shard at its value (the old global head).
    `Drop` raises it to the highest seq of the shards it removes, and `Create` seeds a new index's shards at it. So
    a name's shard never reissues a seq across a drop and recreate, as today, and a copy of a dropped incarnation
    never sees a head behind its applied seq. `HeadSeq`, `Tip` and `ScanShard` of a shard with no row (its index
@@ -70,7 +70,8 @@ These refine the approved plan. Where one departs from it, the reason is given.
    keeps none, since nodes of two versions never share its file. Its rebuilt `sl_changes` stays a rowid table: the
    rows carry document bodies, larger than `WITHOUT ROWID` suits, and the key's index serves the reads by shard and
    seq.
-9. **Migration 0007's seeding.** Every index gets a row per shard of its `settings.shards` (a number, a string of
+9. **Migration 0007's seeding** (M4: superseded; 0007 seeds nothing, and the switch seeds every shard, see "M4 as
+   built"). Every index gets a row per shard of its `settings.shards` (a number, a string of
    one, or null or absent for one); a value that is none of those fails the migration rather than leaving the index
    without rows, and `Migrate` checks every index has exactly its shard count of rows. Postgres's migration locks
    `sl_counter` row 1 before it seeds, so no 1.x commit lands between the seeding and its end. MySQL's DDL is not
@@ -215,6 +216,63 @@ is large, give the runner a non-transactional step for Postgres: `CREATE UNIQUE 
 
 **What M4's tests prove:** a 1.x cluster upgrades in place under load with no client error and nothing lost, and
 the gain Phase 0 measured survives the real implementation.
+
+**M4 as built.** Where it differs from the table:
+
+- **No shard rows until the switch.** Migration 0007 creates `sl_shard_seq` empty and adds `sl_nodes.seq_scheme`.
+  Until shard sequences are on, every commit (Apply, Update's mapping changes, Drop, Create, Prune's horizon) takes
+  row 1's lock and its next values, with the uid and mapping version read from `sl_indexes`, exactly as 1.x does.
+  With no shard rows, every head is row 1's value (the readers' `WHERE f.id IN (1, 3)`). So blockers 2-4 cannot
+  arise (there are no rows for 1.x to miss, leave or let go stale), and blockers 1 and 5 cannot either (every seq is
+  unique and in commit order).
+- **The switch** (`Store.EnableShardSeqs`), in one transaction under row 1's lock: a row per shard of every index in
+  `sl_indexes` at row 1's value with its current uid and mapping version, the floor moved to row 3, row 1 deleted,
+  `shard_seqs` recorded. Deleting row 1 is what refuses 1.x: its Apply, Update, Drop, Prune and every head read need
+  it. 1.x's Create takes no lock and can still insert an index; the next 2.x Migrate seeds an index that has no rows
+  at all at the floor (it can have no changes). A store learns of the switch from row 1's absence at its next
+  write. A database that Migrate creates switches at once. The leader switches once every live node heartbeats
+  `seq_scheme` 1 and no other node holds a live lease (`everyNode`, shared with the zstd_bodies gate).
+- **Mixed-version peer reads** need nothing more: before the switch every seq is global, so a 1.x copy asked to wait
+  for a 2.x token's seq waits for the right thing; after it, no 1.x node holds a live lease, so none is routed to.
+  The chaos test sends token reads to 2.x nodes during the mixed window to exercise it.
+- **Postgres's key swap** builds both indexes `CONCURRENTLY` before the transaction (`0007_shard_seq.concurrent.sql`,
+  a runner feature: statements outside a transaction, under a session advisory lock of their own, polled with
+  `pg_try_advisory_lock`; rerun after a deadlock). Measured on the NVMe instance: swapped in the transaction, a
+  concurrent read waited 2.3 s at 1M changelog rows and 5.9 s at 3M; built concurrently, at most 3-4 ms, with no
+  lock wait logged.
+- **Chaos:** `TestRollingUpgradeFromRelease` builds v1.8.0 from its tag and upgrades three nodes under load;
+  `TestKillMidBulk` and `TestDatabaseRestart` run on 8 shards, the latter counting partial bulks. The chaos suite is
+  Postgres-only (three nodes); SQLite's upgrade (one node) is covered by the store and cluster tests, which run on
+  every dialect.
+- **Clients in the mixed window** must send neither `wait_for_seq` (2.0 refuses it) nor `wait_for` (1.8 refuses it),
+  or route by version; the CHANGELOG says so.
+- The M3 review's fixes were made on `fix/m3-review` and cherry-picked here.
+
+**M4's benchmarks** (NVMe, `fdatasync`, Phase 0's settings and runner, base `c394860` against `c180c9f`, round
+robin, three rounds; median [range]). Store level, `BenchmarkCommitLoad`, a million changes each:
+
+| Case | base | 2.0 | 2.0/base | 2.0 changes per commit |
+|---|---|---|---|---|
+| 64 shards × 4,096, 16 writers | 28,155 [27,689-30,359] | 141,291 [136,778-144,606] | **5.02** | 434 |
+| 8 shards × 500, 16 writers | 29,405 [28,862-29,789] | 110,692 [107,938-111,502] | **3.76** | 446 |
+| 1 shard × 4,096, 16 writers (control) | 28,003 [27,952-30,047] | 27,667 [26,925-28,396] | 0.99 | 4,096 |
+| 64 shards × 500, 4 writers | 28,509 [28,470-28,891] | 31,162 [30,627-31,807] | 1.09 | 29 |
+| 64 shards × 500, 4 writers, 3 nodes | 27,744 [27,643-27,890] | 61,092 [60,515-61,737] | **2.20** | 18 |
+
+The small-batch cases that lost on the hard disk don't lose on NVMe, so the batching mitigation was not built. End
+to end (`slbench writeload`, 30 s, 4,096-document bulks), docs/s:
+
+| Case | base | 2.0 | 2.0/base |
+|---|---|---|---|
+| 64 shards, 16 writers | 12,624 [12,514-12,721] | 24,618 [24,288-24,750] | **1.95** |
+| 1 shard, 16 writers | 24,845 [24,030-28,096] | 17,946 [17,544-21,529] | **0.72** |
+| 1 shard, 4 writers (2 rounds) | 26,388 and 26,716 | 25,781 and 26,048 | 0.98 |
+
+The one-shard loss at 16 writers is in overload: the node is CPU-bound (7.2 of 8 cores in both), and 2.0 refused
+more bulks with 429 (498-566 against 336-443 per 30 s). A refused bulk has already been analyzed, so 2.0 spent more
+of its CPU on analysis it threw away (the profile's write-path `schema.Analyze` per committed document is 1.5×
+base's). Below overload (4 writers, no 429) it is at parity, as is the store-level control. Not fixed in M4:
+admitting a bulk before analyzing it would cut the waste for both releases.
 
 ## Open questions, decided
 

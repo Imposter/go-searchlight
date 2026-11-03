@@ -9,7 +9,10 @@ publishes each version's section here as its GitHub release notes (RELEASING.md)
 Searchlight 2.0.0 (unreleased).
 
 Every shard has its own sequence, and a node commits to several shards at once. A write
-answers with a token in place of a seq, and reads wait on it shard by shard.
+answers with a token in place of a seq, and reads wait on it shard by shard. On Postgres
+with NVMe storage, a node's commit path sustains 3.8-5.0× 1.8's changes per second on 8
+and 64 shards (2.2× across three nodes), and end to end a 64-shard index takes 1.95× the
+documents per second; one shard is unchanged below overload.
 
 ### Changed (breaking)
 

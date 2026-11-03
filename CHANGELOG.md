@@ -54,7 +54,9 @@ documents per second; one shard is unchanged below overload.
   - **`_bulk` responses lose their top-level `seq`** and gain `token` (absent when
     nothing was written). Items keep their `seq`.
   - **`percolated_seq` is replaced by `percolated_at`**, a token of where each shard
-    stood for the percolation.
+    stood for the percolation. A shard percolated by another node's copy counts at the
+    generation that copy percolated at, so it covers saved queries written through any
+    node; a shard it does not name held no change.
   - Single-document and saved-query writes keep `seq` (the document's own, for
     `if_seq`) and add `token`. `if_seq`, `_seq` on hits, `version` and `current_seq` are
     unchanged and remain per document.

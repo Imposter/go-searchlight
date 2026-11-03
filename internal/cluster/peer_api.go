@@ -387,7 +387,7 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	if details.Any() && found == nil {
 		found = make([][]api.PercolateMatch, len(docs))
 	}
-	return &percolateReply{Matches: out, Details: found, Stale: t.Stale(), Level: level}, nil
+	return &percolateReply{Matches: out, Details: found, Stale: t.Stale(), Level: level, Seq: t.Seq()}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {

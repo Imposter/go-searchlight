@@ -2,12 +2,14 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/store/storetest"
 )
@@ -154,6 +156,46 @@ func TestOldNodeAfterTheSwitchIsNotLive(t *testing.T) {
 		}
 		if !n0.leader() {
 			t.Errorf("%s does not lead beside an old node with a lower id", n0.id)
+		}
+	})
+}
+
+// TestPercolatedAtCoversAPeersCopy: a saved query written through the node holding its
+// shard's only copy, and a percolation through another node, which reads that copy: the
+// percolation's percolated_at names the generation the peer percolated at, so it covers
+// the saved query it matched, though the percolating node wrote no saved query there.
+func TestPercolatedAtCoversAPeersCopy(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		c := newCluster(t, d, nil)
+		a := c.start(0)
+		b := c.start(1)
+		if _, err := a.n.CreateIndex(tctx(t), "pa", api.IndexSpec{Settings: api.IndexSettings{Shards: 1, ReplicasPerShard: 1}}); err != nil {
+			t.Fatal(err)
+		}
+		waitCopies(t, a.st, "pa", 1, 1, time.Minute)
+		_, holders := serving(t, a.st, store.ShardID{Index: "pa"})
+		holder, other := a, b
+		if holders[0] == b.cfg.NodeID {
+			holder, other = b, a
+		}
+		mustWrite(t, holder.n, "pa", upsertOp("first", 1))
+		if _, err := count(tctx(t), other.n, "pa", nil); err != nil { // the other node opens the index before the saved query
+			t.Fatal(err)
+		}
+		q := mustWrite(t, holder.n, "pa", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "price", "op": "exists"}`)})
+		req := &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"price": 1}`)}}
+		if _, err := holder.n.Percolate(tctx(t), "pa", req, api.ReadOptions{WaitFor: q}); err != nil {
+			t.Fatal(err)
+		}
+		res, err := other.n.Write(tctx(t), "pa", []api.WriteOp{upsertOp("d", 1)}, api.WriteOptions{Percolate: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Percolated || string(res.Items[0].Queries) != `["q"]` {
+			t.Fatalf("the percolation through the other node: percolated %v, queries %s", res.Percolated, res.Items[0].Queries)
+		}
+		if got := res.PercolatedAt.Seq(0); got < q.Seq(0) {
+			t.Errorf("percolated_at names shard 0 at %d, below the saved query it matched at %d", got, q.Seq(0))
 		}
 	})
 }

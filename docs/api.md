@@ -625,9 +625,13 @@ curl -sS -X POST 'localhost:8780/indexes/products/_bulk?percolate=true' \
     It is not `token`: an unchanged document's noop puts its stored document's shard
     and seq, which can be far older, in `token`, and a written document's seq can be
     newer than the copies' last refresh. On a cluster, a shard percolated by a copy on
-    another node counts up to the seq the percolation asked of it (`wait_for`'s seq of
-    that shard, or the newest saved query this node wrote to the shard), so pass
-    `wait_for` there to raise it.
+    another node counts as that copy reports it: the seq of the generation it
+    percolated at, whichever node the saved queries were written through. While nodes
+    of 1.8 still serve (a rolling upgrade), one of them reports nothing, and its shard
+    counts up to the seq the percolation asked of it (`wait_for`'s seq of that shard, or
+    the newest saved query this node wrote there); every seq is global then, so that
+    holds. A shard `percolated_at` does not name stood at no seq: its copy held no
+    change of it, so the percolation saw no saved query of it.
 - **`refresh`.** As on single-document writes.
 
 ## Search and count

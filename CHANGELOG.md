@@ -95,8 +95,10 @@ from v1.8.0, with no client error and nothing lost.
 1. **Make clients work with both releases.** While 1.8 and 2.0 nodes both serve, the
    same request may reach either. 1.8 refuses `wait_for` and 2.0 refuses
    `wait_for_seq`, so send neither until every node runs 2.0, or send each node its own.
-   Accept a bulk response with either `seq` (1.8) or `token` (2.0). Once every node runs
-   2.0, use `token`, `wait_for` and `percolated_at` (scrape-bot among the clients).
+   Accept a bulk response with either `seq` (1.8) or `token` (2.0), and on
+   `_bulk?percolate=true` either `percolated_seq` (1.8, a seq) or `percolated_at` (2.0, a
+   token). Once every node runs 2.0, use `token`, `wait_for` and `percolated_at`
+   (scrape-bot among the clients).
 2. **Upgrade the nodes one at a time.** The first 2.0 node runs migration 7, after which
    no 1.x binary starts against the database: finish the rollout, and terminate old pods
    rather than isolating them. Until every node runs 2.0, every commit takes the global

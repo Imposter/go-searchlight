@@ -956,7 +956,10 @@ Notes:
      transaction, and the migration then holds `sl_changes`' lock only to swap the key
      onto one of them: reads and writes go on meanwhile (on an NVMe workstation, three
      million changelog rows took 7.5 s, and no read or write waited on a lock). Other
-     nodes starting meanwhile wait for it. On MySQL the key change rebuilds the table in
+     2.0 nodes starting on Postgres meanwhile wait for it; a 1.x node starting meanwhile
+     finds migrations 1 to 6 applied and starts (it is a 1.x node like the others). On
+     a database the first node creates, every migration runs in one transaction, and a
+     1.x node starting meanwhile waits for it and then refuses the newer schema. On MySQL the key change rebuilds the table in
      place online, about 18 s per million rows, while writes go on; MySQL logs those
      writes meanwhile, and if they outgrow `innodb_online_alter_log_max_size` (128 MiB
      by default) the online change fails (error 1799) and the migration runs it again
@@ -999,6 +1002,10 @@ Notes:
     leader within 30 s. Terminate old pods rather than isolating them.
   - **Rollback** means restoring the database, as for every migration. After the
     switch, seqs repeat across shards and row 1 is gone: no 1.x binary can use it.
+    **Restart every node after a restore.** A 2.0 store that saw shard sequences on
+    notices a database restored to before the switch at its next write and goes back
+    to the global sequence, but a node's cluster view still counts nodes without a seq
+    scheme out until it restarts.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and

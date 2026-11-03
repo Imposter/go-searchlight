@@ -2,12 +2,17 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
 // TestMigrationLockHold times migration 0007 on a changelog of
@@ -185,4 +190,54 @@ func TestConcurrentStepNeedsItsMigration(t *testing.T) {
 	if err == nil {
 		t.Fatal("an orphan concurrent step was accepted")
 	}
+}
+
+// TestFreshDatabaseMigratesInOneTransaction: on Postgres, the run that creates a
+// database runs every migration in one transaction, building migration 7's indexes
+// inside it: a node of the release before (a v6 binary) starting meanwhile waits, then
+// finds the schema newer than it knows, rather than starting on a database that then
+// switches to shard sequences at once.
+func TestFreshDatabaseMigratesInOneTransaction(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect != "postgres" {
+			t.Skip("only Postgres runs migration statements outside a transaction")
+		}
+		ctx := context.Background()
+		slow := func(d *dialect.Dialect) {
+			all := d.Migrations
+			files := fstest.MapFS{}
+			names, _ := fs.Glob(all, "*.sql")
+			for _, n := range names {
+				b, _ := fs.ReadFile(all, n)
+				if n == "0007_shard_seq.concurrent.sql" {
+					b = append([]byte("SELECT pg_sleep(3);\n\n"), b...)
+				}
+				files[n] = &fstest.MapFile{Data: b}
+			}
+			d.Migrations = files
+		}
+		a, err := Open(ctx, h.url, quiet, withDialect(slow))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = a.Close() })
+		var aErr error
+		var wg sync.WaitGroup
+		wg.Go(func() { aErr = a.Migrate(ctx) })
+		time.Sleep(1500 * time.Millisecond)
+		old, err := Open(ctx, h.url, quiet, WithSchema(6))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = old.Close() })
+		oldErr := old.Migrate(ctx)
+		wg.Wait()
+		if aErr != nil {
+			t.Fatal(aErr)
+		}
+		on, _ := a.ShardSeqs(ctx)
+		if !errors.Is(oldErr, ErrNewerSchema) || !on {
+			t.Errorf("a v6 binary starting while a database was created: %v; shard sequences on after: %v; want the schema refused and them on", oldErr, on)
+		}
+	})
 }

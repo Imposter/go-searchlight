@@ -281,6 +281,13 @@ func (s *sqlStore) migrateInSteps(ctx context.Context, ms []migration, created *
 		}
 	}()
 	known := knownVersion(ms)
+	fresh, err := s.pending(ctx, conn, ms[0].version)
+	if err != nil {
+		return err
+	}
+	if fresh {
+		return s.migrateTxRetrying(ctx, conn, inline(ms), known, created)
+	}
 	for start := 0; start < len(ms); {
 		end := start + 1
 		for end < len(ms) && len(ms[end].concurrent) == 0 {
@@ -366,6 +373,30 @@ func (s *sqlStore) pending(ctx context.Context, conn *sql.Conn, version int) (bo
 		}
 	}
 	return true, rows.Err()
+}
+
+// inline is ms with each migration's concurrent statements run first inside it, without
+// CONCURRENTLY: the run that creates a database runs every migration in one
+// transaction, so that no node of an earlier release finds the schema part way (it
+// waits for the migration lock, then finds the schema newer than it knows), and the
+// tables it builds on are empty. A concurrent statement must therefore also be valid
+// inside a transaction once CONCURRENTLY is taken out.
+func inline(ms []migration) []migration {
+	out := make([]migration, len(ms))
+	for i, m := range ms {
+		out[i] = m
+		if len(m.concurrent) == 0 {
+			continue
+		}
+		stmts := make([]string, 0, len(m.concurrent)+len(m.stmts))
+		for _, st := range m.concurrent {
+			stmts = append(stmts, strings.ReplaceAll(st, " CONCURRENTLY", ""))
+		}
+		stmts = append(stmts, m.stmts...)
+		out[i].stmts = stmts
+		out[i].concurrent = nil
+	}
+	return out
 }
 
 // migrateTxRetrying is migrateTx, run again when its DDL times out waiting for a table

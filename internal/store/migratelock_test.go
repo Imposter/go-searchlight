@@ -7,11 +7,13 @@ import (
 	"io/fs"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/store/dialect"
 )
 
@@ -241,3 +243,49 @@ func TestFreshDatabaseMigratesInOneTransaction(t *testing.T) {
 		}
 	})
 }
+
+// TestConcurrentStepBuildsOnce: on Postgres, a migration transaction that keeps
+// timing out is retried by migrateTxRetrying and then by Migrate's own loop; the
+// concurrent statements before it run once, and later runs find their indexes built.
+func TestConcurrentStepBuildsOnce(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, h *harness) {
+		if h.dialect != "postgres" {
+			t.Skip("only Postgres runs migration statements outside a transaction")
+		}
+		ctx := context.Background()
+		st, all := openAt(t, h, "0001_init.sql", "0002_body_codecs.sql", "0003_change_nonce.sql",
+			"0004_mapping_types.sql", "0005_versions.sql", "0006_body_hash.sql")
+		s := engine(st)
+		if _, err := s.w.ExecContext(ctx, "CREATE TABLE concurrent_runs (n INT)"); err != nil {
+			t.Fatal(err)
+		}
+		files := fstest.MapFS{}
+		names, _ := fs.Glob(all, "*.sql")
+		for _, n := range names {
+			b, _ := fs.ReadFile(all, n)
+			switch n {
+			case "0007_shard_seq.concurrent.sql":
+				b = append([]byte("INSERT INTO concurrent_runs VALUES (1);\n\n"), b...)
+			case "0007_shard_seq.sql":
+				b = append([]byte("SELECT 1/0;\n\n"), b...)
+			}
+			files[n] = &fstest.MapFile{Data: b}
+		}
+		s.d.Migrations = files
+		s.d.Maintenance.LockTimedOut = func(err error) bool { return strings.Contains(err.Error(), "division by zero") }
+		s.clock = instant{}
+		err := st.Migrate(ctx)
+		if err == nil {
+			t.Fatal("migrate succeeded")
+		}
+		runs := countRows(t, st, "SELECT COUNT(*) FROM concurrent_runs")
+		if runs != 1 {
+			t.Errorf("the concurrent statements ran %d times for one Migrate, want once", runs)
+		}
+	})
+}
+
+// instant is a clock whose Sleep returns at once.
+type instant struct{ clock.Real }
+
+func (instant) Sleep(ctx context.Context, _ time.Duration) error { return ctx.Err() }

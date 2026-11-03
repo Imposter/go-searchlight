@@ -505,8 +505,12 @@ type Maintenance struct {
 	// migration has one.
 	ConcurrentLock   string
 	ConcurrentUnlock string
-	SessionLock      string // must return one row whose first column is 1 on success
-	SessionUnlock    string
+	// ValidIndex: (name) -> 1 when the schema has a valid index of that name, else 0;
+	// a migration's concurrent statements are not run again once every index they build
+	// is. With ConcurrentLock.
+	ValidIndex    string
+	SessionLock   string // must return one row whose first column is 1 on success
+	SessionUnlock string
 	// MigrateLockTimeout bounds how long a migration's DDL waits for a table lock,
 	// run after MigrateLock or SessionLock: a statement queued behind a long query
 	// would otherwise hold back every query on its table meanwhile. A migration that

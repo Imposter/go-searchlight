@@ -411,6 +411,7 @@ ON CONFLICT (index_name, shard) DO UPDATE SET below_seq = GREATEST(sl_pruned.bel
 	MigrateLock:       fmt.Sprintf("SELECT pg_advisory_xact_lock(%d)", int64(migrateLockKey)),
 	ConcurrentLock:    fmt.Sprintf("SELECT pg_try_advisory_lock(%d)", int64(concurrentLockKey)),
 	ConcurrentUnlock:  fmt.Sprintf("SELECT pg_advisory_unlock(%d)", int64(concurrentLockKey)),
+	ValidIndex:        "SELECT COUNT(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 AND n.nspname = current_schema() AND i.indisvalid",
 	// ALTER TABLE queues for its table's lock behind the queries running on it,
 	// and every later query queues behind it meanwhile.
 	MigrateLockTimeout: "SET LOCAL lock_timeout = '1s'",

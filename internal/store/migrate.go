@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -324,9 +325,44 @@ func (s *sqlStore) migrateInSteps(ctx context.Context, ms []migration, created *
 // Postgres may cancel either.
 const concurrentAttempts = 5
 
+// concurrentIndex finds the index a concurrent statement builds.
+var concurrentIndex = regexp.MustCompile(`(?i)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)`)
+
+// built reports whether every index m's concurrent statements build exists and is
+// valid, so that they need not run (again): a run interrupted after them, or whose
+// transaction kept timing out, built them already.
+func (s *sqlStore) built(ctx context.Context, conn *sql.Conn, m migration) (bool, error) {
+	if s.d.Maintenance.ValidIndex == "" {
+		return false, nil
+	}
+	names := 0
+	for _, st := range m.concurrent {
+		x := concurrentIndex.FindStringSubmatch(st)
+		if x == nil {
+			continue
+		}
+		names++
+		var n int
+		if err := conn.QueryRowContext(ctx, s.d.Maintenance.ValidIndex, x[1]).Scan(&n); err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return false, nil
+		}
+	}
+	return names > 0, nil
+}
+
 // runConcurrent runs m's concurrent statements, all of them again after a deadlock
-// (they are written to be run again).
+// (they are written to be run again), unless the indexes they build are there and
+// valid already.
 func (s *sqlStore) runConcurrent(ctx context.Context, conn *sql.Conn, m migration) error {
+	if done, err := s.built(ctx, conn, m); err != nil || done {
+		if done {
+			s.log.InfoContext(ctx, "a migration's concurrent statements built their indexes already", slog.Int("version", m.version))
+		}
+		return err
+	}
 	t0 := s.clock.Now()
 	for attempt := 1; ; attempt++ {
 		var err error
@@ -400,8 +436,9 @@ func inline(ms []migration) []migration {
 }
 
 // migrateTxRetrying is migrateTx, run again when its DDL times out waiting for a table
-// lock, as Migrate runs a whole migration again, so that what ran outside the
-// transaction before it is not run again.
+// lock. Migrate runs a whole run again too, after this gives up; runConcurrent then
+// finds the indexes the concurrent statements built already valid, and builds nothing
+// again.
 func (s *sqlStore) migrateTxRetrying(ctx context.Context, conn *sql.Conn, ms []migration, known int, created *bool) error {
 	timedOut := s.d.Maintenance.LockTimedOut
 	wait := migrateRetryBase

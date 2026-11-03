@@ -26,6 +26,7 @@ func optionalStatements(d *dialect.Dialect) map[string]bool {
 		// Only Postgres has a migration that builds outside a transaction.
 		"Maintenance.ConcurrentLock":   d.Name == "postgres",
 		"Maintenance.ConcurrentUnlock": d.Name == "postgres",
+		"Maintenance.ValidIndex":       d.Name == "postgres",
 		// Notifications are sent only where the engine can listen.
 		"Changelog.Notify": d.Listen != nil,
 	}

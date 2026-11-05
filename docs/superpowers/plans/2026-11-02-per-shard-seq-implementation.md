@@ -1,5 +1,9 @@
 # Implementation plan: per-shard sequences (Change A, Searchlight 2.0.0)
 
+**Status: done.** Shipped as Searchlight 2.0.0 on 2026-11-03 (PR #136, released in #137). Production runs it on every
+node since scrape-bot's v0.48.0 made the rollout safe; what is left of the write scaling work is Phase 4 of
+[the write scaling plan](2026-11-01-write-scaling.md). This plan is kept as the record of how it was built.
+
 **Source:** Phases 1 and 2 of [the write scaling plan](2026-11-01-write-scaling.md), as approved: D1 (one commit
 per shard, per-item results, no 2PC), D2 (an opaque token in place of the scalar `seq`, `wait_for_seq` and
 `percolated_seq`) and D4 (on all three dialects). Change B is out of scope. File and line references are in

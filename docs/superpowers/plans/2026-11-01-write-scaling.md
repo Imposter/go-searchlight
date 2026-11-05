@@ -5,6 +5,13 @@ opaque token, in Searchlight 2.0.0), and Change A now, re-measuring before any d
 that decision. Production's storage check is deferred, so the gain there is unconfirmed. The
 [implementation plan](2026-11-02-per-shard-seq-implementation.md) builds it; its corrections are folded in below.
 
+**Progress (2026-11-05):** Phases 0-3 are done. Change A shipped as Searchlight 2.0.0 on 2026-11-03 (PR #136, released
+in #137): on Postgres with NVMe storage a node's commit path sustains 3.8-5.0× 1.8's changes per second on 8 and 64
+shards (2.2× across three nodes), and end to end a 64-shard index takes 1.95× the documents per second. scrape-bot's
+Phase 3 shipped in its v0.48.0 (1.x, 2.0 and a mix during the rollout) and v0.55.0 (2.0 alone), and production runs
+2.0 on every node. **Next is Phase 4**, the decision on Change B: it needs production's storage measured (still
+deferred) and answers to open questions 1 and 2. Until then nothing more is scheduled here.
+
 **Order changed by Phase 0:** several committers on today's single counter row were slower (by up to 54%), and moving
 `pg_notify` out gained nothing alone. So Phase 1 doesn't ship on its own: its items land with Phase 2, and the first
 release with any of this is 2.0.0.
@@ -135,19 +142,36 @@ shard.
 
 **Exit:** D6's bar on one instance for lock contention, and no conformance or chaos regressions.
 
-## Phase 3: scrape-bot and other clients (1-2 weeks, in that repo)
+## Phase 3: scrape-bot and other clients (1-2 weeks, in that repo) — done
+
+**Done 2026-11-05.** scrape-bot v0.48.0 (its PR #126) compares per-shard positions and tokens, handles partial bulks,
+and works with 1.x, 2.0 and a mix of both, so the rollout needed no stop. v0.55.0 (its PR #137) dropped 1.x: its
+version floor is 2.0, and its migration `d3f5b7c9e1a2` forgets the 1.x seqs it had stored. The items below were the
+plan:
+
 
 - Replace `mirrored_seq`, `percolated_seq` and `decided_seq` comparisons with per-shard or token forms
   (`watch_search.py:795-797,1024,1183`, `models.py:198-216`, `mirror.py`, `reconcile.py`).
 - Handle partial bulk results: only rows whose item succeeded leave the mirror queue.
 - Add a migration, and bump the Searchlight version floor.
 
-Change A isn't released until this is ready, so the two ship together.
+Change A wasn't released until this was ready, so the two shipped together.
 
 ## Phase 4: decision point before Change B
 
 Rerun Phase 0's measurements. Only go on if the WAL or the instance is now the measured limit, and separate storage exists for at
 least 2 instances. Otherwise stop: Change A has shipped value on its own.
+
+**Where it stands (2026-11-05).** Not started. Phase 0 and 2.0's numbers come from an NVMe workstation; production's
+storage (one Searchlight node on the app's Postgres, on the TrueNAS pool) was never measured, so 2.0's gain there is
+unconfirmed. scrape-bot's load test (its `docs/superpowers/specs/2026-10-31-scale-for-growth-design.md`) found that
+Searchlight's writes aren't what limits its growth at today's change rates, so nothing pushes this phase yet. Start
+it when writes are the measured limit, with:
+
+1. Phase 0's suite on production's storage, on 2.0 (the numbers D6 needs).
+2. Answers to open questions 1 (the throughput goal) and 2 (hardware for 2-3 Postgres instances on separate storage).
+3. A look at the parked stateless nodes design (PR #79, `docs/superpowers/specs/2026-10-10-stateless-nodes-design.md`
+   on its branch), §14: its bundles and claims would need a placement rule under Change B.
 
 ## Phase 5: sharded databases, Change B (2-3 months, Postgres only)
 

@@ -116,14 +116,6 @@ func New(opts Options) *Percolator {
 	return p
 }
 
-var defaultPercolator = sync.OnceValue(func() *Percolator { return New(Options{}) })
-
-// Percolate is [Percolator.Percolate] on a process-wide Percolator with default
-// options.
-func Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
-	return defaultPercolator().Percolate(ctx, g, docs)
-}
-
 // view is one query segment of a generation, as percolation reads it.
 type view struct {
 	seg     *Segment           // nil: not the percolator's format (checked by brute force)
@@ -171,9 +163,16 @@ func (s *docStats) add(o *docStats) {
 // verify_ms: per-document probe and verify time summed over every worker (busy time,
 // which exceeds the wall time when documents run in parallel).
 //
+// The documents' matches together are at most MaxMatches: past it, the call stops and
+// returns ErrTooManyMatches. A document that fails stops the other workers too.
+//
 // The result is exactly the brute force one, every live query checked with
 // [query.Match]: the query index only skips queries that cannot match, and each
 // candidate's program decides as the matcher does.
+//
+// Date math resolves at the instant ctx carries ([query.WithNow]), which the
+// coordinator sets once for every shard of a request; without one, at the time of the
+// call.
 func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []schema.Doc) ([]IDs, error) {
 	if g == nil {
 		return nil, errors.New("percolate: no generation")
@@ -182,6 +181,11 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 		attribute.Int("documents", len(docs)), attribute.Int64("queries", int64(g.NumQueries())))...)) //nolint:gosec // a query count
 	defer span.End()
 	start := time.Now()
+	now, ok := query.NowFrom(ctx)
+	if !ok {
+		now = start
+	}
+	nowMS := now.UnixMilli()
 
 	views := make([]view, len(g.QuerySegments))
 	var maxN, maxEntries uint32
@@ -211,13 +215,14 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	var total docStats
 	var mu sync.Mutex
 	var firstErr error
-	var next atomic.Int64
+	var next, matches atomic.Int64
 	work := func() {
 		sc, _ := p.scratchCache.Get().(*scratch)
 		if sc == nil {
 			sc = new(scratch)
 		}
 		sc.fit(size.n, size.entries, size.fields)
+		sc.now = nowMS
 		var local docStats
 		for {
 			i := int(next.Add(1) - 1)
@@ -246,11 +251,18 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 				mu.Lock()
 				firstErr = cmpErr(firstErr, fmt.Errorf("percolate: document %d (%q): %w", i, docs[i].ID, err))
 				mu.Unlock()
-				next.Store(int64(len(docs))) // stop the others
+				next.Store(int64(len(docs)))
 				break
 			}
 			out[i] = ids
 			local.add(&st)
+			if matches.Add(int64(st.matched)) > int64(maxMatches) {
+				mu.Lock()
+				firstErr = cmpErr(firstErr, ErrTooManyMatches)
+				mu.Unlock()
+				next.Store(int64(len(docs)))
+				break
+			}
 		}
 		p.scratchCache.Put(sc)
 		mu.Lock()
@@ -273,8 +285,6 @@ func (p *Percolator) Percolate(ctx context.Context, g *shard.Generation, docs []
 	if total.verifiedMiss > 0 {
 		p.verified.Add(ctx, int64(total.verifiedMiss), p.missSet)
 	}
-	// probe_ms and verify_ms are per-document time summed over every worker: with
-	// several workers they exceed the call's wall time.
 	span.SetAttributes(attribute.Int("candidates", total.candidates), attribute.Int("verified", total.verifiedMatch+total.verifiedMiss),
 		attribute.Int("matches", total.matched), attribute.Int("always_check", always),
 		attribute.Float64("probe_ms", float64(total.probe.Microseconds())/1000), attribute.Float64("verify_ms", float64(total.verify.Microseconds())/1000))
@@ -339,6 +349,18 @@ type scratchSize struct {
 	n, entries uint32
 	fields     int
 }
+
+// MaxMatches bounds the matches one percolation answers, every document's together.
+// Past it, Percolate stops and returns ErrTooManyMatches rather than answer with
+// matches left out: an answer is complete or refused (spec section 7).
+const MaxMatches = 1_000_000
+
+// maxMatches is MaxMatches, a variable so tests can lower it.
+var maxMatches = MaxMatches
+
+// ErrTooManyMatches is a percolation refused because its documents match more than
+// MaxMatches saved queries together.
+var ErrTooManyMatches = fmt.Errorf("percolate: the documents match more than %d saved queries together", MaxMatches)
 
 // Splitting one document: minWindowQueries is the fewest saved queries per worker
 // (a variable so tests can force splits), windowsPerWorker how many windows each
@@ -435,7 +457,8 @@ func newSplitPlan(views []view, workers, k int) *splitPlan {
 // split percolates one document across every query segment, window by window, on
 // win.workers goroutines (this one and helpers, sc serving this one) that take the
 // windows in turn, and joins the windows' matches in order: window w's are
-// buf[lo:hi] of the scratch of the worker that took it. A canceled ctx stops the
+// buf[lo:hi] of the scratch of the worker that took it, so the helpers' scratches go
+// back to the pool only once the answer is copied out. A canceled ctx stops the
 // workers before their next window.
 func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []view, d *schema.Doc, win *splitPlan, sc *scratch, size scratchSize) (IDs, docStats, error) {
 	if d.Fields == nil {
@@ -461,6 +484,7 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 				c = new(scratch)
 			}
 			c.fit(size.n, size.entries, size.fields)
+			c.now = sc.now
 			scs[id] = c
 		}
 		st := &stats[id]
@@ -498,11 +522,13 @@ func (p *Percolator) split(ctx context.Context, g *shard.Generation, views []vie
 	}
 	work(0)
 	wg.Wait()
-	for _, c := range scs[1:] {
-		if c != nil {
-			p.scratchCache.Put(c)
+	defer func() {
+		for _, c := range scs[1:] {
+			if c != nil {
+				p.scratchCache.Put(c)
+			}
 		}
-	}
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, docStats{}, err
 	}
@@ -576,7 +602,8 @@ func bruteForce(v *view, d *schema.Doc, sc *scratch, st *docStats) error {
 			return err
 		}
 		st.candidates++
-		if !query.Match(q.Query, d) {
+		resolved, _ := query.Resolve(q.Query, time.UnixMilli(sc.now))
+		if !query.Match(resolved, d) {
 			st.verifiedMiss++
 			continue
 		}

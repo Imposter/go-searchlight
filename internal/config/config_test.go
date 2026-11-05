@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/prio"
 )
 
 // envOf returns a getenv over a fixed map.
@@ -52,6 +54,7 @@ func TestLoadDefaults(t *testing.T) {
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
+		BackgroundShare:       prio.Default(),
 		GCHeapFloor:           64 << 20,
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       time.Minute,
@@ -59,6 +62,7 @@ func TestLoadDefaults(t *testing.T) {
 		MaxBodyBytes:          16 << 20,
 		MaxDocBytes:           4 << 20,
 		MaxBulkOps:            10_000,
+		MaxResultWindow:       10_000,
 		RequestTimeout:        30 * time.Second,
 		ReadTimeout:           time.Minute,
 		SearchQueue:           1000,
@@ -73,6 +77,12 @@ func TestLoadDefaults(t *testing.T) {
 		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               128 << 20,
+		RequestCacheRedisPrefix:        "searchlight:rc:",
+		RequestCacheRedisTTL:           24 * time.Hour,
+		RequestCacheRedisTimeout:       50 * time.Millisecond,
+		RequestCacheRedisMaxEntryBytes: 8 << 20,
 	}
 	if c != want {
 		t.Errorf("defaults:\n got %+v\nwant %+v", c, want)
@@ -100,6 +110,8 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		"SEARCHLIGHT_MERGE_BUDGET":             "128MB",
 		"SEARCHLIGHT_MERGE_THREADS":            "3",
 		"SEARCHLIGHT_SEARCH_THREADS":           "7",
+		"SEARCHLIGHT_WRITE_TRANSACTIONS":       "12",
+		"SEARCHLIGHT_BACKGROUND_SHARE":         "0.5",
 		"SEARCHLIGHT_GC_HEAP_FLOOR":            "0",
 		"SEARCHLIGHT_LOG_LEVEL":                "DEBUG",
 		"SEARCHLIGHT_PPROF":                    "true",
@@ -107,6 +119,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		"SEARCHLIGHT_MAX_BODY_BYTES":           "8MiB",
 		"SEARCHLIGHT_MAX_DOC_BYTES":            "1MiB",
 		"SEARCHLIGHT_MAX_BULK_OPS":             "500",
+		"SEARCHLIGHT_MAX_RESULT_WINDOW":        "50000",
 		"SEARCHLIGHT_REQUEST_TIMEOUT":          "5s",
 		"SEARCHLIGHT_READ_TIMEOUT":             "20s",
 		"SEARCHLIGHT_SEARCH_QUEUE":             "64",
@@ -142,6 +155,8 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		MergeBudget:           128e6,
 		MergeThreads:          3,
 		SearchThreads:         7,
+		WriteTransactions:     12,
+		BackgroundShare:       0.5,
 		GCHeapFloor:           0,
 		LogLevel:              slog.LevelDebug,
 		Pprof:                 true,
@@ -149,6 +164,7 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		MaxBodyBytes:          8 << 20,
 		MaxDocBytes:           1 << 20,
 		MaxBulkOps:            500,
+		MaxResultWindow:       50_000,
 		RequestTimeout:        5 * time.Second,
 		ReadTimeout:           20 * time.Second,
 		SearchQueue:           64,
@@ -163,6 +179,12 @@ func TestLoadEnvironmentOverrides(t *testing.T) {
 		BundleInterval:        30 * time.Minute,
 		BundleRetention:       3,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               128 << 20,
+		RequestCacheRedisPrefix:        "searchlight:rc:",
+		RequestCacheRedisTTL:           24 * time.Hour,
+		RequestCacheRedisTimeout:       50 * time.Millisecond,
+		RequestCacheRedisMaxEntryBytes: 8 << 20,
 	}
 	if c != want {
 		t.Errorf("env overrides:\n got %+v\nwant %+v", c, want)
@@ -240,6 +262,7 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"gc_heap_floor", map[string]string{"SEARCHLIGHT_GC_HEAP_FLOOR": "-1MiB"}, nil},
 		{"merge_threads", map[string]string{"SEARCHLIGHT_MERGE_THREADS": "0"}, nil},
 		{"search_threads", map[string]string{"SEARCHLIGHT_SEARCH_THREADS": "many"}, nil},
+		{"background_share", map[string]string{"SEARCHLIGHT_BACKGROUND_SHARE": "0.01"}, nil},
 		{"log_level", map[string]string{"SEARCHLIGHT_LOG_LEVEL": "loud"}, nil},
 		{"pprof", map[string]string{"SEARCHLIGHT_PPROF": "maybe"}, nil},
 		{"shutdown_timeout", map[string]string{"SEARCHLIGHT_SHUTDOWN_TIMEOUT": "0"}, nil},
@@ -250,6 +273,8 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"max_doc_bytes", map[string]string{"SEARCHLIGHT_MAX_DOC_BYTES": "17MiB"}, nil},
 		{"max_doc_bytes", map[string]string{"SEARCHLIGHT_MAX_DOC_BYTES": "0"}, nil},
 		{"max_bulk_ops", map[string]string{"SEARCHLIGHT_MAX_BULK_OPS": "0"}, nil},
+		{"max_result_window", map[string]string{"SEARCHLIGHT_MAX_RESULT_WINDOW": "0"}, nil},
+		{"max_result_window", map[string]string{"SEARCHLIGHT_MAX_RESULT_WINDOW": "1000001"}, nil},
 		{"request_timeout", map[string]string{"SEARCHLIGHT_REQUEST_TIMEOUT": "0s"}, nil},
 		{"read_timeout", map[string]string{"SEARCHLIGHT_READ_TIMEOUT": "never"}, nil},
 		{"search_queue", map[string]string{"SEARCHLIGHT_SEARCH_QUEUE": "-1"}, nil},
@@ -265,7 +290,17 @@ func TestLoadInvalidValuesNameTheSetting(t *testing.T) {
 		{"bundle_retention", map[string]string{"SEARCHLIGHT_BUNDLE_RETENTION": "0"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_KEY": "key.pem"}, nil},
 		{"tls_cert", map[string]string{"SEARCHLIGHT_TLS_CERT": filepath.Join(t.TempDir(), "nope.pem"), "SEARCHLIGHT_TLS_KEY": filepath.Join(t.TempDir(), "nope.key")}, nil},
+		{"request_cache_size", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_SIZE": "big"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "memcached://cache:11211"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "redis:///0"}, nil},
+		{"request_cache_redis_url", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL": "redis://cache:6379/first"}, nil},
+		{"request_cache_redis_password", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD": "x"}, nil},
+		{"request_cache_redis_ttl", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_TTL": "0s"}, nil},
+		{"request_cache_redis_timeout", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_TIMEOUT": "fast"}, nil},
+		{"request_cache_redis_max_entry_bytes", map[string]string{"SEARCHLIGHT_REQUEST_CACHE_REDIS_MAX_ENTRY_BYTES": "0"}, nil},
 		{"search_threads", nil, []string{"--search_threads=-2"}},
+		{"write_transactions", nil, []string{"--write_transactions=-1"}},
+		{"background_share", nil, []string{"--background_share=1.5"}},
 		{"data_dir", nil, []string{"--data_dir="}},
 		{"bogus", nil, []string{"--bogus=1"}},
 	}
@@ -372,6 +407,41 @@ func TestLogValueRedactsSecrets(t *testing.T) {
 	}
 }
 
+func TestLoadRequestCache(t *testing.T) {
+	c, err := Load(nil, envOf(map[string]string{"SEARCHLIGHT_STORE_URL": sqliteURL, insecure: "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestCacheSize != 128<<20 || c.RequestCacheRedisURL != "" || c.RequestCacheRedisTTL != 24*time.Hour ||
+		c.RequestCacheRedisTimeout != 50*time.Millisecond || c.RequestCacheRedisPrefix != "searchlight:rc:" ||
+		c.RequestCacheRedisMaxEntryBytes != 8<<20 {
+		t.Fatalf("request cache defaults %+v", c)
+	}
+	path := filepath.Join(t.TempDir(), "redis-password")
+	if err := os.WriteFile(path, []byte("s3same\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load([]string{"--request_cache_size=0"}, envOf(map[string]string{
+		"SEARCHLIGHT_STORE_URL":                         sqliteURL,
+		insecure:                                        "true",
+		"SEARCHLIGHT_REQUEST_CACHE_REDIS_URL":           "rediss://user:hunter2@cache:6380/2",
+		"SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD_FILE": path,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RequestCacheSize != 0 || c.RequestCacheRedisPassword != "s3same" {
+		t.Fatalf("request_cache_size %d, password %q", c.RequestCacheSize, c.RequestCacheRedisPassword)
+	}
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("config", "config", c)
+	for _, secret := range []string{"hunter2", "s3same"} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("log leaks %q: %s", secret, buf.String())
+		}
+	}
+}
+
 func TestUsageListsEverySetting(t *testing.T) {
 	var buf bytes.Buffer
 	Usage(&buf)
@@ -401,6 +471,50 @@ func TestParseBytes(t *testing.T) {
 	for n, want := range map[int64]string{0: "0", 1: "1", 1 << 20: "1MiB", 1536: "1536", 3 << 30: "3GiB", 1e6: "1000000"} {
 		if got := FormatBytes(n); got != want {
 			t.Errorf("FormatBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+// TestLoadRefusesAClusterStoreWithoutClusterToken: on Postgres or MySQL, a store nodes
+// share, the peer API needs cluster_token; only insecure_no_auth starts without it.
+func TestLoadRefusesAClusterStoreWithoutClusterToken(t *testing.T) {
+	tokens := filepath.Join(t.TempDir(), "tokens")
+	if err := os.WriteFile(tokens, []byte("t0ken write\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		store, clusterToken, insecureNoAuth string
+		ok                                  bool
+	}{
+		{"postgres://u@db/sl", "", "", false},
+		{"mysql://u@db/sl", "", "", false},
+		{"postgres://u@db/sl", "secret", "", true},
+		{"mysql://u@db/sl", "", "true", true},
+		{sqliteURL, "", "", true},
+	} {
+		env := map[string]string{
+			"SEARCHLIGHT_STORE_URL": tc.store, "SEARCHLIGHT_TOKENS_FILE": tokens,
+			"SEARCHLIGHT_CLUSTER_TOKEN": tc.clusterToken, insecure: tc.insecureNoAuth,
+		}
+		_, err := Load(nil, envOf(env))
+		switch {
+		case tc.ok && err != nil:
+			t.Errorf("%+v: %v", tc, err)
+		case !tc.ok && (err == nil || !strings.Contains(err.Error(), "set cluster_token")):
+			t.Errorf("%+v: err = %v, want one asking to set cluster_token", tc, err)
+		case !tc.ok && strings.Index(err.Error(), "insecure_no_auth") < strings.Index(err.Error(), "set cluster_token"):
+			t.Errorf("%+v: err = %v, want cluster_token offered before insecure_no_auth", tc, err)
+		}
+	}
+}
+
+func TestLoopback(t *testing.T) {
+	for host, want := range map[string][2]bool{
+		"127.0.0.1": {true, true}, "::1": {true, true}, "localhost": {true, false},
+		"0.0.0.0": {false, false}, "10.0.0.7": {false, false}, "node-a": {false, false}, "": {false, false},
+	} {
+		if got := [2]bool{LoopbackHost(host), LoopbackIP(host)}; got != want {
+			t.Errorf("LoopbackHost, LoopbackIP(%q) = %v, want %v", host, got, want)
 		}
 	}
 }

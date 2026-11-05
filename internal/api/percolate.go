@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/percolate"
 )
 
 // MaxPercolateDocs bounds the documents (given and stored) of one _percolate request.
@@ -19,8 +21,10 @@ type percolateBody struct {
 
 // percolate serves POST /indexes/{index}/_percolate: {"docs": [{...}], "ids": [...]}
 // in; for each document, given ones first, the ids of the saved queries it matches.
+// Documents matching more than percolate.MaxMatches saved queries together are
+// refused with a 422, never answered in part.
 func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -43,12 +47,29 @@ func (s *Server) percolate(w http.ResponseWriter, r *http.Request, p params) err
 			return TooLarge("docs.%d is %d bytes, over %d (max_doc_bytes)", i, len(d), s.cfg.MaxDocBytes)
 		}
 	}
-	res, err := s.c.Percolate(r.Context(), r.PathValue("index"), &PercolateRequest{Docs: req.Docs, IDs: req.IDs}, ReadOptions{WaitForSeq: wait})
+	withMatches, innerHits, release, e := s.percolateDetails(p)
+	if e != nil {
+		return e
+	}
+	defer release()
+	res, err := s.c.Percolate(r.Context(), r.PathValue("index"), &PercolateRequest{Docs: req.Docs, IDs: req.IDs, Matches: withMatches, InnerHits: innerHits}, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}
+	if matches(res.Results, func(r *PercolateResult) json.RawMessage { return r.Queries }) > percolate.MaxMatches {
+		return tooManyMatches(nil)
+	}
 	admitted := info(r.Context()).admitted
 	return writePercolate(w, res, func() time.Duration { return s.clock.Since(admitted) })
+}
+
+// matches counts the saved-query ids of every result, queries giving each one's.
+func matches[T any](results []T, queries func(*T) json.RawMessage) int {
+	n := 0
+	for i := range results {
+		n += percolate.IDs(queries(&results[i])).Len()
+	}
+	return n
 }
 
 // emptyArray is the queries of a document that matches none.
@@ -89,11 +110,21 @@ func writePercolate(w http.ResponseWriter, res *PercolateResponse, took func() t
 			b = append(b, ',')
 		}
 		b = strconv.AppendBool(append(b, `"found":`...), r.Found)
+		if r.Seq > 0 {
+			b = strconv.AppendInt(append(b, `,"_seq":`...), r.Seq, 10)
+		}
 		b = append(b, `,"queries":`...)
 		if len(r.Queries) == 0 {
 			b = append(b, emptyArray...)
 		} else {
 			b = append(b, r.Queries...)
+		}
+		if r.Matches != nil {
+			ms, err := json.Marshal(r.Matches)
+			if err != nil {
+				return err
+			}
+			b = append(append(b, `,"matches":`...), ms...)
 		}
 		b = append(b, '}')
 	}
@@ -117,3 +148,30 @@ func writePercolate(w http.ResponseWriter, res *PercolateResponse, took func() t
 	}
 	return nil
 }
+
+// percolateDetails reads a percolation's percolate_matches and percolate_inner_hits
+// parameters (the second implies the first), and reserves, for inner hits, the heap
+// MaxPercolateInnerHits offsets may take from max_inflight_read_bytes: release gives it
+// back (a no-op without).
+func (s *Server) percolateDetails(p params) (matches, innerHits bool, release func(), e *Error) {
+	release = func() {}
+	if matches, e = p.bool("percolate_matches"); e != nil {
+		return false, false, release, e
+	}
+	if innerHits, e = p.bool("percolate_inner_hits"); e != nil {
+		return false, false, release, e
+	}
+	if innerHits {
+		cost := min(int64(MaxPercolateInnerHits)*innerHitOffsetBytes, s.readBytes.limit/2)
+		if !s.readBytes.reserve(cost) {
+			return false, false, release, overBudget(s.readBytes)
+		}
+		release = func() { s.readBytes.release(cost) }
+	}
+	return matches || innerHits, innerHits, release, nil
+}
+
+// innerHitOffsetBytes is the heap one inner hit offset of a percolation's answer is
+// charged against max_inflight_read_bytes: its int as a match holds it, and its digits
+// in the response.
+const innerHitOffsetBytes = 16

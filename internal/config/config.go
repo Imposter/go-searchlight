@@ -4,10 +4,10 @@
 //
 // Every setting has one snake_case name, used everywhere: the flag is
 // --<name> and the environment variable is SEARCHLIGHT_<NAME>. A flag wins
-// over the environment, which wins over the default. Secrets (store_url and
-// cluster_token) can also come from a file named by SEARCHLIGHT_<NAME>_FILE,
-// so container secrets never have to sit in the environment. Only store_url
-// is required.
+// over the environment, which wins over the default. Secrets (store_url,
+// cluster_token and the request cache's Redis URL and password) can also come
+// from a file named by SEARCHLIGHT_<NAME>_FILE, so container secrets never have
+// to sit in the environment. Only store_url is required.
 package config
 
 import (
@@ -25,6 +25,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/Imposter/go-searchlight/internal/prio"
 )
 
 // EnvPrefix prefixes every setting's environment variable.
@@ -125,6 +127,17 @@ type Config struct {
 	MergeThreads int
 	// SearchThreads sizes the search worker pool.
 	SearchThreads int
+	// WriteTransactions bounds the write transactions this node runs at once, one a
+	// shard: its group committer's share of the store's connections. 0 means
+	// store.DefaultWriteTransactions (16), at most half the store's write connections
+	// (SQLite's one writer gets 1, which commits a request's shards together).
+	WriteTransactions int
+	// BackgroundShare is the share of each prio.Period background work (merges, refresh
+	// builds, write and apply analysis, file removal) runs while searches occupy every
+	// processor: it steps aside for them at its checkpoints for the rest (see package
+	// prio). 1 never steps aside. By default 0.25 at GOMAXPROCS 1, where searches would
+	// otherwise queue behind merges, and 1 with more.
+	BackgroundShare float64
 	// GCHeapFloor is the heap size below which the garbage collector does not start
 	// a cycle (at most a quarter of GOMEMLIMIT); 0 turns the floor off, and a GOGC
 	// environment variable overrides it.
@@ -146,6 +159,11 @@ type Config struct {
 	MaxDocBytes int64
 	// MaxBulkOps caps the operations of one _bulk request.
 	MaxBulkOps int
+	// MaxResultWindow caps a search's from + size (Elasticsearch's
+	// index.max_result_window): each shard finds that many hits and the coordinator
+	// merges them all, so a deeper page is refused, to be read with search_after. At
+	// most MaxResultWindowLimit.
+	MaxResultWindow int
 	// RequestTimeout is every public API request's deadline: a search past it
 	// answers with what it has (timed_out), a wait past it gives up.
 	RequestTimeout time.Duration
@@ -184,6 +202,27 @@ type Config struct {
 	// it behind a TLS-terminating proxy.
 	TLSCert string
 	TLSKey  string
+
+	// RequestCacheSize bounds the shard request cache in memory: the shard results
+	// of size-0 searches (counts, aggregations), kept until what the shard holds
+	// changes. 0 keeps none in memory.
+	RequestCacheSize int64
+	// RequestCacheRedisURL, when set, puts a Redis behind the memory cache
+	// (redis://[user:password@]host:port[/db], or rediss:// for TLS), shared by every
+	// node that reaches it and kept across restarts.
+	RequestCacheRedisURL string
+	// RequestCacheRedisPassword, when set, replaces the URL's password.
+	RequestCacheRedisPassword string
+	// RequestCacheRedisPrefix starts every key the cache writes to Redis.
+	RequestCacheRedisPrefix string
+	// RequestCacheRedisTTL is how long a Redis entry lives.
+	RequestCacheRedisTTL time.Duration
+	// RequestCacheRedisTimeout bounds each Redis call, its dial included: a slow or
+	// unreachable Redis delays a search by at most about this much.
+	RequestCacheRedisTimeout time.Duration
+	// RequestCacheRedisMaxEntryBytes is the largest encoded result written to, or read
+	// from, Redis.
+	RequestCacheRedisMaxEntryBytes int64
 }
 
 // MaxBodyLimit is the largest max_body_bytes: 32 MiB less 1 KiB, so a body
@@ -191,6 +230,19 @@ type Config struct {
 // segment stores (segment.MaxStoredBytes, 32 MiB with its id), and no accepted
 // body can carry a document a refresh would refuse.
 const MaxBodyLimit = 32<<20 - 1<<10
+
+// MaxResultWindowLimit is the largest max_result_window: the most hits of one search
+// a shard keeps (search.MaxResultWindow is it).
+const MaxResultWindowLimit = 1_000_000
+
+// The request cache's defaults (request_cache_size and request_cache_redis_*).
+const (
+	DefaultRequestCacheSize               = 128 << 20
+	DefaultRequestCacheRedisPrefix        = "searchlight:rc:"
+	DefaultRequestCacheRedisTTL           = 24 * time.Hour
+	DefaultRequestCacheRedisTimeout       = 50 * time.Millisecond
+	DefaultRequestCacheRedisMaxEntryBytes = 8 << 20
+)
 
 // Default returns the production defaults. StoreURL is empty because it has
 // no default.
@@ -211,12 +263,14 @@ func Default() Config {
 		MergeBudget:           64 << 20,
 		MergeThreads:          max(1, runtime.GOMAXPROCS(0)/4),
 		SearchThreads:         runtime.GOMAXPROCS(0),
+		BackgroundShare:       prio.Default(),
 		GCHeapFloor:           64 << 20,
 		LogLevel:              slog.LevelInfo,
 		ShutdownTimeout:       time.Minute,
 		MaxBodyBytes:          16 << 20,
 		MaxDocBytes:           4 << 20,
 		MaxBulkOps:            10_000,
+		MaxResultWindow:       10_000,
 		RequestTimeout:        30 * time.Second,
 		ReadTimeout:           time.Minute,
 		SearchQueue:           1000,
@@ -231,6 +285,12 @@ func Default() Config {
 		BundleRetention:       2,
 		ShutdownGrace:         2 * time.Second,
 		MaxIndexFields:        1000,
+
+		RequestCacheSize:               DefaultRequestCacheSize,
+		RequestCacheRedisPrefix:        DefaultRequestCacheRedisPrefix,
+		RequestCacheRedisTTL:           DefaultRequestCacheRedisTTL,
+		RequestCacheRedisTimeout:       DefaultRequestCacheRedisTimeout,
+		RequestCacheRedisMaxEntryBytes: DefaultRequestCacheRedisMaxEntryBytes,
 	}
 }
 
@@ -441,6 +501,31 @@ var settings = []setting{
 		format: func(c *Config) string { return strconv.Itoa(c.SearchThreads) },
 	},
 	{
+		name: "write_transactions", usage: "write transactions this node runs at once, one a shard (0 = 16, at most half the store's write connections)",
+		parse: func(c *Config, v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return fmt.Errorf("want 0 or a positive integer, got %q", v)
+			}
+			c.WriteTransactions = n
+			return nil
+		},
+		format: func(c *Config) string { return strconv.Itoa(c.WriteTransactions) },
+	},
+	{
+		name:  "background_share",
+		usage: "share of each 100 ms merges, refresh builds and write analysis run while searches occupy every core, 0.05 to 1 (1: searches get no priority; default: 0.25 at GOMAXPROCS 1, else 1)",
+		parse: func(c *Config, v string) error {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil || !(f >= prio.MinShare && f <= 1) {
+				return fmt.Errorf("want a share from %g to 1, got %q", prio.MinShare, v)
+			}
+			c.BackgroundShare = f
+			return nil
+		},
+		format: func(c *Config) string { return strconv.FormatFloat(c.BackgroundShare, 'g', -1, 64) },
+	},
+	{
 		name: "log_level", usage: "minimum log level: debug, info, warn or error",
 		parse: func(c *Config, v string) error {
 			if err := c.LogLevel.UnmarshalText([]byte(v)); err != nil {
@@ -489,6 +574,19 @@ var settings = []setting{
 		name: "max_bulk_ops", usage: "most operations in one _bulk request",
 		parse:  func(c *Config, v string) error { return positiveInt(&c.MaxBulkOps, v) },
 		format: func(c *Config) string { return strconv.Itoa(c.MaxBulkOps) },
+	},
+	{
+		name: "max_result_window", usage: "most a search's from + size reaches (at most 1000000); deeper pages use search_after",
+		parse: func(c *Config, v string) error {
+			if err := positiveInt(&c.MaxResultWindow, v); err != nil {
+				return err
+			}
+			if c.MaxResultWindow > MaxResultWindowLimit {
+				return fmt.Errorf("want at most %d, got %q", MaxResultWindowLimit, v)
+			}
+			return nil
+		},
+		format: func(c *Config) string { return strconv.Itoa(c.MaxResultWindow) },
 	},
 	{
 		name: "request_timeout", usage: "deadline of every API request",
@@ -559,6 +657,59 @@ var settings = []setting{
 		name: "tls_key", usage: "PEM private key file for tls_cert",
 		parse:  func(c *Config, v string) error { c.TLSKey = v; return nil },
 		format: func(c *Config) string { return c.TLSKey },
+	},
+	{
+		name: "request_cache_size", usage: "memory for the shard request cache of size-0 searches, e.g. 128MiB (0 = none in memory)",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			c.RequestCacheSize = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.RequestCacheSize) },
+	},
+	{
+		name: "request_cache_redis_url", secret: true, usage: "Redis behind the request cache, shared by the nodes (redis:// or rediss://; empty = memory only)",
+		parse:  func(c *Config, v string) error { c.RequestCacheRedisURL = v; return nil },
+		format: func(c *Config) string { return c.RequestCacheRedisURL },
+		display: func(c *Config) string {
+			if u, err := url.Parse(c.RequestCacheRedisURL); err == nil {
+				return u.Redacted()
+			}
+			return redacted(c.RequestCacheRedisURL)
+		},
+	},
+	{
+		name: "request_cache_redis_password", secret: true, usage: "Redis password, in place of the URL's",
+		parse:   func(c *Config, v string) error { c.RequestCacheRedisPassword = v; return nil },
+		format:  func(c *Config) string { return c.RequestCacheRedisPassword },
+		display: func(c *Config) string { return redacted(c.RequestCacheRedisPassword) },
+	},
+	{
+		name: "request_cache_redis_prefix", usage: "prefix of every request cache key in Redis",
+		parse:  func(c *Config, v string) error { c.RequestCacheRedisPrefix = v; return nil },
+		format: func(c *Config) string { return c.RequestCacheRedisPrefix },
+	},
+	{
+		name: "request_cache_redis_ttl", usage: "how long a request cache entry lives in Redis",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestCacheRedisTTL, v) },
+		format: func(c *Config) string { return c.RequestCacheRedisTTL.String() },
+	},
+	{
+		name: "request_cache_redis_timeout", usage: "bound of each Redis call, its dial included (a slow Redis delays a search by at most about this much)",
+		parse:  func(c *Config, v string) error { return positiveDuration(&c.RequestCacheRedisTimeout, v) },
+		format: func(c *Config) string { return c.RequestCacheRedisTimeout.String() },
+	},
+	{
+		name: "request_cache_redis_max_entry_bytes", usage: "largest encoded shard result written to or read from Redis, e.g. 8MiB",
+		parse: func(c *Config, v string) error {
+			n, err := ParseBytes(v)
+			if err == nil && n == 0 {
+				return fmt.Errorf("want a positive byte size such as 8MiB, got %q", v)
+			}
+			c.RequestCacheRedisMaxEntryBytes = n
+			return err
+		},
+		format: func(c *Config) string { return FormatBytes(c.RequestCacheRedisMaxEntryBytes) },
 	},
 }
 
@@ -692,6 +843,9 @@ func (c *Config) validate() []error {
 	case !c.InsecureNoAuth:
 		errs = append(errs, errors.New("tokens_file: is required; set insecure_no_auth=true to serve the API without auth"))
 	}
+	if c.ClusterToken == "" && !c.InsecureNoAuth && sharedStore(c.StoreURL) {
+		errs = append(errs, errors.New("cluster_token: set cluster_token (any shared secret, the same on every node) on a Postgres or MySQL store, which nodes share: without it the peer API is closed. insecure_no_auth=true runs without it, but then the peer API under /_internal/ on the public listener, like the API, takes requests without any auth"))
+	}
 	if c.MaxBodyBytes < 1<<10 || c.MaxBodyBytes > MaxBodyLimit {
 		errs = append(errs, fmt.Errorf("max_body_bytes: want 1KiB to %d bytes, got %d", MaxBodyLimit, c.MaxBodyBytes))
 	}
@@ -706,6 +860,13 @@ func (c *Config) validate() []error {
 			errs = append(errs, fmt.Errorf("%s: want at least max_body_bytes times inflight_amplification (%d), got %d", b.name, floor, b.n))
 		}
 	}
+	if c.RequestCacheRedisURL != "" {
+		if err := validRedisURL(c.RequestCacheRedisURL); err != nil {
+			errs = append(errs, fmt.Errorf("request_cache_redis_url: %w", err))
+		}
+	} else if c.RequestCacheRedisPassword != "" {
+		errs = append(errs, errors.New("request_cache_redis_password: is set without request_cache_redis_url"))
+	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		errs = append(errs, errors.New("tls_cert: tls_cert and tls_key are set together"))
 	}
@@ -719,19 +880,55 @@ func (c *Config) validate() []error {
 	return errs
 }
 
+// validRedisURL checks request_cache_redis_url's shape, without quoting it: it may
+// hold a password.
+func validRedisURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("is not a valid URL")
+	}
+	if s := strings.ToLower(u.Scheme); s != "redis" && s != "rediss" {
+		return fmt.Errorf("scheme must be redis or rediss, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("names no host (redis://host:port/db)")
+	}
+	if db := strings.Trim(u.Path, "/"); db != "" {
+		if n, err := strconv.Atoi(db); err != nil || n < 0 {
+			return fmt.Errorf("the path is the database number, got %q", db)
+		}
+	}
+	return nil
+}
+
+// validStoreURL checks store_url's shape. An unparsable URL is reported without
+// quoting it, since it may hold a password.
 func validStoreURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("is required (--store_url, %sSTORE_URL or %sSTORE_URL_FILE)", EnvPrefix, EnvPrefix)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		// url.Error repeats the URL, which may hold a password.
 		return errors.New("is not a valid URL")
 	}
 	if !slices.Contains(StoreSchemes, strings.ToLower(u.Scheme)) {
 		return fmt.Errorf("scheme must be one of %s, got %q", strings.Join(StoreSchemes, ", "), u.Scheme)
 	}
 	return nil
+}
+
+// sharedStore reports whether raw names a store several nodes can share (Postgres or
+// MySQL), as opposed to SQLite, which serves one node.
+func sharedStore(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "postgres", "postgresql", "mysql":
+		return true
+	}
+	return false
 }
 
 // deriveAdvertise turns the listen address into one peers can dial.
@@ -744,6 +941,17 @@ func deriveAdvertise(listen string) string {
 		host = hostname()
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// LoopbackHost reports whether host, a host name or IP literal with no port, is this
+// machine's loopback interface: localhost, or a loopback IP.
+func LoopbackHost(host string) bool { return host == "localhost" || LoopbackIP(host) }
+
+// LoopbackIP reports whether host, with no port, is a loopback IP literal. A host name,
+// localhost included, is not one: what it resolves to depends on DNS.
+func LoopbackIP(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // LogValue renders the configuration for logs with its secrets redacted.
@@ -765,7 +973,7 @@ func Usage(w io.Writer) {
 	def := Default()
 	fmt.Fprintf(w, "Usage: searchlight [--setting=value ...]\n\n")
 	fmt.Fprintf(w, "Each setting is a flag or a %s* environment variable; flags win.\n", EnvPrefix)
-	fmt.Fprintf(w, "store_url and cluster_token may also be read from <VAR>_FILE.\n\n")
+	fmt.Fprintf(w, "store_url, cluster_token, request_cache_redis_url and request_cache_redis_password may also be read from <VAR>_FILE.\n\n")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "SETTING\tENVIRONMENT\tDEFAULT\tMEANING")
 	for i := range settings {

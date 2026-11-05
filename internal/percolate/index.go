@@ -55,6 +55,7 @@ import (
 //	nodes      24 bytes per interval tree node: center, left, right, record start and count
 //	bylo       20 bytes per tree record (lo, hi, rank), each node's sorted by lo ascending
 //	byhi       the same records, each node's sorted by hi descending
+//	versions   u64 per query: its client version, 0 for none (format 4; a format 3 segment has none)
 //
 // The dictionary is an open-addressing hash table over (kind, field, term) with a
 // stable hash (64-bit FNV-1a), so a probe is a hash and one or two term compares with
@@ -100,12 +101,16 @@ import (
 
 const (
 	// FormatName is the format [Index] builds; shards record it per query segment.
-	FormatName = "percolate/3"
+	FormatName = "percolate/4"
 	// FileExt is a query segment file's extension.
 	FileExt = ".perc"
 
-	formatVersion = 3
-	numSections   = 19
+	formatVersion = 4
+	// formatV3 is the format before client versions: numSectionsV3 sections, all but
+	// versions. Open reads it, each query with no version.
+	formatV3      = 3
+	numSectionsV3 = 19
+	numSections   = 20
 	entrySize     = 32
 	filteredSize  = 24
 	nodeSize      = 24
@@ -145,11 +150,12 @@ const (
 	secNodes
 	secByLo
 	secByHi
+	secVersions
 )
 
 var sectionNames = [numSections]string{
 	"meta", "fields", "offsets", "records", "verify", "ids", "idtext", "programs", "slots", "entries",
-	"terms", "postings", "filtered", "partners", "pairs", "always", "nodes", "bylo", "byhi",
+	"terms", "postings", "filtered", "partners", "pairs", "always", "nodes", "bylo", "byhi", "versions",
 }
 
 // CorruptError is a query segment file that fails its checksum or does not parse.
@@ -173,6 +179,10 @@ var _ shard.QueryIndexBuilder = Index{}
 
 // Format implements [shard.QueryIndexBuilder].
 func (Index) Format() string { return FormatName }
+
+// Reads implements [shard.FormatReader]: percolate/3, the format before client
+// versions.
+func (Index) Reads(format string) bool { return format == "percolate/3" }
 
 // Check implements [shard.QueryIndexBuilder]: the query must survive a round trip
 // through its JSON form unchanged, which is how the segment stores it.
@@ -338,14 +348,18 @@ func encodeSegment(ctx context.Context, queries []shard.StoredQuery, stats shard
 	return b.encode(queries, byID, offsets, records)
 }
 
-// add anchors the query at rank, src its stored JSON.
+// add anchors the query at rank, src its stored JSON. Anchors and the class come from
+// the stored JSON parsed back, the very tree verification compiles, so the two can
+// never disagree; its date math that does not read now is resolved first
+// ([query.ResolveFixed]), so it anchors and filters as any range. Each half of a pair is a member of its field (postings: every query
+// it is half of); the pair itself is stored once, under one of its halves (see
+// encode).
 func (b *segmentBuilder) add(rank uint32, src []byte) error {
-	// Anchors and the class come from the stored JSON parsed back, the very tree
-	// verification compiles, so the two can never disagree.
-	stored, problems := query.Parse(src)
+	parsed, problems := query.Parse(src)
 	if len(problems) > 0 {
 		return fmt.Errorf("query does not round-trip: %s: %s", problems[0].Loc, problems[0].Message)
 	}
+	stored := query.ResolveFixed(parsed)
 	set := b.ex.node(stored)
 	filter, filtered := postingFilter(stored, &set)
 	rest, proven := provenRest(stored, &set, filter, filtered)
@@ -388,8 +402,6 @@ func (b *segmentBuilder) add(rank uint32, src []byte) error {
 		}
 	}
 	for _, p := range set.pairs {
-		// Each half is a member of its field (postings: every query it is half of);
-		// the pair itself is stored once, under one of its halves (see encode).
 		var k [2]string
 		for i, t := range p {
 			fi := b.field(t.Field)
@@ -450,10 +462,15 @@ type treeNode struct {
 	start, count uint32
 }
 
+// encode serializes the segment: the dictionary, in key order (so a build is
+// deterministic), and its hash table; the pairs; the fields and their interval trees.
+// Each pair is stored once, under its owner, with its partner and postings. The owner
+// is the half with fewer pairs (then the rarer, then the smaller key), so a frequent
+// atom paired with many rare ones (a store with every model) keeps a short partner
+// list, and a document walks about one record per member it holds.
 func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offsets []uint64, records []byte) ([]byte, error) {
 	n := len(queries)
 
-	// The dictionary, in key order (so a build is deterministic), and its hash table.
 	keys := make([]string, 0, len(b.dict))
 	for k := range b.dict {
 		keys = append(keys, k)
@@ -506,10 +523,6 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 		}
 	}
 
-	// Pairs, each stored once under its owner, with its partner and postings. The
-	// owner is the half with fewer pairs (then the rarer, then the smaller key), so a
-	// frequent atom paired with many rare ones (a store with every model) keeps a short
-	// partner list, and a document walks about one record per member it holds.
 	entryOf := make(map[string]uint32, len(keys))
 	for i, k := range keys {
 		entryOf[k] = count32(i)
@@ -542,7 +555,6 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 		numPairs += len(list)
 	}
 
-	// Fields and their interval trees.
 	var fields []byte
 	var nodes []treeNode
 	var byLo, byHi []interval
@@ -611,6 +623,9 @@ func (b *segmentBuilder) encode(queries []shard.StoredQuery, byID []uint32, offs
 	}
 	sec[secByLo] = appendIntervals(byLo)
 	sec[secByHi] = appendIntervals(byHi)
+	for i := range queries {
+		sec[secVersions] = binary.LittleEndian.AppendUint64(sec[secVersions], uint64(queries[i].Version)) //nolint:gosec // a version is positive
+	}
 
 	size := len(fileMagic) + 8 + 4
 	for _, s := range sec {
@@ -743,6 +758,10 @@ type fieldInfo struct {
 	recStart, recEnd   uint32
 	grams              []uint64
 	gramMask           uint32
+	// path is the nested field a name of path.name may be a sub-field of ("" for a
+	// name with no dot): a document holding no field of the whole name and objects of
+	// path has its objects' values of it probed for atoms.
+	path string
 }
 
 // Segment is an open query segment: a [shard.QuerySegment] that also answers the
@@ -769,6 +788,9 @@ type Segment struct {
 	nodes     []byte
 	byLo      []byte
 	byHi      []byte
+	// versions are each query's client version (u64 by ordinal), nil in a segment of
+	// format 3, whose queries have none.
+	versions []byte
 
 	classes    []uint32
 	anyEscaped bool
@@ -808,16 +830,21 @@ func parseBody(path string, body []byte) (*Segment, error) {
 	if len(body) < len(fileMagic)+8 || !bytes.Equal(body[:len(fileMagic)], fileMagic[:]) {
 		return nil, corrupt("bad magic")
 	}
-	if v := u32(body, len(fileMagic)); v != formatVersion {
+	v := u32(body, len(fileMagic))
+	if v != formatVersion && v != formatV3 {
 		return nil, fmt.Errorf("percolate: query segment %s: format version %d, this build reads %d: %w",
 			path, v, formatVersion, segment.FormatError(uint64(v), formatVersion))
 	}
-	if c := u32(body, len(fileMagic)+4); c != numSections {
-		return nil, corrupt("%d sections, want %d", c, numSections)
+	sections := uint32(numSections)
+	if v == formatV3 {
+		sections = numSectionsV3
+	}
+	if c := u32(body, len(fileMagic)+4); c != sections {
+		return nil, corrupt("%d sections, want %d", c, sections)
 	}
 	var sec [numSections][]byte
 	rest := body[len(fileMagic)+8:]
-	for i := range sec {
+	for i := range sections {
 		if len(rest) < 8 {
 			return nil, corrupt("section %s: truncated", sectionNames[i])
 		}
@@ -844,7 +871,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		offsets: sec[secOffsets], records: sec[secRecords], verifies: sec[secVerify], ids: sec[secIDs], idText: sec[secIDText], programs: sec[secPrograms],
 		slots: sec[secSlots], entries: sec[secEntries], terms: sec[secTerms], postings: sec[secPostings], filtered: sec[secFiltered],
 		partners: sec[secPartners], pairs: sec[secPairs],
-		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi],
+		always: sec[secAlways], nodes: sec[secNodes], byLo: sec[secByLo], byHi: sec[secByHi], versions: sec[secVersions],
 	}
 	sizes := []struct {
 		sec  int
@@ -861,6 +888,7 @@ func parseBody(path string, body []byte) (*Segment, error) {
 		{secByHi, recordSize * uint64(numRecs)},
 		{secPartners, 8 * uint64(numEntries)},
 		{secPairs, pairSize * uint64(numPairs)},
+		{secVersions, versionsSize(v, n)},
 	}
 	for _, sz := range sizes {
 		if uint64(len(sec[sz.sec])) != sz.want {
@@ -950,7 +978,7 @@ func (s *Segment) checkRecords() error {
 
 // checkRanks checks the classes and their programs (each class's once, at its
 // first rank; the others must hold the same), the always-check list and the tree
-// records.
+// records. A NaN bound fails lo <= hi.
 func (s *Segment) checkRanks() error {
 	numFields := uint32(len(s.fields)) //nolint:gosec // bounded by a u32 count
 	for r := range s.n {
@@ -986,7 +1014,7 @@ func (s *Segment) checkRanks() error {
 	for _, recs := range [][]byte{s.byLo, s.byHi} {
 		for i := 0; i < len(recs); i += recordSize {
 			lo, hi := f64(recs, i), f64(recs, i+8)
-			if !(lo <= hi) || u32(recs, i+16) >= s.n { // NaN fails lo <= hi
+			if !(lo <= hi) || u32(recs, i+16) >= s.n {
 				return errors.New("interval records: a bad interval or rank")
 			}
 		}
@@ -995,7 +1023,8 @@ func (s *Segment) checkRanks() error {
 }
 
 // checkDictionary checks every entry's term and postings (at least one, plain or
-// filtered), and every slot.
+// filtered), its partners (only a member lists any), every pair (it names a member
+// entry as its partner, with valid postings), and every slot.
 func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 	for i := range numEntries {
 		e := int(i) * entrySize
@@ -1018,13 +1047,11 @@ func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 			filtN > 0 && (kind == AtomMember || !s.validFiltered(filtOff, filtN, numFields)) {
 			return fmt.Errorf("entry %d: postings out of range or order", i)
 		}
-		// Partners: only a member lists any.
 		pOff, pN := uint64(u32(s.partners, int(i)*8)), uint64(u32(s.partners, int(i)*8+4))
 		if pOff+pN > uint64(len(s.pairs)/pairSize) || pN > 0 && kind != AtomMember {
 			return fmt.Errorf("entry %d: partners out of range", i)
 		}
 	}
-	// Each pair names a member entry as its partner, with valid postings.
 	for r := 0; r < len(s.pairs); r += pairSize {
 		partner := u32(s.pairs, r)
 		if partner >= numEntries || AtomKind(u32(s.entries, int(partner)*entrySize+4)&0xff) != AtomMember ||
@@ -1042,11 +1069,11 @@ func (s *Segment) checkDictionary(numEntries, numFields uint32) error {
 
 // parseFields reads the fields section, checking each field's tree: its nodes lie in
 // its own range, every child follows its parent (so a walk ends), and every node's
-// records lie in the field's record range.
+// records lie in the field's record range. Each field takes at least minFieldSize
+// bytes (a length byte and six u32s), which bounds the count by the section before
+// anything is allocated for it.
 func (s *Segment) parseFields(b []byte, numFields, numNodes, numRecs uint32) error {
 	r := byteReader{b: b}
-	// Each field takes at least 25 bytes (a length byte and six u32s): bound the count
-	// by the section before allocating for it.
 	if uint64(numFields)*minFieldSize > uint64(len(b)) {
 		return errors.New("fields: count out of range")
 	}
@@ -1084,6 +1111,9 @@ func (s *Segment) parseFields(b []byte, numFields, numNodes, numRecs uint32) err
 			if start < uint64(f.recStart) || start+count > uint64(f.recEnd) {
 				return fmt.Errorf("field %d: node records out of range", i)
 			}
+		}
+		if dot := strings.IndexByte(f.name, '.'); dot > 0 {
+			f.path = f.name[:dot]
 		}
 		s.fields = append(s.fields, f)
 	}
@@ -1186,7 +1216,7 @@ func (s *Segment) Query(ord uint32) (shard.StoredQuery, error) {
 	if len(meta) > 0 {
 		m = bytes.Clone(meta)
 	}
-	return shard.StoredQuery{ID: string(id), Seq: seq, Query: n, Meta: m}, nil
+	return shard.StoredQuery{ID: string(id), Seq: seq, Version: s.Version(ord), Query: n, Meta: m}, nil
 }
 
 // Close implements [shard.QuerySegment]: it unmaps the file. Nothing the segment
@@ -1287,7 +1317,8 @@ func (s *Segment) lookupHashed(kind AtomKind, field uint32, term string, h uint6
 	return -1
 }
 
-// lookupKey is lookup of an AtomSimKey term.
+// lookupKey is lookup of an AtomSimKey term, whose 8 bytes the segment's check
+// validated.
 func (s *Segment) lookupKey(field uint32, key uint64) int {
 	h := hashKey(field, key)
 	fk := field<<8 | uint32(AtomSimKey)
@@ -1300,7 +1331,7 @@ func (s *Segment) lookupKey(field uint32, key uint64) int {
 		if u32(s.entries, o) != hi32(h) || u32(s.entries, o+4) != fk {
 			continue
 		}
-		off := u32(s.entries, o+8) // validated: 8 bytes
+		off := u32(s.entries, o+8)
 		if binary.BigEndian.Uint64(s.terms[off:]) == key {
 			return o
 		}
@@ -1442,6 +1473,11 @@ func writeQuery(buf *bytes.Buffer, n query.Node) error {
 		}
 		buf.WriteByte('}')
 		return nil
+	case *query.Nested:
+		if x == nil {
+			return errors.New("a nil nested node cannot be stored")
+		}
+		return writeNested(buf, x)
 	default:
 		return fmt.Errorf("query node %T cannot be stored", n)
 	}
@@ -1649,3 +1685,45 @@ func (s *Segment) pairAt(r int) (partner uint32, posts []byte) {
 
 // NumEntries is how many terms the segment's dictionary holds.
 func (s *Segment) NumEntries() uint32 { return uint32(len(s.entries) / entrySize) } //nolint:gosec // validated against a u32 count
+
+// writeNested writes a nested node: {"nested": {"path": ..., "query": ...,
+// "inner_hits": ...}}.
+func writeNested(buf *bytes.Buffer, n *query.Nested) error {
+	path, err := json.Marshal(n.Path)
+	if err != nil {
+		return err
+	}
+	buf.WriteString(`{"nested":{"path":`)
+	buf.Write(path)
+	buf.WriteString(`,"query":`)
+	if err := writeQuery(buf, n.Query); err != nil {
+		return err
+	}
+	if n.InnerHits != nil {
+		hits, err := json.Marshal(n.InnerHits)
+		if err != nil {
+			return err
+		}
+		buf.WriteString(`,"inner_hits":`)
+		buf.Write(hits)
+	}
+	buf.WriteString("}}")
+	return nil
+}
+
+// versionsSize is the size of the versions section of a segment of format v and n
+// queries.
+func versionsSize(v, n uint32) uint64 {
+	if v == formatV3 {
+		return 0
+	}
+	return 8 * uint64(n)
+}
+
+// Version implements [shard.QuerySegment].
+func (s *Segment) Version(ord uint32) int64 {
+	if len(s.versions) == 0 || ord >= s.n {
+		return 0
+	}
+	return int64(u64(s.versions, 8*int(ord))) //nolint:gosec // written from an int64
+}

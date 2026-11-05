@@ -51,7 +51,7 @@ func aggValues(d *schema.Doc, field string) []any {
 // bruteAgg computes a over docs, as the reduce should answer with exact shard sizes.
 func bruteAgg(t *testing.T, a Agg, docs []*schema.Doc) *AggResult {
 	t.Helper()
-	spec := prepareAgg("x", a, testMapping, "aggs.x", false, new(problems))
+	spec := prepareAgg("x", a, testMapping, "aggs.x", new(problems))
 	if spec == nil {
 		t.Fatalf("agg %+v refused", a)
 	}
@@ -90,6 +90,15 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 		if res.Count > 0 {
 			res.Avg = ptr(res.Sum / float64(res.Count))
 		}
+	case AggMin, AggMax:
+		for _, d := range docs {
+			for _, v := range aggValues(d, spec.field) {
+				x, ok := v.(float64)
+				if ok && (res.Number == nil || (spec.typ == AggMin && x < *res.Number) || (spec.typ == AggMax && x > *res.Number)) {
+					res.Number = ptr(x)
+				}
+			}
+		}
 	case AggCardinality:
 		seen := map[any]bool{}
 		for _, d := range docs {
@@ -98,11 +107,17 @@ func bruteSpec(spec *aggSpec, docs []*schema.Doc) *AggResult {
 			}
 		}
 		res.Value = int64(len(seen))
+		if spec.threshold > 0 {
+			res.Value = min(res.Value, int64(spec.threshold))
+		}
 	case AggTerms:
 		in := map[any][]*schema.Doc{}
 		var total int64
 		for _, d := range docs {
 			for _, v := range aggValues(d, spec.field) {
+				if !bruteKeeps(spec, v) {
+					continue
+				}
 				in[v] = append(in[v], d)
 				total++
 			}
@@ -262,12 +277,23 @@ func diffAgg(got, want *AggResult, path string) string {
 		return fmt.Sprintf("%s: stats %d %v %v %v %v, want %d %v %v %v %v", path,
 			got.Count, got.Sum, deref(got.Min), deref(got.Max), deref(got.Avg),
 			want.Count, want.Sum, deref(want.Min), deref(want.Max), deref(want.Avg))
+	case !ptrEq(got.Number, want.Number):
+		return fmt.Sprintf("%s: value %v, want %v", path, deref(got.Number), deref(want.Number))
 	case got.Value != want.Value:
 		return fmt.Sprintf("%s: cardinality %d, want %d", path, got.Value, want.Value)
 	case got.SumOtherDocCount != want.SumOtherDocCount:
 		return fmt.Sprintf("%s: sum_other_doc_count %d, want %d", path, got.SumOtherDocCount, want.SumOtherDocCount)
+	case got.DocCount != want.DocCount:
+		return fmt.Sprintf("%s: doc_count %d, want %d", path, got.DocCount, want.DocCount)
+	case len(got.Aggs) != len(want.Aggs):
+		return fmt.Sprintf("%s: %d aggregations, want %d", path, len(got.Aggs), len(want.Aggs))
 	case len(got.Buckets) != len(want.Buckets):
 		return fmt.Sprintf("%s: %d buckets %v, want %d %v", path, len(got.Buckets), bucketKeys(got.Buckets), len(want.Buckets), bucketKeys(want.Buckets))
+	}
+	for name, w := range want.Aggs {
+		if d := diffAgg(got.Aggs[name], w, path+"."+name); d != "" {
+			return d
+		}
 	}
 	for i, gb := range got.Buckets {
 		wb := want.Buckets[i]
@@ -309,10 +335,17 @@ func deref(p *float64) any {
 
 func randomAgg(rng *rand.Rand) Agg {
 	metric := func() Agg {
-		if rng.IntN(2) == 0 {
+		switch rng.IntN(4) {
+		case 0:
 			return Agg{Type: AggStats, Field: pick(rng, []string{"price", "created", "nope"})}
+		case 1:
+			return Agg{Type: pick(rng, []string{AggMin, AggMax}), Field: pick(rng, []string{"price", "created", "nope"})}
 		}
-		return Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		a := Agg{Type: AggCardinality, Field: pick(rng, []string{"brand", "tags", "price", "active", "title", "_id"})}
+		if rng.IntN(2) == 0 {
+			a.Threshold = pick(rng, []int{1, 2, 3, 7, 40, 1000})
+		}
+		return a
 	}
 	var a Agg
 	switch rng.IntN(7) {
@@ -320,9 +353,17 @@ func randomAgg(rng *rand.Rand) Agg {
 		a = Agg{
 			Type: AggTerms, Field: pick(rng, []string{"brand", "tags", "active", "price", "title", "_id", "created", "nope"}),
 			Size: pick(rng, []int{0, 1, 3, 100}), ShardSize: 10_000,
+			CollectMode: pick(rng, []string{"", CollectDepthFirst, CollectBreadthFirst}),
 		}
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(3))
+		}
+		if rng.IntN(3) == 0 {
+			seed := func() string { return pick(rng, vocab) }
+			if a.Field == IDField {
+				seed = func() string { return pick(rng, ids) }
+			}
+			a.Include, a.Exclude = randomTermsFilters(rng, a.Field, seed)
 		}
 	case 1:
 		a = Agg{Type: AggRange, Field: pick(rng, []string{"price", "created"}), Ranges: []Range{
@@ -384,8 +425,9 @@ func TestAggregationsEqualBruteForce(t *testing.T) {
 				aggChunkMin, aggChunk = 1, 1+rng.Uint32N(40) // segments collected in parts
 			}
 			globalOrdsDensity = pick(rng, []uint64{0, 8, 1 << 40}) // merged by term, either, by global ordinal
+			lazyTermsRatio = pick(rng, []uint64{0, 16, 1 << 40})   // terms filters decided per ordinal, either, over the dictionary
 			got, err := c.search(&Request{Query: q, Aggs: aggs})
-			aggChunkMin, aggChunk, globalOrdsDensity = 1<<15, 1<<16, 8
+			aggChunkMin, aggChunk, globalOrdsDensity, lazyTermsRatio = 1<<15, 1<<16, 8, 16
 			if err != nil {
 				t.Fatalf("%s %+v: %v", raw, aggs, err)
 			}

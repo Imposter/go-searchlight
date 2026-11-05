@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -231,6 +233,48 @@ func TestTermsPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestTermsFrom: a walk from any term, present or not, before the first or past the
+// last, yields every later term with its ordinal and document frequency, across
+// dictionary blocks.
+func TestTermsFrom(t *testing.T) {
+	m := &schema.Mapping{Fields: map[string]schema.FieldType{"k": schema.Keyword}}
+	var docs []schema.Doc
+	var terms []string
+	for i := range 300 {
+		terms = append(terms, fmt.Sprintf("k%04d", 2*i))
+		docs = append(docs, mustAnalyze(t, m, fmt.Sprintf("d%d", i), fmt.Sprintf(`{"k": %q}`, terms[i])))
+	}
+	r := mustBuild(t, docs)
+	kc := r.Keywords("k")
+	for _, from := range []string{"", "a", "k0000", "k0001", "k0263", "k0264", "k0598", "k0599", "z"} {
+		var got []string
+		r.TermsFrom("k", KindValue, from, func(ord uint32, term []byte, df uint32) bool {
+			if kc.Term(ord) != string(term) || df != 1 {
+				t.Fatalf("from %q: ordinal %d is %q, the walk says %q (%d documents)", from, ord, kc.Term(ord), term, df)
+			}
+			got = append(got, string(term))
+			return true
+		})
+		var want []string
+		for _, term := range terms {
+			if term >= from {
+				want = append(want, term)
+			}
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("TermsFrom(%q) = %d terms from %v, want %d", from, len(got), head3(got), len(want))
+		}
+	}
+	n := 0
+	r.TermsFrom("k", KindValue, "", func(uint32, []byte, uint32) bool { n++; return n < 5 })
+	r.TermsFrom("nope", KindValue, "", func(uint32, []byte, uint32) bool { n++; return true })
+	if n != 5 {
+		t.Fatalf("a stopped walk and a missing field: %d calls, want 5", n)
+	}
+}
+
+func head3(xs []string) []string { return xs[:min(3, len(xs))] }
 
 func TestRange(t *testing.T) {
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{"n": schema.Number}}
@@ -912,6 +956,8 @@ func identityCorpora(t *testing.T) map[string][]schema.Doc {
 		"singleDoc":  sparseDocs(t, 1),
 		"singleDoc2": testDocs(t)[:1],
 		"noDocs":     nil,
+		"points":     xyDocs(t, rand.New(rand.NewPCG(1, 2)), 1200, 6),
+		"nested":     nestedDocs(t, rand.New(rand.NewPCG(5, 6)), 400),
 	}
 }
 
@@ -1170,14 +1216,8 @@ func TestDuplicateIDsRefused(t *testing.T) {
 func TestNoDirSync(t *testing.T) {
 	docs := testDocs(t)
 	dir := t.TempDir()
-	count := func(f func()) SyncStats {
-		before := SyncCounts()
-		f()
-		after := SyncCounts()
-		return SyncStats{Files: after.Files - before.Files, Dirs: after.Dirs - before.Dirs}
-	}
 	var meta Meta
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		var err error
 		if meta, err = Build(dir, docs, BuildOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
@@ -1185,7 +1225,7 @@ func TestNoDirSync(t *testing.T) {
 	}); got.Files < 1 || got.Dirs != 0 {
 		t.Fatalf("Build with NoDirSync: %+v syncs, want the file's and no directory's", got)
 	}
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if _, err := Build(dir, docs, BuildOptions{}); err != nil {
 			t.Fatal(err)
 		}
@@ -1197,14 +1237,14 @@ func TestNoDirSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if _, err := Merge(dir, []*Reader{r}, nil, MergeOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
 		}
 	}); got.Files < 1 || got.Dirs != 0 {
 		t.Fatalf("Merge with NoDirSync: %+v syncs", got)
 	}
-	if got := count(func() {
+	if got := syncsDuring(func() {
 		if err := WriteDeletes(dir, meta.ID, 1, roaring.BitmapOf(1), DeletesOptions{NoDirSync: true}); err != nil {
 			t.Fatal(err)
 		}
@@ -1246,4 +1286,35 @@ func TestNumTermsAndResidentBytes(t *testing.T) {
 	if _, err := r.ResidentBytes(); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("ResidentBytes after Close = %v", err)
 	}
+}
+
+// syncStats are fsyncs counted through ObserveSyncs: of files and of directories.
+type syncStats struct{ Files, Dirs int64 }
+
+// syncCounter counts every fsync SyncFile and SyncDir make while it is
+// installed, whoever asks for them.
+type syncCounter struct{ files, dirs atomic.Int64 }
+
+// countSyncs installs a syncCounter until stop is called.
+func countSyncs() (c *syncCounter, stop func()) {
+	c = &syncCounter{}
+	return c, ObserveSyncs(func(_ string, dir bool) {
+		if dir {
+			c.dirs.Add(1)
+		} else {
+			c.files.Add(1)
+		}
+	})
+}
+
+func (c *syncCounter) stats() syncStats {
+	return syncStats{Files: c.files.Load(), Dirs: c.dirs.Load()}
+}
+
+// syncsDuring returns the fsyncs made while f ran.
+func syncsDuring(f func()) syncStats {
+	c, stop := countSyncs()
+	f()
+	stop()
+	return c.stats()
 }

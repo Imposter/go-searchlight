@@ -82,6 +82,20 @@ func (n *Single) PauseCopy(ctx context.Context, cp store.Copy) error {
 	return nil
 }
 
+// StopTailer stops the tailer of this node's copy cp (at its epoch) and waits for its
+// Run to return, its final flush and report included; the copy stays hosted until
+// UnhostCopy closes it. A stopping node stops every copy's tailer this way, together,
+// before it marks the copies retiring, so no tailer writes their state after that.
+func (n *Single) StopTailer(cp store.Copy) {
+	c, _, unlock := n.lockCopy(cp)
+	if c == nil {
+		return
+	}
+	defer unlock()
+	c.cancel()
+	<-c.done
+}
+
 // ResumeCopy starts a paused copy again under cp (its lease re-claimed at the same
 // epoch): a new tailer over the open shard catches it up, reporting under cp.
 func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {
@@ -101,7 +115,7 @@ func (n *Single) ResumeCopy(ctx context.Context, cp store.Copy) error {
 	next := &copyState{
 		id:      c.id,
 		slot:    c.slot,
-		tailer:  n.opts.NewTailer(n.st, sh, c.id, TailerEnv{Head: n.head.Load, Fetcher: c.spec.Fetcher, Copy: &copyCopy}),
+		tailer:  n.opts.NewTailer(n.st, sh, c.id, n.tailerEnvWith(idx, c.slot, c.spec.Fetcher, &copyCopy)),
 		startup: c.startup,
 		spec:    c.spec,
 		copy:    &copyCopy,
@@ -180,6 +194,7 @@ func (n *Single) unhost(ctx context.Context, cp store.Copy, mode unhostMode) err
 	sl.unhostedAtNano.Store(n.clock.Now().UnixNano())
 	c.cancel()
 	<-c.done
+	sl.analyzed.clear()
 	var err error
 	if sh := c.shard(); sh != nil {
 		if mode == unhostClose {
@@ -274,7 +289,8 @@ func (n *Single) SegmentMajors(ctx context.Context, id store.ShardID) (oldest, n
 }
 
 // Snapshot takes a snapshot of this node's serving copy of id, for a peer's recovery.
-// Release it when done.
+// Release it when done. A copy a rebuild swaps meanwhile is snapshotted again, as its
+// replacement.
 func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapshot, error) {
 	idx, err := n.lookup(ctx, id.Index)
 	if err != nil {
@@ -294,7 +310,7 @@ func (n *Single) Snapshot(ctx context.Context, id store.ShardID) (*shard.Snapsho
 		sh := c.shard()
 		sn, err := sh.Snapshot(ctx)
 		if errors.Is(err, shard.ErrClosed) && c.shard() != sh {
-			continue // swapped by a rebuild: snapshot its replacement
+			continue
 		}
 		if err != nil {
 			return nil, api.Unavailable(err, "%s cannot be copied now", id)
@@ -336,9 +352,6 @@ func (n *Single) Counts(ctx context.Context, id store.ShardID) (docs, queries ui
 	return lt.g.NumDocs(), lt.g.NumQueries(), nil
 }
 
-// Head returns the newest seq this node knows committed.
-func (n *Single) Head() int64 { return n.head.Load() }
-
 // NoteDB records whether the database just answered a call the cluster made: reads are
 // marked stale while it does not (spec section 10).
 func (n *Single) NoteDB(err error) { n.noteDB(err) }
@@ -357,7 +370,7 @@ func (n *Single) Indexes() []IndexView {
 	out := make([]IndexView, 0, len(list))
 	for _, idx := range list {
 		st := idx.meta.Load()
-		out = append(out, IndexView{Name: idx.name, UID: st.meta.UID, Shards: len(idx.shards), ReplicasPerShard: st.settings.ReplicasPerShard})
+		out = append(out, IndexView{Name: idx.name, UID: st.meta.UID, Shards: len(idx.shards), ReplicasPerShard: st.settings.ReplicasPerShard, GCDeletes: st.settings.EffectiveGCDeletes()})
 	}
 	return out
 }
@@ -500,7 +513,8 @@ func (n *Single) retire(ctx context.Context, idx *index) {
 }
 
 // reloadIfNewer re-reads idx's catalogue entry and adopts it when another node has
-// changed it since this node read it: changed reports that.
+// changed it since this node read it: changed reports that, also when another caller
+// adopted a newer entry meanwhile.
 func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, err error) {
 	m, err := n.st.Indexes().Get(ctx, idx.name)
 	if err != nil {
@@ -515,7 +529,7 @@ func (n *Single) reloadIfNewer(ctx context.Context, idx *index) (changed bool, e
 		return false, err
 	}
 	if !idx.meta.CompareAndSwap(cur, st) {
-		return true, nil // someone else adopted a newer one meanwhile
+		return true, nil
 	}
 	n.adoptSettings(idx, st.settings)
 	return true, nil

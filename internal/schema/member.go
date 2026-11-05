@@ -19,7 +19,7 @@ import (
 // It reads a stored body for what the index does not keep, a text field's words, say,
 // without re-analyzing the document: so it answers as the document was indexed even
 // when the mapping has changed since (a field mapped later, a strict mapping that now
-// refuses another member).
+// refuses another member). Only the members whose names can be field's are kept.
 func FieldValue(body []byte, field string) (any, bool, error) {
 	if field == IDField || field == "" || utf8.RuneCountInString(field) > MaxFieldChars {
 		return nil, false, nil
@@ -56,10 +56,10 @@ func FieldValue(body []byte, field string) (any, bool, error) {
 			return nil, false, invalid(err)
 		}
 		if analysis.Clean(name) != field {
-			continue // only the names that can be field's matter
+			continue
 		}
 		if i, seen := at[name]; seen {
-			members[i].value = value // a repeated key: first position, last value
+			members[i].value = value
 			continue
 		}
 		at[name] = len(members)

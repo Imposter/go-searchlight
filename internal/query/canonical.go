@@ -28,6 +28,15 @@ import (
 //     contains_any, contains_all, words_any, words_all: each is a set) is sorted and
 //     deduplicated after normalizing. between's [lo, hi] is ordered and keeps its
 //     shape, and so does similar's {text, min}, whose members are encoded by name.
+//   - A nested node encodes its path and query; its inner_hits are left out, as they
+//     change what a hit shows, never what matches.
+//   - box encodes each axis's ends in order (x's lower and upper, then y's), each
+//     absent or its inclusiveness and bound.
+//   - Date math (a string bound of lt, lte, gt, gte, between or box) encodes parsed
+//     ([ParseDateMath]), never normalized: now-1M (a month) and now-1m (a minute)
+//     differ. The expression is kept, not resolved, so a saved query's form is the same
+//     at every instant; a search resolves its query ([Resolve]) before it is planned,
+//     so the caches keyed by a search's leaves hold resolved instants.
 func Canonical(n Node) []byte {
 	return appendNode(nil, n)
 }
@@ -39,8 +48,11 @@ const (
 	tagAny
 	tagNot
 	tagLeaf
+	tagNested
 )
 
+// appendNode appends n's canonical encoding to buf; a nil node, typed or not, is
+// tagNil.
 func appendNode(buf []byte, n Node) []byte {
 	switch x := n.(type) {
 	case *All:
@@ -64,7 +76,13 @@ func appendNode(buf []byte, n Node) []byte {
 			return append(buf, tagNil)
 		}
 		return appendLeaf(buf, x)
-	default: // nil
+	case *Nested:
+		if x == nil {
+			return append(buf, tagNil)
+		}
+		buf = appendString(append(buf, tagNested), x.Path)
+		return appendNode(buf, x.Query)
+	default:
 		return append(buf, tagNil)
 	}
 }
@@ -100,18 +118,28 @@ const (
 	valObject
 	valWords // words_*: the phrases as the matcher reads them
 	valNever // a condition that never holds
+	valDate  // date math, parsed (a string that is none: valText)
+	valText  // a string as written, not normalized
+	valBox   // box's bounds: per axis, per end, absent or (inclusive, bound)
 )
 
+// appendLeafValue appends a leaf's value, canonically: {exists} and {exists: true}
+// mean the same thing, so an exists leaf's value is the bool wanted, exactly as
+// compileLeaf derives it.
 func appendLeafValue(buf []byte, l *Leaf) []byte {
 	a := l.arg()
 	if l.Op == OpExists {
-		// {exists} and {exists: true} mean the same thing: canonicalize to the bool
-		// wanted, exactly as compileLeaf derives it.
 		want := a.Kind != ArgBool || a.Scalar.Bool
 		return appendScalar(buf, Scalar{Kind: ArgBool, Bool: want})
 	}
 	if l.Op == OpWordsAll || l.Op == OpWordsAny {
 		return appendWords(buf, &a, l.Op == OpWordsAll)
+	}
+	if IsDateMathOp(l.Op) && hasDateText(&a) {
+		return appendDateValue(buf, &a)
+	}
+	if l.Op == OpBox && a.Kind == ArgBox && a.Box != nil {
+		return appendBox(buf, a.Box)
 	}
 	switch a.Kind {
 	case ArgBool, ArgNumber, ArgString:
@@ -120,7 +148,7 @@ func appendLeafValue(buf []byte, l *Leaf) []byte {
 		return appendList(buf, a.List, unorderedList(l.Op))
 	case ArgObject:
 		return appendObject(buf, a.Object)
-	default: // ArgNone
+	default:
 		return append(buf, valNone)
 	}
 }
@@ -137,6 +165,8 @@ func unorderedList(op string) bool {
 	}
 }
 
+// appendScalar appends a scalar value. Every number no float64 holds behaves alike
+// (it never equals anything), so all of them encode the same.
 func appendScalar(buf []byte, s Scalar) []byte {
 	switch s.Kind {
 	case ArgBool:
@@ -148,7 +178,7 @@ func appendScalar(buf []byte, s Scalar) []byte {
 	case ArgNumber:
 		buf = append(buf, valNumber)
 		if !s.Finite {
-			return append(buf, 0) // every such number behaves alike: never equal
+			return append(buf, 0)
 		}
 		buf = append(buf, 1)
 		var bits [8]byte
@@ -217,4 +247,51 @@ func appendWords(buf []byte, a *Arg, every bool) []byte {
 		buf = appendString(buf, p)
 	}
 	return buf
+}
+
+// appendDateValue appends a date math condition's value: a bound, or between's [lo,
+// hi], each a number or date math.
+func appendDateValue(buf []byte, a *Arg) []byte {
+	if a.Kind != ArgList {
+		return appendDateBound(buf, &a.Scalar)
+	}
+	buf = append(buf, valList)
+	buf = binary.AppendUvarint(buf, uint64(len(a.List)))
+	for i := range a.List {
+		buf = appendDateBound(buf, &a.List[i])
+	}
+	return buf
+}
+
+// appendBox appends a box's bounds: per axis (x, y) and end (lower, upper), 0 for
+// none, or 1, whether it is inclusive, and the bound, a number or date math parsed.
+func appendBox(buf []byte, b *Box) []byte {
+	buf = append(buf, valBox)
+	for _, iv := range b.Axes() {
+		for _, end := range []*Bound{&iv.Lo, &iv.Hi} {
+			if !end.Set {
+				buf = append(buf, 0)
+				continue
+			}
+			buf = append(buf, 1)
+			if end.Inclusive {
+				buf = append(buf, 1)
+			} else {
+				buf = append(buf, 0)
+			}
+			buf = appendDateBound(buf, &end.Value)
+		}
+	}
+	return buf
+}
+
+func appendDateBound(buf []byte, s *Scalar) []byte {
+	if s.Kind != ArgString {
+		return appendScalar(buf, *s)
+	}
+	d, why := ParseDateMath(s.Text)
+	if why != "" {
+		return appendString(append(buf, valText), s.Text)
+	}
+	return d.appendCanonical(append(buf, valDate))
 }

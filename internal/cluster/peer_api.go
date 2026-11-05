@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +25,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/node"
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -38,9 +37,11 @@ import (
 //
 //	POST   /_internal/hint                      push hints: wake the named copies' tailers
 //	POST   /_internal/search                    a shard's query (or whole search) on this node's copy
+//	POST   /_internal/search/{level}            the same, for a search of wire level 1 to 8 (searchPath)
 //	POST   /_internal/fetch                     bodies of hits from a pinned generation
 //	DELETE /_internal/pins/{id}                 unpin a generation
 //	POST   /_internal/percolate                 percolate documents against a copy's saved queries
+//	POST   /_internal/percolate/{level}         the same, for a percolation of wire level 1 to 4 (percolatePath)
 //	POST   /_internal/get                       a stored document or saved query from a copy
 //	POST   /_internal/wait                      wait until a copy has a seq searchable
 //	POST   /_internal/counts                    a copy's live documents and saved queries
@@ -63,9 +64,15 @@ func (p *peerAPI) handler() http.Handler {
 	}
 	handle("POST /_internal/hint", p.hint)
 	handle("POST /_internal/search", p.search)
+	for level := 1; level <= searchLevel; level++ {
+		handle("POST "+searchPath(level), p.search)
+	}
 	handle("POST /_internal/fetch", p.fetch)
 	handle("DELETE /_internal/pins/{id}", p.unpin)
 	handle("POST /_internal/percolate", p.percolate)
+	for level := 1; level <= percolateLevel; level++ {
+		handle("POST "+percolatePath(level), p.percolate)
+	}
 	handle("POST /_internal/get", p.get)
 	handle("POST /_internal/wait", p.wait)
 	handle("POST /_internal/counts", p.counts)
@@ -74,7 +81,7 @@ func (p *peerAPI) handler() http.Handler {
 	handle("DELETE /_internal/snapshots/{id}", p.release)
 	mux.Handle("GET /_internal/snapshots/{id}/files/{name}", p.wrapStream("GET /_internal/snapshots/{id}/files/{name}", p.file))
 	mux.Handle("/", p.wrap("unmatched", func(*http.Request) (any, error) {
-		return nil, api.NotFound(api.CodeNotFound, "no peer endpoint here")
+		return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
 	}))
 	return mux
 }
@@ -88,13 +95,12 @@ func (p *peerAPI) authorized(r *http.Request) *api.Error {
 		}
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "cluster_token is not set on this node: the peer API is closed"}
 	}
-	scheme, presented, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
+	presented, ok := api.BearerToken(r)
+	if !ok {
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "the cluster token is required"}
 	}
-	want := sha256.Sum256([]byte(token))
-	got := sha256.Sum256([]byte(strings.TrimSpace(presented)))
-	if subtle.ConstantTimeCompare(want[:], got[:]) != 1 {
+	want, got := api.SumToken(token), api.SumToken(presented)
+	if want.Match(&got) != 1 {
 		return &api.Error{Status: http.StatusUnauthorized, Code: api.CodeUnauthorized, Detail: "the cluster token is not valid"}
 	}
 	return nil
@@ -239,9 +245,35 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 	if msg.Request == nil {
 		return nil, api.InvalidAt("request", "no search request")
 	}
+	if msg.Request.Needs > searchLevel {
+		return nil, api.Unavailable(nil, "this node speaks search wire level %d and the search needs %d: it runs an older release than the coordinator", searchLevel, msg.Request.Needs)
+	}
 	req, err := msg.Request.decode()
 	if err != nil {
 		return nil, err
+	}
+	level := searchLevel
+	if h := p.n.opts.hooks; h != nil && msg.Request.Needs > h.olderLevel {
+		switch h.olderPeer {
+		case olderNoEndpoint:
+			return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
+		case olderDropsLevel:
+			if level = h.olderLevel; level < levelFilterAggs {
+				req.PostFilter = nil
+			}
+			if level < levelTermsFilter {
+				dropTermsFilters(req.Aggs)
+			}
+			if level < levelFrom {
+				req.From = 0
+			}
+			if level < levelMetrics {
+				dropMetrics(req.Aggs)
+			}
+			if level < levelPercentiles {
+				dropPercentiles(req.Aggs)
+			}
+		}
 	}
 	t, err := p.target(r, msg.shardRef)
 	if err != nil {
@@ -252,7 +284,7 @@ func (p *peerAPI) search(r *http.Request) (any, error) {
 		t.Release()
 		return nil, err
 	}
-	reply := &searchReply{Result: res, Stale: t.Stale()}
+	reply := &searchReply{Result: res, Stale: t.Stale(), Level: level}
 	if msg.Pin {
 		reply.Pin = p.n.pins.add(t)
 		if h := p.n.opts.hooks; h != nil && h.pinned != nil {
@@ -301,6 +333,23 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 	if err := decode(r, &msg); err != nil {
 		return nil, err
 	}
+	if msg.Needs > percolateLevel {
+		return nil, api.Unavailable(nil, "this node speaks percolate wire level %d and the percolation needs %d: it runs an older release than the coordinator", percolateLevel, msg.Needs)
+	}
+	level := percolateLevel
+	if h := p.n.opts.hooks; h != nil && msg.Needs > h.olderLevel {
+		switch h.olderPeer {
+		case olderNoEndpoint:
+			return nil, api.NotFound(api.CodeNotFound, noPeerEndpoint)
+		case olderDropsLevel:
+			msg.Now, msg.Details, level = nil, nil, h.olderLevel
+		}
+	}
+	if msg.Now != nil {
+		ctx = query.WithNow(ctx, time.UnixMilli(*msg.Now))
+	} else {
+		ctx = query.WithNow(ctx, p.n.clock.Wall())
+	}
 	m := &schema.Mapping{Fields: map[string]schema.FieldType{}}
 	if len(msg.Mapping) > 0 {
 		if err := json.Unmarshal(msg.Mapping, m); err != nil {
@@ -320,7 +369,11 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 		return nil, err
 	}
 	defer t.Release()
-	matches, err := t.Percolate(ctx, msg.Mapping, docs)
+	var details node.MatchDetails
+	if msg.Details != nil {
+		details = *msg.Details
+	}
+	matches, found, err := t.Percolate(ctx, msg.Mapping, docs, details)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +384,10 @@ func (p *peerAPI) percolate(r *http.Request) (any, error) {
 			out[i] = json.RawMessage("[]")
 		}
 	}
-	return &percolateReply{Matches: out, Stale: t.Stale()}, nil
+	if details.Any() && found == nil {
+		found = make([][]api.PercolateMatch, len(docs))
+	}
+	return &percolateReply{Matches: out, Details: found, Stale: t.Stale(), Level: level, Seq: t.Seq()}, nil
 }
 
 func (p *peerAPI) get(r *http.Request) (any, error) {
@@ -349,7 +405,7 @@ func (p *peerAPI) get(r *http.Request) (any, error) {
 	if msg.Query {
 		reply.Saved, reply.Found, err = t.GetQuery(ctx, msg.ID)
 	} else {
-		reply.Body, reply.Found, err = t.Get(ctx, msg.ID)
+		reply.Body, reply.Seq, reply.Found, err = t.Get(ctx, msg.ID)
 	}
 	if err != nil {
 		return nil, err
@@ -539,7 +595,8 @@ func (p *peerAPI) file(w http.ResponseWriter, r *http.Request) error {
 
 // leaseWriter streams a snapshot file: before each write it moves the write deadline
 // on (a big file outlasts the listener's write timeout, a stalled reader does not
-// outlast the bound), and it aborts the stream once the copy no longer serves peers.
+// outlast the bound), and it aborts the stream, dropping the connection, once the
+// copy's lease lapses and it no longer serves peers.
 type leaseWriter struct {
 	http.ResponseWriter
 	rc    *http.ResponseController
@@ -548,7 +605,7 @@ type leaseWriter struct {
 
 func (w *leaseWriter) Write(b []byte) (int, error) {
 	if !w.valid() {
-		panic(http.ErrAbortHandler) // the copy's lease lapsed: drop the connection
+		panic(http.ErrAbortHandler)
 	}
 	_ = w.rc.SetWriteDeadline(time.Now().Add(peerWriteBound)) //nolint:forbidigo // a connection deadline is by the OS clock
 	return w.ResponseWriter.Write(b)

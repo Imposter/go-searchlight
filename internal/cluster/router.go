@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,8 +20,10 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
@@ -37,6 +38,11 @@ type candidate struct {
 // key names the copy for adaptive replica selection's staleness memory.
 func (c candidate) key() string { return c.node + "|" + c.shard.String() }
 
+// at names the copy as a read tries it: its node at its address. A node that restarted
+// with the same id at another address (a new pod IP, a port bound anew) is another
+// copy to try.
+func (c candidate) at() string { return c.node + "@" + c.addr }
+
 // ErrNoServingCopy is the cause of the 503 a request for a shard no node serves a copy
 // of gets: one that the registry, read again, shows no serving copy of either (an index
 // whose copies are still being placed or recovered, or whose nodes are all down).
@@ -44,13 +50,26 @@ var ErrNoServingCopy = errors.New("cluster: no node serves a copy of the shard")
 
 // routeCandidates is candidates, read again from a fresh view when the routing view
 // has none: the view lags the registry by up to ViewInterval, and a copy claimed
-// since (an index another node just created) is served at once.
-func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidate {
-	if c := n.candidates(id); len(c) > 0 {
-		return c
+// since (an index another node just created) is served at once. It also returns the
+// start of the read the candidates come from, and whether it read the registry again.
+func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) (c []candidate, routed time.Duration, reread bool) {
+	if c, routed = n.route(id); len(c) > 0 {
+		return c, routed, false
 	}
-	n.refreshOnMiss(ctx)
-	return n.candidates(id)
+	n.refreshSince(ctx, n.lc.Now())
+	c, routed = n.route(id)
+	return c, routed, true
+}
+
+// rerouteCandidates is candidates from a view read after routed began: the published
+// view when one was read since (another shard of the request, or the view loop, read
+// it), and otherwise a registry read the reads waiting on one share (refreshSince). It
+// is for a read whose every known copy failed: the view it was routed with can trail
+// the registry by a refresh, and miss a copy that serves. gaveUp is refreshSince's.
+func (n *Node) rerouteCandidates(ctx context.Context, id store.ShardID, routed time.Duration) (c []candidate, at time.Duration, gaveUp bool) {
+	gaveUp = n.refreshSince(ctx, routed+1)
+	c, at = n.route(id)
+	return c, at, gaveUp
 }
 
 // missRefreshEvery is the least time between two registry reads routing misses make:
@@ -58,25 +77,71 @@ func (n *Node) routeCandidates(ctx context.Context, id store.ShardID) []candidat
 // interval, and each miss waits at most that long for a fresh view.
 const missRefreshEvery = 75 * time.Millisecond
 
-// refreshOnMiss re-reads the registry for routing, unless a read that began after the
-// call did meanwhile: concurrent misses share one registry read. Reads it makes are
-// missRefreshEvery apart.
-func (n *Node) refreshOnMiss(ctx context.Context) {
-	asked := n.lc.Now()
-	n.missMu.Lock()
-	defer n.missMu.Unlock()
-	fresh := func() bool { v := n.view.Load(); return v != nil && v.readBegan >= asked }
-	if fresh() {
-		return
+// missFlight is a routing registry read under way: began is when it began reading
+// (set before done closes), and done closes once it is over.
+type missFlight struct {
+	began time.Duration
+	done  chan struct{}
+}
+
+// missReadWait bounds a routing registry read. The read runs for every caller waiting
+// on it, under the node's life rather than a caller's context, so a caller whose time
+// runs out does not cut it short for the others.
+const missReadWait = 2 * time.Second
+
+// refreshSince re-reads the registry for routing, unless the published view was read
+// by a read that began at since or later: concurrent callers share one registry read,
+// and reads are missRefreshEvery apart. It reports whether ctx ended first: the caller
+// stops waiting then, and the read goes on for the others.
+func (n *Node) refreshSince(ctx context.Context, since time.Duration) (gaveUp bool) {
+	for {
+		if v := n.view.Load(); v != nil && v.readBegan >= since {
+			return false
+		}
+		n.missMu.Lock()
+		f := n.missFlight
+		if f == nil {
+			f = &missFlight{done: make(chan struct{})}
+			n.missFlight = f
+			if !n.background(func(bctx context.Context) { n.missRead(bctx, f) }) {
+				n.missFlight = nil
+				n.missMu.Unlock()
+				return false
+			}
+		}
+		n.missMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return true
+		}
+		if f.began >= since {
+			return false
+		}
 	}
+}
+
+// missRead is flight f: it waits out the spacing between routing reads, reads the
+// registry, and ends the flight.
+func (n *Node) missRead(ctx context.Context, f *missFlight) {
+	defer func() {
+		n.missMu.Lock()
+		n.missFlight = nil
+		n.missMu.Unlock()
+		close(f.done)
+	}()
 	if wait := missRefreshEvery - n.clock.Since(n.missReadAt); wait > 0 {
-		if n.clock.Sleep(ctx, wait) != nil || fresh() {
+		if n.clock.Sleep(ctx, wait) != nil {
+			f.began = n.lc.Now()
 			return
 		}
 	}
+	f.began = n.lc.Now()
 	n.missReadAt = n.clock.Now()
-	if err := n.refreshView(ctx); err != nil && ctx.Err() == nil {
-		n.log.DebugContext(ctx, "reading the registry for a shard with no copy in view failed", slog.Any("error", err))
+	rctx, cancel := context.WithTimeout(ctx, missReadWait)
+	defer cancel()
+	if err := n.refreshView(rctx); err != nil && ctx.Err() == nil {
+		n.log.DebugContext(ctx, "reading the registry again for routing failed", slog.Any("error", err))
 	}
 }
 
@@ -87,6 +152,13 @@ func noServingCopy(id store.ShardID) *api.Error {
 // candidates lists the serving copies of id on live peers, best first (adaptive
 // replica selection).
 func (n *Node) candidates(id store.ShardID) []candidate {
+	c, _ := n.route(id)
+	return c
+}
+
+// route is candidates, with the start of the registry read the view it read them from
+// began (view.readBegan).
+func (n *Node) route(id store.ShardID) ([]candidate, time.Duration) {
 	v := n.view.Load()
 	var out []candidate
 	for i := range v.copies[id] {
@@ -101,11 +173,12 @@ func (n *Node) candidates(id store.ShardID) []candidate {
 		out = append(out, candidate{node: c.NodeID, addr: nd.Address, shard: id})
 	}
 	n.ars.order(out, len(v.live))
-	return out
+	return out, v.readBegan
 }
 
-// peerError is a transport failure reaching a peer: the peer is gone, or did not
-// answer in time.
+// peerError is a transport failure reaching a peer: the peer is gone, did not answer
+// in time, or refused this node's cluster token (401, 403). Either way none of its
+// copies can serve this node.
 type peerError struct {
 	node string
 	err  error
@@ -143,7 +216,8 @@ func (n *Node) call(ctx context.Context, peer, addr, method, path string, in, ou
 }
 
 // readCall is call for a read of copy c: its outcome feeds adaptive replica selection.
-// A copy that answered stale is remembered as stale, not suspected.
+// A copy that answered stale is remembered as stale, not suspected, and an error that
+// is the request's own fault, not the copy's, does not count against the copy.
 func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out any) error {
 	done := n.ars.start(c.node, c.key())
 	service, queue, err := n.do(ctx, c.node, c.addr, http.MethodPost, path, in, out)
@@ -155,14 +229,15 @@ func (n *Node) readCall(ctx context.Context, c candidate, path string, in, out a
 		done(false, service, queue)
 		n.ars.noteStale(c.key(), true)
 	case errors.As(err, &ae) && ae.Status < 500 && ae.Status != http.StatusTooManyRequests:
-		done(false, service, queue) // the request's own fault, not the copy's
+		done(false, service, queue)
 	default:
 		done(true, -1, -1)
 	}
 	return err
 }
 
-// do runs a peer request and returns what the peer reported of its load.
+// do runs a peer request and returns what the peer reported of its load. addr is a
+// peer's advertise address from the registry: peers are trusted.
 func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out any) (service, queue float64, err error) {
 	service, queue = -1, -1
 	var body io.Reader
@@ -173,8 +248,7 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 		}
 		body = bytes.NewReader(b)
 	}
-	// addr is a peer's advertise address from the registry: peers are trusted.
-	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // see above
+	req, err := http.NewRequestWithContext(ctx, method, n.scheme+"://"+addr+path, body) //nolint:gosec // addr is a trusted peer's, from the registry: see the doc comment
 	if err != nil {
 		return service, queue, err
 	}
@@ -191,6 +265,14 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 	defer resp.Body.Close()
 	n.inst.peer(ctx, path, peer, resp.StatusCode, n.clock.Since(start))
 	service, queue = reported(resp.Header)
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		err := decodeError(resp)
+		if _, warned := n.refusedWarned.LoadOrStore(peer, true); !warned {
+			n.log.WarnContext(ctx, "a peer refused this node's cluster token: its copies are skipped; every node needs the same cluster_token",
+				slog.String("peer", peer), slog.Any("error", err))
+		}
+		return service, queue, &peerError{node: peer, err: err}
+	}
 	if resp.StatusCode >= 400 {
 		return service, queue, decodeError(resp)
 	}
@@ -205,12 +287,13 @@ func (n *Node) do(ctx context.Context, peer, addr, method, path string, in, out 
 }
 
 // authorize adds the cluster token and the trace context to a peer request, and the
-// caller's deadline. A token sent in the clear to a peer off this machine is warned
-// about, once per peer: set tls_cert (and peer_ca_file) on a network you do not trust.
+// caller's deadline less a reserve (peerReserve). A token sent in the clear to a peer
+// off this machine is warned about, once per peer: set tls_cert (and peer_ca_file) on
+// a network you do not trust.
 func (n *Node) authorize(req *http.Request) {
 	if n.cfg.ClusterToken != "" {
 		req.Header.Set("Authorization", "Bearer "+n.cfg.ClusterToken)
-		if req.URL.Scheme == "http" && !loopback(req.URL.Hostname()) {
+		if req.URL.Scheme == "http" && !config.LoopbackHost(req.URL.Hostname()) {
 			if _, warned := n.clearWarned.LoadOrStore(req.URL.Host, true); !warned {
 				n.log.WarnContext(req.Context(), "the cluster token goes to a peer over plain HTTP: serve the peer API over TLS (tls_cert, peer_ca_file)",
 					slog.String("peer", req.URL.Host))
@@ -218,19 +301,17 @@ func (n *Node) authorize(req *http.Request) {
 		}
 	}
 	if dl, ok := req.Context().Deadline(); ok {
-		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, time.Until(dl).Milliseconds()), 10)) //nolint:forbidigo // a context deadline is by the process clock
+		left := time.Until(dl) //nolint:forbidigo // a context deadline is by the process clock
+		req.Header.Set(headerDeadline, strconv.FormatInt(max(1, (left-peerReserve(left)).Milliseconds()), 10))
 	}
 	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 }
 
-// loopback reports whether host names this machine.
-func loopback(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
-}
+// peerReserve is the part of a caller's remaining time a peer is not given: the
+// reply's way back and, for a search, the fetch phase after it. A peer that runs out
+// of its time answers (a search with partial results, timed_out) while the caller can
+// still use the answer.
+func peerReserve(left time.Duration) time.Duration { return min(left/5, 2*time.Second) }
 
 // reported reads the service time and queue a peer reported (-1 when it did not).
 func reported(h http.Header) (service, queue float64) {
@@ -259,52 +340,157 @@ func decodeError(resp *http.Response) error {
 
 // remoteTarget reads a shard from a serving copy on a peer: the first call tries the
 // candidates in order until one answers (a failed or timed-out one is retried on the
-// next), and the rest go to the copy that did.
+// next), and the rest go to the copy that did. routed is when the registry read the
+// candidates come from began; reread is set once the read has read the copy table
+// again for the shard, which it does at most once.
 type remoteTarget struct {
 	n       *Node
 	id      store.ShardID
 	waitSeq int64
 	cands   []candidate
+	routed  time.Duration
+	reread  bool
 	chosen  *candidate
 	pin     string
 	stale   bool
+	// seen is the seq of the generation the peer's copy percolated at, as its reply
+	// says (percolateReply.Seq); 0 until one says.
+	seen int64
 }
 
 var _ node.ShardTarget = (*remoteTarget)(nil)
 
+// errOlderLevel marks a peer refused for speaking a lower wire level than a request
+// needs: a copy of an older release, which another copy may stand in for.
+var errOlderLevel = errors.New("it runs an older release")
+
 // attempt runs fn on the chosen copy, or on each candidate in turn until one answers.
 // Every attempt but the last refuses a stale copy (max_lag: the peer answers a
 // retryable 503); the last accepts one, flagged stale, as does the coordinator's own
-// copy after it.
+// copy after it. A chosen copy refused for its wire level (errOlderLevel: an earlier
+// call of the read, a stored document's Get, needed less) is dropped, and the other
+// candidates are tried as on a first call. When every candidate failed (or was
+// refused) retryably, the copy table is read again once (reroute), and the serving
+// copies it shows that the read has not tried are tried in turn. When those fail too,
+// the copies that refused only for being stale are asked again, accepting a stale
+// answer. When none answers the read is unavailable (503).
 func (t *remoteTarget) attempt(ctx context.Context, op string, fn func(ctx context.Context, c candidate, ref shardRef) error) error {
+	var last error
+	tried := map[string]bool{}
+	var refusedStale []candidate
 	if t.chosen != nil {
 		ref := t.ref()
 		ref.AllowStale = true
-		return fn(ctx, *t.chosen, ref)
+		err := fn(ctx, *t.chosen, ref)
+		if err == nil || !errors.Is(err, errOlderLevel) {
+			return err
+		}
+		tried[t.chosen.at()] = true
+		last, t.chosen = err, nil
 	}
-	var last error
-	for i, c := range t.cands {
+	// try runs fn on c, and reports whether the read is over: answered, or failed in a
+	// way no other copy helps.
+	try := func(c candidate, allowStale bool) (bool, error) {
 		ref := t.ref()
-		ref.AllowStale = i == len(t.cands)-1
+		ref.AllowStale = allowStale
 		actx, cancel := context.WithTimeout(ctx, t.n.opts.PeerTimeout)
 		err := fn(actx, c, ref)
 		cancel()
 		if err == nil {
-			t.chosen = &t.cands[i]
-			return nil
+			t.chosen = &c
+			return true, nil
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return true, ctx.Err()
 		}
 		if !retryable(err) {
-			return err
+			return true, err
+		}
+		var ae *api.Error
+		if !allowStale && errors.As(err, &ae) && ae.Code == codeStale {
+			refusedStale = append(refusedStale, c)
 		}
 		last = err
 		t.n.inst.retry(ctx, op)
 		t.n.log.DebugContext(ctx, "a peer read failed; trying another copy", slog.String("op", op), slog.String("shard", t.id.String()),
 			slog.String("peer", c.node), slog.Any("error", err))
+		return false, nil
+	}
+	for {
+		todo := untried(t.cands, tried)
+		for i, c := range todo {
+			tried[c.at()] = true
+			if over, err := try(c, i == len(todo)-1); over {
+				return err
+			}
+		}
+		if t.reread {
+			break
+		}
+		found, err := t.reroute(ctx, op, tried)
+		if err != nil {
+			return err
+		}
+		if !found {
+			break
+		}
+	}
+	for _, c := range refusedStale {
+		if over, err := try(c, true); over {
+			return err
+		}
 	}
 	return api.Unavailable(last, "no copy of shard %d of index %q answered", t.id.Shard, t.id.Index)
+}
+
+// rereadWait bounds how long a read waits on its copy table re-read (reroute), as does
+// a quarter of the time the request has left: the rest is for the copies it finds and,
+// after them, the coordinator's own copy, which a read falls back to when no copy
+// elsewhere answers. The registry read itself goes on for the others (refreshSince).
+const rereadWait = time.Second
+
+// reroute reads the copy table again for the shard, once per read, and reports
+// whether it shows a serving copy the read has not tried. A re-read the read stops
+// waiting on (its time ran out, or it had none) leaves the routing as it was.
+func (t *remoteTarget) reroute(ctx context.Context, op string, tried map[string]bool) (bool, error) {
+	t.reread = true
+	budget := rereadWait
+	if dl, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(dl)/4) //nolint:forbidigo // a context deadline is by the process clock
+	}
+	if budget <= 0 {
+		t.n.inst.reread(ctx, op, "timeout")
+		return false, nil
+	}
+	rctx, cancel := context.WithTimeout(ctx, budget)
+	cands, routed, timedOut := t.n.rerouteCandidates(rctx, t.id, t.routed)
+	cancel()
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	t.cands, t.routed = cands, routed
+	found := len(untried(cands, tried)) > 0
+	result := "none"
+	switch {
+	case found:
+		result = "found"
+		t.n.log.DebugContext(ctx, "every known copy failed; the copy table read again shows another", slog.String("op", op), slog.String("shard", t.id.String()))
+	case timedOut:
+		result = "timeout"
+	}
+	t.n.inst.reread(ctx, op, result)
+	return found, nil
+}
+
+// untried lists the candidates whose copy is not in tried.
+func untried(cands []candidate, tried map[string]bool) []candidate {
+	var out []candidate
+	for _, c := range cands {
+		if !tried[c.at()] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (t *remoteTarget) ref() shardRef {
@@ -325,11 +511,21 @@ func (t *remoteTarget) Search(ctx context.Context, r *search.Request) (*search.S
 	err = t.attempt(ctx, "search", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = searchReply{}
 		msg := searchMsg{shardRef: ref, Request: wr, Pin: r.NoBodies}
-		if err := t.n.readCall(ctx, c, peerPrefix+"search", msg, &reply); err != nil {
+		if err := t.n.readCall(ctx, c, searchPath(wr.Needs), msg, &reply); err != nil {
+			var ae *api.Error
+			if wr.Needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a search of wire level %d (%s): %w; retry once the upgrade is done", wr.Needs, levelNeeds(wr.Needs), errOlderLevel)}
+			}
 			return err
 		}
 		if reply.Result == nil {
 			return &peerError{node: c.node, err: errors.New("no result")}
+		}
+		if reply.Level < wr.Needs {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at search wire level %d and the search needs %d (%s): %w; retry once the upgrade is done", reply.Level, wr.Needs, levelNeeds(wr.Needs), errOlderLevel)}
+		}
+		if len(reply.Result.Hits) > r.From+r.Size {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered with %d hits, past the %d of from + size", len(reply.Result.Hits), r.From+r.Size)}
 		}
 		t.noteStale(c, reply.Stale)
 		return nil
@@ -370,26 +566,44 @@ func (t *remoteTarget) Fetch(ctx context.Context, hits []search.Hit, fields []st
 	return nil
 }
 
-func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error) {
+func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc, details node.MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error) {
 	wdocs := make([]wireDoc, len(docs))
 	for i := range docs {
 		wdocs[i] = wireDoc{ID: docs[i].ID, Body: docs[i].Body}
 	}
+	var at *int64
+	if now, ok := query.NowFrom(ctx); ok {
+		ms := now.UnixMilli()
+		at = &ms
+	}
+	needs := percolateNeeds(mapping)
+	var asked *node.MatchDetails
+	if details.Any() {
+		asked, needs = &details, max(needs, percolateDetails)
+	}
 	var reply percolateReply
 	err := t.attempt(ctx, "percolate", func(ctx context.Context, c candidate, ref shardRef) error {
 		reply = percolateReply{}
-		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs}
-		if err := t.n.readCall(ctx, c, peerPrefix+"percolate", msg, &reply); err != nil {
+		msg := percolateMsg{shardRef: ref, Mapping: mapping, Docs: wdocs, Now: at, Needs: needs, Details: asked}
+		if err := t.n.readCall(ctx, c, percolatePath(needs), msg, &reply); err != nil {
+			var ae *api.Error
+			if needs > 0 && errors.As(err, &ae) && ae.Status == http.StatusNotFound && ae.Detail == noPeerEndpoint {
+				return &peerError{node: c.node, err: fmt.Errorf("it has no endpoint for a percolation of wire level %d (%s): %w; retry once the upgrade is done", needs, percolateLevelNeeds(needs), errOlderLevel)}
+			}
 			return err
 		}
+		if reply.Level < needs {
+			return &peerError{node: c.node, err: fmt.Errorf("it answered at percolate wire level %d and the percolation needs %d (%s): %w; retry once the upgrade is done", reply.Level, needs, percolateLevelNeeds(needs), errOlderLevel)}
+		}
 		t.noteStale(c, reply.Stale)
+		t.seen = reply.Seq
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(reply.Matches) != len(docs) {
-		return nil, fmt.Errorf("cluster: the peer percolated %d documents of %d", len(reply.Matches), len(docs))
+		return nil, nil, fmt.Errorf("cluster: the peer percolated %d documents of %d", len(reply.Matches), len(docs))
 	}
 	out := make([]percolate.IDs, len(docs))
 	for i, m := range reply.Matches {
@@ -397,7 +611,10 @@ func (t *remoteTarget) Percolate(ctx context.Context, mapping json.RawMessage, d
 			out[i] = percolate.IDs(m)
 		}
 	}
-	return out, nil
+	if asked != nil && len(reply.Details) != len(docs) {
+		return nil, nil, fmt.Errorf("cluster: the peer gave details of %d documents of %d", len(reply.Details), len(docs))
+	}
+	return out, reply.Details, nil
 }
 
 func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getReply, error) {
@@ -413,12 +630,12 @@ func (t *remoteTarget) get(ctx context.Context, id string, saved bool) (*getRepl
 	return &reply, err
 }
 
-func (t *remoteTarget) Get(ctx context.Context, id string) ([]byte, bool, error) {
+func (t *remoteTarget) Get(ctx context.Context, id string) ([]byte, int64, bool, error) {
 	reply, err := t.get(ctx, id, false)
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
-	return reply.Body, reply.Found, nil
+	return reply.Body, reply.Seq, reply.Found, nil
 }
 
 func (t *remoteTarget) GetQuery(ctx context.Context, id string) (*api.SavedQuery, bool, error) {
@@ -430,6 +647,13 @@ func (t *remoteTarget) GetQuery(ctx context.Context, id string) (*api.SavedQuery
 }
 
 func (t *remoteTarget) Stale() bool { return t.stale }
+
+// Seq is where the copy stood for what it answered: the generation seq its percolation
+// reply named, else the seq the read asked of it (a peer that names none, a 1.8 node
+// in a rolling upgrade, answered with every change up to that one, and while 1.8 nodes
+// run every seq is global, so that holds of the shard too). It is never below the seq
+// asked: the copy waited for it.
+func (t *remoteTarget) Seq() int64 { return max(t.waitSeq, t.seen) }
 
 // Release unpins the generation the fetch phase held, in the background: the pin
 // expires on its own if the call is lost.
@@ -446,14 +670,16 @@ func (t *remoteTarget) Release() {
 	})
 }
 
-// background runs fn in a goroutine bounded by the node's life; Stop waits for it.
-func (n *Node) background(fn func(ctx context.Context)) {
+// background runs fn in a goroutine bounded by the node's life; Stop waits for it. It
+// reports whether fn runs: not once the node stopped.
+func (n *Node) background(fn func(ctx context.Context)) bool {
 	n.bgMu.Lock()
 	defer n.bgMu.Unlock()
 	if n.bgClosed {
-		return
+		return false
 	}
 	n.bg.Go(func() { fn(n.loopCtx) })
+	return true
 }
 
 // closeBackground stops background work and waits for it.
@@ -468,11 +694,11 @@ func (n *Node) closeBackground() {
 
 // Remote implements node.Cluster.
 func (h *clusterHooks) Remote(ctx context.Context, id store.ShardID, waitSeq int64) (node.ShardTarget, error) {
-	cands := h.n.routeCandidates(ctx, id)
+	cands, routed, reread := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
 		return nil, noServingCopy(id)
 	}
-	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands}, nil
+	return &remoteTarget{n: h.n, id: id, waitSeq: waitSeq, cands: cands, routed: routed, reread: reread}, nil
 }
 
 // Committed implements node.Cluster: a push hint to every peer holding a copy of a
@@ -495,16 +721,22 @@ func (h *clusterHooks) Committed(index string, shards map[int]int64) {
 	}
 }
 
-// WaitRefreshed implements node.Cluster: it waits on every serving copy of id on a
-// live peer, together. A copy whose peer cannot be reached, or that does not serve
-// now, is skipped, and suspected, so reads routed by adaptive replica selection avoid
-// it; but when no copy at all (this node's included: localDone) reached seq, the wait
-// fails.
+// WaitRefreshed implements node.Cluster. With api.RefreshTrue it waits on every
+// serving copy of id on a live peer, together, each refreshed at once. With
+// api.RefreshWaitFor it waits for none when this node's copy has seq (localDone), and
+// otherwise for the first peer copy that has it. A copy whose peer cannot be reached,
+// or that does not serve now, is skipped, and suspected, so reads routed by adaptive
+// replica selection avoid it; but when no copy at all (this node's included) reached
+// seq, the wait fails.
 func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error {
 	n := h.n
+	first := mode != api.RefreshTrue
+	if first && localDone {
+		return nil
+	}
 	cands := n.candidates(id)
 	if len(cands) == 0 && !localDone {
-		cands = n.routeCandidates(ctx, id)
+		cands, _, _ = n.routeCandidates(ctx, id)
 	}
 	if len(cands) == 0 {
 		if localDone {
@@ -515,23 +747,32 @@ func (h *clusterHooks) WaitRefreshed(ctx context.Context, id store.ShardID, seq 
 	errs := make([]error, len(cands))
 	var reached atomic.Int32
 	var wg sync.WaitGroup
+	wctx, answered := context.WithCancel(ctx)
+	defer answered()
 	for i, c := range cands {
 		wg.Go(func() {
 			msg := waitMsg{shardRef: shardRef{Index: id.Index, Shard: id.Shard}, Seq: seq, Refresh: mode == api.RefreshTrue}
-			err := n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
+			err := n.call(wctx, c.node, c.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
 			var pe *peerError
 			var ae *api.Error
 			switch {
 			case err == nil:
 				reached.Add(1)
+				if first {
+					answered()
+				}
+			case wctx.Err() != nil && ctx.Err() == nil:
 			case errors.As(err, &pe) && ctx.Err() == nil, errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable:
-				n.ars.suspect(c.key()) // it did not reach seq: reads avoid it a while
+				n.ars.suspect(c.key())
 			default:
 				errs[i] = err
 			}
 		})
 	}
 	wg.Wait()
+	if first && reached.Load() > 0 {
+		return nil
+	}
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
@@ -607,14 +848,20 @@ func (h *clusterHooks) CopyStopped(c store.Copy, err error) {
 
 // Counts implements node.Cluster.
 func (h *clusterHooks) Counts(ctx context.Context, id store.ShardID) (uint64, uint64, error) {
-	cands := h.n.routeCandidates(ctx, id)
+	cands, routed, reread := h.n.routeCandidates(ctx, id)
 	if len(cands) == 0 {
 		return 0, 0, noServingCopy(id)
 	}
-	t := &remoteTarget{n: h.n, id: id, cands: cands}
+	t := &remoteTarget{n: h.n, id: id, cands: cands, routed: routed, reread: reread}
+	return t.counts(ctx)
+}
+
+// counts reads the shard's document and saved query counts from a copy.
+func (t *remoteTarget) counts(ctx context.Context) (docs, queries uint64, err error) {
 	var reply countsReply
-	err := t.attempt(ctx, "counts", func(ctx context.Context, c candidate, ref shardRef) error {
-		return h.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", ref, &reply)
+	err = t.attempt(ctx, "counts", func(ctx context.Context, c candidate, ref shardRef) error {
+		reply = countsReply{}
+		return t.n.call(ctx, c.node, c.addr, http.MethodPost, peerPrefix+"counts", ref, &reply)
 	})
 	return reply.Docs, reply.Queries, err
 }
@@ -685,6 +932,22 @@ func (h *hinter) run(peer string, q *hintQueue) {
 			h.n.log.Debug("a push hint was not delivered; the peer's poll picks the change up", slog.String("peer", peer), slog.Any("error", err))
 		}
 		cancel()
+	}
+}
+
+// forget stops and drops the hint queue of every peer keep refuses. Once the hinter
+// is closed it does nothing: close stopped every queue.
+func (h *hinter) forget(keep func(peer string) bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	for peer, q := range h.queues {
+		if !keep(peer) {
+			close(q.stop)
+			delete(h.queues, peer)
+		}
 	}
 }
 

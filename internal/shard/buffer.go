@@ -128,14 +128,26 @@ func (b *buffer) queryIDs() []string {
 }
 
 // docBytes estimates the memory a buffered document holds: its id and body, and its
-// analyzed fields (a map entry and value each, plus their terms).
+// analyzed fields (a map entry and value each, plus their terms and points). A point
+// costs its 16 bytes in the value, and the 24 bytes a refresh's build holds it in
+// (segment's xyPoint) while the buffer becomes a segment. A nested field's objects
+// cost theirs as fields do, and objectBytes each.
 func docBytes(id string, d *schema.Doc) int64 {
 	n := int64(len(id)) + 64
 	if d == nil {
 		return n
 	}
-	n += int64(len(d.Body))
-	for name, v := range d.Fields {
+	return n + int64(len(d.Body)) + fieldsBytes(d.Fields)
+}
+
+// objectBytes is what one member of a nested field costs beyond its fields: its
+// schema.Object and map.
+const objectBytes = 64
+
+func fieldsBytes(fields map[string]schema.Value) int64 {
+	var n int64
+	for name := range fields {
+		v := fields[name]
 		n += int64(len(name)) + 96
 		if v.Text != nil {
 			n += int64(len(*v.Text))
@@ -144,9 +156,17 @@ func docBytes(id string, d *schema.Doc) int64 {
 		for _, e := range v.Entries {
 			n += int64(len(e)) + 16
 		}
+		n += int64(len(v.Points)) * pointBytes
+		for i := range v.Objects {
+			n += objectBytes + fieldsBytes(v.Objects[i].Fields)
+		}
 	}
 	return n
 }
+
+// pointBytes is what one point of a buffered document costs: schema.Point in the value,
+// and the build's copy of it.
+const pointBytes = 16 + 24
 
 func queryBytes(id string, q *StoredQuery) int64 {
 	n := int64(len(id)) + 64

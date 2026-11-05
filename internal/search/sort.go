@@ -70,6 +70,8 @@ type sortCol struct {
 	nc   segment.NumericColumn
 	kc   segment.KeywordColumn
 	t, f *roaring.Bitmap
+	// nest reads a sort on a sub-field, nc or kc being its object segment's column.
+	nest *nestCol
 }
 
 // segSorter is one segment's sort state.
@@ -89,14 +91,21 @@ func newSegSorter(s *segExec) *segSorter {
 	ss := &segSorter{s: s, idCol: -1}
 	for i, spec := range s.p.sorts {
 		c := sortCol{spec: spec}
+		r := s.r
+		if spec.nested != nil {
+			var in *segExec
+			if c.nest, in = s.nestCol(spec); in != nil {
+				r = in.r
+			}
+		}
 		switch spec.kind {
 		case sortNumber:
-			c.nc = s.r.Numbers(spec.field)
+			c.nc = r.Numbers(spec.field)
 		case sortKeyword:
-			c.kc = s.r.Keywords(spec.field)
+			c.kc = r.Keywords(spec.field)
 		case sortBool:
-			c.t = s.r.Postings(spec.field, kindValue, "true")
-			c.f = s.r.Postings(spec.field, kindValue, "false")
+			c.t = r.Postings(spec.field, kindValue, "true")
+			c.f = r.Postings(spec.field, kindValue, "false")
 		case sortID:
 			ss.idCol = i
 		}
@@ -112,6 +121,9 @@ func newSegSorter(s *segExec) *segSorter {
 // key reads document d's value for key i.
 func (ss *segSorter) key(d uint32, i int) part {
 	c := &ss.cols[i]
+	if c.nest != nil {
+		return c.nest.key(c, d)
+	}
 	switch c.spec.kind {
 	case sortNumber:
 		v, ok := c.nc.Value(d)
@@ -142,7 +154,9 @@ func (ss *segSorter) ranks() []uint32 {
 	return ss.rank
 }
 
-// afterPart returns search_after's value for key i, segment-local.
+// afterPart returns search_after's value for key i, segment-local. A keyword cursor on
+// a segment where no document has a value sorts before every document: they are all
+// missing, after it.
 func (ss *segSorter) afterPart(i int) part {
 	if ss.afterDone[i] {
 		return ss.after[i]
@@ -162,7 +176,7 @@ func (ss *segSorter) afterPart(i int) part {
 	case c.spec.kind == sortKeyword:
 		term := v.(string) //nolint:errcheck,forcetypeassert // prepareAfter typed it
 		if !c.kc.Exists() {
-			p.v = math.Inf(1) // no document has a value: every one is missing, after it
+			p.v = math.Inf(1)
 			break
 		}
 		if o, ok := c.kc.Lookup(term); ok {
@@ -205,7 +219,8 @@ func sortSearch(n int, f func(int) bool) int {
 	return lo
 }
 
-// afterOK reports whether document d (whose first key is k0) sorts after the cursor.
+// afterOK reports whether document d (whose first key is k0) sorts after the cursor;
+// the cursor's own document does not.
 func (ss *segSorter) afterOK(d uint32, k0 part) bool {
 	for i := range ss.cols {
 		var k part
@@ -221,7 +236,7 @@ func (ss *segSorter) afterOK(d uint32, k0 part) bool {
 			return false
 		}
 	}
-	return false // the cursor's own document
+	return false
 }
 
 // entry is one document in a segment's top-k heap: its keys but the id tie-breaker,
@@ -265,7 +280,8 @@ func (ss *segSorter) compare(a, b *entry) int {
 	return cmp.Compare(a.ord, b.ord)
 }
 
-// fill sets e's keys for document d, the id key aside.
+// fill sets e's keys for document d, the id key aside: compare reads it from the rank
+// array.
 func (ss *segSorter) fill(e *entry, d uint32, k0 part) {
 	e.ord = d
 	if cap(e.keys) < len(ss.cols) {
@@ -277,7 +293,7 @@ func (ss *segSorter) fill(e *entry, d uint32, k0 part) {
 		case 0:
 			e.keys[i] = k0
 		case ss.idCol:
-			e.keys[i] = part{} // compare reads the rank array
+			e.keys[i] = part{}
 		default:
 			e.keys[i] = ss.key(d, i)
 		}
@@ -300,7 +316,8 @@ func (ss *segSorter) collect(h *topHeap, docs *roaring.Bitmap, k int) {
 	}
 }
 
-// offer offers docs to the heap of at most k.
+// offer offers docs to the heap of at most k. A maybe candidate is verified only once
+// it would enter the heap, and it replaces the worst entry in place, reusing its keys.
 func (ss *segSorter) offer(h *topHeap, docs []uint32, k int) {
 	s := ss.s
 	for _, d := range docs {
@@ -320,11 +337,9 @@ func (ss *segSorter) offer(h *topHeap, docs []uint32, k int) {
 					continue
 				}
 			}
-			// It would enter: only now is a maybe candidate verified.
 			if !s.accept(d) {
 				continue
 			}
-			// Replace the worst in place, reusing its keys.
 			ss.fill(top, d, k0)
 			heap.Fix(h, 0)
 			continue
@@ -351,8 +366,8 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 		hits.GetCardinality()*16 >= uint64(s.n) {
 		return s.topByIDWalk(hits, k)
 	}
-	h := &topHeap{ss: ss, entries: make([]entry, 0, k)}
-	if first.kind == sortNumber && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
+	h := &topHeap{ss: ss, entries: make([]entry, 0, capFor(k, hits))}
+	if first.kind == sortNumber && ss.cols[0].nest == nil && ss.cols[0].nc.Exists() && s.walkPoints(hits, k) {
 		s.collectByPoints(ss, h, hits, k)
 	} else {
 		ss.collect(h, hits, k)
@@ -367,6 +382,12 @@ func (s *segExec) topK(hits *roaring.Bitmap, k int) []segHit {
 	return s.toSegHits(ss, out)
 }
 
+// capFor is the room k best hits among hits need: no more than there are hits, so a
+// deep from does not reserve its whole window in a segment that matched a few.
+func capFor(k int, hits *roaring.Bitmap) int {
+	return int(min(uint64(k), hits.GetCardinality())) //nolint:gosec // at most k
+}
+
 // sortWalkFactor: a number sort walks the point index when hits² exceeds
 // sortWalkFactor·k·n: when the k/density documents the walk expects to visit (each a
 // membership test) cost less than reading every hit's value. A variable so tests can
@@ -377,7 +398,7 @@ var sortWalkFactor uint64 = 2
 // index than by reading every hit's value.
 func (s *segExec) walkPoints(hits *roaring.Bitmap, k int) bool {
 	c := hits.GetCardinality()
-	return c*c > sortWalkFactor*uint64(k)*uint64(s.n) //nolint:gosec // k is at most MaxSize
+	return c*c > sortWalkFactor*uint64(k)*uint64(s.n) //nolint:gosec // k is From+Size, at most MaxResultWindow: k·n stays far below 2^64
 }
 
 // collectByPoints feeds the heap from the point index's blocks in sort order, from the
@@ -482,7 +503,7 @@ func (s *segExec) topByIDWalk(hits *roaring.Bitmap, k int) []segHit {
 	if s.p.after != nil {
 		from = s.p.after[0].(string) //nolint:forcetypeassert,errcheck // prepareAfter typed it
 	}
-	out := make([]segHit, 0, k)
+	out := make([]segHit, 0, capFor(k, hits))
 	i := 0
 	s.r.IDsFrom(from, func(id []byte, ord uint32) bool {
 		i++

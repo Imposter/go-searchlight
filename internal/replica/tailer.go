@@ -17,11 +17,16 @@
 //     [Fetcher] (a serving peer, Task 11) when there is one, else from the store's
 //     ScanShard snapshot. A failed shard (shard.ErrFailed) is reopened from its
 //     directory, and rebuilt if that fails.
-//   - Tailing: HeadSeq, then ChangesAfter from the applied seq; each page is analyzed
-//     and applied, and a page shorter than its limit proves no change of the shard up
-//     to the head is missing, so the copy Advances there (seqs are global, so a shard's
-//     own have gaps). Between polls it sleeps until woken by a local write, a Postgres
-//     notification ([Hub]) or the poll interval.
+//   - Tailing: the head (store Tip), then ChangesAfter from the applied seq; each page
+//     is analyzed and applied, and a page shorter than its limit proves no change of
+//     the shard up to the head is missing, so the copy Advances there (a shard's seqs
+//     are its own and contiguous, but it may stand above its last change: a new shard
+//     starts at the store's floor). Between polls it sleeps until woken by a local
+//     write, a Postgres notification ([Hub]) or the poll interval. Each poll also
+//     checks that the changelog still holds what the copy applied (rewind.go): a
+//     change the copy applied, replaced at its seq, or a head behind the copy's seq
+//     on two polls, is a database that lost commits, and the copy is rebuilt from the
+//     store's snapshot. The copy's mark of what it applied is kept in its manifest.
 //   - Halted: a change the store accepted but this copy cannot apply (a body that does
 //     not analyze, a query that does not parse, one the shard refuses) is a bug, never
 //     skipped: the copy stops before it and is marked recovering in the registry.
@@ -66,6 +71,7 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/Imposter/go-searchlight/internal/clock"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -130,11 +136,25 @@ type Options struct {
 	// while new mapping versions keep arriving, up to five times over. 0 means
 	// DefaultRemapDebounce; negative means no wait.
 	RemapDebounce time.Duration
+	// OnRewind, when set, is called from Run when the copy finds the changelog
+	// rewound under it (a failover that lost commits), with the changelog's head as
+	// the poll read it.
+	OnRewind func(head int64)
 	// Hub delivers store notifications (Postgres): share one per node, run by the
 	// node. Nil means the tailer only polls, woken early by Wake.
 	Hub *Hub
 	// Fetcher, when set, is tried before ScanShard when the copy must be rebuilt.
 	Fetcher Fetcher
+	// Analyzed, when set, returns the document a writer on this node analyzed
+	// ([schema.Analyze]) for the upsert committed at seq, with the mapping it analyzed it
+	// under; nil when it kept none. The tailer applies it in place of analyzing the
+	// change's body when it is that change's document (the same id and body bytes) and
+	// every field it holds, the sub-fields of its nested objects included, has the same
+	// type under the writer's mapping and the copy's, none of them a sub-field's name in
+	// the copy's: then its analysis is the one the copy would make (mappings only add
+	// fields, and a field's type never changes). Otherwise the tailer analyzes the body,
+	// as without it.
+	Analyzed func(seq int64) (*schema.Doc, *schema.Mapping)
 	// OpenShard reopens the copy's directory: after a wipe, and after the shard
 	// failed. Nil opens it with shard.Open and the first shard's options.
 	OpenShard func(ctx context.Context, dir string) (*shard.Shard, error)
@@ -164,6 +184,9 @@ type testHooks struct {
 	// beforeApply runs before every Apply or Load of a batch into sh; an error is taken
 	// as the shard's answer instead (shard.ErrBackpressure: a full buffer).
 	beforeApply func(sh *shard.Shard) error
+	// syncRoot replaces the fsync of a copy's root once an aside rebuild has renamed
+	// CURRENT.
+	syncRoot func(root string) error
 }
 
 func (o *Options) resolve() {
@@ -294,8 +317,16 @@ type Tailer struct {
 	warn        rateLimitedWarn
 	lastSource  string // the source of the last rebuild
 	recoveredAt int64  // the applied seq that rebuild ended at
+	// fetchSpent is set when a fetched replacement needed rebuilding again before it
+	// moved: the next rebuild reads the store, and completing it clears the flag.
+	fetchSpent bool
+	// rw is what the copy knows to tell a rewound changelog (checkRewind).
+	rw          rewindCheck
 	needRebuild string // a rebuild to (re)try before tailing, by reason
-	needReopen  bool
+	// rebuilt is set once a rebuild completes, until the next report resets the
+	// registry's applied seq to the rebuilt copy's.
+	rebuilt    bool
+	needReopen bool
 	// minMappingVersion is the mapping version a fetched copy must have: the
 	// remap that asked for the rebuild.
 	minMappingVersion int64
@@ -350,6 +381,7 @@ func NewTailer(st store.Store, sh *shard.Shard, id ShardID, opts Options) *Taile
 	t.lag.lastOK = t.opts.Clock.Now()
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
+	t.rw = markOf(sh)
 	if opts.Copy != nil {
 		c := *opts.Copy
 		t.copy = &c
@@ -441,7 +473,7 @@ func (t *Tailer) setState(s State) { t.state.Store(int32(s)) }
 // the index or the shard is dropped ([ErrIndexDropped]), the shard is closed under
 // it (shard.ErrClosed), or the store is (store.ErrClosed). A halted copy does not
 // stop Run: it is retried with backoff ([Tailer.Halt] says where it is stuck). Only
-// one Run may run at a time.
+// one Run may run at a time. The copy's lag is judged from the moment Run starts.
 func (t *Tailer) Run(ctx context.Context) (err error) {
 	if !t.running.CompareAndSwap(false, true) {
 		return ErrRunning
@@ -456,7 +488,7 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 		defer hub.subscribe(t)()
 	}
 	defer t.inst.observe(t)()
-	t.pollOK() // the lag is judged from now
+	t.pollOK()
 
 	t.log.InfoContext(ctx, "tailer started", slog.Int64("seq", t.Applied()))
 	err = t.loop(runCtx, hub)
@@ -471,11 +503,11 @@ func (t *Tailer) Run(ctx context.Context) (err error) {
 	return err
 }
 
-// loop is Run's body.
+// loop is Run's body. Nothing is known until the catalogue has been read: it retries
+// the start until the start decides, never treating an unread catalogue as a changed
+// incarnation.
 func (t *Tailer) loop(ctx context.Context, hub *Hub) error {
 	t.setState(StateRecovering)
-	// Nothing is known until the catalogue has been read: retry until the start
-	// decides, never treating an unread catalogue as a changed incarnation.
 	for {
 		err := t.start(ctx)
 		if err == nil {
@@ -520,7 +552,12 @@ func (t *Tailer) loop(ctx context.Context, hub *Hub) error {
 }
 
 // handle classifies a failure: it returns the error Run must stop with, or nil after
-// arranging the retry (a rebuild, a reopen, or a backoff).
+// arranging the retry (a rebuild, a reopen, or a backoff). A rebuild that asks for
+// another backs off rather than spin. A drop followed at once by a create is a new
+// incarnation, not the end: only an index the catalogue lacks at every read for a
+// whole CatalogInterval stops the copy, and since the catalogue is read again at every
+// retry (RetryBase to RetryCap apart), any moment it holds the index ends the grace.
+// Any other failure is transient (the database, or a refresh) and backs off.
 func (t *Tailer) handle(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -535,7 +572,7 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.needRebuild = rb.reason
 		t.log.InfoContext(ctx, "shard copy must be rebuilt", slog.String("reason", rb.reason), slog.Any("error", rb.err))
 		if again {
-			t.backoffRebuild(ctx) // a rebuild asked for another: do not spin
+			t.backoffRebuild(ctx)
 		}
 		return nil
 	case errors.Is(err, shard.ErrFailed):
@@ -543,11 +580,6 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.log.WarnContext(ctx, "shard copy failed; reopening it", slog.Any("error", err))
 		return nil
 	case errors.Is(err, ErrIndexDropped):
-		// A drop followed at once by a create is a new incarnation, not the end:
-		// only an index the catalogue lacks at every read for a whole
-		// CatalogInterval stops the copy.
-		// The catalogue is read again at every retry (RetryBase to RetryCap
-		// apart), so any moment it holds the index ends the grace.
 		if !t.cat.missingSince.IsZero() && t.opts.Clock.Since(t.cat.missingSince) >= t.opts.CatalogInterval {
 			return err
 		}
@@ -555,11 +587,13 @@ func (t *Tailer) handle(ctx context.Context, err error) error {
 		t.lastCatalog = time.Time{}
 		t.backoff(ctx)
 		return nil
+	case errors.Is(err, errHeadBehind):
+		t.backoff(ctx)
+		return nil
 	case errors.Is(err, store.ErrLeaseLost), errors.Is(err, shard.ErrClosed),
 		errors.Is(err, store.ErrClosed), errors.Is(err, store.ErrInvalid):
 		return err
 	}
-	// Transient: the database, or a refresh.
 	t.pollFailed()
 	if suppressed, ok := t.warn.allow(); ok {
 		t.log.WarnContext(ctx, "tailer retrying after a failure", slog.Any("error", err), slog.Int("suppressed", suppressed))
@@ -616,18 +650,29 @@ func (t *Tailer) sleep(ctx context.Context, hub *Hub) {
 
 // step polls once: it reads the head, then the shard's changes after the applied seq,
 // applies them, and when the page proves nothing more is pending, advances to the
-// head. caughtUp reports that.
+// head. caughtUp reports that: a full page means more to read now. The head is read
+// before the page, so every change at or below it had committed, and a short page
+// holds all of this shard's changes after the applied seq. At a damaged change it
+// applies the changes before it, then halts there: retrying would read the same
+// bytes, and a later write of the document gets past it.
 func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	sh := t.Shard()
 	if err := sh.Err(); err != nil {
 		return false, err
 	}
-	head, dbNow, err := t.st.HeadSeq(ctx)
+	from := t.Applied()
+	tip, err := t.st.Tip(ctx, t.rw.query(t.id, from))
 	if err != nil {
 		t.pollFailed()
 		return false, err
 	}
-	from := t.Applied()
+	t.pollOK()
+	if wait, err := t.checkRewind(ctx, sh, &t.rw, from, &tip); err != nil {
+		return false, err
+	} else if wait {
+		return false, errHeadBehind
+	}
+	head, dbNow := tip.Head, tip.Now
 	changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 	if errors.Is(err, store.ErrPruned) {
 		t.pollOK()
@@ -635,8 +680,6 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 	}
 	var ce *store.CorruptError
 	if errors.As(err, &ce) {
-		// Apply the changes before the damaged one, then halt at it: retrying would
-		// read the same bytes. A later write of the document gets past it.
 		t.pollOK()
 		if len(changes) > 0 {
 			if err := t.applyChanges(ctx, sh, changes); err != nil {
@@ -656,17 +699,17 @@ func (t *Tailer) step(ctx context.Context) (caughtUp bool, err error) {
 		if err := t.applyChanges(ctx, sh, changes); err != nil {
 			return false, err
 		}
+		noteApplied(sh, &t.rw, changes[n-1].Mark())
 	}
 	if len(changes) >= t.opts.BatchSize {
-		return false, nil // more to read now
+		return false, nil
 	}
-	// The head was read before the page: every change at or below it had
-	// committed, and the page holds all of this shard's after from.
-	if head > t.Applied() {
+	if prev := t.Applied(); head > prev {
 		if err := sh.Advance(head); err != nil {
 			return false, err
 		}
 		t.applied.Store(head)
+		noteAdvanced(sh, &t.rw, prev, head, tip.HeadMark)
 	}
 	t.observeLag(head, t.Applied(), false, 0)
 	return true, nil
@@ -692,12 +735,20 @@ func (t *Tailer) housekeeping(ctx context.Context, caughtUp bool) error {
 }
 
 // report sends CommittedSeq to the registry when it moved, at most every
-// ReportInterval unless force.
+// ReportInterval unless force. The first report after a rebuild resets the registry's
+// seq to the rebuilt copy's, lower or not.
 func (t *Tailer) report(ctx context.Context, force bool) error {
 	if t.copy == nil {
 		return nil
 	}
 	seq := t.Shard().CommittedSeq()
+	if t.rebuilt {
+		if err := t.st.Registry().ResetApplied(ctx, *t.copy, seq); err != nil {
+			return fmt.Errorf("reset the applied seq to %d: %w", seq, err)
+		}
+		t.rebuilt, t.reported, t.lastReport = false, seq, t.opts.Clock.Now()
+		return nil
+	}
 	if seq <= t.reported || (!force && t.opts.Clock.Since(t.lastReport) < t.opts.ReportInterval) {
 		return nil
 	}

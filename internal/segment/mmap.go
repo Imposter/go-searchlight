@@ -103,8 +103,11 @@ func (m *mapping) release() error {
 // it durable (a documented no-op on Windows, where the volume's journal does this; see
 // mmap_windows.go). Shards use it after swapping their manifest.
 func SyncDir(dir string) error {
-	dirSyncs.Add(1)
-	return fsyncDir(dir)
+	if err := fsyncDir(dir); err != nil {
+		return err
+	}
+	observeSync(dir, true)
+	return nil
 }
 
 // ErrSync marks an fsync that failed. Retrying it proves nothing: once a write-back
@@ -112,27 +115,28 @@ func SyncDir(dir string) error {
 // lost pages never written, so a caller must treat the file as lost.
 var ErrSync = errors.New("segment: fsync failed")
 
-// SyncFile fsyncs f's contents, counting it in [SyncCounts] and telling every
-// [ObserveSyncs] observer f's name once the fsync succeeded. A failure wraps [ErrSync].
+// SyncFile fsyncs f's contents, telling every [ObserveSyncs] observer f's name once the
+// fsync succeeded. A failure wraps [ErrSync].
 func SyncFile(f *os.File) error {
-	fileSyncs.Add(1)
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("%w: %w", ErrSync, err)
 	}
-	if obs := syncObservers.Load(); obs != nil {
-		for _, o := range *obs {
-			o.fn(f.Name())
-		}
-	}
+	observeSync(f.Name(), false)
 	return nil
 }
 
-// ObserveSyncs calls fn with the name of every file [SyncFile] fsyncs from now on, as
-// the file was opened (a temp file renamed afterwards is reported under its temp name),
-// until the returned stop is called. fn runs on the syncing goroutine, concurrently
-// with other syncs, and must not block. It is the ground truth for checks that a
-// durable manifest names only fsynced files (the shard's crash tests).
-func ObserveSyncs(fn func(name string)) (stop func()) {
+// ObserveSyncs calls fn with the name of every file [SyncFile] and every directory
+// [SyncDir] fsyncs from now on (dir tells which), until the returned stop is called. A
+// file is named as it was opened (a temp file renamed afterwards is reported under its
+// temp name). fn runs on the syncing goroutine, concurrently with other syncs, and must
+// not block.
+//
+// It is a test seam, inert until a test installs an observer (one atomic load per
+// fsync): the ground truth for checks that a durable manifest names only fsynced files
+// (the shard's crash tests), and how tests and benchmarks count what a refresh or merge
+// costs in syncs. It lives here rather than in a test file because the shard's tests
+// observe the fsyncs this package makes.
+func ObserveSyncs(fn func(name string, dir bool)) (stop func()) {
 	o := &syncObserver{fn: fn}
 	syncObserversMu.Lock()
 	defer syncObserversMu.Unlock()
@@ -158,23 +162,17 @@ func ObserveSyncs(fn func(name string)) (stop func()) {
 	}
 }
 
-type syncObserver struct{ fn func(string) }
+func observeSync(name string, dir bool) {
+	if obs := syncObservers.Load(); obs != nil {
+		for _, o := range *obs {
+			o.fn(name, dir)
+		}
+	}
+}
+
+type syncObserver struct{ fn func(name string, dir bool) }
 
 var (
 	syncObserversMu sync.Mutex
 	syncObservers   atomic.Pointer[[]*syncObserver]
 )
-
-// fileSyncs and dirSyncs count every fsync this package (or a caller through SyncFile
-// and SyncDir) asked for, for measuring what a refresh or merge costs in syncs.
-var fileSyncs, dirSyncs atomic.Int64
-
-// SyncStats are the fsyncs asked for so far in this process.
-type SyncStats struct {
-	// Files are file fsyncs; Dirs are directory fsyncs (requested: on Windows they are
-	// no-ops, see SyncDir).
-	Files, Dirs int64
-}
-
-// SyncCounts returns the fsyncs asked for so far, through this package.
-func SyncCounts() SyncStats { return SyncStats{Files: fileSyncs.Load(), Dirs: dirSyncs.Load()} }

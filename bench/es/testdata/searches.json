@@ -336,6 +336,12 @@
       "size": 5,
       "sort": [
         {
+          "price": {
+            "missing": "_last",
+            "order": "asc"
+          }
+        },
+        {
           "sl_id": {
             "order": "desc"
           }
@@ -345,10 +351,10 @@
     },
     "searchlight": {
       "sort": [
+        "price",
         {
           "_id": "desc"
-        },
-        "price"
+        }
       ],
       "size": 5,
       "track_total": false

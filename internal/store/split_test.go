@@ -16,9 +16,10 @@ import (
 // (document and query upserts, rewrites, deletes, an upsert then delete of
 // one key and the reverse) and a mapping change are written in many
 // statements of one transaction. On Postgres that is writeSQL in parts
-// (deletes in the first, notifications in the last, the counter in every
-// one); on MySQL, VALUES and IN lists cut by placeholders and bytes. SQLite
-// writes one row a statement whatever the limits.
+// (deletes in the first, the sequence rows in every one); on MySQL, VALUES and
+// IN lists cut by placeholders and bytes. SQLite writes one row a statement
+// whatever the limits. On Postgres, each shard's newest seq is announced after
+// the commit.
 func TestSplitWrites(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, h *harness) {
 		ctx := context.Background()
@@ -27,7 +28,7 @@ func TestSplitWrites(t *testing.T) {
 			t.Fatal(err)
 		}
 		qp := func(i int) []byte {
-			p, err := EncodeQueryPayload(json.RawMessage(fmt.Sprintf(`{"eq":{"n":%d}}`, i)), json.RawMessage(`{"pad":"`+strings.Repeat("m", 40)+`"}`))
+			p, err := EncodeQueryPayload(json.RawMessage(fmt.Sprintf(`{"eq":{"n":%d}}`, i)), json.RawMessage(`{"pad":"`+strings.Repeat("m", 40)+`"}`), 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -35,13 +36,12 @@ func TestSplitWrites(t *testing.T) {
 		}
 		body := func(i int) string { return fmt.Sprintf(`{"v":%d,"pad":%q}`, i, strings.Repeat("x", 50)) }
 		model := make(map[string]string) // "d:id" or "q:id" -> body (documents) or query DSL
-		apply := func(batch []Change) (int64, int64) {
+		apply := func(batch []Change) map[int]int64 {
 			t.Helper()
-			first, last := mustApply(t, st, batch...)
-			for i, c := range batch {
-				if c.Seq != first+int64(i) {
-					t.Fatalf("change %d has seq %d, want %d", i, c.Seq, first+int64(i))
-				}
+			mustApply(t, st, batch...)
+			top := map[int]int64{}
+			for _, c := range batch {
+				top[c.Shard] = c.Seq
 				switch c.Kind {
 				case KindUpsert:
 					model[fmt.Sprintf("%d/d:%s", c.Shard, c.ID)] = string(c.Payload)
@@ -57,7 +57,7 @@ func TestSplitWrites(t *testing.T) {
 					delete(model, fmt.Sprintf("%d/q:%s", c.Shard, c.ID))
 				}
 			}
-			return first, last
+			return top
 		}
 
 		// Records to delete, written with the normal limits.
@@ -114,26 +114,19 @@ func TestSplitWrites(t *testing.T) {
 			del("sp", 0, "never"),                                   // a delete of nothing
 			del("sp", 2, "p23"), upsert("sp", 2, "p23", body(2023)), // deleted, then upserted again
 		)
-		first, last := apply(batch)
+		top := apply(batch)
 
 		if h.dialect != "sqlite" && statements < 5 {
 			t.Fatalf("the batch was written in %d statements; the limits did not split it", statements)
 		}
-		if got := counterValue(t, st); got != last {
-			t.Fatalf("counter %d after a batch ending at %d", got, last)
-		}
-		if head, _, err := st.HeadSeq(ctx); err != nil || head != last {
-			t.Fatalf("head %d %v, want %d", head, err, last)
-		}
-		top := make(map[int]int64)
-		for i, c := range batch {
-			top[c.Shard] = first + int64(i)
-		}
 		for sh := range 3 {
 			shard := ShardID{Index: "sp", Shard: sh}
+			if head := headSeq(t, st, shard); head != top[sh] {
+				t.Fatalf("shard %d's head %d after a batch ending there at %d", sh, head, top[sh])
+			}
 			recs, asOf := scanAll(t, st, shard)
-			if asOf != last {
-				t.Fatalf("shard %d scanned as of %d, want %d", sh, asOf, last)
+			if asOf != top[sh] {
+				t.Fatalf("shard %d scanned as of %d, want %d", sh, asOf, top[sh])
 			}
 			want := 0
 			for k, v := range model {
@@ -175,8 +168,8 @@ func TestSplitWrites(t *testing.T) {
 			}
 		}
 
-		// A mapping change under the same limits logs one change per shard,
-		// contiguous, and moves the counter.
+		// A mapping change under the same limits logs one change per shard, at the
+		// shard's next seq, and moves each shard's head.
 		meta, err := st.Indexes().Get(ctx, "sp")
 		if err != nil {
 			t.Fatal(err)
@@ -185,17 +178,15 @@ func TestSplitWrites(t *testing.T) {
 		if _, err := st.Indexes().Update(ctx, meta); err != nil {
 			t.Fatal(err)
 		}
-		if got := counterValue(t, st); got != last+3 {
-			t.Fatalf("counter %d after the mapping change, want %d", got, last+3)
-		}
 		for sh := range 3 {
-			changes := allChanges(t, st, ShardID{Index: "sp", Shard: sh})
-			if c := changes[len(changes)-1]; c.Kind != KindMapping || c.Seq != last+1+int64(sh) {
+			shard := ShardID{Index: "sp", Shard: sh}
+			changes := allChanges(t, st, shard)
+			if c := changes[len(changes)-1]; c.Kind != KindMapping || c.Seq != top[sh]+1 || headSeq(t, st, shard) != top[sh]+1 {
 				t.Fatalf("shard %d ends with %+v", sh, c)
 			}
 		}
-		if f, _ := mustApply(t, st, upsert("sp", 0, "after", `{}`)); f != last+4 {
-			t.Fatalf("the next change took seq %d, want %d", f, last+4)
+		if f, _ := mustApply(t, st, upsert("sp", 0, "after", `{}`)); f != top[0]+2 {
+			t.Fatalf("the next change took seq %d, want %d", f, top[0]+2)
 		}
 	})
 }

@@ -18,8 +18,10 @@ import (
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 	"github.com/Imposter/go-searchlight/internal/query"
+	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestPinnedFetchSurvivesRetire: a search's query phase pins a generation on a peer,
@@ -32,14 +34,14 @@ func TestPinnedFetchSurvivesRetire(t *testing.T) {
 	p := c.start(1)
 	createIndex(t, a.n, "ret", 1, 0)
 	waitCopies(t, a.st, "ret", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 10 {
-		last = mustWrite(t, a.n, "ret", upsertOp(fmt.Sprintf("r%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "ret", upsertOp(fmt.Sprintf("r%d", k), k)))
 	}
 	waitCount(t, p.n, "ret", last, 10)
 
 	id := store.ShardID{Index: "ret", Shard: 0}
-	rt := &remoteTarget{n: a.n, id: id, waitSeq: last, cands: []candidate{{node: p.n.ID(), addr: p.addr, shard: id}}}
+	rt := &remoteTarget{n: a.n, id: id, waitSeq: last.Seq(0), cands: []candidate{{node: p.n.ID(), addr: p.addr, shard: id}}}
 	defer rt.Release()
 	res, err := rt.Search(tctx(t), &search.Request{Index: "ret", Query: &query.All{}, Size: 10, NoBodies: true, TrackTotal: search.TrackTotalAll})
 	if err != nil {
@@ -90,18 +92,18 @@ func TestPinnedFetchSurvivesRetire(t *testing.T) {
 	fetch("after the copy retired")
 }
 
-// TestWaitForSeqReadSurvivesDrain (#66): a wait_for_seq search parked on a node's own
+// TestWaitForReadSurvivesDrain (#66): a wait_for search parked on a node's own
 // copy, which has not applied the seq, while that node drains and retires the copy. The
 // read is answered by the copy on the other node, a 200, not a 503 from the closed one.
-func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
+func TestWaitForReadSurvivesDrain(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	p := c.start(1)
 	createIndex(t, a.n, "dr", 1, 0)
 	waitCopies(t, a.st, "dr", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 10 {
-		last = mustWrite(t, a.n, "dr", upsertOp(fmt.Sprintf("d%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "dr", upsertOp(fmt.Sprintf("d%d", k), k)))
 	}
 	waitCount(t, p.n, "dr", last, 10)
 
@@ -114,7 +116,7 @@ func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
 		}
 		return nil
 	})
-	last = mustWrite(t, a.n, "dr", upsertOp("late", 10))
+	last = merged(last, mustWrite(t, a.n, "dr", upsertOp("late", 10)))
 	waitCount(t, a.n, "dr", last, 11)
 
 	type answer struct {
@@ -124,7 +126,7 @@ func TestWaitForSeqReadSurvivesDrain(t *testing.T) {
 	}
 	got := make(chan answer, 1)
 	go func() {
-		url := fmt.Sprintf("http://%s/indexes/dr/_search?wait_for_seq=%d", p.addr, last)
+		url := fmt.Sprintf("http://%s/indexes/dr/_search?wait_for=%s", p.addr, last)
 		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
 		if err != nil {
 			got <- answer{err: err}
@@ -180,9 +182,9 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 	c.start(1)
 	createIndex(t, a.n, "rq", 4, 1)
 	waitCopies(t, a.st, "rq", 4, 1, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 20 {
-		last = mustWrite(t, a.n, "rq", upsertOp(fmt.Sprintf("q%02d", k), k))
+		last = merged(last, mustWrite(t, a.n, "rq", upsertOp(fmt.Sprintf("q%02d", k), k)))
 	}
 	var coord *tnode
 	var remote []int
@@ -200,6 +202,9 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 	if coord == nil {
 		t.Fatal("every node hosts every shard: no search reads a peer")
 	}
+	if err := coord.n.SyncCatalog(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
 
 	bound := func(v float64) *float64 { return &v }
 	aggs := map[string]search.Agg{
@@ -208,6 +213,8 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		"distinct": {Type: search.AggCardinality, Field: "brand"},
 		"spread":   {Type: search.AggHistogram, Field: "price", Interval: 5},
 		"bands":    {Type: search.AggRange, Field: "price", Ranges: []search.Range{{To: bound(5)}, {From: bound(5), To: bound(12)}, {From: bound(12)}}},
+		"cheap":    {Type: search.AggFilter, Filter: &query.Leaf{Field: "price", Op: query.OpLt, Value: json.RawMessage(`10`)}, Aggs: map[string]search.Agg{"brands": {Type: search.AggTerms, Field: "brand", Size: 2}}},
+		"all":      {Type: search.AggGlobal, Aggs: map[string]search.Agg{"prices": {Type: search.AggStats, Field: "price"}}},
 	}
 	for _, tc := range []struct {
 		r           search.Request
@@ -217,7 +224,7 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		{search.Request{Query: &query.All{}, Size: 3, Sort: []search.SortField{{Field: "price", Desc: true}}, TrackTotal: 5, Aggs: aggs}, false},
 	} {
 		base := tc.r
-		want, err := coord.n.Search(tctx(t), "rq", &base, api.ReadOptions{WaitForSeq: last})
+		want, err := coord.n.Search(tctx(t), "rq", &base, api.ReadOptions{WaitFor: last})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -237,7 +244,7 @@ func TestSearchRequeriesShardWhoseFetchFails(t *testing.T) {
 		}
 		probe.start(drop)
 		r := tc.r
-		got, err := coord.n.Search(tctx(t), "rq", &r, api.ReadOptions{WaitForSeq: last})
+		got, err := coord.n.Search(tctx(t), "rq", &r, api.ReadOptions{WaitFor: last})
 		pins, fetches, timeouts := probe.stop()
 		if err != nil {
 			t.Fatalf("search with shard %d's pins lost twice: %v", drop, err)
@@ -375,4 +382,282 @@ func (pp *peerProbe) RoundTrip(r *http.Request) (*http.Response, error) {
 	c := r.Clone(r.Context())
 	c.Body = io.NopCloser(bytes.NewReader(b))
 	return pp.base.RoundTrip(c)
+}
+
+// TestWaitForWaitsOnOneCopy: refresh=wait_for returns once the write is searchable on
+// the coordinator's own copy, or, on a node without one, on the first copy that has
+// it: a peer copy whose tailer lags does not hold the write to its deadline.
+func TestWaitForWaitsOnOneCopy(t *testing.T) {
+	testtier.Heavy(t)
+	c := newCluster(t, sqliteDB(t), nil)
+	nodes := []*tnode{c.start(0), c.start(1), c.start(2)}
+	a := nodes[0]
+	createIndex(t, a.n, "wf", 1, 0)
+	waitCopies(t, a.st, "wf", 1, 3, time.Minute)
+	createIndex(t, a.n, "wf1", 1, 2)
+	waitCopies(t, a.st, "wf1", 1, 2, time.Minute)
+
+	stall := func(tn *tnode) {
+		t.Helper()
+		ch := make(chan struct{})
+		t.Cleanup(func() { close(ch) })
+		tn.wrap.stallTail.Store(&ch)
+		eventually(t, 10*time.Second, tn.cfg.NodeID+"'s tailers are held", func() error {
+			if tn.wrap.stalled.Load() == 0 {
+				return errors.New("no poll held yet")
+			}
+			return nil
+		})
+	}
+	write := func(tn *tnode, index string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		start := time.Now()
+		res, err := tn.n.Write(ctx, index, []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: api.RefreshWaitFor})
+		if err != nil || res.TimedOut {
+			t.Fatalf("a wait_for write to %s through %s: %+v, %v after %s", index, tn.cfg.NodeID, res, err, time.Since(start))
+		}
+	}
+
+	_, holders := serving(t, a.st, store.ShardID{Index: "wf1"})
+	var coordinator, lagging *tnode
+	for _, tn := range nodes {
+		switch {
+		case !slices.Contains(holders, tn.cfg.NodeID):
+			coordinator = tn
+		case lagging == nil:
+			lagging = tn
+		}
+	}
+	if coordinator == nil || lagging == nil {
+		t.Fatalf("wf1 is served by %v", holders)
+	}
+	stall(lagging)
+	write(coordinator, "wf1")
+	writer := a
+	if writer == lagging {
+		writer = coordinator
+	}
+	write(writer, "wf")
+}
+
+// TestWritesDoNotWaitOnACopyRebuiltAside: a copy being rebuilt aside serves its old data
+// and applies nothing until its replacement is swapped in, so a refresh=wait_for or
+// refresh=true write through its node waits on a copy that applies (the peer's) rather
+// than on it, and answers within its deadline. The mapping change rebuilds both copies,
+// in either order, so node-0's copy counts as rebuilt only once it has applied past the
+// change: before it has seen it, it is serving and not rebuilding too, and would start
+// its own rebuild under the write.
+func TestWritesDoNotWaitOnACopyRebuiltAside(t *testing.T) {
+	testtier.Heavy(t)
+	release := make(chan struct{})
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.HoldRecovery = func(ctx context.Context) error {
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
+	})
+	t.Cleanup(func() { close(release) })
+	a := c.start(0)
+	b := c.start(1)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "rb", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitCopies(t, a.st, "rb", 1, 2, time.Minute)
+	last := mustWrite(t, a.n, "rb", api.WriteOp{Kind: api.OpUpsert, ID: "r", Body: json.RawMessage(`{"title": "x", "colour": "red"}`)})
+	waitCount(t, b.n, "rb", last, 1)
+	if _, err := a.n.PatchMapping(tctx(t), "rb", map[string]schema.FieldType{"colour": schema.Keyword}); err != nil {
+		t.Fatal(err)
+	}
+	remapped, _, err := a.st.HeadSeq(tctx(t), store.ShardID{Index: "rb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copyOf := func(tn *tnode) api.ShardInfo {
+		shards, err := tn.n.Shards(tctx(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range shards {
+			if s.Index == "rb" && s.Node == tn.cfg.NodeID {
+				return s
+			}
+		}
+		return api.ShardInfo{}
+	}
+	eventually(t, time.Minute, "node-1's copy is held mid-rebuild and node-0's is rebuilt", func() error {
+		if s := copyOf(b); !s.Rebuilding {
+			return fmt.Errorf("node-1's copy: %+v", s)
+		}
+		if s := copyOf(a); s.Rebuilding || s.State != api.ShardServing || s.AppliedSeq < remapped {
+			return fmt.Errorf("node-0's copy: %+v (the mapping change is seq %d)", s, remapped)
+		}
+		return nil
+	})
+	for _, mode := range []api.RefreshMode{api.RefreshWaitFor, api.RefreshTrue} {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		start := time.Now()
+		res, err := b.n.Write(ctx, "rb", []api.WriteOp{upsertOp("w", 1)}, api.WriteOptions{Refresh: mode})
+		cancel()
+		if err != nil || res.TimedOut {
+			t.Fatalf("a %v write through the node rebuilding its copy: %+v, %v after %s", mode, res, err, time.Since(start))
+		}
+	}
+}
+
+// TestPercolateRereadsAStaleCatalogue: a node whose cached mapping predates a field
+// another node mapped re-reads the catalogue when a percolated document names a field
+// the cache lacks, instead of dropping it (dynamic false) until its next sync, so the
+// saved queries on the field match.
+func TestPercolateRereadsAStaleCatalogue(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.CatalogInterval = time.Hour
+		}
+	})
+	a := c.start(0)
+	spec := api.IndexSpec{
+		Mapping:  &schema.Mapping{Dynamic: schema.DynamicFalse, Fields: map[string]schema.FieldType{"title": schema.Text}},
+		Settings: api.IndexSettings{Shards: 1},
+	}
+	if _, err := a.n.CreateIndex(tctx(t), "pc", spec); err != nil {
+		t.Fatal(err)
+	}
+	b := c.start(1) // it reads the catalogue as it starts, and not again for an hour
+	waitCopies(t, a.st, "pc", 1, 2, time.Minute)
+	if _, err := a.n.PatchMapping(tctx(t), "pc", map[string]schema.FieldType{"tags": schema.KeywordList}); err != nil {
+		t.Fatal(err)
+	}
+	seq := mustWrite(t, a.n, "pc", api.WriteOp{Kind: api.OpQueryUpsert, ID: "q", Query: json.RawMessage(`{"field": "tags", "op": "has", "value": "x"}`)})
+	res, err := b.n.Percolate(tctx(t), "pc", &api.PercolateRequest{Docs: []json.RawMessage{json.RawMessage(`{"tags": ["x"]}`)}}, api.ReadOptions{WaitFor: seq})
+	if err != nil || string(res.Results[0].Queries) != `["q"]` {
+		t.Fatalf("percolating on the node with a stale catalogue: %+v, %v", res, err)
+	}
+}
+
+// TestOlderPeerRefusedForPostFilter: a peer of an older release, one with no endpoint
+// for a level-1 search (as 1.0.0) or one answering it at level 0 (having dropped the
+// post_filter unread), is not trusted with a search that needs level 1: the coordinator refuses its reply, and with no other copy the search is
+// unavailable (503) rather than answered with unfiltered hits. Searches that need
+// nothing new are answered as before.
+func TestOlderPeerRefusedForPostFilter(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, 0) })
+	}
+}
+
+// TestOlderPeerRefusedForTermsFilter: a peer at wire level 1 (filter aggregations, no
+// include or exclude), with no endpoint for a level-2 search or answering it at level
+// 1 with every value counted, is not trusted with a terms aggregation's include or
+// exclude: the search is unavailable (503), while the level-1 features it has are
+// answered.
+func TestOlderPeerRefusedForTermsFilter(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelFilterAggs) })
+	}
+}
+
+// TestOlderPeerRefusedForMetrics: a peer at wire level 3 (from, no min or max), with
+// no endpoint for a level-4 search or answering it at level 3 without its min and max
+// aggregations, is not trusted with them: the search is unavailable (503), while the
+// features of the levels below are answered.
+func TestOlderPeerRefusedForMetrics(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelFrom) })
+	}
+}
+
+// TestOlderPeerRefusedForFrom: a peer at wire level 2 (include and exclude, no from),
+// with no endpoint for a level-3 search or answering it at level 2 with the first
+// page, is not trusted with a from past 0: the search is unavailable (503), while the
+// level-1 and level-2 features it has, and a from with size 0, are answered.
+func TestOlderPeerRefusedForFrom(t *testing.T) {
+	for name, older := range map[string]olderPeer{"no endpoint": olderNoEndpoint, "drops the level": olderDropsLevel} {
+		t.Run(name, func(t *testing.T) { testOlderPeer(t, older, levelTermsFilter) })
+	}
+}
+
+func testOlderPeer(t *testing.T, older olderPeer, level int) {
+	c := newCluster(t, sqliteDB(t), func(_ int, o *Options) {
+		o.hooks.olderPeer, o.hooks.olderLevel = older, level
+	})
+	a := c.start(0)
+	c.start(1)
+	createIndex(t, a.n, "lv", 4, 1)
+	waitCopies(t, a.st, "lv", 4, 1, time.Minute)
+	var last *api.Token
+	for k := range 20 {
+		last = merged(last, mustWrite(t, a.n, "lv", upsertOp(fmt.Sprintf("l%02d", k), k)))
+	}
+	var coord *tnode
+	for _, tn := range c.live() {
+		if err := tn.n.SyncCatalog(tctx(t)); err != nil {
+			t.Fatal(err)
+		}
+		for s := range 4 {
+			if _, ok := tn.n.Hosted(store.ShardID{Index: "lv", Shard: s}); !ok {
+				coord = tn
+			}
+		}
+	}
+	if coord == nil {
+		t.Fatal("every node hosts every shard: no search reads a peer")
+	}
+	cheap := &query.Leaf{Field: "price", Op: query.OpLt, Value: json.RawMessage(`5`)}
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last}); err != nil || res.Total != 20 {
+		t.Fatalf("a level-0 search through an older peer: %v, %v", res, err)
+	}
+	refused := map[string]*search.Request{}
+	levelFour := map[string]*search.Request{
+		"min": {Query: &query.All{}, Aggs: map[string]search.Agg{"lo": {Type: search.AggMin, Field: "price"}}},
+		"max": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Aggs: map[string]search.Agg{
+			"hi": {Type: search.AggMax, Field: "price"},
+		}}}},
+		"threshold": {Query: &query.All{}, Aggs: map[string]search.Agg{"n": {Type: search.AggCardinality, Field: "brand", Threshold: 2}}},
+	}
+	levelThree := map[string]*search.Request{
+		"from": {Query: &query.All{}, Sort: []search.SortField{{Field: "price"}}, Size: 5, From: 5},
+	}
+	levelTwo := map[string]*search.Request{
+		"include": {Query: &query.All{}, Aggs: map[string]search.Agg{"b": {Type: search.AggTerms, Field: "brand", Include: &search.TermsFilter{Pattern: "b[0-2]"}}}},
+		"exclude": {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap, Aggs: map[string]search.Agg{
+			"b": {Type: search.AggTerms, Field: "brand", Exclude: &search.TermsFilter{Values: []any{"b1"}}},
+		}}}},
+	}
+	levelOne := map[string]*search.Request{
+		"post_filter": {Query: &query.All{}, PostFilter: cheap, Size: 20, TrackTotal: search.TrackTotalAll},
+		"filter":      {Query: &query.All{}, Aggs: map[string]search.Agg{"f": {Type: search.AggFilter, Filter: cheap}}},
+	}
+	for below, rs := range map[int]map[string]*search.Request{levelFilterAggs: levelOne, levelTermsFilter: levelTwo, levelFrom: levelThree, levelMetrics: levelFour} {
+		if level < below {
+			maps.Copy(refused, rs)
+			continue
+		}
+		for name, r := range rs {
+			if res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitFor: last}); err != nil {
+				t.Fatalf("%s through a level-%d peer: %v, %v", name, level, res, err)
+			}
+		}
+	}
+	if res, err := coord.n.Search(tctx(t), "lv", &search.Request{Query: &query.All{}, From: 5, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last}); err != nil || res.Total != 20 {
+		t.Fatalf("a from with size 0 through a level-%d peer: %v, %v", level, res, err)
+	}
+	for name, r := range refused {
+		res, err := coord.n.Search(tctx(t), "lv", r, api.ReadOptions{WaitFor: last})
+		var ae *api.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
+			t.Fatalf("%s through an older peer: %v, %v; want a 503", name, res, err)
+		}
+	}
 }

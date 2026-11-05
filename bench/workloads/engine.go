@@ -166,13 +166,13 @@ func newClient(base, token string, log io.Writer) *client {
 
 // retryDelay is how long to wait before retrying attempt (0-based), honoring a
 // server-given Retry-After (capped at maxRetryAfter) over the default exponential
-// backoff.
+// backoff, which is capped at retryMaxDelay (an overflowing shift included).
 func retryDelay(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
 		return min(retryAfter, maxRetryAfter)
 	}
 	d := retryBaseDelay << attempt
-	if d <= 0 || d > retryMaxDelay { // overflow, or past the cap
+	if d <= 0 || d > retryMaxDelay {
 		d = retryMaxDelay
 	}
 	return d

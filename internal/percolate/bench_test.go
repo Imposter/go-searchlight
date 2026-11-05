@@ -70,6 +70,8 @@ type benchConfig struct {
 	// segments: the saved searches arrive in this many refreshes (query segments);
 	// 0 is one.
 	segments int
+	// nested: documents with variants, and mostly nested saved searches.
+	nested bool
 }
 
 // filler is the description vocabulary.
@@ -84,6 +86,9 @@ var filler = func() []string {
 type benchGen struct {
 	r    *rand.Rand
 	long bool
+	// nested gives each document 2 to 8 variants (_v: size, color, price, in_stock)
+	// and makes most saved searches variant searches.
+	nested bool
 }
 
 func (g *benchGen) pick(list []string) string { return list[g.r.IntN(len(list))] }
@@ -128,6 +133,16 @@ func (g *benchGen) doc(i int) (string, []byte) {
 		fields["description"] = d.String()
 		fields["url"] = fmt.Sprintf("https://www.%s.example/p/%s-%d?ref=search&utm_source=feed", store, model, i)
 	}
+	if g.nested {
+		variants := make([]any, 2+g.r.IntN(7))
+		for k := range variants {
+			variants[k] = map[string]any{
+				"size": g.pick(benchSizes), "color": g.pick(benchColors),
+				"price": float64(5+g.r.IntN(300000)) / 100, "in_stock": g.r.IntN(3) != 0,
+			}
+		}
+		fields["_v"] = variants
+	}
 	body, _ := json.Marshal(fields)
 	return fmt.Sprintf("p%07d", i), body
 }
@@ -145,6 +160,26 @@ func (g *benchGen) query() string {
 	}
 	var n map[string]any
 	r := g.r.IntN(100)
+	if g.nested && r < 70 { // variant searches: one variant of a size (and colour) under a price, in stock
+		inner := []any{q("_v.size", "eq", g.pick(benchSizes)), q("_v.price", "lte", price())}
+		switch {
+		case r < 30:
+			inner = append(inner, q("_v.in_stock", "eq", true))
+		case r < 50:
+			inner = append(inner, q("_v.color", "in", []string{g.pick(benchColors), g.pick(benchColors)}))
+		}
+		v := map[string]any{"nested": map[string]any{"path": "_v", "query": map[string]any{"all": inner}, "inner_hits": map[string]any{"name": "picked"}}}
+		n = map[string]any{"all": []any{q("store", "eq", g.pick(c.stores)), q("brand", "eq", g.pick(c.brands)), v}}
+		switch {
+		case r >= 60:
+			n = map[string]any{"all": []any{q("category", "eq", g.pick(c.categories)), v}}
+		case r >= 50: // a variant search alone: a size and a colour under a price, anywhere
+			v["nested"].(map[string]any)["query"] = map[string]any{"all": []any{inner[0], inner[1], q("_v.color", "eq", g.pick(benchColors))}} //nolint:forcetypeassert,errcheck // built above
+			n = v
+		}
+		raw, _ := json.Marshal(n)
+		return string(raw)
+	}
 	if g.long && r < 10 { // searches on the description and the url
 		switch {
 		case r < 5:
@@ -210,12 +245,12 @@ func (env *benchEnv) regenerate() {
 func newBenchEnv(b *testing.B, cfg benchConfig) *benchEnv {
 	b.Helper()
 	ctx := context.Background()
-	s, err := shard.Open(ctx, b.TempDir(), benchMapping, shard.Options{QueryIndex: Index{}, RefreshInterval: -1, RefreshBytes: -1, DisableMerges: true})
+	s, err := shard.Open(ctx, b.TempDir(), mappingFor(cfg), shard.Options{QueryIndex: Index{}, RefreshInterval: -1, RefreshBytes: -1, DisableMerges: true})
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = s.Close(ctx) })
-	g := &benchGen{r: rand.New(rand.NewPCG(uint64(cfg.queries), 1)), long: cfg.long}
+	g := &benchGen{r: rand.New(rand.NewPCG(uint64(cfg.queries), 1)), long: cfg.long, nested: cfg.nested}
 	var seq int64
 	numDocs := 20000
 	if cfg.long {
@@ -224,7 +259,7 @@ func newBenchEnv(b *testing.B, cfg benchConfig) *benchEnv {
 	changes := make([]shard.Change, 0, numDocs)
 	for i := range numDocs {
 		id, body := g.doc(i)
-		d, _, err := schema.Analyze(benchMapping, id, body)
+		d, _, err := schema.Analyze(mappingFor(cfg), id, body)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -263,7 +298,7 @@ func newBenchEnv(b *testing.B, cfg benchConfig) *benchEnv {
 	}
 	for i := range numTest {
 		id, body := g.doc(1_000_000 + i)
-		d, _, err := schema.Analyze(benchMapping, id, body)
+		d, _, err := schema.Analyze(mappingFor(cfg), id, body)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -449,4 +484,42 @@ func BenchmarkPercolateAnalyze(b *testing.B) {
 		}
 		i++
 	}
+}
+
+var (
+	benchSizes  = []string{"XS", "S", "M", "L", "XL", "XXL", "28", "30", "32", "34", "36", "38"}
+	benchColors = []string{"black", "white", "red", "blue", "green", "grey", "navy", "beige"}
+)
+
+// benchNestedMapping is benchMapping with the variants' nested field.
+var benchNestedMapping = func() *schema.Mapping {
+	m := benchMapping.Clone()
+	m.Fields["_v"] = schema.Nested
+	m.Fields["_v.size"] = schema.Keyword
+	m.Fields["_v.color"] = schema.Keyword
+	m.Fields["_v.price"] = schema.Number
+	m.Fields["_v.in_stock"] = schema.Bool
+	return m
+}()
+
+// BenchmarkPercolateNested is 100k saved searches over documents with variants, 70% of
+// them variant searches (a nested node of a size, a price and stock or colours, beside
+// a store and a brand or a category, or alone: a tenth of all are a variant search with
+// no other condition, which nothing outside the nested node can anchor).
+func BenchmarkPercolateNested(b *testing.B) {
+	env := newBenchEnv(b, benchConfig{queries: 100000, nested: true})
+	p := New(Options{})
+	if _, err := p.Percolate(context.Background(), env.g, env.docs[:500]); err != nil {
+		b.Fatal(err)
+	}
+	b.Run("doc", func(b *testing.B) { benchDoc(b, env, p) })
+	b.Run("batch", func(b *testing.B) { benchBatch(b, env, p) })
+}
+
+// mappingFor is cfg's mapping.
+func mappingFor(cfg benchConfig) *schema.Mapping {
+	if cfg.nested {
+		return benchNestedMapping
+	}
+	return benchMapping
 }

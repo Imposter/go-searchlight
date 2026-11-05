@@ -25,16 +25,16 @@
 // copies have a searchable generation covering that seq (shard.WaitRefreshed);
 // refresh=true waits until they have applied it, then refreshes them at once. On a
 // cluster node that is every serving copy of the written shards, here and elsewhere.
-// Any read takes wait_for_seq=N and waits the same way on every copy it reads, after
-// waking their tailers, so an idle copy advances to N without a change of its own.
+// Any read takes wait_for=<token> and waits the same way on every copy it reads, each
+// for the token's seq of its shard, after waking their tailers.
 // Every wait is bounded by the request's deadline.
 //
 // # Searches
 //
 // A search holds one generation of each shard's copy from the query to the fetch:
-// with one shard it runs once with bodies; with several it runs the query phase on
-// each (NoBodies), reduces, then fetches the bodies of the winning hits alone from the
-// copies that found them (a peer pins its generation between the two). A copy lost
+// with one shard (and no from) it runs once with bodies; otherwise it runs the query
+// phase on each (NoBodies), reduces, then fetches the bodies of the page's hits alone
+// from the copies that found them (a peer pins its generation between the two). A copy lost
 // between the phases makes the search run again.
 package node
 
@@ -62,6 +62,7 @@ import (
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/percolate"
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/replica"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -121,6 +122,9 @@ type Options struct {
 // Options.Cluster set it hosts the copies the cluster gives it and reads the rest from
 // peers.
 type Single struct {
+	// handoffs bounds the documents every shard's handoff holds together.
+	handoffs handoffBudget
+
 	st         store.Store
 	records    store.RecordReader
 	cfg        config.Config
@@ -133,12 +137,10 @@ type Single struct {
 	clock      clock.Clock
 	budget     *shard.MergeBudget
 	cache      *shard.FilterCache
+	rcache     *search.RequestCache // nil: no request cache
 	maxLag     int64
 	openFailed metric.Int64Counter
 	splits     percolate.SplitBudget
-
-	// head is the newest seq committed or seen applied.
-	head atomic.Int64
 
 	// dbOK is when the database last answered (Unix nanoseconds); dbDown is set
 	// while it does not. Reads served meanwhile are marked stale (spec section 10).
@@ -166,6 +168,8 @@ var _ api.Coordinator = (*Single)(nil)
 // index is one open index: its catalogue entry and its shards.
 type index struct {
 	name string
+	// uid is the incarnation this index is: a token of another is refused.
+	uid string
 	// catalog serializes changes to the catalogue entry (mapping and settings),
 	// honouring deadlines; fields queues writes' new dynamic fields for it.
 	catalog catalogLock
@@ -179,6 +183,9 @@ type index struct {
 	refresh     atomic.Int64
 	refreshWake chan struct{}
 	dropped     atomic.Bool
+	// catalogRecheck is when (Unix ns) percolated documents naming unmapped fields
+	// last re-read the catalogue (analyzeDocs).
+	catalogRecheck atomic.Int64
 	// runCtx is the context the index's tailers and refresher run under; cancel
 	// stops them all.
 	runCtx context.Context
@@ -197,13 +204,26 @@ type indexState struct {
 type shardSlot struct {
 	id store.ShardID
 	// written is the newest seq the node committed to this shard; querySeq the
-	// newest that wrote one of its saved queries.
+	// newest that wrote one of its saved queries, or the shard's head when the index
+	// was opened (every saved query committed before then is at or below it).
 	written  atomic.Int64
 	querySeq atomic.Int64
+	// head is the newest seq of the shard this node knows committed. It is read from
+	// the store when the index opens and when a wait_for names a seq past it, raised
+	// by every commit through this node and to the seq a copy held when it was hosted
+	// here; it does not follow the copy's tailer. A copy that finds the changelog
+	// rewound lowers it (with written and querySeq).
+	head atomic.Int64
+	// commits counts the changes committed through this node to the shard, noted
+	// before their seqs raise the marks above: a lowering to a head read from the
+	// store tells by it that a commit landed while it read (slotMarks).
+	commits atomic.Int64
 	// host serializes hosting and unhosting the copy: one tailer per copy directory.
 	host           sync.Mutex
 	local          atomic.Pointer[copyState]
 	unhostedAtNano atomic.Int64
+	// analyzed hands the documents writes on this node analyzed to its copy's tailer.
+	analyzed handoff
 }
 
 // copyState is one shard copy hosted on this node, and its tailer.
@@ -251,6 +271,10 @@ func (c *copyState) startedUp() bool {
 	return false
 }
 
+// refreshDisabled reports whether idx's copies refresh only on demand
+// (refresh_interval -1): a read or write that waits for a seq refreshes them itself.
+func (idx *index) refreshDisabled() bool { return idx.refresh.Load() <= 0 }
+
 // copies returns the copies of idx this node hosts, by shard.
 func (idx *index) copies() []*copyState {
 	out := make([]*copyState, 0, len(idx.shards))
@@ -271,7 +295,8 @@ func (n *Single) pingInterval() time.Duration {
 	return min(time.Second, max(50*time.Millisecond, n.cfg.MaxLag/4))
 }
 
-// pingLoop checks the database until ctx ends.
+// pingLoop checks the database until ctx ends. A database slower than max_lag/2 to
+// answer a ping is as good as gone for reads that must not trail by more than max_lag.
 func (n *Single) pingLoop(ctx context.Context) {
 	t := n.clock.NewTicker(n.pingInterval())
 	defer t.Stop()
@@ -281,8 +306,6 @@ func (n *Single) pingLoop(ctx context.Context) {
 			return
 		case <-t.C():
 		}
-		// A database slower than max_lag/2 to answer a ping is as good as gone
-		// for reads that must not trail by more than max_lag.
 		pctx, cancel := context.WithTimeout(ctx, n.pingTimeout())
 		err := n.st.Ping(pctx)
 		cancel()
@@ -366,12 +389,16 @@ func (c *copyState) trailing(maxLag time.Duration) bool {
 // its lease may be lost (a cluster node), it has halted, or it is recovering (being
 // opened, reopened or rebuilt: the shard a tailer exposes then may be empty or partly
 // loaded, so it is never read).
+//
+// A paused copy serves this node's last-resort reads, stale (lapsed). A copy rebuilding
+// aside serves, stale, until its replacement is swapped in. A copy resumed from a
+// warm shard serves while its new tailer starts up over the shard that served.
 func (c *copyState) notServing() error {
 	if c.spec.Quarantined != nil && c.spec.Quarantined() {
 		return api.Unavailable(store.ErrLeaseLost, "shard %d of index %q was taken over from another node and serves nothing yet", c.id.Shard, c.id.Index)
 	}
 	if c.paused.Load() {
-		return nil // it serves this node's last-resort reads, stale (lapsed)
+		return nil
 	}
 	if h := c.halted.Load(); h != nil {
 		return api.Unavailable(*h, "shard %d of index %q has halted", c.id.Shard, c.id.Index)
@@ -384,13 +411,11 @@ func (c *copyState) notServing() error {
 	if sr, ok := c.tailer.(StateReporter); ok {
 		switch sr.StateName() {
 		case StateTailing, StateRebuilding:
-			// Rebuilding aside: the current copy serves (stale) until its
-			// replacement is swapped in.
 		case StateHalted:
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q has halted", c.id.Shard, c.id.Index)
 		default:
 			if c.warm != nil && c.shard() == c.warm {
-				return nil // resumed: its new tailer starts up over the shard that served
+				return nil
 			}
 			return api.Unavailable(errors.New(sr.StateName()), "shard %d of index %q is recovering", c.id.Shard, c.id.Index)
 		}
@@ -406,7 +431,7 @@ type LagReporter interface {
 
 // backlog is how far the copy trails its writes: the tailer's own measure when it has
 // one, else the seqs between what the node committed to the shard and what the copy
-// has applied (an over-estimate, since other shards' changes share the seq space).
+// has applied.
 func (c *copyState) backlog() int64 {
 	if lr, ok := c.tailer.(LagReporter); ok {
 		seq, _ := lr.Lag()
@@ -424,6 +449,11 @@ func (c *copyState) shard() *shard.Shard { return c.tailer.Shard() }
 // NewSingle opens every index in the store's catalogue and, on a single node, a copy of
 // every shard with its tailer, and starts them. Copies of indexes no longer in the
 // catalogue are removed from data_dir.
+//
+// Without Options.NewTailer, every tailer shares the node's one Hub, or polls and is
+// woken by writes when the store pushes no notifications (SQLite, MySQL). The
+// shards' heads, which bound wait_for, and every copy's saved-query wait start at the
+// store's heads of the shards, so nothing committed before a restart is missed.
 func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Store == nil {
 		return nil, errors.New("node: Options.Store is required")
@@ -447,6 +477,9 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Clock == nil {
 		o.Clock = clock.Real{}
 	}
+	if o.GroupCommit.MaxTransactions == 0 {
+		o.GroupCommit.MaxTransactions = o.Config.WriteTransactions
+	}
 	if o.GroupCommit.Clock == nil {
 		o.GroupCommit.Clock = o.Clock
 	}
@@ -457,8 +490,6 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		o.GroupCommit.Meter = o.Meter
 	}
 	if o.NewTailer == nil {
-		// One Hub per node, shared by every tailer; nil (no notifications, as on
-		// SQLite and MySQL) means the tailers poll and are woken by writes.
 		hub := replica.NewHub(o.Store, replica.HubOptions{Logger: o.Logger, Meter: o.Meter, Clock: o.Clock})
 		if hub != nil {
 			o.Background = append(o.Background, hub.Run)
@@ -482,6 +513,11 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		absent:   absentIndexes{clock: o.Clock},
 		reserved: map[string]bool{},
 	}
+	rc, err := newRequestCache(o)
+	if err != nil {
+		return nil, err
+	}
+	n.rcache = rc
 	in := telemetry.NewInstruments(o.Meter)
 	n.openFailed = in.Counter(telemetry.MetricShardOpenFailed)
 	if err := in.Err(); err != nil {
@@ -490,7 +526,10 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 	if o.Config.SearchThreads > 0 {
 		search.SetThreads(o.Config.SearchThreads)
 	}
-	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit) //nolint:contextcheck // the committer outlives this call; each Apply carries its caller's context
+	if o.Config.BackgroundShare > 0 {
+		prio.Set(prio.New(o.Config.BackgroundShare, o.Clock))
+	}
+	n.gc = store.NewGroupCommitter(o.Store, o.GroupCommit)
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	n.bgCancel = cancel
 	for _, run := range o.Background {
@@ -506,14 +545,6 @@ func NewSingle(ctx context.Context, o Options) (*Single, error) {
 		return nil, fmt.Errorf("node: list indexes: %w", err)
 	}
 	n.noteDB(nil)
-	// The wait_for_seq bound and every copy's saved-query wait start at the
-	// store's head, so nothing committed before a restart is missed.
-	if head, _, err := o.Store.HeadSeq(ctx); err == nil {
-		n.noteHead(head)
-	} else {
-		_ = n.Close(ctx)
-		return nil, fmt.Errorf("node: read the head seq: %w", err)
-	}
 	n.bg.Go(func() { n.pingLoop(bgCtx) })
 	keep := map[string]bool{}
 	for _, m := range metas {
@@ -580,22 +611,28 @@ func (n *Single) resolvedRefresh(s api.IndexSettings) time.Duration {
 }
 
 // openIndex opens an index and starts its refresher. A single node hosts every shard's
-// copy at once; a cluster node hosts the copies the cluster gives it (HostCopy).
+// copy at once; a cluster node hosts the copies the cluster gives it (HostCopy). A
+// percolation waits until a copy has every change up to its shard's head as of the
+// index's opening (its saved queries among them), then only for queries saved since.
 func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, error) {
 	state, err := parseState(m)
 	if err != nil {
 		return nil, err
 	}
-	idx := &index{name: m.Name, dir: filepath.Join(n.indexesDir(), m.UID), refreshWake: make(chan struct{}, 1), catalog: make(catalogLock, 1)}
+	idx := &index{name: m.Name, uid: m.UID, dir: filepath.Join(n.indexesDir(), m.UID), refreshWake: make(chan struct{}, 1), catalog: make(catalogLock, 1)}
 	idx.meta.Store(state)
 	idx.refresh.Store(int64(n.resolvedRefresh(state.settings)))
 	idx.runCtx, idx.cancel = context.WithCancel(context.WithoutCancel(ctx))
-	for s := range state.settings.Shards {
+	heads, err := n.st.IndexHeads(ctx, m.Name, state.settings.Shards)
+	if err != nil {
+		idx.cancel()
+		return nil, fmt.Errorf("node: read the heads of index %q: %w", m.Name, err)
+	}
+	for s, head := range heads {
 		sl := &shardSlot{id: store.ShardID{Index: m.Name, Shard: s}}
-		// A percolation waits until the copy has every change up to the head as of
-		// its opening (its saved queries among them), then only for queries saved
-		// since.
-		sl.querySeq.Store(n.head.Load())
+		sl.analyzed.budget = &n.handoffs
+		sl.head.Store(head)
+		sl.querySeq.Store(head)
 		idx.shards = append(idx.shards, sl)
 	}
 	if n.cl == nil {
@@ -612,7 +649,17 @@ func (n *Single) openIndex(ctx context.Context, m store.IndexMeta) (*index, erro
 }
 
 // hostCopy opens this node's copy of shard s of idx and starts its tailer, unless it
-// hosts one already.
+// hosts one already. The node's refresher drives the copy's refreshes, so the interval
+// can change.
+//
+// A copy rebuilt aside lives in a subdirectory its root names: the current one is
+// opened (and what a crash or a swap left behind collected). The directory is a cache
+// of the store: one whose data is damaged or of a format this build no longer reads
+// (segment.Rebuildable) is wiped, and the copy, opened empty, is rebuilt from a peer or
+// the store, never served (spec section 10). One written in a newer format is refused
+// and left as it is (spec section 9: a binary rolled back must not destroy its
+// successor's copy), and any other failure (I/O, permissions, resources) is returned
+// for the allocator to retry.
 func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec) error {
 	sl := idx.shards[s]
 	sl.host.Lock()
@@ -627,7 +674,7 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	opts := shard.Options{
 		Index:           idx.name,
 		Shard:           s,
-		RefreshInterval: -1, // the node's refresher drives refreshes, so the interval can change
+		RefreshInterval: -1,
 		FlushInterval:   n.cfg.FlushInterval,
 		MergeBudget:     n.budget,
 		FilterCache:     n.cache,
@@ -636,18 +683,11 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 		Logger:          n.log,
 		Tracer:          n.tr,
 		Meter:           n.meter,
+		Published:       search.WarmOrdinals,
 	}
 	if n.opts.ShardOptions != nil {
 		n.opts.ShardOptions(&opts)
 	}
-	// A copy rebuilt aside lives in a subdirectory its root names: open the
-	// current one (and collect what a crash or a swap left behind). The directory is a
-	// cache of the store: one whose data is damaged or of a format this build no longer
-	// reads (segment.Rebuildable) is wiped, and the copy, opened empty, is rebuilt from a
-	// peer or the store, never served (spec section 10). One written in a newer format is
-	// refused and left as it is (spec section 9: a binary rolled back must not destroy
-	// its successor's copy), and any other failure (I/O, permissions, resources) is
-	// returned for the allocator to retry.
 	root := idx.copyRoot(s)
 	sh, err := replica.OpenCopy(ctx, root, state.mapping, opts)
 	if err != nil && ctx.Err() == nil {
@@ -670,8 +710,8 @@ func (n *Single) hostCopy(ctx context.Context, idx *index, s int, spec HostSpec)
 	if err != nil {
 		return fmt.Errorf("node: open %s: %w", sl.id, err)
 	}
-	n.noteHead(sh.AppliedSeq())
-	env := TailerEnv{Head: n.head.Load, Fetcher: spec.Fetcher}
+	raise(&sl.head, sh.AppliedSeq())
+	env := n.tailerEnv(idx, sl, spec.Fetcher)
 	if n.cl != nil {
 		cp := spec.Copy
 		env.Copy = &cp
@@ -765,6 +805,7 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 		sl.host.Lock()
 		c := sl.local.Swap(nil)
 		sl.host.Unlock()
+		sl.analyzed.clear()
 		if c == nil {
 			continue
 		}
@@ -777,14 +818,74 @@ func (n *Single) stopIndex(ctx context.Context, idx *index) error {
 	return errors.Join(errs...)
 }
 
-// noteHead raises the node's head to seq.
-func (n *Single) noteHead(seq int64) {
-	for {
-		cur := n.head.Load()
-		if seq <= cur || n.head.CompareAndSwap(cur, seq) {
-			return
+// rewound lowers the shard's known head, newest write and newest saved-query seq to
+// its head, each when it is higher: its copy found the changelog rewound (a failover
+// that lost commits) at pollHead, so seqs past the head are not committed any more. A
+// wait_for past it must be checked with the store again, and a percolation must not
+// wait for saved queries the rewind lost. The head is read from the store again after
+// the marks are loaded, so a commit through this node since the copy's poll is not
+// lowered under; while the store cannot be asked, pollHead stands in for it. ctx is
+// the index's run context, which the copy's tailer runs under.
+func (n *Single) rewound(ctx context.Context, sl *shardSlot, pollHead int64) {
+	m := sl.load(&sl.head, &sl.written, &sl.querySeq)
+	ctx, cancel := context.WithTimeout(ctx, clampTimeout)
+	defer cancel()
+	head := pollHead
+	if h, _, err := n.st.HeadSeq(ctx, sl.id); err == nil {
+		head = h
+	}
+	m.lowerTo(head)
+}
+
+// slotMarks are some of a slot's marks (head, written, querySeq) as loaded before a
+// read of the store's head, with the slot's commit count before them, to lower them
+// to that head without lowering under a commit that landed while it was read.
+type slotMarks struct {
+	sl      *shardSlot
+	commits int64
+	vs      []*atomic.Int64
+	was     []int64
+}
+
+// load loads vs, marks of sl, for a lowering to a head read after it.
+func (sl *shardSlot) load(vs ...*atomic.Int64) slotMarks {
+	m := slotMarks{sl: sl, commits: sl.commits.Load(), vs: vs, was: make([]int64, len(vs))}
+	for i, v := range vs {
+		m.was[i] = v.Load()
+	}
+	return m
+}
+
+// lowerTo lowers each mark past head to it, from its loaded value only: a mark
+// raised since (by a commit's seq) stays. A commit noted since the load whose seq did
+// not raise its mark (the mark was past it, as after a rewind) may have been lowered
+// under: then each mark is raised back to its loaded value, as if the lowering had not
+// happened, and a later one tries again.
+func (m slotMarks) lowerTo(head int64) {
+	lowered := false
+	for i, v := range m.vs {
+		if m.was[i] > head && v.CompareAndSwap(m.was[i], head) {
+			lowered = true
 		}
 	}
+	if lowered && m.sl.commits.Load() != m.commits {
+		for i, v := range m.vs {
+			raise(v, m.was[i])
+		}
+	}
+}
+
+// tailerEnv is what the node offers the tailer of the copy of idx's shard sl.
+func (n *Single) tailerEnv(idx *index, sl *shardSlot, fetcher replica.Fetcher) TailerEnv {
+	rewound := func(head int64) { n.rewound(idx.runCtx, sl, head) }
+	return TailerEnv{Head: sl.head.Load, Fetcher: fetcher, Rewound: rewound, Analyzed: sl.analyzed.take}
+}
+
+// tailerEnvWith is tailerEnv for a copy the registry holds as cp.
+func (n *Single) tailerEnvWith(idx *index, sl *shardSlot, fetcher replica.Fetcher, cp *store.Copy) TailerEnv {
+	env := n.tailerEnv(idx, sl, fetcher)
+	env.Copy = cp
+	return env
 }
 
 // lookup returns an open index, or a 404. A cluster node that does not know the index
@@ -794,10 +895,63 @@ func (n *Single) lookup(ctx context.Context, name string) (*index, error) {
 }
 
 // lookupForRead is lookup for a read, which may answer 404 from a recent store lookup
-// (absentTTL) unless it waits for a seq: a read that names one follows a write, and
-// must find the index that write found.
-func (n *Single) lookupForRead(ctx context.Context, name string, waitSeq int64) (*index, error) {
-	return n.lookupIndex(ctx, name, waitSeq <= 0)
+// (absentTTL) unless it waits for a token: a read that names one follows a write, and
+// must find the index that write found. A token of another incarnation of the index
+// (one dropped and created again since the write) is a 400: no seq of the new one
+// answers it.
+func (n *Single) lookupForRead(ctx context.Context, name string, wait *api.Token) (*index, error) {
+	idx, err := n.lookupIndex(ctx, name, wait == nil)
+	if err != nil {
+		return nil, err
+	}
+	return n.checkTokenOf(ctx, idx, wait)
+}
+
+// checkTokenOf is checkToken for an index this node looked up: it returns idx, or,
+// when wait is a token of the incarnation the catalogue has now and this cluster node
+// has not synced it yet (the index was dropped and created again through another
+// node), that incarnation, adopted. A token the catalogue's incarnation does not match
+// either is refused.
+func (n *Single) checkTokenOf(ctx context.Context, idx *index, wait *api.Token) (*index, error) {
+	if wait != nil && wait.UID != idx.uid && n.cl != nil {
+		m, err := n.st.Indexes().Get(ctx, idx.name)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return nil, indexNotFound(idx.name)
+		case err != nil:
+			return nil, storeError(err, idx.name)
+		case m.UID == wait.UID:
+			cur, err := n.adopt(ctx, m)
+			if err != nil {
+				return nil, err
+			}
+			if cur == nil {
+				return nil, api.Unavailable(nil, "index %q is being reopened as the catalogue's incarnation", idx.name)
+			}
+			idx = cur
+		}
+	}
+	if err := checkToken(idx, wait); err != nil {
+		return nil, err
+	}
+	return idx, nil
+}
+
+// checkToken refuses (400) a token of another incarnation of idx (one dropped and
+// created again since the write), or one naming a shard idx does not have.
+func checkToken(idx *index, wait *api.Token) error {
+	if wait == nil {
+		return nil
+	}
+	if wait.UID != idx.uid {
+		return api.InvalidAt("params.wait_for", "wait_for is a token of another incarnation of index %q: it was dropped and created again since that write", idx.name)
+	}
+	for s := range wait.Seqs {
+		if s >= len(idx.shards) {
+			return api.InvalidAt("params.wait_for", "wait_for names shard %d, and index %q has %d", s, idx.name, len(idx.shards))
+		}
+	}
+	return nil
 }
 
 func (n *Single) lookupIndex(ctx context.Context, name string, cachedAbsence bool) (*index, error) {
@@ -851,6 +1005,7 @@ func (n *Single) Close(ctx context.Context) error {
 			n.bgCancel()
 		}
 		n.bg.Wait()
+		errs = append(errs, n.rcache.Close())
 		n.closeErr = errors.Join(errs...)
 		n.log.InfoContext(ctx, "node engine closed")
 	})

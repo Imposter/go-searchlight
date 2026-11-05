@@ -9,19 +9,6 @@ import (
 	"github.com/Imposter/go-searchlight/internal/search"
 )
 
-// DefaultSize is a search's size when the request gives none, as Elasticsearch's.
-const DefaultSize = 10
-
-// hasKey reports whether the JSON object body has a top-level key.
-func hasKey(body []byte, key string) bool {
-	var top map[string]json.RawMessage
-	if json.Unmarshal(body, &top) != nil {
-		return false
-	}
-	_, ok := top[key]
-	return ok
-}
-
 // searchResponse answers POST _search.
 type searchResponse struct {
 	TookMS   int64                        `json:"took_ms"`
@@ -40,17 +27,20 @@ type total struct {
 
 // hit is a search hit as the API shows it: never the internal segment reference.
 type hit struct {
-	ID   string          `json:"id"`
-	Sort []any           `json:"sort"`
-	Body json.RawMessage `json:"body,omitempty"`
+	ID        string                       `json:"id"`
+	Sort      []any                        `json:"sort"`
+	Seq       int64                        `json:"_seq,omitempty"`
+	Body      json.RawMessage              `json:"body,omitempty"`
+	InnerHits map[string]*search.InnerHits `json:"inner_hits,omitempty"`
 }
 
-// search serves POST /indexes/{index}/_search: {query, sort, size, search_after,
-// track_total, aggs, fields, timeout}. Past the search's timeout, or the request's
-// deadline, the response holds what the shards found by then, with timed_out set.
+// search serves POST /indexes/{index}/_search: {query, post_filter, sort, size, from,
+// search_after, track_total, aggs, fields, seq_no, timeout}. Past the search's timeout, or the
+// request's deadline, the response holds what the shards found by then, with timed_out
+// set.
 func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error {
 	start := s.clock.Now()
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -68,10 +58,28 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	if len(problems) > 0 {
 		return Invalid("the search request is invalid", problems...)
 	}
-	if !hasKey(body, "size") {
-		req.Size = DefaultSize
+	if window := req.From + req.Size; window > s.cfg.MaxResultWindow {
+		loc := "from"
+		if req.From == 0 {
+			loc = "size"
+		}
+		return InvalidAt(loc, "the result window is too large: from + size is %d, and max_result_window is %d; page deeper with search_after, passing the previous page's next", window, s.cfg.MaxResultWindow)
 	}
-	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitForSeq: wait})
+	if req.From > 0 && req.Size > 0 {
+		cost := windowCost(s.readBytes, req.From+req.Size)
+		if !s.readBytes.reserve(cost) {
+			return overBudget(s.readBytes)
+		}
+		defer s.readBytes.release(cost)
+	}
+	if objects := search.InnerHitsObjects(req); objects > 0 {
+		cost := windowCost(s.readBytes, min(objects, search.MaxInnerHitsObjects))
+		if !s.readBytes.reserve(cost) {
+			return overBudget(s.readBytes)
+		}
+		defer s.readBytes.release(cost)
+	}
+	resp, err := s.c.Search(r.Context(), r.PathValue("index"), req, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}
@@ -85,7 +93,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 	}
 	for i := range resp.Hits {
 		h := &resp.Hits[i]
-		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Body: h.Body}
+		out.Hits[i] = hit{ID: h.ID, Sort: h.Sort, Seq: h.Seq, Body: h.Body, InnerHits: h.InnerHits}
 	}
 	out.TookMS = s.clock.Since(start).Milliseconds()
 	return writeJSON(w, http.StatusOK, out)
@@ -93,12 +101,13 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request, p params) error 
 
 // countBody is POST _count's body.
 type countBody struct {
-	Query json.RawMessage `json:"query"`
+	Query        json.RawMessage `json:"query"`
+	MaxStaleness json.RawMessage `json:"max_staleness"`
 }
 
 // count serves POST /indexes/{index}/_count: {query}, an exact count.
 func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -118,7 +127,14 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 		}
 		sr.Query = n
 	}
-	resp, err := s.c.Search(r.Context(), r.PathValue("index"), sr, ReadOptions{WaitForSeq: wait})
+	if len(req.MaxStaleness) > 0 {
+		d, ok := search.ParseMaxStaleness(req.MaxStaleness)
+		if !ok {
+			return InvalidAt("body.max_staleness", `max_staleness is a duration ("5s", "1m") or milliseconds, at most 1h`)
+		}
+		sr.MaxStaleness = d
+	}
+	resp, err := s.c.Search(r.Context(), r.PathValue("index"), sr, ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}
@@ -127,4 +143,17 @@ func (s *Server) count(w http.ResponseWriter, r *http.Request, p params) error {
 		out["stale"] = true
 	}
 	return writeJSON(w, http.StatusOK, out)
+}
+
+// windowHitBytes is the heap one hit of a from search's window is charged against
+// max_inflight_read_bytes: its entry in a shard's heap, its id, sort values and ref as
+// a peer's JSON reply carries them, and its place in the coordinator's merge; and so is
+// each inner hit object a response may hold (search.InnerHitsObjects).
+const windowHitBytes = 1 << 10
+
+// windowCost is what a search reaching window hits deep reserves from b: window hits
+// at windowHitBytes, at most half of b, so one such search fits an idle budget while
+// more of them at once are refused (429).
+func windowCost(b *budget, window int) int64 {
+	return min(int64(window)*windowHitBytes, b.limit/2)
 }

@@ -77,6 +77,14 @@ func newUploadID() (string, error) {
 
 func (b *blobStore) crashAt(point string) bool { return b.crash != nil && b.crash(point) }
 
+// Put implements [BlobStore]. Until switchTo's transaction makes upload the live one,
+// a failure leaves upload this call's own, abandoned attempt, which Put removes. From
+// the switch on, upload's chunks are never removed here, however Put goes on to fail (a
+// cancelled context, a transient error, a test's injected failure). An ambiguous
+// switch counts as made: upload may be live, and the upload it replaced may or may not
+// be garbage (the commit may have rolled back, leaving it current), so both are left
+// to a later Sweep, or to upload's own eventual removal. The caller cannot be told
+// what happened; it must Stat or Get to find out.
 func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info BlobInfo, err error) {
 	s := b.s
 	ctx, end := s.start(ctx, "blob_put", attribute.String("blob", name))
@@ -92,11 +100,6 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 	if _, err := s.w.ExecContext(ctx, q.Register, upload, name); err != nil {
 		return info, fmt.Errorf("register blob upload: %w", err)
 	}
-	// committed becomes true once switchTo's transaction makes upload the
-	// live one; after that, upload's chunks must never be swept by this
-	// defer, however Put goes on to fail (a cancelled context, a transient
-	// error, a test's injected failure) — only a failure before the switch
-	// means upload is still this call's own, abandoned attempt.
 	committed := false
 	defer func() {
 		if err != nil && !committed && !errors.Is(err, errSimulatedCrash) {
@@ -138,20 +141,12 @@ func (b *blobStore) Put(ctx context.Context, name string, r io.Reader) (info Blo
 
 	old, createdAt, err := b.switchTo(ctx, name, upload, size, chunks, sum)
 	if errors.Is(err, ErrAmbiguousCommit) {
-		// upload may now be live (the commit may have landed): never sweep
-		// it. old may or may not actually be garbage (the commit may have
-		// rolled back, in which case old is still sl_blobs' current
-		// upload): leave it alone and let a later Sweep, or this same
-		// upload's own eventual removal, sort it out. The caller cannot be
-		// told what happened; it must Stat or Get to find out.
 		committed = true
 		return info, err
 	}
 	if err != nil {
 		return info, err
 	}
-	// The blob is now committed: upload is live, and its chunks must stay
-	// put no matter what happens from here on.
 	committed = true
 	info = BlobInfo{Name: name, Size: size, Chunks: chunks, SHA256: sum, CreatedAt: millis(createdAt)}
 	if b.crashAt("cleanup") {
@@ -187,6 +182,15 @@ func sweptCheck(res sql.Result, err error, name string) error {
 // switchTo points name at upload and returns the upload it replaced (now
 // registered for removal) and the commit timestamp it stamped on the row,
 // so the caller can report the result without a second read.
+//
+// One read of the database clock serves both the row and the return value, so they
+// can never disagree. The upload must still be registered, or Sweep has started
+// removing it. The blob's row is created if need be and locked, so that of two
+// concurrent Puts the second sees the first's upload as the one it replaces. A failed
+// commit is ErrAmbiguousCommit: ctx may have been cancelled, or the connection
+// dropped, right as the server decided, so the caller must not act as if it knows the
+// outcome either way. The "commit" crash point reports a commit that landed as
+// ambiguous, to simulate that race.
 func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int64, chunks int, sum string) (old string, createdAt int64, err error) {
 	s := b.s
 	q := &s.d.Blobs
@@ -195,18 +199,13 @@ func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int6
 		return "", 0, err
 	}
 	defer rollback(tx)
-	// One read of the database clock serves both the row and the return
-	// value, so they can never disagree.
 	if err := tx.QueryRowContext(ctx, q.Clock).Scan(&createdAt); err != nil {
 		return "", 0, err
 	}
-	// The upload must still be registered, or Sweep has started removing it.
 	res, err := tx.ExecContext(ctx, q.Unregister, upload)
 	if err := sweptCheck(res, err, name); err != nil {
 		return "", 0, err
 	}
-	// Make sure the row exists and lock it, so that of two concurrent Puts
-	// the second sees the first's upload as the one it replaces.
 	row, err := returningRow(ctx, tx, q.Take, []any{name}, []any{name})
 	if err != nil {
 		return "", 0, err
@@ -223,14 +222,9 @@ func (b *blobStore) switchTo(ctx context.Context, name, upload string, size int6
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		// Whether this landed server-side is unknown: ctx may have been
-		// cancelled, or the connection dropped, right as the server decided.
-		// The caller must not act as if it knows the outcome either way.
 		return "", 0, fmt.Errorf("switch blob %q to upload %s: %w: %w", name, upload, ErrAmbiguousCommit, err)
 	}
 	if b.crashAt("commit") {
-		// The commit above genuinely landed; simulate the same race by
-		// reporting it as unknown anyway.
 		return "", 0, fmt.Errorf("switch blob %q to upload %s: %w: simulated", name, upload, ErrAmbiguousCommit)
 	}
 	return old, createdAt, nil
@@ -274,6 +268,13 @@ func (b *blobStore) deleteChunks(ctx context.Context, upload string) error {
 	return nil
 }
 
+// Sweep implements [BlobStore]. It removes registered uploads that are unreferenced
+// and stale, deleting each registration first, and only while it is still stale (one
+// touched meanwhile is still being written), so a Put still writing it fails rather
+// than commit a blob with missing chunks. Then it removes the chunks of uploads that
+// are neither referenced nor registered: left by an interrupted cleanup, or written
+// after a sweep took the upload. Uploads register before their first chunk, so those
+// are never live.
 func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed int, err error) {
 	s := b.s
 	ctx, end := s.start(ctx, "blob_sweep")
@@ -283,9 +284,6 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 	}
 	ms := olderThan.Milliseconds()
 
-	// Registered uploads that are unreferenced and stale. Deleting the
-	// registration first (only if still stale) makes a Put still writing it
-	// fail rather than commit a blob with missing chunks.
 	stale, err := b.uploadIDs(ctx, s.d.Blobs.Stale, ms)
 	if err != nil {
 		return 0, err
@@ -298,7 +296,7 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 		if n, err := res.RowsAffected(); err != nil {
 			return removed, err
 		} else if n == 0 {
-			continue // touched meanwhile: still being written
+			continue
 		}
 		if err := b.deleteChunks(ctx, id); err != nil {
 			return removed, err
@@ -306,9 +304,6 @@ func (b *blobStore) Sweep(ctx context.Context, olderThan time.Duration) (removed
 		removed++
 	}
 
-	// Chunks of uploads that are neither referenced nor registered: left by
-	// an interrupted cleanup, or written after a sweep took the upload.
-	// Uploads register before their first chunk, so these are never live.
 	orphans, err := b.uploadIDs(ctx, s.d.Blobs.Orphans)
 	if err != nil {
 		return removed, err
@@ -373,16 +368,18 @@ func (b *blobStore) Get(ctx context.Context, name string) (rc io.ReadCloser, inf
 
 // prefixEnd returns the smallest string greater than every string that
 // starts with prefix, in byte (and so code point) order, or false when there
-// is none. It stays valid UTF-8, which Postgres text requires.
+// is none. It stays valid UTF-8, which Postgres text requires: the last rune is
+// incremented, skipping the surrogates, and a last rune with no successor is dropped
+// for the one before it to carry.
 func prefixEnd(prefix string) (string, bool) {
 	for prefix != "" {
 		r, size := utf8.DecodeLastRuneInString(prefix)
 		prefix = prefix[:len(prefix)-size]
 		switch r {
 		case utf8.MaxRune:
-			continue // no successor; carry into the rune before
+			continue
 		case 0xD7FF:
-			r = 0xE000 // skip the surrogates
+			r = 0xE000
 		default:
 			r++
 		}
@@ -391,12 +388,12 @@ func prefixEnd(prefix string) (string, bool) {
 	return "", false
 }
 
+// List implements [BlobStore]. Names compare byte for byte on every dialect, so the
+// prefix is a key range.
 func (b *blobStore) List(ctx context.Context, prefix string) (out []BlobInfo, err error) {
 	s := b.s
 	ctx, end := s.start(ctx, "blob_list", attribute.String("prefix", prefix))
 	defer end(&err)
-	// Names compare byte for byte on every dialect, so the prefix is a key
-	// range.
 	q, args := s.d.Blobs.ListFrom, []any{prefix}
 	if hi, ok := prefixEnd(prefix); ok {
 		q, args = s.d.Blobs.ListRange, []any{prefix, hi}
@@ -413,7 +410,7 @@ func (b *blobStore) List(ctx context.Context, prefix string) (out []BlobInfo, er
 			return nil, err
 		}
 		if !strings.HasPrefix(info.Name, prefix) {
-			break // past the range
+			break
 		}
 		info.CreatedAt = millis(created)
 		out = append(out, info)

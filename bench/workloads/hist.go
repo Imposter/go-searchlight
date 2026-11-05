@@ -39,12 +39,12 @@ func NewHistogram() *Histogram {
 	return &Histogram{counts: make([]int64, histLen), min: math.MaxInt64}
 }
 
-// index is v's counter.
+// index is v's counter. Past the first subN values, v's shift is at least 1.
 func index(v int64) int {
 	if v < subN {
 		return int(v)
 	}
-	shift := bits.Len64(uint64(v)) - subBits // >= 1
+	shift := bits.Len64(uint64(v)) - subBits
 	return subN + (shift-1)*subHalf + int(v>>uint(shift)) - subHalf
 }
 
@@ -103,9 +103,6 @@ func (h *Histogram) Min() int64 {
 	}
 	return h.min
 }
-
-// Max is the largest value recorded (0 when empty).
-func (h *Histogram) Max() int64 { return h.max }
 
 // Mean is the values' mean (0 when empty).
 func (h *Histogram) Mean() float64 {

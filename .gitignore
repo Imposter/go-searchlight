@@ -9,3 +9,5 @@ coverage.*
 go.work
 go.work.sum
 .pgtmp/
+/deploy/.env
+/deploy/tokens

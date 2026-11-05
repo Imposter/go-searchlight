@@ -16,13 +16,14 @@ import (
 )
 
 // instruments are the cluster's metrics (spec section 11): lease and allocation
-// changes, live nodes, peer requests and retries, and the bytes recoveries fetch from
-// peers and bundles.
+// changes, live nodes, peer requests, retries and copy table re-reads, and the bytes
+// recoveries fetch from peers and bundles.
 type instruments struct {
 	leases      metric.Int64Counter
 	allocations metric.Int64Counter
 	peerDur     metric.Float64Histogram
 	retries     metric.Int64Counter
+	rereads     metric.Int64Counter
 	recovered   metric.Int64Counter
 	nodes       atomic.Int64
 }
@@ -37,6 +38,7 @@ func newInstruments(meter metric.Meter, log *slog.Logger) *instruments {
 		allocations: in.Counter(telemetry.MetricClusterAllocations),
 		peerDur:     in.Histogram(telemetry.MetricClusterPeerDuration),
 		retries:     in.Counter(telemetry.MetricClusterReadRetries),
+		rereads:     in.Counter(telemetry.MetricClusterReadRereads),
 		recovered:   in.Counter(telemetry.MetricReplicaRecoveryBytes),
 	}
 	in.ObservableGauge(telemetry.MetricClusterNodes, func(_ context.Context, o metric.Float64Observer) error {
@@ -64,6 +66,12 @@ func (i *instruments) peer(ctx context.Context, route, node string, status int, 
 
 func (i *instruments) retry(ctx context.Context, op string) {
 	i.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op)))
+}
+
+// reread counts a shard read's copy table re-read by its result: found (a serving copy
+// the read has not tried), none, or timeout (it ran out of its time first).
+func (i *instruments) reread(ctx context.Context, op, result string) {
+	i.rereads.Add(ctx, 1, metric.WithAttributes(attribute.String("op", op), attribute.String("result", result)))
 }
 
 func (i *instruments) recoveryBytes(ctx context.Context, source string, n int64) {

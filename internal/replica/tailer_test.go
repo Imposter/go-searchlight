@@ -180,7 +180,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		go func() {
 			defer writers.Done()
 			for !stopped.Load() {
-				_, _, err := gc.Apply(context.Background(), randomBatch())
+				err := gc.Apply(context.Background(), randomBatch())
 				// A batch can meet a dropped index (it is recreated at once).
 				if err != nil && !errors.Is(err, store.ErrNotFound) {
 					t.Errorf("group commit: %v", err)
@@ -210,7 +210,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		for range 3 {
 			write()
 		}
-		head, _, err := writer.HeadSeq(context.Background())
+		head, _, err := writer.HeadSeq(context.Background(), id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -283,7 +283,7 @@ func runConvergence(t *testing.T, d *db, seed uint64) {
 		t.Fatal(err)
 	}
 
-	head, _, err := writer.HeadSeq(context.Background())
+	head, _, err := writer.HeadSeq(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,10 +523,11 @@ func TestApplyErrorHalts(t *testing.T) {
 				c.waitApplied(mustApply(t, st, upsert("h", 0, "ok1", `{"title":"one"}`)))
 				waitCopyState(t, st, id, store.CopyServing)
 
-				_, last, err := st.Apply(ctx, []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)})
-				if err != nil {
+				batch := []store.Change{upsert("h", 0, "ok2", `{"title":"two"}`), tc.bad(t), upsert("h", 0, "ok3", `{"title":"three"}`)}
+				if err := st.Apply(ctx, batch); err != nil {
 					t.Fatal(err)
 				}
+				last := batch[2].Seq
 				badSeq := last - 1
 				c.tailer.Wake()
 				c.until("the copy halts", func() bool { return c.current().Halt() != nil })
@@ -877,9 +878,10 @@ func TestLagMetrics(t *testing.T) {
 	})
 }
 
-// TestRecover covers the standalone Recover: an empty copy loads the snapshot, a copy
-// with changes resumes, and a half-loaded or stale one must be wiped.
-func TestRecover(t *testing.T) {
+// TestTailerStart covers how a tailer's start sorts the copy it was given: an empty
+// copy asks for a rebuild and loads the snapshot, a copy with changes resumes, and a
+// half-loaded or stale one asks for a rebuild.
+func TestTailerStart(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		ctx := context.Background()
 		st := d.open(t)
@@ -890,9 +892,11 @@ func TestRecover(t *testing.T) {
 		head := mustApply(t, st, del("rc", 0, "b"), upsert("rc", 1, "z", `{}`))
 		dir := t.TempDir()
 		sh := openShard(t, dir, testShardOptions(id))
-		seq, err := Recover(ctx, sh, st, id)
+		tl := NewTailer(st, sh, id, Options{})
+		wantRebuild(t, tl.start(ctx), reasonEmpty)
+		seq, err := tl.loadSnapshot(ctx, sh)
 		if err != nil || seq != head {
-			t.Fatalf("Recover = %d, %v; want %d", seq, err, head)
+			t.Fatalf("loadSnapshot = %d, %v; want %d", seq, err, head)
 		}
 		if err := sh.WaitRefreshed(ctx, head); err != nil {
 			t.Fatal(err)
@@ -900,14 +904,14 @@ func TestRecover(t *testing.T) {
 		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
 			t.Fatalf("recovered copy differs:\n%s", dd)
 		}
-		if seq, err := Recover(ctx, sh, st, id); err != nil || seq != head {
-			t.Fatalf("Recover of a loaded copy = %d, %v", seq, err)
+		loaded := NewTailer(st, sh, id, Options{})
+		if err := loaded.start(ctx); err != nil || loaded.Applied() != head {
+			t.Fatalf("start of a loaded copy = %v, applied %d; want nil, %d", err, loaded.Applied(), head)
 		}
 		if err := sh.Close(ctx); err != nil {
 			t.Fatal(err)
 		}
 
-		// Half loaded: segments committed at seq 0.
 		half := openShard(t, t.TempDir(), testShardOptions(id))
 		defer half.Close(ctx)
 		doc := upsertChange(t, "x", 5)
@@ -917,21 +921,24 @@ func TestRecover(t *testing.T) {
 		if err := half.Refresh(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Recover(ctx, half, st, id); !errors.Is(err, ErrWipeNeeded) {
-			t.Fatalf("Recover of a half-loaded copy: %v", err)
-		}
+		wantRebuild(t, NewTailer(st, half, id, Options{}).start(ctx), reasonInterrupted)
 
-		// Another incarnation.
 		old := openShard(t, dir, testShardOptions(id))
 		defer old.Close(ctx)
 		if err := st.Indexes().Drop(ctx, "rc"); err != nil {
 			t.Fatal(err)
 		}
 		createIndex(t, st, "rc", testMapping)
-		if _, err := Recover(ctx, old, st, id); !errors.Is(err, ErrWipeNeeded) {
-			t.Fatalf("Recover of a stale incarnation: %v", err)
-		}
+		wantRebuild(t, NewTailer(st, old, id, Options{}).start(ctx), reasonIncarnation)
 	})
+}
+
+func wantRebuild(t *testing.T, err error, reason string) {
+	t.Helper()
+	var rb *rebuildError
+	if !errors.As(err, &rb) || rb.reason != reason {
+		t.Fatalf("start = %v; want a rebuild for %q", err, reason)
+	}
 }
 
 func upsertChange(t testing.TB, id string, seq int64) shard.Change {
@@ -1091,6 +1098,51 @@ func TestFetcherRebuildsAside(t *testing.T) {
 		}
 		if peer := counterSum(t, reader, telemetry.MetricReplicaRecoveries, "source", "peer"); peer != 1 || f.calls.Load() != 1 {
 			t.Fatalf("%d peer recoveries, %d fetches", peer, f.calls.Load())
+		}
+	})
+}
+
+// TestFetchedCopyPrunedPastIsNotFetchedAgain: an aside rebuild whose fetched copy the
+// changelog was pruned past before it moved does not fetch again (the peers are no
+// better off): the next attempt rebuilds from the store's snapshot.
+func TestFetchedCopyPrunedPastIsNotFetchedAgain(t *testing.T) {
+	forEachDialect(t, func(t *testing.T, d *db) {
+		ctx := context.Background()
+		st := d.open(t)
+		createIndex(t, st, "fp", testMapping)
+		id := ShardID{Index: "fp", Shard: 0}
+		c := newCopy(t, d.open(t), id, testOptions())
+		c.start()
+		c.waitApplied(mustApply(t, st, upsert("fp", 0, "a", docBody("a", 1))))
+		if err := c.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		seed := newCopy(t, d.open(t), id, testOptions())
+		seed.start()
+		seed.waitApplied(mustApply(t, st, upsert("fp", 0, "b", docBody("b", 2))))
+		if err := seed.stop(); err != nil {
+			t.Fatal(err)
+		}
+		if err := seed.shard().Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+		mustApply(t, st, upsert("fp", 0, "c", docBody("c", 3)))
+		head := mustApply(t, st, upsert("fp", 0, "d", docBody("d", 4)))
+		if err := st.Prune(ctx, id, head); err != nil { // past both copies
+			t.Fatal(err)
+		}
+		f := &dirFetcher{from: seed.dir}
+		c.opts.Fetcher = f
+		c.start()
+		sh := c.waitApplied(head)
+		if f.calls != 1 {
+			t.Fatalf("fetched %d times, want once", f.calls)
+		}
+		if dd := diff(viewOf(t, sh), truthOf(t, st, id), false); dd != "" {
+			t.Fatalf("rebuilt copy differs:\n%s", dd)
 		}
 	})
 }

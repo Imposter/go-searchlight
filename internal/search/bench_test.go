@@ -247,9 +247,17 @@ func openBench(b *testing.B) (*shard.Shard, *corpus) {
 	return benchShard, benchCorp
 }
 
-// runBench runs next's request b.N times on the shard and reports p50 and p99.
+// runBench runs next's request b.N times on the shard and reports p50 and p99; a
+// request with NoBodies is a query-then-fetch, the page's bodies fetched after the
+// reduce, as the node runs a from.
 func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 	s, _ := openBench(b)
+	runBenchOn(b, s, next)
+}
+
+// runBenchOn is runBench on shard s.
+func runBenchOn(b *testing.B, s *shard.Shard, next func(rng *rand.Rand) *Request) {
+	b.Helper()
 	rng := rand.New(rand.NewPCG(1, 2))
 	// Warm up the mappings (the OS page cache) and the rank arrays, as a serving node is.
 	for range 3 {
@@ -269,11 +277,18 @@ func runBench(b *testing.B, next func(rng *rand.Rand) *Request) {
 		start := nanotime()
 		g := s.Acquire()
 		res, err := ExecuteShard(context.Background(), g, r)
+		if err != nil {
+			g.Release()
+			b.Fatal(err)
+		}
+		resp := Reduce(context.Background(), []*ShardResult{res}, r)
+		if r.NoBodies {
+			err = FetchShard(context.Background(), g, resp.Hits, r.Fields)
+		}
 		g.Release()
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp := Reduce([]*ShardResult{res}, r)
 		lat = append(lat, time.Duration(nanotime()-start))
 		total += resp.Total
 		verified += res.Scanned
@@ -384,7 +399,22 @@ func BenchmarkDeepSearchAfterByID(b *testing.B) {
 	})
 }
 
-// BenchmarkTermsAggAll: the top brands and categories over every document.
+// BenchmarkFromDeep: offset paging, from 5000 size 50 by price over every in-stock
+// document, as the node runs it: the shard's best 5,050 without bodies, the reduce
+// dropping the first 5,000, then the page's 50 bodies.
+func BenchmarkFromDeep(b *testing.B) {
+	runBench(b, func(rng *rand.Rand) *Request {
+		return &Request{
+			Query:    leaf("in_stock", query.OpEq, true),
+			Sort:     []SortField{{Field: "price", Desc: rng.IntN(2) == 0}},
+			Size:     50,
+			From:     5000,
+			NoBodies: true,
+		}
+	})
+}
+
+// BenchmarkTermsAggAll:the top brands and categories over every document.
 func BenchmarkTermsAggAll(b *testing.B) {
 	runBench(b, func(_ *rand.Rand) *Request {
 		return &Request{Query: &query.All{}, Aggs: map[string]Agg{
@@ -428,4 +458,95 @@ func BenchmarkTermsAggUnique(b *testing.B) {
 	runBench(b, func(_ *rand.Rand) *Request {
 		return &Request{Query: &query.All{}, Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10}}}
 	})
+}
+
+// BenchmarkTermsAggPrefixInclude: a facet type-ahead over a field of unique values
+// (sku), every document hit: a prefix include of 1 to 4 typed digits, which each
+// segment decides from the dictionary terms after the prefix alone.
+func BenchmarkTermsAggPrefixInclude(b *testing.B) {
+	runBench(b, func(rng *rand.Rand) *Request {
+		typed := fmt.Sprintf("%04d", rng.IntN(10_000))[:1+rng.IntN(4)]
+		return &Request{Query: &query.All{}, Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10, Include: &TermsFilter{Pattern: "sku-000" + typed + ".*"}}}}
+	})
+}
+
+// BenchmarkTermsAggSparsePattern: a pattern include (".*foo") over a field of unique
+// values (sku) under a query of three hits, the filter decided over each segment's
+// whole dictionary (as it is for dense hits) or lazily, per collected ordinal.
+func BenchmarkTermsAggSparsePattern(b *testing.B) {
+	for name, ratio := range map[string]uint64{"dictionary": 1 << 40, "lazy": lazyTermsRatio} {
+		b.Run(name, func(b *testing.B) {
+			defer func(r uint64) { lazyTermsRatio = r }(lazyTermsRatio)
+			lazyTermsRatio = ratio
+			runBench(b, func(rng *rand.Rand) *Request {
+				skus := []string{fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs())), fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs())), fmt.Sprintf("SKU-%07d", rng.IntN(benchDocs()))}
+				return &Request{Query: leaf("sku", query.OpIn, skus), Aggs: map[string]Agg{"skus": {Type: AggTerms, Field: "sku", Size: 10, Include: &TermsFilter{Pattern: ".*foo"}}}}
+			})
+		})
+	}
+}
+
+// facetPicks are a facet panel's picks: two brands and a category, over a price range.
+func facetPicks(c *corpus, rng *rand.Rand) (q, brands, category query.Node) {
+	lo := float64(rng.IntN(200))
+	return leaf("price", query.OpBetween, []float64{lo, lo + 300}),
+		leaf("brand", query.OpIn, []string{c.brands[rng.IntN(50)], c.brands[rng.IntN(50)]}),
+		leaf("category", query.OpEq, c.categories[rng.IntN(len(c.categories))])
+}
+
+// BenchmarkFacetPanel: a facet panel in one search, as docs/api.md builds it: 20 hits
+// under a post_filter of every pick, each facet a filter aggregation of the other
+// picks.
+func BenchmarkFacetPanel(b *testing.B) {
+	_, c := openBench(b)
+	runBench(b, func(rng *rand.Rand) *Request {
+		q, brands, category := facetPicks(c, rng)
+		return &Request{Query: q, PostFilter: &query.All{Children: []query.Node{brands, category}}, Size: 20, Aggs: map[string]Agg{
+			"brands":     {Type: AggFilter, Filter: category, Aggs: map[string]Agg{"brands": {Type: AggTerms, Field: "brand", Size: 10}}},
+			"categories": {Type: AggFilter, Filter: brands, Aggs: map[string]Agg{"categories": {Type: AggTerms, Field: "category", Size: 10}}},
+		}}
+	})
+}
+
+// BenchmarkFacetPanelSearches: the same panel as BenchmarkFacetPanel the way it took
+// before filter aggregations, one search per picked facet and one for the hits, run one
+// after another; a p50 and p99 of all of them together.
+func BenchmarkFacetPanelSearches(b *testing.B) {
+	s, c := openBench(b)
+	rng := rand.New(rand.NewPCG(1, 2))
+	panel := func() []*Request {
+		q, brands, category := facetPicks(c, rng)
+		and := func(ns ...query.Node) query.Node { return &query.All{Children: ns} }
+		return []*Request{
+			{Query: and(q, brands, category), Size: 20},
+			{Query: and(q, category), Aggs: map[string]Agg{"brands": {Type: AggTerms, Field: "brand", Size: 10}}},
+			{Query: and(q, brands), Aggs: map[string]Agg{"categories": {Type: AggTerms, Field: "category", Size: 10}}},
+		}
+	}
+	search := func(rs []*Request) {
+		for _, r := range rs {
+			g := s.Acquire()
+			res, err := ExecuteShard(context.Background(), g, r)
+			g.Release()
+			if err != nil {
+				b.Fatal(err)
+			}
+			Reduce(context.Background(), []*ShardResult{res}, r)
+		}
+	}
+	for range 3 {
+		search(panel())
+	}
+	lat := make([]time.Duration, 0, b.N)
+	b.ResetTimer()
+	for range b.N {
+		rs := panel()
+		start := nanotime()
+		search(rs)
+		lat = append(lat, time.Duration(nanotime()-start))
+	}
+	b.StopTimer()
+	slices.Sort(lat)
+	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds())/1e3, "p50-µs")
+	b.ReportMetric(float64(lat[min(len(lat)-1, len(lat)*99/100)].Nanoseconds())/1e3, "p99-µs")
 }

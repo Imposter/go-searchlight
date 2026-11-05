@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
@@ -35,8 +36,14 @@ type Hit struct {
 	// Body is the stored document, limited to Request.Fields when set; nil when the
 	// request asked for no bodies (Request.NoBodies), for a later [FetchShard].
 	Body json.RawMessage `json:"body,omitempty"`
+	// Seq is the seq of the change that wrote the version the copy holds, with
+	// Request.SeqNo (0 for a document indexed by a release that kept none).
+	Seq int64 `json:"seq,omitempty"`
 	// Ref locates the hit in the generation that found it, for [FetchShard].
 	Ref *HitRef `json:"ref,omitempty"`
+	// InnerHits are the hit's inner hits, by key ([query.InnerHits.Key]): set by
+	// [FillInnerHits] once the hit's body is fetched, for each nested node that asks.
+	InnerHits map[string]*InnerHits `json:"inner_hits,omitempty"`
 }
 
 // HitRef is where a hit lives: a segment of the generation that found it, and the
@@ -49,6 +56,9 @@ type HitRef struct {
 // ShardResult is one shard's answer: its own top hits (bodies fetched), its exact
 // total, and partial aggregations for [Reduce].
 type ShardResult struct {
+	// Hits are the shard's best Request.From+Size, in order: the reduce needs every
+	// one's place to know which make the page (a query phase, NoBodies, reads none of
+	// their bodies).
 	Hits []Hit `json:"hits"`
 	// Total is how many live documents matched: exact when TotalRelation is
 	// RelationEq; with RelationGte a lower bound, because the shard stopped verifying
@@ -58,8 +68,9 @@ type ShardResult struct {
 	TotalRelation string                 `json:"total_relation"`
 	Aggs          map[string]*AggPartial `json:"aggs,omitempty"`
 	// TimedOut is set when the search ran out of time (Request.Timeout or the
-	// context's deadline) before every segment finished: the hits, total and
-	// aggregations are those of the segments that did.
+	// context's deadline) before every segment finished, or before the shard merged
+	// every aggregation: the hits, total and aggregations are those of the segments
+	// that did, and an aggregation left unmerged is empty.
 	TimedOut bool `json:"timed_out"`
 	// Segments is how many segments the shard searched; Scanned how many candidates
 	// it verified one at a time (residual checks): the per-query work the index could
@@ -94,6 +105,10 @@ func SetThreads(n int) {
 	ch := make(chan struct{}, max(1, n))
 	slots.Store(&ch)
 }
+
+// poolSize is how many calls runParallel makes at once at most: the search pool's
+// goroutines and the caller's.
+func poolSize() int { return cap(*slots.Load()) + 1 }
 
 // runParallel calls fn(0..n-1), on the calling goroutine and on as many pool
 // goroutines as are free, and returns when every call has. A panic in fn is recovered,
@@ -168,7 +183,28 @@ type segExec struct {
 	lazy *lazyState
 
 	scanned int64
-	err     error
+	// buckets counts the buckets the segment's histograms hold by key, together at
+	// most MaxBuckets: shared by the forks that collect parts of the segment apart.
+	buckets *atomic.Int64
+	// masks are the terms aggregations' filters over this segment's ordinals, shared
+	// by the forks as buckets is.
+	masks *termMasks
+	// collecting is how many documents the aggregations being made collect, which
+	// chooses how a terms filter is decided (lazyTerms).
+	collecting uint64
+	// inners are the executions over the segment's nested fields' objects, by path,
+	// made on first use (inner); nil for a field the segment holds no member of.
+	inners map[string]*segExec
+	// parent, in an execution over a nested field's objects, is its segment's: nv and
+	// path are that field's, r its object segment, and allDocs the members that are
+	// objects.
+	parent *segExec
+	nv     *segment.Nested
+	path   string
+	// lastBody is the last document body an object's one-at-a-time check read
+	// (verifyDoc), kept for the document's next object.
+	lastBody parentBody
+	err      error
 }
 
 // lazyState is a segment's lazy verification: the root's maybe documents, those
@@ -229,6 +265,8 @@ func newSegExec(ctx context.Context, p *prepared, g *shard.Generation, i int) *s
 		orders:     map[*pnode][]*pnode{},
 		estimates:  map[*leafPlan]estimate{},
 		sources:    map[string]*fieldSrc{},
+		buckets:    new(atomic.Int64),
+		masks:      &termMasks{},
 	}
 }
 
@@ -291,6 +329,11 @@ type segResult struct {
 // variable so tests can make it small).
 var countChunk = 4096
 
+// runSegment searches segment i of g. Aggregations and exact totals need every match,
+// so every candidate is verified, in batches. Otherwise verification runs in two
+// phases: only the candidates that could enter the top hits, then as many more as the
+// total needs, counted in batches sized from the match rate so far to what is still
+// needed (twice over), at least countChunk: few round trips, little overshoot.
 func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (out segResult) {
 	s := newSegExec(ctx, p, g, i)
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.segment", trace.WithAttributes(
@@ -319,17 +362,12 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 	case s.err != nil:
 	case a.maybe.IsEmpty():
 	case len(p.aggs) > 0 || p.need < 0:
-		// Aggregations and exact totals need every match: verify all, in batches.
 		hits = roaring.Or(a.sure, s.resolve(p.root, a.maybe))
 	default:
-		// Two phases: verify only the candidates that could enter the top hits, then
-		// as many more as the total needs.
 		s.lazy = &lazyState{maybe: a.maybe, checked: roaring.New()}
 		p.confirmed.Add(card(a.sure))
-		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size)
+		out.top = s.topK(roaring.Or(a.sure, a.maybe), p.size) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		rest := roaring.AndNot(a.maybe, s.lazy.checked)
-		// Count in batches sized from the match rate so far to what is still needed
-		// (twice over), at least countChunk: few round trips, little overshoot.
 		var tried, matched int64
 		for !rest.IsEmpty() && p.confirmed.Load() < p.need && !s.checkCtx() {
 			size := int64(countChunk)
@@ -351,11 +389,15 @@ func runSegment(ctx context.Context, p *prepared, g *shard.Generation, i int) (o
 		out.complete = rest.IsEmpty()
 	}
 	if s.lazy == nil && s.err == nil {
-		out.hits = card(hits)
+		matched := hits
+		if p.post != nil {
+			matched = s.matches(p.post, hits) //nolint:contextcheck // only the filter cache's hit counter takes no context
+		}
+		out.hits = card(matched)
 		p.confirmed.Add(out.hits)
-		out.top = s.topK(hits, p.size)
+		out.top = s.topK(matched, p.size) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		if s.err == nil {
-			out.aggs = s.aggregate(hits)
+			out.aggs = s.aggregate(hits, live) //nolint:contextcheck // only the filter cache's hit counter takes no context
 		}
 	}
 	out.scanned = s.scanned
@@ -383,15 +425,21 @@ func isCtxErr(err error) bool {
 // operations per segment, in two phases: the index's candidates first, then residual
 // checks where the index cannot decide alone, made only as the top hits and the total
 // need them (all of them when there are aggregations, or TrackTotal is
-// TrackTotalAll). Segments run in parallel on the search pool ([SetThreads]). When the
-// request's Timeout or ctx's deadline passes, segments stop where they are and the
-// result holds what the finished ones found, with TimedOut set; a cancelled ctx
-// returns its error. A request the mapping refuses (an unknown aggregation type, a
-// sort on a list, ...) is a *RequestError.
+// TrackTotalAll). Segments run in parallel on the search pool ([SetThreads]).
+//
+// The shard's deadline is the earlier of ctx's and r.Timeout from the call; the
+// segments get it less deadlineReserve, and the merge of their partials the rest.
+// When the segments' deadline passes, they stop where they are and the result holds
+// what the finished ones found, with TimedOut set; an aggregation whose shard merge
+// the deadline cuts off is left empty, also with TimedOut set (one whose global
+// ordinals are still building merges by term instead: see finishOrds). The hits found
+// are still fetched. A ctx cancelled before the merge is done returns its error. A request the mapping refuses (an unknown aggregation type, a sort on a list,
+// ...) is a *RequestError.
 func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardResult, error) {
 	if g == nil || r == nil {
 		return nil, errNoGeneration
 	}
+	defer prio.Foreground()()
 	start := time.Now()
 	tr := otel.Tracer(telemetry.ScopeName)
 	ctx, span := tr.Start(ctx, "search.shard", trace.WithAttributes(
@@ -416,16 +464,19 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	planned := time.Now()
 	parent := ctx
-	if r.Timeout > 0 {
+	segCtx := ctx
+	if deadline, ok := shardDeadline(ctx, start, r.Timeout); ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+		segCtx, cancel = context.WithDeadline(ctx, deadline.Add(-deadlineReserve(deadline.Sub(start))))
 		defer cancel()
 	}
 	n := len(g.Segments)
 	p.segments = n
-	loadOrds(g, p)
+	loadOrds(ctx, g, p)
 	results := make([]segResult, n)
-	if err := runParallel(n, func(i int) { results[i] = runSegment(ctx, p, g, i) }); err != nil {
+	if err := runParallel(n, func(i int) { results[i] = runSegment(segCtx, p, g, i) }); err != nil {
 		return fail(err, "segment panicked")
 	}
 	if err := parent.Err(); errors.Is(err, context.Canceled) {
@@ -433,14 +484,7 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	}
 	res := &ShardResult{TotalRelation: RelationEq, Segments: n}
 	tops := make([][]segHit, 0, n)
-	var aggs map[string]*AggPartial
-	if len(p.aggs) > 0 {
-		aggs = make(map[string]*AggPartial, len(p.aggs))
-		for _, spec := range p.aggs {
-			aggs[spec.name] = &AggPartial{Type: spec.typ}
-		}
-	}
-	ordParts := map[*aggSpec][]*ordPartial{}
+	segAggs := make([]map[string]*AggPartial, 0, n)
 	complete := true
 	for i := range results {
 		sr := &results[i]
@@ -457,31 +501,27 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 		if len(sr.top) > 0 {
 			tops = append(tops, sr.top)
 		}
-		for _, spec := range p.aggs {
-			part := sr.aggs[spec.name]
-			if part != nil && part.ords != nil {
-				ordParts[spec] = append(ordParts[spec], part.ords...)
-				continue
-			}
-			mergePartial(aggs[spec.name], part, spec)
-		}
+		segAggs = append(segAggs, sr.aggs)
 	}
-	for spec, parts := range ordParts {
-		finishOrds(ctx, aggs[spec.name], parts, spec, g, p)
+	aggs := mergeShard(ctx, p.aggs, segAggs, g, p)
+	if err := parent.Err(); errors.Is(err, context.Canceled) {
+		return fail(err, "cancelled")
 	}
-	for _, spec := range p.aggs {
-		cutShard(aggs[spec.name], spec)
-		if err := checkBuckets(aggs[spec.name], spec); err != nil {
-			return fail(err, "too many buckets")
-		}
+	if err := p.failed.Load(); err != nil {
+		return fail(*err, "aggregation failed")
+	}
+	buckets := 0
+	if spec := cutShardAggs(p.aggs, aggs, &buckets); spec != nil {
+		return fail(tooManyBuckets(spec), "too many buckets")
 	}
 	res.Aggs = aggs
+	res.TimedOut = res.TimedOut || p.cut.Load()
 	if res.TimedOut || !complete {
 		res.TotalRelation = RelationGte
 	}
 	executed := time.Now()
 	_, fetchSpan := tr.Start(ctx, "search.fetch")
-	hits, err := fetchTops(g, p, tops)
+	hits, err := fetchTops(parent, g, p, tops)
 	fetchSpan.SetAttributes(attribute.Int("hits", len(hits)))
 	fetchSpan.End()
 	if err != nil {
@@ -519,6 +559,24 @@ func ExecuteShard(ctx context.Context, g *shard.Generation, r *Request) (*ShardR
 	return res, nil
 }
 
+// shardDeadline is when a shard search started at start must be done: the earlier of
+// ctx's deadline and start+timeout (a timeout of 0 adds none).
+func shardDeadline(ctx context.Context, start time.Time, timeout time.Duration) (time.Time, bool) {
+	deadline, ok := ctx.Deadline()
+	if timeout > 0 {
+		if d := start.Add(timeout); !ok || d.Before(deadline) {
+			deadline, ok = d, true
+		}
+	}
+	return deadline, ok
+}
+
+// deadlineReserve is how much of a shard search's time budget its segments leave for
+// the merge of their partials: a tenth of the budget, between 1 ms and 1 s.
+func deadlineReserve(budget time.Duration) time.Duration {
+	return min(max(budget/10, time.Millisecond), time.Second)
+}
+
 // warnLimiter lets one warning per key through per interval, counting the rest.
 type warnLimiter struct {
 	mu       sync.Mutex
@@ -531,7 +589,8 @@ type warnLimiter struct {
 var timeoutWarnings = &warnLimiter{interval: 10 * time.Second, last: map[string]time.Time{}, dropped: map[string]int{}}
 
 // allow reports whether a warning for key may be logged now, and how many were
-// dropped since the last one.
+// dropped since the last one. Past 1024 keys it forgets them all: memory stays
+// bounded, and many indexes just log a little more often.
 func (w *warnLimiter) allow(key string) (int, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -541,7 +600,7 @@ func (w *warnLimiter) allow(key string) (int, bool) {
 		return 0, false
 	}
 	if len(w.last) > 1024 {
-		clear(w.last) // bounded: many indexes just log a little more often
+		clear(w.last)
 		clear(w.dropped)
 	}
 	w.last[key] = now
@@ -617,8 +676,11 @@ func (m *topMerge) Pop() any {
 }
 
 // fetchTops merges the segments' tops into the shard's best p.size hits and fetches
-// their bodies.
-func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error) {
+// their bodies. A canceled ctx stops the fetch; a passed deadline does not, so a search
+// that timed out still returns the hits it found. The hits are chosen first, reading
+// ids only where they break a tie; then the chosen records are fetched in parallel: a
+// stored block's decompression is most of a small search.
+func fetchTops(ctx context.Context, g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error) {
 	if p.size == 0 || len(tops) == 0 {
 		return nil, nil
 	}
@@ -627,8 +689,6 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 		m.order = append(m.order, i)
 	}
 	heap.Init(m)
-	// Choose first, reading ids only where they break a tie; then fetch the chosen
-	// records in parallel: a stored block's decompression is most of a small search.
 	var chosen []*segHit
 	for len(chosen) < p.size && m.Len() > 0 && m.err == nil {
 		i := m.order[0]
@@ -648,6 +708,9 @@ func fetchTops(g *shard.Generation, p *prepared, tops [][]segHit) ([]Hit, error)
 	const perTask = 2
 	if err := runParallel((len(chosen)+perTask-1)/perTask, func(task int) {
 		for k := task * perTask; k < min(len(chosen), (task+1)*perTask); k++ {
+			if errs[k] = canceled(ctx); errs[k] != nil {
+				return
+			}
 			out[k], errs[k] = fetchHit(g, p, chosen[k])
 		}
 	}); err != nil {
@@ -668,6 +731,9 @@ func fetchHit(g *shard.Generation, p *prepared, h *segHit) (Hit, error) {
 		return Hit{}, err
 	}
 	hit := Hit{ID: h.id, Ref: &HitRef{Segment: sv.ID, Ord: h.ord}}
+	if p.req.SeqNo {
+		hit.Seq = g.DocSeq(h.seg, h.ord)
+	}
 	if !p.req.NoBodies {
 		body, err := readBody(sv.Reader, h.ord, p.fields)
 		if err != nil {
@@ -704,8 +770,11 @@ var ErrStaleHit = errors.New("search: the hit's segment is not in this generatio
 
 // FetchShard fills the bodies of hits found with Request.NoBodies (each with its Ref),
 // from g, the generation the query ran on: the fetch phase of a query-then-fetch.
-// fields limits each body as Request.Fields does.
+// fields limits each body as Request.Fields does. A canceled ctx stops the fetch; a
+// passed deadline does not, so a search that timed out still gets the bodies of the
+// hits it found.
 func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []string) error {
+	defer prio.Foreground()()
 	_, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.fetch", trace.WithAttributes(attribute.Int("hits", len(hits))))
 	defer span.End()
 	segs := make(map[string]*segment.Reader, len(g.Segments))
@@ -714,6 +783,9 @@ func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []s
 	}
 	errs := make([]error, len(hits))
 	if err := runParallel(len(hits), func(k int) {
+		if errs[k] = canceled(ctx); errs[k] != nil {
+			return
+		}
 		h := &hits[k]
 		if h.Ref == nil {
 			errs[k] = fmt.Errorf("%w: hit %q has no ref", ErrStaleHit, h.ID)
@@ -735,8 +807,18 @@ func FetchShard(ctx context.Context, g *shard.Generation, hits []Hit, fields []s
 	return nil
 }
 
+// canceled is ctx's error when ctx was canceled, nil while it is live or only past its
+// deadline.
+func canceled(ctx context.Context) error {
+	if err := ctx.Err(); errors.Is(err, context.Canceled) {
+		return err
+	}
+	return nil
+}
+
 // filterBody keeps the members of a stored JSON object named in fields, in fields'
-// order (a repeated member: its last value, as everywhere else).
+// order (a repeated member: its last value, as everywhere else). A field listed twice
+// is written once.
 func filterBody(body []byte, fields []string) (json.RawMessage, error) {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(body, &members); err != nil {
@@ -749,7 +831,7 @@ func filterBody(body []byte, fields []string) (json.RawMessage, error) {
 		if !ok {
 			continue
 		}
-		delete(members, f) // a field listed twice is written once
+		delete(members, f)
 		if !first {
 			out = append(out, ',')
 		}

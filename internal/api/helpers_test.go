@@ -246,6 +246,27 @@ var specRouter = sync.OnceValues(func() (routers.Router, error) {
 	return legacyrouter.NewRouter(doc)
 })
 
+// validateRequest checks a request's parameters against api/openapi.yaml.
+func validateRequest(t testing.TB, method, path string) error {
+	t.Helper()
+	router, err := specRouter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), method, "http://x"+path, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, params, err := router.FindRoute(req)
+	if err != nil {
+		t.Fatalf("%s %s is no operation of api/openapi.yaml: %v", method, path, err)
+	}
+	return openapi3filter.ValidateRequest(context.Background(), &openapi3filter.RequestValidationInput{
+		Request: req, PathParams: params, Route: route,
+		Options: &openapi3filter.Options{ExcludeRequestBody: true, AuthenticationFunc: openapi3filter.NoopAuthenticationFunc},
+	})
+}
+
 // validateResponse checks a response against api/openapi.yaml: its status is one the
 // operation lists, and its body matches that response's schema. A request no
 // operation serves (an unmatched path) is skipped.
@@ -365,7 +386,60 @@ func hasLoc(m map[string]any, prefix string) bool {
 	return false
 }
 
-// seqOf reads a write response's seq.
+// tokenOf reads a write response's token, checking it parses.
+func tokenOf(t testing.TB, m map[string]any) string {
+	t.Helper()
+	s, _ := m["token"].(string)
+	if _, err := api.ParseToken(s); err != nil {
+		t.Fatalf("no token in %v: %v", m, err)
+	}
+	return s
+}
+
+// mergeTokens is the merge of two write tokens, the second when the first is "".
+func mergeTokens(t testing.TB, a, b string) string {
+	t.Helper()
+	if a == "" {
+		return b
+	}
+	x, err := api.ParseToken(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	y, err := api.ParseToken(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !x.Merge(y) {
+		t.Fatalf("tokens of two incarnations: %s and %s", a, b)
+	}
+	return x.String()
+}
+
+// tokenPast is tok with every seq raised by n: past what was committed.
+func tokenPast(t testing.TB, tok string, n int64) string {
+	t.Helper()
+	x, err := api.ParseToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for s, seq := range x.Seqs {
+		x.Seqs[s] = seq + n
+	}
+	return x.String()
+}
+
+// tokenSeq is a token's seq of shard s.
+func tokenSeq(t testing.TB, tok string, s int) int64 {
+	t.Helper()
+	x, err := api.ParseToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return x.Seq(s)
+}
+
+// seqOf reads a single write response's seq: the document's.
 func seqOf(t testing.TB, m map[string]any) int64 {
 	t.Helper()
 	f, ok := m["seq"].(float64)
@@ -397,3 +471,17 @@ func totalOf(m map[string]any) int {
 
 // ndjson joins lines with newlines, ending with one.
 func ndjson(lines ...string) string { return strings.Join(lines, "\n") + "\n" }
+
+// maxTokenSeq is the highest seq a token names.
+func maxTokenSeq(t testing.TB, tok string) int64 {
+	t.Helper()
+	x, err := api.ParseToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var top int64
+	for _, s := range x.Seqs {
+		top = max(top, s)
+	}
+	return top
+}

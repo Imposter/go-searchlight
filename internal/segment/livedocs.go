@@ -102,7 +102,9 @@ func EncodeDeletes(w io.Writer, deletes *roaring.Bitmap, major int) error {
 }
 
 // LoadDeletes reads segmentID's generation gen deletes sidecar, or an empty bitmap when
-// none has been written yet.
+// none has been written yet. The bitmap gets the check segment bitmaps get
+// ([checkBitmap]) before it is decoded: UnmarshalBinary accepts container shapes that
+// later operations on the bitmap would panic over.
 func LoadDeletes(segmentDir, segmentID string, gen uint64) (*roaring.Bitmap, error) {
 	path := deletesPath(segmentDir, segmentID, gen)
 	data, err := os.ReadFile(path)
@@ -119,8 +121,6 @@ func LoadDeletes(segmentDir, segmentID string, gen uint64) (*roaring.Bitmap, err
 	sec := footer.sections[sectionPresence]
 	rb := roaring.New()
 	if sec.n > 0 {
-		// The same check segment bitmaps get (checkBitmap): UnmarshalBinary accepts
-		// container shapes that later operations on rb would panic over.
 		raw := data[sec.off : sec.off+sec.n]
 		if _, ok := checkBitmap(raw, 1<<32); !ok {
 			return nil, &CorruptError{Path: path, Section: "presence", Reason: "malformed bitmap"}

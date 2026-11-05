@@ -36,6 +36,12 @@ func viewOf(t testing.TB, sh *shard.Shard) view {
 		t.Fatal("the shard is closed")
 	}
 	defer g.Release()
+	return viewOfGeneration(t, g)
+}
+
+// viewOfGeneration reads g, which the caller holds.
+func viewOfGeneration(t testing.TB, g *shard.Generation) view {
+	t.Helper()
 	v := view{seq: g.Seq(), docs: map[string]string{}, queries: map[string]string{}, terms: map[string]string{}}
 	m := g.Mapping()
 	if m != nil {
@@ -127,7 +133,7 @@ func mappingString(m *schema.Mapping) string {
 func truthOf(t testing.TB, st store.Store, id ShardID) view {
 	t.Helper()
 	v := view{docs: map[string]string{}, queries: map[string]string{}}
-	asOf, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
+	pt, err := st.ScanShard(context.Background(), id, func(r store.Record) error {
 		switch r.Kind {
 		case store.RecordDocument:
 			v.docs[r.ID] = string(r.Body)
@@ -143,7 +149,7 @@ func truthOf(t testing.TB, st store.Store, id ShardID) view {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v.seq = asOf
+	v.seq = pt.Seq
 	meta, err := st.Indexes().Get(context.Background(), id.Index)
 	if err != nil {
 		t.Fatal(err)

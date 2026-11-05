@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -184,15 +185,15 @@ func TestTrigramsAndSimilarity(t *testing.T) {
 	if got := Trigrams("!!"); got != nil {
 		t.Errorf("Trigrams(!!) = %q, want none", got)
 	}
-	if got := Similarity("word", "word"); got != 1 {
-		t.Errorf("Similarity(same) = %v", got)
+	if got := similarity("word", "word"); got != 1 {
+		t.Errorf("similarity(same) = %v", got)
 	}
-	if got := Similarity("word", ""); got != 0 {
-		t.Errorf("Similarity(word, empty) = %v", got)
+	if got := similarity("word", ""); got != 0 {
+		t.Errorf("similarity(word, empty) = %v", got)
 	}
 	// pg_trgm: "word" has 5 trigrams, "words" 6, and they share 4: 4/7 as a float32.
-	if got := Similarity("word", "words"); got != float64(float32(4.0/7.0)) {
-		t.Errorf("Similarity(word, words) = %v", got)
+	if got := similarity("word", "words"); got != float64(float32(4.0/7.0)) {
+		t.Errorf("similarity(word, words) = %v", got)
 	}
 }
 
@@ -339,6 +340,44 @@ func BenchmarkWords(b *testing.B) {
 
 func BenchmarkSimilarity(b *testing.B) {
 	for b.Loop() {
-		_ = Similarity("nike air max 90", "nike air max 270")
+		_ = similarity("nike air max 90", "nike air max 270")
+	}
+}
+
+// TestFoldRune: FoldRune is Normalize of one code point (but whitespace), and
+// FoldChanged lists exactly the code points it changes.
+func TestFoldRune(t *testing.T) {
+	changed := map[rune]bool{}
+	for _, r := range FoldChanged(0, unicode.MaxRune) {
+		changed[r] = true
+	}
+	for r := rune(0); r <= 0x2ffff; r++ {
+		if IsSpace(r) || (r >= 0xd800 && r < 0xe000) {
+			continue
+		}
+		f := FoldRune(r)
+		if f != Normalize(string(r)) {
+			t.Fatalf("FoldRune(%U) = %q, Normalize %q", r, f, Normalize(string(r)))
+		}
+		if (f != string(r)) != changed[r] {
+			t.Fatalf("%U: folds to %q, FoldChanged says changed %t", r, f, changed[r])
+		}
+	}
+	if got := FoldChanged('A', 'C'); len(got) != 3 || got[0] != 'A' {
+		t.Fatalf("FoldChanged(A, C) = %q", got)
+	}
+	if got := FoldChanged('a', 'z'); len(got) != 0 {
+		t.Fatalf("FoldChanged(a, z) = %q", got)
+	}
+}
+
+// TestFoldChangedAppendKeepsTable: appending to a FoldChanged result (as a negated
+// pattern class does with its whitespace) leaves the shared table, and so every later
+// FoldChanged, as it was.
+func TestFoldChangedAppendKeepsTable(t *testing.T) {
+	_ = append(FoldChanged(0, ' '), '\t', 0)
+	_ = append(FoldChanged('A', 'B'), 'x')
+	if got := FoldChanged('A', 'D'); string(got) != "ABCD" {
+		t.Fatalf("FoldChanged(A, D) after appends = %q, want \"ABCD\"", got)
 	}
 }

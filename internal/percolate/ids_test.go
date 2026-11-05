@@ -94,3 +94,15 @@ func TestMergeIDsIsSortedUnion(t *testing.T) {
 		}
 	}
 }
+
+func TestIDsLen(t *testing.T) {
+	for _, ids := range [][]string{nil, {"a"}, {"a", "b\\\"c", "\"", "d,e", ""}} {
+		raw, _ := json.Marshal(ids)
+		if len(ids) == 0 {
+			raw = nil
+		}
+		if got := IDs(raw).Len(); got != len(ids) {
+			t.Fatalf("%s: Len %d, want %d", raw, got, len(ids))
+		}
+	}
+}

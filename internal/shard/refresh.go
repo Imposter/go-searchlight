@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
@@ -46,15 +47,15 @@ func (s *Shard) Refresh(ctx context.Context) error {
 
 	s.mu.Lock()
 	fb := s.buf
-	seq, maxSeq, uid, mp := s.applied, s.maxChange, s.indexUID, s.mapState
+	seq, maxSeq, uid, mp, mk := s.applied, s.maxChange, s.indexUID, s.mapState, marks{seq: s.markAt(s.applied), anchor: s.anchor, own: s.own}
 	if fb.empty() {
 		s.mu.Unlock()
-		if seq == cur.seq && uid == cur.uid && mp == cur.mp {
+		if seq == cur.seq && uid == cur.uid && mp == cur.mp && mk.equal(cur.marks) {
 			return nil
 		}
 		ctx, span := s.startSpan(ctx, "shard.refresh", attribute.Int64("seq", seq), attribute.Bool("seq_only", true))
 		defer span.End()
-		s.publishSeq(ctx, seq, maxSeq, uid, mp)
+		s.publishSeq(ctx, seq, maxSeq, uid, mp, mk)
 		return nil
 	}
 	s.buf = newBuffer()
@@ -65,7 +66,7 @@ func (s *Shard) Refresh(ctx context.Context) error {
 		attribute.Int("documents", len(fb.docs)), attribute.Int("queries", len(fb.queries)), attribute.Int64("seq", seq))
 	defer span.End()
 	start := s.opts.Clock.Now()
-	if err := s.refresh(ctx, fb, seq, maxSeq, uid, mp); err != nil {
+	if err := s.refresh(ctx, fb, seq, maxSeq, uid, mp, mk); err != nil {
 		if !isCrash(err) {
 			s.mu.Lock()
 			fb.absorb(s.buf)
@@ -95,7 +96,7 @@ const telemetryDuration = "duration_ms"
 
 // refresh writes a frozen buffer's segments and publishes them. When it fails, nothing
 // of fb is visible.
-func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState) error {
+func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid string, mp *mappingState, mk marks) error {
 	var built []*segRef
 	discard := func(err error) error {
 		for _, ref := range built {
@@ -146,19 +147,24 @@ func (s *Shard) refresh(ctx context.Context, fb *buffer, seq, maxSeq int64, uid 
 			queries = append(queries, st)
 		}
 	}
-	s.publish(ctx, docs, queries, built, seq, maxSeq, uid, mp)
+	s.publish(ctx, docs, queries, built, seq, maxSeq, uid, mp, mk)
 	return nil
 }
 
-// buildDocSegment writes docs as a new segment and opens it.
+// buildDocSegment writes docs as a new segment and opens it. It uses a build thread
+// per docsPerBuildThread documents, up to RefreshThreads: each Build worker keeps its
+// own per-term structures for its range of documents, so a small refresh split many
+// ways mostly multiplies that overhead.
 func (s *Shard) buildDocSegment(ctx context.Context, docs []schema.Doc) (*segRef, error) {
 	_, span := s.startSpan(ctx, "shard.build_segment", attribute.Int("documents", len(docs)))
 	defer span.End()
 	name := newSegmentName()
-	// Each Build worker keeps its own per-term structures for its range of documents,
-	// so a small refresh split many ways mostly multiplies that overhead.
 	threads := min(s.opts.RefreshThreads, max(1, len(docs)/docsPerBuildThread))
-	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{Name: name, Threads: threads, NoSync: true, MarksUntyped: true})
+	meta, err := segment.Build(s.dir, docs, segment.BuildOptions{
+		Name: name, Threads: threads, NoSync: true, MarksUntyped: true,
+		// A refresh steps aside for searches as it writes; it never fails for it.
+		Throttle: func(int) error { _ = prio.Yield(ctx); return nil },
+	})
 	if err != nil {
 		s.jan.removeLater(segmentFiles(s.dir, name)...)
 		return nil, fmt.Errorf("shard: building a segment: %w", err)
@@ -263,7 +269,7 @@ func (s *Shard) mask(states []segState, ids []string) []segState {
 // generation, and numbers the deletes it changed (dirty) for it: the flush that
 // persists it writes them as sidecars of that number. It writes nothing. The caller
 // holds commitMu.
-func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*segRef, seq, maxSeq int64, uid string, mp *mappingState) {
+func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*segRef, seq, maxSeq int64, uid string, mp *mappingState, mk marks) {
 	s.gen++
 	for _, list := range [][]segState{docs, queries} {
 		for i := range list {
@@ -273,17 +279,21 @@ func (s *Shard) publish(ctx context.Context, docs, queries []segState, built []*
 		}
 	}
 	g := newGeneration(s, s.gen, seq, maxSeq, uid, mp, docs, queries)
+	g.marks = mk
 	s.unflushed = append(s.unflushed, built...)
 	if old := s.cur.Swap(g); old != nil {
 		old.Release()
 	}
 	s.notifyPublished()
 	s.recordGeneration(ctx, g)
+	if s.opts.Published != nil {
+		s.opts.Published(g)
+	}
 }
 
 // publishSeq publishes the current segments as covering seq: a refresh with nothing
 // to write.
-func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState) {
+func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, mp *mappingState, mk marks) {
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	cur := s.cur.Load()
@@ -291,6 +301,7 @@ func (s *Shard) publishSeq(ctx context.Context, seq, maxSeq int64, uid string, m
 		return
 	}
 	g := newGeneration(s, cur.gen, seq, maxSeq, uid, mp, slices.Clone(cur.docs), slices.Clone(cur.queries))
+	g.marks = mk
 	s.cur.Store(g)
 	cur.Release()
 	s.notifyPublished()
@@ -328,11 +339,12 @@ func manifestEntry(st *segState) manifestSegment {
 }
 
 // newSegmentName returns a segment name unique for the shard's life (and any other's):
-// 128 random bits, hex-encoded.
+// 128 random bits, hex-encoded. It panics when crypto/rand fails, which means the OS's
+// random number generator is broken.
 func newSegmentName() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand failing means the OS's RNG is broken
+		panic(err)
 	}
 	return hex.EncodeToString(b[:])
 }

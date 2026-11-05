@@ -1,6 +1,7 @@
 package query
 
 import (
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -25,7 +26,8 @@ type Compiled struct {
 
 // Compile prepares n for matching. It accepts any tree, valid or not: a condition whose
 // value its op cannot read matches as scrape-bot's matcher does (eq never, ne always), a
-// nil node or an unknown op never matches.
+// nil node or an unknown op never matches. Date math is read only once resolved
+// ([Resolve]): a condition still holding it never matches.
 func Compile(n Node) *Compiled {
 	return &Compiled{root: compileNode(n)}
 }
@@ -34,7 +36,8 @@ func Compile(n Node) *Compiled {
 // matches nothing but exists:false, empty and ne; a value of the wrong type for its
 // field (Present with no typed part) is invisible to every op that reads a typed part;
 // text ops compare the full normalized text, never grams, so a value too long for grams
-// matches as any other. A nil d is a document with no field. Match allocates nothing.
+// matches as any other; a nested node holds when one object of its field satisfies its
+// whole query. A nil d is a document with no field. Match allocates nothing.
 func (c *Compiled) Match(d *schema.Doc) bool {
 	var fields map[string]schema.Value
 	if d != nil {
@@ -64,6 +67,7 @@ const (
 	opHas // has, has_any, has_all
 	opEmpty
 	opNonempty
+	opBox
 )
 
 var opCodes = map[string]opCode{
@@ -76,6 +80,7 @@ var opCodes = map[string]opCode{
 	OpSimilar: opSimilar,
 	OpHas:     opHas, OpHasAny: opHas, OpHasAll: opHas,
 	OpEmpty: opEmpty, OpNonempty: opNonempty,
+	OpBox: opBox,
 }
 
 type nodeKind uint8
@@ -87,14 +92,16 @@ const (
 	kindAny
 	kindNot
 	kindLeaf
+	kindNested // one object of path satisfies children[0]
 )
 
 // cnode is a compiled node.
 type cnode struct {
 	kind     nodeKind
 	cost     int
-	children []cnode // all, any; not's one child
+	children []cnode // all, any; not's and nested's one child
 	leaf     *cleaf
+	path     string // nested
 }
 
 var (
@@ -122,6 +129,14 @@ func (n *cnode) match(fields map[string]schema.Value) bool {
 		return false
 	case kindNot:
 		return !n.children[0].match(fields)
+	case kindNested:
+		v := fields[n.path]
+		for i := range v.Objects {
+			if o := &v.Objects[i]; o.IsObject() && n.children[0].match(o.Fields) {
+				return true
+			}
+		}
+		return false
 	case kindTrue:
 		return true
 	default:
@@ -160,16 +175,35 @@ func compileNode(n Node) cnode {
 			return never
 		}
 		return compileLeaf(x)
+	case *Nested:
+		if x == nil {
+			return never
+		}
+		child := compileNode(x.Query)
+		if child.kind == kindFalse {
+			return never
+		}
+		return cnode{kind: kindNested, cost: costScan + child.cost, children: []cnode{child}, path: x.Path}
 	default:
 		return never
 	}
 }
 
+// MatchObject reports whether one object of a nested field satisfies the query, the
+// query being a nested node's inner query (its conditions naming sub-fields by their
+// full names): what a nested node asks of each object. A member that is no object
+// never matches.
+func (c *Compiled) MatchObject(o *schema.Object) bool {
+	return o.IsObject() && c.root.match(o.Fields)
+}
+
 // compileGroup folds constant children away (all: a false child is false, true children
 // drop out; any the other way round), keeps a lone child as itself, and orders the rest
-// cheapest first, so the matcher settles on the cheap conditions before the costly.
+// cheapest first, so the matcher settles on the cheap conditions before the costly. A
+// group whose every child dropped out holds what its empty form does: {"all": []}
+// holds, {"any": []} does not.
 func compileGroup(kind nodeKind, nodes []Node) cnode {
-	decided, dropped := kindFalse, kindTrue // all: false decides, true drops out
+	decided, dropped := kindFalse, kindTrue
 	if kind == kindAny {
 		decided, dropped = kindTrue, kindFalse
 	}
@@ -186,7 +220,7 @@ func compileGroup(kind nodeKind, nodes []Node) cnode {
 	}
 	switch len(children) {
 	case 0:
-		return cnode{kind: dropped} // every child dropped out: {"all": []} holds, {"any": []} not
+		return cnode{kind: dropped}
 	case 1:
 		return children[0]
 	}
@@ -228,8 +262,79 @@ type cleaf struct {
 	texts           []string // contains_*, starts_with (one), has_* (sorted, distinct), words_*
 	keys            []uint64 // similar: the text's trigram keys
 	minimum         float64  // similar
+	box             BoxBounds
 }
 
+// BoxBounds is a box condition's bounds, compiled: per axis, the closed or open
+// interval a coordinate must lie in, an absent bound an infinite one.
+type BoxBounds struct {
+	XLo, XHi, YLo, YHi             float64
+	XLoInc, XHiInc, YLoInc, YHiInc bool
+}
+
+// Holds reports whether point p lies in the box.
+func (b *BoxBounds) Holds(p schema.Point) bool {
+	return within(p.X, b.XLo, b.XHi, b.XLoInc, b.XHiInc) && within(p.Y, b.YLo, b.YHi, b.YLoInc, b.YHiInc)
+}
+
+// Any reports whether one of points lies in the box.
+func (b *BoxBounds) Any(points []schema.Point) bool {
+	for _, p := range points {
+		if b.Holds(p) {
+			return true
+		}
+	}
+	return false
+}
+
+func within(v, lo, hi float64, incLo, incHi bool) bool {
+	return (v > lo || incLo && v == lo) && (v < hi || incHi && v == hi)
+}
+
+// CompileBox returns a box value's bounds, false when the box holds no point: a bound
+// that is no finite number (date math not resolved, 1e400), or an axis whose bounds
+// leave nothing between them.
+func CompileBox(a *Arg) (BoxBounds, bool) {
+	if a.Kind != ArgBox || a.Box == nil {
+		return BoxBounds{}, false
+	}
+	var out BoxBounds
+	var ok bool
+	if out.XLo, out.XHi, out.XLoInc, out.XHiInc, ok = compileInterval(&a.Box.X); !ok {
+		return BoxBounds{}, false
+	}
+	if out.YLo, out.YHi, out.YLoInc, out.YHiInc, ok = compileInterval(&a.Box.Y); !ok {
+		return BoxBounds{}, false
+	}
+	return out, true
+}
+
+// compileInterval is one axis of CompileBox: its ends, -Inf and +Inf (inclusive) where
+// unbounded.
+func compileInterval(iv *Interval) (lo, hi float64, loInc, hiInc, ok bool) {
+	lo, hi, loInc, hiInc = math.Inf(-1), math.Inf(1), true, true
+	if iv.Lo.Set {
+		if !iv.Lo.Value.isNumber() {
+			return 0, 0, false, false, false
+		}
+		lo, loInc = iv.Lo.Value.Number, iv.Lo.Inclusive
+	}
+	if iv.Hi.Set {
+		if !iv.Hi.Value.isNumber() {
+			return 0, 0, false, false, false
+		}
+		hi, hiInc = iv.Hi.Value.Number, iv.Hi.Inclusive
+	}
+	if lo > hi || lo == hi && (!loInc || !hiInc) {
+		return 0, 0, false, false, false
+	}
+	return lo, hi, loInc, hiInc, true
+}
+
+// compileLeaf compiles one condition. exists wants presence unless its value is false,
+// as the matcher's `value is not False`. When nothing can equal the value (a list, an
+// object, 1e400), eq never holds and ne always does. A similar whose text has no
+// trigram has similarity 0, below any minimum, and never holds.
 func compileLeaf(l *Leaf) cnode {
 	code := opCodes[l.Op]
 	a := l.arg()
@@ -237,11 +342,10 @@ func compileLeaf(l *Leaf) cnode {
 	cost := costCompare
 	switch code {
 	case opExists:
-		c.want = a.Kind != ArgBool || a.Scalar.Bool // `value is not False`
+		c.want = a.Kind != ArgBool || a.Scalar.Bool
 	case opEmpty, opNonempty:
 	case opEq, opNe:
 		if !c.setEq(&a) {
-			// Nothing equals the value (a list, an object, 1e400): eq never holds, ne always.
 			if code == opEq {
 				return never
 			}
@@ -294,7 +398,7 @@ func compileLeaf(l *Leaf) cnode {
 		text := a.Object["text"]
 		c.keys = analysis.TrigramKeys(text.Norm)
 		if len(c.keys) == 0 {
-			return never // similarity 0, below any minimum
+			return never
 		}
 		c.minimum = minimum
 		cost = costSimilar
@@ -306,6 +410,13 @@ func compileLeaf(l *Leaf) cnode {
 		}
 		slices.Sort(c.texts)
 		c.texts = slices.Compact(c.texts)
+		cost = costLookup
+	case opBox:
+		box, ok := CompileBox(&a)
+		if !ok {
+			return never
+		}
+		c.box = box
 		cost = costLookup
 	default:
 		return never
@@ -377,7 +488,8 @@ func (c *cleaf) setIn(a *Arg) bool {
 }
 
 // setWords keeps the words of each phrase (scrape-bot's wanted_words); false when the
-// condition can never hold: no phrase, or, for words_all, a phrase with no word.
+// condition can never hold: no phrase, or, for words_all, a phrase with no word (which
+// words_any passes over: it matches nothing).
 func (c *cleaf) setWords(a *Arg) bool {
 	for _, s := range a.texts() {
 		words := analysis.Words(s.Text)
@@ -385,7 +497,7 @@ func (c *cleaf) setWords(a *Arg) bool {
 			if c.every {
 				return false
 			}
-			continue // a phrase with no word matches nothing
+			continue
 		}
 		c.texts = append(c.texts, words)
 	}
@@ -435,6 +547,8 @@ func (c *cleaf) match(fields map[string]schema.Value) bool {
 		return c.has(v.Entries)
 	case opNonempty:
 		return len(v.Entries) > 0
+	case opBox:
+		return c.box.Any(v.Points)
 	default:
 		return false
 	}

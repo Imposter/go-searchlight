@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,27 +19,38 @@ import (
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/store"
+	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
 // TestWireRoundTrip: a search request and a shard's result survive the peer API's JSON
 // exactly: the reduce over a result that went through the wire equals the reduce over
-// the original, aggregations (terms, histogram, stats, cardinality) and sort values
-// included.
+// the original, aggregations (terms, histogram, stats, cardinality, filter, filters
+// and global, with the aggregations under them) and sort values included; and the
+// decoded request, post_filter, aggregation filters and terms include and exclude
+// included, searches as the original does.
 func TestWireRoundTrip(t *testing.T) {
 	c := newCluster(t, sqliteDB(t), nil)
 	a := c.start(0)
 	createIndex(t, a.n, "wire", 1, 0)
-	var last int64
+	var last *api.Token
 	for k := range 300 {
-		last = mustWrite(t, a.n, "wire", upsertOp(fmt.Sprintf("w%03d", k), k))
+		last = merged(last, mustWrite(t, a.n, "wire", upsertOp(fmt.Sprintf("w%03d", k), k)))
 	}
 	q, problems := query.Parse([]byte(`{"any":[{"field":"price","op":"between","value":[10,200]},{"field":"tags","op":"has","value":"t1"}]}`))
 	if len(problems) > 0 {
 		t.Fatal(problems)
 	}
+	parse := func(raw string) query.Node {
+		n, problems := query.Parse([]byte(raw))
+		if len(problems) > 0 {
+			t.Fatal(problems)
+		}
+		return n
+	}
 	minCount := 1
 	r := &search.Request{
 		Query: q, Size: 13, TrackTotal: search.TrackTotalAll, Index: "wire",
+		PostFilter:  parse(`{"field":"brand","op":"in","value":["b1","b2","b3"]}`),
 		Sort:        []search.SortField{{Field: "price", Desc: true}, {Field: "brand"}},
 		SearchAfter: []any{float64(250), "b1", "w250"},
 		Aggs: map[string]search.Agg{
@@ -45,6 +60,19 @@ func TestWireRoundTrip(t *testing.T) {
 			"hist":  {Type: search.AggHistogram, Field: "price", Interval: 50},
 			"uniq":  {Type: search.AggCardinality, Field: "brand", Precision: 14},
 			"price": {Type: search.AggStats, Field: "price"},
+			"cheap": {Type: search.AggFilter, Filter: parse(`{"field":"price","op":"lt","value":100}`), Aggs: map[string]search.Agg{
+				"brands": {Type: search.AggTerms, Field: "brand", Size: 2, Aggs: map[string]search.Agg{"uniq": {Type: search.AggCardinality, Field: "tags"}}},
+			}},
+			"tags": {Type: search.AggFilters, OtherBucketKey: "rest", Filters: map[string]query.Node{
+				"t1": parse(`{"field":"tags","op":"has","value":"t1"}`),
+				"t2": parse(`{"field":"tags","op":"has","value":"t2"}`),
+			}, Aggs: map[string]search.Agg{"price": {Type: search.AggStats, Field: "price"}}},
+			"all": {Type: search.AggGlobal, Aggs: map[string]search.Agg{
+				"hist":  {Type: search.AggHistogram, Field: "price", Interval: 100},
+				"picks": {Type: search.AggTerms, Field: "brand", Include: &search.TermsFilter{Values: []any{"B1", "b4", json.Number("5"), 6.0}}},
+			}},
+			"bs":     {Type: search.AggTerms, Field: "brand", Size: 2, Include: &search.TermsFilter{Pattern: "b[2-6]"}, Exclude: &search.TermsFilter{Values: []any{"b3"}}},
+			"prices": {Type: search.AggTerms, Field: "price", Include: &search.TermsFilter{Values: []any{20.0, json.Number("30"), 31}}, Exclude: &search.TermsFilter{Values: []any{}}},
 		},
 	}
 	wr, err := encodeRequest(r)
@@ -63,11 +91,14 @@ func TestWireRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if wr.Needs != levelTermsFilter || back.Needs != levelTermsFilter {
+		t.Fatalf("a search with include and exclude needs wire level %d, %d after the wire; want %d", wr.Needs, back.Needs, levelTermsFilter)
+	}
 	if !bytes.Equal(query.Canonical(r2.Query), query.Canonical(r.Query)) {
 		t.Fatalf("the query changed on the wire")
 	}
 
-	tg, err := a.n.LocalTarget(tctx(t), "wire", 0, last)
+	tg, err := a.n.LocalTarget(tctx(t), "wire", 0, last.Seq(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,10 +115,54 @@ func TestWireRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(rb, &wired); err != nil {
 		t.Fatal(err)
 	}
-	direct, _ := json.Marshal(search.Reduce([]*search.ShardResult{res}, r))
-	via, _ := json.Marshal(search.Reduce([]*search.ShardResult{wired.Result}, r2))
+	direct, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{res}, r))
+	via, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{wired.Result}, r2))
 	if !bytes.Equal(direct, via) {
 		t.Fatalf("the reduce differs after the wire:\n%s\n%s", direct, via)
+	}
+	res2, err := tg.Search(tctx(t), r2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, _ := json.Marshal(search.Reduce(context.Background(), []*search.ShardResult{res2}, r2))
+	if !bytes.Equal(direct, decoded) {
+		t.Fatalf("the decoded request searches differently:\n%s\n%s", direct, decoded)
+	}
+	if !bytes.Contains(direct, []byte(`"rest":{`)) || res.Total >= 300 {
+		t.Fatalf("the filters aggregation or the post_filter did not apply: total %d, %s", res.Total, direct)
+	}
+	var out struct {
+		Aggs map[string]json.RawMessage `json:"aggs"`
+	}
+	if err := json.Unmarshal(direct, &out); err != nil {
+		t.Fatal(err)
+	}
+	keys := func(raw json.RawMessage) string {
+		var terms struct {
+			Buckets []struct {
+				Key any `json:"key"`
+			} `json:"buckets"`
+		}
+		if err := json.Unmarshal(raw, &terms); err != nil {
+			t.Fatal(err)
+		}
+		var ks []string
+		for _, b := range terms.Buckets {
+			ks = append(ks, fmt.Sprint(b.Key))
+		}
+		slices.Sort(ks)
+		return strings.Join(ks, ",")
+	}
+	var all struct {
+		Picks json.RawMessage `json:"picks"`
+	}
+	if err := json.Unmarshal(out.Aggs["all"], &all); err != nil {
+		t.Fatal(err)
+	}
+	bs := strings.Split(keys(out.Aggs["bs"]), ",")
+	chosen := len(bs) == 2 && !slices.ContainsFunc(bs, func(k string) bool { return !slices.Contains([]string{"b2", "b4", "b5", "b6"}, k) })
+	if p, a := keys(out.Aggs["prices"]), keys(all.Picks); !chosen || p != "20,30,31" || a != "b1,b4" {
+		t.Fatalf("include and exclude did not apply: bs %v, prices %s, picks %s", bs, p, a)
 	}
 }
 
@@ -218,9 +293,9 @@ func TestPruneBehindLiveCopies(t *testing.T) {
 	createIndex(t, a.n, "pr", 1, 0)
 	c.start(1)
 	waitCopies(t, a.st, "pr", 1, 2, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 30 {
-		last = mustWrite(t, a.n, "pr", upsertOp(fmt.Sprintf("p%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "pr", upsertOp(fmt.Sprintf("p%d", k), k)))
 	}
 	id := store.ShardID{Index: "pr", Shard: 0}
 	eventually(t, time.Minute, "the changelog is pruned behind both copies", func() error {
@@ -229,7 +304,7 @@ func TestPruneBehindLiveCopies(t *testing.T) {
 		}
 		return nil
 	})
-	floor := last
+	floor := last.Seq(0)
 	for _, cp := range liveCopies(t, a.st, id) {
 		floor = min(floor, cp.AppliedSeq)
 	}
@@ -328,5 +403,230 @@ func TestSingleNodeCluster(t *testing.T) {
 		if c.State != store.CopyRetiring || c.AppliedSeq == 0 {
 			t.Fatalf("a stopped node's copy is %+v, want retiring at its applied seq", c)
 		}
+	}
+}
+
+// TestStopRetiresEveryCopyBeforeClosingThem: a stopping node marks its copies retiring
+// while their leases are live, before it closes them. Closing each one here takes
+// longer than the lease (its final report hangs to its timeout), so a copy marked only
+// after the others closed would stay serving under an expired lease, to be stolen and
+// rebuilt rather than replayed when the node comes back.
+func TestStopRetiresEveryCopyBeforeClosingThem(t *testing.T) {
+	testtier.Heavy(t)
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "slow", 3, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	var last *api.Token
+	for k := range 30 {
+		last = merged(last, mustWrite(t, a.n, "slow", upsertOp(fmt.Sprintf("s%02d", k), k)))
+	}
+	waitCount(t, a.n, "slow", last, 30)
+	hang := func(ctx context.Context) { <-ctx.Done() }
+	a.wrap.onReport.Store(&hang)
+	a.stop()
+	st := c.db.open(t)
+	defer st.Close()
+	copies, err := st.Registry().Copies(context.Background(), "slow")
+	if err != nil || len(copies) != 3 {
+		t.Fatalf("copies: %+v %v", copies, err)
+	}
+	for _, cp := range copies {
+		if cp.State != store.CopyRetiring {
+			t.Errorf("a stopped node's copy is %+v, want retiring", cp)
+		}
+	}
+}
+
+// TestStopStopsTheTailersBeforeMarkingRetiring: a stopping node stops every copy's
+// tailer (each makes its final flush and report) before it marks any copy retiring, so
+// no tailer can mark a copy serving or recovering over the retiring mark.
+func TestStopStopsTheTailersBeforeMarkingRetiring(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "order", 3, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	var last *api.Token
+	for k := range 30 {
+		last = merged(last, mustWrite(t, a.n, "order", upsertOp(fmt.Sprintf("o%02d", k), k)))
+	}
+	waitCount(t, a.n, "order", last, 30)
+	var mu sync.Mutex
+	var events []string
+	report := func(context.Context) {
+		mu.Lock()
+		events = append(events, "report")
+		mu.Unlock()
+	}
+	setState := func(_ store.Copy, state store.CopyState) {
+		mu.Lock()
+		events = append(events, string(state))
+		mu.Unlock()
+	}
+	a.wrap.onReport.Store(&report)
+	a.wrap.onSetState.Store(&setState)
+	a.stop()
+	mu.Lock()
+	defer mu.Unlock()
+	retired := false
+	for _, e := range events {
+		switch {
+		case e == string(store.CopyRetiring):
+			retired = true
+		case retired:
+			t.Fatalf("%q after a copy was marked retiring: %v", e, events)
+		}
+	}
+	if !retired {
+		t.Fatalf("no copy was marked retiring: %v", events)
+	}
+}
+
+// TestPeerRefusingTheTokenIsACopyFailure: a peer that refuses this node's cluster token
+// (401) cannot serve it, as one that is unreachable cannot: the call is a transport
+// failure, retried on another copy, and a write's refresh=true skips that copy rather
+// than failing on it.
+func TestPeerRefusingTheTokenIsACopyFailure(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), func(i int, o *Options) {
+		if i == 1 {
+			o.Config.ClusterToken = "another-token"
+		}
+	})
+	a := c.start(0)
+	b := c.start(1)
+	createIndex(t, a.n, "tk", 1, 0)
+	waitCopies(t, a.st, "tk", 1, 2, time.Minute)
+
+	msg := waitMsg{shardRef: shardRef{Index: "tk"}, Seq: 1}
+	err := a.n.call(tctx(t), b.cfg.NodeID, b.addr, http.MethodPost, peerPrefix+"wait", msg, nil)
+	var pe *peerError
+	if !errors.As(err, &pe) || !retryable(err) {
+		t.Fatalf("a peer refusing the token: %v, want a retryable transport failure", err)
+	}
+	res, err := a.n.Write(tctx(t), "tk", []api.WriteOp{upsertOp("x", 1)}, api.WriteOptions{Refresh: api.RefreshTrue})
+	if err != nil || res.TimedOut {
+		t.Fatalf("a refresh=true write with a peer refusing the token: %+v, %v", res, err)
+	}
+}
+
+// TestDepartedPeerStateIsFreed: a peer that is no longer live (node ids repeat rarely:
+// they default to the hostname, new on every rollout) leaves nothing behind once the
+// view is read again: no hint queue or its goroutine, no adaptive replica selection
+// entries.
+func TestDepartedPeerStateIsFreed(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	ghost := "node-gone"
+	a.n.hints.send(ghost, "127.0.0.1:1", hint{Index: "g", Shard: 0, Seq: 1})
+	a.n.ars.start(ghost, ghost+"|g/0")(false, 0.001, 0)
+	a.n.ars.suspect(ghost + "|g/1")
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	a.n.hints.mu.Lock()
+	_, queued := a.n.hints.queues[ghost]
+	a.n.hints.mu.Unlock()
+	a.n.ars.mu.Lock()
+	_, measured := a.n.ars.peers[ghost]
+	copies := len(a.n.ars.copies)
+	a.n.ars.mu.Unlock()
+	if queued || measured || copies != 0 {
+		t.Fatalf("a departed peer's state stays: hint queue %v, ARS peer %v, ARS copies %d", queued, measured, copies)
+	}
+}
+
+// TestLosingACopyDoesNotWaitForItsClose: a copy found taken over (by a routing miss's
+// registry read, under a client's read) stops counting as held at once, and is closed
+// in the background: its final flush and report do not hold up the read that found it.
+func TestLosingACopyDoesNotWaitForItsClose(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "lc", 1, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	waitCount(t, a.n, "lc", mustWrite(t, a.n, "lc", upsertOp("x", 1)), 1)
+	hang := func(ctx context.Context) { <-ctx.Done() }
+	a.wrap.onReport.Store(&hang)
+	l := a.n.leaseList()[0]
+	v := &view{at: a.n.clock.Now(), readBegan: a.n.lc.Now() + 1, copies: map[store.ShardID][]store.Copy{
+		l.copy.Shard: {{Shard: l.copy.Shard, Slot: l.copy.Slot, NodeID: "node-9", Epoch: l.copy.Epoch + 1}},
+	}}
+	if !v.takenOver(l) {
+		t.Fatal("the view does not show the copy taken over")
+	}
+	start := time.Now()
+	a.n.loseTakenOver(tctx(t), v)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("losing a copy took %s: it waited for the copy's close", took)
+	}
+	if l.valid() {
+		t.Fatal("a lost copy's lease still counts as held")
+	}
+	eventually(t, 30*time.Second, "the lost copy is closed", func() error {
+		if _, hosted := a.n.Hosted(l.copy.Shard); hosted {
+			return errors.New("still hosted")
+		}
+		return nil
+	})
+}
+
+// TestPeerDeadlineLeavesAReserve: a peer is given the caller's remaining time less a
+// reserve, so a search that runs out of time on a peer answers timed_out with partial
+// results while the coordinator still has time to take the reply and fetch the hits.
+func TestPeerDeadlineLeavesAReserve(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:1/_internal/search", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.n.authorize(req)
+	ms, err := strconv.ParseInt(req.Header.Get(headerDeadline), 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := time.Duration(ms) * time.Millisecond; got > 1700*time.Millisecond || got < 1200*time.Millisecond {
+		t.Fatalf("a peer is given %s of a caller's 2s", got)
+	}
+}
+
+// TestRegistryReadAfterStopForgetsNoPeerTwice: a registry read still under way once the
+// node stopped (a routing miss, an allocation) frees no per-peer state again: the hint
+// queues were closed with the node.
+func TestRegistryReadAfterStopForgetsNoPeerTwice(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	ghost := store.Node{ID: "node-gone", Address: "127.0.0.1:1", BodyCodecs: store.BodyCodecs}
+	if err := a.st.Registry().Heartbeat(tctx(t), ghost); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	a.n.hints.send(ghost.ID, ghost.Address, hint{Index: "g", Shard: 0, Seq: 1})
+	if err := a.n.Stop(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.st.Registry().RemoveNode(tctx(t), ghost.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.n.refreshView(tctx(t)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWatchdogLeavesAGoneLeaseAlone: a lease marked gone (lost, its copy closing in the
+// background) is not the lease watchdog's: it pauses nothing and counts no second loss.
+func TestWatchdogLeavesAGoneLeaseAlone(t *testing.T) {
+	c := newCluster(t, sqliteDB(t), nil)
+	a := c.start(0)
+	createIndex(t, a.n, "gl", 1, 0)
+	c.waitHealth(t, api.StatusGreen, 30*time.Second)
+	l := a.n.leaseList()[0]
+	l.gone.Store(true)
+	time.Sleep(10 * a.n.opts.LeaseMargin)
+	if a.n.Paused(l.copy.Shard) {
+		t.Fatal("the watchdog paused a copy whose lease is gone")
 	}
 }

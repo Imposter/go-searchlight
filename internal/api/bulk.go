@@ -10,15 +10,19 @@ import (
 	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Imposter/go-searchlight/internal/percolate"
 )
 
 var errItemCount = errors.New("api: the coordinator answered a different number of items than ops")
 
-// bulkMeta is an action line's metadata: {"upsert": {"id": "a", "if_seq": 3}}.
+// bulkMeta is an action line's metadata: {"upsert": {"id": "a", "if_seq": 3}} or
+// {"query_upsert": {"id": "q", "version": 7}}.
 type bulkMeta struct {
-	ID    json.RawMessage `json:"id"`
-	AltID json.RawMessage `json:"_id"`
-	IfSeq *int64          `json:"if_seq"`
+	ID      json.RawMessage `json:"id"`
+	AltID   json.RawMessage `json:"_id"`
+	IfSeq   *int64          `json:"if_seq"`
+	Version *int64          `json:"version"`
 }
 
 // bulkItem is one op's outcome in a _bulk response.
@@ -26,38 +30,74 @@ type bulkItem struct {
 	Op     string `json:"op"`
 	ID     string `json:"id"`
 	Status int    `json:"status"`
-	Seq    int64  `json:"seq,omitempty"`
+	// Shard is the shard the id routes to; with Seq, where the item stands, which a
+	// client can put in a token of its own (docs/api.md, Tokens).
+	Shard *int `json:"shard,omitempty"`
+	// Seq is the op's seq on Shard when it committed; on a noop, the stored target's
+	// (omitted when there is none).
+	Seq int64 `json:"seq,omitempty"`
+	// Version is the op's client version, when it named one; Result is "noop" when it
+	// was not above the stored one, or when an upsert's body was byte-identical to the
+	// stored document's.
+	Version int64  `json:"version,omitempty"`
+	Result  string `json:"result,omitempty"`
 	// Queries are the upserted document's matching saved queries, with
 	// percolate=true.
 	Queries *json.RawMessage `json:"queries,omitempty"`
-	Error   map[string]any   `json:"error,omitempty"`
+	// Matches are their details, with percolate_matches or percolate_inner_hits.
+	Matches *[]PercolateMatch `json:"matches,omitempty"`
+	Error   map[string]any    `json:"error,omitempty"`
 }
 
 // bulkResponse answers a _bulk request.
 type bulkResponse struct {
 	TookMS int64 `json:"took_ms"`
-	// Seq is the newest seq the request committed: pass it as wait_for_seq.
-	Seq      int64 `json:"seq"`
-	Errors   bool  `json:"errors"`
-	TimedOut bool  `json:"timed_out"`
+	// Token is where the request left each shard it wrote or found its target on (an
+	// unchanged upsert, a versioned noop): pass it as wait_for. Omitted when it names
+	// no shard.
+	Token string `json:"token,omitempty"`
+	// Committed is where the request's commits left each shard: only what it committed.
+	// A client detects a database that lost commits by it (docs/api.md, Tokens).
+	// Omitted when nothing committed.
+	Committed string `json:"committed,omitempty"`
+	// Errors is set when any item failed, on its own or with its shard's transaction.
+	Errors   bool `json:"errors"`
+	TimedOut bool `json:"timed_out"`
 	// Percolated, with percolate=true, says whether the items carry their
 	// matching saved queries: false when the percolation could not finish after
-	// the writes committed (a deadline, a closed copy).
-	Percolated *bool      `json:"percolated,omitempty"`
-	Items      []bulkItem `json:"items"`
+	// the writes committed (a deadline, a closed copy, too many matches).
+	Percolated *bool `json:"percolated,omitempty"`
+	// PercolateReason is CodeTooManyMatches when Percolated is false because the
+	// documents match more than percolate.MaxMatches saved queries together.
+	PercolateReason string `json:"percolate_reason,omitempty"`
+	// PercolatedAt, with Percolated true, is a token of where each shard stood for the
+	// percolation (WriteResult.PercolatedAt).
+	PercolatedAt string     `json:"percolated_at,omitempty"`
+	Items        []bulkItem `json:"items"`
 }
 
 // bulk serves POST /indexes/{index}/_bulk: NDJSON, an action line per op, then the
-// document for an upsert:
+// document for an upsert, or the saved query for a query_upsert:
 //
 //	{"upsert": {"id": "a"}}            (also "index"; "create" requires it to be new)
 //	{"title": "...", "price": 3}
 //	{"delete": {"id": "b", "if_seq": 12}}
+//	{"query_upsert": {"id": "q", "version": 7}}
+//	{"query": {...}, "meta": {...}}
+//	{"query_delete": {"id": "r", "version": 8}}
 //
-// Every op commits in one transaction. An op refused on its own (an invalid document,
-// a failed if_seq) is reported in its item, with errors set, and the rest commit; a
-// malformed action line, a line over max_doc_bytes or more than max_bulk_ops ops
-// refuse the whole request before anything is written.
+// A version (Elasticsearch's external versioning) makes an op apply only when it is
+// higher than the stored one; otherwise its item's result is noop, and nothing is
+// written for it. An unconditional upsert whose body is byte-identical to the stored
+// document's is a noop too, at the stored document's seq, unless detect_noop=false;
+// with percolate=true it still reports the document's matching saved queries.
+//
+// Each shard's ops commit in one transaction, the shards' apart: a request is whole or
+// nothing only on one shard. An op refused on its own (an invalid document, a failed
+// if_seq) is reported in its item, with errors set, and the rest commit; so is every op
+// of a shard whose transaction failed (a 5xx status in its item), while the other
+// shards' ops commit. A malformed action line, a line over max_doc_bytes or more than
+// max_bulk_ops ops refuse the whole request before anything is written.
 func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	start := s.clock.Now()
 	refresh, e := p.refresh()
@@ -68,39 +108,76 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 	if e != nil {
 		return e
 	}
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
+	}
+	keep, e := p.keepIdentical()
+	if e != nil {
+		return e
+	}
+	withMatches, innerHits, release, e := s.percolateDetails(p)
+	if e != nil {
+		return e
+	}
+	defer release()
+	if withMatches && !perc {
+		return InvalidAt("params.percolate_matches", "percolate_matches and percolate_inner_hits detail a percolation: give percolate=true")
+	}
+	if wait != nil && !perc {
+		return InvalidAt("params.wait_for", "wait_for on _bulk is what a percolation reads saved queries up to: give percolate=true")
 	}
 	ops, err := s.parseBulk(r.Body)
 	if err != nil {
 		return err
 	}
-	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{Refresh: refresh, Percolate: perc, WaitForSeq: wait})
+	res, err := s.c.Write(r.Context(), r.PathValue("index"), ops, WriteOptions{
+		Refresh: refresh, Percolate: perc, Matches: perc && withMatches, InnerHits: perc && innerHits, WaitFor: wait, KeepIdentical: keep,
+	})
 	if err != nil {
 		return err
 	}
 	if len(res.Items) != len(ops) {
 		return ProblemFor(errItemCount)
 	}
-	out := bulkResponse{Seq: res.Seq, TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
+	out := bulkResponse{Token: res.Token.String(), Committed: res.Committed.String(), TimedOut: res.TimedOut, Items: make([]bulkItem, len(ops))}
+	switch {
+	case perc && res.Percolated && matches(res.Items, func(it *ItemResult) json.RawMessage { return it.Queries }) > percolate.MaxMatches:
+		res.Percolated = false
+		out.PercolateReason = CodeTooManyMatches
+	case perc && res.PercolateErr != nil && ProblemFor(res.PercolateErr).Code == CodeTooManyMatches:
+		out.PercolateReason = CodeTooManyMatches
+	}
 	if perc {
 		out.Percolated = &res.Percolated
+		if res.Percolated {
+			out.PercolatedAt = res.PercolatedAt.String()
+		}
 	}
 	id := info(r.Context()).id
 	for i := range ops {
 		it := &res.Items[i]
-		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Seq: it.Seq}
+		item := bulkItem{Op: ops[i].Kind.String(), ID: ops[i].ID, Status: http.StatusOK, Shard: it.Shard, Seq: it.Seq, Version: it.Version}
+		if it.Noop {
+			item.Result = resultNoop
+		}
 		if it.Err != nil {
 			pe := ProblemFor(it.Err)
 			item.Status, item.Seq, item.Error = pe.Status, 0, problemBody(pe, id)
 			out.Errors = true
-		} else if perc && res.Percolated && ops[i].Kind == OpUpsert {
+		} else if perc && res.Percolated && ops[i].Kind == OpUpsert && (!it.Noop || it.Unchanged) {
 			q := it.Queries
 			if len(q) == 0 {
 				q = json.RawMessage(emptyArray)
 			}
 			item.Queries = &q
+			if perc && withMatches {
+				ms := it.Matches
+				if ms == nil {
+					ms = []PercolateMatch{}
+				}
+				item.Matches = &ms
+			}
 		}
 		out.Items[i] = item
 	}
@@ -109,7 +186,7 @@ func (s *Server) bulk(w http.ResponseWriter, r *http.Request, p params) error {
 }
 
 // parseBulk reads the NDJSON body into ops, bounded by max_bulk_ops and, per line,
-// max_doc_bytes.
+// max_doc_bytes. Blank lines, a blank last line included, are skipped.
 func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 	br := bufio.NewReaderSize(body, 64<<10)
 	var ops []WriteOp
@@ -128,7 +205,7 @@ func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 				return b, true, nil
 			}
 			if errors.Is(err, io.EOF) {
-				return nil, false, nil // a blank last line
+				return nil, false, nil
 			}
 		}
 	}
@@ -147,15 +224,24 @@ func (s *Server) parseBulk(body io.Reader) ([]WriteOp, error) {
 		if e != nil {
 			return nil, e
 		}
-		if op.Kind == OpUpsert {
+		switch op.Kind {
+		case OpUpsert, OpQueryUpsert:
 			doc, ok, err := next()
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
-				return nil, InvalidAt(fmt.Sprintf("line.%d", line), "the upsert of %q has no document line after it", op.ID)
+				return nil, InvalidAt(fmt.Sprintf("line.%d", line), "the %s of %q has no line after it", op.Kind, op.ID)
 			}
-			op.Body = doc
+			if op.Kind == OpUpsert {
+				op.Body = doc
+				break
+			}
+			var q queryBody
+			if err := decodeJSONObject(doc, &q, false); err != nil || len(q.Query) == 0 || string(q.Query) == "null" {
+				return nil, InvalidAt(fmt.Sprintf("line.%d", line), `a query_upsert's line is {"query": ..., "meta": {...}}`)
+			}
+			op.Query, op.Meta = q.Query, q.Meta
 		}
 		ops = append(ops, op)
 	}
@@ -192,12 +278,15 @@ func (s *Server) readLine(br *bufio.Reader) ([]byte, error) {
 	}
 }
 
-// parseAction reads an action line.
+// parseAction reads an action line. An id must be valid UTF-8 as its JSON spells it:
+// decoding would replace invalid UTF-8 with U+FFFD, silently writing another id, and an
+// escape that is no character (a lone surrogate, "\ud800") decodes to U+FFFD too, so
+// an id holding one its JSON did not spell is refused.
 func parseAction(raw []byte, line int) (WriteOp, *Error) {
 	loc := fmt.Sprintf("line.%d", line)
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || len(obj) != 1 {
-		return WriteOp{}, InvalidAt(loc, `an action line is one of {"upsert": {"id": ...}}, {"create": {...}} or {"delete": {...}}`)
+		return WriteOp{}, InvalidAt(loc, `an action line is one of {"upsert": {"id": ...}}, {"create": {...}}, {"delete": {...}}, {"query_upsert": {...}} or {"query_delete": {...}}`)
 	}
 	var op WriteOp
 	var metaRaw json.RawMessage
@@ -208,16 +297,20 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 			op.Kind = OpUpsert
 		case "create":
 			op.Kind, op.IfSeq = OpUpsert, IfAbsent
+		case "query_upsert":
+			op.Kind = OpQueryUpsert
+		case "query_delete":
+			op.Kind = OpQueryDelete
 		case "delete":
 			op.Kind = OpDelete
 		default:
-			return WriteOp{}, InvalidAt(loc+"."+key, "unknown action: use upsert, create or delete")
+			return WriteOp{}, InvalidAt(loc+"."+key, "unknown action: use upsert, create, delete, query_upsert or query_delete")
 		}
 		loc += "." + key
 	}
 	var meta bulkMeta
 	if err := strictDecode(metaRaw, &meta); err != nil {
-		return WriteOp{}, InvalidAt(loc, `an action's metadata is {"id": "...", "if_seq": n}: %v`, err)
+		return WriteOp{}, InvalidAt(loc, `an action's metadata is {"id": "...", "if_seq": n} or {"id": "...", "version": n}: %v`, err)
 	}
 	idRaw := meta.ID
 	switch {
@@ -228,16 +321,12 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 	case meta.ID == nil:
 		return WriteOp{}, InvalidAt(loc+".id", "an action needs an id")
 	}
-	// Decoding would replace invalid UTF-8 with U+FFFD, silently writing another
-	// id: refuse it instead.
 	if !utf8.Valid(idRaw) {
 		return WriteOp{}, InvalidAt(loc+".id", "an id must be valid UTF-8")
 	}
 	if err := json.Unmarshal(idRaw, &op.ID); err != nil {
 		return WriteOp{}, InvalidAt(loc+".id", "an id is a string")
 	}
-	// An escape that is no character (a lone surrogate, "\ud800") decodes to
-	// U+FFFD: refuse an id holding one its JSON did not spell.
 	if strings.ContainsRune(op.ID, utf8.RuneError) && !spellsReplacement(idRaw) {
 		return WriteOp{}, InvalidAt(loc+".id", "an id must be valid UTF-8 (a lone surrogate escape is not)")
 	}
@@ -246,6 +335,12 @@ func parseAction(raw []byte, line int) (WriteOp, *Error) {
 			return WriteOp{}, InvalidAt(loc+".if_seq", "if_seq is a seq of at least 1, and not with create")
 		}
 		op.IfSeq = *meta.IfSeq
+	}
+	if meta.Version != nil {
+		if *meta.Version < 1 || *meta.Version > MaxVersion || op.IfSeq != 0 {
+			return WriteOp{}, InvalidAt(loc+".version", "version is a whole number from 1 to %d, and excludes if_seq and create", int64(MaxVersion))
+		}
+		op.Version = *meta.Version
 	}
 	return op, nil
 }

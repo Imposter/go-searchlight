@@ -21,7 +21,9 @@ import (
 // sweeps abandoned blob uploads, and every node collects its own unused copy
 // directories and recovery staging. Leadership needs no election: every node reads the
 // same registry, and the leader's jobs are idempotent and safe when two nodes briefly
-// both believe they lead. The store only executes Prune; the policy lives here.
+// both believe they lead. The store only executes Prune; the policy lives here. The
+// leader also prunes each index's tombstones older than its gc_deletes, at every
+// changelog prune.
 //
 // # Pruning (spec section 9)
 //
@@ -135,6 +137,13 @@ func (n *Node) pruneAll(ctx context.Context) error {
 	now := n.clock.Now()
 	cutoff := n.clock.Wall().Add(-n.opts.ChangelogRetention)
 	for _, iv := range n.Indexes() {
+		pruned, err := n.st.PruneTombstones(ctx, iv.Name, iv.GCDeletes)
+		if err != nil {
+			return err
+		}
+		if pruned > 0 {
+			n.log.DebugContext(ctx, "pruned tombstones", slog.String("index", iv.Name), slog.Int64("tombstones", pruned))
+		}
 		for s := range iv.Shards {
 			id := store.ShardID{Index: iv.Name, Shard: s}
 			floor, ok := n.pruneFloor(v.copies[id], v, progress, now)
@@ -222,7 +231,7 @@ func (n *Node) releaseDecommissioned(ctx context.Context, v *view) {
 
 // pruneFloor is the seq a shard's changelog may be pruned up to (inclusive) on account
 // of its copies: the lowest applied seq of the copies that count (see above). ok is
-// false when none counts.
+// false when none counts. A copy stalled behind the others does not hold pruning back.
 func (n *Node) pruneFloor(copies []store.Copy, v *view, progress map[copyKey]int64, now time.Time) (int64, bool) {
 	type counted struct {
 		c        *store.Copy
@@ -245,7 +254,7 @@ func (n *Node) pruneFloor(copies []store.Copy, v *view, progress map[copyKey]int
 		k := copyKey{shard: c.Shard, node: c.NodeID, epoch: c.Epoch}
 		still := n.prune.observe(k, c.AppliedSeq, progress[k], now)
 		if !e.retiring && c.AppliedSeq < top && still >= n.opts.PruneStallTimeout {
-			continue // stalled behind the others: pruning goes on without it
+			continue
 		}
 		if !ok || c.AppliedSeq < floor {
 			floor, ok = c.AppliedSeq, true
@@ -255,39 +264,24 @@ func (n *Node) pruneFloor(copies []store.Copy, v *view, progress map[copyKey]int
 }
 
 // ageFloor is the newest seq of id's changelog older than cutoff (0 when the change
-// after from is not): changes up to it are pruned whatever copy needs them.
+// after from is not): changes up to it are pruned whatever copy needs them. A log an
+// earlier leader pruned past from is searched from where it starts ([Node.logStart]).
+// Once the first change is older than cutoff, it finds the largest seq whose first
+// change after it is still older: that change is the newest older than cutoff (commit
+// order is seq order, so the changes' times rise with their seqs).
 func (n *Node) ageFloor(ctx context.Context, id store.ShardID, from int64, cutoff time.Time) (int64, error) {
 	lo := max(from, n.prune.prunedBelow(id)-1, 0)
 	first, ok, err := n.firstAfter(ctx, id, lo)
 	if errors.Is(err, store.ErrPruned) {
-		// Pruned past lo by an earlier leader: find where the log starts.
-		head, _, herr := n.st.HeadSeq(ctx)
-		if herr != nil {
-			return 0, herr
+		if lo, err = n.logStart(ctx, id, lo); err != nil {
+			return 0, err
 		}
-		a, b := lo, head
-		for a < b { // the smallest x the log still holds the changes after
-			mid := a + (b-a)/2
-			_, _, err := n.firstAfter(ctx, id, mid)
-			switch {
-			case errors.Is(err, store.ErrPruned):
-				a = mid + 1
-			case err != nil:
-				return 0, err
-			default:
-				b = mid
-			}
-		}
-		lo = a
 		first, ok, err = n.firstAfter(ctx, id, lo)
 	}
 	if err != nil || !ok || !first.At.Before(cutoff) {
 		return 0, err
 	}
-	// first (after lo) is older than cutoff: find the largest x whose first change
-	// after it is still older; that change, x+1, is the newest older than cutoff
-	// (commit order is seq order, so the changes' times rise with their seqs).
-	head, _, err := n.st.HeadSeq(ctx)
+	head, _, err := n.st.HeadSeq(ctx, id)
 	if err != nil {
 		return 0, err
 	}
@@ -309,6 +303,29 @@ func (n *Node) ageFloor(ctx context.Context, id store.ShardID, from int64, cutof
 		return 0, err
 	}
 	return c.Seq, nil
+}
+
+// logStart returns the smallest seq at or above lo after which id's changelog, pruned
+// past lo, still holds the changes.
+func (n *Node) logStart(ctx context.Context, id store.ShardID, lo int64) (int64, error) {
+	head, _, err := n.st.HeadSeq(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	a, b := lo, head
+	for a < b {
+		mid := a + (b-a)/2
+		_, _, err := n.firstAfter(ctx, id, mid)
+		switch {
+		case errors.Is(err, store.ErrPruned):
+			a = mid + 1
+		case err != nil:
+			return 0, err
+		default:
+			b = mid
+		}
+	}
+	return a, nil
 }
 
 // firstAfter is id's first change after seq.

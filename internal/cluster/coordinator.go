@@ -184,6 +184,17 @@ type testHooks struct {
 	// pinned is told of every generation of this node's copy of id a peer's query phase
 	// pinned, before the reply goes back.
 	pinned func(id store.ShardID, pin string)
+	// olderPeer makes the node answer peer searches and percolations past olderLevel as
+	// a release of that search wire level does: 0 is 1.0.0 (search and percolate level
+	// 0), 1 the release before include and exclude (search and percolate level 1), 2
+	// the release before from (search level 2), 3 the release before min and max
+	// (search level 3). olderNoEndpoint gives them no endpoint,
+	// olderDropsLevel serves them with what that release lacks dropped (a search's
+	// post_filter below level 1, include and exclude below 2, from below 3, min and
+	// max aggregations and cardinality thresholds below 4; a
+	// percolation's now below 1) and its level in the reply.
+	olderPeer  olderPeer
+	olderLevel int
 }
 
 func (o *Options) resolve() error {
@@ -298,10 +309,16 @@ type Node struct {
 	scheme string
 	// clearWarned are the peers warned about getting the cluster token in the clear.
 	clearWarned sync.Map
-	ars         *ars
-	view        atomic.Pointer[view]
-	missMu      sync.Mutex
-	missReadAt  time.Time
+	// refusedWarned are the peers warned about refusing this node's cluster token.
+	refusedWarned sync.Map
+	ars           *ars
+	view          atomic.Pointer[view]
+	// missMu guards missFlight, the routing registry read under way (refreshSince);
+	// missReadAt, when the last one began, is read and written only by the flights,
+	// which run one after another.
+	missMu     sync.Mutex
+	missFlight *missFlight
+	missReadAt time.Time
 
 	// leases are the copies this node holds, by shard.
 	leaseMu sync.Mutex
@@ -330,6 +347,11 @@ type Node struct {
 	// zstdBodies is set once this node stores document bodies compressed
 	// (bodyCodecGate).
 	zstdBodies atomic.Bool
+	// shardSeqs is set once this node has seen shard sequences on (shardSeqGate).
+	shardSeqs atomic.Bool
+	// lastSeed is when shardSeqGate last looked for indexes without sequence rows; only
+	// the view loop and Start touch it.
+	lastSeed time.Time
 
 	started  atomic.Bool
 	draining atomic.Bool
@@ -432,17 +454,16 @@ func New(ctx context.Context, o Options) (*Node, error) {
 	return n, nil
 }
 
-// loopbackAddress reports whether addr (a host:port, or a bare host) resolves to the
-// loopback interface: a plain-http cluster_token never leaves the machine then.
-// A host that is not a literal IP (a hostname) is treated as non-loopback, since it may
-// resolve to a reachable address depending on DNS.
+// loopbackAddress reports whether addr (a host:port, or a bare host) is a loopback IP
+// ([config.LoopbackIP]): a plain-http cluster_token never leaves the machine then. A
+// host name is treated as non-loopback, since it may resolve to a reachable address
+// depending on DNS.
 func loopbackAddress(addr string) bool {
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return config.LoopbackIP(host)
 }
 
 // ID is the node's id.
@@ -466,6 +487,9 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	if err := n.bodyCodecGate(ctx); err != nil {
 		n.log.WarnContext(ctx, "reading the cluster's features failed; the view loop retries", slog.Any("error", err))
+	}
+	if err := n.shardSeqGate(ctx); err != nil {
+		n.log.WarnContext(ctx, "turning shard sequences on failed; the view loop retries", slog.Any("error", err))
 	}
 	if err := n.singleSQLite(ctx); err != nil {
 		return err
@@ -559,7 +583,7 @@ func (n *Node) Drain(ctx context.Context) {
 	retired := 0
 	for _, l := range n.leaseList() {
 		if v.servingElsewhere(l.copy.Shard, n.id) == 0 {
-			continue // the only serving copy: it serves until Stop
+			continue
 		}
 		if n.retire(ctx, l) {
 			retired++
@@ -604,14 +628,16 @@ func (n *Node) retire(ctx context.Context, l *lease) bool {
 	return true
 }
 
-// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not),
-// stops the loops, stops every copy's tailer and closes its shard (a final manifest and
-// a final applied seq), marks every copy retiring and deregisters the node, then closes
-// the engine. The copies' leases are not released: their rows stay, retiring, at their
-// final applied seqs, so the changelog the node needs to replay when it comes back is
-// kept for retiring_retention, and the node claims its own slots back at the same
-// epochs. Peers place replacements meanwhile (a retiring copy does not count towards
-// its target). It does not close the store. It is idempotent; Close is the same.
+// Stop leaves the cluster as a rolling restart wants: it drains (if the API has not)
+// and stops the loops; it stops every copy's tailer, all together (each makes a final
+// flush and a final applied-seq report), marks every copy retiring while its lease is
+// live and no tailer is left to write its state, then closes the shards, deregisters
+// the node and closes the engine. The copies' leases are not released: their rows stay,
+// retiring, at their final applied seqs, so the changelog the node needs to replay when
+// it comes back is kept for retiring_retention, and the node claims its own slots back
+// at the same epochs. Peers place replacements meanwhile (a retiring copy does not
+// count towards its target). It does not close the store. It is idempotent; Close is
+// the same.
 func (n *Node) Stop(ctx context.Context) error {
 	n.stopOnce.Do(func() {
 		n.stopped.Store(true)
@@ -622,14 +648,27 @@ func (n *Node) Stop(ctx context.Context) error {
 		n.loops.Wait()
 		n.closeBackground()
 		var errs []error
-		for _, l := range n.leaseList() {
+		leases := n.leaseList()
+		var tailers sync.WaitGroup
+		for _, l := range leases {
+			tailers.Go(func() { n.StopTailer(l.copy) })
+		}
+		tailers.Wait()
+		for _, l := range leases {
+			if l.retired.Load() {
+				continue
+			}
+			switch err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); {
+			case err == nil:
+				n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
+			case !errors.Is(err, store.ErrLeaseLost):
+				n.log.WarnContext(ctx, "marking a stopping node's copy retiring failed; once its lease expires it is rebuilt elsewhere rather than replayed",
+					slog.String("shard", l.copy.Shard.String()), slog.Any("error", err))
+			}
+		}
+		for _, l := range leases {
 			if err := n.unhostCopy(ctx, l.copy, false); err != nil {
 				errs = append(errs, err)
-			}
-			if !l.retired.Load() {
-				if err := n.reg.SetCopyState(ctx, l.copy, store.CopyRetiring); err == nil {
-					n.inst.allocation(ctx, l.copy.Shard, string(store.CopyRetiring))
-				}
 			}
 			n.dropLease(l)
 		}
@@ -653,24 +692,11 @@ func (n *Node) Stop(ctx context.Context) error {
 // Close implements [api.Coordinator]: [Node.Stop].
 func (n *Node) Close(ctx context.Context) error { return n.Stop(ctx) }
 
-// kill stops the node as a crash would (tests): no drain, no final commit, no lease
-// released, no deregistration. The shards are abandoned with what they had not
-// committed.
-func (n *Node) kill() {
-	n.stopOnce.Do(func() {
-		n.stopped.Store(true)
-		n.draining.Store(true)
-		n.loopCancel()
-		n.loops.Wait()
-		n.closeBackground()
-		ctx := context.Background()
-		for _, l := range n.leaseList() {
-			_ = n.AbandonCopy(ctx, l.copy)
-			n.dropLease(l)
-		}
-		n.hints.close()
-		n.pins.closeAll()
-		n.snaps.closeAll()
-		_ = n.Single.Close(ctx)
-	})
-}
+// olderPeer is how a test node plays a peer of an older release (testHooks.olderPeer).
+type olderPeer uint8
+
+const (
+	olderNone olderPeer = iota
+	olderNoEndpoint
+	olderDropsLevel
+)

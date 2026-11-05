@@ -1,10 +1,10 @@
 // Package mysql is the MySQL (InnoDB) dialect of the SQL store, on
 // go-sql-driver/mysql.
 //
-// Apply locks the counter row with SELECT ... FOR UPDATE under READ
-// COMMITTED, so sequence numbers are assigned and committed in order, and
-// writes a batch as multi-row INSERTs sized to MySQL's placeholder and packet
-// limits.
+// Apply locks its shards' sequence rows with SELECT ... FOR UPDATE under READ
+// COMMITTED, so each shard's sequence numbers are assigned and committed in
+// order, and writes a batch as multi-row INSERTs sized to MySQL's placeholder
+// and packet limits.
 // MySQL DDL is not transactional, so migrations run on one connection holding
 // a GET_LOCK named after an MD5 hash of the database (a name can run to 64
 // bytes, which a long database name alone could exceed), and each file is
@@ -35,11 +35,12 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Dialect returns the MySQL dialect.
+// Dialect returns the MySQL dialect. It panics only if the binary lacks its embedded
+// migrations directory.
 func Dialect() *dialect.Dialect {
 	sub, err := fs.Sub(migrations, "migrations")
 	if err != nil {
-		panic(err) // the embedded directory always exists
+		panic(err)
 	}
 	return &dialect.Dialect{
 		Name:        "mysql",
@@ -70,10 +71,24 @@ func lockTimedOut(err error) bool {
 }
 
 // alreadyApplied reports DDL that an interrupted migration had already run: a
-// duplicate column (1060), table (1050) or index name (1061).
+// duplicate column (1060), table (1050) or index name (1061), or a column or index to
+// drop that is gone (1091). An ALTER TABLE is atomic, so one that fails that way had
+// run whole.
 func alreadyApplied(err error) bool {
 	var me *mysql.MySQLError
-	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061)
+	return errors.As(err, &me) && (me.Number == 1060 || me.Number == 1050 || me.Number == 1061 || me.Number == 1091)
+}
+
+// blocking is dialect.Maintenance's Blocking: an ALTER TABLE that failed with 1799
+// (its rebuild's log of the writes running beside it passed
+// innodb_online_alter_log_max_size) runs again with LOCK=SHARED, which holds writes, so
+// that it logs none. Reads go on.
+func blocking(stmt string, err error) (string, bool) {
+	var me *mysql.MySQLError
+	if !errors.As(err, &me) || me.Number != 1799 || !strings.HasPrefix(strings.ToUpper(stmt), "ALTER TABLE") {
+		return "", false
+	}
+	return stmt + ", LOCK=SHARED", true
 }
 
 // Config converts a store URL of the form
@@ -82,7 +97,9 @@ func alreadyApplied(err error) bool {
 // session variables. The store always interpolates parameters client-side
 // (one round trip per statement), reports matched rather than changed rows,
 // and talks UTC: the session time_zone is +00:00, so the database clock
-// (UNIX_TIMESTAMP(NOW(3))) is never ambiguous across a DST change.
+// (UNIX_TIMESTAMP(NOW(3))) is never ambiguous across a DST change. It reads
+// max_allowed_packet from the server, so a statement the server would take is never
+// refused, or interpolated past it, client-side.
 func Config(u *url.URL) (*mysql.Config, error) {
 	host := u.Host
 	if host == "" {
@@ -109,8 +126,6 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.InterpolateParams = true
 	cfg.ClientFoundRows = true
-	// Read max_allowed_packet from the server, so a statement the server
-	// would take is never refused, or interpolated past it, client-side.
 	cfg.MaxAllowedPacket = 0
 	cfg.MultiStatements = false
 	cfg.Loc = time.UTC
@@ -119,15 +134,6 @@ func Config(u *url.URL) (*mysql.Config, error) {
 	}
 	cfg.Params["time_zone"] = "'+00:00'"
 	return cfg, nil
-}
-
-// DSN returns the go-sql-driver DSN for a mysql:// store URL.
-func DSN(u *url.URL) (string, error) {
-	cfg, err := Config(u)
-	if err != nil {
-		return "", err
-	}
-	return cfg.FormatDSN(), nil
 }
 
 func open(u *url.URL) (dialect.Pools, error) {

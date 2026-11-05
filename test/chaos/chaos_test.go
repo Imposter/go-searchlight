@@ -12,14 +12,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/node"
 )
 
 // TestKillMidBulk: a node killed (SIGKILL) while _bulk requests are in flight on it
 // loses no acknowledged write; the load fails over to the other nodes, and the node
-// rejoins and converges.
+// rejoins and converges. The index has 8 shards, so a bulk commits in several
+// transactions and the kill can land between them.
 func TestKillMidBulk(t *testing.T) {
 	c := newCluster(t, 3, "")
+	c.shards = 8
 	c.createIndex()
 	m := newModel()
 	l := c.startLoad(m, 4, 3)
@@ -111,8 +114,8 @@ func TestKillMidRecovery(t *testing.T) {
 			serving++
 		}
 	}
-	t.Logf("killed chaos-3 mid-recovery, once its first copy had been fetched: %d of %d copies fetched, %d serving", recovered, shards, serving)
-	if serving >= shards {
+	t.Logf("killed chaos-3 mid-recovery, once its first copy had been fetched: %d of %d copies fetched, %d serving", recovered, c.shards, serving)
+	if serving >= c.shards {
 		t.Fatalf("every copy of chaos-3 served before the kill: it hit no recovery (the recovery hold did not hold)")
 	}
 	l.waitWrites(t, 1000)
@@ -128,7 +131,8 @@ func TestKillMidRecovery(t *testing.T) {
 
 // TestDatabaseRestart: the database restarting under load costs writes a few retried
 // 503s while it is down, never an acknowledged write, and the nodes reconnect and
-// converge. The restart is SEARCHLIGHT_CHAOS_DB_RESTART's (in CI, docker restart of the
+// converge. The index has 8 shards, so a bulk can commit some shards and answer the
+// others' items with a 5xx: those may or may not have committed, and the rest must. The restart is SEARCHLIGHT_CHAOS_DB_RESTART's (in CI, docker restart of the
 // Postgres service container).
 func TestDatabaseRestart(t *testing.T) {
 	cmdline := os.Getenv(envDBRestart)
@@ -136,6 +140,7 @@ func TestDatabaseRestart(t *testing.T) {
 		t.Skip(envDBRestart + " is not set: no command to restart the database with")
 	}
 	c := newCluster(t, 3, "")
+	c.shards = 8
 	c.write503 = true
 	c.createIndex()
 	m := newModel()
@@ -144,6 +149,7 @@ func TestDatabaseRestart(t *testing.T) {
 	restartDatabase(t, cmdline, filepath.Join(c.dir, "db-restart.log"))
 	l.waitWrites(t, 3000)
 	l.stop()
+	t.Logf("%d bulk items answered a 5xx while the rest of their bulk committed", l.partial.Load())
 	c.settle(m)
 	c.verify(m)
 	if c.lb.retriedOf("write 503") == 0 && !c.sawDatabaseErrors() {
@@ -324,8 +330,8 @@ func (c *cluster) fill(m *model, from, count int) {
 			c.t.Fatal(err)
 		}
 		var resp struct {
-			Seq    int64 `json:"seq"`
-			Errors bool  `json:"errors"`
+			Token  string `json:"token"`
+			Errors bool   `json:"errors"`
 		}
 		if a.status != http.StatusOK || json.Unmarshal(a.body, &resp) != nil || resp.Errors {
 			c.t.Fatalf("fill: HTTP %d %s", a.status, truncate(a.body))
@@ -334,7 +340,11 @@ func (c *cluster) fill(m *model, from, count int) {
 		for id, d := range ids {
 			m.docs[id] = d
 		}
-		m.head = max(m.head, resp.Seq)
+		if tok, err := api.ParseToken(resp.Token); err == nil {
+			if m.head == nil || !m.head.Merge(tok) {
+				m.head = tok
+			}
+		}
 		m.acked += int64(len(ids))
 		m.mu.Unlock()
 	}
@@ -346,9 +356,9 @@ func (c *cluster) fill(m *model, from, count int) {
 func (c *cluster) timeRestart(i int, m *model) time.Duration {
 	c.t.Helper()
 	v := m.snapshot()
-	perShard := make([]int64, shards)
+	perShard := make([]int64, c.shards)
 	for id := range v.docs {
-		perShard[node.ShardFor(id, shards)]++
+		perShard[node.ShardFor(id, c.shards)]++
 	}
 	mb := c.members[i]
 	mb.disrupted.Store(true)
@@ -364,7 +374,7 @@ func (c *cluster) timeRestart(i int, m *model) time.Duration {
 		if err != nil {
 			return err
 		}
-		if len(copies) != shards {
+		if len(copies) != c.shards {
 			return fmt.Errorf("%d copies", len(copies))
 		}
 		for _, sc := range copies {
@@ -385,8 +395,8 @@ func (c *cluster) timeRestart(i int, m *model) time.Duration {
 			opened++
 		}
 	}
-	if opened < shards {
-		c.t.Errorf("%s reopened %d copies with documents, want %d", mb.NodeID(), opened, shards)
+	if opened < c.shards {
+		c.t.Errorf("%s reopened %d copies with documents, want %d", mb.NodeID(), opened, c.shards)
 	}
 	return took
 }
@@ -424,8 +434,8 @@ func (c *cluster) assertReopened(i int, reopen bool) {
 			withDocs++
 		}
 	}
-	if withDocs < shards {
-		c.t.Errorf("%s reopened %d copies holding documents, want %d", c.members[i].NodeID(), withDocs, shards)
+	if withDocs < c.shards {
+		c.t.Errorf("%s reopened %d copies holding documents, want %d", c.members[i].NodeID(), withDocs, c.shards)
 	}
 }
 
@@ -465,4 +475,54 @@ func orphanSegments(t *testing.T, dataDir string) []string {
 		}
 	}
 	return out
+}
+
+// TestRollingUpgradeFromRelease: a rolling upgrade from the last release before shard
+// sequences (fromRelease) under write and read load. Each node in turn stops gracefully
+// and starts on this build; while nodes of both serve, every commit takes the global
+// sequence and reads ask for no position (each release refuses the other's
+// read-your-writes parameter). Once every node runs this build the leader turns shard
+// sequences on, and reads wait for the writes' tokens again. No client sees an error,
+// nothing acknowledged is lost, and the copies converge.
+func TestRollingUpgradeFromRelease(t *testing.T) {
+	tag, old := releaseBinary(t)
+	_, cur := binaries(t)
+	c := newCluster(t, 3, old)
+	c.refusedOnly = true
+	c.mixed.Store(true)
+	c.createIndex()
+	m := newModel()
+	l := c.startLoad(m, 4, 3)
+	l.waitWrites(t, 2000)
+	for i, mb := range c.members {
+		mb.disrupted.Store(true)
+		start := time.Now()
+		if err := mb.Stop(time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		mb.UseBinary(cur)
+		c.restart(i)
+		mb.current.Store(true)
+		c.waitGreen(3 * time.Minute)
+		c.assertReopened(i, true)
+		t.Logf("upgraded %s from %s in %s", mb.NodeID(), tag, time.Since(start).Round(time.Millisecond))
+		l.waitWrites(t, 1000)
+	}
+	waitUntil(t, 2*time.Minute, "the leader turns shard sequences on", func() bool {
+		for _, mb := range c.members {
+			if strings.Contains(mb.Logs().TailExcept(100000, "request served"), "turned the cluster's shard_seqs feature on") {
+				return true
+			}
+		}
+		return false
+	})
+	c.mixed.Store(false)
+	l.waitWrites(t, 2000)
+	l.stop()
+	if l.mixedReads.Load() == 0 {
+		t.Error("no read waited for a token while both releases served")
+	}
+	t.Logf("%d reads waited for a token on a node of this build while both releases served", l.mixedReads.Load())
+	c.settle(m)
+	c.verify(m)
 }

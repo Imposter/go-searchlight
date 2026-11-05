@@ -250,8 +250,8 @@ func TestParitySimilarity(t *testing.T) {
 		}
 	}
 	for _, p := range data.Pairs {
-		if got := Similarity(p.A, p.B); got != p.Similarity {
-			t.Errorf("Similarity(%+q, %+q) = %v, want %v", p.A, p.B, got, p.Similarity)
+		if got := similarity(p.A, p.B); got != p.Similarity {
+			t.Errorf("similarity(%+q, %+q) = %v, want %v", p.A, p.B, got, p.Similarity)
 		}
 	}
 	lower := runeKeyed(t, data.Lower)

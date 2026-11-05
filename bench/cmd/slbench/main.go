@@ -6,6 +6,7 @@
 //	slbench run       load, cross-check, then run every workload on each engine
 //	slbench report    render a run's JSON as markdown (docs/benchmarks.md)
 //	slbench translate print the Elasticsearch DSL for a Searchlight query or search
+//	slbench writeload a sustained _bulk load and the reads beside it, on a small CPU budget
 //
 // Searchlight runs as its real binary: --sl-bin starts it as a child process, on SQLite
 // with a generated tokens file (internal/slproc), and restarts it for the restart
@@ -41,6 +42,7 @@ commands:
   run        load, cross-check, then run every workload on each engine
   report     render a run's JSON as markdown
   translate  print the Elasticsearch DSL for a Searchlight query or search (stdin)
+  writeload  a sustained _bulk load and the reads beside it, on a small CPU budget
 
 Run "slbench <command> -h" for a command's flags.
 `
@@ -60,6 +62,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		err = cmdRun(ctx, args[1:], stdout, stderr, false)
 	case "report":
 		err = cmdReport(args[1:], stdout)
+	case "writeload":
+		err = cmdWriteload(ctx, args[1:], stdout, stderr)
 	case "translate":
 		err = cmdTranslate(args[1:], stdin, stdout)
 	case "help", "-h", "--help":

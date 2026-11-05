@@ -29,7 +29,7 @@ func (r *Reader) DiskUsage() DiskUsage {
 	u := DiskUsage{File: int64(len(r.data))}
 	footer, err := verifyFileSections(r.path, r.data, nil)
 	if err == nil {
-		for _, k := range sectionOrder {
+		for _, k := range knownSections {
 			if s, ok := footer.sections[k]; ok {
 				u.Sections = append(u.Sections, DiskSection{Name: k.String(), Bytes: int64(s.n)}) //nolint:gosec // a section of a mapped file
 			}
@@ -65,6 +65,14 @@ func (r *Reader) DiskUsage() DiskUsage {
 				add(name, "points", n)
 			}
 		}
+		if t := fi.xy; t != nil {
+			n := uint64(xyTreeHeaderLen) + uint64(len(t.nodes)+len(t.leafOffs))
+			for i := range t.numLeaves {
+				lf := t.leaf(i)
+				n += xyLeafHeaderLen + uint64(len(lf.xs)+len(lf.ys)+len(lf.ds))
+			}
+			add(name, "xy tree", n)
+		}
 		add(name, "presence", fi.presRegion.n)
 		add(name, "truncated", fi.truncRegion.n)
 		add(name, "untyped", fi.untypedRegion.n)
@@ -72,6 +80,10 @@ func (r *Reader) DiskUsage() DiskUsage {
 	if r.ids != nil {
 		_, total := r.ids.usage()
 		add("", "ids", total)
+	}
+	for path, n := range r.nested {
+		add(path, "nested starts", uint64(len(n.starts)))
+		u.Parts = append(u.Parts, n.objects.DiskUsage().Parts...)
 	}
 	if s, ok := footer.sections[sectionStored]; ok {
 		dict := uint64(len(r.stored.dict))

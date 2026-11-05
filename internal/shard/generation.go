@@ -1,13 +1,16 @@
 package shard
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -172,6 +175,56 @@ type QuerySegmentView struct {
 	Live       uint32
 }
 
+// backgroundWait bounds how long a shard's shutdown waits for the background work
+// over its generations ([Generation.Background]) once it has cancelled it.
+const backgroundWait = 10 * time.Second
+
+// bgWork counts the background work over a shard's generations, for its shutdown to
+// wait on.
+type bgWork struct {
+	mu      sync.Mutex
+	n       int
+	closing bool
+	idle    chan struct{} // closed when n reaches 0 during shutdown
+}
+
+// add registers one piece of work: false once shutdown has begun.
+func (b *bgWork) add() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closing {
+		return false
+	}
+	b.n++
+	return true
+}
+
+func (b *bgWork) done() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.n--
+	if b.n == 0 && b.idle != nil {
+		close(b.idle)
+		b.idle = nil
+	}
+}
+
+// wait refuses new work and returns a channel closed once the work in flight is done.
+func (b *bgWork) wait() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closing = true
+	if b.n == 0 {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	if b.idle == nil {
+		b.idle = make(chan struct{})
+	}
+	return b.idle
+}
+
 // Generation is an immutable view of the shard: its segments and query segments, with
 // deletes, as of one refresh or merge. Acquire one with [Shard.Acquire] and Release it
 // when done; everything it exposes is valid in between, and never changes.
@@ -185,6 +238,7 @@ type Generation struct {
 	uid     string
 	mapping *schema.Mapping
 	mp      *mappingState // mapping, with its version
+	marks   marks
 
 	// Segments are the document segments, in base-ordinal order.
 	Segments []SegmentView
@@ -254,6 +308,40 @@ func (g *Generation) tryRef() bool {
 	}
 }
 
+// Background adds a reference to a generation the caller holds, for background work
+// that outlives the caller's hold (a cache build over its segments), and registers
+// the work with the shard: its shutdown cancels Context, then waits (at most
+// backgroundWait) for the work to call release, which also drops the reference. ok is
+// false when the generation is already retired or its shard shutting down.
+func (g *Generation) Background() (release func(), ok bool) {
+	if !g.tryRef() {
+		return nil, false
+	}
+	if g.shard == nil {
+		return g.Release, true
+	}
+	if !g.shard.background.add() {
+		g.Release()
+		return nil, false
+	}
+	return sync.OnceFunc(func() {
+		g.Release()
+		g.shard.background.done()
+	}), true
+}
+
+// Shard is the shard that published the generation: for caches kept per shard.
+func (g *Generation) Shard() *Shard { return g.shard }
+
+// Context is the lifetime of the generation's shard: done once the shard shuts down
+// (Close or Abandon), for background work over the generation to stop.
+func (g *Generation) Context() context.Context {
+	if g.shard == nil || g.shard.bg == nil {
+		return context.Background()
+	}
+	return g.shard.bg
+}
+
 // Release drops the reference Acquire gave. The generation, and every bitmap and
 // reader taken from it, must not be used afterwards. It allocates nothing unless it
 // retires the generation.
@@ -296,7 +384,7 @@ func (g *Generation) MaxSeq() int64 { return g.maxSeq }
 // seen).
 func (g *Generation) IndexUID() string { return g.uid }
 
-// MappingVersion is the version of Mapping (0 when it came from Open or SetMapping).
+// MappingVersion is the version of Mapping (0 when it came from Open).
 func (g *Generation) MappingVersion() int64 { return g.mp.version }
 
 // Mapping is the index mapping as of the generation's seq.
@@ -335,10 +423,20 @@ func (g *Generation) NumQueries() uint64 { return g.numQueries }
 func (g *Generation) FilterCache() *FilterCache { return g.shard.opts.FilterCache }
 
 // DocFreq implements [TermStats]: how many documents hold term, deleted ones included.
+// A nested field's sub-field (path.name) counts the objects holding it, which bounds
+// the documents holding it from above.
 func (g *Generation) DocFreq(field string, kind segment.TermKind, term string) uint64 {
 	var n uint64
+	path, _, sub := strings.Cut(field, ".")
 	for i := range g.Segments {
-		n += uint64(g.Segments[i].Reader.TermFreq(field, kind, term))
+		r := g.Segments[i].Reader
+		f := uint64(r.TermFreq(field, kind, term))
+		if f == 0 && sub {
+			if nv := r.Nested(path); nv != nil {
+				f = uint64(nv.Objects().TermFreq(field, kind, term))
+			}
+		}
+		n += f
 	}
 	return n
 }
@@ -380,7 +478,8 @@ func (g *Generation) LookupQuery(id string) (seg int, ord uint32, ok bool) {
 	return 0, 0, false
 }
 
-// openGeneration opens every segment the manifest lists, checking each against it.
+// openGeneration opens every segment the manifest lists, checking each against it. The
+// generation it returns holds the segments' references: newGeneration took them.
 func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, error) {
 	legacy := man.UntypedMarks == untypedMarksFormat
 	var docs, queries []segState
@@ -406,7 +505,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	for _, ms := range man.QuerySegments {
-		if ms.Format != s.opts.QueryIndex.Format() {
+		if ms.Format != s.opts.QueryIndex.Format() && !reads(s.opts.QueryIndex, ms.Format) {
 			return fail(fmt.Errorf("shard: query segment %s is in format %q, the query index builds %q: %w", ms.ID, ms.Format, s.opts.QueryIndex.Format(),
 				queryFormatError(ms.Format, s.opts.QueryIndex.Format())))
 		}
@@ -424,7 +523,7 @@ func (s *Shard) openGeneration(man *manifest, mp *mappingState) (*Generation, er
 		}
 	}
 	g := newGeneration(s, man.Gen, man.Seq, man.MaxSeq, man.IndexUID, mp, docs, queries)
-	// newGeneration took the generation's references; the opener's are not needed.
+	g.marks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
 	return g, nil
 }
 
@@ -473,4 +572,25 @@ func queryFormatError(found, builds string) error {
 		}
 	}
 	return segment.ErrOlderFormat
+}
+
+// reads reports whether qi opens query segments of format, an older one it reads.
+func reads(qi QueryIndexBuilder, format string) bool {
+	r, ok := qi.(FormatReader)
+	return ok && r.Reads(format)
+}
+
+// DocSeq returns the seq of the change that wrote document ord of Segments[seg], the
+// version the segment holds ([schema.SeqColumn]): 0 for a document indexed by a release
+// that kept none.
+func (g *Generation) DocSeq(seg int, ord uint32) int64 {
+	nc := g.Segments[seg].Reader.Numbers(schema.SeqColumn)
+	if !nc.Exists() {
+		return 0
+	}
+	v, ok := nc.Value(ord)
+	if !ok {
+		return 0
+	}
+	return int64(v)
 }

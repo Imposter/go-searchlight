@@ -65,6 +65,10 @@ type BuildOptions struct {
 	// ([schema.Value.Untyped]), so a reader can trust [Reader.Untyped] to list exactly
 	// them ([Reader.MarksUntyped]).
 	MarksUntyped bool
+	// Throttle, when set, is called as [MergeOptions.Throttle] is while the segment is
+	// written: with each chunk's size before it is written, never from two goroutines
+	// at once. An error from it stops Build, which removes its temp files.
+	Throttle func(n int) error
 }
 
 // Meta describes a written segment: enough for a shard's manifest entry.
@@ -77,11 +81,12 @@ type Meta struct {
 	NumDocs uint32
 }
 
-// genName returns a random segment name: a 16-byte identifier, hex-encoded.
+// genName returns a random segment name: a 16-byte identifier, hex-encoded. It panics
+// when crypto/rand fails, which means the OS's random number generator is broken.
 func genName() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		panic(err) // crypto/rand failing means the OS's RNG is broken
+		panic(err)
 	}
 	return hex.EncodeToString(b[:])
 }
@@ -138,16 +143,36 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 	if opts.MarksUntyped {
 		flags |= flagMarksUntyped
 	}
+	nested, err := nestedStarts(docs)
+	if err != nil {
+		return Meta{}, err
+	}
 	ranges := splitRanges(numDocs, opts.Threads)
-	parts := buildPartsParallel(docs, ranges)
-	names := unionFieldNames(parts)
+	parts := buildPartsParallel(docs, ranges, nested)
+	for i := range nested {
+		np := &nested[i]
+		np.names, np.dicts, np.flags = unionFieldNames(np.parts), partsDicts, flags|flagObjects
+	}
+	img := &image{
+		numDocs: numDocs, flags: flags, names: unionFieldNames(parts), parts: parts, dicts: partsDicts,
+		stored: storedFromDocs(docs), ids: idsFromSorted(ids), nested: nested,
+	}
 
 	name := opts.Name
 	if name == "" {
 		name = genName()
 	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, numDocs, flags, names, parts, partsDicts, storedFromDocs(docs), idsFromSorted(ids), opts.Threads, nil, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
+	var throttle func(int) error
+	if opts.Throttle != nil {
+		var mu sync.Mutex
+		throttle = func(n int) error {
+			mu.Lock()
+			defer mu.Unlock()
+			return opts.Throttle(n)
+		}
+	}
+	meta, err := writeSegmentParts(path, img, opts.Threads, throttle, !opts.NoSync, !opts.NoSync && !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -156,11 +181,15 @@ func Build(dir string, docs []schema.Doc, opts BuildOptions) (Meta, error) {
 }
 
 // buildPartsParallel builds one part (a field name to fieldBuilder map) per range,
-// each in its own goroutine when there is more than one range.
-func buildPartsParallel(docs []schema.Doc, ranges []docRange) []map[string]*fieldBuilder {
+// each in its own goroutine when there is more than one range, and each nested
+// field's part of its objects for the range (nestedPart.parts).
+func buildPartsParallel(docs []schema.Doc, ranges []docRange, nested []nestedPart) []map[string]*fieldBuilder {
 	parts := make([]map[string]*fieldBuilder, len(ranges))
+	for i := range nested {
+		nested[i].parts = make([]map[string]*fieldBuilder, len(ranges))
+	}
 	if len(ranges) == 1 {
-		parts[0] = buildPart(docs, ranges[0])
+		parts[0] = buildPart(docs, ranges[0], 0, nested)
 		return parts
 	}
 	var wg sync.WaitGroup
@@ -168,7 +197,7 @@ func buildPartsParallel(docs []schema.Doc, ranges []docRange) []map[string]*fiel
 		wg.Add(1)
 		go func(i int, rg docRange) {
 			defer wg.Done()
-			parts[i] = buildPart(docs, rg)
+			parts[i] = buildPart(docs, rg, i, nested)
 		}(i, rg)
 	}
 	wg.Wait()
@@ -176,26 +205,59 @@ func buildPartsParallel(docs []schema.Doc, ranges []docRange) []map[string]*fiel
 }
 
 // buildPart accumulates rg's documents into one fieldBuilder per field they use, and
-// sorts each one's term dictionaries ready for the merge-and-write pass.
-func buildPart(docs []schema.Doc, rg docRange) map[string]*fieldBuilder {
+// sorts each one's term dictionaries ready for the merge-and-write pass; and each
+// nested field's objects of those documents into nested[...].parts[part], each object
+// at its ordinal (nestedPart.starts), every member that is an object present in the
+// field's own name and its sub-fields in theirs.
+func buildPart(docs []schema.Doc, rg docRange, part int, nested []nestedPart) map[string]*fieldBuilder {
 	builders := make(map[string]*fieldBuilder)
 	for ord := rg.start; ord < rg.end; ord++ {
-		for name, v := range docs[ord].Fields {
-			if !v.Present {
-				continue
+		fields := docs[ord].Fields
+		for name := range fields {
+			if v := fields[name]; v.Present {
+				addValue(builderFor(builders, name), ord, v)
 			}
-			b, ok := builders[name]
-			if !ok {
-				b = newFieldBuilder()
-				builders[name] = b
-			}
-			addValue(b, ord, v)
 		}
 	}
 	for _, b := range builders {
 		b.sortTermGroups()
 	}
+	for i := range nested {
+		np := &nested[i]
+		objects := make(map[string]*fieldBuilder)
+		for ord := rg.start; ord < rg.end; ord++ {
+			v := docs[ord].Fields[np.path]
+			base := np.starts[ord]
+			for k := range v.Objects {
+				o := &v.Objects[k]
+				if !o.IsObject() {
+					continue
+				}
+				obj := base + uint32(k)
+				addValue(builderFor(objects, np.path), obj, schema.Value{Present: true})
+				for sub := range o.Fields {
+					if sv := o.Fields[sub]; sv.Present {
+						addValue(builderFor(objects, sub), obj, sv)
+					}
+				}
+			}
+		}
+		for _, b := range objects {
+			b.sortTermGroups()
+		}
+		np.parts[part] = objects
+	}
 	return builders
+}
+
+// builderFor returns builders' fieldBuilder of name, made on first use.
+func builderFor(builders map[string]*fieldBuilder, name string) *fieldBuilder {
+	b, ok := builders[name]
+	if !ok {
+		b = newFieldBuilder()
+		builders[name] = b
+	}
+	return b
 }
 
 // addValue folds one document's field value into its builder, as [Build] and
@@ -211,6 +273,9 @@ func addValue(b *fieldBuilder, ord uint32, v schema.Value) {
 	}
 	if v.Untyped {
 		b.untyped.Add(ord)
+	}
+	for _, p := range v.Points {
+		b.xy = append(b.xy, xyPoint{x: xyKey(p.X), y: xyKey(p.Y), doc: ord})
 	}
 	switch {
 	case v.Text != nil:
@@ -341,7 +406,8 @@ func runParallel(n, threads int, work func(i int)) {
 // segment's directory), written through throttle like the segment itself. So a write
 // holds at most spillAt bytes for each contribution running or waiting its turn, and
 // needs up to about one section's size of extra disk while they wait. Once a write
-// fails, no further contribution starts and the first error is returned.
+// fails, no further contribution starts and the first error is returned. Held
+// contributions are placed, under mu, as soon as their turn comes.
 func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int) error, n, threads int, writeOne func(fw *fileWriter, i int), fixup func(i int, base uint64)) error {
 	sectionStart := w.off
 	var mu sync.Mutex
@@ -350,8 +416,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 	failed := false
 	held := make([]*spillBuffer, n)
 	errs := make([]error, n)
-	// place lands every held field whose turn has come; mu must be held.
-	place := func() {
+	placeHeldLocked := func() {
 		for next < n && held[next] != nil && !direct && !failed {
 			fixup(next, w.off-sectionStart)
 			if err := held[next].copyTo(w); err != nil {
@@ -383,7 +448,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 				errs[i], failed = fw.err, true
 			}
 			next++
-			place()
+			placeHeldLocked()
 			mu.Unlock()
 			return
 		}
@@ -406,7 +471,7 @@ func writeFieldSectionParallel(w *fileWriter, spill string, throttle func(n int)
 			return
 		}
 		held[i] = buf
-		place()
+		placeHeldLocked()
 	})
 	for _, b := range held {
 		if b != nil {
@@ -501,17 +566,34 @@ func (b *spillBuffer) discard() {
 	}
 }
 
-// writeSegmentParts writes every section to a fresh segment file at path, with the
-// segment flags flags: each field's (names, which must be sorted) doc values, points
-// and presence from parts, its term dictionaries from dicts, then stored and ids.
-// parts may have any length: one (a sequential build, or any Merge with one effective
-// worker) or many (one per [BuildOptions.Threads] worker, or one per Merge reader
-// group) - writeFieldDict and friends treat those identically, which is what makes
-// the file byte-for-byte the same either way; so does threads, the degree of
-// parallelism the writing phase itself (as opposed to parts, accumulation's) uses.
-// throttle, when not nil, is called before every chunk written to the file
-// ([MergeOptions.Throttle]).
-func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts []map[string]*fieldBuilder, dicts dictSources, stored storedSource, ids idSource, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
+// image is what one segment image holds: numDocs documents (or a nested field's
+// objects), flags, each field's (names, which must be sorted) doc values, points and
+// presence from parts and term dictionaries from dicts, stored records and ids (both
+// nil for an object segment, which holds neither), and the nested fields' objects.
+type image struct {
+	numDocs uint32
+	flags   uint32
+	names   []string
+	parts   []map[string]*fieldBuilder
+	dicts   dictSources
+	stored  storedSource
+	ids     idSource
+	nested  []nestedPart
+}
+
+// writeSegmentParts writes img to a fresh segment file at path. parts may have any
+// length: one (a sequential build, or any Merge with one effective worker) or many
+// (one per [BuildOptions.Threads] worker, or one per Merge reader group) -
+// writeFieldDict and friends treat those identically, which is what makes the file
+// byte-for-byte the same either way; so does threads, the degree of parallelism the
+// writing phase itself (as opposed to parts, accumulation's) uses. throttle, when not
+// nil, is called before every chunk written to the file ([MergeOptions.Throttle]).
+//
+// The rename is durable only once the directory entry itself is fsynced: without
+// that, a crash can leave the directory pointing at the old file (or nothing), even
+// though the new file's own bytes were fsynced. A caller that syncs the directory
+// itself, once for many files, passes syncDir false.
+func writeSegmentParts(path string, img *image, threads int, throttle func(n int) error, syncFile, syncDir bool) (Meta, error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
@@ -531,7 +613,43 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 	w := newFileWriter(out)
 	w.abort = new(atomic.Bool)
-	w.header()
+	if err := writeImage(w, path, throttle, img, threads); err != nil {
+		return Meta{}, err
+	}
+	if syncFile {
+		if err := SyncFile(f); err != nil {
+			return Meta{}, err
+		}
+	}
+	if err := f.Close(); err != nil {
+		return Meta{}, err
+	}
+	ok = true
+	if err := os.Rename(tmp, path); err != nil {
+		return Meta{}, err
+	}
+	if syncDir {
+		if err := SyncDir(filepath.Dir(path)); err != nil {
+			return Meta{}, err
+		}
+	}
+	return Meta{Path: path, NumDocs: img.numDocs}, nil
+}
+
+// writeImage writes img through w, header to footer: a segment file's bytes, or an
+// object segment's inside its segment's NESTED section. spill names the temp files a
+// section's held contributions spill to, in the segment's directory.
+func writeImage(w *fileWriter, spill string, throttle func(n int) error, img *image, threads int) error {
+	names, parts, dicts, numDocs := img.names, img.parts, img.dicts, img.numDocs
+	xyNames := pointFieldNames(names, parts)
+	minor := uint16(0)
+	switch {
+	case len(img.nested) > 0:
+		minor = minorNested
+	case len(xyNames) > 0:
+		minor = minorXY
+	}
+	w.header(minor)
 
 	empty := newFieldBuilder()
 	scratch := make(map[string]*fieldScratch, len(names))
@@ -540,7 +658,7 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 	}
 
 	w.beginSection(sectionTerms)
-	err = writeFieldSectionParallel(w, path, throttle, len(names)*numKinds, threads,
+	err := writeFieldSectionParallel(w, spill, throttle, len(names)*numKinds, threads,
 		func(fw *fileWriter, i int) {
 			name, kind := names[i/numKinds], TermKind(i%numKinds) //nolint:gosec // i%numKinds < numKinds
 			writeFieldDict(fw, name, kind, partsFor(parts, name, empty), dicts, scratch[name])
@@ -552,12 +670,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 			}
 		})
 	if err != nil {
-		return Meta{}, err
+		return err
 	}
 	w.endSection()
 
 	w.beginSection(sectionDocValues)
-	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+	err = writeFieldSectionParallel(w, spill, throttle, len(names), threads,
 		func(fw *fileWriter, i int) {
 			writeFieldDocValues(fw, partsFor(parts, names[i], empty), numDocs, scratch[names[i]])
 		},
@@ -574,12 +692,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 			}
 		})
 	if err != nil {
-		return Meta{}, err
+		return err
 	}
 	w.endSection()
 
 	w.beginSection(sectionPoints)
-	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+	err = writeFieldSectionParallel(w, spill, throttle, len(names), threads,
 		func(fw *fileWriter, i int) { writeFieldPoints(fw, numDocs, scratch[names[i]]) },
 		func(i int, fieldBase uint64) {
 			out := scratch[names[i]].out
@@ -588,12 +706,12 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 			}
 		})
 	if err != nil {
-		return Meta{}, err
+		return err
 	}
 	w.endSection()
 
 	w.beginSection(sectionPresence)
-	err = writeFieldSectionParallel(w, path, throttle, len(names), threads,
+	err = writeFieldSectionParallel(w, spill, throttle, len(names), threads,
 		func(fw *fileWriter, i int) {
 			writeFieldPresence(fw, partsFor(parts, names[i], empty), scratch[names[i]].out)
 		},
@@ -608,57 +726,47 @@ func writeSegmentParts(path string, numDocs, flags uint32, names []string, parts
 			}
 		})
 	if err != nil {
-		return Meta{}, err
+		return err
 	}
 	w.endSection()
 
-	w.beginSection(sectionStored)
-	storedIndexOff, err := writeStored(w, stored, threads)
-	if err != nil {
-		return Meta{}, err
-	}
-	w.endSection()
+	var storedIndexOff uint64
+	if img.stored != nil {
+		w.beginSection(sectionStored)
+		storedIndexOff, err = writeStored(w, img.stored, threads)
+		if err != nil {
+			return err
+		}
+		w.endSection()
 
-	w.beginSection(sectionIDs)
-	if err := writeIDs(w, ids); err != nil {
-		return Meta{}, err
+		w.beginSection(sectionIDs)
+		if err := writeIDs(w, img.ids); err != nil {
+			return err
+		}
+		w.endSection()
 	}
-	w.endSection()
+
+	if len(xyNames) > 0 {
+		if err := writeXYSection(w, spill, throttle, numDocs, xyNames, parts, threads); err != nil {
+			return err
+		}
+	}
+	if len(img.nested) > 0 {
+		if err := writeNestedSection(w, spill, throttle, img, threads); err != nil {
+			return err
+		}
+	}
 
 	w.beginSection(sectionMeta)
 	outs := make(map[string]*fieldOutput, len(names))
 	for _, name := range names {
 		outs[name] = scratch[name].out
 	}
-	writeMeta(w, numDocs, flags, storedIndexOff, names, outs)
+	writeMeta(w, numDocs, img.flags, storedIndexOff, names, outs)
 	w.endSection()
 
 	w.footer()
-	if w.err != nil {
-		return Meta{}, w.err
-	}
-	if syncFile {
-		if err := SyncFile(f); err != nil {
-			return Meta{}, err
-		}
-	}
-	if err := f.Close(); err != nil {
-		return Meta{}, err
-	}
-	ok = true
-	if err := os.Rename(tmp, path); err != nil {
-		return Meta{}, err
-	}
-	// The rename is only durable once the directory entry itself is fsynced: without
-	// this, a crash can leave the directory pointing at the old file (or nothing),
-	// even though the new file's own bytes were already fsynced above. A caller that
-	// syncs the directory itself, once for many files, skips this one.
-	if syncDir {
-		if err := SyncDir(filepath.Dir(path)); err != nil {
-			return Meta{}, err
-		}
-	}
-	return Meta{Path: path, NumDocs: numDocs}, nil
+	return w.err
 }
 
 // throttledWriter calls throttle before each write to w, failing the write with its
@@ -673,4 +781,54 @@ func (t throttledWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	return t.w.Write(p)
+}
+
+// pointFieldNames returns the names (sorted, as names is) of the fields some part holds
+// points of.
+func pointFieldNames(names []string, parts []map[string]*fieldBuilder) []string {
+	var out []string
+	for _, name := range names {
+		for _, m := range parts {
+			if b, ok := m[name]; ok && len(b.xy) > 0 {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// writeXYSection writes the XY section: each of names' tree, from every part's points
+// in canonical order, then the directory and its offset. A part's points are dropped
+// once its field's tree is built.
+func writeXYSection(w *fileWriter, path string, throttle func(n int) error, numDocs uint32, names []string, parts []map[string]*fieldBuilder, threads int) error {
+	w.beginSection(sectionXY)
+	start := w.off
+	offs := make([]uint64, len(names))
+	err := writeFieldSectionParallel(w, path, throttle, len(names), threads,
+		func(fw *fileWriter, i int) {
+			var pts []xyPoint
+			for _, m := range parts {
+				if b, ok := m[names[i]]; ok {
+					pts = append(pts, b.xy...)
+					b.xy = nil
+				}
+			}
+			writeXYTree(fw, numDocs, canonicalXY(pts))
+		},
+		func(i int, base uint64) { offs[i] = base })
+	if err != nil {
+		return err
+	}
+	var e encoder
+	e.u32(uint32(len(names))) //nolint:gosec // a segment holds far fewer than 4 billion fields
+	for i, name := range names {
+		e.bytes([]byte(name))
+		e.u64(offs[i])
+	}
+	dirOff := w.off - start
+	w.write(e.b)
+	w.u64(dirOff)
+	w.endSection()
+	return w.err
 }

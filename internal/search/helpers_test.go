@@ -50,13 +50,23 @@ func longMode() bool {
 }
 
 var testMapping = &schema.Mapping{Fields: map[string]schema.FieldType{
-	"title":   schema.Text,
-	"brand":   schema.Keyword,
-	"tags":    schema.KeywordList,
-	"price":   schema.Number,
-	"created": schema.Date,
-	"active":  schema.Bool,
-	"desc":    schema.Text,
+	"title":    schema.Text,
+	"brand":    schema.Keyword,
+	"tags":     schema.KeywordList,
+	"price":    schema.Number,
+	"created":  schema.Date,
+	"active":   schema.Bool,
+	"desc":     schema.Text,
+	"spot":     schema.PointType(schema.Number, schema.Number),
+	"when":     schema.PointType(schema.Date, schema.Number),
+	"_v":       schema.Nested,
+	"_v._key":  schema.Keyword,
+	"_v.size":  schema.Keyword,
+	"_v.color": schema.Text,
+	"_v.price": schema.Number,
+	"_v.stock": schema.Bool,
+	"_v.tags":  schema.KeywordList,
+	"_v.at":    schema.Date,
 }}
 
 var quiet = slog.New(slog.DiscardHandler)
@@ -89,8 +99,23 @@ func newCluster(t testing.TB, n int) *cluster {
 		for _, s := range c.shards {
 			_ = s.Close(context.Background())
 		}
+		waitOrdsIdle(t)
 	})
 	return c
+}
+
+// waitOrdsIdle waits until no global ordinals build runs: a build holds its
+// generation's segments mapped, which Windows will not let a test's directory be
+// removed under. A closed shard cancels its builds.
+func waitOrdsIdle(t testing.TB) {
+	t.Helper()
+	for deadline := time.Now().Add(30 * time.Second); ordsBuilding.Load() > 0; {
+		if time.Now().After(deadline) {
+			t.Errorf("%d global ordinals builds still running", ordsBuilding.Load())
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (c *cluster) route(id string) int {
@@ -175,7 +200,7 @@ func (c *cluster) search(r *Request) (*Response, error) {
 		}
 		parts = append(parts, res)
 	}
-	return Reduce(parts, r), nil
+	return Reduce(context.Background(), parts, r), nil
 }
 
 // brute returns the visible documents q matches, in r's order.
@@ -377,11 +402,69 @@ func randomDoc(rng *rand.Rand) string {
 	if rng.IntN(10) == 0 {
 		add("blob", pick(rng, []string{"{}", "[]", `{"a":[1]}`}))
 	}
+	if rng.IntN(3) > 0 {
+		add("spot", randomPoints(rng, func() string { return strconv.Itoa(rng.IntN(12)) }))
+	}
+	if rng.IntN(3) > 0 {
+		add("when", randomPoints(rng, func() string {
+			ms := 1_700_000_000_000 + rng.Int64N(20)*86_400_000
+			if rng.IntN(4) == 0 {
+				return jsonString(time.UnixMilli(ms).UTC().Format(time.RFC3339))
+			}
+			return strconv.FormatInt(ms, 10)
+		}))
+	}
 	rng.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
 	return "{" + strings.Join(members, ",") + "}"
 }
 
-var queryFields = []string{"title", "brand", "tags", "price", "created", "active", "desc", "_id", "blob", "nope"}
+var queryFields = []string{"title", "brand", "tags", "price", "created", "active", "desc", "spot", "when", "_id", "blob", "nope"}
+
+// randomPoints is a point field's value: a list of up to five pairs of x (from x) and a
+// small y, or one pair, now and then a pair or a value that is no point.
+func randomPoints(rng *rand.Rand, x func() string) string {
+	pair := func() string {
+		if rng.IntN(20) == 0 {
+			return pick(rng, []string{`["a",1]`, `[1]`, `[1,2,3]`, `[1e400,1]`, `null`})
+		}
+		return "[" + x() + "," + strconv.Itoa(rng.IntN(12)) + "]"
+	}
+	switch rng.IntN(12) {
+	case 0:
+		return pick(rng, []string{`"here"`, `[]`, `7`, `{"x":1}`})
+	case 1, 2:
+		return pair()
+	}
+	parts := make([]string, rng.IntN(6))
+	for i := range parts {
+		parts[i] = pair()
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// randomBox is a box value over small coordinates (x as given): each axis left out or
+// bounded on one side or both, each end open or closed.
+func randomBox(rng *rand.Rand, x func() string) string {
+	axis := func(bound func() string) string {
+		var ends []string
+		if rng.IntN(3) > 0 {
+			ends = append(ends, fmt.Sprintf("%q:%s", pick(rng, []string{"gt", "gte"}), bound()))
+		}
+		if rng.IntN(3) > 0 || len(ends) == 0 {
+			ends = append(ends, fmt.Sprintf("%q:%s", pick(rng, []string{"lt", "lte"}), bound()))
+		}
+		rng.Shuffle(len(ends), func(i, j int) { ends[i], ends[j] = ends[j], ends[i] })
+		return "{" + strings.Join(ends, ",") + "}"
+	}
+	var axes []string
+	if rng.IntN(4) > 0 {
+		axes = append(axes, `"x":`+axis(x))
+	}
+	if rng.IntN(4) > 0 {
+		axes = append(axes, `"y":`+axis(func() string { return strconv.Itoa(rng.IntN(13) - 1) }))
+	}
+	return "{" + strings.Join(axes, ",") + "}"
+}
 
 // randomValue returns a JSON value for op: mostly the shape it takes, sometimes not.
 func randomValue(rng *rand.Rand, op string) string {
@@ -458,6 +541,13 @@ func randomValue(rng *rand.Rand, op string) string {
 	case query.OpSimilar:
 		return fmt.Sprintf(`{"text":%s,"min":%s}`, jsonString(phrase(rng, 1+rng.IntN(2))),
 			pick(rng, []string{"0.1", "0.3", "0.5", "0.8", "1"}))
+	case query.OpBox:
+		if rng.IntN(2) == 0 {
+			return randomBox(rng, func() string { return strconv.Itoa(rng.IntN(13) - 1) })
+		}
+		return randomBox(rng, func() string {
+			return strconv.FormatInt(1_700_000_000_000+rng.Int64N(22)*86_400_000-86_400_000, 10)
+		})
 	}
 	return "null"
 }
@@ -534,4 +624,12 @@ var sortChoices = [][]SortField{
 
 func floatEq(a, b float64) bool {
 	return a == b || math.Abs(a-b) <= 1e-9*math.Max(math.Abs(a), math.Abs(b))
+}
+
+// reset forgets every count, for tests that need a leaf unseen.
+func (u *usageSketch) reset() {
+	for i := range u.slots {
+		u.slots[i].count.Store(0)
+		u.slots[i].last.Store(0)
+	}
 }

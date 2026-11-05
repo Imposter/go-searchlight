@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/config"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 )
@@ -47,9 +48,31 @@ const (
 	TrackTotalNone = -2
 	// MaxSize is the most hits one request returns.
 	MaxSize = 10_000
-	// MaxBuckets bounds the buckets of one response (Elasticsearch's search.max_buckets).
-	// A histogram's empty buckets are filled in only while the total stays under it.
+	// MaxResultWindow is the largest From+Size any node takes (its max_result_window,
+	// 10,000 by default as Elasticsearch's index.max_result_window, is at most this):
+	// each shard keeps that many hits of a search in memory, and the coordinator
+	// merges them all.
+	MaxResultWindow = config.MaxResultWindowLimit
+	// DefaultSize is the size ParseRequest gives a request that names none, as
+	// Elasticsearch's.
+	DefaultSize = 10
+	// MaxSortKeys is the most sort keys one request takes: each field once, and none
+	// after _id.
+	MaxSortKeys = 16
+	// MaxBuckets bounds the buckets of one response, every aggregation's together
+	// (Elasticsearch's search.max_buckets). A shard whose partial passes it refuses the
+	// search (a terms aggregation counting its size, not its shard_size over-fetch); shards that pass it only once merged are cut, in aggregation name order,
+	// each aggregation cut marked truncated. A histogram's empty buckets are filled in
+	// only while the response stays within it; one left unfilled is marked truncated.
 	MaxBuckets = 65_536
+	// MaxAggs is the most aggregations one request holds, sub-aggregations included.
+	MaxAggs = 100
+	// MaxRanges is the most ranges one range aggregation holds.
+	MaxRanges = 100
+	// MaxFilters is the most filters one filters aggregation holds.
+	MaxFilters = 100
+	// MaxFields is the most names Request.Fields holds.
+	MaxFields = 100
 	// DefaultTermsSize is a terms aggregation's bucket count when Size is 0.
 	DefaultTermsSize = 10
 	// DefaultPrecision is a cardinality aggregation's HyperLogLog++ precision when
@@ -58,7 +81,41 @@ const (
 	// MinPrecision and MaxPrecision bound a cardinality aggregation's precision.
 	MinPrecision = 4
 	MaxPrecision = 18
+	// MaxThreshold is the largest threshold a cardinality aggregation takes.
+	MaxThreshold = 65_536
+	// MaxTermsOrder is the most keys a terms aggregation's order holds.
+	MaxTermsOrder = 8
+	// OrderedShardSize is a terms aggregation's shard_size when ShardSize is 0 and its
+	// order bounds no error (by a sub-aggregation, or _count ascending): each shard
+	// returns that many terms, so the answer is exact while no shard holds more
+	// distinct values (see Agg.Order).
+	OrderedShardSize = 10_000
+	// MaxTopMetricsSize is the largest size a top_metrics aggregation takes
+	// (Elasticsearch's index.top_metrics_max_size), and MaxTopMetrics the most metrics
+	// it reads.
+	MaxTopMetricsSize = 10
+	MaxTopMetrics     = 10
+	// DefaultCompositeSize is a composite aggregation's page of buckets when Size is 0,
+	// MaxCompositeSize its largest page, and MaxCompositeSources the most sources it
+	// keys its buckets by.
+	DefaultCompositeSize = 10
+	MaxCompositeSize     = 10_000
+	MaxCompositeSources  = 10
+	// DefaultCompression is a percentiles or percentile_ranks aggregation's t-digest
+	// compression when Compression is 0, as Elasticsearch's: exact up to 100 distinct
+	// values, and about 100 centroids past them.
+	DefaultCompression = 100
+	// MinCompression and MaxCompression bound a t-digest's compression.
+	MinCompression = 10
+	MaxCompression = 1_000
+	// MaxPercents is the most percents a percentiles aggregation, or values a
+	// percentile_ranks aggregation, holds.
+	MaxPercents = 100
 )
+
+// DefaultPercents are a percentiles aggregation's percents when it names none, as
+// Elasticsearch's.
+var DefaultPercents = []float64{1, 5, 25, 50, 75, 95, 99}
 
 // IDField is the pseudo-field of the document id. Sorting on it sorts by the exact id;
 // querying it compares the id normalized, as a keyword.
@@ -72,7 +129,51 @@ const (
 	AggDateHistogram = "date_histogram"
 	AggStats         = "stats"
 	AggCardinality   = "cardinality"
+	AggMin           = "min"
+	AggMax           = "max"
+	AggPercentiles   = "percentiles"
+	// AggPercentileRanks is percentiles' inverse: for each of its values, the percent
+	// of values below it, plus half those equal to it.
+	AggPercentileRanks = "percentile_ranks"
+	AggFilter          = "filter"
+	AggFilters         = "filters"
+	AggGlobal          = "global"
+	AggTopMetrics      = "top_metrics"
+	AggComposite       = "composite"
 )
+
+// aggTypeList names the aggregation types, for problems.
+const aggTypeList = "terms, range, histogram, date_histogram, composite, stats, cardinality, min, max, percentiles, percentile_ranks, top_metrics, filter, filters or global"
+
+// The collect modes of a terms aggregation with sub-aggregations (Agg.CollectMode).
+const (
+	// CollectDepthFirst collects the sub-aggregations of every term as the documents
+	// are read, whether or not the term makes the shard's cut.
+	CollectDepthFirst = "depth_first"
+	// CollectBreadthFirst counts the terms first, cuts the shard's list, then reads
+	// the hits again for the sub-aggregations of the terms kept alone.
+	CollectBreadthFirst = "breadth_first"
+)
+
+// metricType reports whether typ is a metric aggregation: stats, cardinality, min, max,
+// percentiles, percentile_ranks or top_metrics, which a bucket aggregation holds as
+// sub-aggregations.
+func metricType(typ string) bool {
+	return typ == AggStats || typ == AggCardinality || typ == AggMin || typ == AggMax || percentileType(typ) || typ == AggTopMetrics
+}
+
+// percentileType reports whether typ is percentiles or percentile_ranks, which read
+// one t-digest.
+func percentileType(typ string) bool {
+	return typ == AggPercentiles || typ == AggPercentileRanks
+}
+
+// singleBucket reports whether typ is a filter, filters or global aggregation: buckets
+// of documents chosen by query (or every live document), each holding the aggregations
+// under it as the search holds its top-level ones.
+func singleBucket(typ string) bool {
+	return typ == AggFilter || typ == AggFilters || typ == AggGlobal
+}
 
 // Request is one search (spec section 5).
 type Request struct {
@@ -86,6 +187,13 @@ type Request struct {
 	// Size is how many hits to return, at most MaxSize; 0 returns none (a count, or
 	// aggregations only).
 	Size int
+	// From skips that many hits in sort order, as Elasticsearch's from does: each
+	// shard finds its best From+Size, the reduce merges them and drops the first From,
+	// and only the page's bodies are read. From+Size is at most MaxResultWindow (the
+	// API holds it to the node's max_result_window); a deeper walk pages with
+	// SearchAfter, and From must then be 0. Aggregations count every hit whatever
+	// From is.
+	From int
 	// SearchAfter resumes after a hit: pass the previous page's Response.Next (the
 	// last hit's Sort). Each page runs on the generation current when it runs, so
 	// paging under concurrent writes is stable in this sense: a document that is
@@ -101,6 +209,10 @@ type Request struct {
 	TrackTotal int
 	// Aggs are the aggregations to compute over every matching document, by name.
 	Aggs map[string]Agg
+	// PostFilter, when set, narrows the hits once the aggregations are computed: Hits,
+	// Total, the sort, SearchAfter paging and Next are those of the documents Query and
+	// PostFilter both match, while every aggregation but global counts Query's alone.
+	PostFilter query.Node
 	// Fields, when set, limits each hit's body to these top-level members.
 	Fields []string
 	// Timeout bounds the search; past it the shards answer with what they have,
@@ -108,9 +220,35 @@ type Request struct {
 	Timeout time.Duration
 	// Index labels the search's spans, logs and metrics.
 	Index string
+	// SeqNo gives each hit its Seq, as Elasticsearch's seq_no_primary_term gives
+	// _seq_no: the seq of the change that wrote the version a copy holds.
+	SeqNo bool
 	// NoBodies leaves the hits' bodies out (each keeps its Ref): the query phase of a
 	// query-then-fetch, whose fetch phase is [FetchShard].
 	NoBodies bool
+	// NoRequestCache keeps the search out of the shard request cache
+	// ([RequestCache]), as Elasticsearch's request_cache: false does: each shard
+	// computes its result, and stores none. Only searches with Size 0 (and no From or
+	// SearchAfter) are cached in any case; [ResolveQueries] sets it for date math
+	// that reads now unrounded.
+	NoRequestCache bool
+	// MaxStaleness lets a cacheable search (size 0) be answered from the shard request
+	// cache with a result its copy computed up to this long ago, the copy's writes since
+	// unseen ([RequestCache]), rather than only with one of what the copy holds now. 0
+	// asks for a current result; at most MaxStalenessLimit.
+	MaxStaleness time.Duration
+	// Nested is set by [ValidateQueries] when the request reads a nested field's
+	// objects: a nested node in a query, or an aggregation or sort on a sub-field. A
+	// peer answers such a request only from the release that reads them.
+	Nested bool `json:"-"`
+	// NestedSubAggs is set by [ValidateQueries] when a terms aggregation on a
+	// sub-field holds sub-aggregations, which a peer answers only from the release
+	// that collects them.
+	NestedSubAggs bool `json:"-"`
+
+	// aggsKey is the key the body gave Aggs under, "aggs" or "aggregations", for locs
+	// ("" reads as aggs).
+	aggsKey string
 
 	// serial identifies a parsed request for the filter cache's admission (0: not
 	// parsed here; its address stands in).
@@ -121,19 +259,47 @@ type Request struct {
 var requestSerials atomic.Uint64
 
 // SortField is one sort key: a field (or IDField), ascending unless Desc.
+//
+// A nested field's sub-field sorts each document by the least (Mode SortModeMin) or
+// greatest (SortModeMax) value among its objects, of those Where (an inner query of
+// the field, [query.ValidateInner]) matches when set: Mode defaults to min ascending,
+// max descending, as Elasticsearch's. A document with no such value sorts after every
+// one with one.
 type SortField struct {
 	Field string
 	Desc  bool
+	Mode  string     `json:",omitempty"`
+	Where query.Node `json:"-"`
 }
 
+// The modes of a sort on a sub-field (SortField.Mode).
+const (
+	SortModeMin = "min"
+	SortModeMax = "max"
+)
+
 // Agg is one aggregation. Bucket aggregations (terms, range, histogram,
-// date_histogram) may hold metric sub-aggregations (stats, cardinality) in Aggs, one
-// level deep.
+// date_histogram, composite) may hold metric sub-aggregations (stats, cardinality,
+// min, max, percentiles, percentile_ranks, top_metrics) in Aggs, one level deep. A filter, filters or global aggregation (global only at the top level)
+// holds any other aggregation in Aggs, each with its own metric sub-aggregations: its
+// buckets are sets of documents, which the aggregations under it count as top-level
+// ones count the search's matches.
 //
 // Text values aggregate as they are indexed and compared: normalized (casefolded,
 // whitespace folded). That includes the _id field, a normalized keyword for queries
 // and aggregations alike (the parity rules), so terms and cardinality over _id count
 // ids that differ only in case as one; sorting by _id, by contrast, uses the exact id.
+//
+// A nested field's sub-field (_v.size) is aggregated by terms, stats, min, max,
+// cardinality, percentiles and percentile_ranks alone, at the top level or under filter, filters and global: over the
+// objects of the hits that Where chooses. terms counts each document once per value,
+// however many of its objects hold it; the metrics read every chosen object's value.
+// A terms on a sub-field holds metric and terms sub-aggregations (those terms holding
+// none): one on a top-level field reads the bucket's documents, each once; one on a
+// sub-field of the same nested field reads the bucket's objects, the chosen ones
+// holding its value that its own Where chooses. No shard cuts a terms
+// sub-aggregation there (its buckets count towards MaxBuckets as they are collected),
+// and the outer bucket's error bound bounds what it misses.
 type Agg struct {
 	// Type is one of the Agg* constants.
 	Type  string
@@ -141,13 +307,44 @@ type Agg struct {
 
 	// Size is how many terms buckets to return: DefaultTermsSize when 0.
 	Size int
-	// ShardSize is how many terms buckets each shard returns: Size*3/2+10 when 0.
-	// More is more exact across shards (see Response.Aggs).
+	// ShardSize is how many terms buckets each shard returns: Size*3/2+10 when 0,
+	// at least Size and at most MaxBuckets. More is more exact across shards (see
+	// Response.Aggs).
 	ShardSize int
 	// MinDocCount drops buckets with fewer documents. terms defaults to 1 (and takes
 	// at least 1); histograms default to 0, which fills the empty buckets between the
 	// first and the last.
 	MinDocCount *int
+	// Include and Exclude choose a terms aggregation's values (exclude wins), before
+	// any shard cuts its list: see [TermsFilter]. Nil includes every value and
+	// excludes none.
+	Include *TermsFilter `json:",omitempty"`
+	Exclude *TermsFilter `json:",omitempty"`
+	// CollectMode is how a terms aggregation collects its sub-aggregations,
+	// CollectDepthFirst or CollectBreadthFirst. Empty chooses per segment: breadth
+	// first when the segment's field holds more distinct values than ShardSize, so
+	// that most of them would be collected for buckets the shard then drops; depth
+	// first otherwise. Either answers the same; only the cost differs.
+	CollectMode string `json:",omitempty"`
+	// Order orders a terms aggregation's buckets key by key, as Elasticsearch's order
+	// does: by _count, by _key, or by a metric sub-aggregation's value. Empty is
+	// _count descending; _key ascending breaks whatever ties are left. See
+	// [TermsOrder] for what each order costs and how exact it is across shards.
+	Order []TermsOrder `json:",omitempty"`
+
+	// Metrics are a top_metrics aggregation's fields (at most MaxTopMetrics), read
+	// from its Size documents (1 when 0, at most MaxTopMetricsSize) first by TopSort,
+	// one number or date field; equal sort values go to the least _id.
+	Metrics []string   `json:",omitempty"`
+	TopSort *SortField `json:",omitempty"`
+
+	// Sources are a composite aggregation's keys, in order (at most
+	// MaxCompositeSources): each bucket is one combination of their values, the
+	// buckets ordered by them, Size per page (DefaultCompositeSize when 0, at most
+	// MaxCompositeSize). After, the previous page's after_key by source name, starts
+	// the page after that bucket. See [CompositeSource].
+	Sources []CompositeSource `json:",omitempty"`
+	After   map[string]any    `json:",omitempty"`
 
 	// Ranges are a range aggregation's buckets: From inclusive, To exclusive, either
 	// open when nil.
@@ -165,9 +362,51 @@ type Agg struct {
 	// to MaxPrecision): DefaultPrecision when 0. Counts are exact while fewer than
 	// 2^(Precision-2) distinct values are seen.
 	Precision int
+	// Threshold (1 to MaxThreshold), when set, makes a cardinality aggregation exact
+	// up to it: its value is the number of distinct values when there are fewer than
+	// Threshold, else Threshold ("are there at least two?"). Each segment stops
+	// counting once it has seen Threshold values, and so do the shard's others. It is
+	// not Elasticsearch's precision_threshold, and takes no Precision.
+	Threshold int `json:",omitempty"`
+
+	// Percents are a percentiles aggregation's percentiles, each from 0 to 100, at most
+	// MaxPercents and none twice: DefaultPercents when empty. Values are a
+	// percentile_ranks aggregation's values (at least one, at most MaxPercents, none
+	// twice), each answered with the percent of values below it plus half those equal
+	// to it. Either answers in ascending order.
+	Percents []float64 `json:",omitempty"`
+	Values   []float64 `json:",omitempty"`
+	// Compression is their t-digest's compression (MinCompression to MaxCompression):
+	// DefaultCompression when 0. The digest is exact while the values it collects hold
+	// at most Compression distinct values (rounded up), and approximate past them,
+	// sharpest at the extreme percentiles; a larger compression is more exact and
+	// costs more memory and wire (about 16 bytes a centroid).
+	Compression float64 `json:",omitempty"`
+	// Unkeyed writes a percentiles or percentile_ranks result as a list of
+	// {"key", "value"} rather than an object by key (Elasticsearch's keyed: false).
+	Unkeyed bool `json:",omitempty"`
+
+	// Where, on an aggregation of a nested field's sub-field (terms, stats, min, max,
+	// cardinality, percentiles or percentile_ranks), chooses the objects it collects: an inner query of the field
+	// ([query.ValidateInner]); every object of the hits when nil. Its owner encodes it
+	// on the wire.
+	Where query.Node `json:"-"`
+
+	// Filter is a filter aggregation's query: its one bucket holds the documents both
+	// the search's query and Filter match. Its owner encodes it (as query DSL) on the
+	// wire.
+	Filter query.Node `json:"-"`
+	// Filters are a filters aggregation's queries by bucket key (at most MaxFilters),
+	// each bucket a filter aggregation's. Its owner encodes them on the wire.
+	Filters map[string]query.Node `json:"-"`
+	// OtherBucketKey, when set, gives a filters aggregation one more bucket, by that
+	// key: the documents the search's query matches and no filter does.
+	OtherBucketKey string
 
 	// Aggs are the sub-aggregations computed per bucket.
 	Aggs map[string]Agg
+	// aggsKey is the key the body gave Aggs under, as Request.aggsKey.
+	aggsKey string
 }
 
 // Range is one bucket of a range aggregation.
@@ -197,17 +436,35 @@ func (ps *problems) add(loc, format string, args ...any) {
 	*ps = append(*ps, query.Problem{Loc: loc, Message: fmt.Sprintf(format, args...)})
 }
 
-// ParseRequest reads a search request body: {query, sort, size, search_after,
-// track_total, aggs, fields, timeout}, Elasticsearch style:
+// ParseRequest reads a search request body: {query, post_filter, sort, size, from,
+// search_after, track_total, aggs, fields, seq_no, timeout, request_cache}, Elasticsearch
+// style:
 //
 //   - sort: ["price", {"price": "desc"}, {"price": {"order": "desc"}}];
+//   - from: how many hits to skip, 0 with search_after (from+size is at most
+//     MaxResultWindow here; the API holds it to max_result_window);
 //   - track_total: true (exact) or a count;
-//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}};
-//   - timeout: "250ms" (any Go duration, or d for days) or milliseconds.
+//   - aggs: {"name": {"terms": {"field": "brand", "size": 10}, "aggs": {...}}}
+//     (terms also takes include and exclude, an array of values or a pattern,
+//     collect_mode, and order: {"_count"|"_key"|"<sub-aggregation>": "asc"|"desc"} or a
+//     list of them; percentiles takes percents, keyed and tdigest.compression, and
+//     percentile_ranks values, keyed and tdigest.compression), {"name": {"top_metrics":
+//     {"metrics": [{"field": f}], "sort": {f: "desc"}, "size": 1}}}, {"name":
+//     {"composite": {"sources": [{"name": {"terms": {"field": f}}}], "size": 10,
+//     "after": {...}}, "aggs": {...}}}, or
+//     {"name": {"filter": query}}, {"name": {"filters": {"filters": {"key": query},
+//     "other_bucket_key": "other"}}} and {"name": {"global": {}}}, each with "aggs";
+//   - timeout: "250ms" (any Go duration, or d for days) or milliseconds;
+//   - request_cache: false keeps a size-0 search out of the shard request cache;
+//   - seq_no: true gives each hit the seq of the change that wrote it.
 //
-// A missing query matches every document. It returns every problem found, each with
-// its loc ("sort.1", "aggs.by_brand.terms.size"); the query's are [query.Parse]'s.
-// Fields, sort and aggregation types are checked against the mapping by ExecuteShard.
+// A missing query matches every document, and a missing size is DefaultSize. It
+// returns every problem found, each with its loc ("sort.1",
+// "aggs.by_brand.terms.size"); the query's are [query.Parse]'s, and so are
+// post_filter's and each aggregation filter's, under their own locs
+// ("post_filter.all.0.op", "aggs.brand.filter.field"). Fields, sort and aggregation
+// types are checked against the mapping by ExecuteShard, and the queries by
+// [ValidateQueries].
 func ParseRequest(raw []byte) (*Request, []query.Problem) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -215,7 +472,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 	if err := dec.Decode(&top); err != nil {
 		return nil, []query.Problem{{Loc: "body", Message: "the request is not a JSON object: " + err.Error()}}
 	}
-	r := &Request{Query: &query.All{}, serial: requestSerials.Add(1)}
+	r := &Request{Query: &query.All{}, Size: DefaultSize, serial: requestSerials.Add(1)}
 	var ps problems
 	for _, key := range slices.Sorted(maps.Keys(top)) {
 		val := top[key]
@@ -226,6 +483,8 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 			if n != nil {
 				r.Query = n
 			}
+		case "post_filter":
+			r.PostFilter = parseQueryAt(val, key, &ps)
 		case "sort":
 			r.Sort = parseSort(val, &ps)
 		case "size":
@@ -233,6 +492,12 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				r.Size = n
 			} else {
 				ps.add("size", "size is a whole number from 0 to %d", MaxSize)
+			}
+		case "from":
+			if n, ok := intOf(val); ok && n >= 0 && n <= MaxResultWindow {
+				r.From = n
+			} else {
+				ps.add("from", "from is a whole number from 0 to %d", MaxResultWindow)
 			}
 		case "search_after":
 			var after []any
@@ -265,7 +530,7 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				}
 			}
 		case "aggs", "aggregations":
-			r.Aggs = parseAggs(val, key, 0, &ps)
+			r.Aggs, r.aggsKey = parseAggs(val, key, 0, false, &ps), key
 		case "fields":
 			var fields []string
 			if err := json.Unmarshal(val, &fields); err != nil {
@@ -273,6 +538,24 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Fields = fields
+		case "seq_no":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				r.SeqNo = true
+			case "false":
+				r.SeqNo = false
+			default:
+				ps.add("seq_no", "seq_no is true or false")
+			}
+		case "request_cache":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				r.NoRequestCache = false
+			case "false":
+				r.NoRequestCache = true
+			default:
+				ps.add("request_cache", "request_cache is true or false")
+			}
 		case "timeout":
 			d, ok := parseTimeout(val)
 			if !ok {
@@ -280,9 +563,22 @@ func ParseRequest(raw []byte) (*Request, []query.Problem) {
 				continue
 			}
 			r.Timeout = d
+		case "max_staleness":
+			d, ok := ParseMaxStaleness(val)
+			if !ok {
+				ps.add("max_staleness", `max_staleness is a duration ("5s", "1m") or milliseconds, at most 1h`)
+				continue
+			}
+			r.MaxStaleness = d
 		default:
-			ps.add(key, "unknown key: a search holds query, sort, size, search_after, track_total, aggs, fields and timeout")
+			ps.add(key, "unknown key: a search holds query, post_filter, sort, size, from, search_after, track_total, aggs, fields, seq_no, timeout, request_cache and max_staleness")
 		}
+	}
+	switch {
+	case r.From > 0 && len(r.SearchAfter) > 0:
+		ps.add("from", "from must be 0 with search_after, which already starts the page after its hit")
+	case r.From > 0 && r.From+r.Size > MaxResultWindow:
+		ps.add("from", "from + size is at most %d; page deeper with search_after", MaxResultWindow)
 	}
 	if len(ps) > 0 {
 		return nil, ps
@@ -325,10 +621,11 @@ func floatOf(raw json.RawMessage) (float64, bool) {
 	return f, true
 }
 
+// parseSort reads a request's sort: a list of sort keys, or a single one, as
+// Elasticsearch also takes it.
 func parseSort(raw json.RawMessage, ps *problems) []SortField {
 	var items []json.RawMessage
 	if err := json.Unmarshal(raw, &items); err != nil {
-		// A single sort key, as Elasticsearch also takes it.
 		items = []json.RawMessage{raw}
 	}
 	out := make([]SortField, 0, len(items))
@@ -346,26 +643,33 @@ func parseSort(raw json.RawMessage, ps *problems) []SortField {
 		}
 		for field, spec := range obj {
 			var order string
+			sf := SortField{Field: field}
 			if json.Unmarshal(spec, &order) != nil {
 				var o struct {
-					Order string `json:"order"`
+					Order string          `json:"order"`
+					Mode  string          `json:"mode"`
+					Where json.RawMessage `json:"where"`
 				}
 				dec := json.NewDecoder(bytes.NewReader(spec))
 				dec.DisallowUnknownFields()
 				if dec.Decode(&o) != nil {
-					ps.add(loc+"."+field, `a sort order is "asc", "desc" or {"order": ...}`)
+					ps.add(loc+"."+field, `a sort order is "asc", "desc" or {"order": ..., "mode": "min"|"max", "where": query}`)
 					continue
 				}
-				order = o.Order
+				order, sf.Mode = o.Order, o.Mode
+				if o.Where != nil {
+					sf.Where = parseQueryAt(o.Where, loc+"."+field+".where", ps)
+				}
 			}
 			switch order {
 			case "asc", "":
-				out = append(out, SortField{Field: field})
 			case "desc":
-				out = append(out, SortField{Field: field, Desc: true})
+				sf.Desc = true
 			default:
 				ps.add(loc+"."+field, `a sort order is "asc" or "desc"`)
+				continue
 			}
+			out = append(out, sf)
 		}
 	}
 	return out
@@ -387,6 +691,16 @@ func parseTimeout(raw json.RawMessage) (time.Duration, bool) {
 	return d, ok && d >= 0
 }
 
+// MaxStalenessLimit is the longest Request.MaxStaleness.
+const MaxStalenessLimit = time.Hour
+
+// ParseMaxStaleness reads a max_staleness: a duration ("5s") or milliseconds, from 0 to
+// MaxStalenessLimit.
+func ParseMaxStaleness(raw json.RawMessage) (time.Duration, bool) {
+	d, ok := parseTimeout(raw)
+	return d, ok && d <= MaxStalenessLimit
+}
+
 // maxTimeoutMillis bounds a timeout in milliseconds: a year, far inside a Duration.
 const maxTimeoutMillis = 365 * 24 * 3600 * 1000
 
@@ -403,7 +717,10 @@ func parseDuration(s string) (time.Duration, bool) {
 	return d, err == nil
 }
 
-func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[string]Agg {
+// parseAggs reads named aggregations at loc, depth levels below the top; wrapped is
+// set under a filter, filters or global aggregation, whose children hold
+// sub-aggregations of their own one level further down.
+func parseAggs(raw json.RawMessage, loc string, depth int, wrapped bool, ps *problems) map[string]Agg {
 	var named map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &named); err != nil {
 		ps.add(loc, "aggs is an object of named aggregations")
@@ -423,21 +740,46 @@ func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[str
 		}
 		var a Agg
 		typed := 0
+		var subs json.RawMessage
+		var subsKey string
 		for _, key := range slices.Sorted(maps.Keys(body)) {
 			val := body[key]
 			switch key {
 			case "aggs", "aggregations":
-				if depth > 0 {
-					ps.add(at+"."+key, "sub-aggregations nest one level deep")
-					continue
-				}
-				a.Aggs = parseAggs(val, at+"."+key, depth+1, ps)
-			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality:
+				subs, subsKey = val, key
+			case AggTerms, AggRange, AggHistogram, AggDateHistogram, AggStats, AggCardinality, AggMin, AggMax, AggPercentiles, AggPercentileRanks:
 				typed++
 				a.Type = key
 				parseAggBody(&a, val, at+"."+key, ps)
+			case AggTopMetrics:
+				typed++
+				a.Type = key
+				parseTopMetrics(&a, val, at+"."+key, ps)
+			case AggComposite:
+				typed++
+				a.Type = key
+				parseComposite(&a, val, at+"."+key, ps)
+			case AggFilter:
+				typed++
+				a.Type = key
+				a.Filter = parseQueryAt(val, at+"."+key, ps)
+			case AggFilters:
+				typed++
+				a.Type = key
+				parseFilters(&a, val, at+"."+key, ps)
+			case AggGlobal:
+				typed++
+				a.Type = key
+				parseGlobal(val, at+"."+key, ps)
 			default:
-				ps.add(at+"."+key, "unknown aggregation type: use terms, range, histogram, date_histogram, stats or cardinality")
+				ps.add(at+"."+key, "unknown aggregation type: use "+aggTypeList)
+			}
+		}
+		if subs != nil {
+			if depth == 0 || (depth == 1 && wrapped) {
+				a.Aggs, a.aggsKey = parseAggs(subs, at+"."+subsKey, depth+1, singleBucket(a.Type), ps), subsKey
+			} else {
+				ps.add(at+"."+subsKey, "sub-aggregations nest one level deep, or two under filter, filters and global")
 			}
 		}
 		if typed != 1 {
@@ -449,6 +791,284 @@ func parseAggs(raw json.RawMessage, loc string, depth int, ps *problems) map[str
 	return out
 }
 
+// parseQueryAt reads a query given at loc (post_filter, or an aggregation's filter):
+// [query.Parse]'s tree and problems, located under loc.
+func parseQueryAt(raw json.RawMessage, loc string, ps *problems) query.Node {
+	n, qps := query.Parse(raw)
+	*ps = append(*ps, relocate(qps, loc)...)
+	return n
+}
+
+// relocate moves problems located under [query.RootLoc] to loc, in place.
+func relocate(ps []query.Problem, loc string) []query.Problem {
+	for i := range ps {
+		if rest, ok := strings.CutPrefix(ps[i].Loc, query.RootLoc); ok && (rest == "" || rest[0] == '.') {
+			ps[i].Loc = loc + rest
+		}
+	}
+	return ps
+}
+
+// parseFilters reads a filters aggregation's settings: {"filters": {key: query},
+// "other_bucket_key": key}. The anonymous form, a list of queries, is refused: every
+// bucket is keyed.
+func parseFilters(a *Agg, raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, `a filters aggregation's settings are an object: {"filters": {"key": query}, "other_bucket_key": "key"}`)
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		val := body[key]
+		at := loc + "." + key
+		switch key {
+		case "filters":
+			var named map[string]json.RawMessage
+			if err := json.Unmarshal(val, &named); err != nil {
+				ps.add(at, `filters is an object of queries by bucket key, {"key": query}; the anonymous list is not taken`)
+				continue
+			}
+			if len(named) > MaxFilters {
+				ps.add(at, "a filters aggregation holds at most %d filters", MaxFilters)
+				continue
+			}
+			a.Filters = make(map[string]query.Node, len(named))
+			for _, k := range slices.Sorted(maps.Keys(named)) {
+				if k == "" {
+					ps.add(at, "a filter needs a bucket key")
+					continue
+				}
+				a.Filters[k] = parseQueryAt(named[k], at+"."+k, ps)
+			}
+		case "other_bucket_key":
+			if json.Unmarshal(val, &a.OtherBucketKey) != nil || a.OtherBucketKey == "" {
+				ps.add(at, "other_bucket_key is a bucket key: text")
+			}
+		default:
+			ps.add(at, "unknown key: filters takes filters and other_bucket_key")
+		}
+	}
+}
+
+// parseGlobal reads a global aggregation's settings: {}, as it takes none.
+func parseGlobal(raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, "a global aggregation's settings are an empty object, {}")
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		ps.add(loc+"."+key, "unknown key: global takes no settings")
+	}
+}
+
+// ValidateQueries reports every problem with r's queries as queries of an index with
+// mapping m, as [query.Validate] finds them: the query's (at query...), post_filter's
+// (at post_filter...), each filter and filters aggregation's (at
+// aggs.<name>.filter... and aggs.<name>.filters.filters.<key>..., under the
+// aggregation that holds it), which ask for no inner hits, and as
+// [query.ValidateInner] finds them, each where of an aggregation or a sort on a nested
+// field's sub-field (at aggs.<name>.<type>.where... and sort.<i>.<field>.where...). The
+// query and post_filter give one key to one path's nodes alone, and ask for at most
+// MaxInnerHitsObjects inner hits together (InnerHitsObjects). It sets r.Nested when r
+// reads a nested field's objects, and r.NestedSubAggs when a terms aggregation on a
+// sub-field holds sub-aggregations.
+func ValidateQueries(r *Request, m *schema.Mapping) []query.Problem {
+	ps := query.Validate(r.Query, m)
+	if r.PostFilter != nil {
+		ps = append(ps, relocate(query.Validate(r.PostFilter, m), "post_filter")...)
+		ps = append(ps, sharedInnerHits(r.Query, r.PostFilter)...)
+	}
+	if n := InnerHitsObjects(r); n > MaxInnerHitsObjects {
+		ps = append(ps, query.Problem{Loc: "size", Message: fmt.Sprintf("size times the inner_hits sizes is %d: a response holds at most %d inner hit objects", n, MaxInnerHitsObjects)})
+	}
+	for i, f := range r.Sort {
+		if f.Where == nil {
+			continue
+		}
+		if path, ok := m.NestedPath(f.Field); ok {
+			ps = append(ps, relocate(query.ValidateInner(f.Where, m, path), fmt.Sprintf("sort.%d.%s.where", i, f.Field))...)
+		}
+	}
+	ps = append(ps, validateAggQueries(r.Aggs, aggsLoc(r.aggsKey), m)...)
+	r.Nested = readsNested(r, m)
+	r.NestedSubAggs = nestedSubAggs(r.Aggs, m)
+	return ps
+}
+
+// sharedInnerHits reports each nested node of post that asks for inner hits under a key
+// one of q's takes already for another path: nodes of one path share a key, and its
+// inner hits, across the query and post_filter as within either.
+func sharedInnerHits(q, post query.Node) []query.Problem {
+	keys := map[string]string{}
+	query.Walk(q, func(_ string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			if key := x.InnerHits.Key(x.Path); keys[key] == "" {
+				keys[key] = x.Path
+			}
+		}
+		return true
+	})
+	var ps []query.Problem
+	query.Walk(post, func(at string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			if path := keys[x.InnerHits.Key(x.Path)]; path != "" && path != x.Path {
+				ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: fmt.Sprintf("the query's inner_hits %q are nested field %q's: nodes share inner hits by name on one path alone (name these otherwise)", x.InnerHits.Key(x.Path), path)})
+			}
+		}
+		return true
+	})
+	return relocate(ps, "post_filter")
+}
+
+// readsNested reports whether r reads a nested field's objects under m: a nested node
+// in any of its queries, or an aggregation or a sort on a sub-field.
+func readsNested(r *Request, m *schema.Mapping) bool {
+	if hasNestedNode(r.Query) || hasNestedNode(r.PostFilter) {
+		return true
+	}
+	for _, f := range r.Sort {
+		if _, ok := m.NestedPath(f.Field); ok {
+			return true
+		}
+	}
+	var aggs func(map[string]Agg) bool
+	aggs = func(as map[string]Agg) bool {
+		for name := range as {
+			a := as[name]
+			if _, ok := m.NestedPath(a.Field); ok || hasNestedNode(a.Filter) || aggs(a.Aggs) {
+				return true
+			}
+			for _, f := range a.Filters {
+				if hasNestedNode(f) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return aggs(r.Aggs)
+}
+
+// hasNestedNode reports whether n holds a nested node.
+func hasNestedNode(n query.Node) bool {
+	found := false
+	if n != nil {
+		query.Walk(n, func(_ string, node query.Node) bool {
+			_, found = node.(*query.Nested)
+			return !found
+		})
+	}
+	return found
+}
+
+// noInnerHits reports each nested node of n, a query with no hits of its own (an
+// aggregation's filter), that asks for inner hits, at its loc under loc.
+func noInnerHits(n query.Node, loc string) []query.Problem {
+	var ps []query.Problem
+	if n == nil {
+		return nil
+	}
+	query.Walk(n, func(at string, node query.Node) bool {
+		if x, ok := node.(*query.Nested); ok && x.InnerHits != nil {
+			ps = append(ps, query.Problem{Loc: at + ".nested.inner_hits", Message: "inner_hits show a hit's objects: an aggregation's filter has no hits"})
+		}
+		return true
+	})
+	return relocate(ps, loc)
+}
+
+// ResolveQueries resolves the date math of r's queries at now, as [query.Resolve]
+// does: the query, post_filter, each filter and filters aggregation's and each where of
+// an aggregation or a sort, replaced in r (the aggregation maps and the sort are copied,
+// never changed). Problems are located as ValidateQueries locates them. The
+// coordinator calls it once per request, so every shard and peer reads the same
+// instant. Date math that reads now with no rounding (now-7d, not now-7d/d) turns r's
+// request cache off (NoRequestCache): it resolves to another instant every
+// millisecond.
+func ResolveQueries(r *Request, now time.Time) []query.Problem {
+	if readsNowUnrounded(r) {
+		r.NoRequestCache = true
+	}
+	var ps []query.Problem
+	r.Query, ps = query.Resolve(r.Query, now)
+	if r.PostFilter != nil {
+		var more []query.Problem
+		r.PostFilter, more = query.Resolve(r.PostFilter, now)
+		ps = append(ps, relocate(more, "post_filter")...)
+	}
+	if slices.ContainsFunc(r.Sort, func(f SortField) bool { return f.Where != nil }) {
+		sorts := slices.Clone(r.Sort)
+		for i := range sorts {
+			if sorts[i].Where != nil {
+				var more []query.Problem
+				sorts[i].Where, more = query.Resolve(sorts[i].Where, now)
+				ps = append(ps, relocate(more, fmt.Sprintf("sort.%d.%s.where", i, sorts[i].Field))...)
+			}
+		}
+		r.Sort = sorts
+	}
+	var more []query.Problem
+	r.Aggs, more = resolveAggQueries(r.Aggs, aggsLoc(r.aggsKey), now)
+	return append(ps, more...)
+}
+
+func resolveAggQueries(aggs map[string]Agg, loc string, now time.Time) (map[string]Agg, []query.Problem) {
+	if aggs == nil {
+		return nil, nil
+	}
+	var ps []query.Problem
+	out := make(map[string]Agg, len(aggs))
+	for _, name := range slices.Sorted(maps.Keys(aggs)) {
+		a := aggs[name]
+		at := loc + "." + name
+		var more []query.Problem
+		switch a.Type {
+		case AggFilter:
+			a.Filter, more = query.Resolve(a.Filter, now)
+			ps = append(ps, relocate(more, at+"."+AggFilter)...)
+		case AggFilters:
+			filters := make(map[string]query.Node, len(a.Filters))
+			for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
+				filters[key], more = query.Resolve(a.Filters[key], now)
+				ps = append(ps, relocate(more, at+".filters.filters."+key)...)
+			}
+			a.Filters = filters
+		}
+		if a.Where != nil {
+			a.Where, more = query.Resolve(a.Where, now)
+			ps = append(ps, relocate(more, at+"."+a.Type+".where")...)
+		}
+		a.Aggs, more = resolveAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), now)
+		ps = append(ps, more...)
+		out[name] = a
+	}
+	return out, ps
+}
+
+func validateAggQueries(aggs map[string]Agg, loc string, m *schema.Mapping) []query.Problem {
+	var ps []query.Problem
+	for _, name := range slices.Sorted(maps.Keys(aggs)) {
+		a := aggs[name]
+		at := loc + "." + name
+		switch a.Type {
+		case AggFilter:
+			ps = append(ps, relocate(query.Validate(a.Filter, m), at+"."+AggFilter)...)
+			ps = append(ps, noInnerHits(a.Filter, at+"."+AggFilter)...)
+		case AggFilters:
+			for _, key := range slices.Sorted(maps.Keys(a.Filters)) {
+				ps = append(ps, relocate(query.Validate(a.Filters[key], m), at+".filters.filters."+key)...)
+				ps = append(ps, noInnerHits(a.Filters[key], at+".filters.filters."+key)...)
+			}
+		}
+		if path, ok := m.NestedPath(a.Field); ok && a.Where != nil {
+			ps = append(ps, relocate(query.ValidateInner(a.Where, m, path), at+"."+a.Type+".where")...)
+		}
+		ps = append(ps, validateAggQueries(a.Aggs, at+"."+aggsLoc(a.aggsKey), m)...)
+	}
+	return ps
+}
+
 func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 	var body map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -456,12 +1076,16 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 		return
 	}
 	allowed := map[string][]string{
-		AggTerms:         {"field", "size", "shard_size", "min_doc_count"},
-		AggRange:         {"field", "ranges"},
-		AggHistogram:     {"field", "interval", "offset", "min_doc_count"},
-		AggDateHistogram: {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
-		AggStats:         {"field"},
-		AggCardinality:   {"field", "precision"},
+		AggTerms:           {"field", "size", "shard_size", "min_doc_count", "include", "exclude", "collect_mode", "order", "where"},
+		AggRange:           {"field", "ranges"},
+		AggHistogram:       {"field", "interval", "offset", "min_doc_count"},
+		AggDateHistogram:   {"field", "fixed_interval", "calendar_interval", "interval", "offset", "min_doc_count"},
+		AggStats:           {"field", "where"},
+		AggMin:             {"field", "where"},
+		AggMax:             {"field", "where"},
+		AggCardinality:     {"field", "precision", "threshold", "where"},
+		AggPercentiles:     {"field", "percents", "keyed", "tdigest", "where"},
+		AggPercentileRanks: {"field", "values", "keyed", "tdigest", "where"},
 	}[a.Type]
 	for _, key := range slices.Sorted(maps.Keys(body)) {
 		val := body[key]
@@ -475,7 +1099,9 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 			if json.Unmarshal(val, &a.Field) != nil || a.Field == "" {
 				ps.add(at, "field is a field name")
 			}
-		case "size", "shard_size", "precision":
+		case "where":
+			a.Where = parseQueryAt(val, at, ps)
+		case "size", "shard_size", "precision", "threshold":
 			n, ok := intOf(val)
 			if !ok || n < 1 {
 				ps.add(at, "%s is a whole number of at least 1", key)
@@ -486,8 +1112,48 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 				a.Size = n
 			case "shard_size":
 				a.ShardSize = n
+			case "threshold":
+				a.Threshold = n
 			default:
 				a.Precision = n
+			}
+		case "order":
+			a.Order = parseTermsOrder(val, at, ps)
+		case "percents", "values":
+			nums, ok := floatsOf(val)
+			switch {
+			case !ok:
+				ps.add(at, "%s is a list of numbers", key)
+			case len(nums) == 0:
+				ps.add(at, "%s holds at least one number", key)
+			case key == "percents":
+				a.Percents = nums
+			default:
+				a.Values = nums
+			}
+		case "keyed":
+			switch string(bytes.TrimSpace(val)) {
+			case "true":
+				a.Unkeyed = false
+			case "false":
+				a.Unkeyed = true
+			default:
+				ps.add(at, "keyed is true or false")
+			}
+		case "tdigest":
+			parseTDigest(a, val, at, ps)
+		case "collect_mode":
+			if json.Unmarshal(val, &a.CollectMode) != nil || (a.CollectMode != CollectDepthFirst && a.CollectMode != CollectBreadthFirst) {
+				ps.add(at, "collect_mode is %q or %q", CollectDepthFirst, CollectBreadthFirst)
+			}
+		case "include", "exclude":
+			if string(bytes.TrimSpace(val)) == "null" {
+				continue
+			}
+			if key == "include" {
+				a.Include = parseTermsFilter(val, at, ps)
+			} else {
+				a.Exclude = parseTermsFilter(val, at, ps)
 			}
 		case "min_doc_count":
 			n, ok := intOf(val)
@@ -586,6 +1252,45 @@ func parseAggBody(a *Agg, raw json.RawMessage, loc string, ps *problems) {
 	}
 }
 
+// floatsOf reads a JSON list of finite numbers.
+func floatsOf(raw json.RawMessage) ([]float64, bool) {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, false
+	}
+	out := make([]float64, len(items))
+	for i, item := range items {
+		f, ok := floatOf(item)
+		if !ok {
+			return nil, false
+		}
+		out[i] = f
+	}
+	return out, true
+}
+
+// parseTDigest reads a percentiles or percentile_ranks aggregation's tdigest settings:
+// {"compression": n}.
+func parseTDigest(a *Agg, raw json.RawMessage, loc string, ps *problems) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		ps.add(loc, `tdigest is an object: {"compression": n}`)
+		return
+	}
+	for _, key := range slices.Sorted(maps.Keys(body)) {
+		if key != "compression" {
+			ps.add(loc+"."+key, "unknown key: tdigest takes compression")
+			continue
+		}
+		f, ok := floatOf(body[key])
+		if !ok || f < MinCompression || f > MaxCompression {
+			ps.add(loc+"."+key, "compression is a number from %d to %d", MinCompression, MaxCompression)
+			continue
+		}
+		a.Compression = f
+	}
+}
+
 // intervalMillis reads a fixed interval: a duration ("90m", "1d") or milliseconds.
 func intervalMillis(raw json.RawMessage) (float64, bool) {
 	if ms, ok := floatOf(raw); ok {
@@ -604,3 +1309,24 @@ func intervalMillis(raw json.RawMessage) (float64, bool) {
 
 // errNoGeneration is ExecuteShard called without a generation.
 var errNoGeneration = errors.New("search: no generation")
+
+// aggsLoc is the loc of aggregations given under key: aggs unless the body spelled it
+// aggregations.
+func aggsLoc(key string) string {
+	if key == "" {
+		return "aggs"
+	}
+	return key
+}
+
+// nestedSubAggs reports whether aggs hold, at any level, a terms aggregation on a
+// sub-field of m's with sub-aggregations.
+func nestedSubAggs(aggs map[string]Agg, m *schema.Mapping) bool {
+	for name := range aggs {
+		a := aggs[name]
+		if _, sub := m.NestedPath(a.Field); (sub && a.Type == AggTerms && len(a.Aggs) > 0) || nestedSubAggs(a.Aggs, m) {
+			return true
+		}
+	}
+	return false
+}

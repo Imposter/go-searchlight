@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/Imposter/go-searchlight/internal/api"
 	"github.com/Imposter/go-searchlight/internal/percolate"
@@ -25,10 +26,11 @@ type Cluster interface {
 	// written shard to the newest seq it took): it sends push hints to the peers
 	// holding copies of them. It must not block.
 	Committed(index string, shards map[int]int64)
-	// WaitRefreshed waits, under ctx, until every serving copy of id on another node
-	// has seq searchable; with api.RefreshTrue the copies refresh at once once they
-	// have applied it. localDone says this node's copy has it: when it has not and no
-	// other copy reached seq either, the wait fails.
+	// WaitRefreshed waits, under ctx, until copies of id on other nodes have seq
+	// searchable: with api.RefreshTrue every serving one, each refreshed at once once
+	// it has applied seq; with api.RefreshWaitFor none when localDone (this node's
+	// copy has it), else the first that has it. When neither this node's copy nor any
+	// other reached seq, the wait fails.
 	WaitRefreshed(ctx context.Context, id store.ShardID, seq int64, mode api.RefreshMode, localDone bool) error
 	// Allocate claims and hosts this node's copies of index now, so a new index
 	// serves when CreateIndex answers.
@@ -40,6 +42,11 @@ type Cluster interface {
 	// Counts returns the live documents and saved queries of a serving copy of id on
 	// another node.
 	Counts(ctx context.Context, id store.ShardID) (docs, queries uint64, err error)
+	// AdmitFields refuses (a 409 *api.Error naming them) fields some live node of the
+	// cluster could not decode in a mapping: a point field while a node of an earlier
+	// release, which reads no point type, is live or holds a copy. It is called before
+	// an index is created or its mapping patched.
+	AdmitFields(ctx context.Context, fields map[string]schema.FieldType) error
 }
 
 // ShardTarget is the copy one read uses for one shard: this node's own, or a serving
@@ -55,15 +62,20 @@ type ShardTarget interface {
 	Fetch(ctx context.Context, hits []search.Hit, fields []string) error
 	// Percolate matches docs, analyzed under mapping (its catalogue JSON), against the
 	// copy's saved queries: the ids each document matches, in order, as
-	// [percolate.Percolator.Percolate] returns them.
-	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc) ([]percolate.IDs, error)
-	// Get reads a stored document from the copy.
-	Get(ctx context.Context, id string) (body []byte, found bool, err error)
+	// [percolate.Percolator.Percolate] returns them, and, when details asks for any,
+	// each document's matches with them, in the same order ([MatchDetails]).
+	Percolate(ctx context.Context, mapping json.RawMessage, docs []schema.Doc, details MatchDetails) ([]percolate.IDs, [][]api.PercolateMatch, error)
+	// Get reads a stored document from the copy, with the seq of the change that wrote
+	// the version it holds (0 when the copy kept none).
+	Get(ctx context.Context, id string) (body []byte, seq int64, found bool, err error)
 	// GetQuery reads a saved query from the copy.
 	GetQuery(ctx context.Context, id string) (q *api.SavedQuery, found bool, err error)
 	// Stale reports whether the copy's reads are stale: it trails the changelog by
 	// more than max_lag, or its node cannot reach the database.
 	Stale() bool
+	// Seq is a seq every change up to which is in what the target answers from: this
+	// node's copy's generation's, or, for a copy elsewhere, the seq the read asked of it.
+	Seq() int64
 	// Release lets the copy drop the generation the read held.
 	Release()
 }
@@ -104,4 +116,6 @@ type IndexView struct {
 	Shards int
 	// ReplicasPerShard is the copy target per shard; 0 means every node.
 	ReplicasPerShard int
+	// GCDeletes is how long its deletes keep their versions (api.IndexSettings).
+	GCDeletes time.Duration
 }

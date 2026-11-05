@@ -112,6 +112,18 @@ const (
 	MetricSearchFilterCacheLooks = "searchlight.search.filter_cache.lookups"
 	MetricSearchDocsScanned      = "searchlight.search.documents.scanned"
 	MetricSearchDocsMatched      = "searchlight.search.documents.matched"
+	MetricSearchOrdinalsBuilds   = "searchlight.search.ordinals.builds"
+	MetricSearchOrdinalsDuration = "searchlight.search.ordinals.build.duration"
+	MetricSearchOrdinalsLookups  = "searchlight.search.ordinals.lookups"
+
+	MetricSearchRequestCacheLookups   = "searchlight.search.request_cache.lookups"
+	MetricSearchRequestCacheErrors    = "searchlight.search.request_cache.errors"
+	MetricSearchRequestCacheEvictions = "searchlight.search.request_cache.evictions"
+	MetricSearchRequestCacheStored    = "searchlight.search.request_cache.stored"
+	MetricSearchRequestCacheSize      = "searchlight.search.request_cache.size"
+	MetricSearchRequestCacheEntries   = "searchlight.search.request_cache.entries"
+	MetricSearchRequestCacheDropped   = "searchlight.search.request_cache.writes_dropped"
+	MetricSearchRequestCacheStoreOpen = "searchlight.search.request_cache.store_open"
 
 	// Percolation.
 	MetricPercolateDuration      = "searchlight.percolate.duration"
@@ -153,19 +165,23 @@ const (
 	MetricReplicaApplyDuration    = "searchlight.replica.apply.duration"
 	MetricReplicaBackpressure     = "searchlight.replica.backpressure"
 	MetricReplicaHalts            = "searchlight.replica.halts"
+	MetricReplicaHandedOff        = "searchlight.replica.handed_off"
 	MetricReplicaHalted           = "searchlight.replica.halted"
 	MetricReplicaPollFailing      = "searchlight.replica.poll.failing"
 	MetricReplicaWatchReconnects  = "searchlight.replica.watch.reconnects"
+	MetricChangelogRewinds        = "searchlight.changelog.rewinds"
 	MetricClusterLeaseChanges     = "searchlight.cluster.lease.changes"
 	MetricClusterAllocations      = "searchlight.cluster.allocation.changes"
 	MetricClusterNodes            = "searchlight.cluster.nodes"
 	MetricClusterPeerDuration     = "searchlight.cluster.peer.request.duration"
 	MetricClusterReadRetries      = "searchlight.cluster.read.retries"
+	MetricClusterReadRereads      = "searchlight.cluster.read.rereads"
 
 	// Database.
 	MetricStoreOperationDuration = "searchlight.store.operation.duration"
 	MetricStoreErrors            = "searchlight.store.errors"
 	MetricStoreWALSize           = "searchlight.store.wal.size"
+	MetricStoreNotificationsLost = "searchlight.store.notifications.lost"
 )
 
 // Histogram bucket boundaries.
@@ -189,6 +205,17 @@ var Catalog = []MetricSpec{
 	{MetricSearchFilterCacheLooks, KindCounter, "{lookup}", "Filter cache lookups by index and result (hit or miss).", nil},
 	{MetricSearchDocsScanned, KindCounter, "{document}", "Documents a shard search checked one at a time (residual verification), by index.", nil},
 	{MetricSearchDocsMatched, KindCounter, "{document}", "Documents a shard search matched, by index.", nil},
+	{MetricSearchOrdinalsBuilds, KindCounter, "{build}", "Global ordinals builds, by kind (full, incremental, or unstarted: superseded or cancelled before it began), trigger (search or warm) and result (done, cancelled, superseded, shutdown or panic).", nil},
+	{MetricSearchOrdinalsDuration, KindHistogram, "s", "Global ordinals build time, by kind (full or incremental) and trigger (search or warm).", SlowBuckets},
+	{MetricSearchOrdinalsLookups, KindCounter, "{lookup}", "Global ordinals cache lookups by result: hit (built), shared (a build in progress joined), miss (a build started), queued (a build not yet running, left to the background), stale (refused: the shard has a newer generation's) or absent (none built yet, as a search starts).", nil},
+	{MetricSearchRequestCacheLookups, KindCounter, "{lookup}", "Shard request cache lookups, by store (memory or redis) and result (hit, miss, or skipped while the store's breaker is open).", nil},
+	{MetricSearchRequestCacheErrors, KindCounter, "{error}", "Shard request cache store failures (the shard computed its result), by store and operation (get, set, encode or decode).", nil},
+	{MetricSearchRequestCacheEvictions, KindCounter, "{entry}", "Shard request cache memory entries evicted for room.", nil},
+	{MetricSearchRequestCacheStored, KindCounter, "By", "Bytes of shard results written to the request cache's shared store, by store.", nil},
+	{MetricSearchRequestCacheSize, KindGauge, "By", "Estimated bytes the shard request cache's memory entries hold.", nil},
+	{MetricSearchRequestCacheEntries, KindGauge, "{entry}", "Entries in the shard request cache's memory.", nil},
+	{MetricSearchRequestCacheDropped, KindCounter, "{write}", "Shard results not written to the request cache's shared store, by reason (busy: too many writes in flight; store_failing: its breaker open; closed).", nil},
+	{MetricSearchRequestCacheStoreOpen, KindGauge, "1", "1 while the request cache's shared store is skipped after failing (its breaker open), else 0, by store.", nil},
 
 	{MetricPercolateDuration, KindHistogram, "s", "Percolation time per document by phase (probe, verify) and index.", FastBuckets},
 	{MetricPercolateCandidates, KindHistogram, "{query}", "Candidate queries per percolated document, by index.", CountBuckets},
@@ -225,18 +252,22 @@ var Catalog = []MetricSpec{
 	{MetricReplicaApplyDuration, KindHistogram, "s", "Time a tailer takes to analyze and apply one batch to its shard copy, by index and shard.", FastBuckets},
 	{MetricReplicaBackpressure, KindCounter, "{wait}", "Times a tailer waited out a full write buffer before applying again, by index and shard.", nil},
 	{MetricReplicaHalts, KindCounter, "{halt}", "Shard copies halted by a change they could not apply, by index, shard and reason.", nil},
+	{MetricReplicaHandedOff, KindCounter, "{document}", "Upserted documents a tailer applied as the write on its node analyzed them, without analyzing them again, by index and shard.", nil},
 	{MetricReplicaHalted, KindGauge, "1", "1 while a shard copy is halted at a change it cannot apply, else 0, by index and shard.", nil},
 	{MetricReplicaPollFailing, KindGauge, "1", "1 while a shard copy's changelog polls fail (its lag in changes is then the last known one), else 0, by index and shard.", nil},
 	{MetricReplicaWatchReconnects, KindCounter, "{reconnect}", "Changelog notification subscriptions restarted after they failed.", nil},
+	{MetricChangelogRewinds, KindCounter, "{rewind}", "Shard copies rebuilt because the changelog no longer holds what they applied (a database failover that lost commits), by index and shard.", nil},
 	{MetricClusterLeaseChanges, KindCounter, "{change}", "Shard lease events by kind (claim, renew, renew_failed, reclaim, lapse, resume, lost, release).", nil},
 	{MetricClusterAllocations, KindCounter, "{change}", "Shard copy state transitions by index and state (recovering, serving, retiring).", nil},
 	{MetricClusterNodes, KindGauge, "{node}", "Live nodes in the cluster, as this node reads the registry.", nil},
 	{MetricClusterPeerDuration, KindHistogram, "s", "Internal peer API request latency by route, peer and status (0: unreachable).", FastBuckets},
 	{MetricClusterReadRetries, KindCounter, "{retry}", "Shard reads retried on another copy after one failed or timed out, by operation.", nil},
+	{MetricClusterReadRereads, KindCounter, "{reread}", "Copy table re-reads by shard reads whose every known copy failed, by operation and result (found: a serving copy the read has not tried; none; timeout: the re-read ran out of its time).", nil},
 
 	{MetricStoreOperationDuration, KindHistogram, "s", "SQL store latency by operation and dialect.", FastBuckets},
 	{MetricStoreErrors, KindCounter, "{error}", "SQL store errors by operation and dialect.", nil},
 	{MetricStoreWALSize, KindGauge, "By", "SQLite's write-ahead log file size, and the part of it no checkpoint has copied yet (pending=true).", nil},
+	{MetricStoreNotificationsLost, KindCounter, "{notification}", "Commit notifications (a shard's newest seq) that could not be sent twice over: tailers poll for those changes instead.", nil},
 }
 
 var catalogIndex = func() map[string]*MetricSpec {

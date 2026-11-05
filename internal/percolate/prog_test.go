@@ -35,8 +35,10 @@ func (ft *fieldTable) field(name string) uint32 {
 // evalOn evaluates program p on d, its fields laid out by ft.
 func evalOn(ft *fieldTable, sc *scratch, p []byte, d *schema.Doc) bool {
 	sc.fit(0, 0, len(ft.names))
+	sc.fields = sc.fields[:0]
 	for i, name := range ft.names {
 		sc.vals[i] = d.Fields[name]
+		sc.fields = append(sc.fields, fieldInfo{name: name})
 	}
 	got := sc.eval(p)
 	sc.reset()
@@ -52,7 +54,7 @@ func TestProgramsMatchTheMatcher(t *testing.T) {
 		seeds, queries, docs = []uint64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 3000, 1000
 	}
 	m := testMapping()
-	pairs := 0
+	pairs, nestedMatches := 0, 0
 	for _, seed := range seeds {
 		for _, positive := range []bool{false, true} {
 			g := newGen(seed)
@@ -86,14 +88,21 @@ func TestProgramsMatchTheMatcher(t *testing.T) {
 				}
 				for _, q := range qs {
 					pairs++
-					if got, want := evalOn(ft, sc, q.prog, &d), q.m.Match(&d); got != want {
+					got, want := evalOn(ft, sc, q.prog, &d), q.m.Match(&d)
+					if got != want {
 						t.Fatalf("seed %d: query %s on %s: program %v, matcher %v", seed, q.raw, body, got, want)
+					}
+					if want && bytes.Contains(q.raw, []byte(`"nested"`)) {
+						nestedMatches++
 					}
 				}
 			}
 		}
 	}
-	t.Logf("%d query/document pairs", pairs)
+	if nestedMatches == 0 {
+		t.Fatal("no query with a nested node matched: the generator draws none")
+	}
+	t.Logf("%d query/document pairs, %d matches of queries with a nested node", pairs, nestedMatches)
 }
 
 // The percolator gives scrape-bot's verdicts on the parity fixtures

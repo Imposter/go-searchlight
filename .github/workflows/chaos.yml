@@ -11,11 +11,13 @@ name: chaos
 #   - it is time-boxed (the job at 40 minutes, the tests at 30);
 #   - it is not a required check: a slow or failing run shows on the pull request
 #     without holding up ci.yml's checks, which gate the merge. A failure is still a
-#     bug to fix before merging; the node logs are uploaded with it.
+#     bug to fix before merging; the node logs are uploaded with it;
+#   - release.yml calls it, beside ci.yml, as a gate every release must pass.
 on:
   schedule:
     - cron: "0 6 * * 1" # Monday 06:00 UTC
   workflow_dispatch:
+  workflow_call:
   pull_request:
     paths:
       - "cmd/**"
@@ -35,8 +37,10 @@ on:
 permissions:
   contents: read
 
+# github.workflow is the caller's name when release.yml calls this file, so a release's
+# gate never cancels, or is cancelled by, a chaos run on the same ref.
 concurrency:
-  group: chaos-${{ github.ref }}
+  group: chaos-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -59,8 +63,8 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       # Each node opens up to 64 connections plus one for LISTEN; three nodes and the
@@ -84,7 +88,7 @@ jobs:
         run: go test -tags chaos -count=1 -v -timeout 30m ./test/chaos
       - name: upload the nodes' logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: chaos-logs
           path: ${{ runner.temp }}/chaos

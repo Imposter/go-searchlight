@@ -14,6 +14,11 @@
 //	         and docs whose value the writer marked untyped
 //	STORED   an s2 dictionary, then s2 blocks of about 4 KB of documents, each one's
 //	         id and JSON body, then a bit-packed block table
+//	XY       per point field a k-d tree of its points (xy.go); only in a segment with
+//	         a point field, which is format 4.1
+//	NESTED   per nested field its objects' own index, an object segment (nested.go),
+//	         and each document's first object; only in a segment with a nested
+//	         field's objects, which is format 4.2
 //	IDS      the primary key: every document's exact id (as given, never normalized)
 //	         to its ordinal, a term dictionary whose terms each hold one ordinal
 //	         inline, then u64 (the dictionary's index offset in the section) + 1, or
@@ -92,9 +97,15 @@ const (
 	FormatMajor = 4
 	// ReadsMajor is the oldest major Open reads: the one before FormatMajor.
 	ReadsMajor = FormatMajor - 1
-	// FormatMinor is the segment format's minor version: additions an older reader of
-	// the same major can ignore.
-	FormatMinor = 0
+	// FormatMinor is the segment format's newest minor version: additions an older
+	// reader of the same major can ignore. 4.1 adds the XY section (point fields), 4.2
+	// the NESTED section (nested fields); a segment without one is written in the
+	// minor before, byte for byte as before.
+	FormatMinor = 2
+	// minorXY and minorNested are the minors of a segment with points, and of one with
+	// nested fields' objects (points or not).
+	minorXY     = 1
+	minorNested = 2
 	// FileExt is a segment file's extension.
 	FileExt = ".seg"
 )
@@ -124,6 +135,8 @@ const (
 	sectionStored
 	sectionMeta
 	sectionIDs
+	sectionXY
+	sectionNested
 )
 
 var sectionNames = map[sectionKind]string{
@@ -134,6 +147,8 @@ var sectionNames = map[sectionKind]string{
 	sectionStored:    "stored",
 	sectionMeta:      "meta",
 	sectionIDs:       "ids",
+	sectionXY:        "xy",
+	sectionNested:    "nested",
 }
 
 func (k sectionKind) String() string {
@@ -143,9 +158,22 @@ func (k sectionKind) String() string {
 	return fmt.Sprintf("section(%d)", uint32(k))
 }
 
-// sectionOrder is the order sections are written in.
+// sectionOrder is the order sections are written in: every one a segment holds. The
+// XY and NESTED sections, which only a segment with a point field or a nested field's
+// objects holds, are written before META, in that order.
 var sectionOrder = [...]sectionKind{
 	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionIDs, sectionMeta,
+}
+
+// objectSections are the sections an object segment holds: a nested field's objects'
+// index, which keeps no stored records and no ids (nested.go).
+var objectSections = [...]sectionKind{
+	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionMeta,
+}
+
+// knownSections is every section kind this build reads, the optional ones included.
+var knownSections = [...]sectionKind{
+	sectionTerms, sectionDocValues, sectionPoints, sectionPresence, sectionStored, sectionIDs, sectionXY, sectionNested, sectionMeta,
 }
 
 // TermKind is which of a field's term dictionaries a term belongs to.

@@ -118,7 +118,7 @@ Top-k with a sort, and `search_after` walks to the stated depth (latency per pag
 
 ## Aggregations
 
-Size 0; Elasticsearch's request cache is off; filters vary per iteration.
+Size 0; both engines' request caches are off; filters vary per iteration.
 
 | workload | engine | load | ops/s | docs/s | p50 | p99 | p99.9 | max | errors | SL vs ES |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -170,7 +170,7 @@ Every place where the engines' semantics differ, or where the Elasticsearch side
 | cardinality | Both are HyperLogLog++ but with different parameters: Searchlight's precision p (default 14, exact below 2^(p-2) values), Elasticsearch's precision_threshold (exact-ish below it, at most 40000). | precision_threshold = min(2^(p-2), 40000). | The cross-check allows 3% relative difference. |
 | stats | Sums are added in a different order (per segment, per shard), so the last bits of sum and avg can differ. | stats. | The cross-check allows 1e-9 relative difference on sum and avg; count, min and max are exact. |
 | percolation | Searchlight's _percolate and _bulk?percolate return each document's matching saved-query ids; Elasticsearch's percolate query returns each matching query once with the slots of the documents it matched, limited to max_result_window hits per request. _bulk?percolate (write and percolate in one request) has no Elasticsearch equivalent. | A percolator index with the same field mappings; each batch is one percolate query in filter context (no scoring), paged by qid when more than 10000 queries match; the bulk-and-percolate workload sends Elasticsearch a _bulk then a percolate of the same documents. | Match sets are cross-checked per document. |
-| caching | Elasticsearch's shard request cache returns a whole cached response for a repeated size-0 request (aggregations); Searchlight has no response cache, only a filter cache like Elasticsearch's node query cache. | Every Elasticsearch search is sent with request_cache=false; both filter caches stay on. Each workload also cycles through many query variants. | Aggregation latencies measure computing the aggregation, on both engines. |
+| caching | Both engines have a shard request cache that returns a cached shard result for a repeated size-0 request (aggregations), and a filter cache (Elasticsearch's node query cache). | Every search is sent with its request cache off (request_cache=false on Elasticsearch, "request_cache": false on Searchlight); both filter caches stay on. Each workload also cycles through many query variants. | Aggregation latencies measure computing the aggregation, on both engines. |
 | durability and refresh | Searchlight acknowledges a write once its SQL transaction commits (SQLite with synchronous=FULL in the bench); Elasticsearch once its translog is fsynced (index.translog.durability=request, its default). | Both acknowledged-means-durable; both refresh every 1 s (set explicitly on Elasticsearch, which also disables its search-idle refresh skipping); one replica-less node each. | Bulk throughput is compared at equal durability, as spec section 1 requires. |
 | scoring | Searchlight does not score (v1 non-goal); Elasticsearch scores unless a query is in filter context. | Every translated search and percolation runs in constant_score filter context, so Elasticsearch skips scoring and can cache filters. | No engine pays for relevance. |
 

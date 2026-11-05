@@ -8,8 +8,8 @@
 //
 // # Writes
 //
-// [Shard.Apply] takes changes in changelog order (seq strictly increasing; the global
-// changelog leaves gaps, which are fine). Each document or saved query id keeps only
+// [Shard.Apply] takes changes in changelog order (seq strictly increasing; a shard's
+// seqs are contiguous, but gaps are fine). Each document or saved query id keeps only
 // its newest version: within the buffer an upsert or delete replaces the entry; at
 // refresh every id the buffer touched masks every older copy of that id in every
 // segment, so a reader never sees two live copies of one id, nor a deleted one, and an
@@ -36,9 +36,11 @@ package shard
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -89,8 +91,9 @@ func (k ChangeKind) String() string {
 
 // Change is one changelog entry for this shard, already analyzed.
 type Change struct {
-	// Seq is the change's position in the global changelog. Apply requires it to
-	// increase strictly; gaps (other shards' changes) are expected.
+	// Seq is the change's position in its shard's changelog. Apply requires it to
+	// increase strictly; gaps are allowed (a copy may start above a shard's first
+	// change, or skip pruned ones it has).
 	Seq  int64
 	Kind ChangeKind
 	// DocID is the document an Upsert or Delete targets. For an Upsert it may be left
@@ -103,8 +106,10 @@ type Change struct {
 	QueryID string
 	// Query is a QueryUpsert's parsed query ([query.Parse]); the shard keeps it.
 	Query query.Node
-	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes].
-	Meta []byte
+	// Meta is a QueryUpsert's opaque meta object, at most [MaxMetaBytes], and QueryVersion
+	// its client version (store.Change.Version; 0 for none).
+	Meta         []byte
+	QueryVersion int64
 	// Mapping and MappingVersion are a Remap's mapping and its version (the store's
 	// mapping version, increasing with every mapping change of the index).
 	Mapping        *schema.Mapping
@@ -229,6 +234,11 @@ type Options struct {
 	Logger *slog.Logger
 	Tracer trace.Tracer
 	Meter  metric.Meter
+	// Published, when set, is called with each generation a refresh or merge publishes
+	// (new segments or new deletes), once it is current, under the shard's commit lock: it
+	// must not block, and takes its own reference ([Generation.Retain]) to use the
+	// generation past the call. Search uses it to warm caches kept per segment list.
+	Published func(*Generation)
 
 	// hooks are test kill points; nil outside tests.
 	hooks *testHooks
@@ -320,6 +330,8 @@ type Shard struct {
 	log  *slog.Logger
 	tr   trace.Tracer
 	inst *instruments
+	// copyID tells this open copy from every other the process opened (CacheIdentity).
+	copyID uint64
 	// spanAttrs label every span: the index and shard.
 	spanAttrs []attribute.KeyValue
 
@@ -338,6 +350,12 @@ type Shard struct {
 	indexUID  string
 	mapState  *mappingState // the mapping as of applied
 	closing   bool
+	// markSeq and mark are the last SetMark: the mark is applied's when markSeq is.
+	// anchor and own are the last SetAnchorMark and SetOwnMark, whatever applied is.
+	markSeq int64
+	mark    json.RawMessage
+	anchor  json.RawMessage
+	own     json.RawMessage
 
 	// failed is set once the shard cannot vouch for its durable state.
 	failed atomic.Pointer[error]
@@ -367,6 +385,7 @@ type Shard struct {
 	durableGen      uint64
 	committedUID    string
 	committedMap    *mappingState
+	committedMarks  marks
 	durableSegs     map[*segRef]bool
 	durableSidecars map[string]int64
 	strays          map[string]bool
@@ -388,13 +407,15 @@ type Shard struct {
 	// shutdownDone is closed when shutdown has finished: a second Close waits on it.
 	shutdownDone chan struct{}
 	jan          *janitor
+	// background is the work over the shard's generations its shutdown waits for.
+	background bgWork
 }
 
 // Open opens the shard copy in dir, creating dir if needed: it reads the manifest,
 // reopens and verifies every segment it lists with its deletes, removes every file the
 // manifest does not reference, and starts the background refresh and merges. A
 // directory with no manifest is an empty shard. m is the index's mapping (see
-// [Shard.SetMapping]); it may be nil.
+// [Shard.Mapping]); it may be nil.
 func Open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Shard, error) {
 	opts.resolve()
 	ctx, span := opts.Tracer.Start(ctx, "shard.open", trace.WithAttributes(
@@ -410,6 +431,9 @@ func Open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	return s, nil
 }
 
+// open is Open's body. It never reuses a generation a crash left a sidecar of (I1):
+// that sidecar may still be pending removal, or be removed later by a janitor that
+// could not remove it then.
 func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Shard, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("shard: %w", err)
@@ -421,6 +445,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	s := &Shard{
 		dir:         dir,
 		opts:        opts,
+		copyID:      copyIDs.Add(1),
 		log:         opts.Logger.With(telemetry.KeyIndex, opts.Index, telemetry.KeyShard, opts.Shard),
 		tr:          opts.Tracer,
 		buf:         newBuffer(),
@@ -436,7 +461,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		shutdownDone: make(chan struct{}),
 	}
 	s.inst = newInstruments(opts.Meter, opts.Index, opts.Shard, s.log)
-	s.inst.observeResident(opts.Meter, s)
 	s.spanAttrs = []attribute.KeyValue{attribute.String(telemetry.KeyIndex, opts.Index), attribute.Int(telemetry.KeyShard, opts.Shard)}
 	s.jan = newJanitor(s)
 	mp, err := man.mappingState(dir, m)
@@ -457,8 +481,6 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 		s.jan.drain()
 		return nil, err
 	}
-	// Never reuse a generation a crash left a sidecar of (I1): its file may still be
-	// pending removal, or be removed later by a janitor that could not remove it now.
 	topGen, err := maxSidecarGen(dir)
 	if err != nil {
 		g.retireAll()
@@ -489,6 +511,8 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.sidecarBytes.Store(sidecarBytes)
 	s.applied = man.Seq
+	s.markSeq, s.mark, s.anchor, s.own = man.Seq, man.SeqMark, man.AnchorMark, man.OwnMark
+	s.committedMarks = marks{seq: man.SeqMark, anchor: man.AnchorMark, own: man.OwnMark}
 	s.maxChange = man.MaxSeq
 	s.indexUID = man.IndexUID
 	s.committedUID = man.IndexUID
@@ -498,6 +522,7 @@ func open(ctx context.Context, dir string, m *schema.Mapping, opts Options) (*Sh
 	}
 	s.cur.Store(g)
 	s.recordGeneration(ctx, g)
+	s.inst.observeResident(opts.Meter, s)
 
 	s.bg, s.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	s.jan.start()
@@ -534,26 +559,15 @@ func (s *Shard) IndexUID() string {
 }
 
 // Mapping returns the index mapping as of the applied seq: the last Remap applied,
-// the manifest's at Open, or the one Open or SetMapping was given.
+// the manifest's at Open, or the one Open was given.
 func (s *Shard) Mapping() *schema.Mapping { return s.mapping.Load() }
 
 // MappingVersion returns the version of Mapping: the last Remap's, the manifest's at
-// Open, and 0 for a mapping only Open or SetMapping gave.
+// Open, and 0 for a mapping only Open gave.
 func (s *Shard) MappingVersion() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.mapState.version
-}
-
-// SetMapping replaces the index mapping, keeping its version; the next refresh
-// publishes it, and the flush after persists it. A copy that tails the changelog takes
-// its mappings from Remap changes instead, so the mapping is recorded with the seq it
-// holds from.
-func (s *Shard) SetMapping(m *schema.Mapping) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.mapState = &mappingState{m: m, version: s.mapState.version}
-	s.mapping.Store(m)
 }
 
 // CommittedSeq returns the seq of the manifest that is durable on disk: every change
@@ -561,6 +575,64 @@ func (s *Shard) SetMapping(m *schema.Mapping) {
 // changelog from here. It trails RefreshedSeq until the next flush
 // (Options.FlushInterval): a refresh publishes without making anything durable.
 func (s *Shard) CommittedSeq() int64 { return s.committed.Load() }
+
+// SetMark records mark, an opaque JSON value, as the mark of the change at seq: what
+// the changelog held there when the caller applied it. It is the shard's mark once the
+// shard has applied or advanced to seq (set it before), and stays so until the shard
+// moves past seq; refreshes publish it with their seq, flushes write it to the
+// manifest (seq_mark), and an opened copy, a snapshot's included, carries it.
+func (s *Shard) SetMark(seq int64, mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.markSeq, s.mark = seq, mark
+}
+
+// SeqMark returns the mark of the change at AppliedSeq, nil when none was recorded.
+func (s *Shard) SeqMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.markAt(s.applied)
+}
+
+// SetAnchorMark records mark, an opaque JSON value, as the anchor mark: unlike the seq
+// mark it holds whatever the applied seq is. Refreshes publish it, flushes write it to
+// the manifest (anchor_mark), and an opened copy, a snapshot's included, carries it.
+func (s *Shard) SetAnchorMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.anchor = mark
+}
+
+// AnchorMark returns the anchor mark, nil when none was recorded.
+func (s *Shard) AnchorMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.anchor
+}
+
+// SetOwnMark records mark, an opaque JSON value, as the own mark: like the anchor mark
+// it holds whatever the applied seq is, and is published, flushed (own_mark) and
+// carried as it is.
+func (s *Shard) SetOwnMark(mark json.RawMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.own = mark
+}
+
+// OwnMark returns the own mark, nil when none was recorded.
+func (s *Shard) OwnMark() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.own
+}
+
+// markAt is the mark recorded for seq, or nil. The caller holds mu.
+func (s *Shard) markAt(seq int64) json.RawMessage {
+	if seq != s.markSeq {
+		return nil
+	}
+	return s.mark
+}
 
 // AppliedSeq returns the highest seq applied (or advanced to), refreshed or not.
 func (s *Shard) AppliedSeq() int64 {
@@ -586,10 +658,12 @@ func (s *Shard) Err() error {
 	return nil
 }
 
+// fail marks the shard failed with err, once. A failed shard never refreshes again, so
+// WaitRefreshed's waiters are woken to see the failure.
 func (s *Shard) fail(err error) {
 	wrapped := fmt.Errorf("%w: %w", ErrFailed, err)
 	if s.failed.CompareAndSwap(nil, &wrapped) {
-		s.notifyPublished() // a failed shard never refreshes: wake WaitRefreshed
+		s.notifyPublished()
 	}
 }
 
@@ -654,7 +728,7 @@ func (s *Shard) Load(ctx context.Context, changes []Change) error {
 
 // apply checks and buffers changes, returning the buffer's size after. load is Load's
 // variant: seqs in any order, into a shard that has applied nothing, and AppliedSeq
-// left as it is.
+// left as it is. A load's Remap is the snapshot's mapping, not a changelog entry.
 func (s *Shard) apply(changes []Change, load bool) (int, error) {
 	for i := range changes {
 		if err := s.check(&changes[i]); err != nil {
@@ -693,7 +767,7 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 			}
 			mp = &mappingState{m: c.Mapping, version: c.MappingVersion}
 			if load {
-				continue // a snapshot's mapping is not a changelog entry
+				continue
 			}
 		}
 		switch {
@@ -714,11 +788,11 @@ func (s *Shard) apply(changes []Change, load bool) (int, error) {
 		c := &changes[i]
 		switch c.Kind {
 		case Upsert:
-			s.buf.putDoc(c.id(), c.Seq, c.Doc)
+			s.buf.putDoc(c.id(), c.Seq, withSeq(c.Doc, c.Seq))
 		case Delete:
 			s.buf.putDoc(c.id(), c.Seq, nil)
 		case QueryUpsert:
-			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Query: c.Query, Meta: c.Meta})
+			s.buf.putQuery(c.QueryID, c.Seq, &StoredQuery{ID: c.QueryID, Seq: c.Seq, Version: c.QueryVersion, Query: c.Query, Meta: c.Meta})
 		case QueryDelete:
 			s.buf.putQuery(c.QueryID, c.Seq, nil)
 		}
@@ -816,7 +890,8 @@ func (s *Shard) check(c *Change) error {
 }
 
 // Advance records that every change up to seq has been applied, when the changelog
-// holds none for this shard past the last one applied: the next refresh then covers
+// holds none for this shard past the last one applied (a shard starts at the store's
+// floor, above any change it has): the next refresh then covers
 // seq, so WaitRefreshed(seq) returns, and the flush after it moves CommittedSeq on
 // without a replay. A seq at or below the applied one is a no-op.
 func (s *Shard) Advance(seq int64) error {
@@ -836,7 +911,9 @@ func (s *Shard) Advance(seq int64) error {
 
 // Acquire returns the current generation, with a reference the caller must drop with
 // [Generation.Release]. It takes no lock and allocates nothing. It returns nil once
-// the shard is closed.
+// the shard is closed. A generation retired between the load and the reference is
+// tried again: the shard drops its own reference only after publishing the
+// generation's successor, so the next load sees that (or nil).
 func (s *Shard) Acquire() *Generation {
 	for {
 		g := s.cur.Load()
@@ -846,8 +923,6 @@ func (s *Shard) Acquire() *Generation {
 		if g.tryRef() {
 			return g
 		}
-		// g was retired between the Load and tryRef: the shard drops its own reference
-		// only after publishing g's successor, so the next Load sees that (or nil).
 	}
 }
 
@@ -902,7 +977,6 @@ func (s *Shard) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		// Another Close (or a shutdown) is under way: return once it has finished.
 		select {
 		case <-s.shutdownDone:
 			return nil
@@ -943,7 +1017,8 @@ func (s *Shard) Abandon() { s.shutdown() }
 func (s *Shard) Options() Options { return s.opts }
 
 // shutdown stops the background goroutines and drops the shard's generation, without
-// any further flush.
+// any further flush. Taking the locks orders it after any flush, refresh or merge
+// publish in flight.
 func (s *Shard) shutdown() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -951,8 +1026,13 @@ func (s *Shard) shutdown() {
 		s.mu.Unlock()
 		s.cancel()
 		s.wg.Wait()
-		// Taking the locks orders this after any flush, refresh or merge publish in
-		// flight.
+		bgTimer := time.NewTimer(backgroundWait) //nolint:forbidigo // bounds other goroutines' real work, which a test's fake clock does not drive
+		select {
+		case <-s.background.wait():
+		case <-bgTimer.C:
+			s.log.Warn("shard closed with background work over its generations still running")
+		}
+		bgTimer.Stop()
 		s.flushSem <- struct{}{}
 		s.refreshMu.Lock()
 		s.commitMu.Lock()
@@ -1018,4 +1098,15 @@ func (s *Shard) refreshLoop() {
 			}
 		},
 	}.Run(s.bg)
+}
+
+// withSeq returns d with its seq in [schema.SeqColumn], the fields copied: the caller's
+// document is left as it is.
+func withSeq(d *schema.Doc, seq int64) *schema.Doc {
+	out := *d
+	out.Fields = make(map[string]schema.Value, len(d.Fields)+1)
+	maps.Copy(out.Fields, d.Fields)
+	v := float64(seq)
+	out.Fields[schema.SeqColumn] = schema.Value{Present: true, Number: &v}
+	return &out
 }

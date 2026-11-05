@@ -45,7 +45,8 @@ func currentDocs(docs []schema.Doc) []schema.Doc {
 	out := make([]schema.Doc, len(docs))
 	for i, d := range docs {
 		fields := make(map[string]schema.Value, len(d.Fields))
-		for name, v := range d.Fields {
+		for name := range d.Fields {
+			v := d.Fields[name]
 			if v.GramsTruncated && v.Text == nil {
 				v.GramsTruncated, v.Untyped = false, true
 			}

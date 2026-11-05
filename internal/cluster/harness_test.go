@@ -117,7 +117,7 @@ func randName(prefix string) string {
 }
 
 // postgresDB creates a schema for the test and points search_path at it.
-func postgresDB(t *testing.T, base string) *db {
+func postgresDB(t testing.TB, base string) *db {
 	t.Helper()
 	u, err := url.Parse(base)
 	if err != nil {
@@ -476,6 +476,28 @@ func (tn *tnode) kill() {
 	_ = tn.wrap.Close()
 }
 
+// kill stops the node as a crash would: no drain, no final commit, no lease
+// released, no deregistration. The shards are abandoned with what they had not
+// committed.
+func (n *Node) kill() {
+	n.stopOnce.Do(func() {
+		n.stopped.Store(true)
+		n.draining.Store(true)
+		n.loopCancel()
+		n.loops.Wait()
+		n.closeBackground()
+		ctx := context.Background()
+		for _, l := range n.leaseList() {
+			_ = n.AbandonCopy(ctx, l.copy)
+			n.dropLease(l)
+		}
+		n.hints.close()
+		n.pins.closeAll()
+		n.snaps.closeAll()
+		_ = n.Single.Close(ctx)
+	})
+}
+
 func (c *cluster) close() {
 	for _, tn := range c.live() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -531,7 +553,8 @@ func upsertOp(id string, v int) api.WriteOp {
 	return api.WriteOp{Kind: api.OpUpsert, ID: id, Body: json.RawMessage(fmt.Sprintf(`{"title":"item %s","brand":"b%d","price":%d,"tags":["t%d"]}`, id, v%7, v, v%5))}
 }
 
-func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) int64 {
+// mustWrite writes ops through n and returns the write's token.
+func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) *api.Token {
 	t.Helper()
 	res, err := n.Write(tctx(t), index, ops, api.WriteOptions{})
 	if err != nil {
@@ -542,12 +565,12 @@ func mustWrite(t testing.TB, n *Node, index string, ops ...api.WriteOp) int64 {
 			t.Fatalf("op %d: %v", i, it.Err)
 		}
 	}
-	return res.Seq
+	return res.Token
 }
 
-// count runs a match-all search with wait_for_seq on n.
-func count(ctx context.Context, n *Node, index string, wait int64) (int64, error) {
-	res, err := n.Search(ctx, index, &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: wait})
+// count runs a match-all search waiting for wait on n.
+func count(ctx context.Context, n *Node, index string, wait *api.Token) (int64, error) {
+	res, err := n.Search(ctx, index, &search.Request{Query: &query.All{}, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: wait})
 	if err != nil {
 		return 0, err
 	}
@@ -586,10 +609,21 @@ type faultStore struct {
 	// onRetire, when set, runs at the start of every RetireCopy, before it reaches the
 	// store.
 	onRetire atomic.Pointer[func()]
+	// onReport, when set, runs at the start of every ReportApplied, before it reaches
+	// the store.
+	onReport atomic.Pointer[func(ctx context.Context)]
+	// onSetState, when set, runs at the start of every SetCopyState, before it
+	// reaches the store.
+	onSetState atomic.Pointer[func(c store.Copy, state store.CopyState)]
 	// stallTail, while set, holds every ChangesAfter until it is closed or the call's
 	// context ends: the node's tailers stay where they are, serving and current by
 	// their own measure.
 	stallTail atomic.Pointer[chan struct{}]
+	// tableReads counts the reads of every index's copies: the copy table read whole.
+	tableReads atomic.Int64
+	// holdTable, when set, runs at the start of every read of the whole copy table:
+	// a slow database.
+	holdTable atomic.Pointer[func(ctx context.Context)]
 	// stalled counts the ChangesAfter calls stallTail holds now.
 	stalled atomic.Int32
 }
@@ -641,9 +675,9 @@ func (f *faultStore) Indexes() store.IndexStore {
 	return &faultIndexes{IndexStore: f.Store.Indexes(), f: f}
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if f.isDown() {
-		return 0, errPartitioned
+		return store.ScanPoint{}, errPartitioned
 	}
 	return f.Store.ScanShard(ctx, id, fn)
 }
@@ -697,10 +731,10 @@ func (x *faultIndexes) Drop(ctx context.Context, name string) error {
 	return x.IndexStore.Drop(ctx, name)
 }
 
-func (f *faultStore) Apply(ctx context.Context, batch []store.Change) (int64, int64, error) {
+func (f *faultStore) Apply(ctx context.Context, batch []store.Change) error {
 	defer f.timed("Apply")()
 	if f.isDown() {
-		return 0, 0, errPartitioned
+		return errPartitioned
 	}
 	return f.Store.Apply(ctx, batch)
 }
@@ -721,11 +755,25 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return f.Store.ChangesAfter(ctx, id, seq, limit)
 }
 
-func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if f.isDown() {
 		return 0, time.Time{}, errPartitioned
 	}
-	return f.Store.HeadSeq(ctx)
+	return f.Store.HeadSeq(ctx, id)
+}
+
+func (f *faultStore) IndexHeads(ctx context.Context, index string, shards int) ([]int64, error) {
+	if f.isDown() {
+		return nil, errPartitioned
+	}
+	return f.Store.IndexHeads(ctx, index, shards)
+}
+
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
+	if f.isDown() {
+		return store.Tip{}, errPartitioned
+	}
+	return f.Store.Tip(ctx, q)
 }
 
 func (f *faultStore) Ping(ctx context.Context) error {
@@ -743,11 +791,18 @@ func (f *faultStore) GetRecord(ctx context.Context, kind store.RecordKind, id st
 	return f.Store.(store.RecordReader).GetRecord(ctx, kind, id, rec) //nolint:forcetypeassert,errcheck // every SQL store reads records
 }
 
-func (f *faultStore) ListQueries(ctx context.Context, index, after string, limit int) ([]store.Record, error) {
+func (f *faultStore) ListQueries(ctx context.Context, index, after string, limit int, lean bool) ([]store.Record, error) {
 	if f.isDown() {
 		return nil, errPartitioned
 	}
-	return f.Store.(store.RecordReader).ListQueries(ctx, index, after, limit) //nolint:forcetypeassert,errcheck // every SQL store reads records
+	return f.Store.(store.RecordReader).ListQueries(ctx, index, after, limit, lean) //nolint:forcetypeassert,errcheck // every SQL store reads records
+}
+
+func (f *faultStore) DocumentHashes(ctx context.Context, index string, keys []store.DocKey) ([]store.DocHash, error) {
+	if f.isDown() {
+		return nil, errPartitioned
+	}
+	return f.Store.(store.RecordReader).DocumentHashes(ctx, index, keys) //nolint:forcetypeassert,errcheck // every SQL store reads records
 }
 
 // watchingFaultStore is a faultStore over a store that pushes notifications.
@@ -782,6 +837,12 @@ func (r *faultRegistry) Nodes(ctx context.Context) ([]store.Node, error) {
 }
 
 func (r *faultRegistry) Copies(ctx context.Context, index string) ([]store.Copy, error) {
+	if index == "" {
+		r.f.tableReads.Add(1)
+		if hold := r.f.holdTable.Load(); hold != nil {
+			(*hold)(ctx)
+		}
+	}
 	if r.f.isDown() {
 		return nil, errPartitioned
 	}
@@ -812,6 +873,9 @@ func (r *faultRegistry) SetCopyState(ctx context.Context, c store.Copy, state st
 	if r.f.isDown() {
 		return errPartitioned
 	}
+	if fn := r.f.onSetState.Load(); fn != nil {
+		(*fn)(c, state)
+	}
 	return r.RegistryStore.SetCopyState(ctx, c, state)
 }
 
@@ -820,7 +884,18 @@ func (r *faultRegistry) ReportApplied(ctx context.Context, c store.Copy, seq int
 	if r.f.isDown() {
 		return errPartitioned
 	}
+	if fn := r.f.onReport.Load(); fn != nil {
+		(*fn)(ctx)
+	}
 	return r.RegistryStore.ReportApplied(ctx, c, seq)
+}
+
+func (r *faultRegistry) ResetApplied(ctx context.Context, c store.Copy, seq int64) error {
+	defer r.f.timed("ResetApplied")()
+	if r.f.isDown() {
+		return errPartitioned
+	}
+	return r.RegistryStore.ResetApplied(ctx, c, seq)
 }
 
 func (r *faultRegistry) RetireCopy(ctx context.Context, c store.Copy) (bool, error) {
@@ -848,4 +923,28 @@ func (r *faultRegistry) ReleaseCopy(ctx context.Context, c store.Copy) error {
 		return errPartitioned
 	}
 	return r.RegistryStore.ReleaseCopy(ctx, c)
+}
+
+// merged is a's seqs raised to b's, shard by shard (b when a is nil).
+func merged(a, b *api.Token) *api.Token {
+	if a == nil {
+		return b
+	}
+	out := &api.Token{UID: a.UID}
+	out.Merge(a)
+	if !out.Merge(b) {
+		return b
+	}
+	return out
+}
+
+// maxSeq is the highest seq a token names.
+func maxSeq(t *api.Token) int64 {
+	var top int64
+	if t != nil {
+		for _, s := range t.Seqs {
+			top = max(top, s)
+		}
+	}
+	return top
 }

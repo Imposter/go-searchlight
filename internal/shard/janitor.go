@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Imposter/go-searchlight/internal/prio"
 	"github.com/Imposter/go-searchlight/internal/segment"
 )
 
@@ -34,6 +35,11 @@ import (
 type janitor struct {
 	s      *Shard
 	remove func(path string) error
+
+	// drainMu serializes drains, so that one returns only once every segment retired
+	// before it began is closed and its files tried, whichever drain took them: the
+	// loop's, woken by the retire, may be closing them while another drain runs.
+	drainMu sync.Mutex
 
 	// removeMu is held across each removal and by forget, so forget returns only
 	// once no removal of the forgotten names is running or can start.
@@ -146,8 +152,13 @@ func (j *janitor) loop() {
 }
 
 // drain closes every retired segment, queues the files of obsolete ones, and tries
-// every pending removal once. After stop nothing stays pending.
+// every pending removal once. After stop nothing stays pending. A segment's own name
+// is unique for the directory's life (and no manifest lists an obsolete one again),
+// so its files are safe to remove whenever this runs. Drains run one at a time
+// (drainMu).
 func (j *janitor) drain() {
+	j.drainMu.Lock()
+	defer j.drainMu.Unlock()
 	j.mu.Lock()
 	retired := j.retired
 	j.retired = nil
@@ -159,9 +170,6 @@ func (j *janitor) drain() {
 		j.s.opts.FilterCache.DropSegment(ref.id)
 		ref.closed.Store(true)
 		if ref.obsolete.Load() {
-			// A segment's own name is unique for the directory's life (and no
-			// manifest lists an obsolete one again), so its files are safe to remove
-			// whenever this runs.
 			files := segmentFiles(j.s.dir, ref.id)
 			j.mu.Lock()
 			for _, p := range files {
@@ -176,15 +184,19 @@ func (j *janitor) drain() {
 	for p := range j.pending {
 		paths = append(paths, p)
 	}
-	stopped := j.stopped
+	stopped, background := j.stopped, j.running
 	j.mu.Unlock()
 	for _, p := range paths {
+		if background && !stopped {
+			prio.Step() // the loop's drain steps aside for searches; one on a search's release never waits
+		}
 		j.removeOne(p, stopped)
 	}
 }
 
-// removeOne removes p if it is still pending; on failure it stays pending, unless the
-// janitor has stopped.
+// removeOne removes p if it is still pending (not forgotten because it is about to be
+// written again, nor removed by another drain); on failure it stays pending, unless
+// the janitor has stopped.
 func (j *janitor) removeOne(p string, stopped bool) {
 	j.removeMu.Lock()
 	defer j.removeMu.Unlock()
@@ -192,7 +204,7 @@ func (j *janitor) removeOne(p string, stopped bool) {
 	still := j.pending[p]
 	j.mu.Unlock()
 	if !still {
-		return // forgotten (about to be written again), or removed by another drain
+		return
 	}
 	err := j.remove(p)
 	if err != nil && !errors.Is(err, os.ErrNotExist) && !stopped {
@@ -202,17 +214,6 @@ func (j *janitor) removeOne(p string, stopped bool) {
 	j.mu.Lock()
 	delete(j.pending, p)
 	j.mu.Unlock()
-}
-
-// pendingFiles returns the files still waiting to be removed (for tests).
-func (j *janitor) pendingFiles() []string {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	out := make([]string, 0, len(j.pending))
-	for p := range j.pending {
-		out = append(out, p)
-	}
-	return out
 }
 
 // segmentFiles lists every file of segment id in dir: its segment or query files and

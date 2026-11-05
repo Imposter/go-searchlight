@@ -1,0 +1,781 @@
+# Changelog
+
+Searchlight's releases. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/). The release workflow
+publishes each version's section here as its GitHub release notes (RELEASING.md).
+
+## [2.0.0] - 2026-11-03
+
+Every shard has its own sequence, and a node commits to several shards at once. A write
+answers with a token in place of a seq, and reads wait on it shard by shard. On Postgres
+with NVMe storage, a node's commit path sustains 3.8-5.0× 1.8's changes per second on 8
+and 64 shards (2.2× across three nodes), and end to end a 64-shard index takes 1.95× the
+documents per second; one shard is unchanged below overload.
+
+### Changed (breaking)
+
+- **Per-shard sequences** ([docs/api.md](docs/api.md#conventions)): a change's `seq` is
+  its position in its shard's changelog. Seqs are contiguous per shard and commit in
+  order there; they repeat across shards. Each shard has a row in a new table,
+  `sl_shard_seq`, locked by the transactions that commit to that shard, in key order
+  (index name, shard), so commits to different shards run in parallel and never
+  deadlock; a mapping change or a drop locks every shard row of the index, in shard
+  order. `sl_counter` row 3 is the floor: new shards start at it, a dropped index
+  raises it past its shards' seqs, and a shard with no row stands at it. Row 1, the
+  1.x global sequence, is deleted when shard sequences come on (see Upgrading). Row 2
+  still issues copy epochs.
+- **A bulk commits shard by shard** ([docs/api.md](docs/api.md#bulk)): each shard's
+  operations commit in one transaction of their own, so a request is whole or nothing
+  only on one shard. On SQLite the whole request is still one transaction, but clients
+  must not rely on it.
+- **Per-item results for a failed shard**: when a shard's transaction fails (the
+  database cannot be reached, the deadline passes), every operation of that shard is
+  answered with that 5xx error in its item while the other shards' commit, and
+  `errors` is true. Only when nothing was written is the request itself an error
+  (5xx). With `percolate=true` only committed documents are percolated: a failed
+  shard's operations carry no `queries`.
+- **The token replaces the scalar seq for read-your-writes**
+  ([docs/api.md](docs/api.md#tokens)). Every write response carries `token`, an opaque
+  string naming, for each shard the write committed to (or found an unchanged document
+  on), the newest seq there, plus the index's incarnation. Tokens merge by per-shard
+  maximum.
+  - Reads take `wait_for=<token>` (`_search`, `_count`, `_percolate`, `_fields`, `GET`
+    of a document or saved query, the saved-query listing, and `_bulk` with
+    `percolate=true`) and wait only on the shards they read; a `GET` only on its
+    document's shard. A malformed token, a seq past its shard's newest committed seq, a
+    token of another incarnation of the index, or one naming a shard the index lacks
+    is a 400 at `params.wait_for`; so is `wait_for` on `_bulk` without
+    `percolate=true`.
+  - **`wait_for_seq` is removed**: it is refused by name with a 400 at
+    `params.wait_for_seq` ("wait_for_seq was removed in 2.0: pass the token a write
+    returned as wait_for").
+  - **`_bulk` responses lose their top-level `seq`** and gain `token` (absent when
+    nothing was written). Items keep their `seq`.
+  - **`percolated_seq` is replaced by `percolated_at`**, a token of where each shard
+    stood for the percolation. A shard percolated by another node's copy counts at the
+    generation that copy percolated at, so it covers saved queries written through any
+    node; a shard it does not name held no change.
+  - Single-document and saved-query writes keep `seq` (the document's own, for
+    `if_seq`) and add `token`. `if_seq`, `_seq` on hits, `version` and `current_seq` are
+    unchanged and remain per document.
+  - **Every write names where each item stands.** A `_bulk` item and a single write
+    answer `shard` (the shard the id routes to) and `seq` there: the seq it committed
+    at, or for a noop the stored target's. A versioned noop now answers that stored
+    `seq` (it had none) and a `token`, and a request's `token` names where its noops
+    stand. A client forms a token of exactly the items it cares about from their
+    `shard`, `seq` and the index's uid ([docs/api.md](docs/api.md#tokens)).
+  - **`committed`**, on `_bulk` and single writes: a token of only what the request
+    committed, never a noop's old seq. A shard committing at or below a seq an earlier
+    commit took means the database lost commits.
+  - **A `GET` of a document or saved query answers `shard` and a `token`** of it at
+    its seq.
+  - **Routing is a documented contract** ([docs/api.md](docs/api.md#routing)): an id's
+    shard is the 32-bit FNV-1a hash of its UTF-8 bytes modulo the shard count.
+- **Commit notifications** on Postgres are sent after the commit, coalesced, with
+  `synchronous_commit` off. A lost one costs a copy up to half `max_lag` (1 s by
+  default).
+
+### Added
+
+- **`write_transactions`** ([docs/operations.md](docs/operations.md#every-setting)), a
+  node setting: a node's group committer has a lane per shard and runs up to this many
+  transactions at once (16 by default, at most half the store's write pool; 1 on
+  SQLite, where a request's shards commit together in one transaction). It bounds the
+  writes' share of a node's 64-connection pool, which its reads share: Postgres's
+  `max_connections` must still cover nodes × 65 (the pool and `LISTEN`). A refused
+  connection (53300) fails with an error that names the pool size and
+  `max_connections`.
+- **Retry guidance** ([docs/api.md](docs/api.md#retrying-after-a-5xx)): a 5xx response,
+  or a 5xx bulk item, may or may not have committed. Retry with conditions that make a
+  repeat safe: the same unconditional upsert body (an unchanged upsert is a noop,
+  unless `detect_noop=false`), `if_seq`, `version`, or `op_type=create`. A delete of
+  nothing is a 404.
+- Schema migration 7 creates `sl_shard_seq` (empty until shard sequences come on) and
+  `sl_nodes.seq_scheme`, and re-keys `sl_changes` by (index name, shard, seq). On
+  Postgres and MySQL it keeps an index on `seq` alone for the rolling-upgrade window, to
+  be dropped in 2.1.
+- **`shard_seqs`**, a feature in `sl_features` the leader turns on once no node from
+  before 2.0 is live. Until then every commit takes the global sequence, as 1.x's do,
+  so a cluster upgrades in place.
+
+### Upgrading
+
+A cluster upgrades from 1.8 in place, one node at a time, under load
+([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)). From an earlier
+1.x, upgrade to 1.8 first. The chaos suite's `TestRollingUpgradeFromRelease` does it
+from v1.8.0, with no client error and nothing lost.
+
+1. **Make clients work with both releases.** While 1.8 and 2.0 nodes both serve, the
+   same request may reach either. 1.8 refuses `wait_for` and 2.0 refuses
+   `wait_for_seq`, so send neither until every node runs 2.0, or send each node its own.
+   Accept a bulk response with either `seq` (1.8) or `token` (2.0), and on
+   `_bulk?percolate=true` either `percolated_seq` (1.8, a seq) or `percolated_at` (2.0, a
+   token). Once every node runs 2.0, use `token`, `wait_for` and `percolated_at`
+   (scrape-bot among the clients).
+2. **Upgrade the nodes one at a time.** The first 2.0 node runs migration 7, after which
+   no 1.x binary starts against the database: finish the rollout, and terminate old pods
+   rather than isolating them. Until every node runs 2.0, every commit takes the global
+   sequence, as 1.8's do. That's correct for both releases, but writes don't run in
+   parallel yet.
+3. **The switch is automatic.** Once every node heartbeats 2.0, and any other has been
+   silent past `dead_after` plus `lease_ttl` with no live lease, the leader turns shard
+   sequences on (`shard_seqs` in `sl_features`, and a log line). Writes wait while it
+   seeds a row per shard of every index: about 0.1 s for 12,800 shards. If a 1.8 node never
+   leaves, the cluster stays on the global sequence. A 1.8 node that comes back after
+   the switch without restarting gets an error for every write, mapping change, drop
+   and head read: it writes nothing outside the shard sequences.
+4. **No rollback but a restore.** As with every migration, going back to 1.8 means
+   restoring the database.
+
+**Migration 7 builds indexes on the changelog.** On Postgres it builds them
+`CONCURRENTLY`, outside its transaction, then holds `sl_changes`' lock only to swap the
+key onto one: three million changelog rows took 7.5 s on an NVMe workstation, with no
+read or write waiting on a lock (swapped in the transaction, every read waited 5.9 s).
+MySQL rebuilds the table in place online, about 18 s per million rows. SQLite rebuilds
+it, about 33 s per three million, while its one node is down. `SELECT count(*) FROM
+sl_changes` beforehand tells you what to expect.
+
+## [1.8.0] - 2026-10-31
+
+### Added
+
+- **A `terms` order by a percentile** ([docs/api.md](docs/api.md#terms-order)), as
+  Elasticsearch's: `"order": {"load.99": "asc"}` orders by a `percentiles`
+  sub-aggregation's value at one of its `percents`, and `{"ranks.100": "desc"}` by a
+  `percentile_ranks` one's at one of its `values`. The percent is read as
+  Elasticsearch reads it (`"50"`, `"50.0"`, `"5e1"`), and one the sub-aggregation does
+  not hold is a 400 naming those it does. Across shards it follows the rules of every
+  order by a sub-aggregation: each shard orders its terms by its own digest, and the
+  coordinating node orders the merged terms by the merged digest's value, the one each
+  bucket shows; the docs describe what is approximate.
+- **An order key's member in brackets**, as Elasticsearch's paths take it:
+  `"prices[avg]"` is `"prices.avg"`, and `"load[99.9]"` is `"load.99.9"`.
+- Search wire level 11: a search ordering by a percentile, or naming a member in
+  brackets, reaches only nodes of this release or later, and is refused with a
+  retryable 503 by an older peer during a rolling upgrade.
+- **api/openapi.yaml describes every aggregation**: an `Aggregation` schema per type
+  (`terms` with its `order`, `include` and `exclude`, `range`, `histogram`,
+  `date_histogram`, `composite` with its sources, `stats`, `min`, `max`, `cardinality`,
+  `percentiles`, `percentile_ranks`, `top_metrics`, `filter`, `filters`, `global`) and
+  the result of each (`AggregationResult`), where it held only prose before, and a
+  hit's `sort` values (`SortValue`, null for a hit without one).
+
+### Fixed
+
+- The problem of an aggregation nested where it cannot be (a `filter` under a
+  `filters`, sub-aggregations under a metric) lists every type the place takes,
+  `top_metrics` included, and says that `composite` and `global` are top level only.
+
+## [1.7.0] - 2026-10-28
+
+### Added
+
+- **`percentiles` and `percentile_ranks` aggregations**
+  ([docs/api.md](docs/api.md#search-and-count)), Elasticsearch's, over number and date
+  fields: `percents` (1, 5, 25, 50, 75, 95 and 99 by default) or `values`, `keyed`
+  (`{"values": {"50.0": v}}`, or a list of `{"key", "value"}`) and
+  `tdigest.compression` (10 to 1,000, 100 by default). Top-level, as a metric
+  sub-aggregation of every bucket aggregation, under `filter`, `filters` and `global`,
+  and on a nested field's sub-field with `where`, as `stats` is. Each collects a merging
+  t-digest that shards merge: exact while the values hold at most `compression`
+  distinct values, and past that within 0.15% of a rank on the data tested (0.08% at
+  the 1st and 99th percentiles and beyond), the least and greatest values exact. At most
+  100 percents or values each, none twice. A search holding one needs search wire
+  level 9, so it reaches only nodes of this release or later (503 while only older
+  copies serve a shard).
+- **`top_metrics`** ([docs/api.md](docs/api.md#top_metrics)): fields of the documents
+  first by a sort, as Elasticsearch's top_metrics: `{"metrics": [{"field": "price"}],
+  "sort": {"changed_at": "desc"}, "size": 1}` answers `{"top": [{"sort": [...],
+  "metrics": {"price": 12}}]}`. Top level, under `filter`, `filters` and `global`, or
+  per bucket as a sub-aggregation. Equal sort values go to the least `_id`, so the
+  answer is exact and the same however documents spread over shards. `size` is at most
+  10, `metrics` at most 10.
+- **A `terms` aggregation's `order`** ([docs/api.md](docs/api.md#terms-order)):
+  `{"_count": "asc"|"desc"}`, `{"_key": ...}`, or a metric sub-aggregation's value
+  (`"low"`, `"prices.avg"`, `"latest.price"` for a `top_metrics` of size 1), or a list of
+  them for tie-breaks. The default, `_count` descending, is unchanged. Ordered by
+  `_key` the top `size` are exact; ordered by a sub-aggregation or by `_count`
+  ascending, each shard orders every term exactly and returns `shard_size` of them
+  (10,000 by default), so the answer is exact while no shard holds more distinct
+  values, and says `doc_count_error_upper_bound: -1` where it cannot tell.
+- **`composite`** ([docs/api.md](docs/api.md#composite)): every combination of its
+  `sources`' values (`terms`, `histogram`, `date_histogram`), `size` buckets a page (at
+  most 10,000), paged with `after` and the answer's `after_key`, with metric
+  sub-aggregations per bucket. Exact, and every bucket is walked exactly once.
+- Search wire level 10: a search with any of the three reaches only nodes of this
+  release or later, and is refused with a retryable 503 by an older peer during a
+  rolling upgrade.
+
+## [1.6.0] - 2026-10-26
+
+Write efficiency and read latency on small CPU budgets: unchanged documents are noops,
+abandoned bulks stop, each document is analyzed once on its node, searches go before
+background work, and counts and facets can accept a bounded staleness.
+
+On `slbench writeload` (one core, Postgres, 150k listings with nested variants, 500-document
+bulks percolated with matches and inner hits, two readers of counts and facets), with half
+of each bulk's documents unchanged, writes went from 2,517 to 3,991 documents a second (bulk
+p50 180 to 63 ms, p95 353 to 259 ms) and reads' p95 from 267 to 152 ms; with every document
+changed, from 2,716 to 2,834 a second, and reads' p95 from 214 to 161 ms, or 52 ms with
+`max_staleness: 5s`.
+
+### Added
+
+- **`percolated_seq`** in a `_bulk?percolate=true` response
+  ([docs/api.md](docs/api.md#bulk)): every saved query committed at or below it was
+  percolated against (the least, over the shards, of the seq the copy percolating it
+  held every change up to). Use it, not `seq`, to tell which saved queries an answer
+  covers: `seq` now covers unchanged documents' stored seqs (below), which can be far
+  older than the percolation.
+- **`detect_noop`** (`PUT .../docs/{id}` and `_bulk`, `true` by default): see
+  unchanged documents under Changed. Schema migration 6 adds `body_hash` and
+  `hash_seq` to `sl_documents` for it (nullable; nothing is rewritten), a rolling
+  upgrade: a document written by an older release has no hash until it is written
+  again, and 1.5 nodes keep working (their writes leave the hash behind, which is then
+  not trusted), but as with every migration a 1.5 binary refuses to start once the
+  first node has migrated, so finish the rollout
+  ([upgrade notes](docs/operations.md#upgrades-and-rolling-restarts)).
+- **`max_staleness` for counts and size-0 searches**
+  ([docs/api.md](docs/api.md#search-and-count)): a duration (at most 1h) in the body of
+  `_count` or of a `_search` with `size` 0. Each shard may answer with its copy's
+  newest cached result for the same search under the same mapping computed within it,
+  although the copy has refreshed writes since, so under continuous writes counts and
+  facets compute about once per `max_staleness` instead of at every refresh.
+  `wait_for_seq` and `request_cache: false` ignore it. It needs no wire level: a peer
+  before 1.6 ignores it and answers with a current result.
+- **`background_share`** ([docs/operations.md](docs/operations.md#cpu)): on a node of
+  one core (GOMAXPROCS 1), searches go before background work. A shard search marks
+  its work, and while searches occupy every processor, merges, refresh builds, write
+  and apply analysis and file removal step aside at their checkpoints for the first
+  `1 - background_share` (0.75 by default) of each 100 ms, and run the rest beside the
+  searches (so under reads that never stop, about half of `background_share` on one
+  core). `1`, the default from 2 cores, gives searches no priority.
+- **`slbench writeload`**: a sustained `_bulk` load (scrape-bot shaped listings with
+  nested variants, percolated with matches and inner hits) and the counts and facet
+  searches beside it, on a node of its own GOMAXPROCS, with the write throughput, the
+  bulk and read latencies, and the segments and merge backlog over the load.
+- `searchlight_replica_handed_off_total`, and `result="stale_hit"` on
+  `searchlight_search_request_cache_lookups_total`.
+
+### Changed
+
+- **Unchanged documents are noops by default** ([docs/api.md](docs/api.md#documents)):
+  an upsert without `if_seq`, `create` or `version` whose body is byte for byte the
+  stored document's answers `"result": "noop"` with the stored document's `seq`, and is
+  not analyzed, committed, indexed or logged. In `_bulk` it applies item by item, to
+  ids only one operation of the request names, and under `percolate=true` the item
+  still lists its `queries` and `matches` (it is percolated as a write of the same
+  body, against the saved queries as they are now). One batched read by id decides it,
+  before the request commits. **Compatibility:** such an upsert no longer gets a new
+  seq (nor re-indexes the document): its item's `seq` is the stored one, and the
+  response's `seq` covers it, so `wait_for_seq` still reads it back, but a client that
+  took `seq` as the seq the percolation saw should read `percolated_seq`.
+  `detect_noop=false` restores the old behaviour.
+- **A bulk whose client went away stops** before the next document it would analyze
+  and before its group commit's transaction begins; once committed, its percolation and
+  refresh wait end too. One whose transaction is under way may still commit after the
+  client has gone (a transaction is cancelled only before its commit, and only once
+  every request in it has gone). It commits in one transaction, so whole or not at all, and the
+  client's retry of the same bulk is cheap and idempotent: if the abandoned attempt
+  committed, the retry's upserts are noops at their stored seqs (still percolated).
+- **Each document is analyzed once per write on its node**: the node that takes a write
+  hands its analyzed documents to its own copies of their shards, which apply them
+  without analyzing the bodies again when the documents are their changes' and every
+  field they hold has the same type under the writer's mapping and theirs (dynamic
+  true or strict), at most 64 MiB of them per node at once. Other nodes' copies analyze
+  the bodies as before, and a write analyzes in full only the documents it percolates
+  or hands off.
+- **The request cache's memory is cut into 8 parts** under their own locks, each
+  bounded by an eighth of `request_cache_size`; one result takes at most a sixteenth of
+  it (an eighth before).
+
+## [1.5.0] - 2026-10-19
+
+Versioned writes and saved queries in `_bulk`, percolation that reports versions, sequence numbers and matched nested objects, nested saved queries anchored on their inner conditions, and sub-aggregations and merged inner hits for nested fields.
+
+### Added
+
+- **Sub-aggregations under a `terms` on a sub-field**
+  ([docs/api.md](docs/api.md#nested-fields)): `stats`, `min`, `max`, `cardinality` and
+  one level of `terms`, per bucket over its documents (a top-level field, each document
+  once) or over its objects (a sub-field of the same nested field, narrowed by the
+  sub-aggregation's own `where`). A `terms` there is never cut per shard (its buckets
+  carry the outer bucket's error bound where a shard cut that); its
+  buckets count towards the 65,536 as shards collect them. Search wire level 7 keeps them off
+  peers of an earlier release (503 with no other copy).
+- **Client versions** ([docs/api.md](docs/api.md#documents)), Elasticsearch's external
+  versioning, on documents and saved queries: `version=N` on `PUT` and `DELETE`, and
+  `"version": N` in a `_bulk` action, applies only when N is higher than the stored
+  version, and is otherwise a noop (`"result": "noop"`, no seq), never a 409. Versions
+  only rise: an unversioned write keeps the stored version, and a delete keeps it as a
+  tombstone, so a replay of an older write after it is a noop too. A versioned delete
+  of an absent id is a 404 that records its version above the tombstone, a noop at or
+  below it. Tombstones are kept for the index setting `gc_deletes` (24 h by default, as
+  Elasticsearch's), then pruned by the cluster's leader. `GET`, listings and `_bulk`
+  items return `version`. Schema migration 5 adds `version` to `sl_documents` and
+  `sl_queries` and the table `sl_tombstones`. Until every node runs 1.5, versions and
+  percolation matches may disagree with `GET`.
+- **Saved queries in `_bulk`**: `query_upsert` (followed by `{"query": ..., "meta":
+  ...}`) and `query_delete` actions beside the documents, in one transaction, with
+  per-item results. With `percolate=true` the documents percolate against the saved
+  queries as the whole request leaves them (its own query writes included, wherever
+  they are in it).
+- **A lean saved-query listing**: `GET .../queries?fields=id,version` pages ids and
+  versions without reading the queries' trees or meta.
+- **Percolation matches with versions and inner hits** ([docs/api.md](docs/api.md#percolation)):
+  `percolate_matches=true` on `_percolate` and `_bulk?percolate=true` adds `matches`,
+  each matched saved query as `{"id", "version"}` beside the unchanged `queries`, and
+  `percolate_inner_hits=true` adds to each the inner hits its nested nodes declare,
+  `{"total", "offsets"}` by key, as a search reports them for the document (at most
+  100,000 offsets per request, charged to `max_inflight_read_bytes`; past them a 422
+  `too_many_matches`). Percolate wire level 4 keeps them off peers of an earlier
+  release.
+- **Document seqs in answers**: a search's `seq_no: true` gives each hit `_seq`, the seq
+  of the change that wrote the version its copy holds (search wire level 8), and
+  `_percolate` gives each found stored document its `_seq`. Each copy keeps the seqs in a
+  column of its own from this release; documents indexed before have none until written
+  again.
+
+### Changed
+
+- **Percolation fans out to every shard at once** instead of one after another (this
+  node's own copies at once for 64 documents or more: 200 documents on 8 shards take
+  2.5 ms against 3.3 ms; fewer run in turn while the peers answer), and
+  merges their matches; a shard that fails cancels the rest.
+- **Saved-query listings pick a page's ids from each shard's primary key range** in one
+  statement (each range cut at the page size), then read the trees and meta of those ids
+  alone, so a page of 1,000 costs the same at 100 or 1,000,000 queries (it sorted every
+  query of the index by id before).
+- **Query segments are format `percolate/4`**, which keeps each saved query's version.
+  Segments of `percolate/3` open as they are, their queries with no version, until
+  merges rewrite them; a release before this one refuses a `percolate/4` segment, so a
+  copy that has written one cannot be downgraded.
+- **Saved nested queries anchor on their inner conditions** instead of being checked
+  against every document: a nested node anchors as its inner query would, on the
+  path's sub-fields, and a document holds the atoms of each of its objects; only an
+  inner query with no positive conjunct stays always-check. On
+  BenchmarkPercolateNested (100k saved searches, 70% variant searches, a tenth of all
+  with no other condition), always-check queries fall from 9,867 to 0 and candidates
+  from 10,492 to 2,292 per document: 6,692 documents a second against 1,564, p50
+  255 µs against 906 µs. Answers are exactly as before.
+- **Inner hits merged by name** ([docs/api.md](docs/api.md#nested-fields)): nested nodes
+  of one path giving one `inner_hits` name, in the query and the `post_filter`, share
+  one set of inner hits: every member satisfying any of their queries once, `total`
+  exact, by the largest of their sizes. Such a request was a 400; a name given to
+  nodes of two paths still is. Peers need no new wire level: only the coordinating
+  node checks names and reads inner hits.
+
+## [1.4.0] - 2026-10-18
+
+Nested fields: one document per product with its variants, queried, counted and sorted per variant.
+
+### Added
+
+- **Nested fields**, Elasticsearch's `nested` type ([docs/api.md](docs/api.md#nested-fields)):
+  one document per product with its variants, each matched apart. A mapping types a
+  field `{"type": "nested", "fields": {"size": "keyword", "price": "number", ...}}`
+  (sub-fields of any type but a point, added later by a mapping patch), and a document
+  gives an array of objects, at most 10,000 members. Sub-fields are named by their full
+  names (`_v.size`) everywhere.
+  - `{"nested": {"path": "_v", "query": ...}}` holds when one object satisfies the whole
+    query (a `not` inside applies per object), in queries, `post_filter`, filter
+    aggregations and saved queries; `inner_hits` returns each hit's matching members,
+    by offset, with the sub-fields asked for (at most 10,000 inner hit objects per
+    response: `size` times the `inner_hits` sizes).
+  - `terms`, `stats`, `min`, `max` and `cardinality` on a sub-field, with an optional
+    `where` choosing the objects: `terms` counts each document once per value. A sort
+    on a sub-field orders hits by the least or greatest value among their objects
+    (`mode`, `where`), a hit with none last.
+  - Each segment indexes a nested field's objects as an object segment of their own,
+    in a NESTED section (segment format 4.2; a segment without one is written as
+    before, byte for byte); documents, deletes, totals and caches stay the documents'.
+  - Search wire level 6 and percolate wire level 3 keep nested reads off peers of an
+    earlier release (503 with no other copy). Nodes heartbeat mapping types 2: a
+    nested field is refused (409, naming the nodes) while a node of an earlier release
+    is live, and once one exists no node can be downgraded below this release
+    ([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)).
+
+### Changed
+
+- A mapping's or a `PATCH .../mapping`'s invalid field type is now a 400 located at the
+  field (`mapping.fields.<name>`, `fields.<name>`), not at `mapping` or `fields`.
+- The request cache's key format is 4: entries of earlier releases are not read.
+
+## [1.3.0] - 2026-10-17
+
+Point fields and box queries, and reads that retry a serving copy their view had not listed yet.
+
+### Added
+
+- **Point fields and box queries**, Elasticsearch's `point` field and Lucene's
+  `XYPoint` ([docs/api.md](docs/api.md#point-fields)). A mapping types a field
+  `{"type": "point", "x": "number"|"date", "y": "number"|"date"}`, and a document gives
+  a list of `[x, y]` pairs or one pair, a date axis taking what a date field takes.
+  `{"field": "seen", "op": "box", "value": {"x": {"gte": "now-7d/d"}, "y": {"gte": 4}}}`
+  matches a document with one point inside on both axes: any of `gt`, `gte`, `lt` and
+  `lte` per axis, either axis optional, date math on a date axis (resolved once per
+  request by the coordinator, and at each percolation for a saved query). It composes
+  in `all`, `any`, `not`, `post_filter`, `filter` and `filters` aggregations and saved
+  queries; `exists` works on point fields; aggregations and sorts on them are refused.
+  - Each segment indexes a point field in a k-d tree, in a new XY section (segment
+    format 4.1, which a 4.0 reader ignores; a segment without a point field is written
+    as 4.0, byte for byte as before). A box over 10M points takes 0.2 to 0.6 ms at
+    100k matches or fewer, 1.5 to 21 times faster than a scan of the points sorted
+    by x, except for a bound on x alone ([docs/architecture.md](docs/architecture.md)).
+  - Search wire level 5 and percolate wire level 2: a box search, and a percolation of
+    an index with a point field, are not answered by a peer of an earlier release,
+    which would refuse the op or misread the mapping; with no other copy they are a
+    503 until the upgrade is done.
+  - The request cache keys a box by its resolved bounds; a box reading `now`
+    unrounded is never cached, as any such date math is.
+  - Schema migration 4 adds `sl_nodes.mapping_types`, the mapping field types each
+    node reads. A point field (at index creation or by a mapping patch) is refused
+    with a 409 naming them while a node of an earlier release is live, which could not
+    decode the mapping. Once a point field exists, no node can be downgraded below
+    this release ([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)).
+
+### Fixed
+
+- **A remote read no longer fails while another copy of its shard serves.** A
+  coordinator read the copy table again only when its view listed no serving copy of a
+  shard; when the view (which can trail the database by a refresh) listed one, and that
+  one failed, a search, percolation, get or count answered 503 "no copy of shard N of
+  index X answered" though another copy was serving. Once every copy it knows of has
+  failed (or refused it for an older wire level), a read now reads the copy table again,
+  once per shard (shards of the request, and concurrent reads, share one read), and
+  tries the serving copies it has not tried, a peer back at a new address included. The
+  read waits on the re-read for at most a quarter of its remaining time and 1 s, so a
+  slow database leaves time for the coordinator's own stale copy to answer instead; the
+  registry read itself runs on for the reads after it, and waiting for the routing
+  reads' turn now gives up at the request's deadline too. Date math
+  stays resolved once and `wait_for_seq` holds. `searchlight_cluster_read_rereads_total`
+  counts the re-reads, by `op` and `result` (`found`, `none`, `timeout`).
+- **A rejected negated pattern no longer changes how later patterns fold.** Compiling a
+  `terms` include or exclude pattern with a negated class (`[^\t]`) appended to the
+  process-wide table of case-folded code points, so a later `[A-C]` stopped matching
+  `a` until the process restarted, and concurrent searches raced on the table.
+- **A Windows node no longer needs `GODEBUG=asyncpreemptoff=1` set.** The Go runtime can
+  corrupt a thread's registers when it preempts that thread while Windows is handling an
+  exception on it ([golang/go#79249](https://github.com/golang/go/issues/79249), fixed
+  upstream for Go 1.28, in no release yet), and the node then crashes with an access
+  violation at a small address.
+  The Windows release binary now links `asyncpreemptoff=1` in as the runtime's default
+  ([tools/ldflags.sh](tools/ldflags.sh), also used by `make build`), and a Windows binary
+  built without it, such as by `go install`, starts itself again with the setting, as a
+  second process. `make` now needs `sh` on PATH (on Windows, Git Bash's). An
+  `asyncpreemptoff` in `GODEBUG` still wins, so `GODEBUG=asyncpreemptoff=0` turns
+  preemption back on ([docs/operations.md](docs/operations.md#the-binary)).
+
+## [1.2.0] - 2026-10-17
+
+Fast aggregations: a shard request cache (in memory, optionally Redis), breadth-first `terms`, `min`/`max`, a cardinality `threshold`, global ordinals that survive refreshes, and a `timeout` that bounds the whole shard search.
+
+### Added
+
+- **The shard request cache**, Elasticsearch's, for counts and aggregation-only
+  searches ([docs/operations.md](docs/operations.md#request-cache)): a search with
+  `size` 0 is answered shard by shard from an identical search's result over the same
+  shard contents, and stored otherwise. Keys hold the request (date math resolved,
+  never its `timeout`) and what the shard holds, so a refresh that writes, a delete, a
+  merge or a remap misses and no hit is ever stale; concurrent identical searches
+  compute once, each waiting within its own `timeout`. Never cached: a search with
+  hits, a `from` or a `search_after`; date math reading `now` unrounded (`now-7d`;
+  `now-7d/d` is cached); a result that timed out.
+  - `request_cache: false` on `_search` keeps a search out of it
+    ([docs/api.md](docs/api.md#search-and-count)). It travels to peers without a new
+    wire level: an older peer has no cache to keep it out of.
+  - In memory, up to `request_cache_size` (128 MiB by default; `0` for none).
+  - Optionally in front of a Redis (`request_cache_redis_url`, with
+    `request_cache_redis_password`, `_prefix`, `_ttl`, `_timeout` and
+    `_max_entry_bytes`; the URL and the password also from `_FILE`), shared by every
+    node and shard copy and kept across restarts. Its entries are keyed by the shard's
+    newest change the copy holds, so writes to other shards and indexes leave them be,
+    and by this binary's version. A Redis that is down or slow fails no search: each
+    call is bounded (50 ms by default, and a tenth of the search's time left), a breaker
+    skips it after 5 failures in a row, and failures are logged and counted. What is
+    read back is bounded and checked; Redis is trusted as the database is.
+  - Metrics: `searchlight_search_request_cache_lookups_total` (by store and result),
+    `_errors_total`, `_evictions_total`, `_stored_bytes_total`,
+    `_writes_dropped_total`, `_store_open_ratio`, `_size_bytes` and `_entries`.
+- The benchmark sends Searchlight's searches with `request_cache: false`, as it does
+  Elasticsearch's.
+- **`min` and `max` aggregations**, Elasticsearch's: `{"value": x}`, or `{"value":
+  null}` when no document has one (Unix milliseconds on a `date` field, as `stats`
+  gives them), at the top level, under `filter`, `filters` and
+  `global`, and as a bucket aggregation's sub-aggregation. Each keeps one value per
+  bucket; over a dense hit set it reads the point index from the end sought until a
+  block holds a hit ([docs/api.md](docs/api.md#search-and-count)).
+- **`threshold` on `cardinality`**: `{"cardinality": {"field": "brand", "threshold":
+  2}}` answers exactly with the number of distinct values when there are fewer than
+  the threshold, else the threshold (1 to 65,536; not Elasticsearch's
+  `precision_threshold`, and not with `precision`). A segment stops once it has seen
+  that many values, and so does the rest of its shard; a dense hit set is answered
+  from the dictionary's document frequencies. One value in several segments or shards
+  counts once. 100 cardinality aggregations over a million documents went from about
+  850 ms to 14 ms with a threshold of 2.
+- **`collect_mode` on `terms`**, `depth_first` or `breadth_first`, as Elasticsearch's.
+  Breadth first counts the values, makes each shard's `shard_size` cut, then reads
+  the hits again for the sub-aggregations of the values kept alone. Unset, a segment
+  whose field holds more distinct values than `shard_size` collects breadth first;
+  results are the same either way.
+
+### Changed
+
+- **Global ordinals survive refreshes.** A refresh's or merge's new segment list
+  derives a field's global ordinals from the old list's (the kept segments' maps
+  renumbered, the new segments' terms looked up and inserted), exactly as a full
+  build would make them, when that is cheaper than merging every dictionary again;
+  after each refresh or merge the fields aggregated in the last 10 minutes are
+  rebuilt in the background. Every build, a search's or a warm's, takes a slot of
+  one pool of a quarter of the CPUs, searches' first; a search never waits on a
+  queued build, and on a running one at most 250 ms; a shard's field has one build
+  in flight, which a newer generation's supersedes; a closing shard cancels its
+  builds, waits for them and drops its entries. A build runs once for every search asking, detached from them: one a
+  search's deadline stops waiting for finishes and is cached for the next search
+  instead of being thrown away and paid again ([docs/architecture.md](docs/architecture.md)). New
+  metrics: `searchlight_search_ordinals_builds_total`,
+  `searchlight_search_ordinals_build_duration_seconds` and
+  `searchlight_search_ordinals_lookups_total`.
+- **`timeout` bounds each shard's whole search.** The deadline (the earlier of
+  `timeout` and `request_timeout`) now covers each shard's merge of its segments'
+  aggregations and the dense counts from the index, not only the segment scan:
+  segments stop a tenth of the budget (1 ms to 1 s) early, an aggregation whose
+  global ordinals are still building merges by term rather than wait past the
+  deadline, and only one the deadline cuts off even so is answered empty, with
+  `timed_out: true` ([docs/api.md](docs/api.md#search-and-count)). A search
+  cancelled during the merge returns its cancellation.
+- `stats`' `min` and `max` read `-0` as `0`, as `min`, `max` and every bucket key do.
+- A deadline that passes while a shard reads its hits again for breadth-first
+  sub-aggregations leaves that `terms` aggregation empty on the shard, with
+  `timed_out`, rather than counts its sub-aggregations do not match; a client's
+  cancel then is the search's error.
+- **Faster `terms` over many values.** A shard keeps its `shard_size` best terms by
+  selection rather than a sort of every term (the reduce its `size` likewise); the
+  parts of a large segment collected apart share count arrays, one per part counted
+  at once, rather than one per part; breadth-first sub-aggregations collect stats,
+  `min` and `max` into arrays by bucket, each hit's value read once; the reduce copies
+  a shard's bucket only when another shard returns its term too; and buckets are
+  written as JSON without building a map per bucket. Over a million documents and
+  150,000 distinct list values: the top 100 terms of 95% of the index from 23 to 10
+  ms, of 45% from 35 to 15 ms, and with a `stats` sub-aggregation (breadth first)
+  from 190 to 22 ms.
+
+### Fixed
+
+- **A histogram's empty buckets past 2^53 no longer hang the search.** Filling in a
+  `histogram` or fixed-interval `date_histogram` with `min_doc_count` 0 (the default)
+  counted bucket indices in a float64, which stops advancing past 2^53: buckets at
+  1e16 with an interval of 1 kept a reduce goroutine appending forever. Indices past
+  2^53 or not finite (a huge value over a tiny interval), and neighbouring keys that
+  round together (an offset huge beside the interval), now leave the histogram
+  sparse and `"truncated": true`, as one whose empty buckets pass the response's
+  65,536; a recomputed grid that starts or ends off the real buckets leaves it as it
+  is. Other histograms are filled as before.
+
+### Upgrading
+
+- A search with a `min` or `max` aggregation, or a cardinality `threshold` (search
+  wire level 4), is refused with a 503 rather than read from a node of an earlier
+  release, which would refuse the aggregation as unknown or estimate past the
+  threshold. `collect_mode` needs nothing: an earlier node collects depth first, with
+  the same results.
+
+## [1.1.0] - 2026-10-17
+
+Faceting: filter aggregations and `post_filter`, `terms` include and exclude, date math, and `from` paging.
+
+### Added
+
+- **Filter aggregations and `post_filter`**, so a facet panel is one search
+  ([docs/api.md](docs/api.md#search-and-count)):
+  - `filter` (a query), `filters` (keyed queries, with `other_bucket_key`) and
+    `global` (every document of the index, top level only), each holding any other
+    aggregation with its metric sub-aggregations. Their filters are planned and
+    cached as the query is, checked against the mapping at their own `loc`, and
+    reduced across shards and nodes as top-level aggregations are: `terms` error
+    bounds and the 65,536-bucket limit apply under them too;
+  - `post_filter` on `_search`: the hits, `total`, sort, `search_after` and `next`
+    obey it, the aggregations (all but `global`) do not. `_count` refuses it.
+- **Date math** on `date` fields, as Elasticsearch writes it: `lt`, `lte`, `gt`, `gte`
+  and `between` take `now` or a date, then `+N`/`-N` and `/` rounding in `y M w d h H m
+  s` (`{"field": "seen_at", "op": "gte", "value": "now-7d/d"}`), in UTC. Each bound
+  rounds as Elasticsearch's range query rounds it. `now` is one instant per request,
+  read by the coordinating node and used by every shard and peer. A saved query keeps
+  its expression and resolves it at every percolation.
+- **`include` and `exclude` on `terms`**, Elasticsearch's, for a facet's type-ahead
+  (`"include": "ni.*"`) and its picked values counted in the same search, outside the
+  top buckets too ([docs/api.md](docs/api.md#search-and-count)): an array of at most
+  1,000 exact values, compared normalized as the field's values are, or a pattern of
+  at most 1,000 characters over the whole normalized key, in a subset of Lucene's
+  regular expressions (literals, `.`, classes, `*` `+` `?` `{n,m}`, `|`, groups) run
+  as RE2 and folded as values are (`"Nike.*"` is `nike.*`). Exclude wins; both apply before `size` and `shard_size`, so the top buckets,
+  `sum_other_doc_count` and the error bounds are the chosen values'. Each segment
+  decides them once per distinct value, from its dictionary or, with few hits, as
+  values are collected. Patterns on number, date and bool fields, patterns that
+  cannot fold faithfully (`[ß]`, `[^A-Z]`), Lucene's other operators and partitions
+  are refused with a 400 at their `loc`; a null `include` or `exclude` is none.
+- **`from` on `_search`**, Elasticsearch's offset paging
+  ([docs/api.md](docs/api.md#search-and-count)): `"from": 40, "size": 20` skips the
+  first 40 hits in sort order. `from + size` is at most the new `max_result_window`
+  setting (10,000 by default, as Elasticsearch's `index.max_result_window`; at most
+  1,000,000), past which the search is a 400 at `loc` `from` pointing to
+  `search_after`; a `from` past 0 with `search_after` is a 400 at `from`. Each shard
+  returns its best `from + size` without bodies, the coordinator drops the first
+  `from`, and only the page's bodies are read. `next` is the page's cursor as
+  before, so a client can switch to `search_after` at any page; `total` and the
+  aggregations are the whole search's.
+
+### Changed
+
+- The 100-aggregation bound counts the aggregations under a `filters` aggregation once
+  per bucket.
+- A sub-aggregation named after a member of the bucket it is written in (`key`,
+  `doc_count`, ...) is refused with a 400, rather than overwritten in the response.
+- Problems are located under `aggregations` when the request spells it so.
+
+### Upgrading
+
+- During a rolling upgrade from 1.0.0, a search with a `post_filter` or a `filter`,
+  `filters` or `global` aggregation that would read a shard from a 1.0.0 node is
+  refused with a 503 (a 1.0.0 node does not apply them) until the shard has a copy
+  on an upgraded node; other searches are unaffected
+  ([docs/clustering.md](docs/clustering.md#rolling-restarts-and-upgrades)).
+- **Date math and older nodes.** Searches with date math need nothing: peers get
+  `now` resolved to numbers.
+  - A percolation (`_percolate`, `_bulk?percolate=true`) of **every index with a
+    `date` field** needs percolate wire level 1, whether or not any saved query uses
+    date math. Through an upgraded node, a shard with a copy on an upgraded node
+    percolates there. A shard whose other copies are all on 1.0.0 nodes is refused
+    with a 503 (`_bulk` commits, with `percolated: false`), unless the coordinating
+    node holds a copy of its own that cannot serve now (stale or recovering): the
+    request's first read of the shard then falls back to that copy, which answers
+    flagged `stale` or says why it cannot. Indexes without a `date`
+    field percolate as before.
+  - Saving a date-math query is not refused mid-upgrade. A 1.0.0 node percolating its
+    own copies matches none of its date-math conditions, and a 1.0.0 node coordinating
+    a percolation sends no `now`, so the upgraded peers it asks resolve date math at
+    their own clocks. Save such queries once every node is upgraded.
+  - Rolling back: a query segment holding a condition that reads `now` has a program
+    tag 1.0.0 does not know. A 1.0.0 node refuses it as corrupt and rebuilds the copy,
+    where the query then matches nothing; delete such queries, or rewrite them with
+    numbers, before rolling back. Segments without such a condition are unchanged
+    (format `percolate/3`).
+- Likewise a search with a `terms` `include` or `exclude` (search wire level 2) is
+  refused with a 503 rather than read from a node of an earlier release, which would
+  count every value.
+- Likewise a search with a `from` past 0 (search wire level 3) is refused with a 503
+  rather than read from a node of an earlier release, which would ignore `from` and
+  answer with the first page. Searches without `from` are unaffected. The new
+  `max_result_window` setting applies on the node that takes the search; set it
+  alike on every node.
+- `max_result_window` bounds `from + size`, so with `from` 0 it bounds `size` too, as
+  Elasticsearch's does: lowering it below 10,000 refuses (400 at `size`) searches
+  with a `size` above it that were answered before.
+
+## [1.0.0] - 2026-10-14
+
+The first release: a search engine that behaves like Elasticsearch for filtering,
+sorting, aggregations and percolation, and keeps its durable state in SQL. Licensed
+under the [MIT License](LICENSE).
+
+### Added
+
+- **The HTTP API** ([docs/api.md](docs/api.md), contract in
+  [api/openapi.yaml](api/openapi.yaml)), with bearer-token auth (read and write scopes):
+  - indexes with typed mappings (`keyword`, `text`, `keyword_list`, `number`, `bool`,
+    `date`; dynamic, non-indexing or strict), additive mapping changes, and shards and
+    `refresh_interval` per index;
+  - documents (`PUT`, `GET`, `DELETE`) with optimistic concurrency (`if_seq`) and
+    `op_type=create`, and `_bulk`, every operation of a request in one commit;
+  - search and count: boolean queries with words, phrases, substrings (`contains`, on
+    3-grams), prefixes and trigram similarity, case and Unicode (NFKC) folding;
+    sorting, `search_after` paging, and terms, range, histogram and stats
+    aggregations;
+  - read-your-writes through `refresh=wait_for` and `wait_for_seq`;
+  - saved queries and percolation (`_percolate`) of given and stored documents;
+  - a field catalogue, and `_cluster/health`, `_cluster/nodes` and `_cluster/shards`.
+- **Clustering** on Postgres or MySQL ([docs/clustering.md](docs/clustering.md)): every
+  node is the same binary and takes any request. Nodes register in the database and
+  find each other there; leases decide which node holds which shard copy; a new or
+  restarted copy recovers from a peer's segments, a recovery bundle in the database, or
+  the database's documents. Reads pick replicas adaptively and retry; a rolling restart
+  hands its copies over before the node stops. `replicas_per_shard` sets copies per
+  shard.
+- **Three SQL dialects**: Postgres, MySQL 8.0.19 or later, and SQLite (one node). The
+  database's changelog is the write-ahead log: a write is acknowledged once its
+  transaction commits.
+- **Operations**: one static, pure-Go binary for Linux, Windows and macOS; settings as
+  flags or `SEARCHLIGHT_*` variables, secrets from `*_FILE`; `/healthz`, `/readyz` and
+  Prometheus `/metrics` on a separate admin listener; JSON logs, OpenTelemetry traces
+  and metrics; `searchlight healthcheck` for container probes and `searchlight version`.
+- **Releases**: binaries for linux/amd64, linux/arm64, windows/amd64, darwin/amd64 and
+  darwin/arm64, built with Go 1.25.14, with SHA256SUMS; a multi-arch image,
+  `ghcr.io/imposter/searchlight` (linux/amd64 and linux/arm64, distroless, non-root, with
+  provenance and an SBOM), each carrying the licence and third-party notices; and deploy
+  samples: a three-node Postgres cluster behind nginx and a single SQLite node for Docker
+  Compose, and Kubernetes manifests.
+
+### Performance
+
+Against Elasticsearch 8.15.3 on the same 4-vCPU CI host, 1,000,000 documents, Searchlight
+on SQLite ([docs/benchmarks.md](docs/benchmarks.md)); every graded target passes:
+
+| Target | Searchlight | Elasticsearch 8 |
+| --- | --- | --- |
+| Bulk indexing, acknowledged = durable (T1) | 13.5k docs/s | 7.3k docs/s |
+| Filter, sort and aggregation latency (T2–T4) | p50 0.5–2.9 ms, p99 1.1–15 ms | p50 1.9–140 ms, p99 4.7 ms–2.2 s |
+| Percolation, 100k saved queries (T5) | 3,187 docs/s, server p99 783 µs per doc | 12.6 docs/s |
+| Resident memory per million docs (T6) | 2.42 GiB | 4.15 GiB |
+| Write to visible, p99 (T7) | 999 ms | 998 ms |
+| New replica to serving (T8) | 6.0 s | 28.5 s |
+| Node restart to serving (T9) | 1.1 s | — |
+
+Disk per million documents is 2.33 GiB against 1.5 GiB, for 3-grams on every keyword and
+text field. Replica failure (T10) is checked by the chaos suite rather than measured, and
+scale beyond RAM (T11) is not measured yet; nor is write throughput on Postgres and
+MySQL ([#69](https://github.com/Imposter/go-searchlight/issues/69)).
+
+### Upgrade notes
+
+For databases created by builds of `main` before this release
+([docs/operations.md](docs/operations.md#upgrades-and-rolling-restarts)):
+
+- **Schema migrations 1–3** run at start, on the first node to start: 1, the initial
+  schema; 2, compressed bodies (`body_z`, `payload_z`, `sl_nodes.body_codecs`,
+  `sl_features`; zstd compression turns on once every node reads it); 3, change nonces
+  (`sl_changes.nonce`). Each only adds columns and tables, in milliseconds, and nodes
+  already running an older build keep working beside it. A binary refuses a schema newer than it knows, so
+  rolling back means restoring the database.
+- **`cluster_token` is required on Postgres and MySQL**: a node there refuses to start
+  without it unless `insecure_no_auth` is set. A cluster of several nodes has one
+  already; set one on a single node before upgrading it.
+- **Segment format 4** is read from format 3 as it is; merges rewrite segments as they
+  go.
+
+### Known gaps
+
+From [docs/architecture.md](docs/architecture.md#known-gaps):
+
+- **Background scrub** ([#36](https://github.com/Imposter/go-searchlight/issues/36)): a
+  segment is checksum-verified when its copy opens, so bit rot after open is served until
+  the copy is next opened.
+- **A percolator format change rebuilds the whole copy**
+  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): document segments one
+  major version old are read as they are (format 4 reads format 3), but a change to the
+  saved-query segments' format (`percolate/N`) wipes the shard copy, documents included,
+  and rebuilds it, rather than rebuilding only its query segments.
+- **Scale beyond RAM and many nodes** (T11): designed for (memory-mapped segments, shards
+  across nodes) but not benchmarked yet.
+- No relevance scoring (BM25), stemming, synonyms or phonetic matching, and no
+  SQLite-to-Postgres migration tool ([#95](https://github.com/Imposter/go-searchlight/issues/95)).
+
+[2.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v2.0.0
+[1.8.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.8.0
+[1.7.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.7.0
+[1.6.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.6.0
+[1.5.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.5.0
+[1.4.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.4.0
+[1.3.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.3.0
+[1.2.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.2.0
+[1.1.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.1.0
+[1.0.0]: https://github.com/Imposter/go-searchlight/releases/tag/v1.0.0

@@ -26,10 +26,29 @@ const (
 // MinTokenBytes is the shortest token a tokens file may hold.
 const MinTokenBytes = 16
 
-// token is one API token, kept as its SHA-256 so every comparison takes the same time
-// whatever the token's length.
+// TokenSum is a token's SHA-256. Tokens are compared by sum, so a comparison takes the
+// same time whatever their lengths.
+type TokenSum [sha256.Size]byte
+
+// SumToken returns token's sum.
+func SumToken(token string) TokenSum { return sha256.Sum256([]byte(token)) }
+
+// Match returns 1 when s and o are equal and 0 otherwise, in constant time.
+func (s *TokenSum) Match(o *TokenSum) int { return subtle.ConstantTimeCompare(s[:], o[:]) }
+
+// BearerToken returns the token r's Authorization header presents under the Bearer
+// scheme (in any case), trimmed of white space, and whether the header uses that scheme.
+func BearerToken(r *http.Request) (string, bool) {
+	scheme, presented, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return "", false
+	}
+	return strings.TrimSpace(presented), true
+}
+
+// token is one API token.
 type token struct {
-	sum   [sha256.Size]byte
+	sum   TokenSum
 	write bool
 }
 
@@ -67,7 +86,7 @@ func loadTokens(path string) (*authenticator, error) {
 		if len(fields[0]) < MinTokenBytes {
 			return nil, fmt.Errorf("tokens_file: line %d: a token is at least %d bytes", line, MinTokenBytes)
 		}
-		t.sum = sha256.Sum256([]byte(fields[0]))
+		t.sum = SumToken(fields[0])
 		a.tokens = append(a.tokens, t)
 	}
 	if err := sc.Err(); err != nil {
@@ -80,22 +99,21 @@ func loadTokens(path string) (*authenticator, error) {
 }
 
 // check authorizes r for need: nil, or a 401 (no or unknown token) or 403 (a
-// read-only token on a write route).
+// read-only token on a write route). The presented token is compared against every
+// token, with no early exit, so the time taken says nothing about which token, if any,
+// matched.
 func (a *authenticator) check(r *http.Request, need scope) *Error {
 	if a == nil || need == scopeNone {
 		return nil
 	}
-	auth := r.Header.Get("Authorization")
-	scheme, presented, ok := strings.Cut(auth, " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || strings.TrimSpace(presented) == "" {
+	presented, ok := BearerToken(r)
+	if !ok || presented == "" {
 		return &Error{Status: http.StatusUnauthorized, Code: CodeUnauthorized, Detail: "a bearer token is required"}
 	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(presented)))
-	// Compare against every token, with no early exit, so the time taken says
-	// nothing about which token, if any, matched.
+	sum := SumToken(presented)
 	found, write := 0, 0
 	for i := range a.tokens {
-		eq := subtle.ConstantTimeCompare(sum[:], a.tokens[i].sum[:])
+		eq := sum.Match(&a.tokens[i].sum)
 		found |= eq
 		if a.tokens[i].write {
 			write |= eq

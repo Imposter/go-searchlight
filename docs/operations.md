@@ -24,7 +24,7 @@ front of it as the load balancer, see [nginx.md](nginx.md).
 | Port | Listener | Serves |
 |---|---|---|
 | 8780 (`listen`) | public | the API, and the internal peer API under `/_internal/` (cluster_token auth) |
-| 8781 (`admin_listen`) | admin | `GET /healthz`, `GET /readyz`, `GET /metrics` (no auth), `/debug/pprof/*` when `pprof` is on |
+| 8781 (`admin_listen`) | admin | `GET /healthz`, `GET /readyz`, `GET /metrics` (no auth), `/debug/pprof/*` when `pprof` is on (not `cmdline`, which could show secrets passed as flags) |
 
 - **Admin listener.** It binds to loopback, `127.0.0.1:8781`, by default. The image and
   the Kubernetes ConfigMap set `:8781` explicitly, so probes and Prometheus can reach it.
@@ -32,7 +32,71 @@ front of it as the load balancer, see [nginx.md](nginx.md).
   with `pprof=true` on a non-loopback `admin_listen` logs a warning at start.
 - **Peers** reach each other on the public port, at `advertise_address`.
 
+Each [release](https://github.com/Imposter/go-searchlight/releases) publishes what a
+deployment needs, none of which needs a checkout of the repository:
+
+- binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 and windows/amd64
+  (`searchlight-<version>-<os>-<arch>.tar.gz`, `.zip` on Windows), with `SHA256SUMS`;
+- the image `ghcr.io/imposter/searchlight:<version>`, for linux/amd64 and linux/arm64
+  ([Docker](#docker));
+- `searchlight-deploy-<version>.tar.gz`: the Compose samples with their `.env.example`,
+  nginx's config and the Kubernetes manifests ([Docker Compose](#docker-compose),
+  [Kubernetes](#kubernetes)).
+
+[CHANGELOG.md](../CHANGELOG.md) has each release's notes; read them before an upgrade.
+
 ### The binary
+
+From a release:
+
+```sh
+base=https://github.com/Imposter/go-searchlight/releases/download/v2.0.0
+curl -fsSLO "$base/searchlight-2.0.0-linux-amd64.tar.gz" -O "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf searchlight-2.0.0-linux-amd64.tar.gz
+install searchlight-2.0.0-linux-amd64/searchlight /usr/local/bin/
+```
+
+Each archive also holds `LICENSE` and `THIRD_PARTY_NOTICES`, the licences of Go and of
+every dependency linked into the binary.
+
+**macOS.** The darwin binaries are not signed or notarised. Downloaded with `curl` they
+run as they are; downloaded with a browser, macOS quarantines them and Gatekeeper refuses
+to open "searchlight". Clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine searchlight
+```
+
+or, after macOS refuses to run it once, choose **Open Anyway** in System Settings ›
+Privacy & Security (on macOS 14 and earlier, Finder's right-click **Open** also works);
+macOS remembers the choice.
+
+**Windows.** The node runs with the Go runtime's asynchronous preemption off, as if
+`GODEBUG=asyncpreemptoff=1` were set. The runtime can corrupt a thread's registers when
+it preempts that thread while Windows is handling an exception on it, such as a page
+fault in a mapped segment ([golang/go#79249](https://github.com/golang/go/issues/79249)),
+and the node then crashes with an access violation at a small address. The fix is in
+Go 1.28, and no release carries it yet. The release binaries have the setting built in;
+there is nothing to set. It costs nothing beyond a goroutine in a long, call-free loop
+sometimes waiting for its next function call to yield. An `asyncpreemptoff` of your own
+in `GODEBUG` wins: `GODEBUG=asyncpreemptoff=0` turns preemption back on. To see what a
+binary runs with, run it with `SEARCHLIGHT_DIAG_ASYNC_PREEMPT=1`: instead of starting a
+node it prints `asyncpreemptoff=1` (off) or `asyncpreemptoff=0` (on) after a second or
+so, and exits. `go version -m` does not show the setting.
+
+A Windows binary built another way (`go install`, or `go build` without
+[tools/ldflags.sh](../tools/ldflags.sh)'s flags) cannot change the setting once running,
+so it starts itself again with it and runs as two processes: a wrapper, which only
+waits, and the node, its child, which gets its arguments, environment, standard streams
+and console (none if the wrapper has none) and whose exit code the wrapper exits with. A
+service manager or supervisor tracks the wrapper's process id, and its stop still
+reaches the node: Ctrl+C and Ctrl+Break through the shared console, a stop sent to a
+wrapper with no console passed on to the node, and a killed wrapper takes the node with
+it (a job object). Build with `make build` or those flags to run as one process.
+
+Or build it from a checkout (`go install github.com/Imposter/go-searchlight/cmd/searchlight@v2.0.0`
+also works, and reports its version), then run it:
 
 ```sh
 make build                       # bin/searchlight, version from git describe
@@ -69,6 +133,8 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
   - 1, with one line on standard error, when it cannot start (a bad setting, a
     misconfigured store, a SQLite store another node uses) or when its shutdown failed.
 - **Help.** `searchlight -h` lists every setting.
+- **`searchlight version`** (or `--version`) prints the version it was built as, with its
+  Go version and platform: `searchlight v2.0.0 (go1.25.14, linux/amd64)`.
 - **`searchlight healthcheck [--live]`** probes the node on this host, for container
   healthchecks. It GETs `/readyz` (`/healthz` with `--live`) on `SEARCHLIGHT_ADMIN_LISTEN`,
   where an empty or unspecified host means `127.0.0.1`. It waits at most 2 s, and exits 0
@@ -76,64 +142,139 @@ SEARCHLIGHT_DATA_DIR=/var/lib/searchlight/data \
 
 ### Docker
 
-[`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
-`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`. The base images are
-pinned by digest. Dependabot (`.github/dependabot.yml`) proposes updates for them, for
-the compose images, for the Go modules and for the CI actions. The one exception is the
-kubeconform image that CI runs inside a `run:` step: Dependabot cannot see it, so it is
-bumped by hand, as the comment beside it says.
+Each release publishes `ghcr.io/imposter/searchlight`, for linux/amd64 and linux/arm64,
+tagged with its version (`2.0.0`). Its minor (`2.0`) and major (`2`) lines, and `latest`,
+point at the newest stable release of each: they only move forward, so a patch to an
+older line moves its own `<major>.<minor>` tag and nothing else. Pin the full version in
+production. The `sha-<commit>` tags are where the release workflow stages an image
+before it is tested; do not deploy them.
 
 ```sh
-make docker                                  # searchlight:dev; IMAGE=... to rename
+docker pull ghcr.io/imposter/searchlight:2.0.0
 docker run -d --name searchlight -p 8780:8780 -p 127.0.0.1:8781:8781 \
   -v searchlight-data:/var/lib/searchlight \
   -v "$PWD/secrets:/run/secrets/searchlight:ro" \
   -e SEARCHLIGHT_STORE_URL_FILE=/run/secrets/searchlight/store_url \
   -e SEARCHLIGHT_TOKENS_FILE=/run/secrets/searchlight/tokens \
-  searchlight:dev
+  ghcr.io/imposter/searchlight:2.0.0
 ```
 
 - **User.** It runs as uid/gid 65532.
 - **Defaults.** `SEARCHLIGHT_LISTEN=:8780`, `SEARCHLIGHT_ADMIN_LISTEN=:8781` and
   `SEARCHLIGHT_DATA_DIR=/var/lib/searchlight`, which is a volume.
 - **Labels.** It carries the OCI labels (version, revision, created, source).
+- **Licences.** `/usr/share/doc/searchlight` holds `LICENSE` and `THIRD_PARTY_NOTICES`.
+- **Provenance.** The published image carries a SLSA provenance attestation and an SBOM:
+  `docker buildx imagetools inspect ghcr.io/imposter/searchlight:2.0.0 --format '{{json .Provenance}}'`
+  (or `.SBOM`).
 - **`HEALTHCHECK`.** It runs `searchlight healthcheck` (readiness) every 5 s, with a
   2-minute start period. The image has no shell, so the binary probes itself.
 
-### Docker Compose: a three-node cluster
-
-[`deploy/compose.yml`](../deploy/compose.yml) runs three nodes on Postgres 17:
+To build the image from a checkout instead,
+[`deploy/Dockerfile`](../deploy/Dockerfile) builds a static (`CGO_ENABLED=0`,
+`-trimpath`) binary onto `gcr.io/distroless/static-debian12:nonroot`:
 
 ```sh
-docker compose -f deploy/compose.yml up --build -d
-docker compose -f deploy/compose.yml run --rm secrets cat /secrets/tokens    # the API tokens
-curl -H "Authorization: Bearer <write token>" localhost:8780/_cluster/health
+make docker                                  # searchlight:dev; IMAGE=... to rename
 ```
 
-- **Secrets.** A one-shot `secrets` service generates them on the first start, into a
-  volume: the Postgres password, the `store_url` built from it, the `cluster_token`, and
-  a tokens file with one read-write and one read-only token. The nodes read them through
-  `SEARCHLIGHT_*_FILE` and `tokens_file`. The compose file holds no secret.
-- **Ports.** The nodes serve the API on `127.0.0.1:8780`, `:8782` and `:8784`, and
-  their admin listeners on `:8781`, `:8783` and `:8785`.
-- **Addresses.** Each node's `advertise_address` is its service name.
+The base images are pinned by digest. Dependabot (`.github/dependabot.yml`) proposes
+updates for them, for the compose images, for the Go modules and for the CI actions. The
+one exception is the kubeconform image that CI runs inside a `run:` step: Dependabot
+cannot see it, so it is bumped by hand, as the comment beside it says.
+
+### Docker Compose
+
+Two samples run the published image, from a release's
+`searchlight-deploy-<version>.tar.gz` (or [`deploy/`](../deploy) in a checkout), with
+every path relative to the compose file:
+
+- [`compose.postgres.yml`](../deploy/compose.postgres.yml): three nodes on Postgres 17,
+  behind nginx;
+- [`compose.sqlite.yml`](../deploy/compose.sqlite.yml): one node on SQLite.
+
+```sh
+curl -fsSL https://github.com/Imposter/go-searchlight/releases/download/v2.0.0/searchlight-deploy-2.0.0.tar.gz | tar -xz
+cd searchlight-deploy-2.0.0
+cp .env.example .env                                                       # optional
+docker compose -f compose.postgres.yml up -d
+docker compose -f compose.postgres.yml run --rm secrets cat /secrets/tokens   # the API tokens
+curl -H "Authorization: Bearer <write token>" 127.0.0.1:8080/_cluster/health
+```
+
+The SQLite sample reads its API tokens from a `tokens` file beside it, mounted as a
+Compose secret:
+
+```sh
+printf '%s write\n' "$(openssl rand -hex 24)" > tokens
+docker compose -f compose.sqlite.yml up -d
+curl -H "Authorization: Bearer $(cut -d' ' -f1 tokens)" 127.0.0.1:8780/indexes
+```
+
+- **Settings.** [`.env.example`](../deploy/.env.example) lists what the samples read:
+  the image tag (`SEARCHLIGHT_VERSION`), the published address and ports, Postgres's user,
+  database, `max_connections` and `shared_buffers`, the log level, and the changelog and
+  recovery-bundle retention. Copy it to `.env` beside the compose file; its values are
+  the defaults. Any other setting is a `SEARCHLIGHT_*` variable in the compose file.
+- **Secrets.** In the Postgres sample, a one-shot `secrets` service generates them on the
+  first start, into a volume: the Postgres password, the `store_url` built from it, the
+  `cluster_token`, and a tokens file with one read-write and one read-only token. The
+  nodes read them through `SEARCHLIGHT_*_FILE` and `tokens_file`. Neither the compose
+  file nor `.env` holds a secret. The `store_url` is built once: changing
+  `POSTGRES_USER` or `POSTGRES_DB` later needs fresh `secrets` and `pgdata` volumes.
+- **Ports.** nginx serves the cluster's API on `SEARCHLIGHT_BIND:SEARCHLIGHT_HTTP_PORT`,
+  `127.0.0.1:8080` by default; the SQLite node on `SEARCHLIGHT_BIND:SEARCHLIGHT_API_PORT`,
+  `127.0.0.1:8780`. Set `SEARCHLIGHT_BIND=0.0.0.0` to serve other hosts, behind TLS
+  ([nginx.md](nginx.md#tls)). The cluster's nodes keep their own API on `127.0.0.1:8780`,
+  `:8782` and `:8784`, and every admin listener stays on `127.0.0.1` (`:8781`, `:8783`
+  and `:8785`).
+- **Addresses.** Each node's `node_id` and `advertise_address` is its service name, so it
+  reclaims its own copies when it is recreated.
 - **Health.** Postgres is checked with `pg_isready`, and each node with
   `searchlight healthcheck`.
 - **Stopping.** `stop_grace_period` is 75 s: `shutdown_grace` (5 s) plus
-  `shutdown_timeout` (60 s), plus 10 s of slack.
+  `shutdown_timeout` (60 s), plus 10 s of slack (72 s for the SQLite node, whose
+  `shutdown_grace` is 2 s).
 - **TLS.** The peer API runs in plain HTTP on the compose network, and the nodes log a
   warning that `cluster_token` crosses it in the clear.
-- **Load balancer.** An `nginx` service fronts the three nodes on `127.0.0.1:8080`,
-  using [`deploy/nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see
-  [nginx.md](nginx.md) for what it does and why. The nodes' own ports stay published
-  too.
+- **Load balancer.** An `nginx` service fronts the three nodes, using
+  [`nginx/searchlight.conf`](../deploy/nginx/searchlight.conf); see [nginx.md](nginx.md)
+  for what it does and why.
+
+**Upgrading.** Read the new release's notes in [CHANGELOG.md](../CHANGELOG.md), set
+`SEARCHLIGHT_VERSION` in `.env` to it, and run `docker compose -f <file> up -d` again.
+Compose pulls the new image and recreates the nodes; the first to start migrates the
+schema. That restarts every node of the cluster at once. To keep it serving, recreate
+one node at a time, as in [rolling restarts](#upgrades-and-rolling-restarts):
+
+```sh
+docker compose -f compose.postgres.yml pull
+docker compose -f compose.postgres.yml up -d --no-deps searchlight-1    # then wait until it is healthy
+docker compose -f compose.postgres.yml up -d --no-deps searchlight-2    # and so on
+```
+
+A newer release's deploy bundle may change the compose files too: compare them with
+yours before you switch to them.
+
+**From a checkout**, [`deploy/compose.yml`](../deploy/compose.yml) runs the same
+three-node cluster on an image built from the working tree, for trying a change out:
+
+```sh
+docker compose -f deploy/compose.yml up --build -d
+docker compose -f deploy/compose.yml run --rm secrets cat /secrets/tokens
+```
+
+It repeats `compose.postgres.yml`'s services, with `build:` in place of the published
+image; change the two together.
 
 ### Kubernetes
 
 [`deploy/k8s/`](../deploy/k8s) holds a StatefulSet of three, a headless Service for peer
 addresses, a client Service, an admin Service for Prometheus, a PodDisruptionBudget and a
 ConfigMap. It has been validated with `kubeconform -strict` against Kubernetes 1.27 and
-master.
+master. The same files are `k8s/` in a release's deploy bundle, and run that release's
+image, `ghcr.io/imposter/searchlight:<version>`; upgrade by changing the StatefulSet's
+image, which rolls the nodes one at a time.
 
 ```sh
 kubectl create secret generic searchlight \
@@ -167,9 +308,9 @@ kubectl apply -f deploy/k8s/
 
 ## Configuration
 
-`store_url` is required, and so is `tokens_file` unless `insecure_no_auth` is set. Every
-setting has one snake_case name, which is both the flag `--<name>` and the environment
-variable `SEARCHLIGHT_<NAME>`.
+`store_url` is required; so is `tokens_file`, and on Postgres or MySQL `cluster_token`,
+unless `insecure_no_auth` is set. Every setting has one snake_case name, which is both
+the flag `--<name>` and the environment variable `SEARCHLIGHT_<NAME>`.
 
 - **Precedence.** A flag wins over the environment, which wins over the default.
 - **Secrets from files.** `store_url` and `cluster_token` can also come from
@@ -216,7 +357,7 @@ unless `insecure_no_auth` is set.
 | `data_dir` | `data` | local segments, and recovery staging |
 | `tokens_file` | (none) | the API bearer tokens; required unless `insecure_no_auth` |
 | `insecure_no_auth` | `false` | serve the API unauthenticated when `tokens_file` is empty (logged as a warning; never on a reachable node) |
-| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required for a cluster: without it the peer API is closed |
+| `cluster_token` | (none) | auth for the internal peer API; also `SEARCHLIGHT_CLUSTER_TOKEN_FILE`. Required on Postgres and MySQL (refused at start without it unless `insecure_no_auth` is set): without it the peer API is closed. A peer that refuses this node's token counts as a failed copy, and is skipped |
 | `peer_ca_file` | system roots | PEM CAs that sign peers' TLS certificates (the peer API runs over TLS when `tls_cert` is set) |
 | `tls_cert`, `tls_key` | (none) | serve the API, and the peer API, over TLS; set together. Without them, put a TLS-terminating proxy in front |
 | `lease_ttl` | `0`: 30 s on SQLite, 10 s elsewhere | how long a shard copy's lease lasts unrenewed (renewed every 2 s); at least 3 s |
@@ -235,11 +376,14 @@ unless `insecure_no_auth` is set.
 | `merge_budget` | `64MiB` | bytes per second merges may write on this node (`0` = unlimited) |
 | `merge_threads` | GOMAXPROCS/4, at least 1 | concurrent merge goroutines on this node |
 | `search_threads` | GOMAXPROCS | the search worker pool |
+| `write_transactions` | `0`: 16 (1 on SQLite) | write transactions the node runs at once, each on one shard and holding a connection: commits to different shards run side by side up to it. On SQLite it is 1, and a request's shards commit together. It bounds the writes' share of the node's 64-connection pool, which its reads share, so it does not change how many connections a node can hold: size Postgres's `max_connections` for nodes × 65 (see [Databases](#databases)). A refused connection fails the request with an error that names the pool size and `max_connections`. More is not always faster: in Phase 0's measurements 32 beat 8 and 64 on 64-shard bulks |
+| `background_share` | `0.25` at GOMAXPROCS 1, else `1` | the share of each 100 ms background work runs while searches occupy every processor, `0.05` to `1`: merges, refresh builds, write and apply analysis and file removal step aside for searches at their checkpoints for the rest (see [CPU](#cpu)). `1` gives searches no priority |
 | `gc_heap_floor` | `64MiB` | heap size below which the garbage collector does not start a cycle (`0` = off). A `GOGC` environment variable overrides it, and it is at most a quarter of `GOMEMLIMIT`. The effective value is logged at start. See [Memory](#memory) |
 | `search_queue` | `1000` | reads (searches, counts, percolations, field catalogues) in progress before more get 429 |
 | `max_body_bytes` | `16MiB` | largest request body (at most 32 MiB less 1 KiB) |
 | `max_doc_bytes` | `4MiB` | largest document or saved query JSON, in a PUT or a `_bulk` line |
 | `max_bulk_ops` | `10000` | most operations in one `_bulk` |
+| `max_result_window` | `10000` | most a search's `from + size` reaches (Elasticsearch's `index.max_result_window`, here per node), at most 1,000,000; past it the search is a 400, and deeper pages use `search_after`. Each shard holds `from + size` hits of such a search, and the coordinator merges them all. The node that takes the search applies its own, so set it alike on every node. With `from` 0 it bounds `size` too, as in Elasticsearch: below 10,000 it refuses a `size` above it, which was answered before. A search with a `from` reserves about 1 KiB per hit of its window from `max_inflight_read_bytes` (at most half of it) while it runs |
 | `max_index_fields` | `1000` | most fields in one index's mapping |
 | `request_timeout` | `30s` | every API request's deadline |
 | `read_timeout` | `1m` | how long reading a request's headers and body may take (slow clients are cut off) |
@@ -249,8 +393,85 @@ unless `insecure_no_auth` is set.
 | `drop_timeout` | `10m` | how long dropping an index from the database may take |
 | `shutdown_grace` | `2s` | how long the API keeps serving after readiness turns false, so load balancers stop sending traffic first |
 | `shutdown_timeout` | `60s` | the whole budget of a graceful shutdown after `shutdown_grace`, split as in [rolling restarts](#upgrades-and-rolling-restarts) |
+| `request_cache_size` | `128MiB` | memory for the [request cache](#request-cache) of size-0 searches' shard results (`0` = none in memory) |
+| `request_cache_redis_url` | (none) | a Redis behind the request cache, shared by every node that reaches it (`redis://[user:password@]host:port[/db]`, `rediss://` for TLS); also `SEARCHLIGHT_REQUEST_CACHE_REDIS_URL_FILE` |
+| `request_cache_redis_password` | (none) | the Redis password, in place of the URL's; also `SEARCHLIGHT_REQUEST_CACHE_REDIS_PASSWORD_FILE` |
+| `request_cache_redis_prefix` | `searchlight:rc:` | prefix of every key the cache writes to Redis |
+| `request_cache_redis_ttl` | `24h` | how long a Redis entry lives |
+| `request_cache_redis_timeout` | `50ms` | bound of each Redis call, its dial included: a slow or unreachable Redis delays a search by at most about this much (and is skipped for a while after 5 failures in a row) |
+| `request_cache_redis_max_entry_bytes` | `8MiB` | largest encoded shard result written to or read from Redis |
 | `log_level` | `info` | `debug`, `info`, `warn` or `error` |
 | `pprof` | `false` | serve `/debug/pprof/*` on the admin listener |
+
+### Request cache
+
+Each node keeps the shard results of searches with `size` 0 (counts and
+aggregation-only searches, such as a facet panel's) and answers an identical search of
+the same shard contents from them, as Elasticsearch's shard request cache does
+([`request_cache`](api.md#search-and-count)).
+
+- **Never stale.** An entry is keyed by the request and by what the shard copy holds:
+  a refresh that writes, a delete, a merge or a mapping change makes new keys, and the
+  copy's older entries are dropped from memory at the next store. Nothing is
+  invalidated by hand. A hit has the counts and buckets the search would compute; a
+  float sum may differ in its last bits (it was summed in another copy's segment
+  order), and the result's segment and scan counts are the computing copy's.
+- **Memory.** `request_cache_size` (128 MiB) bounds the entries' estimated heap. It is
+  cut into 8 parts, each under its own lock and bounded by an eighth of it, least
+  recently used out first; an entry's part is chosen by its shard copy and request, and
+  one entry takes at most a sixteenth of the whole. Concurrent identical searches of a
+  copy compute once; a search waiting for another's result waits within its own
+  `timeout`.
+- **Under continuous writes**, each refresh (every `refresh_interval`) changes what a
+  copy holds, so counts and facet searches miss almost every time. A search that gives
+  [`max_staleness`](api.md#search-and-count) (say `"5s"`) accepts the copy's newest
+  result for it computed within that long, under the same mapping: it then computes
+  about once per `max_staleness` per copy, however often dashboards ask, at the cost of
+  missing the last `max_staleness` of writes. The memory cache serves it; Redis does
+  not (its keys name contents, which a stale answer by definition does not match).
+  Stale answers count as `result="stale_hit"` lookups.
+- **Redis.** With `request_cache_redis_url` set, the memory cache sits in front of a
+  Redis that every node, and every copy of a shard, shares, and that outlives
+  restarts. Its keys name the index incarnation, the shard, the mapping version and
+  the shard's newest change the copy holds (its seq, and its mark: id, commit time and
+  nonce, so a database failover that reissued seqs never reads another history's
+  results), this binary's version, and a hash of the request. Every copy that holds the
+  shard's changes up to that change holds the same documents, whatever its segments
+  and however far writes to other shards and indexes have moved its seq. Values are
+  the shard result as peers send it, compressed with zstd.
+- **What Redis shares, and what it does not.** A copy names its contents for Redis
+  only once a changelog poll (every `changelog_poll_interval`, 500 ms, or sooner when
+  woken) has checked the shard's newest change; until then it uses its memory cache
+  alone. A shard written to often therefore shares little: with `w` writes a second to
+  it and a poll every `P` seconds, a key exists about `e^(−w·P)` of the time. The win
+  is the quiet shards, which keep their keys whatever other shards and indexes write,
+  across nodes, copies and restarts. Two more cases have no key: a copy rebuilt from
+  the database after pruning removed its shard's newest change from the changelog (a
+  shard quiet for longer than the copies' prune floor), until the shard's next write;
+  and a shard whose newest change predates change nonces (written by a release before
+  them), until its next write.
+- **A Redis that fails costs nothing but its hits.** Each call, its dial included, is
+  bounded by `request_cache_redis_timeout` (50 ms) and by a tenth of what is left of
+  the search's own time (`timeout`, or `request_timeout`), with no retries; a search
+  with under 20 ms left does not ask Redis. A read that runs out of its time while
+  the search has time left is Redis's failure. A failed read or write is logged (once per 10 s per operation),
+  counted in `searchlight_search_request_cache_errors_total`, and the shard computes.
+  After 5 failures in a row Redis is skipped for 1 s, then one call probes it; each
+  failed probe doubles the wait, up to 30 s
+  (`searchlight_search_request_cache_store_open_ratio` is 1 meanwhile). Writes are made in
+  the background, at most 16 at once; those dropped are counted in
+  `searchlight_search_request_cache_writes_dropped_total`.
+- **Redis is trusted, as the database is.** Anyone who can write to it can make
+  searches return forged counts: give it a password (`request_cache_redis_password`),
+  TLS (`rediss://`) on an untrusted network, and no other writers under the prefix.
+  What is read back is bounded (`request_cache_redis_max_entry_bytes`, and at most 8
+  times that decoded) and checked against the request, so a corrupt value is a miss,
+  never a failure.
+- **Expiry.** Redis entries expire after `request_cache_redis_ttl` (24 h); results
+  whose encoding is larger than `request_cache_redis_max_entry_bytes` stay in memory
+  only. Point several clusters at one Redis with different
+  `request_cache_redis_prefix`es, and give the Redis a `maxmemory` with an eviction
+  policy such as `allkeys-lru`.
 
 ### Refresh and flush
 
@@ -268,6 +489,11 @@ unless `insecure_no_auth` is set.
   last flush.
 - **Tuning.** Raise `flush_interval` to fsync less often, at the price of a longer
   replay after a crash. A clean shutdown always flushes.
+- **Refresh on demand.** An index whose `refresh_interval` is `-1` never refreshes on a
+  timer. A request that waits for a seq refreshes the copy itself once the copy has
+  applied it: a read's `wait_for` token, a write's `refresh=wait_for` or `true`, and a
+  percolation, which waits for the saved queries written through its node. Without such
+  a wait, writes stay invisible until one comes.
 
 ### Recovery bundles
 
@@ -333,8 +559,8 @@ whichever node gets there first.
 
 | Database | Supported | Notes |
 |---|---|---|
-| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections plus one for `LISTEN`, so set `max_connections` to at least 65 per node plus headroom |
-| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node |
+| Postgres | tested on 17 | `LISTEN/NOTIFY` wakes the tailers between polls. Each node opens up to 64 connections, one pool shared by its reads and writes, plus one for `LISTEN`, so set `max_connections` to at least nodes × 65 plus headroom (Postgres's default of 100 fits one node) |
+| MySQL | **8.0.19 or later**, tested on 8.4 LTS | 8.0.19 is the floor because the upserts use the row-alias form (`INSERT ... AS new ON DUPLICATE KEY UPDATE`). `max_allowed_packet` must be at least 64 MB (the 8.x default). Up to 64 connections per node, shared by its reads and writes: `max_connections` must cover nodes × 64 plus headroom |
 | SQLite | 3.35+, bundled (pure Go) | **one node only.** A second live node on the same file refuses to start (`cluster: a SQLite store serves a single node`). The lease TTL defaults to 30 s, because the single writer can delay a renewal |
 
 SQLite suits a laptop, a test, or a small single-node deployment. Its file must sit on a
@@ -367,7 +593,15 @@ A node's memory is three budgets, plus the page cache:
    per-document state, under 1 KiB a document, plus up to 8 MiB for each field it
    writes at once (one per thread it runs on). A merge of a million of the benchmark's
    products peaks at about 0.6 GiB of heap on 4 threads and 0.7 GiB on 16.
-   `merge_threads` merges can run at once.
+   A [point field](api.md#point-fields) adds 24 bytes per point the merged segment
+   keeps, held whole while its k-d tree is built: about 240 MB for 10M points (1M
+   documents of 10). No setting bounds it (`merge_budget` limits bytes written per
+   second, not memory). The merge policy caps a merged segment at 1 GiB, and a point
+   takes about 14 bytes there, so a merge holds at most about 1.8 GiB of points (75M),
+   and that only for a segment of little but points; `merge_threads` merges can run
+   at once. A [nested field](api.md#nested-fields)'s objects merge as documents do:
+   each surviving object costs its per-document state, plus a 4-byte remap of every
+   input object, held for the field while it is merged.
 4. **Caches and the runtime.**
    - The filter cache.
    - The search rank cache: up to 256 MiB, at most 64 MiB of it for one segment (a
@@ -379,6 +613,24 @@ A node's memory is three budgets, plus the page cache:
      field's distinct terms (about 24 bytes each, plus 8 per term per segment): a few
      milliseconds for thousands of values, tens of milliseconds and megabytes for
      hundreds of thousands. A search whose hits hold few of the terms builds nothing.
+     After a refresh the new list's ordinals are derived from the old list's (a
+     fraction of a full build: the new segment's terms are looked up, the rest is
+     renumbered), in the background for the fields searched in the last 10 minutes.
+     Every build, a search's or a warm's, takes a slot of one pool of a quarter of the
+     CPUs (at least one), so builds never use more; each shard's field has at most one
+     in flight, a newer generation's superseding a queued older one (a running one
+     finishes, and the newer derives from it), and a search's build is served before
+     warm builds queued earlier. A search never waits on a build still queued, and on
+     a running one at most 250 ms, then merges by term, exactly; the build finishes in
+     the background and serves the next search. `searchlight_search_ordinals_builds_total` (by
+     `kind`: full, incremental, unstarted; `trigger`: search, warm; `result`: done,
+     cancelled, superseded, shutdown, panic) and `searchlight_search_ordinals_lookups_total`
+     (`hit`, `shared`, `miss`, `queued`: left to the background, `stale`, and `absent` at a
+     search's start) show how
+     often searches wait on a build.
+   - The request cache: up to `request_cache_size` (128 MiB) of size-0 searches'
+     shard results, by estimate; a terms aggregation's partial takes about 100 bytes
+     a bucket.
    - The generations readers hold, and Go's own overhead.
    - **The heap floor.** Segments are mapped files, so a serving node's live heap is
      only a few megabytes, and at Go's default `GOGC` the garbage collector would run
@@ -404,6 +656,42 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
   follow it.
 - **Merges** are further capped by `merge_budget` bytes per second, so a merge storm
   cannot starve searches of disk.
+- **One core** (a container with `cpus: 1`, GOMAXPROCS 1). Go shares the processor
+  between goroutines alike, so a count that needs 5 ms of CPU would queue behind
+  seconds of merging. With `background_share` below 1 (0.25 by default at GOMAXPROCS 1)
+  a search marks its shard work as foreground, and background work (merges every 4,096
+  documents and before each chunk they write, refresh builds before each chunk, the
+  analysis of writes and of the changes a copy applies before each document, file
+  removal before each file) steps aside at its checkpoints while searches occupy every
+  processor: time goes in 100 ms cycles, background work pausing for the first
+  `1 - background_share` of each, or until a processor is free of searches, then
+  running the rest beside the searches. So under reads that never stop it gets about
+  half of `background_share` on one core (about an eighth of the CPU by default), and
+  all of it between reads. Writes slow down under a heavy read load but are never held
+  off for good: their buffers fill and clients get 429s before anything is lost. On
+  `slbench writeload` at one core (50k listings, three readers of counts and facets
+  every 20 ms), merges kept up: segments stayed between 4 and 14, and each burst of
+  merge backlog cleared within seconds. With 2 cores or more the default is `1`; set
+  `background_share` there and background work pauses only while as many searches run
+  as there are processors.
+- **What waits while background work steps aside.** A refresh pauses holding its
+  shard's refresh lock, and the janitor's loop pauses holding its drain lock, so under
+  a steady read load these take longer too: writes with `refresh=true` or
+  `refresh=wait_for`, closing a shard copy (it waits for the janitor's drain), and
+  freeing disk from merged-away segments and old sidecars. A merge pauses holding its
+  `merge_threads` tokens, so other shards' merges wait behind it.
+- **One analysis per write.** A write analyzes its documents once on the node that
+  takes it, and hands them to that node's own copies of their shards, which apply them
+  without analyzing the bodies again (`searchlight_replica_handed_off_total` counts
+  them). The documents waiting for their copy take at most 64 MiB of heap per node (by
+  their fields and objects, not only their bodies); past it the copies analyze the
+  bodies themselves. Copies on other nodes analyze the bodies from the changelog, as
+  before, and a write analyzes in full only the documents it percolates or hands off.
+- **Unchanged documents cost one read.** An upsert of a document's stored bytes is a
+  noop found by id from the body hash its row keeps, before anything is analyzed: a
+  scraper that sends unchanged documents again, or a client's retry of a bulk that
+  committed after it timed out, costs one batched read, not a write, an analysis and a
+  refresh.
 
 ### Disk
 
@@ -444,6 +732,13 @@ smaller, lower the in-flight budgets (and `max_body_bytes` with them) first.
 - **Write rate.** Group commit coalesces each node's concurrent writes into one
   transaction every few milliseconds, so the database sees few, larger transactions.
   Use `_bulk` for throughput.
+- **Each upsert's body is written twice**: in its changelog row (`sl_changes`, the
+  write-ahead log copies tail) and in its document row (`sl_documents`, the record
+  GET, rebuilds and noop checks read), with a hash of it (`body_hash`, 8 bytes). Both
+  go in the one statement of the commit, encoded once. The changelog cannot hold a
+  reference to the document row instead: the row keeps only a document's newest
+  version, and a copy applying the changelog must apply each change's own body at its
+  own seq (see [the architecture](architecture.md#the-write-path-the-sql-changelog-is-the-wal)).
 
 ## Backups and disaster recovery
 
@@ -464,13 +759,34 @@ rebuilt.**
   The nodes rebuild their copies from the restored database.
 - **Losing the database** loses acknowledged writes back to your last backup. Plan its
   high availability as you would for any primary datastore. On a Postgres or MySQL
-  failover, the nodes reconnect with backoff, since the sequence numbers live in the
-  database. While it is unreachable, writes get 503 and reads serve from the segments,
-  marked `stale`, and readiness turns false after `max_lag`.
+  failover, the nodes reconnect with backoff. While it is unreachable, writes get 503
+  and reads serve from the segments, marked `stale`, and readiness turns false after
+  `max_lag`.
+- **A failover is transparent only without lost commits.** Use synchronous replication
+  (Postgres `synchronous_commit` with `synchronous_standby_names`; MySQL
+  semi-synchronous replication waiting `AFTER_SYNC`). A failover that may have lost
+  commits, as async replication can, is a restore to an earlier point: the lost writes
+  are gone, and new writes reuse their seqs. Running copies detect it at their next
+  poll and rebuild from the database by themselves (the log line `the changelog no
+  longer holds what this copy applied`, and `searchlight_changelog_rewinds_total`), so
+  their shards serve again once the rebuilds finish. Nodes stopped across the failover
+  need nothing either while their copies still hold the changelog's prune floor: each
+  copy's manifest keeps what it applied of its own shard and the marks of the changes it
+  applied last, which the copy checks when it starts. A stopped node's copy holds the
+  floor until the node is found dead or the copy's lease runs out (seconds), or, when a
+  clean stop retired it, for `retiring_retention` (15 min) after its lease ran out; and
+  changes older than `changelog_retention` are pruned whatever copy needs them. A node
+  back later may find its shards pruned without it: a copy pruned past its seq rebuilds,
+  but in one pruned short of it, a rewind whose reissued changes of the copy's shard
+  were all pruned may go unseen. (A copy whose last flush
+  predates these marks has none until it flushes again, and trusts what it reads at its
+  first poll: only once, at the upgrade.)
 
 ## Upgrades and rolling restarts
 
-Restart or upgrade **one node at a time**:
+Read the new release's notes in [CHANGELOG.md](../CHANGELOG.md) first: they say whether
+it migrates the schema and what else it asks of an upgrade. Then restart or upgrade
+**one node at a time** (for the Compose samples, see [Upgrading](#docker-compose)):
 
 1. **Signal.** Send SIGTERM: `kubectl rollout restart`, `docker compose stop`, or
    `systemctl stop`.
@@ -482,8 +798,9 @@ Restart or upgrade **one node at a time**:
    2. The API keeps serving for `shutdown_grace`, while load balancers take the node
       out.
    3. The listener stops accepting, and requests in flight finish, within T/4.
-   4. The node stops its remaining copies, writes their final manifests, marks them
-      `retiring` in the registry and deregisters. It has until T/10 before the deadline,
+   4. The node stops its remaining copies' tailers, all together, each writing its
+      final manifest and applied seq; then it marks the copies `retiring` in the
+      registry, closes them and deregisters. It has until T/10 before the deadline,
       which is at least 0.4 T.
    5. In the last T/10, it closes the database and the admin listener, and flushes
       telemetry.
@@ -507,11 +824,19 @@ Notes:
   brings a migration cannot be rolled back by downgrading the binary: restore the
   database instead, as above. Whether nodes still on the old binary keep working against
   the migrated schema is up to each migration, and its release notes say so. So far there
-  are two: the initial schema, and compressed bodies (below). Each migration's DDL waits
-  at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL `lock_wait_timeout`),
-  so a long query on the table holds the table's other queries behind the migration for
-  at most that second; one that times out is retried, up to 40 times over about three
-  minutes, half a second to five seconds apart.
+  are three: the initial schema, compressed bodies, and change nonces (both below). Each
+  migration's DDL waits at most 1 s for its table's lock (Postgres `lock_timeout`, MySQL
+  `lock_wait_timeout`), so a long query on the table holds the table's other queries
+  behind the migration for at most that second; one that times out is retried, up to 40
+  times over about three minutes, half a second to five seconds apart.
+- **Upgrading to a release that requires `cluster_token`.** A node on Postgres or MySQL
+  now refuses to start without `cluster_token` (`cluster_token: set cluster_token ...`),
+  unless `insecure_no_auth` is set. A cluster of several nodes has one already: without
+  it the peer API was closed, and reads of another node's shards failed. **A single node
+  on Postgres or MySQL may not**: set `cluster_token` (any shared secret, through
+  `SEARCHLIGHT_CLUSTER_TOKEN` or `SEARCHLIGHT_CLUSTER_TOKEN_FILE`) before you upgrade
+  it. Otherwise the upgraded pod crash-loops: an outage under a Recreate strategy or a
+  single replica, and a stalled rollout under RollingUpdate.
 - **Upgrading to compressed bodies** (schema migration 2) is a rolling upgrade. The
   migration only adds columns and a table, which takes milliseconds whatever the
   database holds: `body_z` beside `sl_documents.body` and `payload_z` beside
@@ -533,6 +858,156 @@ Notes:
     `store: database schema is newer than this binary` until it runs the new image:
     finish the rollout rather than waiting on it. For the same reason a rollback means
     restoring the database, as above.
+  - **An old pod must be gone, not merely silent**, by the time `dead_after` plus
+    `lease_ttl` has passed since it last heartbeated. The fence counts a silent node as
+    gone; one that was only cut off or frozen (a network partition, a paused VM) and
+    comes back without restarting still runs the old binary, claims copies again, and
+    reads compressed rows as empty bodies (its realtime `GET`s answer empty documents,
+    and its copies halt). Terminate old pods during the rollout rather than isolating
+    them; once restarted, an old binary refuses the schema, as above.
+- **Upgrading to change nonces** (schema migration 3) is a rolling upgrade. The migration
+  only adds a column, which takes milliseconds whatever the database holds:
+  `sl_changes.nonce` (a BIGINT, NULL until used). Nothing is rewritten, and nodes still
+  on the old binary keep reading and writing as before: they never touch the new column,
+  and the changes they write have no nonce.
+  - Upgraded nodes give every change they write a random nonce. A copy checking that the
+    changelog still holds what it applied compares the change's seq, index, shard, kind,
+    id and commit time, as before, and, when both sides have one, the nonce too. So a
+    change a failover lost, reissued to the same document in the same millisecond, is
+    told apart from the one that took its seq.
+  - Once the first node has migrated, an old binary refuses to start (the schema is newer
+    than it knows), so **an old pod that crashes or restarts mid-rollout crash-loops** on
+    `store: database schema is newer than this binary` until it runs the new image:
+    finish the rollout rather than waiting on it. For the same reason a rollback means
+    restoring the database, as above.
+- **Upgrading to point fields** (schema migration 4, segment format 4.1) is a rolling
+  upgrade. The migration only adds a column, `sl_nodes.mapping_types` (an INTEGER,
+  0 for a node that has not heartbeated since), in which each node records the
+  mapping field types it reads; nothing is rewritten. As with migrations 2 and 3, an
+  old binary refuses to start once the first node has migrated, so finish the rollout.
+  - Creating an index with a [point field](api.md#point-fields), or patching one into a
+    mapping, is refused (409, naming the nodes) while any node that reads no point type
+    heartbeats within the fence (`dead_after` plus `lease_ttl`) or holds a copy under a
+    live lease: such a node could not decode the mapping, so its copies would halt at
+    the change and its recoveries would fail. Retry once every node runs the new
+    binary.
+  - **Once a point field exists, no node can be downgraded below this release**: an
+    older binary cannot decode the mapping (its copies halt, and it cannot open a
+    manifest or recovery bundle that carries it), and a point field cannot be removed.
+    Drop the index (or restore the database) before a rollback.
+  - Segments without a point field are still written as format 4.0, byte for byte.
+- **Upgrading to nested fields** (segment format 4.2, mapping types 2; no schema
+  migration) is a rolling upgrade: each upgraded node heartbeats mapping types 2 in
+  `sl_nodes.mapping_types`.
+  - Creating an index with a [nested field](api.md#nested-fields), or patching one into
+    a mapping (a new sub-field of an existing one included), is refused (409, naming
+    the nodes) while any node of an earlier release heartbeats within the fence or
+    holds a copy under a live lease, as point fields were.
+  - **Once a nested field exists, no node can be downgraded below 1.4**: an older
+    binary cannot decode the mapping (its copies halt, and it cannot open a manifest
+    or recovery bundle that carries it), and a nested field cannot be removed. Drop
+    the index (or restore the database) before a rollback.
+  - Searches that read nested objects need search wire level 6, and percolations of a
+    nested index percolate wire level 3: an older peer is never sent one
+    ([clustering](clustering.md)).
+  - Segments without a nested field's objects are still written in the minor before
+    (4.1 with points, 4.0 without), byte for byte.
+- **Upgrading to client versions** (schema migration 5, query segment format
+  `percolate/4`; 1.5) is a rolling upgrade. The migration only adds columns and a table,
+  which takes milliseconds whatever the database holds: `version` (a BIGINT, 0 by
+  default) on `sl_documents` and `sl_queries`, and `sl_tombstones`. Nothing is
+  rewritten. As with the migrations before it, an old binary refuses to start once the
+  first node has migrated, so finish the rollout.
+  - Nodes still on the old binary keep writing as before, never touching the new
+    columns: a write they take leaves the target's stored version as it was, and a
+    delete they take keeps no tombstone. Send versioned writes to upgraded nodes, and
+    expect versions in `GET` and percolation matches to be right only once every node
+    runs 1.5.
+  - **Set `gc_deletes` only once every node runs 1.5**: an older node refuses index
+    settings it does not know, so it cannot read an index whose settings name it.
+    Unset, an index keeps tombstones for 24 h; the leader prunes older ones at each
+    changelog prune.
+  - Upgraded nodes open `percolate/3` query segments as they are (their queries have no
+    version until written again) and write `percolate/4` ones. **A copy that has
+    written one cannot be downgraded**: an older binary refuses the newer format, and
+    the copy is rebuilt from a peer or the database.
+- **Upgrading to body hashes** (schema migration 6; 1.6) is a rolling upgrade. The
+  migration only adds two nullable columns to `sl_documents`, `body_hash` and
+  `hash_seq` (BIGINT), which takes milliseconds whatever the table holds; nothing is
+  rewritten. As before, an old binary refuses to start once the first node has
+  migrated, so finish the rollout.
+  - Upgraded nodes store each written document's hash with the seq that wrote it. A
+    document gets one when it is next written: until then an upsert of its bytes is
+    written, as before.
+  - Nodes still on 1.5 write without touching the columns, so a document they write
+    keeps the hash of its previous version beside a newer seq. A hash is trusted only
+    while `hash_seq` is the row's seq, so such a document is never answered as a noop
+    from its stale hash; its next write on an upgraded node stores a fresh one.
+  - `max_staleness` reaches peers without a wire level: a 1.5 peer ignores it and
+    answers with a current result.
+- **Upgrading to shard sequences** (schema migration 7; 2.0) is a rolling upgrade from
+  1.8, in two steps: the nodes, then a switch the cluster makes on its own. Upgrade from
+  an earlier 1.x to 1.8 first. [CHANGELOG.md](../CHANGELOG.md) has the client side,
+  which must be ready before the first node moves.
+  1. **The migration**, on the first 2.0 node: it creates `sl_shard_seq` empty, adds
+     `sl_nodes.seq_scheme`, and re-keys `sl_changes` by (index, shard, seq), keeping an
+     index on `seq` alone for 1.x's reads. The re-key builds new indexes on the
+     changelog. On Postgres they're built `CONCURRENTLY`, outside the migration's
+     transaction, and the migration then holds `sl_changes`' lock only to swap the key
+     onto one of them: reads and writes go on meanwhile (on an NVMe workstation, three
+     million changelog rows took 7.5 s, and no read or write waited on a lock). Other
+     2.0 nodes starting on Postgres meanwhile wait for it; a 1.x node starting meanwhile
+     finds migrations 1 to 6 applied and starts (it is a 1.x node like the others). On
+     a database the first node creates, every migration runs in one transaction, and a
+     1.x node starting meanwhile waits for it and then refuses the newer schema. On MySQL the key change rebuilds the table in
+     place online, about 18 s per million rows, while writes go on; MySQL logs those
+     writes meanwhile, and if they outgrow `innodb_online_alter_log_max_size` (128 MiB
+     by default) the online change fails (error 1799) and the migration runs it again
+     with `LOCK=SHARED`, which holds writes (reads go on) until it ends. Raising that
+     setting before a busy upgrade keeps writes going; it is optional, and takes a
+     database administrator (`SYSTEM_VARIABLES_ADMIN`): Searchlight's own account needs
+     no such privilege, the fallback included. On SQLite it rebuilds the table, about
+     33 s per three million, while the node is down. Run `SELECT count(*) FROM
+     sl_changes` first to see what to expect; the changelog holds a few
+     `flush_interval`s of writes in steady state. As before, a 1.x
+     binary refuses to start once it has run, so finish the rollout.
+  2. **While 1.x and 2.0 nodes both run**, every node commits as 1.x does: under the
+     global sequence's lock (`sl_counter` row 1), at its next values. Every seq is unique
+     and in commit order, so 1.x and 2.0 copies, tailers and peer reads agree on what a
+     seq means, and nothing 1.x creates, drops or remaps is missed. Writes don't run in
+     parallel yet. 2.0 nodes heartbeat `seq_scheme = 1`.
+  3. **The switch.** Once every node in `sl_nodes` heartbeats `seq_scheme = 1`, or has
+     been silent for longer than `dead_after` plus `lease_ttl`, and no other node holds
+     a copy under a live lease (the test compressed bodies use), the leader turns shard
+     sequences on, in one transaction under row 1's lock: it gives every shard of every
+     index a row at row 1's value, with the index's current incarnation and mapping
+     version, moves the floor to `sl_counter` row 3, deletes row 1, and writes
+     `shard_seqs` into `sl_features`. It logs `every node commits by shard sequences:
+     turned the cluster's shard_seqs feature on`. Every write waits for that
+     transaction, which inserts the rows a thousand per statement: on a workstation, 200
+     indexes of 64 shards (12,800 rows) held writes for 83 ms on Postgres, 121 ms on MySQL
+     and 181 ms on SQLite. No shard's head moves back, so tokens
+     from before it still read back. From then on each shard commits on its own
+     sequence; nodes that haven't seen the switch find row 1 gone at their next write
+     and move over. A single node switches within a second of starting (or, if its
+     `node_id` changed, once its old row has been silent past the fence).
+  - **If a 1.x node never goes away**, the switch never comes: the cluster stays correct
+    on the global sequence, without the parallel writes. `SELECT * FROM sl_features`
+    shows whether `shard_seqs` is on; `SELECT node_id, version, seq_scheme FROM sl_nodes`
+    shows who holds it back.
+  - **An old pod must be gone, not merely silent**, as for compressed bodies. A 1.x
+    node that comes back after the switch without restarting (a partition healed, a
+    paused VM) fails every write, mapping change, drop and head read, since each needs
+    row 1: its clients see errors, but it writes nothing outside the shard sequences.
+    It can still create an index (1.x's create takes no lock), without sequence rows:
+    the first 2.0 write or mapping change to it gives it its rows, and so does the
+    leader within 30 s. Terminate old pods rather than isolating them.
+  - **Rollback** means restoring the database, as for every migration. After the
+    switch, seqs repeat across shards and row 1 is gone: no 1.x binary can use it.
+    **Restart every node after a restore.** A 2.0 store that saw shard sequences on
+    notices a database restored to before the switch at its next write and goes back
+    to the global sequence, but a node's cluster view still counts nodes without a seq
+    scheme out until it restarts.
 - **Segment format.** It is versioned by a major number, and each binary reads its own
   major and the one before it (N−1). An upgrade across one major therefore reopens its
   segments, as a restart does; merges rewrite them into the new major as they go, and
@@ -574,14 +1049,15 @@ label, is `Catalog` in [`internal/telemetry/metrics.go`](../internal/telemetry/m
 | Area | Metrics |
 |---|---|
 | Requests | `searchlight_http_request_duration_seconds` (by route, method, status), `searchlight_http_request_errors_total`, `searchlight_http_requests_inflight` |
-| Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total` |
+| Search | `searchlight_search_phase_duration_seconds` (plan, execute, reduce, fetch), `searchlight_search_segments_touched`, `searchlight_search_filter_cache_lookups_total` (hit, miss), `searchlight_search_documents_scanned_total`, `searchlight_search_documents_matched_total`, `searchlight_search_ordinals_builds_total` (by kind: full, incremental, unstarted; trigger: search, warm; result: done, cancelled, superseded, shutdown, panic), `searchlight_search_ordinals_build_duration_seconds`, `searchlight_search_ordinals_lookups_total` (hit, shared, miss, queued, stale, absent) |
+| Request cache | `searchlight_search_request_cache_lookups_total` (by `store`, memory or redis, and `result`: hit, miss, `stale_hit` (memory, within a search's `max_staleness`), or skipped while Redis is skipped), `searchlight_search_request_cache_errors_total` (by store and operation: get, set, encode, decode), `searchlight_search_request_cache_evictions_total`, `searchlight_search_request_cache_stored_bytes_total` (written to Redis), `searchlight_search_request_cache_writes_dropped_total` (by reason: busy, store_failing, closed), `searchlight_search_request_cache_store_open_ratio` (1 while Redis is skipped), `searchlight_search_request_cache_size_bytes`, `searchlight_search_request_cache_entries` |
 | Percolation | `searchlight_percolate_duration_seconds` (probe, verify), `searchlight_percolate_candidates`, `searchlight_percolate_verifications_total`, `searchlight_percolate_always_check` |
-| Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total` |
+| Indexing | `searchlight_index_changes_total`, `searchlight_store_group_commit_batch_size`, `searchlight_replica_apply_batch_size`, `searchlight_replica_apply_duration_seconds`, `searchlight_replica_backpressure_total`, `searchlight_replica_handed_off_total` (documents a copy applied as its node's write analyzed them) |
 | Refresh, flush and merge | `searchlight_shard_open_failures_total`, `searchlight_shard_refresh_duration_seconds`, `searchlight_shard_refresh_failures_total`, `searchlight_shard_flush_duration_seconds`, `searchlight_shard_flush_failures_total`, `searchlight_shard_merge_duration_seconds`, `searchlight_shard_merge_bytes_total`, `searchlight_shard_merge_backlog`, `searchlight_shard_merge_failures_total`, `searchlight_shard_segments`, `searchlight_shard_buffer_documents` |
 | Size | `searchlight_shard_documents`, `searchlight_shard_terms`, `searchlight_shard_disk_size_bytes`, `searchlight_shard_mmap_resident_bytes` |
-| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total` |
-| Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total` |
-| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`) |
+| Replication | `searchlight_replica_lag_seq`, `searchlight_replica_lag_time_seconds`, `searchlight_replica_halted_ratio`, `searchlight_replica_halts_total`, `searchlight_replica_poll_failing_ratio`, `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recoveries_total`, `searchlight_replica_recovery_duration_seconds`, `searchlight_replica_recovery_bytes_total`, `searchlight_replica_watch_reconnects_total`, `searchlight_changelog_rewinds_total` |
+| Cluster | `searchlight_cluster_nodes`, `searchlight_cluster_lease_changes_total` (by kind: `claim`, `renew`, `renew_failed`, `reclaim`, `lapse`, `resume`, `lost`, `release`), `searchlight_cluster_allocation_changes_total`, `searchlight_cluster_peer_request_duration_seconds`, `searchlight_cluster_read_retries_total`, `searchlight_cluster_read_rereads_total` (by op and result: `found`, `none`, `timeout`) |
+| Database | `searchlight_store_operation_duration_seconds` (by operation, dialect), `searchlight_store_errors_total`, `searchlight_store_wal_size_bytes` (SQLite's write-ahead log, and the part no checkpoint has copied yet, `pending="true"`), `searchlight_store_notifications_lost_total` (Postgres commit notifications sent after their commits that failed twice: copies poll for those changes instead, up to half `max_lag` later, 1 s by default) |
 | Runtime | `go_*` and `process_*` |
 
 Counters and histograms with no observations yet do not appear until their first one.
@@ -592,6 +1068,7 @@ Counters and histograms with no observations yet do not appear until their first
 |---|---|---|
 | Cluster red | `GET /_cluster/health` reports `red` (probe it, or alert on the next row) | a shard has no serving copy: its reads fail |
 | Copy halted | `max by (index, shard) (searchlight_replica_halted_ratio) > 0` for 5 m | a copy stopped at a change it cannot apply (see below) |
+| Changelog rewound | `increase(searchlight_changelog_rewinds_total[10m]) > 0` | the database lost commits (a failover without synchronous replication): copies rebuild from it, and the lost writes are gone |
 | Replica lag | `max by (index, shard) (searchlight_replica_lag_time_seconds) > 30` for 5 m | a copy trails the changelog; it serves no reads past `max_lag` |
 | Changelog polls failing | `max(searchlight_replica_poll_failing_ratio) > 0` for 2 m | the database is unreachable from a node |
 | Nodes missing | `max(searchlight_cluster_nodes) < 3` (your node count) for 5 m | a node died or cannot heartbeat |

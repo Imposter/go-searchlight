@@ -76,7 +76,7 @@ func TestCompletenessProperty(t *testing.T) {
 			// rarely negates, so most queries are anchored and most matches come
 			// through anchors; dense is positive over a tiny vocabulary, so that
 			// conjunctions (pair anchors) match often.
-			for _, mode := range []string{"mixed", "positive", "dense", "filters"} {
+			for _, mode := range []string{"mixed", "positive", "dense", "filters", "nested"} {
 				t.Run(fmt.Sprintf("seed=%d/%s/%s", seed, regime, mode), func(t *testing.T) {
 					var stats shard.TermStats
 					switch regime {
@@ -89,6 +89,7 @@ func TestCompletenessProperty(t *testing.T) {
 					g.positive = mode != "mixed"
 					g.dense = mode == "dense"
 					g.filters = mode == "filters"
+					g.nestedHeavy = mode == "nested"
 					checkCompleteness(t, g, seed, queries, docs, stats)
 				})
 			}
@@ -142,6 +143,18 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	isAlways := make(map[uint32]bool)
 	for i := 0; i < len(seg.always); i += 4 {
 		isAlways[seg.ordAt(u32(seg.always, i))] = true
+	}
+	nestedQueries, nestedAlways := 0, 0
+	for i := range qs {
+		if hasNested(qs[i].Query) {
+			nestedQueries++
+			if isAlways[uint32(i)] {
+				nestedAlways++
+			}
+		}
+	}
+	if g.nestedHeavy && (nestedQueries < numQueries/2 || nestedAlways*3 > nestedQueries) {
+		t.Fatalf("%d queries hold a nested node, %d of them always-check: nested queries should anchor on their inner conditions", nestedQueries, nestedAlways)
 	}
 	pairs, matches, anchored, candidates := 0, 0, 0, 0
 	for di := range numDocs {
@@ -207,8 +220,8 @@ func checkCompleteness(t *testing.T, g *gen, seed uint64, numQueries, numDocs in
 	if anchored == 0 || anchored*200 < pairs {
 		t.Fatalf("only %d of %d pairs match through anchors: the generator is too sparse to test anything", anchored, pairs)
 	}
-	t.Logf("%d pairs, %d matches (%d through anchors), %.1f candidates per document of %d queries (%d always-check)",
-		pairs, matches, anchored, float64(candidates)/float64(numDocs), len(qs), seg.NumAlways())
+	t.Logf("%d pairs, %d matches (%d through anchors), %.1f candidates per document of %d queries (%d always-check; %d nested, %d of them always-check)",
+		pairs, matches, anchored, float64(candidates)/float64(numDocs), len(qs), seg.NumAlways(), nestedQueries, nestedAlways)
 }
 
 // randStats are arbitrary, deterministic term statistics: anchors chosen under them
@@ -236,6 +249,9 @@ type gen struct {
 	positive bool // rarely negate: no ne, empty or exists:false, few nots
 	dense    bool // draw words from a tiny vocabulary
 	filters  bool // root conjunctions of a term anchor and conditions posting filters carry
+	nested   bool // drawing a nested node's inner query: conditions on v's sub-fields
+	// nestedHeavy draws nested nodes most of the time, at the root and in groups.
+	nestedHeavy bool
 }
 
 // positiveOps are the ops a positive generator draws: the anchorable ones.
@@ -243,7 +259,7 @@ var positiveOps = []string{
 	query.OpContains, query.OpContainsAny, query.OpContainsAll, query.OpEq, query.OpIn,
 	query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween,
 	query.OpHas, query.OpHasAny, query.OpHasAll, query.OpNonempty, query.OpExists,
-	query.OpStartsWith, query.OpWordsAll, query.OpWordsAny, query.OpSimilar,
+	query.OpStartsWith, query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpBox,
 }
 
 func newGen(seed uint64) *gen { return &gen{r: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))} }
@@ -255,7 +271,10 @@ var vocab = []string{
 	"refurbished", "open box", "", " ",
 }
 
-var fields = []string{"brand", "title", "tags", "price", "stock", "seen", "extra", "_id", "missing"}
+var fields = []string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra", "_id", "missing"}
+
+// subFields are the conditions' fields inside a nested node: v's sub-fields, one unmapped.
+var subFields = []string{"v.brand", "v.title", "v.tags", "v.price", "v.stock", "v.seen", "v.extra"}
 
 var numbers = []float64{-1, 0, 0.5, 1, 2, 10, 99.99, 100, 250, 1e6, -100}
 
@@ -333,7 +352,11 @@ func (g *gen) leaf() map[string]any {
 	if g.positive {
 		op = positiveOps[g.r.IntN(len(positiveOps))]
 	}
-	l := map[string]any{"field": g.pick(fields), "op": op}
+	f := g.pick(fields)
+	if g.nested {
+		f = g.pick(subFields)
+	}
+	l := map[string]any{"field": f, "op": op}
 	var v any
 	switch op {
 	case query.OpEq, query.OpNe:
@@ -370,6 +393,8 @@ func (g *gen) leaf() map[string]any {
 	case query.OpSimilar:
 		mins := []any{0.1, 0.3, 0.5, 1, 0, -1, 2, "x"}
 		v = map[string]any{"text": g.phrase(3), "min": mins[g.r.IntN(len(mins))]}
+	case query.OpBox:
+		v = g.box()
 	}
 	if v != nil {
 		l["value"] = v
@@ -377,8 +402,61 @@ func (g *gen) leaf() map[string]any {
 	return l
 }
 
+// box is a box value: each axis left out or given one or two of its ends, a number
+// (or, rarely, a word, which is no bound).
+func (g *gen) box() map[string]any {
+	box := map[string]any{}
+	for _, axis := range []string{"x", "y"} {
+		if g.r.IntN(4) == 0 {
+			continue
+		}
+		ends := map[string]any{}
+		bound := func() any {
+			if g.r.IntN(20) == 0 {
+				return g.word()
+			}
+			return g.number()
+		}
+		switch g.r.IntN(3) {
+		case 0:
+			ends[[]string{"gt", "gte"}[g.r.IntN(2)]] = bound()
+		case 1:
+			ends[[]string{"lt", "lte"}[g.r.IntN(2)]] = bound()
+		default:
+			ends[[]string{"gt", "gte"}[g.r.IntN(2)]] = bound()
+			ends[[]string{"lt", "lte"}[g.r.IntN(2)]] = bound()
+		}
+		box[axis] = ends
+	}
+	return box
+}
+
+// points is a point field's value: one pair, or a list of up to four, an entry now
+// and then no point at all.
+func (g *gen) points() any {
+	pair := func() any {
+		if g.r.IntN(15) == 0 {
+			return []any{g.word(), g.number()}
+		}
+		return []any{g.number(), g.number()}
+	}
+	if g.r.IntN(4) == 0 {
+		return pair()
+	}
+	list := make([]any, g.r.IntN(5))
+	for i := range list {
+		list[i] = pair()
+	}
+	return list
+}
+
 func (g *gen) node(depth int) any {
 	switch r := g.r.IntN(10); {
+	case (r == 9 || (g.nestedHeavy && r >= 4)) && depth > 0 && !g.nested && !g.filters:
+		g.nested = true
+		inner := g.node(depth - 1)
+		g.nested = false
+		return map[string]any{"nested": map[string]any{"path": "v", "query": inner}}
 	case r < 2 && depth > 0 && (!g.positive || g.r.IntN(5) == 0):
 		inner := g.node(depth)
 		if g.r.IntN(4) == 0 {
@@ -463,8 +541,30 @@ func (g *gen) docJSON(i int) (string, []byte) {
 	if g.r.IntN(4) == 0 {
 		id = ids[g.r.IntN(len(ids))]
 	}
+	doc := g.object([]string{"brand", "title", "tags", "price", "stock", "seen", "spot", "extra"})
+	if g.r.IntN(3) > 0 {
+		members := make([]any, g.r.IntN(5))
+		for k := range members {
+			if g.r.IntN(8) == 0 {
+				members[k] = g.wrongValue()
+			} else {
+				members[k] = g.object([]string{"brand", "title", "tags", "price", "stock", "seen", "extra"})
+			}
+		}
+		doc["v"] = members
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		panic(err)
+	}
+	return id, body
+}
+
+// object is a document's members, or a nested object's, of names: each present or
+// not, of its type or of another.
+func (g *gen) object(names []string) map[string]any {
 	doc := map[string]any{}
-	for _, f := range []string{"brand", "title", "tags", "price", "stock", "seen", "extra"} {
+	for _, f := range names {
 		if g.r.IntN(10) < 3 {
 			continue
 		}
@@ -496,16 +596,14 @@ func (g *gen) docJSON(i int) (string, []byte) {
 			} else {
 				v = g.number()
 			}
+		case f == "spot":
+			v = g.points()
 		default:
 			v = g.scalar()
 		}
 		doc[f] = v
 	}
-	body, err := json.Marshal(doc)
-	if err != nil {
-		panic(err)
-	}
-	return id, body
+	return doc
 }
 
 func (g *gen) wrongValue() any {
@@ -536,4 +634,14 @@ func (g *gen) title() string {
 		t += "\x00nul"
 	}
 	return t
+}
+
+// hasNested reports whether n holds a nested node.
+func hasNested(n query.Node) bool {
+	found := false
+	query.Walk(n, func(_ string, node query.Node) bool {
+		_, found = node.(*query.Nested)
+		return !found
+	})
+	return found
 }

@@ -119,7 +119,16 @@ func allChanges(t testing.TB, st store.Store, n *Node) []store.Change {
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Index != b.Index {
+			return a.Index < b.Index
+		}
+		if a.Shard != b.Shard {
+			return a.Shard < b.Shard
+		}
+		return a.Seq < b.Seq
+	})
 	return out
 }
 
@@ -127,12 +136,12 @@ func allChanges(t testing.TB, st store.Store, n *Node) []store.Change {
 // the store's documents.
 func converge(t testing.TB, c *cluster, st store.Store, index string, shards int) {
 	t.Helper()
-	head, _, err := st.HeadSeq(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
 	for s := range shards {
 		id := store.ShardID{Index: index, Shard: s}
+		head, _, err := st.HeadSeq(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
 		want := truth(t, st, id)
 		for _, tn := range c.live() {
 			if _, ok := tn.n.Hosted(id); !ok {
@@ -149,60 +158,66 @@ func converge(t testing.TB, c *cluster, st store.Store, index string, shards int
 	}
 }
 
-// ackLog records acknowledged writes: each committed item's seq, shard and id.
+// ackLog records acknowledged writes: each committed item's shard, seq and id.
 type ackLog struct {
 	mu   sync.Mutex
-	acks map[int64]string // seq to "shard/id"
+	acks map[ackKey]string // shard and seq to id
+}
+
+// ackKey is a change's shard and seq: seqs are each shard's own.
+type ackKey struct {
+	shard int
+	seq   int64
 }
 
 func (a *ackLog) note(shards int, ops []api.WriteOp, res *api.WriteResult) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.acks == nil {
-		a.acks = map[int64]string{}
+		a.acks = map[ackKey]string{}
 	}
 	for i, it := range res.Items {
 		if it.Err == nil && it.Seq > 0 {
-			a.acks[it.Seq] = fmt.Sprintf("%d/%s", node.ShardFor(ops[i].ID, shards), ops[i].ID)
+			a.acks[ackKey{node.ShardFor(ops[i].ID, shards), it.Seq}] = ops[i].ID
 		}
 	}
 }
 
-// checkAcks verifies every acknowledged write is in the changelog at its seq, and that
-// the changelog's seqs are contiguous from 1.
+// checkAcks verifies every acknowledged write is in the changelog at its shard and
+// seq, and that each shard's seqs are contiguous from 1 (changes holds one index's
+// changes, as allChanges orders them).
 func (a *ackLog) checkAcks(t testing.TB, changes []store.Change) {
 	t.Helper()
-	bySeq := map[int64]store.Change{}
+	at := map[ackKey]store.Change{}
 	for i := range changes {
 		c := &changes[i]
-		if i > 0 && c.Seq != changes[i-1].Seq+1 {
-			t.Fatalf("the changelog skips from seq %d to %d", changes[i-1].Seq, c.Seq)
+		first := i == 0 || c.Shard != changes[i-1].Shard
+		switch {
+		case first && c.Seq != 1:
+			t.Fatalf("shard %d's changelog starts at seq %d", c.Shard, c.Seq)
+		case !first && c.Seq != changes[i-1].Seq+1:
+			t.Fatalf("shard %d's changelog skips from seq %d to %d", c.Shard, changes[i-1].Seq, c.Seq)
 		}
-		if _, dup := bySeq[c.Seq]; dup {
-			t.Fatalf("seq %d appears twice", c.Seq)
-		}
-		bySeq[c.Seq] = *c
-	}
-	if len(changes) > 0 && changes[0].Seq != 1 {
-		t.Fatalf("the changelog starts at seq %d", changes[0].Seq)
+		at[ackKey{c.Shard, c.Seq}] = *c
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for seq, want := range a.acks {
-		c, ok := bySeq[seq]
+	for k, want := range a.acks {
+		c, ok := at[k]
 		if !ok {
-			t.Fatalf("acknowledged seq %d (%s) is not in the changelog", seq, want)
+			t.Fatalf("acknowledged seq %d of shard %d (%s) is not in the changelog", k.seq, k.shard, want)
 		}
-		if got := fmt.Sprintf("%d/%s", c.Shard, c.ID); got != want {
-			t.Fatalf("seq %d is %s, acknowledged as %s", seq, got, want)
+		if c.ID != want {
+			t.Fatalf("seq %d of shard %d is %s, acknowledged as %s", k.seq, k.shard, c.ID, want)
 		}
 	}
 }
 
 // TestConcurrentWritersOnEveryNode (Review Focus 3): many concurrent bulks on all three
 // nodes, upserting, re-upserting and deleting overlapping ids across three shards:
-// the seqs are contiguous and in order, every acknowledged change is in the changelog
-// at its seq, and every copy on every node converges to exactly the store's documents.
+// each shard's seqs are contiguous and in order, every acknowledged change is in the
+// changelog at its shard and seq, and every copy on every node converges to exactly
+// the store's documents.
 func TestConcurrentWritersOnEveryNode(t *testing.T) {
 	forEachDialect(t, func(t *testing.T, d *db) {
 		c := newCluster(t, d, noPrune)
@@ -300,13 +315,12 @@ func TestNodeLossMidBulk(t *testing.T) {
 		waitCopies(t, a.st, "mb", 2, 2, time.Minute)
 		converge(t, c, a.st, "mb", 2)
 		// Every acknowledged upsert is searchable on the survivors.
-		head, _, _ := a.st.HeadSeq(context.Background())
 		want := int64(0)
 		for s := range 2 {
 			want += int64(len(truth(t, a.st, store.ShardID{Index: "mb", Shard: s})))
 		}
 		for _, tn := range c.live() {
-			waitCount(t, tn.n, "mb", head, want)
+			waitCount(t, tn.n, "mb", nil, want)
 		}
 	})
 }
@@ -395,16 +409,16 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 		c.start(2)
 		createIndex(t, a.n, "ms", 6, 1)
 		waitCopies(t, a.st, "ms", 6, 1, time.Minute)
-		var last int64
+		var last *api.Token
 		for k := range 60 {
-			last = mustWrite(t, c.node(k%3).n, "ms", upsertOp(fmt.Sprintf("d%02d", k), k))
+			last = merged(last, mustWrite(t, c.node(k%3).n, "ms", upsertOp(fmt.Sprintf("d%02d", k), k)))
 		}
 		q := api.WriteOp{Kind: api.OpQueryUpsert, ID: "cheap", Query: json.RawMessage(`{"field":"price","op":"lt","value":10}`)}
-		last = max(last, mustWrite(t, a.n, "ms", q))
+		last = merged(last, mustWrite(t, a.n, "ms", q))
 		for _, tn := range c.live() {
 			res, err := tn.n.Search(tctx(t), "ms", &search.Request{
 				Query: &query.All{}, Sort: []search.SortField{{Field: "price", Desc: true}}, Size: 7, TrackTotal: search.TrackTotalAll,
-			}, api.ReadOptions{WaitForSeq: last})
+			}, api.ReadOptions{WaitFor: last})
 			if err != nil {
 				t.Fatalf("node %d: %v", tn.i, err)
 			}
@@ -424,7 +438,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			// Percolate a given document and a stored one.
 			pres, err := tn.n.Percolate(tctx(t), "ms", &api.PercolateRequest{
 				Docs: []json.RawMessage{json.RawMessage(`{"price":3}`)}, IDs: []string{"d05", "d50"},
-			}, api.ReadOptions{WaitForSeq: last})
+			}, api.ReadOptions{WaitFor: last})
 			if err != nil {
 				t.Fatalf("node %d percolate: %v", tn.i, err)
 			}
@@ -436,7 +450,7 @@ func TestMultiShardSearchAcrossNodes(t *testing.T) {
 			if err != nil || info.Docs != 60 || info.Queries != 1 {
 				t.Fatalf("node %d describes %+v (%v)", tn.i, info, err)
 			}
-			cat, err := tn.n.Fields(tctx(t), "ms", 3, api.ReadOptions{WaitForSeq: last})
+			cat, err := tn.n.Fields(tctx(t), "ms", 3, api.ReadOptions{WaitFor: last})
 			if err != nil || len(cat.Fields) == 0 {
 				t.Fatalf("node %d fields %+v (%v)", tn.i, cat, err)
 			}
@@ -466,9 +480,9 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 	c.start(1)
 	createIndex(t, a.n, "pin", 4, 1)
 	waitCopies(t, a.st, "pin", 4, 1, time.Minute)
-	var last int64
+	var last *api.Token
 	for k := range 20 {
-		last = mustWrite(t, a.n, "pin", upsertOp(fmt.Sprintf("p%d", k), k))
+		last = merged(last, mustWrite(t, a.n, "pin", upsertOp(fmt.Sprintf("p%d", k), k)))
 	}
 	// Expire every pin the moment it is made, as the janitor would after a slow
 	// query phase.
@@ -488,7 +502,7 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 		})
 	}
 	for _, tn := range c.live() {
-		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
+		res, err := tn.n.Search(tctx(t), "pin", &search.Request{Query: &query.All{}, Size: 20, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last})
 		if err != nil {
 			var ae *api.Error
 			if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable {
@@ -517,7 +531,7 @@ func TestFetchAfterPinLostRetries(t *testing.T) {
 			continue
 		}
 		checked++
-		url := fmt.Sprintf("http://%s/indexes/pin/_search?wait_for_seq=%d", tn.addr, last)
+		url := fmt.Sprintf("http://%s/indexes/pin/_search?wait_for=%s", tn.addr, last)
 		req, err := http.NewRequestWithContext(tctx(t), http.MethodPost, url, strings.NewReader(`{"query": {"all": []}, "size": 20}`))
 		if err != nil {
 			t.Fatal(err)
@@ -559,7 +573,7 @@ func TestDynamicFieldFromAnotherNode(t *testing.T) {
 	if len(problems) > 0 {
 		t.Fatal(problems)
 	}
-	res, err := b.n.Search(tctx(t), "dyn", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitForSeq: last})
+	res, err := b.n.Search(tctx(t), "dyn", &search.Request{Query: q, TrackTotal: search.TrackTotalAll}, api.ReadOptions{WaitFor: last})
 	if err != nil || res.Total != 1 {
 		t.Fatalf("node-1 searching a field node-0 added: %v (%v)", res, err)
 	}

@@ -15,16 +15,14 @@ import (
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
-// Reduce merges shard results (from ExecuteShard with the same r) into one response:
-// the best r.Size hits over every shard by the request's sort (ties: _id, then the
+// Reduce merges shard results (from ExecuteShard with the same r) into one response,
+// under ctx's trace (its span is a child of the request's): the best r.Size hits after
+// the first r.From over every shard by the request's sort (ties: _id, then the
 // shards' order), the summed total cut at TrackTotal, and the aggregations merged and
-// finished. A nil result (a shard that failed) is skipped.
-func Reduce(rs []*ShardResult, r *Request) *Response {
-	return ReduceContext(context.Background(), rs, r)
-}
-
-// ReduceContext is Reduce under ctx's trace: its span is a child of the request's.
-func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response {
+// finished within MaxBuckets buckets (see boundBuckets). A nil result (a shard that failed) is skipped. With
+// track_total false there is no bound to cut the total at: it is what the shards
+// confirmed.
+func Reduce(ctx context.Context, rs []*ShardResult, r *Request) *Response {
 	start := time.Now()
 	ctx, span := otel.Tracer(telemetry.ScopeName).Start(ctx, "search.reduce", trace.WithAttributes(
 		attribute.String(telemetry.KeyIndex, r.Index), attribute.Int("shards", len(rs))))
@@ -32,7 +30,7 @@ func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response
 	sorts := prepareSorts(r.Sort, nil, new(problems))
 	var specs []*aggSpec
 	for _, name := range slices.Sorted(maps.Keys(r.Aggs)) {
-		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, false, new(problems)); s != nil {
+		if s := prepareAgg(name, r.Aggs[name], nil, "aggs."+name, new(problems)); s != nil {
 			specs = append(specs, s)
 		}
 	}
@@ -54,26 +52,22 @@ func ReduceContext(ctx context.Context, rs []*ShardResult, r *Request) *Response
 	case 0:
 		track = DefaultTrackTotal
 	case TrackTotalNone:
-		track = -1 // no bound to cut at: the total is what the shards confirmed
+		track = -1
 	}
 	if track >= 0 && resp.Total > track {
 		resp.Total, resp.TotalRelation = track, RelationGte
 	}
-	resp.Hits = mergeHits(live, sorts, r.Size)
+	resp.Hits = mergeHits(live, sorts, r.From, r.Size)
 	if r.Size > 0 && len(resp.Hits) == r.Size {
 		resp.Next = slices.Clone(resp.Hits[len(resp.Hits)-1].Sort)
 	}
 	if len(specs) > 0 {
-		resp.Aggs = make(map[string]*AggResult, len(specs))
-		for _, spec := range specs {
-			parts := make([]*AggPartial, 0, len(live))
-			for _, sr := range live {
-				if p := sr.Aggs[spec.name]; p != nil {
-					parts = append(parts, p)
-				}
-			}
-			resp.Aggs[spec.name] = reduceAgg(parts, spec)
+		shards := make([]map[string]*AggPartial, len(live))
+		for i, sr := range live {
+			shards[i] = sr.Aggs
 		}
+		resp.Aggs = reduceAggs(specs, shards)
+		boundBuckets(specs, resp.Aggs)
 	}
 	instruments().recordPhase(ctx, r.Index, "reduce", time.Since(start))
 	span.SetAttributes(attribute.Int64("total", resp.Total), attribute.Int("hits", len(resp.Hits)))
@@ -115,7 +109,9 @@ func (m *hitMerge) Pop() any {
 	return last
 }
 
-func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
+// mergeHits merges the shards' hits in sort order, skips the first from and returns the
+// next size.
+func mergeHits(rs []*ShardResult, sorts []sortSpec, from, size int) []Hit {
 	if size <= 0 {
 		return nil
 	}
@@ -131,7 +127,11 @@ func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
 	var out []Hit
 	for len(out) < size && m.Len() > 0 {
 		i := m.order[0]
-		out = append(out, m.lists[i][m.pos[i]])
+		if from > 0 {
+			from--
+		} else {
+			out = append(out, m.lists[i][m.pos[i]])
+		}
 		m.pos[i]++
 		if m.pos[i] == len(m.lists[i]) {
 			heap.Pop(m)
@@ -142,9 +142,31 @@ func mergeHits(rs []*ShardResult, sorts []sortSpec, size int) []Hit {
 	return out
 }
 
+// reduceAggs merges the shards' partials of specs (one map per shard) and finishes
+// them, by name.
+func reduceAggs(specs []*aggSpec, shards []map[string]*AggPartial) map[string]*AggResult {
+	if len(specs) == 0 {
+		return nil
+	}
+	out := make(map[string]*AggResult, len(specs))
+	for _, spec := range specs {
+		parts := make([]*AggPartial, 0, len(shards))
+		for _, m := range shards {
+			if p := m[spec.name]; p != nil {
+				parts = append(parts, p)
+			}
+		}
+		out[spec.name] = reduceAgg(parts, spec)
+	}
+	return out
+}
+
 // reduceAgg merges the shards' partials of one aggregation and finishes them.
 func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
-	if spec.typ == AggTerms {
+	switch {
+	case spec.wrapper():
+		return reduceWrapper(parts, spec)
+	case spec.typ == AggTerms:
 		return reduceTerms(parts, spec)
 	}
 	merged := &AggPartial{Type: spec.typ}
@@ -154,28 +176,71 @@ func reduceAgg(parts []*AggPartial, spec *aggSpec) *AggResult {
 	return finish(merged, spec)
 }
 
+// reduceWrapper merges the shards' partials of a filter, filters or global aggregation
+// bucket by bucket: the documents summed, and the aggregations under each reduced as
+// top-level ones are, from the shards' partials of that bucket.
+func reduceWrapper(parts []*AggPartial, spec *aggSpec) *AggResult {
+	res := &AggResult{Type: spec.typ}
+	for _, key := range spec.keys {
+		b := &Bucket{Key: key}
+		subs := make([]map[string]*AggPartial, 0, len(parts))
+		for _, p := range parts {
+			for _, pb := range p.Buckets {
+				if pb.Key == key {
+					b.DocCount += pb.DocCount
+					subs = append(subs, pb.Aggs)
+					break
+				}
+			}
+		}
+		b.Aggs = reduceAggs(spec.subs, subs)
+		res.Buckets = append(res.Buckets, b)
+	}
+	if spec.typ != AggFilters && len(res.Buckets) == 1 {
+		res.DocCount, res.Aggs, res.Buckets = res.Buckets[0].DocCount, res.Buckets[0].Aggs, nil
+	}
+	return res
+}
+
 // reduceTerms merges terms lists, tracking which shards returned each term for its
-// error bound (see aggs.go).
+// error bound (see aggs.go, and TermsOrder for orders other than _count descending,
+// whose bounds are 0 or unknown, -1). One shard's list is exact, so its bound is 0: no
+// term it left out sorts before one it returned.
 func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
+	// acc is one term's bucket over the shards: the first shard's own until a second
+	// returns the term, then a copy the others merge into, so a shard's partial is
+	// never changed, and a term one shard returned is never copied.
 	type acc struct {
-		b    *BucketPartial
-		seen []bool
+		b     *BucketPartial
+		owned bool
+		seen  []bool
 	}
 	accs := map[any]*acc{}
 	var all []*acc
 	res := &AggResult{Type: AggTerms}
 	var docs int64
+	bound := spec.bound()
 	for i, p := range parts {
-		res.DocCountErrorUpperBound += p.DocCountError
+		switch {
+		case len(parts) == 1:
+		case bound == boundCount:
+			res.DocCountErrorUpperBound += p.DocCountError
+		case bound == boundNone && p.Cut:
+			res.DocCountErrorUpperBound = -1
+		}
 		docs += p.OtherDocCount
 		for _, b := range p.Buckets {
 			docs += b.DocCount
 			a := accs[b.Key]
-			if a == nil {
-				a = &acc{b: cloneBucket(b, spec), seen: make([]bool, len(parts))}
+			switch {
+			case a == nil:
+				a = &acc{b: b, seen: make([]bool, len(parts))}
 				accs[b.Key] = a
 				all = append(all, a)
-			} else {
+			case !a.owned:
+				a.b, a.owned = cloneBucket(a.b, spec), true
+				fallthrough
+			default:
 				mergeBucket(a.b, b, spec)
 			}
 			a.seen[i] = true
@@ -186,16 +251,22 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 	for _, a := range all {
 		var e int64
 		for i, p := range parts {
-			if !a.seen[i] {
-				e += p.DocCountError
+			if a.seen[i] {
+				continue
 			}
+			m := missedBound(a.b, p, spec)
+			if m < 0 {
+				e = -1
+				break
+			}
+			e += m
 		}
 		errs[a.b] = e
 		if a.b.DocCount >= int64(spec.minDoc) {
 			buckets = append(buckets, a.b)
 		}
 	}
-	sortTerms(buckets)
+	sortTerms(buckets, spec.size, spec)
 	if len(buckets) > spec.size {
 		buckets = buckets[:spec.size]
 	}
@@ -204,6 +275,10 @@ func reduceTerms(parts []*AggPartial, spec *aggSpec) *AggResult {
 		returned += b.DocCount
 		out := finishBucket(b, spec)
 		out.DocCountErrorUpperBound = errs[b]
+		if out.DocCountErrorUpperBound < 0 && bound != boundCount {
+			res.DocCountErrorUpperBound = -1
+		}
+		boundSubTerms(out, spec)
 		res.Buckets = append(res.Buckets, out)
 	}
 	res.SumOtherDocCount = docs - returned
@@ -239,7 +314,27 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			lo, hi, avg := st.Min, st.Max, st.Sum/float64(st.Count)
 			res.Min, res.Max, res.Avg = &lo, &hi, &avg
 		}
+	case AggMin, AggMax:
+		if p.Value != nil {
+			v := *p.Value
+			res.Number = &v
+		}
+	case AggPercentiles, AggPercentileRanks:
+		res.Keys, res.Keyed = spec.percents, spec.keyed
+		res.Percentiles = make([]*float64, len(spec.percents))
+		if p.Digest == nil {
+			break
+		}
+		for i, k := range spec.percents {
+			if v, ok := percentileValue(p.Digest, spec, k); ok {
+				res.Percentiles[i] = &v
+			}
+		}
 	case AggCardinality:
+		if spec.threshold > 0 {
+			res.Value = int64(min(len(p.Distinct), spec.threshold))
+			break
+		}
 		if p.Sketch != nil {
 			res.Value = p.Sketch.Estimate()
 		}
@@ -263,82 +358,212 @@ func finish(p *AggPartial, spec *aggSpec) *AggResult {
 			}
 			res.Buckets = append(res.Buckets, out)
 		}
+	case AggTopMetrics:
+		res.Top = finishTop(p, spec)
+	case AggComposite:
+		return finishComposite(p, spec)
 	case AggTerms:
 		return reduceTerms([]*AggPartial{p}, spec)
-	default: // histograms
+	case AggFilter, AggFilters, AggGlobal:
+		return reduceWrapper([]*AggPartial{p}, spec)
+	default:
 		bs := slices.Clone(p.Buckets)
 		slices.SortFunc(bs, func(a, b *BucketPartial) int { return cmpValue(a.Key, b.Key, false) })
-		if spec.minDoc <= 0 && len(bs) > 1 {
-			bs = fillHistogram(bs, spec)
-		}
 		for _, b := range bs {
-			if b.DocCount < int64(spec.minDoc) {
-				continue
+			if b.DocCount >= int64(spec.minDoc) {
+				res.Buckets = append(res.Buckets, histogramBucket(b, spec))
 			}
-			if len(res.Buckets) == MaxBuckets {
-				// Each shard refused more than MaxBuckets; together they can still pass
-				// it: keep the first MaxBuckets, and say so.
-				res.Truncated = true
-				break
-			}
-			out := finishBucket(b, spec)
-			if spec.typ == AggDateHistogram {
-				if k, ok := b.Key.(float64); ok && math.Abs(k) <= maxDateMillis {
-					out.KeyAsString = time.UnixMilli(int64(k)).UTC().Format("2006-01-02T15:04:05.000Z07:00")
-				}
-			}
-			res.Buckets = append(res.Buckets, out)
 		}
 	}
 	return res
 }
 
-// fillHistogram adds the empty buckets between the first and the last (min_doc_count
-// 0, Elasticsearch's default), unless that would pass MaxBuckets.
-func fillHistogram(bs []*BucketPartial, spec *aggSpec) []*BucketPartial {
-	first, ok1 := bs[0].Key.(float64)
-	last, ok2 := bs[len(bs)-1].Key.(float64)
+// percentileValue is digest d's value at key k of percentiles or percentile_ranks spec:
+// the value at percent k, or the percent of the values below value k (half those equal
+// to it counted); false when d holds no value. The response and a terms order by spec
+// both read it.
+func percentileValue(d *TDigest, spec *aggSpec, k float64) (float64, bool) {
+	var v float64
+	var ok bool
+	if spec.typ == AggPercentiles {
+		v, ok = d.Quantile(k / 100)
+	} else {
+		v, ok = d.Rank(k)
+		v *= 100
+	}
+	return positiveZero(v), ok
+}
+
+// histogramBucket finishes one histogram bucket, a date_histogram's with its key as a
+// date.
+func histogramBucket(b *BucketPartial, spec *aggSpec) *Bucket {
+	out := finishBucket(b, spec)
+	if spec.typ == AggDateHistogram {
+		if k, ok := b.Key.(float64); ok && math.Abs(k) <= maxDateMillis {
+			out.KeyAsString = time.UnixMilli(int64(k)).UTC().Format("2006-01-02T15:04:05.000Z07:00")
+		}
+	}
+	return out
+}
+
+// boundBuckets keeps a response's aggregations (specs, finished as results) within
+// MaxBuckets buckets together. Each shard kept its own partial within it, but merged
+// they can pass it: past it, in name order, an aggregation's buckets are cut and it is
+// marked Truncated (a terms aggregation's cut buckets join its sum_other_doc_count).
+// Then each histogram with min_doc_count 0 has its empty buckets filled in, in name
+// order, when they fit in what is left; one whose do not is marked Truncated. The
+// aggregations under a filter, filters or global aggregation's buckets are bounded in
+// turn, right after it; its own buckets (one, or at most MaxFilters+1) count but are
+// never cut. A terms aggregation's terms sub-aggregations (under a terms on a
+// sub-field) are bounded right after its own buckets, bucket by bucket.
+func boundBuckets(specs []*aggSpec, results map[string]*AggResult) {
+	left := MaxBuckets
+	cutBuckets(specs, results, &left)
+	fillBuckets(specs, results, &left)
+}
+
+func cutBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
+	for _, spec := range specs {
+		res := results[spec.name]
+		switch spec.typ {
+		case AggFilter, AggGlobal:
+			*left = max(*left-1, 0)
+			cutBuckets(spec.subs, res.Aggs, left)
+			continue
+		case AggFilters:
+			*left = max(*left-len(res.Buckets), 0)
+			for _, b := range res.Buckets {
+				cutBuckets(spec.subs, b.Aggs, left)
+			}
+			continue
+		}
+		if len(res.Buckets) > *left {
+			if res.Type == AggTerms {
+				for _, b := range res.Buckets[*left:] {
+					res.SumOtherDocCount += b.DocCount
+				}
+			}
+			res.Buckets, res.Truncated = res.Buckets[:*left], true
+			if spec.typ == AggComposite {
+				res.AfterKey = lastCompositeKey(res.Buckets)
+			}
+		}
+		*left -= len(res.Buckets)
+		if spec.typ == AggTerms {
+			for _, b := range res.Buckets {
+				cutBuckets(spec.subs, b.Aggs, left)
+			}
+		}
+	}
+}
+
+func fillBuckets(specs []*aggSpec, results map[string]*AggResult, left *int) {
+	for _, spec := range specs {
+		res := results[spec.name]
+		switch {
+		case spec.typ == AggFilter || spec.typ == AggGlobal:
+			fillBuckets(spec.subs, res.Aggs, left)
+		case spec.typ == AggFilters:
+			for _, b := range res.Buckets {
+				fillBuckets(spec.subs, b.Aggs, left)
+			}
+		case (spec.typ == AggHistogram || spec.typ == AggDateHistogram) && spec.minDoc <= 0 && !res.Truncated && len(res.Buckets) > 1:
+			*left -= fillHistogram(res, spec, *left)
+		}
+	}
+}
+
+// maxExactIndex is the greatest bucket index (a count of intervals from offset) a
+// float64 holds together with its neighbours: past 2^53, j+1 rounds back to j, so
+// there the empty buckets between two real ones cannot be keyed.
+const maxExactIndex = 1 << 53
+
+// fillHistogram adds res's empty buckets between its first and its last (min_doc_count
+// 0, Elasticsearch's default), when there are at most room of them, and returns how
+// many it added. When there are more, or their indices pass maxExactIndex or are not
+// finite (a huge key over a tiny interval), or neighbouring keys round to one float64
+// (an offset huge beside the interval), res stays sparse and is marked Truncated. A
+// real bucket's key off the grid (float rounding), or a grid that starts or ends off
+// the real first or last, leaves res as it is rather than lose that bucket or add one
+// outside them.
+func fillHistogram(res *AggResult, spec *aggSpec, room int) int {
+	first, ok1 := res.Buckets[0].Key.(float64)
+	last, ok2 := res.Buckets[len(res.Buckets)-1].Key.(float64)
 	if !ok1 || !ok2 {
-		return bs
+		return 0
 	}
-	have := make(map[float64]*BucketPartial, len(bs))
-	for _, b := range bs {
-		k, _ := b.Key.(float64)
-		have[k] = b
-	}
+	most := len(res.Buckets) + room
 	var keys []float64
 	if spec.calendar == "" {
 		j0 := math.Round((first - spec.offset) / spec.interval)
 		j1 := math.Round((last - spec.offset) / spec.interval)
-		if j1-j0+1 > MaxBuckets {
-			return bs
+		if !(math.Abs(j0) <= maxExactIndex && math.Abs(j1) <= maxExactIndex && j1-j0+1 <= float64(most)) {
+			res.Truncated = true
+			return 0
 		}
-		for j := j0; j <= j1; j++ {
-			keys = append(keys, j*spec.interval+spec.offset)
+		n := int(j1-j0) + 1
+		keys = make([]float64, 0, max(n, 0))
+		for i := range n {
+			k := (j0+float64(i))*spec.interval + spec.offset
+			if i > 0 && !(k > keys[i-1]) {
+				res.Truncated = true // an offset too large for the interval rounds neighbours together
+				return 0
+			}
+			keys = append(keys, k)
+		}
+		if len(keys) == 0 || keys[0] != first || keys[len(keys)-1] != last {
+			return 0 // the grid, recomputed, rounds off the real buckets' keys
 		}
 	} else {
 		t := time.UnixMilli(int64(first - spec.offset)).UTC()
 		end := time.UnixMilli(int64(last - spec.offset)).UTC()
 		for !t.After(end) {
-			if len(keys) == MaxBuckets {
-				return bs
+			if len(keys) == most {
+				res.Truncated = true
+				return 0
 			}
 			keys = append(keys, float64(t.UnixMilli())+spec.offset)
 			t = calendarNext(t, spec.calendar)
 		}
 	}
-	out := make([]*BucketPartial, 0, len(keys))
+	have := make(map[float64]*Bucket, len(res.Buckets))
+	for _, b := range res.Buckets {
+		k, _ := b.Key.(float64)
+		have[k] = b
+	}
+	out := make([]*Bucket, 0, len(keys))
 	for _, k := range keys {
 		if b := have[k]; b != nil {
 			out = append(out, b)
 			delete(have, k)
 			continue
 		}
-		out = append(out, &BucketPartial{Key: k})
+		out = append(out, histogramBucket(&BucketPartial{Key: k}, spec))
 	}
 	if len(have) > 0 {
-		// A key off the grid (float rounding): keep every real bucket rather than lose one.
-		return bs
+		return 0
 	}
-	return out
+	added := len(out) - len(res.Buckets)
+	res.Buckets = out
+	return added
+}
+
+// boundSubTerms gives the terms sub-aggregations of bucket b (a terms aggregation's,
+// spec's) b's own error bound. A terms sub-aggregation is never cut by a shard, but the
+// shards that cut b out of their lists counted its documents under none of its
+// sub-buckets: those documents, at most b's bound, may be missing from each of them.
+func boundSubTerms(b *Bucket, spec *aggSpec) {
+	if b.DocCountErrorUpperBound == 0 {
+		return
+	}
+	for _, sub := range spec.subs {
+		res := b.Aggs[sub.name]
+		if sub.typ != AggTerms || res == nil {
+			continue
+		}
+		res.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		for _, sb := range res.Buckets {
+			sb.DocCountErrorUpperBound = b.DocCountErrorUpperBound
+		}
+	}
 }

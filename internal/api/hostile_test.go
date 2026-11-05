@@ -129,7 +129,7 @@ func TestHostileRequests(t *testing.T) {
 		e.problem(e.do("POST", "/indexes/h/_search", `{"from": 100000}`), http.StatusBadRequest, "invalid_request")
 		e.problem(e.do("GET", "/indexes/h/queries?size=99999999999999999999", ""), http.StatusBadRequest, "invalid_request")
 		e.problem(e.do("GET", "/indexes/h/_fields?entries=-1", ""), http.StatusBadRequest, "invalid_request")
-		e.problem(e.do("POST", "/indexes/h/_search?wait_for_seq=abc", `{}`), http.StatusBadRequest, "invalid_request")
+		e.problem(e.do("POST", "/indexes/h/_search?wait_for=abc", `{}`), http.StatusBadRequest, "invalid_request")
 	})
 	t.Run("malformed JSON", func(t *testing.T) {
 		e := e.with(t)
@@ -227,7 +227,7 @@ func TestUnknownParametersAreRefused(t *testing.T) {
 	if !hasLoc(p, "params.wait_for_sq") {
 		t.Errorf("a misspelled parameter: %v", p)
 	}
-	e.problem(e.do("POST", "/indexes/u/_search?wait_for_seq=1&wait_for_seq=2", `{}`), http.StatusBadRequest, "invalid_request")
+	e.problem(e.do("POST", "/indexes/u/_search?wait_for=a&wait_for=b", `{}`), http.StatusBadRequest, "invalid_request")
 	e.problem(e.do("GET", "/healthz?x=1", ""), http.StatusBadRequest, "invalid_request")
 }
 
@@ -416,17 +416,18 @@ func TestRequestDeadline(t *testing.T) {
 	e.problem(e.do("GET", "/indexes", ""), http.StatusInternalServerError, "internal")
 }
 
-func TestWaitForSeqTimesOut(t *testing.T) {
+func TestWaitForTimesOut(t *testing.T) {
 	// 8 s, not 2: under go test ./... -count=2's full parallel suite (many heavy
 	// packages sharing this machine's cores), the fake tailer's catch-up after Resume
 	// can be scheduled out past 2 s; a real tailer never takes this long, but the
 	// deadline below still has to actually elapse once, by design.
 	e := newEnv(t, envOpts{fakeTailers: true, cfg: func(c *config.Config) { c.RequestTimeout = 8 * time.Second }})
 	e.createIndex("w", "")
-	// A seq past the newest committed one is refused at once, before a bulk writes.
-	e.problem(e.do("POST", "/indexes/w/_search?wait_for_seq=999999", `{}`), http.StatusBadRequest, "invalid_request")
-	p := e.problem(e.do("POST", "/indexes/w/_bulk?percolate=true&wait_for_seq=999999", ndjson(`{"upsert": {"id": "a"}}`, `{"x": 1}`)), http.StatusBadRequest, "invalid_request")
-	if !hasLoc(p, "params.wait_for_seq") {
+	// A token past the newest committed seq is refused at once, before a bulk writes.
+	past := tokenPast(t, tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/w/docs/seed", `{"x": 0}`)), 999999)
+	e.problem(e.do("POST", "/indexes/w/_search?wait_for="+past, `{}`), http.StatusBadRequest, "invalid_request")
+	p := e.problem(e.do("POST", "/indexes/w/_bulk?percolate=true&wait_for="+past, ndjson(`{"upsert": {"id": "a"}}`, `{"x": 1}`)), http.StatusBadRequest, "invalid_request")
+	if !hasLoc(p, "params.wait_for") {
 		t.Errorf("bulk = %v", p)
 	}
 	e.problem(e.do("GET", "/indexes/w/docs/a", ""), http.StatusNotFound, "document_not_found")
@@ -435,10 +436,10 @@ func TestWaitForSeqTimesOut(t *testing.T) {
 	// 504; a bulk whose percolation must wait for a saved query on it is still
 	// committed, and says so.
 	e.tailer("w", 0).Pause()
-	q := seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/w/queries/q", `{"query": {"all": []}}`))
-	e.problem(e.do("POST", fmt.Sprintf("/indexes/w/_search?wait_for_seq=%d", q), `{}`), http.StatusGatewayTimeout, "timeout")
+	q := tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/w/queries/q", `{"query": {"all": []}}`))
+	e.problem(e.do("POST", fmt.Sprintf("/indexes/w/_search?wait_for=%s", q), `{}`), http.StatusGatewayTimeout, "timeout")
 	r := e.must(http.StatusOK, "POST", "/indexes/w/_bulk?percolate=true", ndjson(`{"upsert": {"id": "a"}}`, `{"x": 1}`))
-	if r["timed_out"] != true || r["percolated"] != false || seqOf(t, r) == 0 {
+	if r["timed_out"] != true || r["percolated"] != false || r["token"] == nil {
 		t.Errorf("bulk = %v", r)
 	}
 	if item := r["items"].([]any)[0].(map[string]any); item["queries"] != nil || item["status"] != 200.0 { //nolint:forcetypeassert,errcheck // the shape

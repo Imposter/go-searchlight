@@ -10,7 +10,7 @@ const MaxFieldEntries = 1000
 // fields serves GET /indexes/{index}/_fields?entries=N: the mapping's fields, with
 // each keyword_list field's N most frequent entries.
 func (s *Server) fields(w http.ResponseWriter, r *http.Request, p params) error {
-	wait, e := p.waitForSeq()
+	wait, e := p.waitFor()
 	if e != nil {
 		return e
 	}
@@ -18,7 +18,7 @@ func (s *Server) fields(w http.ResponseWriter, r *http.Request, p params) error 
 	if e != nil {
 		return e
 	}
-	cat, err := s.c.Fields(r.Context(), r.PathValue("index"), int(entries), ReadOptions{WaitForSeq: wait})
+	cat, err := s.c.Fields(r.Context(), r.PathValue("index"), int(entries), ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

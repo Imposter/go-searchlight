@@ -118,6 +118,7 @@ func checkRuns(d *decoder) (card uint64, last int, ok bool) {
 }
 
 // checkBitmapWords reads one bitmap container's body: its cardinality is its popcount.
+// A body with no bit set is not a container roaring would write.
 func checkBitmapWords(words []byte) (card uint64, last int, ok bool) {
 	if len(words) != bitmapWords*8 {
 		return 0, 0, false
@@ -133,7 +134,7 @@ func checkBitmapWords(words []byte) (card uint64, last int, ok bool) {
 			return card, w*64 + 63 - bits.LeadingZeros64(word), true
 		}
 	}
-	return 0, 0, false // no bits set: not a container roaring would write
+	return 0, 0, false
 }
 
 // checkArray reads one array container's body: strictly ascending values. It compares

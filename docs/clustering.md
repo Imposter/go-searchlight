@@ -50,10 +50,10 @@ is why:
 
 - **there is no consensus service.** The spec's "no ZooKeeper, no etcd, no consensus
   library" (§1) follows directly from putting the write-ahead log, the sequence counter
-  and the shard registry in the one database every node already talks to. A `seq`,
-  taken under a locked row (`sl_counter`), is the only ordering primitive the cluster
-  needs; no node has to agree with another about anything that isn't already a row in
-  Postgres;
+  and the shard registry in the one database every node already talks to. A shard's
+  `seq`, taken under that shard's locked row (`sl_shard_seq`), is the only ordering
+  primitive the cluster needs; no node has to agree with another about anything that
+  isn't already a row in Postgres;
 - **losing a node's disk loses nothing.** A node whose `data_dir` is gone just looks,
   to the rest of the cluster, like a node with zero shard copies. It recovers every
   copy from a peer, a recovery bundle, or Postgres itself (see
@@ -64,15 +64,21 @@ is why:
 
 | Table | Holds | Role |
 |---|---|---|
-| `sl_changes` | One row per committed change: `seq`, index, shard, kind, id, payload, time | The write-ahead log. Every shard copy tails this in `seq` order; it is the only thing that has to happen before a write is acknowledged |
+| `sl_changes` | One row per committed change, keyed by index, shard and `seq`: kind, id, payload, time | The write-ahead log. Every shard copy tails its shard's rows in `seq` order; it is the only thing that has to happen before a write is acknowledged |
 | `sl_documents` | The current body and `seq` of every live document, by index/shard/id | The system of record for documents. A `GET` of one document reads this table directly (it is realtime), not a segment |
 | `sl_nodes` | node_id, address, version, heartbeat time, capacity | The membership registry: how a node discovers its peers, and how the cluster tells a live node from a dead one |
 | `sl_shard_copies` | index, shard, node_id, state (`recovering`/`serving`/`retiring`), `applied_seq`, `lease_until` | The allocator's bookkeeping: which node holds which shard copy, under what lease, and whether it is caught up |
 | `sl_blobs` | Optional, checksummed recovery bundles of a shard's durable segments | A faster path than re-scanning the database when no peer can serve a recovery (off by default; `bundle_interval`) |
 
 `sl_queries` is `sl_documents`' counterpart for saved queries, and `sl_indexes` holds
-each index's mapping and settings; neither changes the picture above. `sl_counter` is
-the single row every `Apply` locks to hand out contiguous `seq` values (spec §8).
+each index's mapping and settings; neither changes the picture above. `sl_shard_seq`
+holds one row per shard of every index, its newest `seq`: a transaction that commits to
+a shard locks that shard's row to hand out contiguous `seq` values there (spec §8).
+`sl_counter` row 3 is the floor (a new shard starts at it, and a dropped index raises
+it past its shards' seqs), and row 2 issues copy epochs. Row 1 is the global sequence
+of 1.x, which every commit takes while a cluster upgrades from it; the switch to shard
+sequences seeds every shard's row at its value and deletes it
+([upgrading](operations.md#upgrades-and-rolling-restarts)).
 
 ## Joining
 
@@ -85,8 +91,10 @@ automatic (spec §9, operations.md's [configuration table](operations.md#every-s
   `deploy/compose.yml`'s `SEARCHLIGHT_ADVERTISE_ADDRESS` and
   [Internal peer traffic](nginx.md#internal-peer-traffic)).
 - **`cluster_token`** authenticates the internal peer API (`/_internal/` on the public
-  listener). Without it, a cluster of more than one node cannot form: peer calls (reads,
-  push hints, recovery snapshots) are refused.
+  listener). A node on Postgres or MySQL refuses to start without it, unless
+  `insecure_no_auth` is set; every node needs the same one. A peer that refuses a node's
+  token (401) counts as a failed copy for that node: reads go to another copy, and
+  recovery falls back to a bundle or the database.
 
 On start, a node inserts or updates its row in `sl_nodes` and heartbeats every 2 s.
 Peers are discovered by reading that same table — there is no separate discovery
@@ -110,34 +118,48 @@ sequenceDiagram
   participant DB as Postgres
   participant T as tailers (every copy, incl. Co's own)
   Cl->>Co: PUT doc / _bulk
-  Co->>DB: group commit: lock sl_counter, take contiguous seqs, insert, commit
+  Co->>DB: group commit, one transaction per shard: lock the shard's sl_shard_seq row, take contiguous seqs, insert, commit
   DB-->>Co: committed
-  Co-->>Cl: 200 {"seq": N}
+  Co-->>Cl: 200 {"token": "..."}
   Co->>T: wake its own tailers (fast path)
   Co->>T: push hint "shard S has seq N" to peers holding S
-  Note over DB,T: Postgres LISTEN/NOTIFY also wakes every tailer; polling is the safety net everywhere
+  Note over DB,T: Postgres NOTIFY after commit also wakes every tailer; polling is the safety net everywhere
   T->>DB: ChangesAfter(shard, applied_seq)
   T->>T: apply, then refresh (visible) and flush (durable) on their own clocks
 ```
 
-- **Any node commits any write.** The coordinator locks the `sl_counter` row, takes
-  contiguous `seq` values for the batch, inserts the change rows and the document or
-  query rows, and commits in one transaction. Concurrent writes on the same node are
-  coalesced into that one transaction every 2 ms, at 4,096 changes or at 16 MiB of stored payload, whichever comes
-  first (**group commit**), the way
+- **Any node commits any write.** Every shard has its own sequence. The coordinator
+  splits a request by shard; for each shard it locks that shard's `sl_shard_seq` row,
+  takes contiguous `seq` values there for the batch, inserts the change rows and the
+  document or query rows, and commits in one transaction of that shard's alone. A
+  transaction locks its rows in key order (index name, shard), so commits to different
+  shards run in parallel and never deadlock; a mapping change or a drop locks every
+  shard row of the index, in shard order. A request is whole or nothing only on one
+  shard: when one shard's transaction fails, the others' may have committed (see
+  [api.md](api.md#bulk)).
+- **Group commit.** A node's group committer has a lane per shard. Concurrent writes
+  on the same node to the same shard are coalesced into one transaction every 2 ms, at
+  4,096 changes or at 16 MiB of stored payload, whichever comes first, the way
   Elasticsearch amortizes translog fsyncs — so `_bulk` is the throughput path, not many
-  small single-document writes (spec §8).
-- **The write is acknowledged with its `seq` only after the commit.** That `seq` is a
-  receipt: pass it back on a later read as `?wait_for_seq=N` for read-your-writes (see
-  below), or hold onto it for `if_seq` optimistic concurrency.
+  small single-document writes (spec §8). Lanes commit at the same time, up to the
+  node's `write_transactions` (16 by default, at most half the store's write pool; 1 on
+  SQLite, where a request's shards commit together in one transaction; see
+  [operations.md](operations.md#every-setting)).
+- **The write is acknowledged with its `token` only after the commit.** The token is a
+  receipt: it names, for each shard the write committed to, the newest `seq` there,
+  plus the index's incarnation. Pass it back on a later read as `?wait_for=<token>` for
+  read-your-writes (see below). A single-document write also answers with the
+  document's `seq`, to hold onto for `if_seq` optimistic concurrency.
 - **Fast path.** The coordinator never writes a shard directly; it wakes its own
   tailers, which is normally the quickest way any copy of a shard it holds sees the new
   change.
 - **Push hint + LISTEN/NOTIFY.** The coordinator also pushes a "shard S has seq N" hint
   over the internal peer API to every other node holding a copy of an affected shard,
   which wakes their tailers immediately rather than waiting for the next poll. On
-  Postgres, `LISTEN/NOTIFY` wakes every tailer too (the payload is sent inside the same
-  commit, so it never arrives before the row it announces is visible).
+  Postgres, `LISTEN/NOTIFY` wakes every tailer too. The notifications are sent after
+  the commit, coalesced, with `synchronous_commit` off, so one never arrives before the
+  row it announces is visible; a lost one costs a copy up to half `max_lag` (1 s by
+  default).
 - **Polling is the safety net everywhere**, including on dialects with no
   `LISTEN/NOTIFY` (MySQL): every `changelog_poll_interval` (500 ms by default), a
   tailer with nothing to do checks `ChangesAfter` anyway. A missed hint or a dropped
@@ -148,20 +170,27 @@ sequenceDiagram
   second). Three knobs on the request itself change this:
   - nothing special: visible everywhere within `refresh_interval` of the commit;
   - `?refresh=wait_for`: the response waits until the write is searchable on the
-    **coordinator's own copy** specifically (it never forces an early refresh, and never
-    waits for durability — refresh and flush are separate, see
+    **coordinator's own copy** specifically, or, on a node that hosts no copy of the
+    shard, on the first copy that has it; other copies may still trail (it never forces
+    an early refresh, except on an index whose refresh is disabled, and never waits for
+    durability — refresh and flush are separate, see
     [architecture.md](architecture.md#the-write-path-the-sql-changelog-is-the-wal));
   - `?refresh=true`: forces a refresh of the written shard at once, at the cost of a
     small segment per call — don't do this per document under load.
-- **Read-your-writes with `wait_for_seq`.** Any read (`_search`, `_count`,
-  `_percolate`, `_fields`, `GET` of a document or query) takes `?wait_for_seq=N`. It
-  waits, under the request's deadline, until the copies it actually reads have applied
-  every change up to `N` — which may be a different copy than the one that took the
-  write. An `N` past the newest seq the node knows is a 400; if the database cannot be
-  reached to confirm it, it is a 503 `unavailable` with `Retry-After` (see
-  [api.md](api.md#consistency)). `GET` of a single document or saved query is simpler
-  still: it reads `sl_documents`/`sl_queries` directly, so `wait_for_seq` is trivially
-  satisfied (there is no "applying" to wait for).
+- **Read-your-writes with `wait_for`.** Any read (`_search`, `_count`,
+  `_percolate`, `_fields`, `GET` of a document or query, the saved-query listing, and
+  `_bulk` with `percolate=true`) takes `?wait_for=<token>`. It waits, under the
+  request's deadline, until each shard it actually reads has every change up to the
+  token's seq of that shard searchable, on the copy it reads — which may be a
+  different copy than the one that took the write. It waits on no other shard. A seq
+  past its shard's newest committed seq, a token of another incarnation of the index,
+  or one naming a shard the index lacks is a 400; if the database cannot be reached to
+  confirm a seq past the newest the node knows, it is a 503 `unavailable` with
+  `Retry-After` (see [api.md](api.md#tokens)). `GET` of a single document or saved
+  query reads `sl_documents`/`sl_queries` directly, so it holds every committed change
+  without waiting; it still checks the token's seq of its document's shard (a 400 past
+  that shard's newest), and, while the database cannot be reached and it answers
+  `stale` from a copy, it waits for that copy to have that seq searchable.
 
 ## Reads
 
@@ -182,7 +211,10 @@ not:
    budget) against a chosen copy is retried against another serving copy of the same
    shard, not surfaced to the client. With two or more copies of every shard, one node
    failing is not a client-visible error (architecture.md's
-   [Routing](architecture.md#routing)).
+   [Routing](architecture.md#routing)). When every copy the coordinator knew of has
+   failed, it reads the copy table once more, within a share of the request's time,
+   and tries the serving copies it has not tried: its view can trail the registry by a
+   refresh.
 
 ## Shards and copies
 
@@ -252,9 +284,9 @@ by the slower of disk and network, since whole segments are streamed) plus howev
 changelog has to be replayed since the snapshot's seq (normally small off a healthy
 peer; much larger off `ScanShard`, which starts from scratch). The benchmark harness
 (`bench/`) measures recovery time against Elasticsearch's peer recovery as one of its
-workloads, but the tuning pass to hit the spec's targets is still ahead of this doc (see
-[architecture.md's "Planned, not built"](architecture.md#planned-not-built)) — don't
-take a number from here, watch the actual run instead:
+workloads: a new replica of 1M documents served in 6.0 s against Elasticsearch's 28.5 s
+([benchmarks.md](benchmarks.md)). Your own numbers depend on disk, network and changelog
+backlog, so watch the actual run:
 `searchlight_replica_recovery_progress_ratio`, `searchlight_replica_recovery_bytes_total`
 (by `source`: `peer`, `blob`, `sql`) and `searchlight_replica_recovery_duration_seconds`
 (operations.md's [Monitoring](operations.md#monitoring)).
@@ -270,15 +302,20 @@ target doesn't drop below it just because one copy is being rebuilt.
 | **A node dies** (crashes, is killed, loses power) | Its heartbeat stops. After 10 s its leases expire, and the allocator on other nodes claims its shards up to the target copy count. Reads and writes against the shards it held see no client error as long as ≥ 2 copies existed. |
 | **A network partition** | The cut-off node's copies stop serving *before* another node takes over, not after: each copy tracks its own lease deadline on its own monotonic clock from just before each renewal, and stops serving (and stops its tailer) at that local deadline, independently of whether it can reach the registry to confirm it lost the lease. A node on the wrong side of a partition therefore can't keep answering reads with a stale view of "I still hold this" after another node has legitimately claimed the slot. |
 | **Postgres is down** | Writes return 503 `unavailable` (with `Retry-After`). Reads keep serving from local segments, each one marked `stale: true` and (for a single document) with no `seq`. Readiness (`/readyz`) turns false once the outage has lasted `max_lag`, so a load balancer stops sending this node traffic even though it can still answer some reads. |
-| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff; sequence numbers live in the database, so nothing about `seq` ordering is lost or has to be renegotiated. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume normally once the new primary answers. |
+| **Postgres fails over** (e.g. a primary switch) | Point `store_url` at an endpoint that survives the failover itself — PgBouncer, or a managed Postgres's writer endpoint — not at a single instance's address. During the blip, every node's store reconnects with backoff. Writes 503 and reads go `stale` for the duration, exactly as in the "Postgres is down" row, then resume once the new primary answers. The failover is transparent only when the new primary holds every commit the old one acknowledged: synchronous (or semi-synchronous) replication. |
+| **A failover loses commits** (async replication) | This is a point-in-time restore. The new primary's counter is behind the old one's, so new writes take the lost seqs again, and the copies hold changes the database no longer does. Each running copy sees it at its next poll — the changelog's head behind its seq, or another change at its seq than the one it applied — logs `the changelog no longer holds what this copy applied`, counts `searchlight_changelog_rewinds_total`, and rebuilds from the database (never from a peer or a bundle, which may hold the lost commits too). A shard whose copies rebuild together has no serving copy until one finishes. The lost writes are gone. No operator step is needed. Each copy checks two things at every poll. Its own shard: the newest change of the shard at or below the seq it last checked must be the last one it applied there (a change of its shard it never applied, another change at that seq, or that change gone though the shard was not pruned past it, is a rewind). And a mark of a change it applied, which may be another shard's (the head it advanced to). Both are kept in its manifest (`own_mark`, `anchor_mark`, `seq_mark`), so a node stopped across the failover (back while its copies still hold the changelog's prune floor), a copy fetched from a peer or restored from a bundle, a copy rebuilt aside while it happened, and a copy loaded from the database's snapshot (whose marks come from that same snapshot) all check at their first polls, and rebuild too. A mark is trusted only once a later poll has checked the one before it, so a page read across the failover is caught too. A head behind a copy's seq counts only when two polls in a row see it, so one read that reached a lagging server rebuilds nothing. What remains: a copy whose last flush predates these marks has none until it flushes again, and trusts what it reads at its first poll (once, at the upgrade); a lost change reissued to the same document, of the same kind, in the same millisecond, written by a node from before change nonces (schema v3), looks the same and goes unseen (one written by a current node differs by its nonce); and a node may come back after its shards were pruned without it. A stopped node's copy holds its shard's prune floor until the node is found dead or the copy's lease runs out (seconds), or, when a clean stop retired it, for `retiring_retention` (15 min) after its lease ran out; and changes older than `changelog_retention` are pruned whatever copy needs them. Pruned past its seq, a copy rebuilds; pruned short of it, a rewind whose reissued changes of the copy's shard were all pruned may go unseen. |
 
 ## Postgres sizing and settings
 
-- **`max_connections`.** Each node opens up to 64 connections for its own pool plus one
-  dedicated connection for `LISTEN`, so set Postgres's `max_connections` to at least 65
-  per node, plus headroom for `psql`, backups and migrations (operations.md's
-  [Databases](operations.md#databases) table has the exact per-dialect connection
-  counts; `deploy/compose.yml`'s three-node example sets `max_connections=300`).
+- **`max_connections`.** Each node opens up to 64 connections, one pool shared by its
+  reads and writes, plus one dedicated connection for `LISTEN`. A busy node can hold all
+  65, so set Postgres's `max_connections` to at least nodes × 65, plus headroom for
+  `psql`, backups and migrations: three nodes need 195 and more (operations.md's
+  [Databases](operations.md#databases) table has the per-dialect connection counts;
+  `deploy/compose.yml`'s three-node example sets `max_connections=300`).
+  `write_transactions` bounds only the writes' share of the pool, so lowering it does
+  not lower the total. A refused connection (SQLSTATE 53300) fails the operation with an
+  error that names the pool size and `max_connections`.
 - **PgBouncer: session mode only if you need `LISTEN/NOTIFY`.** A node holds one
   connection open for the lifetime of the process and issues a raw `LISTEN` on it
   (`internal/store/postgres/store.go`); that only works if the pooler keeps that
@@ -290,8 +327,8 @@ target doesn't drop below it just because one copy is being rebuilt.
     500 ms) alone, which still keeps the cluster correct but adds up to that much extra
     latency to every write's visibility on peers.
   - **What does work behind transaction-mode pooling:** everything else the store does.
-    `Apply`'s counter lock is a plain `SELECT ... FOR UPDATE` inside the one transaction
-    that also inserts the change rows, and the migration lock is a transaction-scoped
+    `Apply`'s lock on a shard's `sl_shard_seq` row is a plain `SELECT ... FOR UPDATE`
+    inside the shard's transaction that also inserts the change rows, and the migration lock is a transaction-scoped
     `pg_advisory_xact_lock` — both released at commit, so neither needs the connection
     they ran on to be the same one next time.
   - **The practical choice:** run PgBouncer in **session** mode if you want
@@ -303,10 +340,15 @@ target doesn't drop below it just because one copy is being rebuilt.
 - **`synchronous_commit` and HA.** Searchlight has no durability of its own beyond
   Postgres's: an acknowledged write is exactly as durable as the transaction that
   committed it. Run Postgres (or MySQL) with the replication and failover setup you'd
-  use for any primary datastore — `synchronous_commit` on and synchronous replicas if
-  you need zero loss on a primary failure, async replication if you can tolerate losing
-  the last moment of commits. Searchlight's own replicas don't change this calculus: a
-  node's segments are a cache, not a copy of the database's guarantees.
+  use for any primary datastore. For a failover to be transparent, the new primary must
+  hold every acknowledged commit: synchronous replication (Postgres
+  `synchronous_commit` with `synchronous_standby_names`; MySQL semi-synchronous
+  replication waiting `AFTER_SYNC`). With async replication a failover can lose the last
+  commits, and that is a point-in-time restore: the lost writes are gone, their seqs are
+  reissued to new writes, and every copy rebuilds from the database once it sees the
+  changelog rewound (see [Failures](#failures)). Searchlight's own replicas don't change
+  this calculus: a node's segments are a cache, not a copy of the database's
+  guarantees.
 - **Backups.** Back up Postgres with its own tools (`pg_dump`, or base backups with WAL
   archiving); never back up `data_dir`. See operations.md's
   [Backups and disaster recovery](operations.md#backups-and-disaster-recovery), which
@@ -325,6 +367,90 @@ compatibility rules for upgrading across a major version are in operations.md's
 [Upgrades and rolling restarts](operations.md#upgrades-and-rolling-restarts); this
 section exists only to connect that to the cluster model above. [nginx.md](nginx.md)
 covers the load balancer's side of the same restart.
+
+Mid-upgrade, a coordinator may send a shard's search to a node one release older. The
+peer API only adds fields, and an older node ignores the ones it does not know, so a
+search an older node would answer only in part is never sent to it as one it reads:
+each search has a wire level, the level a peer must speak to answer it exactly.
+
+- A search with a `post_filter`, or a `filter`, `filters` or `global` aggregation,
+  needs level 1 and goes to the peer endpoint of that level, which a 1.0.0 node does
+  not have (it would run the search without the `post_filter`, and refuse the
+  aggregations). Its 404 is taken as an older release: the coordinator tries the
+  shard's next copy, and when no copy is on an upgraded node the search is
+  unavailable (503, retryable) rather than answered wrongly. Searches that need
+  neither are answered by any node.
+- A search with a `terms` aggregation's `include` or `exclude` needs level 2, and its
+  endpoint, in the same way: a node of level 0 or 1 would count every value.
+- A search with a `from` past 0 (and a `size` past 0) needs level 3, and its endpoint,
+  in the same way: a node of level 0 to 2 would ignore `from` and return its first
+  `size` hits, the wrong page. A `from` of 0 needs nothing.
+- A search with a `min` or `max` aggregation, or a cardinality's `threshold`, needs
+  level 4, and its endpoint, in the same way: a node of level 0 to 3 would refuse the
+  aggregation as unknown, or estimate past the threshold. A `terms`
+  aggregation's `collect_mode` needs nothing, as either mode answers the same.
+- A search with a [`box`](api.md#box-queries) condition anywhere (its query,
+  `post_filter`, or a `filter` or `filters` aggregation) needs level 5, and its
+  endpoint, in the same way: a node of level 0 to 4 knows no `box` op and no point
+  field.
+- A search that reads a [nested field](api.md#nested-fields)'s objects (a `nested`
+  node anywhere, an aggregation or a sort on a sub-field, or a `where`) needs level 6,
+  and its endpoint, in the same way: a node of level 0 to 5 would refuse the node, or
+  read the sub-field as a field no document holds and answer empty. The coordinator
+  marks a search that reads one as it checks the queries against the mapping.
+- A search holding sub-aggregations under a `terms` on a sub-field needs level 7, and
+  its endpoint, in the same way: a node of level 0 to 6 would refuse them. A search
+  with `seq_no` (and a `size` past 0) needs level 8: a node of level 0 to 7 would
+  answer its hits without their seqs. Inner hits merged by name need no level: only the
+  coordinating node checks the names and reads inner hits.
+- A search with a `percentiles` or `percentile_ranks` aggregation needs level 9; one
+  with a `top_metrics` or `composite` aggregation, or a `terms` aggregation's `order`,
+  level 10; one whose `terms` order reads a `percentiles` or `percentile_ranks`
+  sub-aggregation, or names a member in brackets (`"prices[avg]"`), level 11. Each goes
+  to its level's endpoint in the same way: an older node would refuse the aggregation
+  or the order key, or answer in count order.
+- Each reply says the level it was answered at, and the coordinator refuses one below
+  the search's; a node refuses (503) a search past its own level. A later wire
+  addition raises the level, so it is never silently ignored either.
+- [Date math](api.md#date-math) needs no level in a search: the coordinator resolves
+  `now` in the query, the `post_filter` and the filter aggregations, and peers get
+  plain numbers, which any release reads.
+- A percolation has a wire level of its own, kept the same way. One of any index whose
+  mapping has a `date` field needs level 1, whether or not a saved query uses date
+  math (the coordinator's `now`, and date math in saved queries, which a 1.0.0 node
+  reads as never matching), and goes to the level-1 percolate endpoint. A 1.0.0 copy
+  is refused as above, also when an earlier read of the request (a stored document's
+  `GET`) chose it: the shard's next copy answers. With none, the percolation is
+  unavailable (503, retryable; `_bulk?percolate=true` commits and answers
+  `percolated: false`), unless the coordinating node holds a copy of its own that
+  cannot serve now (stale or recovering): the request's first read of the shard then
+  falls back to that copy, which answers flagged `stale` or says why it cannot. An index with no `date` field percolates on any node.
+- A percolation of an index whose mapping has a [point field](api.md#point-fields)
+  needs percolate level 2, and its endpoint, in the same way: a node of an earlier
+  release reads neither the mapping nor saved `box` conditions.
+- A percolation of an index whose mapping has a [nested field](api.md#nested-fields)
+  needs percolate level 3, and its endpoint, in the same way.
+- A percolation asked for its matches' details (`percolate_matches`,
+  `percolate_inner_hits`) needs percolate level 4, and its endpoint, in the same way:
+  each copy reads the versions and inner hits of the saved queries it holds, which a
+  node of an earlier release would leave out. A stored document's `_seq` needs none: a
+  copy of an earlier release sends none, and the result has none.
+- A mapping is decoded by every node, so a point or nested field is not admitted while
+  any node of an earlier release is live: each node heartbeats the mapping field types
+  it reads (`sl_nodes.mapping_types`: 1 from point fields on, 2 from nested fields on),
+  and creating an index with such a field, or patching one in, is a 409 naming the
+  nodes that read none, while they heartbeat within the fence or hold a live lease.
+  Once one exists, the cluster cannot be downgraded below the release that added its
+  type ([upgrade notes](operations.md#upgrades-and-rolling-restarts)).
+- Saving a query with date math is not refused while older nodes serve: no request
+  can tell which releases hold a shard's copies. A 1.0.0 node percolating its own
+  copies (a request it coordinates, or a copy it rebuilt after a rollback) matches no
+  condition with date math; a 1.0.0 coordinator sends no `now`, so the upgraded peers
+  it asks resolve date math at their own clocks. Save such queries once every node is
+  upgraded.
+
+Upgrade every node before relying on these features in a cluster; a single node needs
+nothing.
 
 ## SQLite and MySQL notes
 

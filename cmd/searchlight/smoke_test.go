@@ -9,12 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/api"
+	"github.com/Imposter/go-searchlight/internal/slproc"
 	"github.com/Imposter/go-searchlight/internal/testtier"
 )
 
@@ -34,18 +35,19 @@ func TestSmokeBinary(t *testing.T) {
 	if ok, why := canInterrupt(); !ok {
 		t.Skip(why)
 	}
-	goTool, err := exec.LookPath("go")
-	if err != nil {
+	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("no go tool on PATH to build the binary with")
 	}
 	dir := t.TempDir()
-	bin := filepath.Join(dir, "searchlight")
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
+	bin, err := slproc.Build(t.Context(), dir, "smoke")
+	if err != nil {
+		t.Fatal(err)
 	}
-	build := exec.CommandContext(t.Context(), goTool, "build", "-trimpath", "-ldflags", "-X main.version=smoke", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
+	for _, arg := range []string{"version", "--version"} {
+		out, err := exec.CommandContext(t.Context(), bin, arg).Output()
+		if err != nil || !strings.HasPrefix(string(out), "searchlight smoke (") {
+			t.Errorf("searchlight %s: %v, %q; want \"searchlight smoke (...)\"", arg, err, out)
+		}
 	}
 
 	token := "smoke-token-0123456789abcdef"
@@ -72,9 +74,9 @@ func TestSmokeBinary(t *testing.T) {
 	}
 	n.must(t, http.StatusCreated, http.MethodPut, "/indexes/smoke",
 		`{"mapping": {"dynamic": "strict", "fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
-	lastSeq := seqOf(t, n.must(t, http.StatusOK, http.MethodPut, "/indexes/smoke/queries/cheap",
+	tok := tokenOf(t, n.must(t, http.StatusOK, http.MethodPut, "/indexes/smoke/queries/cheap",
 		`{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"search_id": 1}}`))
-	lastSeq = max(lastSeq, seqOf(t, n.must(t, http.StatusOK, http.MethodPut, "/indexes/smoke/queries/acme",
+	tok = merge(t, tok, tokenOf(t, n.must(t, http.StatusOK, http.MethodPut, "/indexes/smoke/queries/acme",
 		`{"query": {"field": "brand", "op": "eq", "value": "Acme"}}`)))
 
 	const docs = 500
@@ -87,8 +89,8 @@ func TestSmokeBinary(t *testing.T) {
 		fmt.Fprintf(&bulk, "{\"upsert\": {\"id\": \"d%03d\"}}\n{\"brand\": %q, \"price\": %d, \"title\": \"item %d\"}\n", i, brand, i, i)
 	}
 	var br struct {
-		Seq    int64 `json:"seq"`
-		Errors bool  `json:"errors"`
+		Token  string `json:"token"`
+		Errors bool   `json:"errors"`
 		Items  []struct {
 			Status int `json:"status"`
 		} `json:"items"`
@@ -97,7 +99,8 @@ func TestSmokeBinary(t *testing.T) {
 	if br.Errors || len(br.Items) != docs {
 		t.Fatalf("bulk: errors=%v, %d items, want %d without errors", br.Errors, len(br.Items), docs)
 	}
-	lastSeq = max(lastSeq, br.Seq)
+	tok = merge(t, tok, parseToken(t, br.Token))
+	lastSeq := minSeq(tok) // every shard wrote documents: each is at or past it
 
 	var sr struct {
 		Total struct {
@@ -105,7 +108,7 @@ func TestSmokeBinary(t *testing.T) {
 		} `json:"total"`
 		Hits []hit `json:"hits"`
 	}
-	n.decode(t, http.StatusOK, http.MethodPost, fmt.Sprintf("/indexes/smoke/_search?wait_for_seq=%d", lastSeq),
+	n.decode(t, http.StatusOK, http.MethodPost, "/indexes/smoke/_search?wait_for="+tok.String(),
 		`{"query": {"all": [{"field": "brand", "op": "eq", "value": "acme"}, {"field": "price", "op": "lt", "value": 20}]}, "sort": [{"price": "desc"}], "size": 3, "track_total": true}`, &sr)
 	if got := hitIDs(sr.Hits); sr.Total.Value != 10 || !slices.Equal(got, []string{"d018", "d016", "d014"}) {
 		t.Errorf("search: total %d, hits %v; want 10 and [d018 d016 d014]", sr.Total.Value, got)
@@ -118,7 +121,7 @@ func TestSmokeBinary(t *testing.T) {
 			Queries []string `json:"queries"`
 		} `json:"results"`
 	}
-	n.decode(t, http.StatusOK, http.MethodPost, fmt.Sprintf("/indexes/smoke/_percolate?wait_for_seq=%d", lastSeq),
+	n.decode(t, http.StatusOK, http.MethodPost, "/indexes/smoke/_percolate?wait_for="+tok.String(),
 		`{"docs": [{"brand": "ACME", "price": 5}], "ids": ["d001", "d002"]}`, &pr)
 	if got := fmt.Sprint(pr.Results); got != "[{ true [acme cheap]} {d001 true [cheap]} {d002 true [acme cheap]}]" {
 		t.Errorf("percolate = %s", got)
@@ -155,8 +158,8 @@ func TestSmokeBinary(t *testing.T) {
 	})
 	assertReopened(t, n, lastSeq)
 	for _, s := range shards.Shards {
-		if s.CommittedSeq < lastSeq {
-			t.Errorf("shard %d reopened at committed seq %d, below the last write's %d", s.Shard, s.CommittedSeq, lastSeq)
+		if s.CommittedSeq < tok.Seq(s.Shard) {
+			t.Errorf("shard %d reopened at committed seq %d, below the last write's %d", s.Shard, s.CommittedSeq, tok.Seq(s.Shard))
 		}
 	}
 	var count struct {
@@ -180,11 +183,18 @@ type binaryNode struct {
 
 func startBinary(t *testing.T, bin string, args []string) *binaryNode {
 	t.Helper()
+	return startBinaryWith(t, bin, args, prepareInterrupt)
+}
+
+// startBinaryWith is startBinary with prepare, instead of prepareInterrupt, setting up
+// the process before it starts.
+func startBinaryWith(t *testing.T, bin string, args []string, prepare func(*exec.Cmd)) *binaryNode {
+	t.Helper()
 	logs := newLogWatch()
 	cmd := exec.Command(bin, args...)
 	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "SEARCHLIGHT_") })
 	cmd.Stderr = logs
-	prepareInterrupt(cmd)
+	prepare(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -255,13 +265,40 @@ func (n *binaryNode) decode(t *testing.T, want int, method, path, body string, v
 	}
 }
 
-func seqOf(t *testing.T, m map[string]any) int64 {
+// tokenOf is a write response's token.
+func tokenOf(t *testing.T, m map[string]any) *api.Token {
 	t.Helper()
-	seq, ok := m["seq"].(float64)
-	if !ok || seq <= 0 {
-		t.Fatalf("no seq in %v", m)
+	text, _ := m["token"].(string)
+	return parseToken(t, text)
+}
+
+func parseToken(t *testing.T, text string) *api.Token {
+	t.Helper()
+	tok, err := api.ParseToken(text)
+	if err != nil {
+		t.Fatalf("token %q: %v", text, err)
 	}
-	return int64(seq)
+	return tok
+}
+
+// merge raises a's seqs to b's.
+func merge(t *testing.T, a, b *api.Token) *api.Token {
+	t.Helper()
+	if !a.Merge(b) {
+		t.Fatalf("tokens of two incarnations: %s and %s", a.UID, b.UID)
+	}
+	return a
+}
+
+// minSeq is the lowest seq a token names.
+func minSeq(tok *api.Token) int64 {
+	var low int64
+	for _, s := range tok.Seqs {
+		if low == 0 || s < low {
+			low = s
+		}
+	}
+	return low
 }
 
 type hit struct {

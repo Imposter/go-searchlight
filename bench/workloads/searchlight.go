@@ -20,6 +20,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/bench/datasets"
 	"github.com/Imposter/go-searchlight/bench/report"
+	"github.com/Imposter/go-searchlight/internal/api"
 )
 
 // SearchlightOptions configure a [Searchlight] engine.
@@ -55,7 +56,7 @@ type Searchlight struct {
 	opts SearchlightOptions
 	// seq is the newest seq any write answered, per index: Refresh waits for it.
 	mu  sync.Mutex
-	seq map[string]int64
+	seq map[string]*api.Token
 }
 
 // NewSearchlight returns the engine at opts.URL.
@@ -63,24 +64,30 @@ func NewSearchlight(opts SearchlightOptions) *Searchlight {
 	if opts.QueryWriters <= 0 {
 		opts.QueryWriters = 32
 	}
-	return &Searchlight{c: newClient(opts.URL, opts.Token, opts.Log), opts: opts, seq: map[string]int64{}}
+	return &Searchlight{c: newClient(opts.URL, opts.Token, opts.Log), opts: opts, seq: map[string]*api.Token{}}
 }
 
 // Name implements Engine.
 func (*Searchlight) Name() string { return "searchlight" }
 
-func (s *Searchlight) noteSeq(index string, seq int64) {
+// noteToken merges a write's token into what index's reads wait for.
+func (s *Searchlight) noteToken(index, text string) {
+	t, err := api.ParseToken(text)
+	if err != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if seq > s.seq[index] {
-		s.seq[index] = seq
+	if cur := s.seq[index]; cur == nil || !cur.Merge(t) {
+		s.seq[index] = t
 	}
 }
 
-func (s *Searchlight) lastSeq(index string) int64 {
+// lastToken is the merge of index's writes' tokens, "" before any.
+func (s *Searchlight) lastToken(index string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.seq[index]
+	return s.seq[index].String()
 }
 
 func ipath(index string, rest ...string) string {
@@ -91,7 +98,8 @@ func ipath(index string, rest ...string) string {
 	return p
 }
 
-// Info implements Engine.
+// Info implements Engine. The node list is {"nodes": [...]} or a bare list, depending
+// on the coordinator.
 func (s *Searchlight) Info(ctx context.Context) (report.EngineInfo, error) {
 	info := report.EngineInfo{Name: s.Name(), URL: s.opts.URL, Config: map[string]string{}}
 	for k, v := range s.opts.Config {
@@ -107,7 +115,6 @@ func (s *Searchlight) Info(ctx context.Context) (report.EngineInfo, error) {
 	if err := s.c.json(ctx, http.MethodGet, "/_cluster/nodes", nil, &raw); err != nil {
 		return info, err
 	}
-	// The node list is {"nodes": [...]} or a bare list, depending on the coordinator.
 	if json.Unmarshal(raw, &nodes) != nil || len(nodes.Nodes) == 0 {
 		_ = json.Unmarshal(raw, &nodes.Nodes)
 	}
@@ -128,13 +135,13 @@ func (s *Searchlight) Ready(ctx context.Context) error {
 	})
 }
 
-// CreateIndex implements Engine.
+// CreateIndex implements Engine. An index being dropped may still hold its name for a
+// moment, so a conflict is retried for up to a minute.
 func (s *Searchlight) CreateIndex(ctx context.Context, index string, fields []datasets.Field, shards int) error {
 	if err := s.DeleteIndex(ctx, index); err != nil {
 		return err
 	}
 	body := datasets.SearchlightMapping(fields, shards, "1s")
-	// An index being dropped may still hold its name for a moment.
 	deadline := time.Now().Add(time.Minute)
 	for {
 		err := s.c.json(ctx, http.MethodPut, ipath(index), body, nil)
@@ -162,8 +169,8 @@ func (s *Searchlight) DeleteIndex(ctx context.Context, index string) error {
 }
 
 type slBulkResponse struct {
-	Seq    int64 `json:"seq"`
-	Errors bool  `json:"errors"`
+	Token  string `json:"token"`
+	Errors bool   `json:"errors"`
 	Items  []struct {
 		ID      string          `json:"id"`
 		Status  int             `json:"status"`
@@ -196,7 +203,7 @@ func (s *Searchlight) bulk(ctx context.Context, index string, docs []Doc, query 
 	if err := json.Unmarshal(body, &res); err != nil {
 		return nil, fmt.Errorf("searchlight bulk: %w", err)
 	}
-	s.noteSeq(index, res.Seq)
+	s.noteToken(index, res.Token)
 	if res.Errors {
 		for _, it := range res.Items {
 			if len(it.Error) > 0 {
@@ -236,7 +243,7 @@ func (s *Searchlight) BulkPercolate(ctx context.Context, index string, docs []Do
 
 // Refresh implements Engine: a count that waits for the newest seq written.
 func (s *Searchlight) Refresh(ctx context.Context, index string) error {
-	_, err := s.c.do(ctx, http.MethodPost, ipath(index, "_count")+"?wait_for_seq="+strconv.FormatInt(s.lastSeq(index), 10), "application/json", []byte(`{}`))
+	_, err := s.c.do(ctx, http.MethodPost, ipath(index, "_count")+"?wait_for="+url.QueryEscape(s.lastToken(index)), "application/json", []byte(`{}`))
 	return err
 }
 
@@ -257,13 +264,19 @@ type slPrepared struct {
 
 func (*slPrepared) isPrepared() {}
 
-// Prepare implements Engine: Searchlight takes the body as it is.
+// Prepare implements Engine: Searchlight takes the body as it is, with its request
+// cache off, as Elasticsearch's is: the benchmark measures computing each search.
 func (*Searchlight) Prepare(search []byte) (Prepared, error) {
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(search, &keys); err != nil {
 		return nil, fmt.Errorf("searchlight: a search body: %w", err)
 	}
-	return &slPrepared{raw: search, keys: keys}, nil
+	keys["request_cache"] = json.RawMessage("false")
+	raw, err := json.Marshal(keys)
+	if err != nil {
+		return nil, err
+	}
+	return &slPrepared{raw: raw, keys: keys}, nil
 }
 
 type slSearchResponse struct {
@@ -332,14 +345,14 @@ func (s *Searchlight) PutQueries(ctx context.Context, index string, qs []dataset
 					return
 				}
 				var res struct {
-					Seq int64 `json:"seq"`
+					Token string `json:"token"`
 				}
 				body := map[string]any{"query": qs[i].Query, "meta": qs[i].Meta}
 				if err := s.c.json(ctx, http.MethodPut, ipath(index, "queries", url.PathEscape(qs[i].ID)), body, &res); err != nil {
 					once.Do(func() { first = fmt.Errorf("saved query %s: %w", qs[i].ID, err); cancel() })
 					return
 				}
-				s.noteSeq(index, res.Seq)
+				s.noteToken(index, res.Token)
 			}
 		})
 	}
@@ -451,7 +464,8 @@ func (s *Searchlight) StoreBytes(context.Context) (int64, string, error) {
 	return n, "du " + strings.Join(s.opts.StorePaths, " + "), nil
 }
 
-// dirSize sums the sizes of the regular files under root (or root itself).
+// dirSize sums the sizes of the regular files under root (or root itself). A file
+// removed while it walks (a merged segment) counts for nothing.
 func dirSize(root string) (int64, error) {
 	var total int64
 	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
@@ -465,7 +479,7 @@ func dirSize(root string) (int64, error) {
 			info, err := d.Info()
 			if err != nil {
 				if errors.Is(err, fs.ErrNotExist) {
-					return nil // removed while walking (a merged segment)
+					return nil
 				}
 				return err
 			}

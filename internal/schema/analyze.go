@@ -2,10 +2,13 @@ package schema
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -44,6 +47,13 @@ type Value struct {
 	// Entries is a keyword_list field's entries, normalized and cleaned, distinct and
 	// sorted ([analysis.EntryTerms]).
 	Entries []string
+	// Points is a point field's points, distinct and sorted by x, then y: every pair of
+	// its value that is two finite coordinates of its axes' types (see [Point]).
+	Points []Point
+	// Objects is a nested field's members, in array order (one object given alone is
+	// one member): each an object's analyzed sub-fields, or, for a member that is no
+	// object, an Object with no Fields, which holds its place and nothing else.
+	Objects []Object
 	// Grams says Text's 3-rune substrings ([analysis.EachGram]) are indexed, as the
 	// anchors and prefilters of contains and starts_with: true for a Text of three to
 	// MaxGramChars characters, never for the IDField. They are read from Text where they
@@ -61,6 +71,16 @@ type Value struct {
 	// so a segment can tell a mapping change that needs a rebuild from one that does not.
 	Untyped bool
 }
+
+// Object is one member of a nested field's value. Fields holds its present
+// sub-fields by their full names (path.name), analyzed as a document's fields are; it
+// is nil for a member that is no object, which no nested query matches.
+type Object struct {
+	Fields map[string]Value
+}
+
+// IsObject reports whether the member is an object.
+func (o *Object) IsObject() bool { return o.Fields != nil }
 
 // Doc is an analyzed document. Fields holds every present field, by name, and the
 // pseudo-field [IDField] (the id as a keyword); Body is the document as it was given,
@@ -108,6 +128,15 @@ func ValidateID(id string) error {
 // DynamicStrict the document is refused, naming the smallest unmapped field name.
 // Errors are *ValidationError, naming the field.
 //
+// A nested field's value is an array of objects (or one object), at most MaxObjects
+// members; a member that is no object holds its place in [Value.Objects] and nothing
+// else. Each object's members are its sub-fields, named path.name, read as top-level
+// members are (a name cleaned, null as absent, an unmapped one by the dynamic mode, a
+// strict refusal naming path.name); of two names that coincide once cleaned, the first
+// non-null one in name order wins. A top-level member named under a nested field
+// (_v.size, with _v nested) is kept in Body but never indexed: that name is its
+// sub-field's. Dynamic typing never makes a field nested: one is mapped first.
+//
 // Body is a copy of body (with invalid UTF-8 replaced): Analyze never keeps the caller's
 // buffer, so a caller may reuse it, and a document sliced out of a large request does
 // not pin the whole request in memory for as long as the document lives.
@@ -142,6 +171,9 @@ const (
 	modeTypes                    // the fields' types alone
 )
 
+// analyze is Analyze, AnalyzeForMatch and Check, by mode. Member names that coincide
+// once NUL-cleaned resolve by document order, which a map loses, so a body with such
+// names is decoded member by member.
 func analyze(m *Mapping, id string, body []byte, mode analyzeMode) (Doc, MappingUpdate, error) {
 	if err := ValidateID(id); err != nil {
 		return Doc{}, MappingUpdate{}, err
@@ -168,7 +200,6 @@ func analyze(m *Mapping, id string, body []byte, mode analyzeMode) (Doc, Mapping
 		a.doc.Fields[IDField] = textValue(Keyword, id, false)
 	}
 	if hasNULName(object) {
-		// Names that coincide once cleaned resolve by document order, which a map loses.
 		members, err := decodeMembers(body)
 		if err != nil {
 			return Doc{}, MappingUpdate{}, err
@@ -201,15 +232,24 @@ type analyzer struct {
 	update    MappingUpdate
 	claimed   map[string]bool // cleaned names taken so far, when names hold NULs
 	unmapped  string          // the smallest unmapped name, under DynamicStrict
+	// presenceOnly analyzes an unmapped field as present and of no type, inferring
+	// none ([AnalyzeObjects]).
+	presenceOnly bool
 }
 
+// member analyzes one top-level member. A name that is empty once cleaned, or longer
+// than MaxFieldChars, is passed over, as scrape-bot's index passes it over: no
+// condition can name it.
 func (a *analyzer) member(name string, value any) error {
 	if name == IDField {
 		return &ValidationError{Field: name, Message: "is reserved for the document id"}
 	}
 	name = analysis.Clean(name)
 	if name == "" || utf8.RuneCountInString(name) > MaxFieldChars {
-		return nil // as scrape-bot's index: no condition can name it
+		return nil
+	}
+	if _, sub := a.mapping.NestedPath(name); sub {
+		return nil
 	}
 	if value == nil {
 		return nil
@@ -220,32 +260,124 @@ func (a *analyzer) member(name string, value any) error {
 		}
 		a.claimed[name] = true
 	}
-	t, mapped := a.mapping.Fields[name]
-	if !mapped {
-		switch a.mapping.Dynamic {
-		case DynamicFalse:
-			return nil
-		case DynamicStrict:
-			if a.unmapped == "" || name < a.unmapped {
-				a.unmapped = name
-			}
-			return nil
-		default:
-			inferred, ok := infer(value)
-			if !ok {
-				if !a.typesOnly {
-					a.doc.Fields[name] = Value{Present: true}
-				}
-				return nil
-			}
-			t = inferred
-			a.update.add(name, t)
+	t, index, typed := a.typeOf(name, value)
+	switch {
+	case !index:
+		return nil
+	case t == Nested:
+		v, err := a.nested(name, value)
+		if err != nil {
+			return err
 		}
-	}
-	if !a.typesOnly {
+		if !a.typesOnly {
+			a.doc.Fields[name] = v
+		}
+	case a.typesOnly:
+	case !typed:
+		a.doc.Fields[name] = Value{Present: true}
+	default:
 		a.doc.Fields[name] = analyzeValue(t, value, a.grams)
 	}
 	return nil
+}
+
+// typeOf is the type field (a top-level field, or a nested object's sub-field by its
+// full name) is analyzed by: its mapped type, or, unmapped, what the dynamic mode makes
+// of it. index is false for a value that is not indexed (dynamic false, or strict, which
+// notes the name); typed is false for a present value of no type (dynamic true, of a
+// value inference does not type). A type inferred for the field is added to the
+// update, and read from it again for the document's other values of the field.
+func (a *analyzer) typeOf(field string, value any) (t FieldType, index, typed bool) {
+	if t, mapped := a.mapping.Fields[field]; mapped {
+		return t, true, true
+	}
+	if t, inferred := a.update.Fields[field]; inferred {
+		return t, true, true
+	}
+	if a.presenceOnly {
+		return 0, true, false
+	}
+	switch a.mapping.Dynamic {
+	case DynamicFalse:
+		return 0, false, false
+	case DynamicStrict:
+		if a.unmapped == "" || field < a.unmapped {
+			a.unmapped = field
+		}
+		return 0, false, false
+	}
+	inferred, ok := infer(value)
+	if !ok {
+		return 0, true, false
+	}
+	a.update.add(field, inferred)
+	return inferred, true, true
+}
+
+// nested analyzes a nested field's value: its members, each object's sub-fields
+// typed and analyzed as top-level fields are (see Analyze).
+func (a *analyzer) nested(path string, value any) (Value, error) {
+	list := nestedMembers(value)
+	if len(list) > MaxObjects {
+		return Value{}, &ValidationError{Field: path, Message: fmt.Sprintf("holds %d members: a nested field holds at most %d", len(list), MaxObjects)}
+	}
+	var objects []Object
+	if !a.typesOnly && list != nil {
+		objects = make([]Object, len(list))
+	}
+	for i, member := range list {
+		obj, ok := member.(map[string]any)
+		if !ok {
+			continue
+		}
+		var fields map[string]Value
+		if !a.typesOnly {
+			fields = make(map[string]Value, len(obj))
+		}
+		var claimed map[string]bool
+		if hasNULName(obj) {
+			claimed = map[string]bool{}
+		}
+		for _, raw := range slices.Sorted(maps.Keys(obj)) {
+			v := obj[raw]
+			sub := analysis.Clean(raw)
+			full := path + "." + sub
+			if v == nil || sub == "" || utf8.RuneCountInString(full) > MaxFieldChars {
+				continue
+			}
+			if claimed != nil {
+				if claimed[full] {
+					continue
+				}
+				claimed[full] = true
+			}
+			t, index, typed := a.typeOf(full, v)
+			switch {
+			case !index || a.typesOnly:
+			case !typed:
+				fields[full] = Value{Present: true}
+			default:
+				fields[full] = analyzeValue(t, v, a.grams)
+			}
+		}
+		if !a.typesOnly {
+			objects[i] = Object{Fields: fields}
+		}
+	}
+	return Value{Present: true, Objects: objects}, nil
+}
+
+// nestedMembers is a nested field's members: an array's, or one object alone; nil
+// for any other value, which holds no member.
+func nestedMembers(value any) []any {
+	switch v := value.(type) {
+	case []any:
+		return v
+	case map[string]any:
+		return []any{v}
+	default:
+		return nil
+	}
 }
 
 func hasNULName(object map[string]any) bool {
@@ -330,7 +462,7 @@ func decodeMembers(body []byte) ([]member, error) {
 		}
 		members = append(members, member{name: name, value: value})
 	}
-	if _, err := dec.Token(); err != nil { // the closing brace
+	if _, err := dec.Token(); err != nil {
 		return nil, invalid(err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
@@ -339,14 +471,15 @@ func decodeMembers(body []byte) ([]member, error) {
 	return dedupe(members), nil
 }
 
-// dedupe keeps each repeated key at its first position with its last value.
+// dedupe keeps each repeated key at its first position with its last value. Below
+// linearMembers members a scan beats building a map.
 func dedupe(members []member) []member {
-	const linear = 16 // below this, a scan beats building a map
+	const linearMembers = 16
 	var index map[string]int
 	out := members[:0]
 	for _, mem := range members {
 		at := -1
-		if len(members) > linear {
+		if len(members) > linearMembers {
 			if index == nil {
 				index = make(map[string]int, len(members))
 			}
@@ -404,15 +537,120 @@ func analyzeValue(t FieldType, value any, grams bool) Value {
 			return Value{Present: true, Bool: &b}
 		}
 	case Date:
-		if ms, ok := dateMillis(value); ok {
+		if ms, ok := DateMillis(value); ok {
 			return Value{Present: true, Number: &ms}
+		}
+	default:
+		if t.IsPoint() {
+			return Value{Present: true, Points: pointList(t, value)}
 		}
 	}
 	return Value{Present: true}
 }
 
-// textValue is a keyword or text field's value: its text, (text only) words, and, when
-// grams is set, whether its grams are indexed.
+// Point is one point of a point field: its x and y, each a finite float64 (a date axis
+// in Unix milliseconds). -0 is read as 0.
+type Point struct {
+	X, Y float64
+}
+
+// MaxPoints is the most points one value of a point field holds: its first MaxPoints
+// valid pairs, in document order (counted before repeats are dropped); the pairs past
+// them are not read.
+const MaxPoints = 10_000
+
+// pointList reads a point field's value: an array of [x, y] pairs, or one pair (an
+// array of two members neither of which is an array). A number axis takes what a
+// number field does, a date axis what a date field does (Unix milliseconds, or a date
+// string). A pair that is not two such coordinates is no point, as a non-finite number
+// is no number: the field is present still, with the pairs that are. A list some of
+// whose members are not arrays ([1, [2, 3]]) is neither one pair nor a list of pairs,
+// and holds no point. The points are sorted and distinct.
+func pointList(t FieldType, value any) []Point {
+	list, ok := value.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	xAxis, yAxis := t.Axes()
+	if !slices.ContainsFunc(list, isArray) {
+		if p, ok := readPoint(list, xAxis, yAxis); ok {
+			return []Point{p}
+		}
+		return nil
+	}
+	if !all(list, isArray) {
+		return nil
+	}
+	var out []Point
+	for _, member := range list {
+		pair, _ := member.([]any) // every member is an array
+		if p, ok := readPoint(pair, xAxis, yAxis); ok {
+			out = append(out, p)
+			if len(out) == MaxPoints {
+				break
+			}
+		}
+	}
+	if len(out) < 2 {
+		return out
+	}
+	slices.SortFunc(out, ComparePoints)
+	return slices.Compact(out)
+}
+
+// ComparePoints orders points by x, then y.
+func ComparePoints(a, b Point) int {
+	if c := cmp.Compare(a.X, b.X); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Y, b.Y)
+}
+
+func all(list []any, f func(any) bool) bool {
+	for _, v := range list {
+		if !f(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func isArray(v any) bool {
+	_, ok := v.([]any)
+	return ok
+}
+
+// readPoint reads one [x, y] pair.
+func readPoint(pair []any, xAxis, yAxis FieldType) (Point, bool) {
+	if len(pair) != 2 {
+		return Point{}, false
+	}
+	x, okX := coordinate(pair[0], xAxis)
+	y, okY := coordinate(pair[1], yAxis)
+	if !okX || !okY {
+		return Point{}, false
+	}
+	return Point{X: x, Y: y}, true
+}
+
+// coordinate reads one coordinate on an axis of type t (Number or Date); -0 reads 0.
+func coordinate(v any, t FieldType) (float64, bool) {
+	var f float64
+	var ok bool
+	if t == Date {
+		f, ok = DateMillis(v)
+	} else {
+		f, ok = analysis.Number(v)
+	}
+	if f == 0 {
+		f = 0
+	}
+	return f, ok
+}
+
+// textValue is a keyword or text field's value: its text, (text only) words (a NUL is
+// no word character, so the words never hold one), and, when grams is set, whether its
+// grams are indexed.
 func textValue(t FieldType, value any, grams bool) Value {
 	text, ok := analysis.AsText(value)
 	if !ok {
@@ -426,7 +664,7 @@ func textValue(t FieldType, value any, grams bool) Value {
 		v.Grams = n >= 3 && !v.GramsTruncated
 	}
 	if s, isString := value.(string); isString && t == Text {
-		v.Words = analysis.Words(s) // a NUL is no word character, so Words never holds one
+		v.Words = analysis.Words(s)
 	}
 	return v
 }
@@ -450,10 +688,10 @@ func listEntries(value any) []string {
 	}
 }
 
-// dateMillis reads a date: a number is Unix milliseconds already; a string is RFC 3339
-// (2026-10-02T09:30:00Z, with or without fractional seconds) or a bare date (2026-10-02,
-// midnight UTC).
-func dateMillis(value any) (float64, bool) {
+// DateMillis reads a date as a date field takes it: a number is Unix milliseconds
+// already; a string is RFC 3339 (2026-10-02T09:30:00Z, with or without fractional
+// seconds) or a bare date (2026-10-02, midnight UTC).
+func DateMillis(value any) (float64, bool) {
 	if s, ok := value.(string); ok {
 		for _, layout := range []string{time.RFC3339Nano, time.DateOnly} {
 			if at, err := time.Parse(layout, s); err == nil {

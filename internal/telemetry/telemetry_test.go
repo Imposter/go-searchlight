@@ -285,6 +285,9 @@ func TestAdminHandler(t *testing.T) {
 		if code != want {
 			t.Errorf("pprof=%v: /debug/pprof/ HTTP %d, want %d", pprofOn, code, want)
 		}
+		if code, _, body := get(t, srv.URL+"/debug/pprof/cmdline"); code != http.StatusNotFound {
+			t.Errorf("pprof=%v: /debug/pprof/cmdline HTTP %d %q, want 404: the command line can hold secrets", pprofOn, code, body)
+		}
 		srv.Close()
 	}
 }
@@ -369,3 +372,7 @@ func get(t *testing.T, url string) (int, http.Header, string) {
 	}
 	return resp.StatusCode, resp.Header, string(b)
 }
+
+// withEnv replaces os.Getenv for the OTEL_* selection; the exporters themselves always
+// read the process environment.
+func withEnv(getenv func(string) string) Option { return func(o *options) { o.getenv = getenv } }

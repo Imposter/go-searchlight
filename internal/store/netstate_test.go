@@ -28,8 +28,12 @@ func TestNetStateDisjoint(t *testing.T) {
 			p.query[i] = QueryPayload{Query: json.RawMessage(fmt.Sprintf(`{"q":%d}`, i)), Meta: json.RawMessage(`{}`)}
 		}
 		const first = 100
+		seqs := make([]int64, n)
+		for i := range seqs {
+			seqs[i] = first + int64(i)
+		}
 		w := &dialect.Write{}
-		netState(w, batch, p, first)
+		netState(w, batch, p, seqs)
 
 		// The model: the last change to each key, by table.
 		type key struct {

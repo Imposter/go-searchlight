@@ -59,7 +59,10 @@ func isFinite(f float64) bool {
 
 // literalNumber parses a JSON number literal the way Python's json module and then
 // number() read it: an integer literal is an exact integer, rounded half-to-even to a
-// float (refused when that overflows); any other literal is a correctly rounded float.
+// float (refused when that overflows); any other literal is a correctly rounded float,
+// out of range as ±Inf or ±0 as Python reads it. JSON forbids leading zeros, so an
+// integer of more than maxFloatDigits digits is at least 1e309, past any float64:
+// refusing it before parsing also keeps big.Int's superlinear parse off huge input.
 func literalNumber(lit string) (float64, bool) {
 	isInt, ok := jsonNumber(lit)
 	if !ok {
@@ -69,8 +72,6 @@ func literalNumber(lit string) (float64, bool) {
 		if i, err := strconv.ParseInt(lit, 10, 64); err == nil {
 			return float64(i), true
 		}
-		// JSON forbids leading zeros, so more than 309 digits is at least 1e309, past any
-		// float64; refusing it here also keeps big.Int's superlinear parse off huge input.
 		if len(strings.TrimPrefix(lit, "-")) > maxFloatDigits {
 			return 0, false
 		}
@@ -80,18 +81,20 @@ func literalNumber(lit string) (float64, bool) {
 		}
 		return bigNumber(n)
 	}
-	f, _ := strconv.ParseFloat(lit, 64) // a range error is ±Inf or ±0, as Python reads it
+	f, _ := strconv.ParseFloat(lit, 64)
 	return f, isFinite(f)
 }
 
 // maxFloatDigits is the most decimal digits an integer below math.MaxFloat64 can have.
 const maxFloatDigits = 309
 
+// bigNumber converts n exactly, then rounds it half-to-even to a float64; an n of more
+// than 1024 bits is at least 2**1024, past any float64, and refused.
 func bigNumber(n *big.Int) (float64, bool) {
-	if n.BitLen() > 1024 { // at least 2**1024, past any float64
+	if n.BitLen() > 1024 {
 		return 0, false
 	}
-	f, _ := new(big.Float).SetInt(n).Float64() // exact, then rounded half-to-even
+	f, _ := new(big.Float).SetInt(n).Float64()
 	return f, isFinite(f)
 }
 
@@ -194,14 +197,15 @@ func AsText(v any) (string, bool) {
 	}
 }
 
+// literalText spells a JSON number literal as Python's str does once json decodes it.
+// JSON forbids leading zeros and '+', so an integer literal is Python's str(int) as it
+// is, but for a negative zero, which an int has not.
 func literalText(lit string) (string, bool) {
 	isInt, ok := jsonNumber(lit)
 	if !ok {
 		return "", false
 	}
 	if isInt {
-		// JSON forbids leading zeros and '+', so the literal is Python's str(int) but for
-		// a negative zero, which an int has not.
 		if lit == "-0" {
 			return "0", true
 		}
@@ -214,7 +218,8 @@ func literalText(lit string) (string, bool) {
 // FloatText returns f as Python's repr (and str) spells a float: the shortest digits
 // that round-trip, positional when the decimal exponent is from -4 to 15 with at least
 // one fractional digit (1.0, 0.0001, 1234567890123456.0), scientific otherwise with a
-// two-digit signed exponent (1e+16, 1e-05, 1.5e+300); and nan, inf, -inf.
+// two-digit signed exponent (1e+16, 1e-05, 1.5e+300); and nan, inf, -inf. It starts
+// from strconv's shortest round-trip digits, d.ddddde±XX.
 func FloatText(f float64) string {
 	switch {
 	case math.IsNaN(f):
@@ -232,28 +237,27 @@ func FloatText(f float64) string {
 	if f == 0 {
 		return sign + "0.0"
 	}
-	// Shortest round-trip digits: d.ddddde±XX.
 	sci := strconv.FormatFloat(f, 'e', -1, 64)
 	mantissa, exponent, _ := strings.Cut(sci, "e")
 	digits := strings.Replace(mantissa, ".", "", 1)
 	exp, _ := strconv.Atoi(exponent)
-	point := exp + 1 // digits before the decimal point
+	digitsBeforePoint := exp + 1
 	var b strings.Builder
 	b.WriteString(sign)
-	if point > -4 && point <= 16 {
+	if digitsBeforePoint > -4 && digitsBeforePoint <= 16 {
 		switch {
-		case point <= 0:
+		case digitsBeforePoint <= 0:
 			b.WriteString("0.")
-			b.WriteString(strings.Repeat("0", -point))
+			b.WriteString(strings.Repeat("0", -digitsBeforePoint))
 			b.WriteString(digits)
-		case point >= len(digits):
+		case digitsBeforePoint >= len(digits):
 			b.WriteString(digits)
-			b.WriteString(strings.Repeat("0", point-len(digits)))
+			b.WriteString(strings.Repeat("0", digitsBeforePoint-len(digits)))
 			b.WriteString(".0")
 		default:
-			b.WriteString(digits[:point])
+			b.WriteString(digits[:digitsBeforePoint])
 			b.WriteByte('.')
-			b.WriteString(digits[point:])
+			b.WriteString(digits[digitsBeforePoint:])
 		}
 		return b.String()
 	}

@@ -2,6 +2,7 @@ package segment
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sync/atomic"
 
@@ -18,6 +19,7 @@ type fieldInfo struct {
 	keywordCol    *keywordColumn
 	multiCol      *multiColumn
 	numberCol     *numberColumn
+	xy            *xyIndex
 
 	// v3Marks and v3Truncated split a format-3 field's truncated bitmap, at Open.
 	v3Marks, v3Truncated *roaring.Bitmap
@@ -52,8 +54,9 @@ type Reader struct {
 	numDocs   uint32
 	fields    map[string]*fieldInfo
 	stored    storedIndex
-	ids       *termDict // the IDS section; nil for a segment with no documents
-	numTerms  uint64    // every field's terms, all kinds, added up
+	ids       *termDict          // the IDS section; nil for a segment with no documents
+	nested    map[string]*Nested // the NESTED section, by nested field; nil without one
+	numTerms  uint64             // every field's terms, all kinds, added up
 	cache     *storedCache
 	ownsCache bool
 	closed    atomic.Bool
@@ -94,8 +97,21 @@ func openData(path string, data []byte) (*Reader, error) {
 	if err := r.parseMeta(metaBytes, footer); err != nil {
 		return nil, err
 	}
+	if r.flags&flagObjects != 0 {
+		return nil, &CorruptError{Path: path, Section: "meta", Reason: "an object segment, which only a NESTED section holds"}
+	}
 	if err := r.openIDs(footer.sections[sectionIDs]); err != nil {
 		return nil, err
+	}
+	if sec, ok := footer.sections[sectionXY]; ok {
+		if err := r.openXYSection(sec); err != nil {
+			return nil, &CorruptError{Path: path, Section: "xy", Reason: err.Error()}
+		}
+	}
+	if sec, ok := footer.sections[sectionNested]; ok {
+		if err := r.openNestedSection(sec); err != nil {
+			return nil, &CorruptError{Path: path, Section: "nested", Reason: err.Error()}
+		}
 	}
 	cache, err := newStoredCache(&r.stored)
 	if err != nil {
@@ -111,7 +127,17 @@ func openData(path string, data []byte) (*Reader, error) {
 // why most of them are section-relative"), so this is the one place that adds each
 // section's absolute start (from footer, the just-verified footer) - once per offset -
 // to get the absolute mmap position openDict/openKeywordColumn/.../openStoredIndex
-// each take.
+// each take. Each offset is stored as (section-relative offset) + 1, 0 meaning absent
+// (fieldOutput's doc comment in fields.go says why): resolving one subtracts the 1
+// back out, then adds the section's own absolute start, in that order.
+//
+// Present, Truncated and Untyped hand out unchecked zero-copy views of their bitmaps on
+// every call, so the bitmaps are checked once, here ([checkBitmap]). The presence
+// bitmap is always written; the others only when they hold a document (length 0:
+// none). Every number column is written with a point index (writeFieldPoints), so a
+// column without one is damage; refusing it here means Range always works from the
+// index, whose size the file bounds, never from a scan of however many documents a
+// damaged META claims.
 func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	corrupt := func() error { return &CorruptError{Path: r.path, Section: "meta", Reason: "truncated or malformed"} }
 	termsBase := footer.sections[sectionTerms].off
@@ -133,11 +159,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	for range numFields {
 		name := string(d.bytes(d.uvarint()))
 		fi := &fieldInfo{}
-		// Every offset read here (presOff/truncOff/dictOffs/keywordColOff/...) is
-		// stored as (section-relative offset) + 1, 0 meaning absent - see
-		// fieldOutput's doc comment in fields.go for why. Resolving one to the
-		// absolute mmap position openDict and friends take is "subtract the 1 back
-		// out, then add the section's own absolute start", in that order.
 		presOff, presLen := d.u64(), d.u64()
 		truncOff, truncLen := d.u64(), d.u64()
 		var untypedOff, untypedLen uint64
@@ -173,10 +194,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 		if d.err != nil {
 			return corrupt()
 		}
-		// Present, Truncated and Untyped hand these out as unchecked zero-copy views on
-		// every call, so they are checked once, here, instead ([checkBitmap]). The
-		// presence bitmap is always written; the others only when they hold a document
-		// (length 0: none).
 		if !r.validBitmap(fi.presRegion) || (truncLen > 0 && !r.validBitmap(fi.truncRegion)) ||
 			(untypedLen > 0 && !r.validBitmap(fi.untypedRegion)) {
 			return &CorruptError{Path: r.path, Section: "presence", Reason: "malformed bitmap"}
@@ -211,10 +228,6 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 			if err != nil {
 				return &CorruptError{Path: r.path, Section: "docvalues", Reason: err.Error()}
 			}
-			// Every number column is written with a point index (writeFieldPoints), so a
-			// column without one is damage - and refusing it here means Range always
-			// works from the index, whose size the file bounds, never from a scan of
-			// however many documents a damaged META claims.
 			if pointsOff == 0 {
 				return &CorruptError{Path: r.path, Section: "points", Reason: "number column without a point index"}
 			}
@@ -232,6 +245,9 @@ func (r *Reader) parseMeta(b []byte, footer parsedFooter) error {
 	}
 	if d.err != nil {
 		return corrupt()
+	}
+	if r.flags&flagObjects != 0 {
+		return nil
 	}
 	stored, err := openStoredIndex(r.data, storedBase+storedIndexOff, storedBase, footer.sections[sectionStored].n, r.numDocs, r.major)
 	if err != nil {
@@ -348,6 +364,35 @@ func (r *Reader) Terms(field string, kind TermKind, prefix string, fn func(term 
 			continue
 		}
 		if !fn(string(it.term), it.info.docFreq) {
+			return
+		}
+	}
+}
+
+// TermsFrom calls fn with the ordinal, bytes and document frequency of every term of
+// field's kind dictionary from the first at or after from, in order, until fn returns false or the
+// terms run out: a walk that starts at from's block, decodes each block it reads once
+// and allocates nothing. term is valid only during the call.
+func (r *Reader) TermsFrom(field string, kind TermKind, from string, fn func(ord uint32, term []byte, docFreq uint32) bool) {
+	if !kind.Valid() {
+		return
+	}
+	fi := r.fields[field]
+	if fi == nil || fi.dicts[kind] == nil {
+		return
+	}
+	dict := fi.dicts[kind]
+	fb := stringBytes(from)
+	block, ok := dict.blockFor(fb)
+	if !ok {
+		block = 0
+	}
+	it := dict.iter(block)
+	for it.next() {
+		if bytes.Compare(it.term, fb) < 0 {
+			continue
+		}
+		if !fn(it.info.ord, it.term, it.info.docFreq) {
 			return
 		}
 	}
@@ -536,6 +581,9 @@ func (r *Reader) storedRecord(ord uint32) (string, []byte, error) {
 // bring the mapping's reference count to zero is a use-after-close on r itself, not
 // something Retain can rescue: incrementing a reference count after the mapping was
 // already unmapped does not re-map it.
+//
+// A second zstd decoder failing to allocate is as unexpected as it is harmless to
+// ignore: the new handle then shares the original's cache.
 func (r *Reader) Retain() *Reader {
 	if r.m != nil {
 		r.m.retain()
@@ -550,6 +598,7 @@ func (r *Reader) Retain() *Reader {
 		fields:  r.fields,
 		stored:  r.stored,
 		ids:     r.ids,
+		nested:  r.nested,
 
 		numTerms: r.numTerms,
 	}
@@ -557,8 +606,6 @@ func (r *Reader) Retain() *Reader {
 		nr.cache = cache
 		nr.ownsCache = true
 	} else {
-		// A second zstd decoder failing to allocate is as unexpected as it is
-		// harmless to ignore: fall back to sharing the original's cache.
 		nr.cache = r.cache
 		nr.ownsCache = false
 	}
@@ -571,7 +618,7 @@ func (r *Reader) Closed() bool { return r.closed.Load() }
 
 // Close unmaps the segment, once every handle from [Reader.Retain] (and the one Open
 // returned) has also been closed. Idempotent, and safe to call concurrently with any
-// other method.
+// other method. A Reader opened over caller-owned data maps nothing to unmap.
 func (r *Reader) Close() error {
 	if !r.closed.CompareAndSwap(false, true) {
 		return nil
@@ -580,7 +627,41 @@ func (r *Reader) Close() error {
 		r.cache.close()
 	}
 	if r.m == nil {
-		return nil // openData's Reader: the caller owns data
+		return nil
 	}
 	return r.m.release()
+}
+
+// openXYSection reads the XY section's directory and opens every point field's tree. A
+// tree names a field of META, at most once.
+func (r *Reader) openXYSection(sec sectionEntry) error {
+	if sec.n < 8 {
+		return errShort
+	}
+	dirOff := binary.LittleEndian.Uint64(r.data[sec.off+sec.n-8:])
+	if dirOff > sec.n-8 {
+		return errShort
+	}
+	d := decoder{b: r.data[sec.off+dirOff : sec.off+sec.n-8]}
+	count := d.u32()
+	for range count {
+		name := d.bytes(d.uvarint())
+		off := d.u64()
+		if d.err != nil {
+			return d.err
+		}
+		fi := r.fields[string(name)]
+		if fi == nil || fi.xy != nil || off >= dirOff {
+			return errors.New("the directory names a field twice, or one META does not")
+		}
+		t, err := openXY(r.data[:sec.off+dirOff], sec.off+off, r.numDocs)
+		if err != nil {
+			return err
+		}
+		fi.xy = t
+	}
+	if d.err != nil || d.pos != len(d.b) {
+		return errShort
+	}
+	return nil
 }

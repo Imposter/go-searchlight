@@ -26,6 +26,18 @@ const codecZstd byte = 0x01
 // heartbeat (sl_nodes.body_codecs): 1 reads zstd. A node from before codecs is at 0.
 const BodyCodecs = 1
 
+// MappingTypes is the mapping field types this binary reads, as a level its nodes
+// heartbeat (sl_nodes.mapping_types): 1 reads point fields, 2 nested fields too. A node
+// from before point fields is at 0, and cannot decode a mapping holding either; one
+// from before nested fields at 1, and cannot decode a mapping holding one.
+const MappingTypes = 2
+
+// The MappingTypes levels: the first that reads each field type.
+const (
+	MappingTypesPoint  = 1
+	MappingTypesNested = 2
+)
+
 // FeatureZstdBodies is the sl_features row that lets Apply store zstd bodies: the
 // cluster's leader records it once every registered node reads them (or has been
 // dead past the fence time), and it is never removed.
@@ -67,6 +79,8 @@ var (
 type storedBody struct {
 	plain string
 	z     []byte
+	// hash is a document body's BodyHash (0 for a saved query's payload).
+	hash int64
 }
 
 // size is the stored body's bytes.

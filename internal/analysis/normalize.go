@@ -7,8 +7,8 @@
 //   - [Words] is words_of: NFKC, Normalize, runs of non-\w folded to one space, padded;
 //   - [Entries] is list_entries: split on ", ", stripped, blanks dropped;
 //   - [Number] and [AsText] are number and as_text over JSON values;
-//   - [Trigrams] and [Similarity] are pg_trgm's trigrams and similarity, as
-//     trigram_similarity computes them;
+//   - [Trigrams] and [SimilarityKeys] (over [TrigramKeys]) are pg_trgm's trigrams and
+//     similarity, as trigram_similarity computes them;
 //   - [Clean] is clean_text: a NUL becomes U+FFFD.
 //
 // Python's whitespace set, its \w class, str.casefold and str.lower differ from Go's
@@ -24,7 +24,9 @@
 package analysis
 
 import (
+	"slices"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 )
@@ -119,3 +121,36 @@ func writeFolded(b *strings.Builder, r rune) {
 func strip(s string) string {
 	return strings.TrimFunc(s, IsSpace)
 }
+
+// FoldRune returns str.casefold() of one code point, as [Normalize] writes it within
+// text: one or more code points (U+00DF ß is "ss").
+func FoldRune(r rune) string {
+	var b strings.Builder
+	writeFolded(&b, r)
+	return b.String()
+}
+
+// FoldChanged returns, ascending, the code points from lo to hi that str.casefold()
+// changes: those whose [FoldRune] is not themselves. The result shares the
+// process-wide table but has no spare capacity, so a caller's append copies it rather
+// than writing over the table's next entries.
+func FoldChanged(lo, hi rune) []rune {
+	all := foldChanged()
+	i, _ := slices.BinarySearch(all, lo)
+	j, _ := slices.BinarySearch(all, hi+1)
+	j = max(i, j)
+	return all[i:j:j]
+}
+
+// foldChanged is every code point str.casefold() changes, ascending.
+var foldChanged = sync.OnceValue(func() []rune {
+	out := make([]rune, 0, 26+len(foldMap))
+	for r := 'A'; r <= 'Z'; r++ {
+		out = append(out, r)
+	}
+	for r := range foldMap {
+		out = append(out, r)
+	}
+	slices.Sort(out)
+	return out
+})

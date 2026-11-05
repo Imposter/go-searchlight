@@ -24,7 +24,8 @@ var (
 	clockBase = time.Now()
 )
 
-// nanotime is a monotonic clock in nanoseconds for latencies.
+// nanotime is a monotonic clock in nanoseconds for latencies. The counter's c/f
+// seconds are converted to nanoseconds without overflowing for days of uptime.
 func nanotime() int64 {
 	if qpcFreq == 0 {
 		return int64(time.Since(clockBase))
@@ -33,6 +34,5 @@ func nanotime() int64 {
 	if r, _, _ := qpc.Call(uintptr(unsafe.Pointer(&c))); r == 0 {
 		return int64(time.Since(clockBase))
 	}
-	// c/f seconds, in nanoseconds, without overflowing for days of uptime.
 	return c/qpcFreq*int64(time.Second) + c%qpcFreq*int64(time.Second)/qpcFreq
 }

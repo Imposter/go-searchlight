@@ -121,7 +121,8 @@ type Stats struct {
 //     not be known until the loop (and hence the pass) is done.
 //
 // values must be sorted by doc, ascending (as [fieldBuilder.prepareField] leaves them);
-// chooseEncoding does not sort them itself.
+// chooseEncoding does not sort them itself. A float column's base is the smallest
+// value's sortable bits: math.Min keeps -0 below +0, as the keys order them.
 func chooseEncoding(numDocs uint32, values []docFloat) (numEncoding, Stats, []uint64) {
 	st := Stats{Min: math.Inf(1), Max: math.Inf(-1)}
 	present := make([]uint64, (uint64(numDocs)+63)/64)
@@ -170,7 +171,7 @@ func chooseEncoding(numDocs uint32, values []docFloat) (numEncoding, Stats, []ui
 		}
 	}
 	if enc.mode == modeFloat {
-		enc.base = sortableBits(st.Min) // math.Min keeps -0 below +0, as the keys order them
+		enc.base = sortableBits(st.Min)
 	}
 	return enc, st, present
 }
@@ -193,10 +194,10 @@ func absDiff(a, b int64) uint64 {
 // writeNumberColumn writes a number column from its already-chosen encoding, stats and
 // has-value bitset ([chooseEncoding], normally run once in [fieldBuilder.prepareField]
 // rather than here) and returns its offset. values must be sorted by doc, ascending.
+// The maximum key belongs to the maximum value: both scaledInt's rounding (int mode)
+// and sortableBits (float mode) are monotonic in v, so values are not scanned again
+// for it.
 func writeNumberColumn(w *fileWriter, numDocs uint32, enc numEncoding, st Stats, present []uint64, values []docFloat) uint64 {
-	// The maximum key belongs to the maximum value: both scaledInt's rounding (int
-	// mode) and sortableBits (float mode) are monotonic in v, so there is no need to
-	// rescan values for it.
 	maxKey := enc.key(st.Max)
 	width := packedWidth(bitsFor(maxKey))
 	off := w.off
@@ -568,6 +569,10 @@ type multiColumn struct {
 	dict               *termDict
 }
 
+// openMultiColumn opens the keyword_list column at off. Its ordinal width is at least
+// 1 in any real column (it holds bitsFor(numTerms), and a column only exists with at
+// least one term): a width of 0 would let total claim any count in a fixed 8 bytes,
+// and Ords then loop that many times, so it is refused.
 func openMultiColumn(data []byte, off uint64, numDocs uint32, dict *termDict) (*multiColumn, error) {
 	if off >= uint64(len(data)) || dict == nil {
 		return nil, errShort
@@ -578,9 +583,6 @@ func openMultiColumn(data []byte, off uint64, numDocs uint32, dict *termDict) (*
 	c.ordWidth = d.u8()
 	c.total = d.u64()
 	c.offs = d.bytes(packedSize(uint64(numDocs)+1, c.offWidth))
-	// ordWidth is at least 1 in any real column (it holds bitsFor(numTerms), and a
-	// column only exists with at least one term). Width 0 would let total claim any
-	// count in a fixed 8 bytes, and Ords then loop that many times.
 	c.ords = d.bytes(packedSize(c.total, c.ordWidth))
 	if d.err != nil || c.ordWidth == 0 || (c.offWidth > 56 && c.offWidth != 64) || (c.ordWidth > 56 && c.ordWidth != 64) {
 		return nil, errShort

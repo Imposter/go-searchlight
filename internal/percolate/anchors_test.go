@@ -12,6 +12,24 @@ import (
 	"github.com/Imposter/go-searchlight/internal/shard"
 )
 
+// Anchors are a query's anchors as the tests read them: an aset with Always spelled out.
+type Anchors struct {
+	Always bool
+	Terms  []Term
+	Ranges []Range
+	Pairs  [][2]Term
+	Cost   float64
+}
+
+// Extract returns n's anchors as a query segment builds them, under stats.
+func Extract(n query.Node, stats TermStats) Anchors {
+	set := newExtractor(stats).node(n)
+	if !set.ok {
+		return Anchors{Always: true, Cost: 1}
+	}
+	return Anchors{Terms: set.terms, Ranges: set.ranges, Pairs: set.pairs, Cost: set.cost}
+}
+
 // describe renders anchors compactly: "always", or the sorted atoms.
 func describe(a Anchors) string {
 	if a.Always {
@@ -49,7 +67,11 @@ func TestExtractRules(t *testing.T) {
 		{`{"field":"price","op":"gte","value":10}`, fmt.Sprintf("range:price=[10,%v]", inf)},
 		{`{"field":"price","op":"between","value":[1,2]}`, `range:price=[1,2]`},
 		{`{"field":"price","op":"between","value":[2,1]}`, `always`},
-		{`{"field":"price","op":"lt","value":"x"}`, `always`},
+		// Date math: the field's presence, never an instant.
+		{`{"field":"seen","op":"lt","value":"x"}`, `present:seen=""`},
+		{`{"field":"seen","op":"gte","value":"now-7d/d"}`, `present:seen=""`},
+		{`{"field":"seen","op":"between","value":[0,"now"]}`, `present:seen=""`},
+		{`{"any":[{"field":"seen","op":"lt","value":"now"},{"field":"a","op":"eq","value":"x"}]}`, `present:seen="" value:a="x"`},
 		// Lists.
 		{`{"field":"tags","op":"has_any","value":["A","b"]}`, `entry:tags="a" entry:tags="b"`},
 		{`{"field":"tags","op":"nonempty"}`, `nonempty:tags=""`},

@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/Imposter/go-searchlight/internal/segment"
 	"github.com/Imposter/go-searchlight/internal/shard"
 	"github.com/Imposter/go-searchlight/internal/store"
 )
@@ -52,38 +53,6 @@ const (
 
 func fetchedFrom(source string) bool { return source == SourcePeer || source == SourceBlob }
 
-// ErrWipeNeeded is returned by [Recover] for a copy it cannot resume: one whose index
-// was dropped and recreated since, or one a rebuild left half-loaded. Close it, remove
-// its directory, open it again empty and recover that.
-var ErrWipeNeeded = errors.New("replica: the shard copy must be wiped and rebuilt")
-
-// Recover readies sh, a shard copy opened from its directory, to tail the changelog of
-// shard id, and returns the seq to tail from. A copy that has applied changes resumes
-// from its seq (CommittedSeq at Open): the changelog is replayed from there. An empty
-// copy is loaded from st's ScanShard snapshot, mapping included, and resumes from the
-// snapshot's seq. A copy of another incarnation of the index, or one an earlier load
-// left half done, is [ErrWipeNeeded]. A [Tailer] does all of this itself; Recover is
-// for callers that manage the copy's directory on their own.
-func Recover(ctx context.Context, sh *shard.Shard, st store.Store, id ShardID) (int64, error) {
-	t := NewTailer(st, sh, id, Options{})
-	if err := t.cat.load(ctx, id.Shard); err != nil {
-		return 0, err
-	}
-	if err := sh.Err(); err != nil {
-		return 0, err
-	}
-	if uid := sh.IndexUID(); uid != "" && uid != t.cat.meta.UID {
-		return 0, fmt.Errorf("%w: the copy holds incarnation %s of index %q, which is now %s", ErrWipeNeeded, uid, id.Index, t.cat.meta.UID)
-	}
-	if seq := sh.AppliedSeq(); seq > 0 {
-		return seq, nil
-	}
-	if holdsData(sh) {
-		return 0, fmt.Errorf("%w: an earlier load did not finish", ErrWipeNeeded)
-	}
-	return t.loadSnapshot(ctx, sh)
-}
-
 // holdsData reports whether sh's current generation has any segment.
 func holdsData(sh *shard.Shard) bool {
 	g := sh.Acquire()
@@ -121,6 +90,14 @@ func (t *Tailer) start(ctx context.Context) error {
 }
 
 // recoverIfNeeded runs a pending reopen or rebuild.
+//
+// A rebuild gated by a load that stopped at a row the copy cannot apply waits until
+// that row is superseded: it would stop there again. A copy that is valid but outdated
+// keeps serving (stale) while its replacement is built aside; any other is rebuilt in
+// place, unserved. A rebuild that asks for another returns it for Run's handler, which
+// records the new reason. After a failed in-place rebuild the next attempt wipes
+// whatever it left behind; a rewound copy keeps its reason, so that attempt too reads
+// the store.
 func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 	if t.needReopen {
 		t.setState(StateRecovering)
@@ -131,8 +108,6 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 	}
 	if t.needRebuild != "" {
 		if g := t.gate; g != nil {
-			// A load stopped at a row the copy cannot apply: a rebuild would stop
-			// there again until the row is superseded.
 			superseded, err := t.superseded(ctx, g)
 			if err != nil {
 				return err
@@ -141,8 +116,6 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 				return g
 			}
 		}
-		// A copy that is valid but outdated keeps serving (stale) while its
-		// replacement is built aside; any other is rebuilt in place, unserved.
 		aside := t.canBuildAside(t.needRebuild)
 		if !t.halted() {
 			if aside {
@@ -165,17 +138,16 @@ func (t *Tailer) recoverIfNeeded(ctx context.Context) error {
 			var halt *HaltError
 			switch {
 			case errors.As(err, &rb):
-				return err // handle records the new reason
+				return err
 			case errors.As(err, &halt):
 				t.gate = halt
 			}
-			if !aside {
-				// Whatever the rebuild left behind is wiped by the next attempt.
+			if !aside && t.needRebuild != reasonRewound {
 				t.needRebuild = reasonInterrupted
 			}
 			return err
 		}
-		t.needRebuild, t.gate, t.remapSince = "", nil, time.Time{}
+		t.needRebuild, t.gate, t.remapSince, t.rebuilt, t.fetchSpent = "", nil, time.Time{}, true, false
 		t.rebuildWait = 0
 		t.clearHalt()
 	}
@@ -200,12 +172,13 @@ func (t *Tailer) canBuildAside(reason string) bool {
 	return asideReasons[reason] && sh.Err() == nil && sh.AppliedSeq() > 0
 }
 
-// useFetcher reports whether a rebuild should try the Fetcher first. A fetched copy
-// that made no progress before it needed rebuilding again (it was pruned past, or
-// halted at the same change) is not fetched again: the peers and bundles are no better
-// off.
-func (t *Tailer) useFetcher() bool {
-	return t.opts.Fetcher != nil && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
+// useFetcher reports whether a rebuild for reason should try the Fetcher first. A
+// fetched copy that made no progress before it needed rebuilding again (it was pruned
+// past, or halted at the same change) is not fetched again: the peers and bundles are
+// no better off. Nor is a copy the changelog rewound under: the peers and bundles may
+// hold the lost commits too, and only the store is the truth.
+func (t *Tailer) useFetcher(reason string) bool {
+	return t.opts.Fetcher != nil && reason != reasonRewound && !t.fetchSpent && (!fetchedFrom(t.lastSource) || t.Applied() != t.recoveredAt)
 }
 
 // rebuildAside rebuilds the copy in a new directory under its root while the current
@@ -217,7 +190,11 @@ func (t *Tailer) useFetcher() bool {
 // generation of the old copy keep it until they release it; the old copy's files are
 // removed once they have (or by the next OpenCopy). A failure, or a crash, leaves the
 // old copy current and serving, and the half-built directory is removed (now, or by
-// the next OpenCopy).
+// the next OpenCopy, when the rebuild stops with its context, as a crash's would be).
+// Once CURRENT is renamed the swap stands, even when the fsync of the root after it
+// fails: the old copy is then left for the next OpenCopy. A rebuild of a fetched copy
+// that the changelog was pruned past fetches no more: the peers and bundles are no
+// better off.
 func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 	if err := t.cat.load(ctx, t.id.Shard); err != nil {
 		return err
@@ -235,12 +212,12 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			t.applied.Store(old.AppliedSeq())
 			if ctx.Err() == nil {
 				_ = os.RemoveAll(dir)
-			} // stopping: left, like a crash's, for the next OpenCopy to remove
+			}
 		}
 	}()
 	source := sourceSQL
 	var asOf int64
-	if t.useFetcher() {
+	if t.useFetcher(reason) {
 		dir = newCopyDir(root, t.opts.Clock.Now())
 		t.log.InfoContext(ctx, "fetching a replacement copy aside; the current copy serves meanwhile", slog.String("reason", reason), slog.String("dir", dir))
 		fetched, ok, err := t.fetchInto(ctx, reason, dir)
@@ -263,15 +240,25 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			return err
 		}
 	}
+	rc := markOf(sh)
 	for {
-		head, _, err := t.st.HeadSeq(ctx)
+		from := sh.AppliedSeq()
+		tip, err := t.st.Tip(ctx, rc.query(t.id, from))
 		if err != nil {
 			return err
 		}
-		changes, err := t.st.ChangesAfter(ctx, t.id, sh.AppliedSeq(), t.opts.BatchSize)
+		wait, err := t.checkRewind(ctx, sh, &rc, from, &tip)
+		if err != nil {
+			return err
+		}
+		if wait {
+			t.pause(ctx, t.opts.PollInterval)
+			continue
+		}
+		changes, err := t.st.ChangesAfter(ctx, t.id, from, t.opts.BatchSize)
 		if errors.Is(err, store.ErrPruned) {
 			if fetchedFrom(source) {
-				t.lastSource, t.recoveredAt = source, asOf // fetch no more: the peers and bundles are no better off
+				t.fetchSpent = true
 			}
 			return &rebuildError{reason: reasonPruned, err: err}
 		}
@@ -282,12 +269,14 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			if err := t.applyChanges(ctx, sh, changes); err != nil {
 				return err
 			}
+			noteApplied(sh, &rc, changes[len(changes)-1].Mark())
 		}
 		if len(changes) < t.opts.BatchSize {
-			if head > sh.AppliedSeq() {
-				if err := sh.Advance(head); err != nil {
+			if prev := sh.AppliedSeq(); tip.Head > prev {
+				if err := sh.Advance(tip.Head); err != nil {
 					return err
 				}
+				noteAdvanced(sh, &rc, prev, tip.Head, tip.HeadMark)
 			}
 			break
 		}
@@ -303,13 +292,24 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 			return err
 		}
 	}
-	if err := makeCurrent(root, dir); err != nil {
+	syncDir := segment.SyncDir
+	if t.opts.hooks != nil && t.opts.hooks.syncRoot != nil {
+		syncDir = t.opts.hooks.syncRoot
+	}
+	renamed, err := makeCurrent(root, dir, syncDir)
+	if !renamed {
 		return fmt.Errorf("replica: making %s current: %w", dir, err)
 	}
 	swapped = true
 	t.swap(sh)
+	t.rw = rc
 	old.Abandon()
-	removeCopy(root, old.Dir())
+	if err != nil {
+		t.log.WarnContext(ctx, "syncing the copy's root after the swap failed; the replaced copy stays until the next open, in case a crash undoes the swap",
+			slog.String("dir", dir), slog.Any("error", err))
+	} else {
+		removeCopy(root, old.Dir())
+	}
 	t.lastSource, t.recoveredAt, t.minMappingVersion = source, asOf, 0
 	t.log.InfoContext(ctx, "shard copy rebuilt aside and swapped in", slog.String("reason", reason), slog.String("source", source),
 		slog.Int64("seq", sh.AppliedSeq()), slog.Float64("duration_ms", float64(t.opts.Clock.Since(start).Microseconds())/1000))
@@ -319,7 +319,8 @@ func (t *Tailer) rebuildAside(ctx context.Context, reason string) (err error) {
 // debounceRemap holds a rebuild a mapping change asked for until mapping changes stop
 // arriving for RemapDebounce (at most five such windows), so that a burst of them
 // costs one rebuild, at the latest seq. Nothing is applied meanwhile: the copy never
-// analyzes a document under a mapping it knows to be stale.
+// analyzes a document under a mapping it knows to be stale. Every further mapping
+// change seen extends the wait, within the limit.
 func (t *Tailer) debounceRemap(ctx context.Context) error {
 	if t.opts.RemapDebounce < 0 {
 		return nil
@@ -345,7 +346,7 @@ func (t *Tailer) debounceRemap(ctx context.Context) error {
 		if v <= t.remapVersion || !t.opts.Clock.Now().Before(limit) {
 			return nil
 		}
-		t.remapVersion = v // another mapping change: wait for the burst to end
+		t.remapVersion = v
 	}
 }
 
@@ -375,6 +376,7 @@ func (t *Tailer) openShard(ctx context.Context, dir string) (*shard.Shard, error
 func (t *Tailer) swap(sh *shard.Shard) {
 	t.sh.Store(sh)
 	t.applied.Store(sh.AppliedSeq())
+	t.rw = markOf(sh)
 	if t.opts.OnShard != nil {
 		t.opts.OnShard(sh)
 	}
@@ -411,7 +413,7 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 	t.lastCatalog = t.opts.Clock.Now()
 	sh := t.Shard()
 	fresh := reason == reasonEmpty && sh.Err() == nil && sh.AppliedSeq() == 0 && !holdsData(sh)
-	useFetcher := t.useFetcher()
+	useFetcher := t.useFetcher(reason)
 	if !fresh || useFetcher {
 		dir := sh.Dir()
 		sh.Abandon()
@@ -437,6 +439,7 @@ func (t *Tailer) rebuild(ctx context.Context, reason string) (err error) {
 	if err != nil {
 		return err
 	}
+	t.rw = markOf(sh)
 	t.lastSource, t.recoveredAt, t.minMappingVersion = sourceSQL, asOf, 0
 	t.log.InfoContext(ctx, "shard copy rebuilt from the store", slog.String("reason", reason), slog.Int64("seq", asOf),
 		slog.Float64("duration_ms", float64(t.opts.Clock.Since(start).Microseconds())/1000))
@@ -500,7 +503,11 @@ func (t *Tailer) fetchInto(ctx context.Context, reason, dir string) (sh *shard.S
 // nothing, then advances it to the snapshot's seq. The snapshot's first record is the
 // index's mapping as of the snapshot, which every document after it is analyzed under.
 // The scan holds one transaction open, so its callback only hands each record over;
-// another goroutine analyzes and loads them in batches, waiting out backpressure.
+// another goroutine analyzes and loads them in batches, waiting out backpressure. When
+// loading fails, it stops the scan and drains whatever the scan already handed over.
+// The load is flushed at once, so a crash from then on resumes rather than reloads; a
+// refresh or flush that fails is retried in the background (the refresh keeps its
+// buffer).
 func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -516,14 +523,13 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		var r result
 		r.bytes, r.count, r.mapped, r.err = t.consumeSnapshot(ctx, sh, records)
 		if r.err != nil {
-			cancel() // stop the scan
+			cancel()
 			for range records {
-				// drain whatever the scan already handed over
 			}
 		}
 		done <- r
 	}()
-	asOf, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
+	pt, scanErr := t.st.ScanShard(ctx, t.id, func(r store.Record) error {
 		select {
 		case records <- r:
 			return nil
@@ -547,12 +553,15 @@ func (t *Tailer) loadSnapshot(ctx context.Context, sh *shard.Shard) (int64, erro
 		return 0, fmt.Errorf("%w: %s is missing from the snapshot", ErrIndexDropped, t.id.Index)
 	}
 	t.inst.recoveryBytes.Add(ctx, res.bytes, t.inst.with(attribute.String("source", sourceSQL)))
+	asOf := pt.Seq
+	if pt.Mark.Seq == asOf {
+		sh.SetMark(asOf, encodeMark(pt.Mark))
+	}
+	sh.SetOwnMark(encodeOwn(ownCheck{}, ownCheck{last: pt.ShardMark, upTo: asOf}))
 	if err := sh.Advance(asOf); err != nil {
 		return 0, err
 	}
 	t.applied.Store(asOf)
-	// Flush now, so a crash from here on resumes rather than reloads. A refresh or
-	// flush that fails is retried in the background (the refresh keeps its buffer).
 	err := sh.Refresh(ctx)
 	if err == nil {
 		err = sh.Flush(ctx)

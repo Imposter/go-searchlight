@@ -38,8 +38,8 @@ func TestHistogramExactBelow2048(t *testing.T) {
 			t.Errorf("Quantile(%v) = %d, want %d", c.q, got, c.want)
 		}
 	}
-	if h.Count() != 1000 || h.Min() != 1 || h.Max() != 1000 || h.Mean() != 500.5 {
-		t.Errorf("count %d min %d max %d mean %v", h.Count(), h.Min(), h.Max(), h.Mean())
+	if h.Count() != 1000 || h.Min() != 1 || h.max != 1000 || h.Mean() != 500.5 {
+		t.Errorf("count %d min %d max %d mean %v", h.Count(), h.Min(), h.max, h.Mean())
 	}
 }
 
@@ -91,8 +91,8 @@ func TestHistogramClampsAndEmpty(t *testing.T) {
 	}
 	h.Record(-5)
 	h.Record(MaxValue * 4)
-	if h.Min() != 0 || h.Max() != MaxValue || h.Quantile(1) != MaxValue {
-		t.Fatalf("min %d max %d q1 %d", h.Min(), h.Max(), h.Quantile(1))
+	if h.Min() != 0 || h.max != MaxValue || h.Quantile(1) != MaxValue {
+		t.Fatalf("min %d max %d q1 %d", h.Min(), h.max, h.Quantile(1))
 	}
 }
 

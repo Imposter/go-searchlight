@@ -47,6 +47,10 @@ type scratch struct {
 	pairOps  int
 	key      []byte
 	lo, hi   uint32
+	now      int64 // the percolation's now, in Unix ms: what date math resolves at
+	// fields are the segment's field table, which vals follows: a nested program reads
+	// its sub-fields' names there.
+	fields []fieldInfo
 }
 
 const (
@@ -198,109 +202,131 @@ func appendSet(dst []uint32, bits []uint64, first uint32) []uint32 {
 // [AtomKind]), only for the kinds of atoms the segment has terms of on each field.
 func (s *Segment) collect(d *schema.Doc, sc *scratch) { s.collectIn(d, sc, 0, s.n) }
 
-// collectIn is collect of the queries whose ranks lie in [lo, hi) alone.
+// collectIn is collect of the queries whose ranks lie in [lo, hi) alone. A missing
+// field holds no atom, so only Always queries match it. A field with pair members
+// looks its atoms up as pair halves too. Gram atoms are every 3-rune window of the
+// whole text: Value.Grams stops at MaxGramChars (and is never filled for _id), the
+// windows do not. A nested field's sub-field (path.name, absent from the document's
+// own fields) holds the atoms of each of the document's objects' values of it, which is
+// what a nested query anchored on its inner query's atoms needs: the object it matches
+// holds them.
 func (s *Segment) collectIn(d *schema.Doc, sc *scratch, lo, hi uint32) {
 	sc.lo, sc.hi = lo, hi
+	sc.fields = s.fields
 	for fi := range s.fields {
 		sc.vals[fi] = d.Fields[s.fields[fi].name]
 	}
 	for fi := range s.fields {
 		f := &s.fields[fi]
-		v := &sc.vals[fi]
-		if !v.Present {
-			continue // a missing field holds no atom: only Always queries match it
+		if v := &sc.vals[fi]; v.Present {
+			s.probe(uint32(fi), f, v, sc)
+			continue
 		}
-		field := uint32(fi)
-		k := f.kinds
-		mem := k&(1<<AtomMember) != 0 // the field's atoms may be halves of pairs
-		if k&(1<<AtomPresent) != 0 {
-			sc.addEntry(s, s.lookup(AtomPresent, field, ""))
+		if f.path == "" {
+			continue
 		}
-		if v.Text != nil {
-			text := *v.Text
-			if k&(1<<AtomText) != 0 {
-				sc.addEntry(s, s.lookup(AtomText, field, ""))
+		objects := d.Fields[f.path].Objects
+		for k := range objects {
+			if v, ok := objects[k].Fields[f.name]; ok && v.Present {
+				s.probe(uint32(fi), f, &v, sc)
 			}
-			if k&(1<<AtomValue) != 0 {
-				sc.addEntry(s, s.lookup(AtomValue, field, text))
-			}
-			if mem {
-				s.addMember(sc, AtomValue, field, text)
-			}
-			if k&(1<<AtomGram) != 0 {
-				// Every 3-rune window of the whole text: Value.Grams stops at
-				// MaxGramChars (and is never filled for _id), the windows do not.
-				a, b, c := -1, -1, -1
-				for i := range text {
-					if a >= 0 {
-						sc.addEntry(s, s.lookupGram(f, field, text[a:i]))
-					}
-					a, b, c = b, c, i
-				}
-				if a >= 0 {
-					sc.addEntry(s, s.lookupGram(f, field, text[a:]))
-				}
-			}
-			if k&(1<<AtomSimKey) != 0 {
-				sc.keys = analysis.AppendTrigramKeys(sc.keys[:0], text)
-				for _, key := range sc.keys {
-					sc.addEntry(s, s.lookupKey(field, key))
-				}
-			}
-		}
-		if v.Bool != nil {
-			if k&(1<<AtomBool) != 0 {
-				sc.addEntry(s, s.lookup(AtomBool, field, boolTerm(*v.Bool)))
-			}
-			if mem {
-				s.addMember(sc, AtomBool, field, boolTerm(*v.Bool))
-			}
-		}
-		if len(v.Entries) > 0 {
-			if k&(1<<AtomNonempty) != 0 {
-				sc.addEntry(s, s.lookup(AtomNonempty, field, ""))
-			}
-			if k&(1<<AtomEntry) != 0 || mem {
-				for _, e := range v.Entries {
-					if k&(1<<AtomEntry) != 0 {
-						sc.addEntry(s, s.lookup(AtomEntry, field, e))
-					}
-					if mem {
-						s.addMember(sc, AtomEntry, field, e)
-					}
-				}
-			}
-		}
-		if v.Words != "" && (k&(1<<AtomWord) != 0 || mem) {
-			words := v.Words
-			for words != "" {
-				i := 0
-				for i < len(words) && words[i] != ' ' {
-					i++
-				}
-				if i > 0 {
-					if k&(1<<AtomWord) != 0 {
-						sc.addEntry(s, s.lookup(AtomWord, field, words[:i]))
-					}
-					if mem {
-						s.addMember(sc, AtomWord, field, words[:i])
-					}
-				}
-				if i == len(words) {
-					break
-				}
-				words = words[i+1:]
-			}
-		}
-		if v.Number != nil && f.root >= 0 {
-			s.stab(f.root, *v.Number, sc)
 		}
 	}
 	s.probePairs(sc)
 	sc.addPosts(s.always)
 }
 
-// stab adds every query whose range on the field (the tree at root) holds x.
+// probe adds the queries anchored on the atoms of value v of field (f, the field at
+// index field), as collectIn reads them.
+func (s *Segment) probe(field uint32, f *fieldInfo, v *schema.Value, sc *scratch) {
+	k := f.kinds
+	pairHalves := k&(1<<AtomMember) != 0
+	if k&(1<<AtomPresent) != 0 {
+		sc.addEntry(s, s.lookup(AtomPresent, field, ""))
+	}
+	if v.Text != nil {
+		text := *v.Text
+		if k&(1<<AtomText) != 0 {
+			sc.addEntry(s, s.lookup(AtomText, field, ""))
+		}
+		if k&(1<<AtomValue) != 0 {
+			sc.addEntry(s, s.lookup(AtomValue, field, text))
+		}
+		if pairHalves {
+			s.addMember(sc, AtomValue, field, text)
+		}
+		if k&(1<<AtomGram) != 0 {
+			a, b, c := -1, -1, -1
+			for i := range text {
+				if a >= 0 {
+					sc.addEntry(s, s.lookupGram(f, field, text[a:i]))
+				}
+				a, b, c = b, c, i
+			}
+			if a >= 0 {
+				sc.addEntry(s, s.lookupGram(f, field, text[a:]))
+			}
+		}
+		if k&(1<<AtomSimKey) != 0 {
+			sc.keys = analysis.AppendTrigramKeys(sc.keys[:0], text)
+			for _, key := range sc.keys {
+				sc.addEntry(s, s.lookupKey(field, key))
+			}
+		}
+	}
+	if v.Bool != nil {
+		if k&(1<<AtomBool) != 0 {
+			sc.addEntry(s, s.lookup(AtomBool, field, boolTerm(*v.Bool)))
+		}
+		if pairHalves {
+			s.addMember(sc, AtomBool, field, boolTerm(*v.Bool))
+		}
+	}
+	if len(v.Entries) > 0 {
+		if k&(1<<AtomNonempty) != 0 {
+			sc.addEntry(s, s.lookup(AtomNonempty, field, ""))
+		}
+		if k&(1<<AtomEntry) != 0 || pairHalves {
+			for _, e := range v.Entries {
+				if k&(1<<AtomEntry) != 0 {
+					sc.addEntry(s, s.lookup(AtomEntry, field, e))
+				}
+				if pairHalves {
+					s.addMember(sc, AtomEntry, field, e)
+				}
+			}
+		}
+	}
+	if v.Words != "" && (k&(1<<AtomWord) != 0 || pairHalves) {
+		words := v.Words
+		for words != "" {
+			i := 0
+			for i < len(words) && words[i] != ' ' {
+				i++
+			}
+			if i > 0 {
+				if k&(1<<AtomWord) != 0 {
+					sc.addEntry(s, s.lookup(AtomWord, field, words[:i]))
+				}
+				if pairHalves {
+					s.addMember(sc, AtomWord, field, words[:i])
+				}
+			}
+			if i == len(words) {
+				break
+			}
+			words = words[i+1:]
+		}
+	}
+	if v.Number != nil && f.root >= 0 {
+		s.stab(f.root, *v.Number, sc)
+	}
+}
+
+// stab adds every query whose range on the field (the tree at root) holds x. Every
+// interval of a node holds its center, so below the center (hi >= center > x) an
+// interval holds x when lo <= x, a prefix of the lo-ascending order; above it, a
+// prefix of the hi-descending one.
 func (s *Segment) stab(root int32, x float64, sc *scratch) {
 	for nd := root; nd >= 0; {
 		o := int(nd) * nodeSize
@@ -308,8 +334,6 @@ func (s *Segment) stab(root int32, x float64, sc *scratch) {
 		start, count := int(u32(s.nodes, o+16)), int(u32(s.nodes, o+20))
 		switch {
 		case x < center:
-			// Every interval here holds center, so hi >= center > x: it holds x when
-			// lo <= x, a prefix of the lo-ascending order.
 			for r := start; r < start+count; r++ {
 				p := r * recordSize
 				if f64(s.byLo, p) > x {

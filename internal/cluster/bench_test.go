@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -111,53 +112,71 @@ func BenchmarkPeerRecovery(b *testing.B) {
 	b.ReportMetric(float64(total)/(1<<20), "copy_MB")
 }
 
-// BenchmarkWriteThroughput: concurrent bulks of 100 documents, four writers per node,
-// through one node (nodes=1) and through all three (nodes=3), into a three-shard index
-// every node holds.
+// BenchmarkWriteThroughput: concurrent bulks, four writers per node, through one node
+// (nodes=1) and through all three (nodes=3), into an index of 3 or 64 shards that every
+// node holds. It runs on Postgres when SEARCHLIGHT_TEST_PG_URL is set, as several nodes
+// committing at once is what it measures, and on SQLite otherwise.
 func BenchmarkWriteThroughput(b *testing.B) {
 	for _, nodes := range []int{1, 3} {
-		b.Run(fmt.Sprintf("nodes=%d", nodes), func(b *testing.B) {
-			c := newCluster(b, benchDB(b), heavyLoad)
-			a := c.start(0)
-			createIndex(b, a.n, "wt", 3, 0)
-			for i := 1; i < nodes; i++ {
-				c.start(i)
+		for _, shards := range []int{3, 64} {
+			for _, bulk := range []int{100, 500} {
+				b.Run(fmt.Sprintf("nodes=%d/shards=%d/bulk=%d", nodes, shards, bulk), func(b *testing.B) {
+					benchWrites(b, nodes, shards, bulk)
+				})
 			}
-			waitCopies(b, a.st, "wt", 3, nodes, time.Minute)
-			var next atomic.Int64
-			var docs atomic.Int64
-			b.ResetTimer()
-			start := time.Now()
-			var wg sync.WaitGroup
-			var failed atomic.Pointer[error]
-			for _, tn := range c.live() {
-				for range 4 {
-					wg.Go(func() {
-						for next.Add(1) <= int64(b.N) {
-							ops := make([]api.WriteOp, 100)
-							base := next.Load() * 100
-							for k := range ops {
-								ops[k] = upsertOp(fmt.Sprintf("w%d-%d", base, k), k)
-							}
-							res, err := tn.n.Write(context.Background(), "wt", ops, api.WriteOptions{})
-							if err != nil {
-								failed.CompareAndSwap(nil, &err)
-								return
-							}
-							for _, it := range res.Items {
-								if it.Err == nil {
-									docs.Add(1)
-								}
-							}
-						}
-					})
-				}
-			}
-			wg.Wait()
-			if e := failed.Load(); e != nil {
-				b.Fatal(*e)
-			}
-			b.ReportMetric(float64(docs.Load())/time.Since(start).Seconds(), "docs/s")
-		})
+		}
 	}
+}
+
+func benchWrites(b *testing.B, nodes, shards, bulk int) {
+	var d *db
+	if base := os.Getenv(envPG); base != "" {
+		d = postgresDB(b, base)
+	} else {
+		d = benchDB(b)
+	}
+	c := newCluster(b, d, heavyLoad)
+	a := c.start(0)
+	createIndex(b, a.n, "wt", shards, 0)
+	for i := 1; i < nodes; i++ {
+		c.start(i)
+	}
+	waitCopies(b, a.st, "wt", shards, nodes, time.Minute)
+	var next atomic.Int64
+	var docs atomic.Int64
+	b.ResetTimer()
+	start := time.Now()
+	var wg sync.WaitGroup
+	var failed atomic.Pointer[error]
+	for _, tn := range c.live() {
+		for range 4 {
+			wg.Go(func() {
+				for {
+					n := next.Add(1)
+					if n > int64(b.N) {
+						return
+					}
+					ops := make([]api.WriteOp, bulk)
+					for k := range ops {
+						ops[k] = upsertOp(fmt.Sprintf("w%d-%d", n, k), k)
+					}
+					res, err := tn.n.Write(context.Background(), "wt", ops, api.WriteOptions{})
+					if err != nil {
+						failed.CompareAndSwap(nil, &err)
+						return
+					}
+					for _, it := range res.Items {
+						if it.Err == nil {
+							docs.Add(1)
+						}
+					}
+				}
+			})
+		}
+	}
+	wg.Wait()
+	if e := failed.Load(); e != nil {
+		b.Fatal(*e)
+	}
+	b.ReportMetric(float64(docs.Load())/time.Since(start).Seconds(), "docs/s")
 }

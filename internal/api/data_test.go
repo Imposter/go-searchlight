@@ -42,9 +42,9 @@ func TestBulk(t *testing.T) {
 	if fmt.Sprint(statuses) != "[200 200 200 400 400 404]" {
 		t.Errorf("item statuses = %v: %v", statuses, items)
 	}
-	last := seqOf(t, r)
-	if seq := int64(items[2].(map[string]any)["seq"].(float64)); seq != last { //nolint:forcetypeassert,errcheck // the shape
-		t.Errorf("the last committed item's seq %d, the bulk's %d", seq, last)
+	last := tokenOf(t, r)
+	if seq := int64(items[2].(map[string]any)["seq"].(float64)); seq <= 0 || seq > maxTokenSeq(t, last) { //nolint:forcetypeassert,errcheck // the shape
+		t.Errorf("the last committed item's seq %d, the bulk's token %s", seq, last)
 	}
 	if gone := items[5].(map[string]any)["error"].(map[string]any); gone["result"] != "not_found" || items[5].(map[string]any)["seq"] != nil { //nolint:forcetypeassert,errcheck // the shape
 		t.Errorf("a delete of nothing = %v", items[5])
@@ -103,8 +103,8 @@ func TestSearch(t *testing.T) {
 			fmt.Sprintf(`{"brand": %q, "price": %d, "tags": ["t%d", "all"], "title": "item %d"}`, brands[i%3], i, i%5, i))
 	}
 	w := e.must(http.StatusOK, "POST", "/indexes/s/_bulk", ndjson(lines...))
-	seq := seqOf(t, w)
-	path := fmt.Sprintf("/indexes/s/_search?wait_for_seq=%d", seq)
+	seq := tokenOf(t, w)
+	path := fmt.Sprintf("/indexes/s/_search?wait_for=%s", seq)
 
 	// Sorted paging over three shards: every document once, in order.
 	var got []string
@@ -172,15 +172,15 @@ func TestSearch(t *testing.T) {
 	if !hasLoc(p, "query.field") {
 		t.Errorf("an unmapped field: %v", p)
 	}
-	p = e.problem(e.do("POST", path, `{"from": 10}`), 400, "invalid_request")
-	if !hasLoc(p, "from") {
-		t.Errorf("from: %v", p)
+	p = e.problem(e.do("POST", path, `{"scroll": "1m"}`), 400, "invalid_request")
+	if !hasLoc(p, "scroll") {
+		t.Errorf("an unknown key: %v", p)
 	}
 	p = e.problem(e.do("POST", path, `{"sort": ["tags"]}`), 400, "invalid_request")
 	if !hasLoc(p, "sort.0") {
 		t.Errorf("a sort on a list: %v", p)
 	}
-	e.problem(e.do("POST", "/indexes/s/_search?wait_for_seq=-1", `{}`), 400, "invalid_request")
+	e.problem(e.do("POST", "/indexes/s/_search?wait_for=-1", `{}`), 400, "invalid_request")
 	e.problem(e.do("POST", "/indexes/s/_search?wait_for=1", `{}`), 400, "invalid_request")
 
 	c := e.must(http.StatusOK, "POST", "/indexes/s/_count", `{"query": {"field": "tags", "op": "has", "value": "t0"}}`)
@@ -193,8 +193,8 @@ func TestSearch(t *testing.T) {
 func TestSavedQueriesAndPercolate(t *testing.T) {
 	e := newEnv(t, envOpts{})
 	e.createIndex("p", `{"mapping": {"fields": {"brand": "keyword", "price": "number", "title": "text"}}, "settings": {"shards": 2}}`)
-	put := func(id, q string) int64 {
-		return seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/p/queries/"+id, q))
+	put := func(id, q string) string {
+		return tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/p/queries/"+id, q))
 	}
 	put("cheap", `{"query": {"field": "price", "op": "lt", "value": 10}, "meta": {"search_id": 7}}`)
 	put("acme", `{"query": {"field": "brand", "op": "eq", "value": "Acme"}}`)
@@ -227,7 +227,7 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 	e.problem(e.do("GET", "/indexes/p/queries/bad", ""), 404, "query_not_found")
 	e.problem(e.do("GET", "/indexes/p/queries?size=0", ""), 400, "invalid_request")
 
-	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/p/_bulk?percolate=true&wait_for_seq=%d", seq), ndjson(
+	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/p/_bulk?percolate=true&wait_for=%s", seq), ndjson(
 		`{"upsert": {"id": "x"}}`, `{"brand": "ACME", "price": 5}`,
 		`{"upsert": {"id": "y"}}`, `{"brand": "other", "price": 50}`,
 		`{"delete": {"id": "z"}}`,
@@ -237,9 +237,10 @@ func TestSavedQueriesAndPercolate(t *testing.T) {
 		t.Errorf("bulk percolation = %s", got)
 	}
 
-	r = e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/p/_percolate?wait_for_seq=%d", seqOf(t, r)), `{"docs": [{"brand": "acme", "price": 50}], "ids": ["x", "missing"]}`)
-	res := r["results"].([]any) //nolint:forcetypeassert,errcheck // the shape
-	if got := fmt.Sprint(res); got != "[map[found:true queries:[acme everything]] map[found:true id:x queries:[acme cheap everything]] map[found:false id:missing queries:[]]]" {
+	r = e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/p/_percolate?wait_for=%s", tokenOf(t, r)), `{"docs": [{"brand": "acme", "price": 50}], "ids": ["x", "missing"]}`)
+	res := r["results"].([]any)                               //nolint:forcetypeassert,errcheck // the shape
+	xSeq := int64(items[0].(map[string]any)["seq"].(float64)) //nolint:forcetypeassert,errcheck // the shape
+	if got := fmt.Sprint(res); got != fmt.Sprintf("[map[found:true queries:[acme everything]] map[_seq:%d found:true id:x queries:[acme cheap everything]] map[found:false id:missing queries:[]]]", xSeq) {
 		t.Errorf("percolate = %s", got)
 	}
 	p = e.problem(e.do("POST", "/indexes/p/_percolate", `{"docs": [{"brand": "a"}, "nope"]}`), 400, "invalid_request")
@@ -279,7 +280,7 @@ func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 		return `{"not": {"field": "brand", "op": "eq", "value": "Acme"}}`
 	}
 	queries := map[string]query.Node{}
-	var seq int64
+	var seq string
 	for i := range 40 {
 		var q string
 		switch rng.IntN(3) {
@@ -291,7 +292,7 @@ func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 			q = fmt.Sprintf(`{"any": [%s, %s]}`, leaf(), leaf())
 		}
 		id := fmt.Sprintf("q%02d", i)
-		seq = seqOf(t, e.must(http.StatusOK, "PUT", "/indexes/bf/queries/"+id, `{"query": `+q+`}`))
+		seq = mergeTokens(t, seq, tokenOf(t, e.must(http.StatusOK, "PUT", "/indexes/bf/queries/"+id, `{"query": `+q+`}`)))
 		n, problems := query.Parse([]byte(q))
 		if len(problems) > 0 {
 			t.Fatal(problems)
@@ -306,7 +307,7 @@ func TestBulkPercolateMatchesBruteForce(t *testing.T) {
 		lines = append(lines, fmt.Sprintf(`{"upsert": {"id": "d%d"}}`, i), body)
 		bodies = append(bodies, body)
 	}
-	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/bf/_bulk?percolate=true&wait_for_seq=%d", seq), ndjson(lines...))
+	r := e.must(http.StatusOK, "POST", fmt.Sprintf("/indexes/bf/_bulk?percolate=true&wait_for=%s", seq), ndjson(lines...))
 	mapping := &schema.Mapping{Fields: map[string]schema.FieldType{"brand": schema.Keyword, "price": schema.Number, "tags": schema.KeywordList, "title": schema.Text}}
 	items := r["items"].([]any) //nolint:forcetypeassert,errcheck // the shape
 	matched := 0
@@ -344,7 +345,7 @@ func TestFieldsAndCluster(t *testing.T) {
 		`{"upsert": {"id": "2"}}`, `{"tags": ["a"], "brand": "y"}`,
 		`{"upsert": {"id": "3"}}`, `{"tags": ["a", "c"]}`,
 	))
-	r := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/f/_fields?entries=2&wait_for_seq=%d", seqOf(t, w)), "")
+	r := e.must(http.StatusOK, "GET", fmt.Sprintf("/indexes/f/_fields?entries=2&wait_for=%s", tokenOf(t, w)), "")
 	if got := fmt.Sprint(r["fields"]); got != "[map[name:brand type:keyword] map[entries:[map[count:3 value:a] map[count:1 value:b]] name:tags type:keyword_list]]" {
 		t.Errorf("fields = %s", got)
 	}

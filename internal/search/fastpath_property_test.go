@@ -256,7 +256,8 @@ func TestSortWalkEveryPath(t *testing.T) {
 		field := pick(rng, []string{"price", "created"})
 		sorts := []SortField{{Field: field, Desc: rng.IntN(2) == 0}}
 		if rng.IntN(3) == 0 {
-			sorts = append(sorts, SortField{Field: pick(rng, []string{"brand", "active", "price"}), Desc: rng.IntN(2) == 0})
+			second := pick(rng, slices.DeleteFunc([]string{"brand", "active", "price"}, func(f string) bool { return f == field }))
+			sorts = append(sorts, SortField{Field: second, Desc: rng.IntN(2) == 0})
 		}
 		raw := `{"all":[]}`
 		switch rng.IntN(4) {
@@ -373,6 +374,11 @@ func revAgg(rng *rand.Rand, vals []float64) Agg {
 		a = Agg{Type: AggTerms, Field: pick(rng, []string{"brand", "tags", "title", "active", "price"}), Size: pick(rng, []int{1, 5, 50}), ShardSize: 1_000_000}
 		if rng.IntN(3) == 0 {
 			a.MinDocCount = ptr(1 + rng.IntN(20))
+		}
+		if rng.IntN(3) == 0 {
+			a.Include, a.Exclude = randomTermsFilters(rng, a.Field, func() string {
+				return pick(rng, []string{fmt.Sprintf("B%03d", rng.IntN(60)), fmt.Sprintf("t%02d", rng.IntN(60)), "red cup 1", "7", "true"})
+			})
 		}
 	case 2:
 		var rs []Range
@@ -584,7 +590,7 @@ func TestOrdinalsConcurrent(t *testing.T) {
 					}
 					parts = append(parts, res)
 				}
-				Reduce(parts, &Request{Aggs: map[string]Agg{"x": aggs[(w+k)%len(aggs)]}})
+				Reduce(context.Background(), parts, &Request{Aggs: map[string]Agg{"x": aggs[(w+k)%len(aggs)]}})
 			}
 		})
 	}
@@ -721,7 +727,7 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	g := c.shards[0].Acquire()
 	key := ordsKey(g, "brand", false)
 	g.Release()
-	if globalOrdsCache.cached(key) != nil {
+	if globalOrdsCache.cached(context.Background(), key) != nil {
 		t.Fatal("a one-hit cardinality built global ordinals")
 	}
 	t.Logf("one hit of %d unique terms: %v", n+1, took)
@@ -729,7 +735,8 @@ func TestSparseOrdinalsBuildNothing(t *testing.T) {
 	if _, err := c.search(dense); err != nil {
 		t.Fatal(err)
 	}
-	if globalOrdsCache.cached(key) == nil {
+	waitOrdsIdle(t)
+	if globalOrdsCache.cached(context.Background(), key) == nil {
 		t.Fatal("a match-all cardinality built no global ordinals")
 	}
 }

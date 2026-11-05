@@ -3,8 +3,7 @@
 This is how Searchlight is built, as the code stands. The design and its reasons are in
 [the spec](superpowers/specs/2026-10-02-searchlight-design.md), and the order the work is
 built in is in [the plan](superpowers/plans/2026-10-02-searchlight.md).
-[Planned, not built](#planned-not-built) lists what the spec promises that is not in the
-code yet.
+[Known gaps](#known-gaps) lists what the spec promises that is not in the code yet.
 
 ## In one paragraph
 
@@ -15,7 +14,14 @@ database (Postgres, MySQL or SQLite), and nowhere else:
 - **The changelog** (`sl_changes`) is the write-ahead log. A write is acknowledged once
   its transaction commits.
 - **The documents and saved queries** (`sl_documents`, `sl_queries`) are the system of
-  record.
+  record, each row with the seq of its last write and the client version it named.
+  `sl_tombstones` keeps the version of each id a delete removed, with when, for the
+  index's `gc_deletes`. A versioned change is checked inside its transaction, under the
+  shard's `sl_shard_seq` row lock, against the greater of the row's version and the tombstone's: at or below
+  it, the change is dropped as a noop and takes no seq. An unversioned upsert keeps the
+  row's version (the upsert statement leaves it), so versions only rise. A saved query's
+  version also rides its changelog payload, so copies index it with the query
+  (`percolate/4` keeps it per query).
 - **The registry** (`sl_nodes`, `sl_shard_copies`) is how nodes find each other, and its
   leases decide who holds which shard copy.
 
@@ -42,18 +48,20 @@ flowchart LR
 |---|---|
 | `cmd/searchlight` | Wiring: config, telemetry and the admin listener, store, cluster node, public listener, signals and the shutdown order |
 | `internal/config` | Every setting from flags, `SEARCHLIGHT_*` variables and `*_FILE` secrets, validated at start |
-| `internal/api` | The public HTTP API: routing, auth, limits and backpressure, problem JSON, `refresh` and `wait_for_seq`, readiness, graceful drain |
+| `internal/api` | The public HTTP API: routing, auth, limits and backpressure, problem JSON, `refresh` and `wait_for` tokens, readiness, graceful drain |
 | `internal/cluster` | `cluster.Node`, the only coordinator, a cluster of one included. It covers membership, leases and fencing, the allocator, peer recovery, routing with adaptive replica selection and retries, push hints, maintenance (pruning), cluster health and the rolling shutdown |
 | `internal/node` | The engine under the cluster node: the index catalogue, the write path (analysis, mapping updates, group commit), one hosted copy and tailer per shard, reads with read-your-writes, scatter-gather and reduce |
 | `internal/replica` | The tailer: keeps one shard copy in step with the changelog (recovering, tailing, halted) |
 | `internal/shard` | One shard copy: write buffer, refresh into segments, generations published atomically, flush to a durable manifest, deletes sidecars, tiered merges under a node-wide budget, filter cache |
-| `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, zstd stored fields, ids. Read through mmap and checksummed |
-| `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort and `search_after`, aggregations, cross-shard reduce |
+| `internal/segment` | The immutable on-disk segment format: term dictionaries, roaring postings, doc values, BKD-lite points, k-d trees of point fields, zstd stored fields, ids. Read through mmap and checksummed |
+| `internal/search` | Planning (cost-ordered bitmap operations plus residual checks), per-segment execution, sort, `from` and `search_after` paging, aggregations, cross-shard reduce |
+| `internal/reqcache` | The shared stores behind search's shard request cache: Redis, behind a breaker |
 | `internal/percolate` | The reverse index of saved queries: anchor extraction, query segments, candidate generation, verification by compiled programs that mirror the exact matcher |
 | `internal/query`, `internal/schema`, `internal/analysis` | The query language and exact matcher, mappings and document analysis, and the normalizers (byte-for-byte compatible with scrape-bot) |
 | `internal/store` | The SQL store: changelog, records, catalogue, registry and leases, blobs. Its logic is written once, and each dialect (`postgres`, `mysql`, `sqlite`) owns its SQL and embedded migrations |
 | `internal/telemetry` | slog JSON logs with trace ids, OpenTelemetry traces and metrics, Prometheus, pprof |
 | `internal/heapfloor` | Keeps the garbage collector from running while the heap is under `gc_heap_floor`: segments are mapped, so the live heap is small |
+| `internal/prio` | The node's priority of searches over background work on a small CPU budget: searches mark their shard work, and merges, refresh builds, analysis and file removal step aside at their checkpoints |
 | `internal/clock` | The engine's source of time: every timer, ticker, sleep and elapsed-time reading goes through an injected `clock.Clock`, `clock.Real` in production and `clock.Fake` in tests |
 
 Packages depend one way: `cmd → api, cluster → node → replica → shard → segment`, with
@@ -71,9 +79,9 @@ sequenceDiagram
   participant P as peer nodes
   Cl->>Co: PUT doc / _bulk
   Co->>Co: analyze and validate, add new dynamic fields to the stored mapping
-  Co->>DB: group commit: lock sl_counter, take contiguous seqs, insert changes and records
+  Co->>DB: group commit, one transaction per shard: lock its sl_shard_seq row, take contiguous seqs, insert changes and records
   DB-->>Co: committed
-  Co-->>Cl: 200 {seq}
+  Co-->>Cl: 200 {token}
   Co->>T: wake local tailers
   Co->>P: push hint "shard S has seq N"
   P->>T: wake their tailers
@@ -87,22 +95,33 @@ sequenceDiagram
    write. If the write brings new dynamic fields, it adds them to the stored mapping
    first: the database's mapping is the one arbiter of a field's type, so every copy
    analyzes the document alike.
-2. **Commit.** The changes go through the node's group committer. Concurrent requests on
-   a node are coalesced into one transaction every few milliseconds, as Elasticsearch
-   amortizes translog fsyncs.
-   - `Apply` locks the counter row and takes contiguous seqs, then inserts the change
-     rows and the document or query rows, and commits.
-   - Commit order therefore equals seq order, and a tailer never skips a change that
-     commits late.
-   - The write is acknowledged with its seq only after the commit.
+2. **Commit.** Every shard has its own sequence, and the changes go through the node's
+   group committer, which has a lane per shard. A request is split by shard, and
+   concurrent requests to a shard on a node are coalesced into one transaction every
+   few milliseconds, as Elasticsearch amortizes translog fsyncs. Lanes commit at the
+   same time, up to the node's `write_transactions` (1 on SQLite, where a request's
+   shards commit together in one transaction).
+   - `Apply` locks the shard's row in `sl_shard_seq` and takes contiguous seqs of that
+     shard, then inserts the change rows and the document or query rows, and commits.
+     Rows are locked in key order (index name, shard), so transactions on different
+     shards run in parallel and never deadlock.
+   - Commit order on a shard therefore equals seq order, and a tailer never skips a
+     change that commits late.
+   - A request is whole or nothing only on one shard: a shard whose transaction fails
+     fails its own operations, and the other shards' commit.
+   - The write is acknowledged with its token, each written shard's newest seq, only
+     after the commit.
 3. **Wake-up.** The node never writes a shard itself. It wakes its own tailers, and the
    cluster pushes a hint to the peers holding copies of the written shards.
-   - On Postgres, `LISTEN/NOTIFY` also wakes every tailer.
+   - On Postgres, `NOTIFY`, sent after the commit and coalesced, also wakes every
+     tailer. A lost one costs a copy up to half `max_lag`.
    - Polling every `changelog_poll_interval` is the safety net everywhere.
 4. **Apply.** Each copy's tailer reads `ChangesAfter(shard, appliedSeq)`, analyzes the
-   changes and applies them to the shard's write buffer. Seqs are global, so a shard
-   sees gaps. A short page proves that nothing below the head is missing, and the copy
-   advances past the gap.
+   changes and applies them to the shard's write buffer. Seqs are contiguous per shard.
+   A shard can still start above its last change (a new shard starts at the floor,
+   `sl_counter` row 3, and the switch from 1.x's global sequence seeded every shard at
+   its value), so the tailer reads the shard's head before each page: a short page proves
+   that nothing below the head is missing, and the copy advances to it.
 5. **Refresh is visibility.** Refreshes tick on a fixed grid, every `refresh_interval`
    from the copy's open, so a refresh's own cost never stretches the period. One that
    overruns skips the ticks it missed. `refresh=true` forces one at once, and a full
@@ -130,6 +149,59 @@ There is no per-node translog: the SQL changelog is the write-ahead log, so noth
 copy publishes needs to be durable on the copy first. After a crash, a copy reopens the
 segments of its last flushed manifest and replays the changelog from that manifest's
 seq, which is at most `flush_interval` of changes.
+
+### What a write does not do twice
+
+- **Unchanged documents.** Before step 1, the unconditional upserts of a write (no
+  version, `if_seq` or create) whose ids no other op of the request names are looked up
+  by id in one statement, outside any transaction: each document row keeps the hash of
+  its stored body (`body_hash`, the first 8 bytes of its SHA-256) with the seq that
+  stored it (`hash_seq`). An upsert whose body hashes as the stored one is answered as a
+  noop at the stored seq, and is neither analyzed, committed nor indexed. The read is a
+  committed state the request saw, so that is where the noop takes effect; it writes
+  nothing, so it needs no lock. Only an id named once is a candidate, because two ops of
+  one id must apply in order. A node from before body hashes moves `seq` on without
+  touching them, so a hash is trusted only while `hash_seq` is `seq`. With
+  percolation, a noop is percolated as the write of its body would be: the saved
+  queries may have changed since it was stored, so keeping each document's last results
+  would be wrong as well as larger.
+- **One analysis per write.** The coordinating node analyzes each upserted document
+  once (step 1) and, when it hosts a copy of the document's shard and the mapping types
+  every field (dynamic true or strict), hands the analyzed document to that copy by
+  seq. Its tailer applies it in place of analyzing the committed body (step 4) when it
+  is that change's document (same id, same body bytes) and every field it holds,
+  nested sub-fields included, is one the copy maps. Mappings only add fields and never
+  retype one, so that document is then exactly the copy's own analysis; anything else
+  (another node's copies, a rebuild, a handoff past the node's 64 MiB) analyzes the
+  body. The handoff carries the writer's mapping, and the copy compares the type of
+  every field the document holds under both, so a value the writer left untyped on a
+  field mapped since, or a dotted member a later nested field claims, is analyzed
+  anew. A write analyzes in full only the documents it percolates or hands off.
+- **Work for a client that went away.** A write checks its context before each op it
+  analyzes and before it commits, so a client that disconnects (its timeout) stops the
+  attempt's work. The group committer drops a caller gone before its batch flushes and
+  cancels a transaction once every caller in it has gone; a cancel that reaches a
+  transaction already in its commit does not stop it, so a request can commit after
+  its caller has been answered with the cancellation (a 499 nobody reads). Each shard's
+  part of a request commits in one transaction, so it is committed whole or not at
+  all, though some shards may commit and others not. The client's retry of the same
+  upserts is idempotent: a shard that committed makes the retry's upserts there noops
+  at their stored seqs.
+
+**Why the changelog keeps the body.** Each upsert writes its body twice, in its
+`sl_changes` row and in its `sl_documents` row, in the one statement of the commit
+(encoded once). The changelog cannot keep a reference to the document row instead:
+that row holds only the newest version of the document, so a tailer applying change
+`s` of a document rewritten at `s' > s` (or deleted) would find another body or none.
+It would then either skip `s`, leaving a copy that reports `s` applied without the
+write a client waits for with a token naming `s`, or apply `s'`'s body early, leaving a
+copy whose state at `s` never existed and whose per-document seqs (`_seq`) and halts
+point at the wrong change; recovery replays the changelog from a snapshot's seq and
+would hit the same. Keeping a hash in the changelog in place of the body has the same
+problem. The cost of the second copy is the database's (its WAL and storage, the time
+the shard's row lock is held), not Searchlight's CPU: on a one-core node writing to
+Postgres (slbench writeload, 150k listings), the whole commit is about 4% of the
+node's CPU, against 20% for analysis (before it was done once) and 28% for merges.
 
 ### Shards and segments
 
@@ -164,10 +236,132 @@ data_dir/
   - The global-ordinals cache keeps, per field and segment list, the map from each
     segment's term ordinals to the shard's sorted union of them: up to 256 MiB, built
     by a terms or cardinality aggregation over many of the field's terms, at a cost
-    that grows with its distinct terms, and dropped when a refresh or merge replaces
-    the segment list.
+    that grows with its distinct terms. A refresh or merge makes a new segment list,
+    whose ordinals are derived from the old list's when that is cheaper than a full
+    merge of the dictionaries: the segments kept keep their maps (renumbered), a
+    removed segment's map and the terms it alone held go, and an added segment's
+    terms are looked up in the old dictionary in one ascending galloping pass and
+    inserted where missing, which gives exactly the full build's ordinals. A small
+    refresh segment is derived; a merge into a segment holding much of the field is
+    built in full. After each refresh or merge the fields searches used over the
+    shard in the last 10 minutes are rebuilt in the background. Every build takes a
+    slot of one pool (a quarter of the CPUs); a shard's field has at most one in
+    flight, which a newer generation's supersedes, and a closing shard cancels its
+    builds, waits for them and drops its entries. A search's build is served before
+    queued warm ones. A build runs detached from the search that asked, once for
+    every search asking: a search never waits on a queued build and on a running one
+    at most 250 ms, then merges by term, exactly, and the build finishes and is
+    cached for the next. The old
+    list's entry is dropped once the new one's is cached.
   - The OS page cache holds the mmap'd files.
-- **Format versions.** The segment format is versioned (major 3). A copy whose files
+- **Point fields** ([`xy.go`](../internal/segment/xy.go)). A segment holding a point
+  field writes an XY section (format 4.1; one without is 4.0, byte for byte as
+  before, and a 4.0 reader ignores the section): per field a static k-d tree of its
+  (x, y, document) triples, as Lucene's BKD tree indexes `XYPoint`.
+  - Coordinates are kept as sortable 64-bit keys (a float's bits turned so unsigned
+    order is numeric order, -0 read as 0), so a box is integer comparisons.
+  - The triples are split into leaves of 512. Each node of the tree covers a run of
+    leaves and splits it in half along the axis whose spread, relative to the field's
+    whole spread on that axis, is the wider (a quickselect, not a sort), so the tree
+    splits dates and scores alike whatever their units. Every node records the box
+    its points span.
+  - A leaf stores its points' x and y as frame-of-reference bit-packed deltas from
+    its own minimum, and their documents bit-packed, sorted by the axis it spreads
+    wider on: about 14 bytes per point for a date and a two-decimal score in 1M
+    documents.
+  - A box query descends only into the nodes its box meets. A node it covers whole
+    contributes its leaves' documents without a coordinate read; a leaf it meets in
+    part is two binary searches on its sorted axis, then a check of the other axis
+    only when the box cuts that one too. Documents are gathered in a list, then, past
+    1/1024 of the segment, in a dense bitset. A document matches once one of its
+    points is inside, so a document with points (1, 10) and (10, 1) never matches
+    x >= 5, y >= 5.
+  - The planner estimates a box from the node boxes alone (no leaf read), spreading
+    the points it counts over the field's documents, and caches a box's bitmap in
+    the filter cache as it does a range's.
+  - Build and Merge put a field's points in one canonical order (document, x, y)
+    before the tree is built, so a merge writes the same bytes as a rebuild of its
+    live documents; a merge reads its inputs' trees, drops deleted documents' points
+    and renumbers the rest. Building holds 24 bytes per point in memory, and
+    partitions with a quickselect per node rather than sorting.
+  - Why a tree, not the points sorted by x with each one's y beside it: the workload's
+    boxes are one-sided on both axes (x >= T, y >= c). Sorted by x, such a box reads
+    every point from T on, however few pass the y bound; the tree prunes on both
+    axes. One segment of 1M documents holding 10M points (x a date over a year, y a
+    score in [0, 100); [`xy_bench_test.go`](../internal/segment/xy_bench_test.go),
+    Ryzen 7 3700X):
+
+    | Box | Documents | Tree | Sorted by x |
+    | --- | --- | --- | --- |
+    | x >= the year's last 50%, y >= 50 | 842,888 | 11.2 ms | 24.8 ms |
+    | x >= last 10%, y >= 90 | 94,270 | 0.44 ms | 1.59 ms |
+    | x >= last 1%, y >= 90 | 10,059 | 0.17 ms | 0.26 ms |
+    | x >= last 90%, y >= 99 | 85,504 | 0.62 ms | 10.5 ms |
+    | x >= last 90%, y <= 1 | 85,919 | 0.58 ms | 12.1 ms |
+    | x >= last 0.1%, any y | 10,014 | 0.33 ms | 0.10 ms |
+
+    The one box the sorted scan wins is a bound on x alone, which reads only its
+    matches there, where the tree also scans the leaves along the bound. An estimate
+    from the node boxes takes 0.5 µs.
+- **Nested fields** ([`nested.go`](../internal/segment/nested.go)). A segment whose
+  documents hold a nested field's members writes a NESTED section (format 4.2; one
+  without is written in the minor before, byte for byte as before): per field an
+  *object segment* and the documents' *starts*.
+  - The object segment is a whole segment image (header to footer, with its own
+    checksums) over object ordinals, flagged as one and holding no STORED and no IDS
+    section. Its fields are the nested field's own name, present for each member that
+    is an object, and the sub-fields by their full names (`_v.size`): built by the
+    builders documents are built by (every term dictionary, column and point index of
+    a sub-field is the one a document field of its type would have) and read by the
+    same `Reader`.
+  - The starts are each document's first object ordinal, then the object count,
+    bit-packed: document d's objects are `[starts[d], starts[d+1])`, in array order. A
+    member that is no object holds its ordinal and nothing else.
+  - The documents are untouched: their ordinals, ids, stored bodies, deletes and
+    every structure of their own fields (the nested field itself is only present) are
+    what they would be without the section. An object is live while its document is.
+    Build numbers objects in document order, across parallel build ranges, and a merge
+    keeps the live documents' objects in that order, merging the object segments as
+    it merges segments, so a merge writes the same bytes as a rebuild.
+  - A nested query runs its inner query over the object segment through an execution
+    of its own (`segExec.inner`): the same candidates, residual checks, cost order and
+    two-phase approximation, its "every document" the members that are objects, so a
+    `not` inside negates per object. Its approximation comes back to documents through
+    the starts (`Nested.Parents`, galloping from the last document found): a document
+    surely matches when one of its objects surely does, may when one may, and a maybe
+    document is decided by its maybe objects' residual checks; a phrase's residual
+    reads the object's member of its document's stored body. With few documents in
+    question the inner query runs over their objects alone. The filter cache, the
+    request cache, totals and sorts stay the documents'.
+  - An aggregation on a sub-field collects the objects of the hits (those its `where`
+    matches); `terms` counts a document once per value with each value's last
+    counted document, and its partial is keyed by value, never by ordinal. Each of its
+    buckets holds its sub-aggregations' collectors, made at the bucket's first object:
+    one on a top-level field built on the parent segment and fed each document once
+    (when the bucket first counts it), one on a sub-field built on the object segment
+    and fed each object (those its own `where` matches, a bitmap computed once per
+    segment). A `terms` there is keyed by value too, charged to the segment's bucket
+    budget as it collects, and never cut by a shard, so the
+    shards' lists merge by key exactly. A sort on
+    a sub-field reads, per document, the least or greatest value among its chosen
+    objects, from a bitset of them. Inner hits are read at the coordinator from each
+    fetched body, by the inner query's compiled matcher on each member.
+  - The percolator compiles a nested node to a program (`pNested`) holding its
+    sub-fields' slots: each object of the document fills them in turn while the inner
+    program runs. A saved nested query anchors on its inner query's atoms (see Anchors).
+  - On BenchmarkNested*/Flat* (20,000 products of five variants, one merged segment,
+    Ryzen 7 3700X), the correlated query "size L, in stock, under 150" takes 0.67 ms
+    nested against 0.21 ms over one document per variant; a `terms` with a `where`
+    1.4 ms against 0.24 ms (which counts from the dictionary); a sort by the cheapest
+    in-stock variant 1.3 ms against 0.1 ms (which walks the point index).
+- **Document seqs.** A copy keeps each document's seq, the seq of the change that wrote
+  the version it indexes, in a numeric column of its own (`schema.SeqColumn`, a name no
+  mapping or document member can take), added as the change is applied: no query reads
+  it, and a hit's `_seq` (`seq_no`) and a stored document's percolation `_seq` are read
+  from it. Segments written before it have no such column, and their documents no seq.
+- **Format versions.** The segment format is versioned (major 4, minor 1 for a segment
+  holding a point field, 2 for one holding a nested field's objects; a binary reads its
+  own major and the one before). A copy whose files
   are damaged (a bad checksum, a damaged manifest, a listed file missing:
   `segment.ErrCorrupt`) or of an older format is wiped and rebuilt like a new one, never
   served. A copy of a newer format (`segment.ErrNewerFormat`) is refused and left as it
@@ -181,8 +375,20 @@ data_dir/
      smallest first, `any` unions, and `not` complements against the live documents.
    - The rest become residual checks over doc values: `contains` behind a trigram
      prefilter, `similar` behind trigram candidates, and ranges served by points.
+   - A search with `size` 0 first asks the shard request cache
+     ([`request_cache.go`](../internal/search/request_cache.go)): LRUs in memory (8
+     parts under their own locks, an entry's part chosen by its copy and request)
+     keyed by the copy's generation, then, when one is configured, a Redis shared by
+     every copy and node, keyed by the shard's newest change the copy holds (as its
+     changelog poll checked it). A complete result is stored in both, a timed-out one
+     in neither. A search that gives `max_staleness` may be answered from the copy's
+     newest memory entry for it under the same mapping although the copy has
+     refreshed since, when that entry was computed within `max_staleness`: under
+     continuous writes counts and facets then compute about once per
+     `max_staleness`, not at every refresh.
 2. **Execute.** Segments are searched in parallel on the `search_threads` pool. Each one
    produces hits, a top-k for the sort, and partial aggregations.
+   - A box leaf is collected from its field's k-d tree, exactly: no residual check.
    - A range leaf is collected from the point index, or checked on doc values when far
      fewer documents are left in question than it matches.
    - A number sort over many hits walks the point index's blocks from the cursor and
@@ -192,6 +398,14 @@ data_dir/
      segments by global ordinal when the hits hold many of the field's terms, by term
      otherwise.
    - A large segment's per-document aggregation is collected in parallel parts.
+   - Percentiles and percentile_ranks collect a merging t-digest (exact while it holds
+     at most `compression` distinct values), which the segments' parts, the segments
+     and the shards merge in turn.
+   - A terms aggregation ordered by a sub-aggregation collects every term's
+     sub-aggregations depth first, so each shard's cut is made in that order.
+     `top_metrics` keeps each segment's few best documents, and `composite` the page's
+     least keys past `after` (pruned once it holds twice the page): each shard and the
+     coordinator keep the best of those, which is exact.
 3. **Reduce.** Results reduce across segments, then across shards on the coordinator.
    With several shards, the query phase runs without bodies, and only the winning hits'
    bodies are fetched. The copy pins its generation between the two phases (a peer for
@@ -201,6 +415,23 @@ data_dir/
    preferring another copy, up to three times within the request's deadline and what
    is left of its `timeout`, and the shards' results are reduced again; only the
    shards run again are fetched again.
+
+### Searches before background work
+
+On one core, Go shares the processor between a search and a merge alike, so a count
+needing milliseconds waited behind seconds of merging. Package `prio` gives searches
+priority without starving the rest: a shard search or fetch marks its work foreground
+(`prio.Foreground`), and background work calls `prio.Yield` at its checkpoints: a merge
+every 4,096 documents and before each chunk it writes (its I/O throttle), a refresh
+build before each chunk, the tailer's and a bulk's analysis before each document, the
+janitor's loop before each file. While searches occupy every processor (as many in
+progress as GOMAXPROCS), time is cut into 100 ms cycles; background work pauses for
+the first `1 - background_share` of a cycle, or until a processor is free of searches,
+and runs the rest beside the searches, so under reads that never stop it gets about
+half of `background_share` on one core. The gate only delays goroutines at
+checkpoints, so what runs between two still runs whole, and a pause holds whatever its
+goroutine holds: a refresh its shard's refresh lock, the janitor its drain lock, a
+merge its merge tokens. `background_share` is 0.25 at GOMAXPROCS 1 and 1 (off) from 2.
 
 ### Percolator
 
@@ -224,12 +455,24 @@ flowchart LR
   (a number range, a bool, a text the field must not equal, or an entry it must not
   hold) that a document must pass to become a candidate. A `words_*` phrase anchors on
   the pair of its two rarest words.
-- **Query segments.** Anchors live in percolator segments (`percolate/3`) that refresh
+- **Nested anchors.** A nested node anchors as its inner query would, on its path's
+  sub-fields by their full names (`_v.size`), and a document holds the atoms of every
+  one of its objects' values of them: the object a match needs holds the anchor, so
+  the document does. Only an inner query with no positive conjunct (a `not`, the
+  match-any `{"all": []}`) leaves the node Always. A sub-field's cost counts the
+  objects holding the term (`Generation.DocFreq`, an upper bound on the documents), or,
+  without statistics, scales its prior by 8: a document holds an atom when any of its
+  objects does, so a top-level anchor of the same group wins unless the variant's is
+  rarer. On BenchmarkPercolateNested (100k saved searches, 70% of them variant
+  searches), always-check queries fall from 9,867 to 0, and throughput rises from
+  1,564 to 6,692 documents a second.
+- **Query segments.** Anchors live in percolator segments (`percolate/4`) that refresh
   and merge like document segments, under their own merge policy (two per tier). Every
   query segment costs every document a probe, so the policy keeps them few. A segment is
   memory-mapped and validated at open; nothing per query goes on the heap. It holds the
   term dictionary, interval trees, always-check list, one compiled program per
-  verification class (queries with the same canonical form), and every id as its JSON
+  verification class (queries with the same canonical form), each query's client
+  version, and every id as its JSON
   literal. All of these are numbered by rank (id order), so candidates read in order
   are matches in output order.
 - **Percolating a document.** The document is analyzed for matching (no grams). Its
@@ -252,6 +495,17 @@ flowchart LR
     percolator keeps the plan of the last set of query segments and worker count it
     split for, so requests alternating between documents whose worker counts differ
     (one document, then two) rebuild it each time: a few hundred id reads and a sort.
+  - **Details.** Asked for matches' details, the copy that percolated reads them after
+    the matches: each matched id's query segment and ordinal (`LookupQuery`), its
+    version from the segment's version section, and, for inner hits, its query once
+    per request (parsed and compiled, `search.QueryInnerHits`), whose nested nodes'
+    inner hits it reads off the analyzed document's objects as a search reads them off a
+    hit's body. The coordinator merges each document's matches from every shard by id
+    (disjoint: a query lives on one shard).
+  - **Shards at once.** The coordinator percolates every shard's copy at once (local
+    copies on their percolators, peers over the peer API; local ones in turn, in the
+    caller's goroutine, below 64 documents, as their percolators use every core
+    already) and merges their answers; the first shard to fail cancels the rest.
   - **Exactness.** The answer is exactly the brute-force one. Property tests check that
     the candidates always include every true match, and that every program decides as
     the matcher does.
@@ -265,7 +519,7 @@ flowchart LR
   `store_url`, plus `advertise_address` when its listen address is not what peers dial.
 - **Slots and epochs.** Each shard copy is a slot in `sl_shard_copies`, held under a
   lease (`lease_ttl`: 10 s, or 30 s on SQLite) with a **fencing epoch** taken from a
-  database counter at each claim. Every registry write a copy makes is conditional on
+  database counter (`sl_counter` row 2) at each claim. Every registry write a copy makes is conditional on
   its slot, node and epoch, so a node that lost its lease gets `ErrLeaseLost` and can
   never overwrite its successor.
 - **Local deadline.** The node renews its leases on the heartbeat tick. It keeps a local
@@ -341,7 +595,25 @@ Any node takes any request.
   serving copy elsewhere whose lag is within `max_lag`, chosen by adaptive replica
   selection on measured latency, like Elasticsearch's ARS. A failed or timed-out attempt
   (10 s) is retried on another copy, so with two or more copies, one node failing is not
-  a client error.
+  a client error. The copies a read knows of come from this node's view of the registry,
+  which can trail it by a refresh. When every one of them has failed (or refused the read
+  for an older wire level), the read reads the copy table again, once per shard, and
+  tries the serving copies it has not tried, a node at a new address included. A view
+  read since the shard was routed (by another shard of the request, or the view loop)
+  serves without a read, and concurrent re-reads share one. A read waits on its re-read
+  for at most a quarter of the request's remaining time, and 1 s, so it still has time
+  for the copies it finds and for this node's own copy, which a read falls back to
+  (stale) when no copy elsewhere answers. The registry read goes on (up to 2 s) after a
+  read stops waiting, and its view serves the reads after it. Registry reads for
+  routing are 75 ms apart, so a re-read that needs one realistically needs 400 ms or
+  more left on the request; one with less mostly gives up, and a later read benefits.
+  When nothing
+  new turns up, the copies that refused only for being stale are asked once more,
+  accepting a stale answer, and then the shard is a 503.
+  `searchlight_cluster_read_rereads_total` counts each shard's re-read (whether it read
+  the database or took a newer view), by `op` and `result`: `found`, `none`, or
+  `timeout` (it gave up first). Routing's own read for a shard with no copy in view is
+  not counted, and stands for the shard's one re-read.
 - **Peer traffic** (reads, hints, snapshots) uses the internal API under `/_internal/` on
   the same listener. It is authenticated by `cluster_token`, and runs over TLS when
   `tls_cert` is set, with peers verified against `peer_ca_file`.
@@ -355,7 +627,9 @@ On SIGTERM, a node:
    tailer and marks it `retiring`, and the database checks atomically that another copy
    still serves, so nodes draining together never retire a shard's last serving copy;
 3. keeps serving for `shutdown_grace`, then drains its listener;
-4. stops its remaining copies, writing their final manifests;
+4. stops its remaining copies' tailers together, each writing its final manifest and
+   applied seq, then marks those copies `retiring` (no tailer is left to change their
+   state) and closes them;
 5. deregisters.
 
 The leases are not released: the rows stay `retiring` at their final applied seqs.
@@ -407,7 +681,7 @@ sequenceDiagram
   Note over M: SIGINT / SIGTERM fixes deadline D = now + shutdown_grace + T
   M->>Api: readiness false; Drain retires covered copies (T/4); serve for shutdown_grace
   M->>Api: stop accepting, finish in-flight requests (T/4)
-  M->>N: Stop: final manifests, rows retiring, deregister (until D - T/10)
+  M->>N: Stop: tailers stopped (final manifests), rows retiring, copies closed, deregister (until D - T/10)
   M->>St: close
   M->>Adm: close
   M->>M: telemetry flush, exit 0
@@ -437,9 +711,23 @@ window, the API's request timing and its shutdown grace.
   `replica`, `cluster`, `store`, `node` and `api`.
 - **Refresh scheduling.** Refreshes run on a fixed grid of this clock (`clock.GridLoop`).
 
-## Planned, not built
+## Benchmarks
 
-- **Tuning against Elasticsearch** (plan Task 14). The benchmark harness is in `bench/`
-  (it runs the real binary, restarts and recoveries included) and the chaos suite in
-  `test/chaos`, but the tuning until every spec §1 target is met is still to come.
-  `docs/benchmarks.md` will hold the results.
+The harness in `bench/` runs the real binary against Elasticsearch 8, restarts and
+recoveries included; the chaos suite in `test/chaos` covers the failure targets.
+`docs/benchmarks.md` holds the latest 1M-document run on `main`, graded against every
+spec §1 target.
+
+## Known gaps
+
+- **Background scrub** ([#36](https://github.com/Imposter/go-searchlight/issues/36)):
+  a segment is checksum-verified when its copy opens, so bit rot after open is served
+  until the copy is next opened.
+- **A percolator format change rebuilds the whole copy**
+  ([#37](https://github.com/Imposter/go-searchlight/issues/37)): document segments one
+  major version old are read as they are (`segment.ReadsMajor`: format 4 reads format
+  3), but a change to the saved-query segments' format (`percolate/N`) wipes the shard
+  copy, documents included, and rebuilds it, rather than rebuilding only its query
+  segments.
+- **Scale beyond RAM and many nodes** (spec T11): designed for (memory-mapped segments,
+  shards across nodes) but not benchmarked yet.

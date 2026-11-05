@@ -90,34 +90,41 @@ func (n *Node) allocatePass(ctx context.Context, only string, startup, eager boo
 // claimed yet (a new index) is left for three heartbeats to the node that created its
 // index, which claims eagerly: so CreateIndex answers once a copy of every shard
 // serves.
+//
+// The lease of a copy this node no longer hosts (its index was dropped, maybe
+// recreated under the same name, or the copy stopped) is dropped and claimed afresh. A
+// slot this node held before it restarted is claimed back; that copy, left serving by
+// a crash or retiring by a shutdown, recovers again until it has caught up, since the
+// tailer promotes only a recovering copy. A retiring copy of another node (draining or
+// stopped, maybe gone already) holds its slot until its lease runs out, but does not
+// count toward the target. A claim the store finds pointless (the index dropped, or the
+// target met meanwhile) is no error. When hosting fails, the slot is released, except
+// for a quarantined takeover: released, its next claim would get a fresh epoch with no
+// quarantine while the previous holder may still serve.
 func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id store.ShardID, startup, eager bool) error {
 	if l := n.leaseFor(id); l != nil {
 		if c, ok := n.Hosted(id); (ok && c.Epoch == l.copy.Epoch) || l.retired.Load() {
 			return n.maybeRelease(ctx, v, iv, l)
 		}
-		// The lease of a copy no longer hosted: its index was dropped (maybe
-		// recreated under the same name), or the copy stopped. Claim afresh.
 		n.dropLease(l)
 	}
 	target := iv.ReplicasPerShard
-	mine, live, retiring := false, 0, 0
+	heldBeforeRestart, live, retiring := false, 0, 0
 	for i := range v.copies[id] {
 		c := &v.copies[id][i]
 		if c.NodeID == n.id {
-			mine = true // a slot this node held before it restarted: claim it back
+			heldBeforeRestart = true
 			continue
 		}
 		switch {
 		case c.State == store.CopyRetiring && c.LeaseLeft > 0:
-			// A retiring copy (its node draining or stopped, maybe gone already)
-			// holds its slot until its lease runs out, but does not count.
 			retiring++
 		case v.usable(c):
 			live++
 		}
 	}
 	key := allocKey{uid: iv.UID, shard: id.Shard}
-	if !mine {
+	if !heldBeforeRestart {
 		if target > 0 && live >= target {
 			n.alloc.clear(key)
 			return nil
@@ -140,17 +147,14 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	n.NoteDB(err)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		return nil // dropped meanwhile
+		return nil
 	case err != nil:
 		return err
 	case !ok:
-		return nil // the target was met meanwhile
+		return nil
 	}
 	n.alloc.clear(key)
 	if c.State != store.CopyRecovering {
-		// This node's own slot from before a restart (left serving by a crash, or
-		// retiring by a shutdown): it recovers again until its copy, reopened, has
-		// caught up (the tailer promotes only a recovering copy).
 		if err := n.reg.SetCopyState(ctx, c, store.CopyRecovering); err != nil {
 			return err
 		}
@@ -168,8 +172,6 @@ func (n *Node) allocateShard(ctx context.Context, v *view, iv node.IndexView, id
 	}
 	if err := n.HostCopy(ctx, spec); err != nil {
 		n.dropLease(l)
-		// A quarantined takeover keeps its row: released, the slot's next claim would
-		// get a fresh epoch with no quarantine while the previous holder may serve.
 		if !l.quarantined() {
 			if rerr := n.reg.ReleaseCopy(ctx, c); rerr == nil {
 				n.inst.lease(ctx, "release")

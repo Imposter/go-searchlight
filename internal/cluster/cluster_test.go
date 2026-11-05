@@ -80,6 +80,27 @@ func waitCopies(t testing.TB, st store.Store, index string, shards, want int, d 
 	})
 }
 
+// waitRoutes waits until tn's own view of the registry, which it routes reads by,
+// lists want serving copies of every shard of index, its own included. waitCopies reads
+// the registry itself, which a node's view may trail by a refresh: a test that fails a
+// read on purpose and counts on its retry on another copy waits for both.
+func waitRoutes(t testing.TB, tn *tnode, index string, shards, want int, d time.Duration) {
+	t.Helper()
+	eventually(t, d, fmt.Sprintf("node %d routes to %d copies per shard of %s", tn.i, want, index), func() error {
+		for s := range shards {
+			id := store.ShardID{Index: index, Shard: s}
+			n := len(tn.n.candidates(id))
+			if _, ok := tn.n.Hosted(id); ok {
+				n++
+			}
+			if n != want {
+				return fmt.Errorf("shard %d: %d copies in its view", s, n)
+			}
+		}
+		return nil
+	})
+}
+
 // TestJoinAllocateAndServe: three nodes join over one database; an index with the
 // default target (every node) gets a copy on each, writes through every node land on
 // every copy, and health turns green.
@@ -92,10 +113,10 @@ func TestJoinAllocateAndServe(t *testing.T) {
 		c.start(2)
 		c.waitHealth(t, api.StatusGreen, 30*time.Second)
 		waitCopies(t, a.st, "items", 2, 3, 30*time.Second)
-		var last int64
+		var last *api.Token
 		for i, tn := range c.live() {
 			for k := range 10 {
-				last = max(last, mustWrite(t, tn.n, "items", upsertOp(fmt.Sprintf("n%d-%d", i, k), k)))
+				last = merged(last, mustWrite(t, tn.n, "items", upsertOp(fmt.Sprintf("n%d-%d", i, k), k)))
 			}
 		}
 		for _, tn := range c.live() {
@@ -172,9 +193,9 @@ func TestNodeKillReallocatesAndHealth(t *testing.T) {
 		b := c.start(1)
 		createIndex(t, a.n, "r2", 2, 2)
 		waitCopies(t, a.st, "r2", 2, 2, 30*time.Second)
-		var last int64
+		var last *api.Token
 		for k := range 50 {
-			last = mustWrite(t, a.n, "r2", upsertOp(fmt.Sprintf("d%d", k), k))
+			last = merged(last, mustWrite(t, a.n, "r2", upsertOp(fmt.Sprintf("d%d", k), k)))
 		}
 		// A single-copy index on b alone: red when b dies.
 		createIndex(t, b.n, "solo", 1, 1)
@@ -283,9 +304,9 @@ func TestReadsRetryAroundDeadNode(t *testing.T) {
 		c.start(2)
 		createIndex(t, a.n, "rr", 4, 2)
 		waitCopies(t, a.st, "rr", 4, 2, 30*time.Second)
-		var last int64
+		var last *api.Token
 		for k := range 40 {
-			last = mustWrite(t, a.n, "rr", upsertOp(fmt.Sprintf("d%d", k), k))
+			last = merged(last, mustWrite(t, a.n, "rr", upsertOp(fmt.Sprintf("d%d", k), k)))
 		}
 		for _, tn := range c.live() {
 			waitCount(t, tn.n, "rr", last, int64(40))
@@ -408,13 +429,8 @@ func TestRollingRestartNoClientErrors(t *testing.T) {
 		if heldAll == 0 {
 			t.Fatal("no search fetched from a copy that stopped serving after its query phase: the restarts did not exercise the fetch path")
 		}
-		st := c.node(0).st
-		head, _, err := st.HeadSeq(tctx(t))
-		if err != nil {
-			t.Fatal(err)
-		}
 		for _, tn := range c.live() {
-			waitCount(t, tn.n, "roll", head, acked.Load())
+			waitCount(t, tn.n, "roll", nil, acked.Load())
 		}
 	})
 }
@@ -1018,7 +1034,7 @@ func TestReadRightAfterCreateOnAnotherNode(t *testing.T) {
 		for k := range 5 {
 			name := fmt.Sprintf("fresh%d", k)
 			createIndex(t, a.n, name, 2, 0)
-			if got, err := count(tctx(t), b.n, name, 0); err != nil || got != 0 {
+			if got, err := count(tctx(t), b.n, name, nil); err != nil || got != 0 {
 				t.Fatalf("read of %s on the other node right after it was created: %d, %v", name, got, err)
 			}
 			seq := mustWrite(t, a.n, name, upsertOp("x", 1))
@@ -1104,7 +1120,7 @@ func TestUnknownIndexLookupsAreCached(t *testing.T) {
 	before := a.wrap.indexGets.Load()
 	for range 50 {
 		var ae *api.Error
-		if _, err := count(tctx(t), a.n, "ghost", 0); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
+		if _, err := count(tctx(t), a.n, "ghost", nil); !errors.As(err, &ae) || ae.Status != http.StatusNotFound {
 			t.Fatalf("an index no node has: %v, want a 404", err)
 		}
 	}
@@ -1143,7 +1159,7 @@ func TestCreateForgetsARememberedAbsence(t *testing.T) {
 		var ae *api.Error
 		return errors.As(err, &ae) && ae.Status == http.StatusNotFound
 	}
-	if _, err := count(tctx(t), a.n, "ghost", 0); !notFound(err) {
+	if _, err := count(tctx(t), a.n, "ghost", nil); !notFound(err) {
 		t.Fatalf("an index no node has: %v, want a 404", err)
 	}
 	createIndex(t, a.n, "ghost", 1, 1)
@@ -1152,7 +1168,7 @@ func TestCreateForgetsARememberedAbsence(t *testing.T) {
 	}
 	createIndex(t, b.n, "ghost", 1, 1)
 	clk.Advance(missRefreshEvery)
-	if got, err := count(tctx(t), a.n, "ghost", 0); err != nil || got != 0 {
+	if got, err := count(tctx(t), a.n, "ghost", nil); err != nil || got != 0 {
 		t.Fatalf("a read on A of the index B created after A dropped its own: %d, %v", got, err)
 	}
 }

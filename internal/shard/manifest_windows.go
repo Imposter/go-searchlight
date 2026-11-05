@@ -57,6 +57,8 @@ func replaceFile(from, to string) error {
 	}
 }
 
+// posixRename is replaceFile's POSIX rename, through SetFileInformationByHandle. The
+// rename information's size counts the file name with its terminating NUL.
 func posixRename(from, to string) error {
 	abs, err := filepath.Abs(to)
 	if err != nil {
@@ -78,7 +80,7 @@ func posixRename(from, to string) error {
 	}
 	defer windows.CloseHandle(h) //nolint:errcheck // a close failure after the rename changes nothing
 	var info fileRenameInfoEx
-	size := int(unsafe.Offsetof(info.FileName)) + len(name)*2 // name ends with its NUL
+	size := int(unsafe.Offsetof(info.FileName)) + len(name)*2
 	buf := make([]byte, size)
 	p := (*fileRenameInfoEx)(unsafe.Pointer(&buf[0]))
 	p.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS

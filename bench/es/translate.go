@@ -424,32 +424,27 @@ func (t *Translator) similar(f datasets.Field, a *query.Arg) (map[string]any, er
 // Search translates a Searchlight search request body into an Elasticsearch _search
 // body: the query in filter context (no scoring: Searchlight does not score), the
 // same size, sort with the id tie-breaker, search_after, track_total_hits,
-// aggregations, _source filtering and timeout.
+// aggregations, _source filtering and timeout. A body holding anything after its
+// JSON object is refused, as the API refuses it.
 func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	req, ps := search.ParseRequest(raw)
 	if len(ps) > 0 {
 		return nil, &InvalidError{Problems: ps}
 	}
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return nil, err
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("es: the search body is not one JSON object")
 	}
 	q, err := t.Query(req.Query)
 	if err != nil {
 		return nil, err
 	}
-	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}}
-	size := req.Size
-	if _, given := top["size"]; !given {
-		size = 10 // the API's DefaultSize
-	}
-	body["size"] = size
+	body := map[string]any{"query": map[string]any{"constant_score": map[string]any{"filter": q}}, "size": req.Size}
 
 	sorts, err := t.sort(req.Sort)
 	if err != nil {
 		return nil, err
 	}
-	if size > 0 || len(req.SearchAfter) > 0 {
+	if req.Size > 0 || len(req.SearchAfter) > 0 {
 		body["sort"] = sorts
 	}
 	if len(req.SearchAfter) > 0 {
@@ -480,16 +475,28 @@ func (t *Translator) Search(raw []byte) (map[string]any, error) {
 	return body, nil
 }
 
+// sort translates sort keys, refusing what Searchlight refuses: more than
+// search.MaxSortKeys keys, a field sorted on twice, and any key after _id. The id
+// tie-breaker is added unless the last key is _id.
 func (t *Translator) sort(fields []search.SortField) ([]any, error) {
+	if len(fields) > search.MaxSortKeys {
+		return nil, fmt.Errorf("es: a search sorts by at most %d keys", search.MaxSortKeys)
+	}
 	out := make([]any, 0, len(fields)+1)
-	for _, s := range fields {
+	for i, s := range fields {
+		if i > 0 && fields[i-1].Field == search.IDField {
+			return nil, fmt.Errorf("es: sort key %d follows _id: nothing sorts after it", i)
+		}
+		if slices.ContainsFunc(fields[:i], func(f search.SortField) bool { return f.Field == s.Field }) {
+			return nil, fmt.Errorf("es: sort key %d sorts on %q again", i, s.Field)
+		}
 		order := "asc"
 		if s.Desc {
 			order = "desc"
 		}
 		if s.Field == search.IDField {
 			out = append(out, map[string]any{IDField: map[string]any{"order": order}})
-			return out, nil // the id is total: Searchlight's sort ends there too
+			continue
 		}
 		f, ok := t.fields[s.Field]
 		if !ok {
@@ -499,6 +506,9 @@ func (t *Translator) sort(fields []search.SortField) ([]any, error) {
 			return nil, fmt.Errorf("es: sort on %s needs doc values in the Elasticsearch mapping", s.Field)
 		}
 		out = append(out, map[string]any{s.Field: map[string]any{"order": order, "missing": "_last"}})
+	}
+	if len(fields) > 0 && fields[len(fields)-1].Field == search.IDField {
+		return out, nil
 	}
 	return append(out, map[string]any{IDField: map[string]any{"order": "asc"}}), nil
 }
@@ -556,7 +566,7 @@ func (t *Translator) aggs(aggs map[string]search.Agg) (map[string]any, error) {
 				body["offset"] = strconv.FormatFloat(a.Offset, 'f', -1, 64) + "ms"
 			}
 			body["min_doc_count"] = minDocs(a.MinDocCount)
-		case search.AggStats:
+		case search.AggStats, search.AggMin, search.AggMax:
 		case search.AggCardinality:
 			p := a.Precision
 			if p == 0 {

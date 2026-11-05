@@ -41,7 +41,7 @@ Its durable source of truth is **any SQL database**: Postgres, MySQL or SQLite. 
 ### Non-goals (v1)
 
 - BM25 relevance scoring and full-text ranking. Matching is boolean, sorting is by field. This is on the v2 roadmap.
-- Nested documents and parent/child joins.
+- Parent/child joins, and nested documents deeper than one level (nested fields, one level, came in 1.4).
 - Interfaces beyond HTTP/JSON: NATS, a SQL dialect, pgwire.
 - Stateful alerting. Matching is stateless; clients keep their own match state.
 - History and time-series conditions (scrape-bot keeps them).
@@ -66,7 +66,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
   - immutable, memory-mapped segment files on local disk;
   - an in-memory write buffer that is refreshed into a new segment every `refresh_interval` (1 s);
   - background merges of small segments into larger ones.
-- **The SQL database is the write-ahead log and the system of record.** Every write commits the change rows and the documents or queries in one transaction, before it is acknowledged, and every shard copy applies the changelog in sequence order. Local segments are a cache of the database that can always be rebuilt or fetched from a peer.
+- **The SQL database is the write-ahead log and the system of record.** Every write commits the change rows and the documents or queries before it is acknowledged, in one transaction per shard it writes (2.0: a request is whole or nothing only on one shard), and every shard copy applies its shard's changelog in sequence order. Every shard has its own sequence. Local segments are a cache of the database that can always be rebuilt or fetched from a peer.
 - **Coordinator role.** Any replica can coordinate. It routes single-document operations to the database and the affected shard, and for searches it scatters to one copy of each shard (local copies first, else a peer over internal HTTP) and gathers the results.
 
 ### Packages
@@ -84,7 +84,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `internal/cluster` | replica registry, shard allocation by database leases, peer recovery, health, internal RPC |
 | `internal/replica` | the changelog tailer and apply loop for each hosted shard |
 | `internal/store` | the SQL storage interface, dialect implementations, migrations |
-| `internal/api` | public HTTP handlers, limits, auth, problem JSON, `wait_for_seq` and `refresh` |
+| `internal/api` | public HTTP handlers, limits, auth, problem JSON, `wait_for` tokens and `refresh` |
 | `internal/telemetry` | slog, OTel traces and metrics, Prometheus, pprof |
 
 ## 3. Data model
@@ -103,6 +103,8 @@ clients ──HTTP/JSON──► any replica (coordinator)
 | `number` | float64 doc values, plus a BKD-style point index for ranges | comparisons, `between`, `exists`; range, histogram and stats aggs, sort |
 | `bool` | term | `eq`, `ne`, `exists`; terms agg |
 | `date` | Unix milliseconds, same as `number` | comparisons; date histogram, sort |
+| `point` (operator decision, 2026-10-17) | `{"type": "point", "x": "number"\|"date", "y": ...}`: a list of `[x, y]` pairs per document, each axis a number or a date, in a per-segment k-d tree | `box`, `exists`; no aggregation, no sort |
+| `nested` (operator decision, 2026-10-18) | `{"type": "nested", "fields": {"size": "keyword", ...}}`: an array of objects per document (at most 10,000), each object's sub-fields (any type but `point`, named `path.name`) indexed in a per-segment object segment with each document's run of objects | `exists`; `{"nested": {"path", "query", "inner_hits"}}` over its sub-fields; terms, stats, min, max and cardinality on a sub-field (with `where`); sort by a sub-field's min or max |
 
 - **Dynamic mapping** (the default) types a field from its first value. Strict mapping refuses unmapped fields. Mapping changes are additive only.
 - **Normalization is byte-for-byte compatible with scrape-bot:**
@@ -113,7 +115,7 @@ clients ──HTTP/JSON──► any replica (coordinator)
   - numbers are finite floats only, never bools.
 
   Parity fixtures from scrape-bot pin these rules.
-- **Document:** an id (1–512 bytes) and a JSON object. Its version is the `seq` of its last change, which also supports optimistic concurrency (`if_seq`).
+- **Document:** an id (1–512 bytes) and a JSON object. Its version is the `seq` of its last change on its shard, which also supports optimistic concurrency (`if_seq`).
 - **Saved query:** an id, a DSL tree and an opaque `meta` JSON object (16 KB or less).
 
 ## 4. Query language
@@ -125,7 +127,7 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
 ```
 
 - **Root.** `{"all": []}` matches every document.
-- **Bounds:** at most 4 levels deep (only `all`/`any` count), 50 conditions and 100 nodes. Strings are at most 500 characters with no NUL, and lists at most 200 entries.
+- **Bounds:** at most 4 levels deep (only `all`/`any` and `nested` count), 50 conditions and 100 nodes. Strings are at most 500 characters with no NUL, and lists at most 200 entries.
 - **Operators:**
   - `eq`, `ne`, `in`;
   - `lt`, `lte`, `gt`, `gte`, `between`;
@@ -135,20 +137,32 @@ The query is a tree of groups and conditions, the same shape scrape-bot uses:
   - `words_all`, `words_any`;
   - `similar` (`{text, min}`, trigram similarity compatible with pg_trgm);
   - `has`, `has_any`, `has_all`;
-  - `empty`, `nonempty`.
+  - `empty`, `nonempty`;
+  - `box` on a `point` field (`{"x": {"gte": a, "lt": b}, "y": {...}}`, any of `gt`, `gte`, `lt`, `lte` per axis, either axis optional): a document with one point inside on both axes. A date axis takes date math as a date field's ranges do, each bound rounding as the op of its key; a box search needs search wire level 5, a percolation of an index with a point field percolate wire level 2.
+- **Nested nodes** (operator decision, 2026-10-18): `{"nested": {"path": "_v", "query": node}}` holds when one object of nested field `_v` satisfies the whole query, whose conditions name `_v`'s sub-fields; a `not` inside applies per object. `inner_hits` returns each hit's matching members. A search reading nested objects needs search wire level 6, a percolation of an index with a nested field percolate wire level 3.
 - **The `_id` pseudo-field** refers to the document id.
+- **Date math** (operator decision, 2026-10-16), Elasticsearch's, on `date` fields:
+  - `lt`, `lte`, `gt`, `gte` and each `between` bound take a number or a string: `now` or a date (RFC 3339 or `YYYY-MM-DD`; a date followed by `||` before any math), then `+N`/`-N` steps and `/` rounding in `y M w d h H m s`. Months and years add as java.time does (`2026-01-31||+1M` is 2026-02-28). UTC only: no `time_zone`.
+  - Rounding follows the op, as Elasticsearch's range query: `gte`, `lt` and `between`'s lo round down; `gt`, `lte` and `between`'s hi round up (to the unit's last millisecond), so `lte now/d` holds through the day and `gt now/d` from the next. Rounding up also fills what a plain date leaves out (a bare date: 23:59:59.999; a time with no fraction: .999).
+  - `eq`, `ne` and `in` on a date take Unix milliseconds only, refusing any string, a plain date too (400): Elasticsearch's `term` on a date turns it into a range, which `between` writes plainly.
+  - A `between` reversed at every instant is refused: neither bound reads `now`, or both are `now` plus fixed-length steps with no rounding.
+  - `now` is resolved once per request, at the coordinating node's wall clock to the millisecond. A search resolves its query, `post_filter` and filter aggregations there (`search.ResolveQueries`) and sends every shard, local or a peer's, the resolved trees, which any release reads. A percolation sends the instant (`query.WithNow`; on the peer wire, `now` in Unix ms) and every shard resolves at it; one of an index with a `date` field needs percolate wire level 1, so a peer of an older release, which would ignore `now` and read date math as never matching, is refused as for a level-1 search (docs/clustering.md).
+  - A saved query stores the expression, never an instant (see §7 for the percolator).
+  - Caches see resolved trees only: the filter cache keys a leaf by its canonical bytes, which then hold the resolved bounds. A `/d`-rounded bound is one key all day and caches as any range; an unrounded one is a new key each millisecond, never seen twice by the usage sketch, so never cached. `query.Canonical` encodes an unresolved expression parsed, not normalized (`now-1M` and `now-1m` differ).
 - **Missing fields** match nothing except `exists:false`, `empty` and `ne`.
 - **Errors** are problem JSON with `loc` paths such as `query.all.2.any.0.value`.
 - **Aggregations** (v1):
-  - `terms` (size, min_doc_count), `range`, `histogram`, `date_histogram`, `stats`, `cardinality` (HyperLogLog++);
-  - nested one level: a bucket aggregation with metric sub-aggregations.
+  - `terms` (size, min_doc_count, include and exclude: exact values compared normalized as the field's, or an anchored pattern in a subset of Lucene's regexp syntax, folded as values are, run as RE2; decided per segment once per dictionary term, or per collected value when the hits are few, before any shard cut), `range`, `histogram`, `date_histogram`, `stats`, `cardinality` (HyperLogLog++);
+  - nested one level: a bucket aggregation with metric sub-aggregations;
+  - `filter` (a query), `filters` (keyed queries, with an optional other bucket) and `global` (every live document, top level only): buckets holding any other aggregation, each with its metric sub-aggregations. Their filters go through the plan and the filter cache as the query does; their partials merge bucket by bucket, the aggregations under each reduced as top-level ones are (terms error bounds and bucket limits included);
+  - `post_filter`: a query the hits, total and paging obey but the aggregations (all but `global`) do not, so a facet panel is one search.
 
 ## 5. HTTP API
 
 The API is in the Elasticsearch style:
 - requests and responses are JSON, except `_bulk`, which is NDJSON;
 - errors are problem JSON;
-- every write answers with its `seq`.
+- every write answers with a `token` (each written shard's newest `seq` and the index's incarnation); a single-document write also with the document's `seq`.
 
 | Endpoint | Purpose |
 |---|---|
@@ -156,8 +170,8 @@ The API is in the Elasticsearch style:
 | `PUT/GET/DELETE /indexes/{i}` | Create (with mapping and settings), inspect, drop an index |
 | `PATCH /indexes/{i}/mapping`, `PATCH /indexes/{i}/settings` | Add fields; change `refresh_interval` (applied at once, `-1` for on demand only) or the replica target |
 | `PUT/GET/DELETE /indexes/{i}/docs/{id}` | One document (`if_seq`, `refresh=true\|wait_for`) |
-| `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per request; `?percolate=true` also returns each upserted document's matching saved queries |
-| `POST /indexes/{i}/_search` | `{query, sort, size, search_after, track_total, aggs, fields, timeout}` |
+| `POST /indexes/{i}/_bulk` | NDJSON upserts and deletes; one transaction per shard (2.0), each shard's operations whole or nothing, a failed shard's reported per item; `?percolate=true` also returns each upserted document's matching saved queries |
+| `POST /indexes/{i}/_search` | `{query, post_filter, sort, size, from, search_after, track_total, aggs, fields, timeout}` |
 | `POST /indexes/{i}/_count` | Matching count |
 | `PUT/GET/DELETE /indexes/{i}/queries/{id}`, `GET /indexes/{i}/queries` | Saved queries |
 | `POST /indexes/{i}/_percolate` | Documents, or stored ids, in; matching query ids per document out |
@@ -166,8 +180,8 @@ The API is in the Elasticsearch style:
 | `GET /healthz`, `GET /readyz`, `GET /metrics` | Liveness, readiness, Prometheus |
 
 - **Consistency:**
-  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy;
-  - any read takes `?wait_for_seq=N`;
+  - `refresh=wait_for` returns once the write is searchable on the coordinator's copy, or, on a node that hosts none, on the first copy that has it;
+  - any read takes `?wait_for=<token>` and waits until each shard it reads has the token's seq of that shard searchable, and on no other shard (2.0; `wait_for_seq` is refused by name);
   - by default, writes become visible within `refresh_interval` everywhere.
 - **Auth:** bearer tokens, read-only or read-write. The internal peer API uses a separate cluster token.
 - **Limits:** request body size, bulk operation count, and per-request deadlines (`timeout`, with partial results flagged like Elasticsearch's `timed_out`).
@@ -212,7 +226,7 @@ A segment is immutable and written once at refresh or merge time. It is one file
 
 1. **Plan.** Normalize the query, then order leaves by cost (estimated from per-segment term frequencies and doc-value stats). Bitmap-able leaves become roaring operations: AND intersects smallest first, OR unions, NOT takes the complement against live-docs. Value leaves become residual filters over doc values: `contains` with a trigram prefilter, `similar` with trigram candidates and then an exact check, and ranges served by points.
 2. **Execute per segment in parallel,** with a goroutine pool sized to GOMAXPROCS. Each segment produces a hit bitmap, per-segment top-k for the sort (a heap over doc values), and partial aggregations.
-3. **Reduce** across segments, then across shards on the coordinator. `search_after` paging uses the sort values plus id. Counts are exact up to `track_total`, otherwise reported as `≥`.
+3. **Reduce** across segments, then across shards on the coordinator. `search_after` paging uses the sort values plus id. `from` paging, as Elasticsearch's query-then-fetch: each shard returns its best `from + size` without bodies, the coordinator merges them and drops the first `from`, and only the page's bodies are fetched; `from + size` is at most `max_result_window` (10,000), past which pages use `search_after`. Counts are exact up to `track_total`, otherwise reported as `≥`.
 4. **Early termination.** A sort on the index's natural order, or a `size` with no total needed, stops as soon as top-k is settled.
 
 ## 7. Percolator
@@ -230,6 +244,7 @@ The percolator reverse-indexes the saved queries.
   - **`all`:** the lowest-frequency child set. Frequencies come from the shard's document statistics.
   - **`all`, pairs:** when cheaper, a pair of two children whose sets are made only of value, bool, entry or word keys, anchored on every pair of one key from each, at most 16 pairs per group. This is sound because both children hold whenever the group does, so a matching document holds a key of each. A document finds its pairs by walking the partner lists of the pair halves it holds, in time linear in those lists rather than quadratic in its keys. Past a budget, it adds every query any held half belongs to, which is also sound.
   - **`any`:** the union of the children's sets. One unanchorable child makes the whole group unanchorable.
+  - **Date math:** a bound that does not read `now` is resolved when the segment is built (`query.ResolveFixed`), so it anchors, filters and verifies as any range. A condition with a bound that reads `now` anchors on the field's `present` key; no interval anchor, posting filter or proven condition is made of it, since none may hold an instant.
   - **Unanchorable:** `not`, `ne`, `exists:false`, `empty`, and the root `{"all": []}`. These go on the always-check list.
 - **Posting filters.** A query anchored on terms alone stores one cheap conjunct of its root with each of its postings. A document holding the term is a candidate only if its value of that field passes the conjunct. This is sound because every match satisfies every conjunct of its root.
   - **Kinds:** a range on a number (`lt` and `gt` kept closed, which only admits a candidate that verification refuses), `eq` on a bool, a text the field must not equal (`ne`, or `not eq`, on a string of at most 15 bytes), or an entry it must not hold (`not has` of one entry).
@@ -246,7 +261,7 @@ The percolator reverse-indexes the saved queries.
   - **Opening.** A segment is memory-mapped, then checked against its CRC32C and validated structurally: every offset, rank, tree link, filter and program, and every id literal against its query's id. A damaged or crafted file is refused, and no accessor of an open one reads out of range. Nothing per query is decoded onto the heap: a segment of a million queries costs its mapped pages.
 - **Ranks.** Within a segment, everything percolation reads is numbered by rank, a query's position sorted by id: postings, filters, pairs, intervals, the always list, programs and id literals. Candidates verified in rank order read the segment front to back and match in output order. Records stay numbered by the ordinal the shard deletes and merges by.
 - **Verification classes and memo.** Queries whose canonical form is the same share a class: one program, verified once per document, with the verdict memoized for the rest. A `words_*` query's class is its exact JSON, because phrases are read as written. Queries proven on different leaves are in different classes. Open keeps a dense copy of every query's class, which also marks every query whose class's program is empty: such a candidate matches, and a memoized class's members are decided, without their records being read.
-- **Programs.** Each class's query is compiled at build time into a compact byte program that names fields by their index in the segment. It mirrors the matcher exactly: the same constant folding, the same reading of every value, children cheapest first. Verification evaluates it over a dense slice of the document's values, laid out once per segment: one map lookup per field, none per candidate.
+- **Programs.** Each class's query is compiled at build time into a compact byte program that names fields by their index in the segment. It mirrors the matcher exactly: the same constant folding, the same reading of every value, children cheapest first. Verification evaluates it over a dense slice of the document's values, laid out once per segment: one map lookup per field, none per candidate. A condition reading `now` is a `date` leaf holding each such bound's steps, parsed at build time, applied at each evaluation to the percolation's `now` and rounded by its op; it decides as the matcher does on the tree resolved at that instant. Queries without date math compile and percolate as before. The tag is new in `percolate/3`: an older binary refuses a segment holding one as corrupt and rebuilds it, and reads one without it unchanged.
 - **Proven conditions.** A condition at a query's root (a leaf, or the `not` of one) that every route to its candidacy implies holds on every candidate, so the program leaves it out. A route is a term it is anchored on (with its posting filter), or a range anchor. For example, `brand eq + price lte` with its price filter verifies nothing, and neither does `brand in + not condition eq used` with its text filter.
 - **Gram prefilter.** Each field with gram terms has a bit filter of them, 16 bits per term (512 bits to 64 Mbit). A window whose bit is clear skips the dictionary.
 - **Per document:**
@@ -271,8 +286,9 @@ The percolator reverse-indexes the saved queries.
 ```go
 type Store interface {
     Migrate(ctx) error
-    Apply(ctx, batch []Change) (firstSeq, lastSeq int64, err error) // one transaction, ordered seq
+    Apply(ctx, batch []Change) error // sets each change's Seq: contiguous per shard, shard rows locked in key order
     ChangesAfter(ctx, shard ShardID, seq int64, limit int) ([]Change, error)
+    HeadSeq(ctx, shard ShardID) (seq int64, now time.Time, err error) // the shard's newest committed seq
     ScanShard(ctx, shard ShardID, fn func(Record) error) (asOfSeq int64, err error)
     Registry(ctx) RegistryStore // nodes, heartbeats, shard leases
     Blobs(ctx) BlobStore        // optional segment and snapshot blobs
@@ -290,15 +306,18 @@ The logical schema is the same in every dialect.
 | `sl_indexes` | name, mapping, settings |
 | `sl_documents` | index, shard, id, body, body_z, seq |
 | `sl_queries` | index, shard, id, query, meta, seq |
-| `sl_changes` | `seq` BIGINT PK, index, shard, kind, id, payload, payload_z, at; index on (index, shard, seq) |
-| `sl_counter` | the sequence row, locked per `Apply` |
+| `sl_changes` | index, shard, `seq` (PK (index, shard, seq) from migration 7), kind, id, payload, payload_z, at, nonce (a random BIGINT, migration 3; NULL on older rows); on Postgres and MySQL an index on `seq` alone for the rolling-upgrade window (dropped in 2.1) |
+| `sl_shard_seq` | index, shard, value (the shard's newest seq), index_uid, mapping_version: one row per shard, locked by every transaction that commits to it (migration 7) |
+| `sl_counter` | row 1, the floor: new shards start at it, a dropped index raises it past its shards' seqs, a shard with no row stands at it; row 2 issues copy epochs |
+| `sl_tombstones` | index, shard, kind, id, version, at: the version of each id a delete removed, kept for `gc_deletes` |
+| `sl_pruned` | index, shard, below_seq: where the changelog of each shard was pruned |
 | `sl_nodes` | node_id, address, version, heartbeat_at, capacity, body_codecs |
 | `sl_features` | name, enabled_at: cluster features turned on for good (`zstd_bodies`) |
 | `sl_shard_copies` | index, shard, node_id, state (`recovering` / `serving` / `retiring`), applied_seq, lease_until |
 | `sl_blobs` | optional segment bundles for recovery without a peer |
 
-- **Write ordering.** `Apply` locks the counter row, takes contiguous `seq` values and commits. Visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: concurrent requests on a coordinator are coalesced into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs.
-- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the counter lock, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
+- **Write ordering** (2.0: per shard). Every shard has its own sequence. `Apply` locks the `sl_shard_seq` row of each shard it writes, in key order (index name, shard), takes contiguous `seq` values of each and commits, so commits to different shards run in parallel and never deadlock; a mapping change or a drop locks every shard row of the index, in shard order. On a shard, visibility order therefore equals `seq` order, and tailers never skip a late commit. Throughput comes from `_bulk` batching and from group commit: a node's committer has a lane per shard, splits a request by shard, and coalesces each shard's concurrent requests into one transaction every few milliseconds, the way Elasticsearch amortizes translog fsyncs; it runs up to `write_transactions` of them at once (1 on SQLite, where a request's shards commit together). A request is whole or nothing only on one shard.
+- **Shared logic, per-engine SQL.** The store's logic (transaction shapes, retries, seq allocation under the shard rows' locks, lease fencing, the blob protocol, the Apply guards) is written once; each dialect package owns every statement, spelled its engine's best way (Postgres arrays and RETURNING, MySQL multi-row VALUES and row-alias upserts, SQLite prepared rows and RETURNING). No dialect JSON functions are used: mappings, settings and saved queries are stored as JSON text, and a document body or changelog payload either as JSON text (`body`, `payload`) or, once every node reads them, as a codec byte followed by its zstd encoding (`body_z`, `payload_z`, the text left empty), so a body stays opaque to the database.
 - **Drivers:** `pgx/v5/stdlib`, `go-sql-driver/mysql`, `modernc.org/sqlite`.
 - **Supported versions:** Postgres (tested on 17), MySQL 8.0.19+ (tested on 8.4 LTS, with `max_allowed_packet` of at least 64 MB, the default), SQLite 3.35+ (bundled by modernc.org/sqlite).
 - **Migrations** are embedded and run under a lock.
@@ -319,7 +338,7 @@ The logical schema is the same in every dialect.
 
   It's like Elasticsearch's file-based peer recovery followed by an operations replay.
 - **Writes anywhere.** Any node accepts writes. They go to SQL first, which is the commit point, and every copy applies them through its tailer.
-  - **Fast path:** the coordinator's own copies apply immediately on commit.
+  - **Fast path:** on commit the coordinator wakes its own copies' tailers, which read the new changes from SQL at once; no copy is written outside its tailer, so a copy applies changes in `seq` order only.
   - **Push hint:** the coordinator pushes a "new `seq`" hint to the peers holding the shard, which wakes their tailers. Polling still runs as the safety net (Postgres `LISTEN/NOTIFY` where available).
 - **Read routing.** The coordinator prefers local copies. Otherwise it picks the least-loaded serving copy whose lag is within `max_lag`, with adaptive replica selection by measured latency, like Elasticsearch's ARS. It retries another copy on failure, so one node failing doesn't produce a client error.
 - **Rolling restarts and upgrades.**
@@ -338,7 +357,8 @@ The logical schema is the same in every dialect.
 | Disk lost or corrupt | Segments are checksummed. A bad segment is dropped and the copy re-recovers from a peer or SQL. It never serves a corrupt segment. |
 | Apply error | It halts that shard copy, which goes `recovering`, and re-recovers. It never skips a change. |
 | Merge interrupted | A merge writes a new file, publishes it, then flushes: until that flush swaps the manifest atomically, the old durable segment set is still valid and none of its files is removed. |
-| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. Sequence numbers are in the database, so they survive. |
+| Database failover (e.g. Postgres primary switch) | The store reconnects with backoff. With synchronous (or semi-synchronous) replication the new primary holds every acknowledged commit, and the failover is transparent. |
+| Failover that lost commits (async replication) | A point-in-time restore: the lost writes are gone, and new writes reuse their seqs. Each copy detects it at a poll (another change at the seq of one it applied, by the row's shard, kind, id and commit time; or the head behind its applied seq on two polls in a row), logs it at error, counts `searchlight_changelog_rewinds_total`, and rebuilds from SQL (`ScanShard`), never from a peer or bundle. Each poll also checks the copy's own shard, in the same statement: its newest change at or below the seq the copy last checked must be the last one the copy applied there; a change of the shard the copy never applied, another change at that seq, or that change gone while the shard's prune horizon is at or below it, is a rewind. The copy's manifest keeps its own-shard state (`own_mark`), the mark of the last change it checked (`anchor_mark`) and of the change at its seq (`seq_mark`); a mark is trusted only once a later poll checked the one before it, and a snapshot load takes its marks from the snapshot itself. So a copy restarted while it still holds the changelog's prune floor, fetched, restored, loaded or rebuilt aside across the failover detects it too, with no operator step. A stopped node's copy holds the floor until the node is found dead or the copy's lease runs out, or, when a clean stop retired it, for `retiring_retention` after its lease ran out; changes older than `changelog_retention` are pruned whatever copy needs them. A mark includes the random nonce every current writer gives a change (`sl_changes.nonce`, schema v3), so a reissue to the same document in the same millisecond differs too. Not detected: a copy with no marks yet (its last flush predates them: once, at the upgrade); a reissue identical to a lost change when either was written by a node from before nonces (compared by identity alone); and possibly, for a copy back after its shard was pruned without it to short of its seq, a rewind whose reissued changes of its shard were all pruned (pruned past its seq, the copy rebuilds). |
 | Overload | Per-request deadlines, bulk size caps, a merge I/O budget, and a search thread pool with a bounded queue (429 when full, like Elasticsearch). |
 
 ## 11. Observability
@@ -359,7 +379,7 @@ The logical schema is the same in every dialect.
 
 ## 12. Configuration
 
-Only `store_url` is required. Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
+`store_url` is required, and so are `tokens_file` and, on Postgres or MySQL, `cluster_token`, unless `insecure_no_auth` is set (a laptop or a test: the API and the peer API then serve without auth). Everything else has a production default, and environment variables use the `SEARCHLIGHT_*` prefix.
 
 | Setting | Default and meaning |
 |---|---|
@@ -367,8 +387,8 @@ Only `store_url` is required. Everything else has a production default, and envi
 | `admin_listen` | metrics and pprof |
 | `advertise_address` | the address peers use to reach this node |
 | `data_dir` | local segments |
-| `tokens_file` | API tokens |
-| `cluster_token` | auth for the internal peer API |
+| `tokens_file` | API tokens (required unless `insecure_no_auth`) |
+| `cluster_token` | auth for the internal peer API (required on Postgres and MySQL unless `insecure_no_auth`; a peer that refuses it counts as a failed copy) |
 | `peer_ca_file` | CAs that sign peers' TLS certificates (system roots by default) |
 | `lease_ttl` | 30 s on SQLite (a single node), 10 s elsewhere |
 | `prune_stall_timeout`, `retiring_retention`, `changelog_retention` | 15 min, 15 min, 24 h: the changelog's prune bounds |
@@ -457,7 +477,8 @@ This is a separate scrape-bot epic, after Searchlight phase 1.
 | `similar` anchoring | trigram keys (union) when min > 0 |
 | Conjunctive anchors | pairs of two `all` children, at most 16 per group, probed in linear time |
 | History ops | stay in scrape-bot |
-| BM25 / nested documents | v2 |
+| BM25 | v2 |
+| Nested documents | `nested` fields (1.4, operator decision 2026-10-18), one level deep |
 | Go | 1.25 |
 | System of record | SQL for document indexes; no embedded consensus database |
 | T6 disk | A deliberate trade-off: 3-grams on every keyword and text field cost more disk than Elasticsearch's index; the bench reports node-local disk but grades only resident memory |

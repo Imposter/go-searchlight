@@ -6,14 +6,33 @@ import (
 
 // writeResponse answers a single document or saved-query write.
 type writeResponse struct {
-	ID  string `json:"id"`
-	Seq int64  `json:"seq"`
+	ID string `json:"id"`
+	// Shard is the shard the id routes to.
+	Shard *int `json:"shard,omitempty"`
+	// Seq is the write's seq; a noop's (a versioned write not above the stored version,
+	// or an upsert of the stored bytes) is the stored target's, omitted when there is
+	// none. It is the target's: pass it as if_seq.
+	Seq int64 `json:"seq,omitempty"`
+	// Token is where the write left its shard, or found its target: pass it as wait_for
+	// to read it back.
+	Token string `json:"token,omitempty"`
+	// Committed is where the write's commit left its shard, omitted for a noop.
+	Committed string `json:"committed,omitempty"`
+	// Version is the write's client version, when it named one.
+	Version int64 `json:"version,omitempty"`
+	// Result is "noop" for a versioned write whose version was not above the stored
+	// one, or an upsert of the stored document's bytes: nothing was written.
+	Result string `json:"result,omitempty"`
 	// TimedOut is set when refresh=wait_for or refresh=true ran out of time: the
 	// write is committed but may not be searchable yet.
 	TimedOut bool `json:"timed_out,omitempty"`
 }
 
-// singleWrite commits one op with the request's refresh and condition parameters.
+// resultNoop is a noop's result, as Elasticsearch names it.
+const resultNoop = "noop"
+
+// singleWrite commits one op with the request's refresh, condition and version
+// parameters.
 func (s *Server) singleWrite(w http.ResponseWriter, r *http.Request, p params, op WriteOp) error {
 	refresh, e := p.refresh()
 	if e != nil {
@@ -22,22 +41,34 @@ func (s *Server) singleWrite(w http.ResponseWriter, r *http.Request, p params, o
 	if op.IfSeq, e = p.ifSeq(); e != nil {
 		return e
 	}
+	if op.Version, e = p.version(op.IfSeq); e != nil {
+		return e
+	}
 	if op.Kind == OpDelete || op.Kind == OpQueryDelete {
 		if op.IfSeq == IfAbsent {
 			return InvalidAt("params.op_type", "op_type=create is for writes, not deletes")
 		}
 	}
-	res, err := s.c.Write(r.Context(), r.PathValue("index"), []WriteOp{op}, WriteOptions{Refresh: refresh})
+	keep, e := p.keepIdentical()
+	if e != nil {
+		return e
+	}
+	res, err := s.c.Write(r.Context(), r.PathValue("index"), []WriteOp{op}, WriteOptions{Refresh: refresh, KeepIdentical: keep})
 	if err != nil {
 		return err
 	}
 	if len(res.Items) != 1 {
 		return ProblemFor(errItemCount)
 	}
-	if it := res.Items[0]; it.Err != nil {
+	it := res.Items[0]
+	if it.Err != nil {
 		return it.Err
 	}
-	return writeJSON(w, http.StatusOK, writeResponse{ID: op.ID, Seq: res.Items[0].Seq, TimedOut: res.TimedOut})
+	out := writeResponse{ID: op.ID, Shard: it.Shard, Seq: it.Seq, Token: res.Token.String(), Committed: res.Committed.String(), Version: it.Version, TimedOut: res.TimedOut}
+	if it.Noop {
+		out.Result = resultNoop
+	}
+	return writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) putDoc(w http.ResponseWriter, r *http.Request, p params) error {
@@ -56,12 +87,11 @@ func (s *Server) deleteDoc(w http.ResponseWriter, r *http.Request, p params) err
 }
 
 func (s *Server) getDoc(w http.ResponseWriter, r *http.Request, p params) error {
-	// Reads of one document are realtime (from the system of record), so every
-	// committed seq is already visible: wait_for_seq is checked and satisfied.
-	if _, e := p.waitForSeq(); e != nil {
+	wait, e := p.waitFor()
+	if e != nil {
 		return e
 	}
-	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"))
+	doc, err := s.c.GetDocument(r.Context(), r.PathValue("index"), r.PathValue("id"), ReadOptions{WaitFor: wait})
 	if err != nil {
 		return err
 	}

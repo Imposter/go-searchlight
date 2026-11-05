@@ -26,6 +26,23 @@ func (ids IDs) Strings() ([]string, error) {
 	return out, nil
 }
 
+// Len is how many ids ids holds.
+func (ids IDs) Len() int {
+	n := 0
+	for i := 0; i < len(ids); i++ {
+		if ids[i] != '"' {
+			continue
+		}
+		n++
+		for i++; i < len(ids) && ids[i] != '"'; i++ {
+			if ids[i] == '\\' {
+				i++
+			}
+		}
+	}
+	return n
+}
+
 // MergeIDs returns the union of lists (each sorted, as Percolate returns them), sorted,
 // each id once; a lone list is returned as it is.
 func MergeIDs(lists []IDs) (IDs, error) {

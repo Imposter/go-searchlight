@@ -153,11 +153,18 @@ http_502 http_503` rather than add to them.)
   request anyway. There's no need to additionally size for `max_doc_bytes` or
   `max_bulk_ops` at the proxy — those are Searchlight's own, more specific limits
   inside a body that already fits under `max_body_bytes`.
+- **`large_client_header_buffers`** bounds the request line, and nginx's default
+  (`4 8k`) answers a longer one with a 414 itself. A `?wait_for=<token>` is up to
+  16 KiB (the node's `MaxTokenBytes`): a token naming many shards at high seqs, such as
+  one merged across a 1,024-shard index, can pass 8 KiB. The shipped
+  `deploy/nginx/searchlight.conf` sets `large_client_header_buffers 4 32k;` in its
+  `server` block, which holds the largest token with the path and other parameters;
+  keep it at least that in your own configuration.
 - **`proxy_read_timeout`** (and `proxy_send_timeout`) need to sit above
   `request_timeout` (30 s by default), the node's own per-request deadline — not above
   any `timeout` a client puts *inside* a search body, which is Searchlight's own
   concern and answered with `timed_out: true` rather than by hanging, and not
-  specially raised for `refresh=wait_for` or `?wait_for_seq=N` either: both run under
+  specially raised for `refresh=wait_for` or `?wait_for=<token>` either: both run under
   the same request deadline, they don't get their own budget. 35 s (`request_timeout`
   plus 5 s of margin) is the shipped default; raise both together if you raise
   `request_timeout`.
@@ -173,7 +180,7 @@ certificate) and run `deploy/compose.yml`'s nodes in plain HTTP behind it, the s
 way the compose file already runs the peer API in plain HTTP on its private network
 (and logs a warning that `cluster_token` crosses it in the clear — see
 [clustering.md](clustering.md#postgres-sizing-and-settings) and
-operations.md's [Compose](operations.md#docker-compose-a-three-node-cluster) section
+operations.md's [Compose](operations.md#docker-compose) section
 for that trade-off). Client `Authorization` headers pass through nginx unchanged —
 nothing in the shipped conf hides, rewrites or strips them, and nothing should: don't
 add `proxy_hide_header Authorization` or a `proxy_set_header Authorization ...` of
@@ -198,6 +205,11 @@ routing would both break. `deploy/compose.yml` already sets this correctly — e
 node's `SEARCHLIGHT_ADVERTISE_ADDRESS` is its own Compose service name
 (`searchlight-1:8780`, and so on), not the nginx service's.
 
+The shipped config also closes `/_internal/` at the proxy:
+`location /_internal/ { return 404; }`. The peer API needs the cluster token anyway,
+but no client outside the cluster has a reason to reach it, so nginx answers 404
+itself rather than pass the request to a node.
+
 ### The admin listener stays off the proxy
 
 Each node serves `/healthz` and `/readyz` on both listeners, without auth, and
@@ -212,8 +224,10 @@ healthchecks and the Kubernetes probes do (operations.md's
 
 ## Compose
 
-`deploy/compose.yml` adds an `nginx` service as the front door: it publishes one port
-(`8080`) and mounts `deploy/nginx/searchlight.conf` read-only, following the file's
+`deploy/compose.yml` (built from a checkout) and `deploy/compose.postgres.yml` (the
+published image, also in each release's deploy bundle) add an `nginx` service as the
+front door: it publishes one port (`8080`; the sample's `SEARCHLIGHT_HTTP_PORT`) and
+mounts `deploy/nginx/searchlight.conf` read-only, following the file's
 existing conventions (an image pinned by digest, a healthcheck, `depends_on` on the
 nodes' own healthchecks). Bring the cluster up exactly as before and go through nginx
 instead of a single node's published port:

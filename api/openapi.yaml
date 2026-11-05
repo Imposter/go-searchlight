@@ -1,33 +1,45 @@
 openapi: 3.1.0
 info:
   title: Searchlight API
-  version: "1"
+  version: "2"
   summary: Search and percolation over SQL-backed, memory-mapped segments.
   description: |
     Searchlight's public HTTP/JSON API (spec section 5). Requests and responses are
     JSON, except `_bulk`, which is NDJSON. Every error is problem JSON (RFC 9457) with
     a machine-readable `code` and, for a refused request, `problems` whose `loc` is a
-    dotted path into the request (`query.all.2.any.0.value`, `params.wait_for_seq`,
+    dotted path into the request (`query.all.2.any.0.value`, `params.wait_for`,
     `line.3.upsert.id`).
 
-    **Consistency.** Every write answers with the `seq` it committed (acknowledged =
-    committed to SQL). Writes become searchable within the index's refresh interval;
-    `refresh=wait_for` returns once the write is searchable on this node, and
+    **Consistency.** Every shard of an index has its own sequence: a change's `seq` is
+    its position in its shard's changelog, and seqs repeat across shards. Each shard's
+    operations of a write commit in one transaction of their own (acknowledged =
+    committed to SQL): a request is whole or nothing only on one shard. Every write
+    answers with a `token`, an opaque string naming where it left each shard it wrote
+    (with the index's incarnation). Writes become searchable within the index's refresh
+    interval; `refresh=wait_for` returns once the write is searchable on this node, and
     `refresh=true` refreshes the written shards at once. Any read takes
-    `wait_for_seq=N` and waits, under the request deadline, until every change up to N
-    is searchable (read-your-writes). GET of one document or saved query is realtime.
+    `wait_for=<token>` and waits, under the request deadline, until each shard it reads
+    has every change up to the token's seq of that shard searchable (read-your-writes);
+    it waits on no other shard. Tokens of several writes may be merged: a client keeps
+    the newest per shard. GET of one document or saved query is realtime.
+
+    **Retries.** A 5xx, or an item with a 5xx status in a `_bulk`, may have committed
+    or not. Retry with conditions that make a repeat safe: an upsert of the same body
+    (a byte-identical upsert is a noop), `if_seq`, `version`, or `op_type=create`.
 
     **Limits.** Bodies over `max_body_bytes` and documents over `max_doc_bytes` are
     413, as is a `_bulk` of more than `max_bulk_ops` operations. A copy whose write
     buffer is full, or that trails its writes, answers writes with 429 and
     `Retry-After`; so does a node with `search_queue` reads in progress. Every request
     has a deadline (`request_timeout`): a search past it answers what it found with
-    `timed_out`, a wait past it is 504.
+    `timed_out`, a wait past it is 504. A search whose `from + size` passes
+    `max_result_window` is a 400: page deeper with `search_after`.
 
     **Auth.** Bearer tokens from `tokens_file`, read-only or read-write. `/healthz` and
     `/readyz` need none.
   license:
-    name: Proprietary
+    name: MIT
+    identifier: MIT
 servers:
   - url: http://localhost:8780
 security:
@@ -237,7 +249,7 @@ paths:
       tags: [indexes]
       operationId: patchMapping
       summary: Add fields to the mapping (additive only).
-      description: A field that exists with another type is a 400, as is passing max_index_fields. The change is logged to every shard; on an index with `dynamic` false, documents that already hold a newly mapped field become searchable on it once their copy is rebuilt under the new mapping (reads of that copy answer 503 meanwhile).
+      description: 'A field that exists with another type is a 400, as is passing max_index_fields. A nested field takes new sub-fields when given again with them, {"_v": {"type": "nested", "fields": {"colour": "keyword"}}}. The change is logged to every shard; on an index with `dynamic` false, documents that already hold a newly mapped field become searchable on it once their copy is rebuilt under the new mapping (reads of that copy answer 503 meanwhile).'
       requestBody:
         required: true
         content:
@@ -249,7 +261,7 @@ paths:
               properties:
                 fields:
                   type: object
-                  additionalProperties: { $ref: "#/components/schemas/FieldType" }
+                  additionalProperties: { $ref: "#/components/schemas/MappingField" }
       responses:
         "200":
           description: The index.
@@ -280,6 +292,7 @@ paths:
               properties:
                 refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
                 replicas_per_shard: { type: integer, minimum: 0, maximum: 1024 }
+                gc_deletes: { $ref: "#/components/schemas/GCDeletes" }
       responses:
         "200":
           description: The index.
@@ -303,8 +316,10 @@ paths:
       summary: Create or replace a document.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
+        - $ref: "#/components/parameters/DetectNoop"
       requestBody:
         required: true
         content:
@@ -326,7 +341,7 @@ paths:
       operationId: getDocument
       summary: Read a document (realtime).
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The document.
@@ -336,6 +351,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -344,6 +360,7 @@ paths:
       summary: Delete a document.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       responses:
@@ -373,23 +390,36 @@ paths:
             {"delete": {"id": "c", "if_seq": 12}}
 
         `index` is an alias of `upsert` and `_id` of `id`; `create` requires the
-        document to be new. An operation refused on its own (an invalid document, a
-        failed `if_seq`) is reported in its item, with `errors` set, and the rest
-        commit. A malformed action line, a line over `max_doc_bytes` or more than
-        `max_bulk_ops` operations refuse the whole request before anything is
-        written. A delete of a document that does not exist is a 404 item (result
-        not_found) and writes nothing. With `percolate=true` each upserted
-        document's item lists the saved queries it matches, as written: against
-        every saved query committed through this node before the percolation, and
-        every change up to `wait_for_seq` when it is given (a seq past the newest
-        committed one is a 400, before anything is written).
+        document to be new. Each shard's operations commit in one transaction of their
+        own, the shards' apart: a request is whole or nothing only on one shard. An
+        operation refused on its own (an invalid document, a failed `if_seq`) is
+        reported in its item, with `errors` set, and the rest commit; so is every
+        operation of a shard whose transaction failed (a 5xx item status: it may or
+        may not have committed), while the other shards' commit. Only when nothing
+        was written is the request itself an error. A malformed action line, a line
+        over `max_doc_bytes` or more than `max_bulk_ops` operations refuse the whole
+        request before anything is written. A delete of a document that does not
+        exist is a 404 item (result not_found) and writes nothing. With
+        `percolate=true` each committed upserted document's item lists the saved
+        queries it matches, as written: against every saved query committed through
+        this node before the percolation, and every change up to `wait_for`'s seqs
+        when it is given (a seq past its shard's newest committed one is a 400,
+        before anything is written; without `percolate=true`, `wait_for` is a 400).
+        An operation of a shard that failed is not
+        percolated. An unconditional upsert
+        whose body is byte-identical to the stored document's is a noop at the stored
+        document's seq (see `detect_noop`), and still lists its matching saved
+        queries.
       parameters:
         - $ref: "#/components/parameters/Refresh"
         - name: percolate
           in: query
           schema: { type: boolean }
           description: Return each upserted document's matching saved queries.
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/PercolateMatches"
+        - $ref: "#/components/parameters/PercolateInnerHits"
+        - $ref: "#/components/parameters/WaitFor"
+        - $ref: "#/components/parameters/DetectNoop"
       requestBody:
         required: true
         content:
@@ -407,6 +437,7 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 
@@ -418,7 +449,7 @@ paths:
       operationId: search
       summary: Search an index.
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: false
         content:
@@ -446,7 +477,7 @@ paths:
       operationId: count
       summary: Count the matching documents exactly.
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: false
         content:
@@ -456,6 +487,7 @@ paths:
               additionalProperties: false
               properties:
                 query: { $ref: "#/components/schemas/Query" }
+                max_staleness: { $ref: "#/components/schemas/MaxStaleness" }
       responses:
         "200":
           description: The count.
@@ -490,10 +522,14 @@ paths:
           in: query
           schema: { type: string }
           description: The previous page's `next`.
+        - name: fields
+          in: query
+          schema: { type: string }
+          description: "A comma-separated list of the members each query carries: id, seq, version, query, meta (id always). Without query and meta, their trees and meta are never read: id,version pages a reconcile cheaply."
         - name: size
           in: query
           schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: A page of saved queries.
@@ -506,7 +542,10 @@ paths:
                 properties:
                   queries:
                     type: array
-                    items: { $ref: "#/components/schemas/SavedQuery" }
+                    items:
+                      anyOf:
+                        - $ref: "#/components/schemas/SavedQuery"
+                        - $ref: "#/components/schemas/SavedQueryFields"
                   next:
                     type: [string, "null"]
                     description: Pass as `after` for the next page; null on the last.
@@ -525,6 +564,7 @@ paths:
       summary: Create or replace a saved query.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       requestBody:
@@ -556,7 +596,7 @@ paths:
       operationId: getQuery
       summary: Read a saved query (realtime).
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The saved query.
@@ -566,6 +606,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "400": { $ref: "#/components/responses/Invalid" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
     delete:
@@ -574,6 +615,7 @@ paths:
       summary: Delete a saved query.
       parameters:
         - $ref: "#/components/parameters/IfSeq"
+        - $ref: "#/components/parameters/Version"
         - $ref: "#/components/parameters/OpType"
         - $ref: "#/components/parameters/Refresh"
       responses:
@@ -593,9 +635,11 @@ paths:
       tags: [percolate]
       operationId: percolate
       summary: The saved queries each document matches.
-      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for_seq to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order.
+      description: Given documents are analyzed under the index's mapping. Stored ones are read by id from this node's copies, as searches read them (not realtime as GET is), so pass wait_for to see a recent write. Every saved query committed through this node before the request is seen. Results list the given documents first, then the ids, each in request order. At most 10000 documents, given and stored together (413 past it), and at most 1000000 matches, every document's together (422 too_many_matches past it; an answer is never truncated).
       parameters:
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/PercolateMatches"
+        - $ref: "#/components/parameters/PercolateInnerHits"
+        - $ref: "#/components/parameters/WaitFor"
       requestBody:
         required: true
         content:
@@ -607,10 +651,12 @@ paths:
                 docs:
                   type: array
                   maxItems: 10000
+                  description: At most 10000 together with ids.
                   items: { $ref: "#/components/schemas/DocumentBody" }
                 ids:
                   type: array
                   maxItems: 10000
+                  description: At most 10000 together with docs.
                   items: { type: string }
       responses:
         "200":
@@ -636,6 +682,11 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/TooLarge" }
+        "422":
+          description: The documents match more than 1000000 saved queries together (code too_many_matches); percolate fewer per request.
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
         "429": { $ref: "#/components/responses/TooMany" }
         "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
@@ -652,7 +703,7 @@ paths:
           in: query
           schema: { type: integer, minimum: 0, maximum: 1000, default: 0 }
           description: How many of each keyword_list field's most frequent entries to list.
-        - $ref: "#/components/parameters/WaitForSeq"
+        - $ref: "#/components/parameters/WaitFor"
       responses:
         "200":
           description: The fields.
@@ -663,6 +714,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "429": { $ref: "#/components/responses/TooMany" }
+        "504": { $ref: "#/components/responses/Timeout" }
         "503": { $ref: "#/components/responses/Unavailable" }
         default: { $ref: "#/components/responses/Error" }
 
@@ -691,21 +743,49 @@ components:
       in: query
       description: Apply only if the target's current seq is this one (409 otherwise).
       schema: { type: integer, minimum: 1 }
+    PercolateMatches:
+      name: percolate_matches
+      in: query
+      description: "Each percolated document's result or item also lists matches, its matched saved queries in queries' order, each {\"id\", \"version\"} (version absent for none). On _bulk, with percolate=true."
+      schema: { type: boolean }
+    PercolateInnerHits:
+      name: percolate_inner_hits
+      in: query
+      description: "percolate_matches, and each match of a saved query whose nested nodes declare inner_hits gives inner_hits by key, {\"total\", \"offsets\"}: the document's members those nodes match, as a search reports them, without the objects. At most 100000 offsets per request (a 422 too_many_matches past them), which count against max_inflight_read_bytes while it runs."
+      schema: { type: boolean }
+    Version:
+      name: version
+      in: query
+      description: "The client's version of the document or saved query (Elasticsearch's external versioning, 1 to 2^62): the write applies only when it is higher than the stored one (the target's, or, while it is absent, the version its last versioned delete kept), and is otherwise a noop, answered with result noop and no seq. Excludes if_seq and op_type=create."
+      schema: { type: integer, minimum: 1, maximum: 4611686018427387904 }
     OpType:
       name: op_type
       in: query
       description: create applies only if the target does not exist (409 otherwise).
       schema: { type: string, enum: [create, upsert, index] }
+    DetectNoop:
+      name: detect_noop
+      in: query
+      description: "true (the default) answers an unconditional upsert (no if_seq, op_type=create or version) whose body is byte-identical to the stored document's as a noop at the stored document's seq, without analyzing, committing or indexing it; false writes it, as releases before 1.6 did. On _bulk, an id named by more than one operation of the request always writes."
+      schema: { type: boolean }
     Refresh:
       name: refresh
       in: query
       description: true refreshes the written shards at once; wait_for returns once the write is searchable on this node.
       schema: { type: string, enum: ["true", wait_for, "false"] }
-    WaitForSeq:
-      name: wait_for_seq
+    WaitFor:
+      name: wait_for
       in: query
-      description: Wait, under the request deadline, until every change up to this seq is searchable on the copies the read uses.
-      schema: { type: integer, minimum: 0 }
+      description: |
+        A token a write returned (or a merge of several): wait, under the request
+        deadline, until each shard the read uses has every change up to the token's seq
+        of that shard searchable. Shards the token does not name are not waited for.
+        The token is opaque and at most 16 KiB; a malformed one, one whose seq is past
+        its shard's newest committed seq, one of another incarnation of the index
+        (dropped and created again since the write), or one naming a shard the index
+        lacks is a 400. Empty, it waits for nothing. `wait_for_seq`, its predecessor
+        before 2.0, is refused by name.
+      schema: { type: string, maxLength: 16384, pattern: "^[A-Za-z0-9_-]*$" }
 
   responses:
     Error:
@@ -764,7 +844,7 @@ components:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
     Timeout:
-      description: The request's deadline passed while it waited (wait_for_seq).
+      description: The request's deadline passed while it waited (wait_for), or, on _bulk, before any of its shards committed.
       content:
         application/problem+json:
           schema: { $ref: "#/components/schemas/Problem" }
@@ -802,8 +882,8 @@ components:
         code:
           type: string
           enum: [invalid_request, unauthorized, forbidden, not_found, index_not_found, document_not_found, query_not_found,
-            method_not_allowed, index_exists, conflict, too_large, too_many_requests, timeout, request_timeout,
-            client_closed_request, unavailable, internal]
+            method_not_allowed, index_exists, conflict, too_large, too_many_requests, too_many_matches, timeout,
+            request_timeout, client_closed_request, unavailable, internal]
         detail: { type: string }
         request_id: { type: string }
         current_seq: { type: integer, description: A failed if_seq's current seq. }
@@ -820,8 +900,29 @@ components:
         loc: { type: string, examples: ["query.all.2.any.0.value"] }
         message: { type: string }
     FieldType:
-      type: string
-      enum: [keyword, text, keyword_list, number, bool, date]
+      description: 'A field type: its name, or a point field (a list of [x, y] pairs, for box queries) as {"type": "point", "x": "number"|"date", "y": "number"|"date"}. The field catalogue lists a nested field as "nested", and each of its sub-fields under its full name (path.name).'
+      oneOf:
+        - type: string
+          enum: [keyword, text, keyword_list, number, bool, date, nested]
+        - type: object
+          additionalProperties: false
+          required: [type, x, y]
+          properties:
+            type: { type: string, const: point }
+            x: { type: string, enum: [number, date] }
+            y: { type: string, enum: [number, date] }
+    MappingField:
+      description: 'A mapping''s field: a field type, or a nested field, an array of objects (one object alone is one; at most 10000 members per document) each matched apart by nested queries, as {"type": "nested", "fields": {"name": type, ...}}, its sub-fields of any type but a point, queried, aggregated and sorted on by their full names (path.name). A nested field''s name holds no dot, and no field of the index takes a name under it. Dynamic typing never makes a field nested.'
+      oneOf:
+        - $ref: "#/components/schemas/FieldType"
+        - type: object
+          additionalProperties: false
+          required: [type, fields]
+          properties:
+            type: { type: string, const: nested }
+            fields:
+              type: object
+              additionalProperties: { $ref: "#/components/schemas/FieldType" }
     Mapping:
       type: object
       additionalProperties: false
@@ -834,7 +935,7 @@ components:
               enum: ["true", "false", strict]
         fields:
           type: object
-          additionalProperties: { $ref: "#/components/schemas/FieldType" }
+          additionalProperties: { $ref: "#/components/schemas/MappingField" }
     RefreshInterval:
       description: A positive duration ("1s", "250ms"), or -1 to refresh only on demand.
       oneOf:
@@ -848,6 +949,10 @@ components:
         shards: { type: integer, minimum: 1, maximum: 1024, default: 1, description: Fixed at creation. }
         replicas_per_shard: { type: integer, minimum: 0, maximum: 1024, default: 0, description: 0 means every node holds every shard. }
         refresh_interval: { $ref: "#/components/schemas/RefreshInterval" }
+        gc_deletes: { $ref: "#/components/schemas/GCDeletes" }
+    GCDeletes:
+      type: string
+      description: 'How long a delete keeps its id''s version (a tombstone) for versioned writes to compare with, as Elasticsearch''s index.gc_deletes: a duration ("24h", "60s"), 1s to 365 days; 24h when unset. Older tombstones are pruned, and a write of any version then applies.'
     IndexInfo:
       type: object
       additionalProperties: false
@@ -867,32 +972,48 @@ components:
     Document:
       type: object
       additionalProperties: false
-      required: [id, body]
+      required: [id, shard, body]
       properties:
         id: { type: string }
-        seq: { type: integer, description: The seq of the change that last wrote it; pass it as if_seq. Absent on a stale read. }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard; pass it as if_seq. Absent on a stale read." }
+        token: { type: string, description: "Where the document stands: a token naming its shard at seq. Absent with seq." }
+        version: { type: integer, description: "The client version its last write named; absent for none." }
         body: { $ref: "#/components/schemas/DocumentBody" }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy, which may trail the latest write." }
     WriteResponse:
       type: object
       additionalProperties: false
-      required: [id, seq]
+      required: [id]
       properties:
         id: { type: string }
-        seq: { type: integer, description: The seq the write committed; pass it as wait_for_seq. }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq the write committed on its shard: the document's, to pass as if_seq. For a noop (a versioned write not above the stored version, or an unchanged upsert), the stored target's seq; absent when there is none." }
+        token: { type: string, description: "Where the write left its shard (for a noop, where it found the stored target): pass it as wait_for to read it back. Absent when there is no seq." }
+        committed: { type: string, description: "A token of where the write's commit left its shard; absent for a noop. A shard committing at or below a seq an earlier commit took means the database lost commits (docs/api.md, Tokens)." }
+        version: { type: integer, description: "The write's client version, when it named one." }
+        result: { type: string, enum: [noop], description: "noop: the write's version was not above the stored one, or an unconditional upsert's body was byte-identical to the stored document's (unless detect_noop=false); nothing was written." }
         timed_out: { type: boolean, description: The refresh wait ran out of time; the write is committed. }
     BulkResponse:
       type: object
       additionalProperties: false
-      required: [took_ms, seq, errors, timed_out, items]
+      required: [took_ms, errors, timed_out, items]
       properties:
         took_ms: { type: integer }
-        seq: { type: integer, description: The newest seq the request committed (0 when none). }
-        errors: { type: boolean }
+        token: { type: string, description: "Where the request left each shard it committed to, or found a noop's stored target on (an unchanged upsert, a versioned noop): pass it as wait_for. Absent when it names no shard." }
+        committed: { type: string, description: "A token of where the request's commits left each shard: only what it committed, never a noop's stored seq. Absent when nothing committed. A shard committing at or below a seq an earlier commit took means the database lost commits (docs/api.md, Tokens)." }
+        errors: { type: boolean, description: "Set when any item failed: on its own (a 4xx item) or with its shard's transaction (a 5xx item, which may or may not have committed)." }
         timed_out: { type: boolean }
         percolated:
           type: boolean
           description: With percolate=true, whether the items carry their matching saved queries (false when the percolation could not finish after the writes committed).
+        percolate_reason:
+          type: string
+          enum: [too_many_matches]
+          description: Why percolated is false when the documents match more than 1000000 saved queries together; the writes stay committed.
+        percolated_at:
+          type: string
+          description: "With percolated true (and an upsert to percolate): a token of where each shard stood for the percolation: every saved query committed to a shard at or below its seq was seen; one written after may or may not have been. A shard it does not name held no change, so no saved query of it was seen. Use it, not token, to tell which saved queries an answer covers: token names what the request committed, or where an unchanged upsert's noop found its document, which can be far older than the percolation."
         items:
           type: array
           items:
@@ -900,13 +1021,17 @@ components:
             additionalProperties: false
             required: [op, id, status]
             properties:
-              op: { type: string, enum: [upsert, delete] }
+              op: { type: string, enum: [upsert, delete, query_upsert, query_delete] }
               id: { type: string }
               status: { type: integer }
-              seq: { type: integer }
+              shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+              seq: { type: integer, description: "The seq the op committed at on its shard; for a noop, the stored target's (absent when there is none). With shard, where the item stands: a client can form a token of its own from them (docs/api.md, Tokens)." }
+              version: { type: integer, description: "The op's client version, when it named one." }
+              result: { type: string, enum: [noop], description: "noop: the op's version was not above the stored one (nothing written or percolated), or an unconditional upsert's body was byte-identical to the stored document's (nothing written, and with percolate=true queries and matches are reported as for a write). Either way seq is the stored target's." }
               queries:
                 type: array
                 items: { type: string }
+              matches: { type: array, items: { $ref: "#/components/schemas/PercolateMatch" }, description: "With percolate_matches or percolate_inner_hits, the matched saved queries in queries' order." }
               error: { $ref: "#/components/schemas/Problem" }
     Query:
       description: 'A tree of groups and conditions (spec section 4); {"all": []} matches every document.'
@@ -928,27 +1053,63 @@ components:
             not: { $ref: "#/components/schemas/Query" }
         - type: object
           additionalProperties: false
+          required: [nested]
+          description: 'One object of nested field path satisfies the whole query, each of its conditions naming a sub-field of path (path.name) and read on that object alone; a not inside applies per object, and a missing query (or {"all": []}) holds of any object. No condition outside a nested node names a sub-field, and no nested node nests in another. inner_hits, never under a not, gives each hit the members satisfying the query.'
+          properties:
+            nested:
+              type: object
+              additionalProperties: false
+              required: [path]
+              properties:
+                path: { type: string }
+                query: { $ref: "#/components/schemas/Query" }
+                inner_hits:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    name: { type: string, description: "The key of the hits' inner hits: the path by default. Nodes of one path under one key share one set of inner hits (the members satisfying any of their queries, by their largest size, with the sub-fields any of them names); one key on two paths is a 400." }
+                    size: { type: integer, minimum: 0, maximum: 1000, default: 3, description: How many matching members each hit shows. }
+                    fields:
+                      type: array
+                      maxItems: 100
+                      items: { type: string }
+                      description: The sub-fields (path.name) each shown member holds; every one when empty.
+        - type: object
+          additionalProperties: false
           required: [field, op]
           properties:
             field: { type: string }
             op:
               type: string
               enum: [eq, ne, in, lt, lte, gt, gte, between, exists, contains, contains_any, contains_all, starts_with,
-                words_all, words_any, similar, has, has_any, has_all, empty, nonempty]
-            value: {}
+                words_all, words_any, similar, has, has_any, has_all, empty, nonempty, box]
+            value:
+              description: 'The operand, by op (spec section 4). On a date field, lt, lte, gt, gte and each between bound take Unix milliseconds or a string: a date (RFC 3339 or YYYY-MM-DD), or date math, now or a date and ||, then +N/-N and / rounding in y M w d h H m s, in UTC (gte, lt and between''s lo round down; gt, lte and between''s hi round up). now is the request''s instant; a saved query keeps the expression and resolves it at each percolation. On a point field, box takes {"x": {...}, "y": {...}}, each axis optional with at most one of gt and gte and one of lt and lte, and matches a document with one point inside on both axes; a date axis takes dates and date math as a date field''s ranges do.'
+              examples: ["Acme", 10, [5, 100], "now-7d/d", ["2026-10-01||+1M", "now"], {"x": {"gte": "now-7d/d"}, "y": {"gte": 5}}]
     SearchRequest:
       type: object
       additionalProperties: false
       properties:
         query: { $ref: "#/components/schemas/Query" }
+        post_filter:
+          description: A query the hits, total, sort, from, search_after and next obey once the aggregations are counted; every aggregation but global counts the query's documents.
+          allOf:
+            - $ref: "#/components/schemas/Query"
         sort:
-          description: 'Field names or {"field": "asc"|"desc"}; the _id breaks ties.'
+          description: 'Field names or {"field": "asc"|"desc"} or {"field": {"order": "asc"|"desc"}}; the _id breaks ties. Each field once, and nothing after _id. A nested field''s sub-field (path.name, a number, date, keyword or text) sorts each hit by the least ("mode": "min", ascending''s default) or greatest ("max", descending''s) value among its objects, of those "where" (a query of the sub-fields) matches when given; a hit with none sorts last.'
           type: array
+          maxItems: 16
           items: {}
         size: { type: integer, minimum: 0, maximum: 10000, default: 10 }
+        from:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          default: 0
+          description: Hits to skip in sort order, as Elasticsearch's from. from + size is at most the node's max_result_window (10000 by default), else a 400 at from (at size when from is 0); page deeper with search_after. 0 with search_after. The total and the aggregations are the whole search's.
         search_after:
           type: array
-          description: The previous page's next.
+          description: The previous page's next. from must then be 0.
           items: {}
         track_total:
           description: true counts exactly, false not past the hits, a number exactly up to it (default 10000).
@@ -957,13 +1118,16 @@ components:
             - type: integer
               minimum: 1
         aggs:
-          type: object
-          description: 'Named aggregations: terms, range, histogram, date_histogram, stats, cardinality, with metric sub-aggregations one level deep.'
+          description: 'Named aggregations (Aggregation): at most 100 per search, sub-aggregations included and those under a filters aggregation counted once per bucket; at most 65536 buckets per response, every aggregation''s together, nested ones included (a shard past it refuses the search; merged shards past it are cut in name order, each aggregation cut marked truncated).'
+          allOf:
+            - $ref: "#/components/schemas/Aggregations"
         aggregations:
-          type: object
-          description: An alias of aggs.
+          description: An alias of aggs, with its bounds.
+          allOf:
+            - $ref: "#/components/schemas/Aggregations"
         fields:
           type: array
+          maxItems: 100
           items: { type: string }
           description: Limit each hit's body to these members.
         timeout:
@@ -971,6 +1135,496 @@ components:
           oneOf:
             - type: string
             - type: number
+        seq_no:
+          type: boolean
+          default: false
+          description: Give each hit its _seq, the seq of the change that wrote the version the copy holds (as Elasticsearch's seq_no_primary_term gives _seq_no); absent for a document indexed by a release before 1.5. A search with hits and seq_no reaches only nodes of 1.5 or later (search wire level 8).
+        request_cache:
+          type: boolean
+          default: true
+          description: Whether a search with size 0 (a count, or aggregations only; no from or search_after) may be answered from, and stored in, each shard's request cache, as Elasticsearch's request_cache. A search with hits, or with date math reading now unrounded (now-7d; now-7d/d is cached), is never cached; a timed-out result is never stored.
+        max_staleness: { $ref: "#/components/schemas/MaxStaleness" }
+    Aggregations:
+      type: object
+      maxProperties: 100
+      description: Aggregations by name (a name is not empty).
+      additionalProperties: { $ref: "#/components/schemas/Aggregation" }
+    Aggregation:
+      type: object
+      additionalProperties: false
+      description: 'One aggregation: exactly one type, and aggs (or aggregations) for its sub-aggregations. A bucket aggregation (terms, range, histogram, date_histogram, composite) holds metric sub-aggregations (stats, cardinality, min, max, percentiles, percentile_ranks, top_metrics) one level deep. filter, filters and global hold any aggregation but composite and global, each with its own metric sub-aggregations, written inline in their bucket. composite and global are top-level only. A nested field''s sub-field (path.name) is aggregated by terms, stats, min, max, cardinality, percentiles and percentile_ranks alone, at the top level or under filter, filters and global, over the objects of the hits that its where (a query of the sub-fields) chooses; such a terms holds metric and terms sub-aggregations (those terms holding none), over the bucket''s documents for a top-level field and over its objects for a sub-field of the same nested field. No sub-aggregation is named after a member of its bucket (doc_count; under a bucket aggregation also key, key_as_string, from, to and doc_count_error_upper_bound).'
+      oneOf:
+        - required: [terms]
+        - required: [range]
+        - required: [histogram]
+        - required: [date_histogram]
+        - required: [composite]
+        - required: [stats]
+        - required: [cardinality]
+        - required: [min]
+        - required: [max]
+        - required: [percentiles]
+        - required: [percentile_ranks]
+        - required: [top_metrics]
+        - required: [filter]
+        - required: [filters]
+        - required: [global]
+      properties:
+        terms: { $ref: "#/components/schemas/TermsAggregation" }
+        range: { $ref: "#/components/schemas/RangeAggregation" }
+        histogram: { $ref: "#/components/schemas/HistogramAggregation" }
+        date_histogram: { $ref: "#/components/schemas/DateHistogramAggregation" }
+        composite: { $ref: "#/components/schemas/CompositeAggregation" }
+        stats: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        min: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        max: { $ref: "#/components/schemas/FieldMetricAggregation" }
+        cardinality: { $ref: "#/components/schemas/CardinalityAggregation" }
+        percentiles: { $ref: "#/components/schemas/PercentilesAggregation" }
+        percentile_ranks: { $ref: "#/components/schemas/PercentileRanksAggregation" }
+        top_metrics: { $ref: "#/components/schemas/TopMetricsAggregation" }
+        filter:
+          description: 'One bucket of the documents both the search''s query and this query match: {"doc_count": n, ...}. Checked against the mapping as query is; asks for no inner_hits.'
+          allOf:
+            - $ref: "#/components/schemas/Query"
+        filters: { $ref: "#/components/schemas/FiltersAggregation" }
+        global:
+          type: object
+          maxProperties: 0
+          description: 'One bucket of every document of the index, whatever the query and post_filter: {"doc_count": n, ...}. Takes no settings; top level only.'
+        aggs: { $ref: "#/components/schemas/Aggregations" }
+        aggregations: { $ref: "#/components/schemas/Aggregations" }
+    TermsAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'A bucket per value, {"doc_count_error_upper_bound": n, "sum_other_doc_count": n, "buckets": [{"key": v, "doc_count": n}, ...]}. Over several shards each returns its shard_size best terms and doc_count_error_upper_bound bounds what they left out (0 on one shard).'
+      properties:
+        field: { type: string, minLength: 1 }
+        size: { type: integer, minimum: 1, maximum: 65536, default: 10 }
+        shard_size:
+          type: integer
+          minimum: 1
+          description: 'How many terms each shard returns: size * 1.5 + 10 by default (10000 when the order bounds no error: _count ascending or a sub-aggregation), at least size, capped at 65536.'
+        min_doc_count: { type: integer, minimum: 1, default: 1 }
+        include: { $ref: "#/components/schemas/TermsFilter" }
+        exclude: { $ref: "#/components/schemas/TermsFilter" }
+        collect_mode:
+          type: string
+          enum: [depth_first, breadth_first]
+          description: 'How the sub-aggregations are collected: depth_first for every value as the hits are read, breadth_first for the values each shard keeps after its shard_size cut. Unset, each segment chooses. The results are the same either way; an order by a sub-aggregation refuses breadth_first.'
+        order: { $ref: "#/components/schemas/TermsOrder" }
+        where:
+          description: On a nested field's sub-field, the objects it counts (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    TermsFilter:
+      description: 'A terms aggregation''s include or exclude (exclude wins, both before size and shard_size): an array of at most 1000 exact values, compared normalized as the field''s values, or a pattern of at most 1000 characters over the whole normalized key, a subset of Lucene''s regular expressions folded as values are. Partitions are refused.'
+      oneOf:
+        - type: string
+          maxLength: 1000
+        - type: array
+          maxItems: 1000
+          items:
+            type: [string, number, boolean]
+    TermsOrder:
+      description: 'The order of a terms aggregation''s buckets, as Elasticsearch''s: {key: "asc"|"desc"}, or a list of at most 8 of them, each breaking the ties of the ones before. A key is _count (the default, descending), _key, or a metric sub-aggregation of the terms by name: a min, max or cardinality by its value ("low", or "low.value"), a stats by a member ("prices.avg": count, min, max, avg or sum), a top_metrics of size 1 by one of its metrics ("latest.price"), a percentiles by one of its percents ("load.99.9", or "load[99.9]"; the percent as Java''s Double.parseDouble reads it, "50", "50.0" or "5e1", equal to one of its percents) or a percentile_ranks by one of its values ("ranks.100"). _key ascending breaks the ties left, and nothing orders after _key; each key once. A bucket without a metric value sorts after every bucket with one. Over several shards an order by _count ascending or by a sub-aggregation makes each shard order every term exactly and return shard_size of them (10000 by default): exact while no shard holds more distinct values, doc_count_error_upper_bound -1 where a shard''s cut may have left a term out. A percentiles or percentile_ranks key orders each shard by its own digest, and the merged buckets by the merged digest''s value, the one the response shows (an estimate once a term''s values pass the compression).'
+      oneOf:
+        - $ref: "#/components/schemas/TermsOrderKey"
+        - type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: "#/components/schemas/TermsOrderKey" }
+    TermsOrderKey:
+      type: object
+      minProperties: 1
+      maxProperties: 1
+      additionalProperties:
+        type: string
+        enum: [asc, desc]
+    RangeAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, ranges]
+      description: 'A bucket per range of a number or date field, {"buckets": [{"key": "10-100", "from": 10, "to": 100, "doc_count": n}, ...]} in the order given.'
+      properties:
+        field: { type: string, minLength: 1 }
+        ranges:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              from: { type: [number, "null"], description: Inclusive; open when absent or null. }
+              to: { type: [number, "null"], description: Exclusive; open when absent or null. }
+              key: { type: string, description: 'The bucket''s key: "from-to" by default, * for an open end.' }
+    HistogramAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, interval]
+      description: 'Buckets of a number or date field interval wide, by start, {"buckets": [{"key": start, "doc_count": n}, ...]}; empty ones between the first and the last filled in while min_doc_count is 0 (and the response stays within its buckets, else truncated).'
+      properties:
+        field: { type: string, minLength: 1 }
+        interval: { type: number, description: Above 0. }
+        offset: { type: number, default: 0 }
+        min_doc_count: { type: integer, minimum: 0, default: 0 }
+    DateHistogramAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'Buckets of a date (or number) field by a fixed or a calendar interval (UTC), {"buckets": [{"key": ms, "key_as_string": "2026-10-01T00:00:00Z", "doc_count": n}, ...]}: one of fixed_interval (or interval) and calendar_interval.'
+      properties:
+        field: { type: string, minLength: 1 }
+        fixed_interval: { $ref: "#/components/schemas/Interval" }
+        interval: { $ref: "#/components/schemas/Interval" }
+        calendar_interval:
+          type: string
+          enum: [minute, hour, day, week, month, quarter, year]
+          description: A week starts on Monday.
+        offset:
+          description: A duration ("1h", "-6h") or milliseconds.
+          type: [string, number]
+        min_doc_count: { type: integer, minimum: 0, default: 0 }
+    Interval:
+      description: A duration ("90m", "1d") or milliseconds, at least 1 ms.
+      type: [string, number]
+    CompositeAggregation:
+      type: object
+      additionalProperties: false
+      required: [sources]
+      description: 'Every combination of its sources'' values, a page at a time, ordered by the keys source by source: {"after_key": {...}, "buckets": [{"key": {"name": v, ...}, "doc_count": n, ...}]}. after_key is the page''s last bucket''s key, absent on a page without buckets (the walk done). A document without a value for some source is in no bucket (missing_bucket is not taken). Exact. Top level only; holds metric sub-aggregations.'
+      properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: Each source once by name.
+          items: { $ref: "#/components/schemas/CompositeSource" }
+        size: { type: integer, minimum: 1, maximum: 10000, default: 10 }
+        after:
+          type: object
+          description: The previous page's after_key, as it was given; the page starts after that bucket.
+    CompositeSource:
+      type: object
+      minProperties: 1
+      maxProperties: 1
+      description: '{"name": {"terms"|"histogram"|"date_histogram": {...}}}, the bucket key''s member by that name.'
+      additionalProperties:
+        type: object
+        additionalProperties: false
+        minProperties: 1
+        maxProperties: 1
+        properties:
+          terms:
+            type: object
+            additionalProperties: false
+            required: [field]
+            description: A keyword, text, keyword_list, number, date or bool field, or _id.
+            properties:
+              field: { type: string, minLength: 1 }
+              order: { type: string, enum: [asc, desc], default: asc }
+          histogram:
+            type: object
+            additionalProperties: false
+            required: [field, interval]
+            description: A number or date field's bucket start.
+            properties:
+              field: { type: string, minLength: 1 }
+              interval: { type: number, description: Above 0. }
+              offset: { type: number, default: 0 }
+              order: { type: string, enum: [asc, desc], default: asc }
+          date_histogram:
+            type: object
+            additionalProperties: false
+            required: [field]
+            description: A date field's bucket start, in Unix milliseconds; one of fixed_interval (or interval) and calendar_interval.
+            properties:
+              field: { type: string, minLength: 1 }
+              fixed_interval: { $ref: "#/components/schemas/Interval" }
+              interval: { $ref: "#/components/schemas/Interval" }
+              calendar_interval: { type: string, enum: [minute, hour, day, week, month, quarter, year] }
+              offset: { type: [string, number], description: 'A duration ("1h", "-6h") or milliseconds.' }
+              order: { type: string, enum: [asc, desc], default: asc }
+    FieldMetricAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'stats ({"count": n, "min": x, "max": x, "avg": x, "sum": x}), min or max ({"value": x}, null with no value) over a number or date field (a date as Unix milliseconds).'
+      properties:
+        field: { type: string, minLength: 1 }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    CardinalityAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'The number of distinct values (HyperLogLog++), {"value": n}: with threshold, exact up to it, the threshold past it.'
+      properties:
+        field: { type: string, minLength: 1 }
+        precision: { type: integer, minimum: 4, maximum: 18, default: 14 }
+        threshold: { type: integer, minimum: 1, maximum: 65536, description: Not with precision. }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    PercentilesAggregation:
+      type: object
+      additionalProperties: false
+      required: [field]
+      description: 'Percentiles of a number or date field from a t-digest, exact while the values hold at most compression distinct values: keyed {"values": {"50.0": v, ...}} (each percent as Java writes a double), else {"values": [{"key": 50, "value": v}, ...]}, in ascending order, null with no value.'
+      properties:
+        field: { type: string, minLength: 1 }
+        percents:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: None twice; by default 1, 5, 25, 50, 75, 95 and 99.
+          items: { type: number, minimum: 0, maximum: 100 }
+        keyed: { type: boolean, default: true }
+        tdigest: { $ref: "#/components/schemas/TDigestSettings" }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    PercentileRanksAggregation:
+      type: object
+      additionalProperties: false
+      required: [field, values]
+      description: 'For each value, the percent of the field''s values below it plus half those equal to it: {"values": {"500.0": 55.2, ...}}, keyed and written as percentiles.'
+      properties:
+        field: { type: string, minLength: 1 }
+        values:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: Finite, none twice.
+          items: { type: number }
+        keyed: { type: boolean, default: true }
+        tdigest: { $ref: "#/components/schemas/TDigestSettings" }
+        where:
+          description: On a nested field's sub-field, the objects it reads (a query of the sub-fields).
+          allOf:
+            - $ref: "#/components/schemas/Query"
+    TDigestSettings:
+      type: object
+      additionalProperties: false
+      properties:
+        compression: { type: number, minimum: 10, maximum: 1000, default: 100 }
+    TopMetricsAggregation:
+      type: object
+      additionalProperties: false
+      required: [metrics, sort]
+      description: 'Fields of the documents first by sort, best first: {"top": [{"sort": [v], "metrics": {"field": v, ...}}, ...]}. A document without a sort value sorts after every one with one; equal values go to the least _id. Exact.'
+      properties:
+        metrics:
+          description: '{"field": name}, or a list of at most 10: a number or date field, a keyword or text field (normalized), a bool, or _id; null for a document without a value. A keyword_list, a point field and a nested field''s sub-fields are refused.'
+          oneOf:
+            - $ref: "#/components/schemas/TopMetric"
+            - type: array
+              minItems: 1
+              maxItems: 10
+              items: { $ref: "#/components/schemas/TopMetric" }
+        sort:
+          description: 'One key on a top-level number or date field, as a search''s sort takes it: "price", {"price": "desc"} or {"price": {"order": "desc"}}, or a list of that one.'
+          oneOf:
+            - type: string
+            - type: object
+              minProperties: 1
+              maxProperties: 1
+            - type: array
+              minItems: 1
+              maxItems: 1
+        size: { type: integer, minimum: 1, maximum: 10, default: 1 }
+    TopMetric:
+      type: object
+      additionalProperties: false
+      required: [field]
+      properties:
+        field: { type: string, minLength: 1 }
+    FiltersAggregation:
+      type: object
+      additionalProperties: false
+      required: [filters]
+      description: 'A filter bucket per key, and with other_bucket_key one more of the documents no filter matches: {"buckets": {"key": {"doc_count": n, ...}, ...}}. Keyed only: the anonymous list is refused.'
+      properties:
+        filters:
+          type: object
+          minProperties: 1
+          maxProperties: 100
+          additionalProperties: { $ref: "#/components/schemas/Query" }
+        other_bucket_key: { type: string, minLength: 1 }
+    AggregationResult:
+      description: 'A top-level aggregation''s result, by its type: terms (TermsResult); range, histogram and date_histogram (BucketsResult); composite (CompositeResult); filters (FiltersResult); filter and global (FilterResult); stats (StatsResult); min, max and cardinality (ValueResult); percentiles and percentile_ranks (PercentilesResult); top_metrics (TopMetricsResult).'
+      anyOf:
+        - $ref: "#/components/schemas/TermsResult"
+        - $ref: "#/components/schemas/BucketsResult"
+        - $ref: "#/components/schemas/CompositeResult"
+        - $ref: "#/components/schemas/FiltersResult"
+        - $ref: "#/components/schemas/FilterResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    WrappedAggregationResult:
+      description: The result of an aggregation under a filter, filters or global aggregation, by its type, as at the top level.
+      anyOf:
+        - $ref: "#/components/schemas/TermsResult"
+        - $ref: "#/components/schemas/BucketsResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    SubAggregationResult:
+      description: 'A bucket''s sub-aggregation''s result: a metric, or the terms under a terms aggregation on a nested field''s sub-field (SubTermsResult).'
+      anyOf:
+        - $ref: "#/components/schemas/SubTermsResult"
+        - $ref: "#/components/schemas/StatsResult"
+        - $ref: "#/components/schemas/ValueResult"
+        - $ref: "#/components/schemas/PercentilesResult"
+        - $ref: "#/components/schemas/TopMetricsResult"
+    TermsResult:
+      type: object
+      additionalProperties: false
+      required: [doc_count_error_upper_bound, sum_other_doc_count, buckets]
+      properties:
+        doc_count_error_upper_bound: { type: integer, description: "The most documents a term left out may have; -1 when unknown (an order by _count ascending or a sub-aggregation, past a shard's cut)." }
+        sum_other_doc_count: { type: integer, description: The documents of the terms left out. }
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    SubTermsResult:
+      type: object
+      additionalProperties: false
+      required: [doc_count_error_upper_bound, sum_other_doc_count, buckets]
+      description: A terms result whose buckets hold no sub-aggregation.
+      properties:
+        doc_count_error_upper_bound: { type: integer }
+        sum_other_doc_count: { type: integer }
+        buckets: { type: array, items: { $ref: "#/components/schemas/LeafBucket" } }
+        truncated: { type: boolean }
+    BucketsResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    CompositeResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        after_key: { type: object, description: "The page's last bucket's key, the next page's after; absent on a page without buckets." }
+        buckets: { type: array, items: { $ref: "#/components/schemas/Bucket" } }
+        truncated: { type: boolean }
+    FiltersResult:
+      type: object
+      additionalProperties: false
+      required: [buckets]
+      properties:
+        buckets:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/FilterResult" }
+    FilterResult:
+      type: object
+      required: [doc_count]
+      description: A filter or global bucket (or a filters bucket), with the aggregations under it inline by name.
+      properties:
+        doc_count: { type: integer }
+      additionalProperties: { $ref: "#/components/schemas/WrappedAggregationResult" }
+    Bucket:
+      type: object
+      required: [key, doc_count]
+      description: A bucket, with its sub-aggregations' results by name.
+      properties:
+        key: { $ref: "#/components/schemas/BucketKey" }
+        key_as_string: { type: string, description: "A date_histogram bucket's start in RFC 3339." }
+        from: { type: number, description: "A range bucket's from; absent when open." }
+        to: { type: number, description: "A range bucket's to; absent when open." }
+        doc_count: { type: integer }
+        doc_count_error_upper_bound: { type: integer, description: "A terms bucket's: how many more documents it may have (-1: unknown); absent when 0." }
+      additionalProperties: { $ref: "#/components/schemas/SubAggregationResult" }
+    LeafBucket:
+      type: object
+      additionalProperties: false
+      required: [key, doc_count]
+      properties:
+        key: { $ref: "#/components/schemas/BucketKey" }
+        doc_count: { type: integer }
+        doc_count_error_upper_bound: { type: integer }
+    BucketKey:
+      description: "A terms bucket's value, a range's key, a histogram bucket's start (Unix milliseconds for a date_histogram), or a composite bucket's key, each source's value by name."
+      type: [string, number, boolean, object]
+    StatsResult:
+      type: object
+      additionalProperties: false
+      required: [count, min, max, avg, sum]
+      properties:
+        count: { type: integer }
+        min: { type: [number, "null"] }
+        max: { type: [number, "null"] }
+        avg: { type: [number, "null"] }
+        sum: { type: number }
+    ValueResult:
+      type: object
+      additionalProperties: false
+      required: [value]
+      properties:
+        value: { type: [number, "null"], description: "A min or max (null with no value), or a cardinality." }
+    PercentilesResult:
+      type: object
+      additionalProperties: false
+      required: [values]
+      properties:
+        values:
+          oneOf:
+            - type: object
+              description: Keyed, by each percent (or value) as Java writes a double ("50.0", "99.9", "1.0E-4").
+              additionalProperties: { type: [number, "null"] }
+            - type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [key, value]
+                properties:
+                  key: { type: number }
+                  value: { type: [number, "null"] }
+    TopMetricsResult:
+      type: object
+      additionalProperties: false
+      required: [top]
+      properties:
+        top:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [sort, metrics]
+            properties:
+              sort: { type: array, items: { $ref: "#/components/schemas/SortValue" } }
+              metrics:
+                type: object
+                description: Each metric's value by field, null for none.
+                additionalProperties: { type: [string, number, boolean, "null"] }
+    SortValue:
+      description: A hit's value for one sort key, null for none.
+      type: [string, number, boolean, "null"]
+    MaxStaleness:
+      description: |
+        For a search with size 0 (a count, or aggregations only) whose request_cache is on: how
+        old a shard's cached result may be, as a duration ("5s", "1m") or milliseconds, at most
+        1h. Each shard may answer with its copy's newest result for the same search under the
+        same mapping computed within it, although the copy has refreshed writes since, rather
+        than search what it holds now: under continuous writes, counts and facets then compute
+        about once per max_staleness instead of at every refresh. The result may miss the
+        writes of the last max_staleness (beyond the refresh interval). 0, the default, asks
+        for a current result; wait_for ignores it (read-your-writes). Peers before 1.6
+        ignore it and answer with a current result.
+      oneOf:
+        - type: string
+        - type: number
     SearchResponse:
       type: object
       additionalProperties: false
@@ -994,25 +1648,52 @@ components:
             required: [id, sort]
             properties:
               id: { type: string }
-              sort: { type: array, items: {} }
+              sort: { type: array, items: { $ref: "#/components/schemas/SortValue" } }
+              _seq: { type: integer, description: "With seq_no: the seq of the change that wrote the version the copy holds." }
               body: { type: object }
+              inner_hits:
+                type: object
+                description: 'Per inner_hits key (merging the nested nodes sharing it): {"total": n, "offsets": [...], "objects": [...]}, the members of its path that satisfy its query (n of them), the first size by their offsets in the array and as objects of the sub-fields asked for, by their own names.'
+                additionalProperties:
+                  type: object
+                  additionalProperties: false
+                  required: [total, offsets, objects]
+                  properties:
+                    total: { type: integer }
+                    offsets: { type: array, items: { type: integer } }
+                    objects: { type: array, items: { type: object } }
         next:
           type: [array, "null"]
           description: The search_after of the next page; null on a short page.
-          items: {}
+          items: { $ref: "#/components/schemas/SortValue" }
         aggs:
           type: object
-          additionalProperties: true
+          description: 'The aggregations by name (AggregationResult, by type). A bucket aggregation cut, or a histogram left without its empty buckets, to keep the response within 65536 buckets carries truncated true. A filter or global aggregation is {"doc_count": n, ...} with the aggregations under it inline by name; a filters aggregation is {"buckets": {key: {"doc_count": n, ...}}}.'
+          additionalProperties: { $ref: "#/components/schemas/AggregationResult" }
     SavedQuery:
       type: object
       additionalProperties: false
-      required: [id, seq, query, meta]
+      required: [id, shard, seq, query, meta]
       properties:
         id: { type: string }
-        seq: { type: integer }
+        shard: { type: integer, description: "The shard the id routes to (docs/api.md, Routing)." }
+        seq: { type: integer, description: "The seq of the change that last wrote it, on its shard." }
+        token: { type: string, description: "Where the saved query stands: a token naming its shard at seq." }
+        version: { type: integer, description: "The client version its last write named; absent for none." }
         query: { $ref: "#/components/schemas/Query" }
         meta: { type: object }
         stale: { type: boolean, description: "The database could not be reached: read from this node's copy." }
+    SavedQueryFields:
+      type: object
+      additionalProperties: false
+      required: [id]
+      description: A saved query as a listing's fields name its members (version 0 for none).
+      properties:
+        id: { type: string }
+        seq: { type: integer }
+        version: { type: integer }
+        query: { $ref: "#/components/schemas/Query" }
+        meta: { type: object }
     PercolateResult:
       type: object
       additionalProperties: false
@@ -1023,6 +1704,28 @@ components:
         queries:
           type: array
           items: { type: string }
+        _seq: { type: integer, description: "A stored document's seq, as the copy that read it holds it: the version it was percolated at." }
+        matches:
+          type: array
+          description: With percolate_matches or percolate_inner_hits, the matched saved queries in queries' order.
+          items: { $ref: "#/components/schemas/PercolateMatch" }
+    PercolateMatch:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: { type: string }
+        version: { type: integer, description: "The saved query's client version; absent for none." }
+        inner_hits:
+          type: object
+          description: "With percolate_inner_hits, for a saved query whose nested nodes declare inner_hits, by key (merged as a search merges them): the document's members their queries match, as a search's inner hits but without the objects."
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [total, offsets]
+            properties:
+              total: { type: integer }
+              offsets: { type: array, items: { type: integer } }
     FieldCatalog:
       type: object
       additionalProperties: false

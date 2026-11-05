@@ -28,6 +28,7 @@ import (
 
 	"github.com/Imposter/go-searchlight/internal/clock"
 	"github.com/Imposter/go-searchlight/internal/config"
+	"github.com/Imposter/go-searchlight/internal/search"
 	"github.com/Imposter/go-searchlight/internal/telemetry"
 )
 
@@ -132,6 +133,9 @@ func NewServer(c Coordinator, t *telemetry.T, cfg config.Config, opts ...ServerO
 	if cfg.MaxBodyBytes <= 0 || cfg.MaxDocBytes <= 0 || cfg.MaxBulkOps <= 0 || cfg.RequestTimeout <= 0 {
 		return nil, errors.New("api: max_body_bytes, max_doc_bytes, max_bulk_ops and request_timeout must be positive")
 	}
+	if cfg.MaxResultWindow <= 0 || cfg.MaxResultWindow > search.MaxResultWindow {
+		return nil, fmt.Errorf("api: max_result_window must be from 1 to %d", search.MaxResultWindow)
+	}
 	in := telemetry.NewInstruments(meter)
 	s.dur = in.Histogram(telemetry.MetricHTTPRequestDuration)
 	s.errs = in.Counter(telemetry.MetricHTTPRequestErrors)
@@ -166,8 +170,8 @@ func (s *Server) Routes() []Route {
 // table is the API's endpoints (spec section 5).
 func (s *Server) table() []*route {
 	read, write := scopeRead, scopeWrite
-	wait := []string{"wait_for_seq"}
-	writeParams := []string{"if_seq", "op_type", "refresh"}
+	wait := []string{"wait_for"}
+	writeParams := []string{"if_seq", "op_type", "refresh", "version"}
 	return []*route{
 		{method: http.MethodGet, path: "/healthz", scope: scopeNone, quiet: true, handler: s.healthz},
 		{method: http.MethodGet, path: "/readyz", scope: scopeNone, quiet: true, handler: s.readyz},
@@ -183,10 +187,10 @@ func (s *Server) table() []*route {
 		{method: http.MethodPatch, path: "/indexes/{index}/mapping", scope: write, handler: s.patchMapping},
 		{method: http.MethodPatch, path: "/indexes/{index}/settings", scope: write, handler: s.patchSettings},
 
-		{method: http.MethodPut, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, docBody: true, handler: s.putDoc},
+		{method: http.MethodPut, path: "/indexes/{index}/docs/{id}", scope: write, params: append(slices.Clone(writeParams), "detect_noop"), docBody: true, handler: s.putDoc},
 		{method: http.MethodGet, path: "/indexes/{index}/docs/{id}", scope: read, params: wait, handler: s.getDoc},
 		{method: http.MethodDelete, path: "/indexes/{index}/docs/{id}", scope: write, params: writeParams, handler: s.deleteDoc},
-		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "wait_for_seq"}, handler: s.bulk},
+		{method: http.MethodPost, path: "/indexes/{index}/_bulk", scope: write, params: []string{"refresh", "percolate", "percolate_matches", "percolate_inner_hits", "wait_for", "detect_noop"}, handler: s.bulk},
 
 		{method: http.MethodPost, path: "/indexes/{index}/_search", scope: read, params: wait, queued: true, handler: s.search},
 		{method: http.MethodPost, path: "/indexes/{index}/_count", scope: read, params: wait, queued: true, handler: s.count},
@@ -194,10 +198,10 @@ func (s *Server) table() []*route {
 		{method: http.MethodPut, path: "/indexes/{index}/queries/{id}", scope: write, params: writeParams, docBody: true, handler: s.putQuery},
 		{method: http.MethodGet, path: "/indexes/{index}/queries/{id}", scope: read, params: wait, handler: s.getQuery},
 		{method: http.MethodDelete, path: "/indexes/{index}/queries/{id}", scope: write, params: writeParams, handler: s.deleteQuery},
-		{method: http.MethodGet, path: "/indexes/{index}/queries", scope: read, params: []string{"after", "size", "wait_for_seq"}, handler: s.listQueries},
+		{method: http.MethodGet, path: "/indexes/{index}/queries", scope: read, params: []string{"after", "size", "fields", "wait_for"}, handler: s.listQueries},
 
-		{method: http.MethodPost, path: "/indexes/{index}/_percolate", scope: read, params: wait, queued: true, handler: s.percolate},
-		{method: http.MethodGet, path: "/indexes/{index}/_fields", scope: read, params: []string{"entries", "wait_for_seq"}, queued: true, handler: s.fields},
+		{method: http.MethodPost, path: "/indexes/{index}/_percolate", scope: read, params: []string{"percolate_matches", "percolate_inner_hits", "wait_for"}, queued: true, handler: s.percolate},
+		{method: http.MethodGet, path: "/indexes/{index}/_fields", scope: read, params: []string{"entries", "wait_for"}, queued: true, handler: s.fields},
 	}
 }
 
@@ -227,7 +231,9 @@ func (s *Server) HTTPServer() *http.Server {
 // when it is one (context.WithCancelCause), else [NewShutdown] from that moment. With
 // T the shutdown_timeout:
 //
-//   - readiness turns false and a [Drainer] coordinator drains, within T/4;
+//   - readiness turns false and a [Drainer] coordinator drains, within T/4 (a cluster
+//     node retires the copies others can stand in for, so peers stop routing reads
+//     here while the listener drains);
 //   - the API keeps serving for the grace, so load balancers stop sending it traffic;
 //   - the listener stops accepting and requests in flight finish, within T/4 (those
 //     still running then are cut off);
@@ -267,8 +273,6 @@ func (s *Server) Run(ctx context.Context, ln net.Listener) error {
 	s.draining.Store(true)
 	s.log.InfoContext(ctx, "API draining: not ready", slog.Duration("grace", sd.Grace), slog.Time("deadline", sd.Deadline))
 	if d, ok := s.c.(Drainer); ok {
-		// A cluster node retires the copies others can stand in for, so peers stop
-		// routing reads here while the listener drains.
 		dctx, cancel := clock.WithDeadline(base, s.clock, sd.within(s.clock.Now(), quarter))
 		d.Drain(dctx)
 		cancel()
@@ -389,6 +393,13 @@ func requestID(r *http.Request) string {
 // continuing the caller's trace, the request metrics and an access log, panic
 // recovery, auth, parameter checks, the request deadline, the read queue and the body
 // limit. A handler's error is answered as problem JSON.
+//
+// The request body is tracked, so a refusal knows how much of it is left to drain. A
+// refusal gives back the request's in-flight byte budget before draining, so a drain
+// holds none, and a 413 on HTTP/1 closes the connection. The budget weighs a body of
+// known length up front, one of unknown length as it is read, each byte at the heap it
+// costs. A queued route reads its body before it takes a slot, so a slow client holds
+// none.
 func (s *Server) wrap(rt *route) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := s.clock.Now()
@@ -428,18 +439,14 @@ func (s *Server) wrap(rt *route) http.Handler {
 			s.finish(ctx, rt, r, sw, span, failure, start)
 		}()
 
-		// body sees what the handler reads of the request body, so a refusal knows
-		// how much is left.
 		body := &trackedBody{r: r.Body}
 		r.Body = body
-		// releaseBudget gives back the request's in-flight budget; a refusal calls
-		// it before draining, so a drain holds none.
 		releaseBudget := func() {}
 		fail := func(e *Error) {
 			failure = e
 			if e.Status == http.StatusRequestEntityTooLarge {
 				if r.ProtoMajor == 1 {
-					sw.Header().Set("Connection", "close") // no more requests on this connection
+					sw.Header().Set("Connection", "close")
 				}
 				s.tooLarge.Add(1)
 			}
@@ -465,8 +472,6 @@ func (s *Server) wrap(rt *route) http.Handler {
 			return
 		}
 		r.Body = http.MaxBytesReader(sw, r.Body, limit)
-		// The in-flight byte budget: a body of known length is weighed up front, one
-		// of unknown length as it is read, each byte at the heap it costs.
 		b := s.readBytes
 		if rt.scope == scopeWrite {
 			b = s.writeBytes
@@ -488,7 +493,6 @@ func (s *Server) wrap(rt *route) http.Handler {
 		ctx, cancel := clock.WithTimeout(ctx, s.clock, s.cfg.RequestTimeout)
 		defer cancel()
 		if rt.queued {
-			// The body is read before a slot is taken: a slow client holds none.
 			body, err := readBody(r)
 			if err != nil {
 				fail(ProblemFor(err))
@@ -632,7 +636,7 @@ func (s *Server) drain(w http.ResponseWriter, r *http.Request, body *trackedBody
 	}
 	rc := http.NewResponseController(w)
 	if err := rc.SetReadDeadline(time.Now().Add(drainTimeout)); err != nil { //nolint:forbidigo // a connection deadline is by the OS clock
-		return 0 // unbounded in time: close instead
+		return 0
 	}
 	_ = rc.Flush()
 	n, _ := io.Copy(io.Discard, io.LimitReader(body, limit))

@@ -63,7 +63,8 @@ func appendID(dst []byte, prefix byte, i int64) []byte {
 	return append(dst, s...)
 }
 
-// AppendProduct appends document i's JSON object to dst.
+// AppendProduct appends document i's JSON object to dst. One listing in twenty has no
+// tags.
 func AppendProduct(dst []byte, seed uint64, i int64) []byte {
 	samplers()
 	r := rng(seed, streamProducts, i)
@@ -101,7 +102,7 @@ func AppendProduct(dst []byte, seed uint64, i int64) []byte {
 	dst = append(dst, `,"category":`...)
 	dst = appendString(dst, Category(zCats.Sample(r)))
 
-	if r.IntN(20) != 0 { // 5% of listings have no tags
+	if r.IntN(20) != 0 {
 		dst = append(dst, `,"tags":[`...)
 		n := 1 + min(r.IntN(4)+r.IntN(3), 5)
 		var picked [6]int

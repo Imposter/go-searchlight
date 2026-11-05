@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Imposter/go-searchlight/internal/percolate"
 	"github.com/Imposter/go-searchlight/internal/query"
 	"github.com/Imposter/go-searchlight/internal/schema"
 	"github.com/Imposter/go-searchlight/internal/search"
@@ -31,6 +32,7 @@ const (
 	CodeConflict         = "conflict"
 	CodeTooLarge         = "too_large"
 	CodeTooMany          = "too_many_requests"
+	CodeTooManyMatches   = "too_many_matches"
 	CodeTimeout          = "timeout"
 	CodeRequestTimeout   = "request_timeout"
 	CodeCanceled         = "client_closed_request"
@@ -118,6 +120,21 @@ func TooMany(retry time.Duration, format string, args ...any) *Error {
 	return &Error{Status: http.StatusTooManyRequests, Code: CodeTooMany, Detail: fmt.Sprintf(format, args...), RetryAfter: retry}
 }
 
+// tooManyMatches is the 422 of a percolation whose documents match more than
+// percolate.MaxMatches saved queries together, caused by err when a copy refused it.
+func tooManyMatches(err error) *Error {
+	if errors.Is(err, ErrTooManyInnerHits) {
+		return &Error{
+			Status: http.StatusUnprocessableEntity, Code: CodeTooManyMatches, Err: err,
+			Detail: fmt.Sprintf("the matches' inner hits hold more than %d offsets together: percolate fewer documents per request", MaxPercolateInnerHits),
+		}
+	}
+	return &Error{
+		Status: http.StatusUnprocessableEntity, Code: CodeTooManyMatches, Err: err,
+		Detail: fmt.Sprintf("the documents match more than %d saved queries together: percolate fewer documents per request", percolate.MaxMatches),
+	}
+}
+
 // Unavailable is a 503 caused by err.
 func Unavailable(err error, format string, args ...any) *Error {
 	return &Error{Status: http.StatusServiceUnavailable, Code: CodeUnavailable, Detail: fmt.Sprintf(format, args...), Err: err, RetryAfter: DefaultRetryAfter}
@@ -131,6 +148,7 @@ func Unavailable(err error, format string, args ...any) *Error {
 //     store.ErrExists are 409s;
 //   - shard.ErrBackpressure is a 429 with Retry-After, and a document over the
 //     segment limit a 413;
+//   - percolate.ErrTooManyMatches is a 422 too_many_matches;
 //   - a passed deadline is a 504, a closed or failed shard or store a 503;
 //   - anything else is a 500, whose cause is logged and never sent.
 func ProblemFor(err error) *Error {
@@ -168,6 +186,8 @@ func ProblemFor(err error) *Error {
 		return &Error{Status: http.StatusTooManyRequests, Code: CodeTooMany, Detail: "the write buffer is full while refreshes catch up; retry", RetryAfter: DefaultRetryAfter, Err: err}
 	case errors.Is(err, shard.ErrDocTooLarge):
 		return TooLarge("the document is larger than a segment stores")
+	case errors.Is(err, percolate.ErrTooManyMatches):
+		return tooManyMatches(err)
 	case errors.Is(err, context.DeadlineExceeded):
 		return &Error{Status: http.StatusGatewayTimeout, Code: CodeTimeout, Detail: "the request's deadline passed", Err: err}
 	case errors.Is(err, context.Canceled):
@@ -218,3 +238,12 @@ func writeProblem(w http.ResponseWriter, e *Error, requestID string) {
 	w.WriteHeader(e.Status)
 	_, _ = w.Write(append(b, '\n'))
 }
+
+// MaxPercolateInnerHits bounds the inner hit offsets one percolation reports, every
+// document's and every match's together.
+const MaxPercolateInnerHits = 100_000
+
+// ErrTooManyInnerHits is a percolation whose matches' inner hits hold more than
+// MaxPercolateInnerHits offsets together: it is refused as one with too many matches is
+// (it wraps percolate.ErrTooManyMatches), a 422 too_many_matches.
+var ErrTooManyInnerHits = fmt.Errorf("%w: their inner hits hold more than %d offsets together", percolate.ErrTooManyMatches, MaxPercolateInnerHits)

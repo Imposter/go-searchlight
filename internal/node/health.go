@@ -23,7 +23,8 @@ func (n *Single) sortedIndexes() []*index {
 	return out
 }
 
-// copyInfo describes one copy.
+// copyInfo describes one copy. A paused copy reports serving: it serves this node's own
+// last-resort reads only.
 func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 	info := api.ShardInfo{Index: c.id.Index, Shard: c.id.Shard, Node: n.cfg.NodeID, State: api.ShardServing}
 	sh := c.shard()
@@ -59,7 +60,7 @@ func (n *Single) copyInfo(c *copyState) api.ShardInfo {
 		info.State, info.Error = api.ShardHalted, (*h).Error()
 	}
 	if c.paused.Load() {
-		info.State = api.ShardServing // this node's own last-resort reads only
+		info.State = api.ShardServing
 	}
 	if info.State == api.ShardServing {
 		info.Rebuilding = c.rebuilding()
@@ -94,7 +95,7 @@ func (n *Single) Health(ctx context.Context) (*api.ClusterHealth, error) {
 		case api.ShardServing:
 			h.ServingShards++
 			if shards[i].Stale && h.Status == api.StatusGreen {
-				h.Status = api.StatusYellow // serving, but behind or being rebuilt
+				h.Status = api.StatusYellow
 			}
 		default:
 			h.Unassigned++

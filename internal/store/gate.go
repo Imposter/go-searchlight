@@ -94,7 +94,8 @@ type gate struct {
 	lanes [2][]chan struct{} // laneLow, laneHigh
 }
 
-// acquire waits for the gate in ctx's lane, or until ctx ends.
+// acquire waits for the gate in ctx's lane, or until ctx ends. A waiter granted the
+// gate as ctx ended passes it on.
 func (g *gate) acquire(ctx context.Context) error {
 	g.mu.Lock()
 	if !g.busy {
@@ -119,7 +120,6 @@ func (g *gate) acquire(ctx context.Context) error {
 			}
 		}
 		g.mu.Unlock()
-		// Granted meanwhile: pass it on.
 		g.release()
 		return ctx.Err()
 	}
@@ -131,14 +131,15 @@ func (g *gate) idle() bool {
 	return !g.busy && len(g.lanes[laneLow]) == 0 && len(g.lanes[laneHigh]) == 0
 }
 
-// release hands the gate to the first high-lane waiter, else the first low-lane one.
+// release hands the gate to the first high-lane waiter, else the first low-lane one;
+// the gate stays busy while a waiter holds it.
 func (g *gate) release() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, l := range []lane{laneHigh, laneLow} {
 		if q := g.lanes[l]; len(q) > 0 {
 			g.lanes[l] = q[1:]
-			close(q[0]) // busy stays set: the waiter holds it now
+			close(q[0])
 			return
 		}
 	}
@@ -179,11 +180,12 @@ func (d *gatedDB) QueryContext(ctx context.Context, query string, args ...any) (
 	return d.DB.QueryContext(ctx, query, args...)
 }
 
+// QueryRowContext queries behind the gate. A row asked for under a context that ended
+// while it waited is the pool's row under that context: a Row carries its error to
+// Scan, where the caller sees the context's error.
 func (d *gatedDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	done, err := d.enter(ctx)
 	if err != nil {
-		// A Row carries its error to Scan; the context's error is what the
-		// caller sees there.
 		return d.DB.QueryRowContext(ctx, query, args...)
 	}
 	defer done()

@@ -60,12 +60,22 @@ const (
 	nAny
 	nNot
 	nLeaf
+	nNested
 )
 
 type pnode struct {
 	kind     nodeKind
 	children []*pnode
 	leaf     *leafPlan
+	nested   *nestedPlan
+}
+
+// nestedPlan is a nested node, compiled: its inner query runs over the path's
+// objects as a query runs over documents ([segExec.inner]), and an object's match is
+// its document's.
+type nestedPlan struct {
+	path  string
+	inner *pnode
 }
 
 // leafPlan is one condition, compiled.
@@ -91,6 +101,8 @@ type leafPlan struct {
 	phrases [][]string
 	never   bool
 	every   bool
+	// box is a box condition's bounds, as the segments' point indexes take them.
+	box segment.XYBox
 }
 
 func compileNode(n query.Node, req uint64) *pnode {
@@ -126,6 +138,11 @@ func compileNode(n query.Node, req uint64) *pnode {
 			return &pnode{kind: nFalse}
 		}
 		return &pnode{kind: nLeaf, leaf: compileLeaf(x, req)}
+	case *query.Nested:
+		if x == nil {
+			return &pnode{kind: nFalse}
+		}
+		return &pnode{kind: nNested, nested: &nestedPlan{path: x.Path, inner: compileNode(x.Query, req)}}
 	default:
 		return &pnode{kind: nFalse}
 	}
@@ -144,6 +161,15 @@ func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 	case query.OpStartsWith:
 		if lp.arg.Kind == query.ArgString {
 			lp.texts = []string{lp.arg.Scalar.Norm}
+		}
+	case query.OpBox:
+		if b, ok := query.CompileBox(&lp.arg); ok {
+			lp.box = segment.XYBox{
+				XLo: b.XLo, XHi: b.XHi, YLo: b.YLo, YHi: b.YHi,
+				XLoInc: b.XLoInc, XHiInc: b.XHiInc, YLoInc: b.YLoInc, YHiInc: b.YHiInc,
+			}
+		} else {
+			lp.never = true
 		}
 	case query.OpWordsAll, query.OpWordsAny:
 		lp.every = l.Op == query.OpWordsAll
@@ -166,7 +192,7 @@ func compileLeaf(l *query.Leaf, req uint64) *leafPlan {
 	switch l.Op {
 	case query.OpLt, query.OpLte, query.OpGt, query.OpGte, query.OpBetween, query.OpIn,
 		query.OpContains, query.OpContainsAny, query.OpContainsAll, query.OpStartsWith,
-		query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpEmpty, query.OpNonempty:
+		query.OpWordsAll, query.OpWordsAny, query.OpSimilar, query.OpEmpty, query.OpNonempty, query.OpBox:
 		lp.cacheable = true
 	case query.OpHasAny, query.OpHasAll:
 		lp.cacheable = len(lp.texts) > 1
@@ -230,25 +256,18 @@ const (
 
 var leafUsage usageSketch
 
-// seen counts key once for request req and reports whether an earlier request saw it.
+// seen counts key once for request req and reports whether an earlier request saw it;
+// a request that counted the key already is not counted again.
 func (u *usageSketch) seen(key string, req uint64) bool {
 	slot := &u.slots[hashString(key)%usageSlots]
 	if slot.last.Swap(req) == req {
-		return slot.count.Load() >= 2 // this request counted it already
+		return slot.count.Load() >= 2
 	}
 	n := slot.count.Add(1)
 	if u.ticks.Add(1)%usageHalfLife == 0 {
 		u.halve()
 	}
 	return n >= 2
-}
-
-// reset forgets every count (tests that need a leaf unseen).
-func (u *usageSketch) reset() {
-	for i := range u.slots {
-		u.slots[i].count.Store(0)
-		u.slots[i].last.Store(0)
-	}
 }
 
 func (u *usageSketch) halve() {
@@ -295,6 +314,13 @@ func (s *segExec) estimate(n *pnode) estimate {
 			out.residual = out.residual || e.residual
 		}
 		return out
+	case nNested:
+		in := s.inner(n.nested.path)
+		if in == nil {
+			return estimate{}
+		}
+		e := in.estimate(n.nested.inner)
+		return estimate{card: min(e.card, uint64(s.n)), residual: e.residual}
 	default:
 		return s.estimateLeaf(n.leaf)
 	}
@@ -309,9 +335,10 @@ func (s *segExec) estimateLeaf(lp *leafPlan) estimate {
 	return e
 }
 
+// estimateLeafUncached estimates a leaf's matches from the segment's index. A bitmap
+// the filter cache holds is exact and costs nothing more to use.
 func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 	if lp.useCache {
-		// A cached bitmap is exact and costs nothing more to use.
 		if bm, ok := s.cacheGet(lp); ok {
 			return estimate{card: bm.GetCardinality()}
 		}
@@ -405,6 +432,8 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 		return estimate{card: min(c, n), residual: true}
 	case query.OpSimilar:
 		return estimate{card: present(), residual: true}
+	case query.OpBox:
+		return estimate{card: s.boxEstimate(lp, present)}
 	case query.OpNonempty:
 		return estimate{card: present()}
 	case query.OpEmpty:
@@ -412,6 +441,23 @@ func (s *segExec) estimateLeafUncached(lp *leafPlan) estimate {
 	default:
 		return estimate{}
 	}
+}
+
+// boxEstimate estimates a box's matches from its field's point index: the points its
+// node boxes put in it, spread over the field's documents as evenly as the field's
+// points are.
+func (s *segExec) boxEstimate(lp *leafPlan, present func() uint64) uint64 {
+	if lp.never {
+		return 0
+	}
+	xy := s.r.XY(lp.field)
+	points := xy.EstimatePoints(lp.box)
+	if points == 0 {
+		return 0
+	}
+	docs := present()
+	share := float64(points) / float64(max(xy.NumPoints(), 1))
+	return max(1, min(docs, uint64(math.Ceil(share*float64(docs)))))
 }
 
 // gramEstimate bounds a needle's matches by its rarest gram (or the field's presence
@@ -528,13 +574,16 @@ func (s *segExec) approximateNode(n *pnode, scope *roaring.Bitmap) approx {
 		}
 		maybe.AndNot(sure)
 		return approx{sure: sure, maybe: maybe}
+	case nNested:
+		return s.approximateNested(n.nested, scope)
 	default:
 		return s.approximateLeaf(n.leaf, scope)
 	}
 }
 
 // approximateLeaf is a leaf's approx over scope: its candidates, or the filter
-// cache's exact bitmap. Only a fully verified bitmap is ever cached.
+// cache's exact bitmap. Only a fully verified bitmap is ever cached: when most of the
+// segment is in question anyway, all of it is verified once, and cached.
 func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 	if lp.never {
 		return emptyApprox
@@ -555,7 +604,6 @@ func (s *segExec) approximateLeaf(lp *leafPlan, scope *roaring.Bitmap) approx {
 		return approx{sure: s.within(c.sure, scope), maybe: roaring.New()}
 	}
 	if lp.useCache && 2*scope.GetCardinality() >= uint64(s.n) {
-		// Most of the segment is in question anyway: verify all of it once, and cache.
 		full := c.sure.Clone()
 		s.verify(lp, roaring.AndNot(c.maybe, c.sure), full)
 		if s.err != nil {
@@ -576,6 +624,17 @@ func (s *segExec) within(bm, scope *roaring.Bitmap) *roaring.Bitmap {
 		return bm
 	}
 	return roaring.And(bm, scope)
+}
+
+// matches returns exactly the documents of scope that n matches, n a query compiled
+// apart from the root (an aggregation's filter, the post_filter): approximated within
+// scope, as the root is within the live documents, then its maybe documents resolved.
+func (s *segExec) matches(n *pnode, scope *roaring.Bitmap) *roaring.Bitmap {
+	a := s.approximate(n, scope)
+	if a.maybe.IsEmpty() {
+		return a.sure
+	}
+	return roaring.Or(a.sure, s.resolve(n, a.maybe))
 }
 
 // resolve returns exactly the documents of d that n matches, verifying in batches:
@@ -617,6 +676,9 @@ func (s *segExec) resolve(n *pnode, d *roaring.Bitmap) *roaring.Bitmap {
 			m.AndNot(got)
 		}
 		return sure
+	case nNested:
+		sure.Or(s.resolveNested(n.nested, m))
+		return sure
 	default:
 		return sure
 	}
@@ -655,6 +717,8 @@ func (s *segExec) check(n *pnode, d uint32) bool {
 			}
 		}
 		return false
+	case nNested:
+		return s.checkNested(n.nested, d)
 	default:
 		return false
 	}

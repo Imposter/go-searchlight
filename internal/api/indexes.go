@@ -144,13 +144,13 @@ func (s *Server) patchMapping(w http.ResponseWriter, r *http.Request, _ params) 
 	if len(req.Fields) == 0 {
 		return InvalidAt("fields", "fields names at least one field to add")
 	}
-	fields := make(map[string]schema.FieldType, len(req.Fields))
-	for name, raw := range req.Fields {
-		var t schema.FieldType
-		if err := json.Unmarshal(raw, &t); err != nil {
-			return InvalidAt("fields."+name, "a field type is keyword, text, keyword_list, number, bool or date")
+	fields, err := schema.ParseFields(req.Fields)
+	if err != nil {
+		var ve *schema.ValidationError
+		if errors.As(err, &ve) {
+			return InvalidAt("fields."+ve.Field, "%s", ve.Message)
 		}
-		fields[name] = t
+		return InvalidAt("fields", "%s", err.Error())
 	}
 	info, err := s.c.PatchMapping(r.Context(), r.PathValue("index"), fields)
 	if err != nil {
@@ -163,6 +163,7 @@ func (s *Server) patchMapping(w http.ResponseWriter, r *http.Request, _ params) 
 type settingsPatchBody struct {
 	RefreshInterval  json.RawMessage `json:"refresh_interval"`
 	ReplicasPerShard *int            `json:"replicas_per_shard"`
+	GCDeletes        json.RawMessage `json:"gc_deletes"`
 	Shards           json.RawMessage `json:"shards"`
 }
 
@@ -192,8 +193,15 @@ func (s *Server) patchSettings(w http.ResponseWriter, r *http.Request, _ params)
 		}
 		patch.ReplicasPerShard = req.ReplicasPerShard
 	}
-	if patch.RefreshInterval == nil && patch.ReplicasPerShard == nil {
-		return InvalidAt("body", "give refresh_interval or replicas_per_shard")
+	if req.GCDeletes != nil {
+		d, err := ParseGCDeletes(req.GCDeletes)
+		if err != nil {
+			return err
+		}
+		patch.GCDeletes = &d
+	}
+	if patch.RefreshInterval == nil && patch.ReplicasPerShard == nil && patch.GCDeletes == nil {
+		return InvalidAt("body", "give refresh_interval, replicas_per_shard or gc_deletes")
 	}
 	info, err := s.c.PatchSettings(r.Context(), r.PathValue("index"), patch)
 	if err != nil {

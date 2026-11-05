@@ -146,7 +146,8 @@ type params struct {
 }
 
 // parseParams refuses a parameter the route does not take, or one given twice, so a
-// misspelled wait_for_seq is an error rather than a stale read.
+// misspelled wait_for is an error rather than a stale read. wait_for_seq, removed in
+// 2.0, is refused by name.
 func parseParams(r *http.Request, allowed []string) (params, *Error) {
 	p := params{values: map[string]string{}}
 	values, err := url.ParseQuery(r.URL.RawQuery)
@@ -156,6 +157,8 @@ func parseParams(r *http.Request, allowed []string) (params, *Error) {
 	var ps []query.Problem
 	for key, vals := range values {
 		switch {
+		case key == "wait_for_seq":
+			ps = append(ps, query.Problem{Loc: "params.wait_for_seq", Message: "wait_for_seq was removed in 2.0: pass the token a write returned as wait_for"})
 		case !slices.Contains(allowed, key):
 			ps = append(ps, query.Problem{Loc: "params." + key, Message: "unknown parameter; this endpoint takes " + takes(allowed)})
 		case len(vals) > 1:
@@ -206,9 +209,27 @@ func (p params) bool(name string) (bool, *Error) {
 	return false, InvalidAt("params."+name, "%s is true or false", name)
 }
 
-// waitForSeq reads wait_for_seq, a seq a write returned.
-func (p params) waitForSeq() (int64, *Error) {
-	return p.int("wait_for_seq", 0, 0, 1<<62)
+// keepIdentical reads detect_noop (true by default): false writes an upsert of the
+// stored document's bytes rather than answering it as a noop.
+func (p params) keepIdentical() (bool, *Error) {
+	if _, given := p.values["detect_noop"]; !given {
+		return false, nil
+	}
+	detect, e := p.bool("detect_noop")
+	return !detect, e
+}
+
+// waitFor reads wait_for, a token a write returned; nil when absent.
+func (p params) waitFor() (*Token, *Error) {
+	v, ok := p.values["wait_for"]
+	if !ok || v == "" {
+		return nil, nil
+	}
+	t, err := ParseToken(v)
+	if err != nil {
+		return nil, InvalidAt("params.wait_for", "wait_for is %v", err)
+	}
+	return t, nil
 }
 
 // refresh reads refresh: true, wait_for or false.
@@ -262,3 +283,19 @@ func (q queue) acquire() bool {
 }
 
 func (q queue) release() { <-q }
+
+// MaxVersion is the greatest client version a write takes.
+const MaxVersion = 1 << 62
+
+// version reads a single write's client version (version=N, at least 1), which
+// excludes if_seq and op_type=create.
+func (p params) version(ifSeq int64) (int64, *Error) {
+	v, e := p.int("version", 0, 1, MaxVersion)
+	if e != nil || v == 0 {
+		return 0, e
+	}
+	if ifSeq != 0 {
+		return 0, InvalidAt("params.version", "version excludes if_seq and op_type=create: a versioned write applies when its version is higher than the stored one")
+	}
+	return v, nil
+}

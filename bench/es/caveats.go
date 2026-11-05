@@ -102,8 +102,8 @@ var Caveats = []Caveat{
 	},
 	{
 		Area:       "caching",
-		Difference: "Elasticsearch's shard request cache returns a whole cached response for a repeated size-0 request (aggregations); Searchlight has no response cache, only a filter cache like Elasticsearch's node query cache.",
-		Choice:     "Every Elasticsearch search is sent with request_cache=false; both filter caches stay on. Each workload also cycles through many query variants.",
+		Difference: "Both engines have a shard request cache that returns a cached shard result for a repeated size-0 request (aggregations), and a filter cache (Elasticsearch's node query cache).",
+		Choice:     "Every search is sent with its request cache off (request_cache=false on Elasticsearch, \"request_cache\": false on Searchlight); both filter caches stay on. Each workload also cycles through many query variants.",
 		Benchmark:  "Aggregation latencies measure computing the aggregation, on both engines.",
 	},
 	{

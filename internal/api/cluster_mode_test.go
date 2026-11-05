@@ -23,6 +23,8 @@ func TestSuitesOnSingleNodeCluster(t *testing.T) {
 		{"Bulk", TestBulk, false},
 		{"Search", TestSearch, false},
 		{"SavedQueriesAndPercolate", TestSavedQueriesAndPercolate, false},
+		{"DateMath", TestDateMath, false},
+		{"FromPaging", TestFromPaging, false},
 		{"BulkPercolateMatchesBruteForce", TestBulkPercolateMatchesBruteForce, false},
 		{"FieldsAndCluster", TestFieldsAndCluster, false},
 		{"HostileRequests", TestHostileRequests, false},
@@ -30,7 +32,7 @@ func TestSuitesOnSingleNodeCluster(t *testing.T) {
 		{"Backpressure", TestBackpressure, true},
 		{"ShardBackpressureAndSearchQueueAre429", TestShardBackpressureAndSearchQueueAre429, false},
 		{"RequestDeadline", TestRequestDeadline, false},
-		{"WaitForSeqTimesOut", TestWaitForSeqTimesOut, true},
+		{"WaitForTimesOut", TestWaitForTimesOut, true},
 		{"InvalidUTF8CannotPoisonTheChangelog", TestInvalidUTF8CannotPoisonTheChangelog, false},
 	}
 	for _, s := range suites {

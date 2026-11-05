@@ -42,12 +42,15 @@ func (ps *problems) addf(loc, format string, args ...any) {
 
 // Messages shared by Parse and Validate.
 const (
-	msgNode       = "a node is {all: [...]}, {any: [...]}, {not: node} or a condition"
+	msgNode       = "a node is {all: [...]}, {any: [...]}, {not: node}, {nested: {path, query}} or a condition"
 	msgEmptyGroup = "an empty group matches nothing: give it a condition or remove it"
 	msgNUL        = "a value cannot hold a NUL character"
 )
 
 var (
+	msgDepth     = fmt.Sprintf("a query nests groups at most %d deep", MaxDepth)
+	msgLeaves    = fmt.Sprintf("a query holds at most %d conditions", MaxLeaves)
+	msgNodes     = fmt.Sprintf("a query holds at most %d nodes (groups, nots and conditions)", MaxNodes)
 	msgLongValue = fmt.Sprintf("a value is at most %d characters", MaxValueChars)
 	msgLongList  = fmt.Sprintf("a list value holds at most %d entries", MaxListItems)
 	msgLongField = fmt.Sprintf("a field name is at most %d characters", MaxFieldChars)

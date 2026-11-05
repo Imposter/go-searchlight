@@ -55,7 +55,12 @@ const mergeCheckDocs = 4096
 // Merge holds no document and no posting in memory: each field's term dictionaries are
 // a merge of the inputs' (already sorted) dictionaries, and stored records and ids
 // stream from the inputs, in order, as the merged file is written. What it accumulates
-// is per document: presence and marks, numbers, and each value and entry ordinal.
+// is per document: presence and marks, numbers, and each value and entry ordinal; and
+// per point of a point field, every surviving one, 24 bytes each (a k-d tree is built
+// over all of a field's points at once): about 240 MB for a field of 10M points, on
+// top of the per-document state. A nested field's objects merge as documents do, each
+// object's per-document state and a 4-byte remap held for the field while it is merged.
+// Nothing bounds it but the segment's size.
 func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOptions) (Meta, error) {
 	threads := opts.Threads
 	if threads < 1 {
@@ -108,9 +113,16 @@ func Merge(dir string, inputs []*Reader, deletes []*roaring.Bitmap, opts MergeOp
 	if opts.MarksUntyped {
 		flags |= flagMarksUntyped
 	}
+	nested, err := mergeNested(inputs, remaps, total, threads, check, flags)
+	if err != nil {
+		return Meta{}, err
+	}
+	img := &image{
+		numDocs: uint32(total), flags: flags, names: names, parts: parts, dicts: readersDicts(inputs, remaps),
+		stored: storedFromReaders(inputs, remaps), ids: idsFromReaders(inputs, remaps), nested: nested,
+	}
 	path := filepath.Join(dir, name+FileExt)
-	meta, err := writeSegmentParts(path, uint32(total), flags, names, parts, readersDicts(inputs, remaps), storedFromReaders(inputs, remaps),
-		idsFromReaders(inputs, remaps), threads, check, true, !opts.NoDirSync)
+	meta, err := writeSegmentParts(path, img, threads, check, true, !opts.NoDirSync)
 	if err != nil {
 		return Meta{}, err
 	}
@@ -221,6 +233,17 @@ func mergeGroup(readers []*Reader, remaps [][]int32, check func(int) error) (map
 			for name, fv := range views {
 				mergeDoc(builders[name], fv, oldOrd, uint32(newOrd))
 			}
+		}
+		for name, fi := range r.fields {
+			if fi.xy == nil {
+				continue
+			}
+			b := builders[name]
+			fi.xy.each(func(doc uint32, x, y uint64) {
+				if newOrd := remap[doc]; newOrd >= 0 {
+					b.xy = append(b.xy, xyPoint{x: x, y: y, doc: uint32(newOrd)})
+				}
+			})
 		}
 		if check != nil {
 			if err := check(0); err != nil {

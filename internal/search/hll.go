@@ -241,11 +241,17 @@ func hashString[T string | []byte](s T) uint64 {
 	return fmix64(h)
 }
 
-func hashFloat(f float64) uint64 {
+// positiveZero returns f with -0 made +0, so the two are one value.
+func positiveZero(f float64) float64 {
 	if f == 0 {
-		f = 0 // -0 and 0 are one value
+		return 0
 	}
-	b := math.Float64bits(f)
+	return f
+}
+
+// hashFloat hashes a number's bits; -0 and 0 are one value.
+func hashFloat(f float64) uint64 {
+	b := math.Float64bits(positiveZero(f))
 	h := uint64(fnvOffset)
 	for i := range 8 {
 		h ^= (b >> (8 * i)) & 0xff

@@ -195,14 +195,19 @@ func (d *db) open(t testing.TB) store.Store {
 
 const testMapping = `{"dynamic":true,"fields":{"title":"text","brand":"keyword","tags":"keyword_list","price":"number"}}`
 
+// createIndex creates an index of testShards shards: the tests write to several,
+// whatever shard their copy follows.
 func createIndex(t testing.TB, st store.Store, name, mapping string) store.IndexMeta {
 	t.Helper()
-	m, err := st.Indexes().Create(context.Background(), store.IndexMeta{Name: name, Mapping: []byte(mapping)})
+	m, err := st.Indexes().Create(context.Background(), store.IndexMeta{Name: name, Mapping: []byte(mapping), Settings: []byte(fmt.Sprintf(`{"shards": %d}`, testShards))})
 	if err != nil {
 		t.Fatalf("create index %s: %v", name, err)
 	}
 	return m
 }
+
+// testShards is the shard count of the tests' indexes.
+const testShards = 4
 
 func docBody(id string, n int) string {
 	return fmt.Sprintf(`{"title":"item %s v%d","brand":"Brand %d","tags":["t%d","t%d"],"price":%d}`, id, n, n%7, n%5, n%3, n%97)
@@ -222,7 +227,7 @@ func queryUpsert(t testing.TB, index string, sh int, id, q, meta string) store.C
 	if meta != "" {
 		m = []byte(meta)
 	}
-	p, err := store.EncodeQueryPayload([]byte(q), m)
+	p, err := store.EncodeQueryPayload([]byte(q), m, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,13 +238,28 @@ func queryDelete(index string, sh int, id string) store.Change {
 	return store.Change{Index: index, Shard: sh, Kind: store.KindQueryDelete, ID: id}
 }
 
+// mustApply applies batch and returns the highest seq it took: its last change's,
+// when it writes one shard.
 func mustApply(t testing.TB, st store.Store, batch ...store.Change) int64 {
 	t.Helper()
-	_, last, err := st.Apply(context.Background(), batch)
-	if err != nil {
+	if err := st.Apply(context.Background(), batch); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
+	var last int64
+	for i := range batch {
+		last = max(last, batch[i].Seq)
+	}
 	return last
+}
+
+// headOf is the head of shard id.
+func headOf(t testing.TB, st store.Store, id ShardID) int64 {
+	t.Helper()
+	head, _, err := st.HeadSeq(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return head
 }
 
 // testShardOptions are quick: a short background refresh, no merges unless asked.
@@ -275,9 +295,9 @@ func testOptions() Options {
 var errInjected = errors.New("injected store fault")
 
 // faultStore wraps a store with injectable faults: fail[op] makes the next n calls
-// of op fail ("head", "changes", "scan", "get"), onRecord runs for every record a
-// scan hands over (its error ends the scan), and onChanges runs before every
-// ChangesAfter (its error fails the call).
+// of op fail ("head" for HeadSeq and Tip, "changes", "scan", "get"), onRecord runs
+// for every record a scan hands over (its error ends the scan), and onChanges runs
+// before every ChangesAfter (its error fails the call).
 type faultStore struct {
 	store.Store
 	mu        sync.Mutex
@@ -288,6 +308,11 @@ type faultStore struct {
 	// corrupt, when set, says which changes read back damaged: ChangesAfter returns
 	// the ones before the first such change with its *store.CorruptError.
 	corrupt func(c *store.Change) bool
+	// onTip, when set, may rewrite what every Tip returns (a read of a lagging server).
+	onTip func(tip *store.Tip)
+	// afterScan, when set, runs once a ScanShard has returned, before its caller
+	// sees the result.
+	afterScan func(ctx context.Context)
 }
 
 func newFaultStore(st store.Store) *faultStore {
@@ -319,11 +344,25 @@ func (f *faultStore) down(op string, down bool) {
 	f.always[op] = down
 }
 
-func (f *faultStore) HeadSeq(ctx context.Context) (int64, time.Time, error) {
+func (f *faultStore) HeadSeq(ctx context.Context, id store.ShardID) (int64, time.Time, error) {
 	if err := f.take("head"); err != nil {
 		return 0, time.Time{}, err
 	}
-	return f.Store.HeadSeq(ctx)
+	return f.Store.HeadSeq(ctx, id)
+}
+
+func (f *faultStore) Tip(ctx context.Context, q store.TipQuery) (store.Tip, error) {
+	if err := f.take("head"); err != nil {
+		return store.Tip{}, err
+	}
+	tip, err := f.Store.Tip(ctx, q)
+	f.mu.Lock()
+	hook := f.onTip
+	f.mu.Unlock()
+	if err == nil && hook != nil {
+		hook(&tip)
+	}
+	return tip, err
 }
 
 func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int64, limit int) ([]store.Change, error) {
@@ -350,15 +389,15 @@ func (f *faultStore) ChangesAfter(ctx context.Context, id store.ShardID, seq int
 	return page, err
 }
 
-func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (int64, error) {
+func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(store.Record) error) (store.ScanPoint, error) {
 	if err := f.take("scan"); err != nil {
-		return 0, err
+		return store.ScanPoint{}, err
 	}
 	f.mu.Lock()
-	hook := f.onRecord
+	hook, after := f.onRecord, f.afterScan
 	f.mu.Unlock()
 	n := 0
-	return f.Store.ScanShard(ctx, id, func(r store.Record) error {
+	pt, err := f.Store.ScanShard(ctx, id, func(r store.Record) error {
 		n++
 		if hook != nil {
 			if err := hook(ctx, n, r); err != nil {
@@ -367,6 +406,10 @@ func (f *faultStore) ScanShard(ctx context.Context, id store.ShardID, fn func(st
 		}
 		return fn(r)
 	})
+	if after != nil {
+		after(ctx)
+	}
+	return pt, err
 }
 
 func (f *faultStore) Indexes() store.IndexStore {
